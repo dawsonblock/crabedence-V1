@@ -1,0 +1,474 @@
+import assert from "node:assert/strict";
+import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import test from "node:test";
+
+import { markdownToHtml } from "./build-docs-site.mjs";
+
+const repoRoot = path.resolve(import.meta.dirname, "..");
+const providersDir = path.join(repoRoot, "docs", "providers");
+const integrationsDir = path.join(repoRoot, "docs", "integrations");
+const useCasesFile = path.join(repoRoot, "docs", "use-cases.md");
+const siteDir = path.join(repoRoot, "dist", "docs-site");
+const providerIndexFile = path.join(siteDir, "providers", "index.html");
+const generatedTest = fs.existsSync(providerIndexFile) ? test : test.skip;
+
+const providerMarkdown = fs
+  .readdirSync(providersDir)
+  .filter((name) => name.endsWith(".md"))
+  .sort((a, b) => (a === "README.md" ? -1 : b === "README.md" ? 1 : a.localeCompare(b)));
+
+const integrationMarkdown = fs
+  .readdirSync(integrationsDir)
+  .filter((name) => name.endsWith(".md"))
+  .sort((a, b) => (a === "README.md" ? -1 : b === "README.md" ? 1 : a.localeCompare(b)));
+
+generatedTest("generated navigation includes every provider page exactly once", () => {
+  const html = readGenerated("providers/index.html");
+  const providerNav = navSection(html, "Providers");
+
+  assert.match(
+    providerNav,
+    new RegExp(`<span class="nav-count">${providerMarkdown.length}</span>`),
+  );
+  assert.equal(
+    occurrences(providerNav, '<a class="nav-link'),
+    providerMarkdown.length,
+    "provider navigation count should match the provider Markdown count",
+  );
+
+  for (const markdown of providerMarkdown) {
+    const output = markdown === "README.md" ? "index.html" : markdown.replace(/\.md$/, ".html");
+    const href = `href="../providers/${output}"`;
+    assert.equal(
+      occurrences(providerNav, href),
+      1,
+      `${markdown} should be linked exactly once from the Providers navigation`,
+    );
+  }
+});
+
+generatedTest("generated site publishes Agent Skill and AI Catalog discovery", () => {
+  const canonical = fs.readFileSync(path.join(repoRoot, "skills", "crabbox", "SKILL.md"), "utf8");
+  const published = fs.readFileSync(
+    path.join(siteDir, ".well-known", "agent-skills", "crabbox", "SKILL.md"),
+    "utf8",
+  );
+  const index = JSON.parse(
+    fs.readFileSync(path.join(siteDir, ".well-known", "agent-skills", "index.json"), "utf8"),
+  );
+  const description = JSON.parse(canonical.match(/^description:\s*("(?:\\.|[^"\\])*")$/m)[1]);
+  const digest = crypto.createHash("sha256").update(published).digest("hex");
+  const catalog = JSON.parse(
+    fs.readFileSync(path.join(siteDir, ".well-known", "ai-catalog.json"), "utf8"),
+  );
+
+  assert.equal(published, canonical);
+  assert.equal(index.$schema, "https://schemas.agentskills.io/discovery/0.2.0/schema.json");
+  assert.deepEqual(index.skills, [
+    {
+      name: "crabbox",
+      type: "skill-md",
+      description,
+      url: "/.well-known/agent-skills/crabbox/SKILL.md",
+      digest: `sha256:${digest}`,
+    },
+  ]);
+  assert.deepEqual(catalog, {
+    specVersion: "1.0",
+    host: {
+      displayName: "Crabbox",
+      documentationUrl: "https://crabbox.sh/integrations/agents.html",
+    },
+    entries: [
+      {
+        identifier: "urn:air:crabbox.sh:skill:crabbox",
+        displayName: "Crabbox Agent Skill",
+        type: "application/agent-skills+md",
+        url: "https://crabbox.sh/.well-known/agent-skills/crabbox/SKILL.md",
+        description,
+        tags: ["remote-testing", "remote-execution", "developer-tools", "agent-skill"],
+        capabilities: [
+          "RemoteTestExecution",
+          "ReusableRemoteEnvironment",
+          "CrossPlatformValidation",
+          "AuditableExecutionEvidence",
+        ],
+        representativeQueries: [
+          "run this repository's tests on a clean remote machine",
+          "validate this change on Linux, macOS, or Windows",
+          "use Crabbox to collect auditable remote test evidence",
+        ],
+      },
+    ],
+  });
+  assert.match(
+    fs.readFileSync(path.join(siteDir, "robots.txt"), "utf8"),
+    /^Agentmap: https:\/\/crabbox\.sh\/\.well-known\/ai-catalog\.json$/m,
+  );
+  assert.match(
+    readGenerated("index.html"),
+    /<link rel="ai-catalog" href="\/\.well-known\/ai-catalog\.json" type="application\/ai-catalog\+json">/,
+  );
+  assert.match(
+    fs.readFileSync(path.join(repoRoot, ".github", "workflows", "pages.yml"), "utf8"),
+    /actions\/upload-pages-artifact@[^\n]+\n\s+with:\n\s+path: dist\/docs-site\n\s+include-hidden-files: true/,
+    "Pages artifact must include the generated .well-known directory",
+  );
+});
+
+generatedTest("generated navigation includes every integration page exactly once", () => {
+  const html = readGenerated("integrations/index.html");
+  const integrationNav = navSection(html, "Integrations");
+
+  assert.match(
+    integrationNav,
+    new RegExp(`<span class="nav-count">${integrationMarkdown.length}</span>`),
+  );
+  assert.equal(
+    occurrences(integrationNav, '<a class="nav-link'),
+    integrationMarkdown.length,
+    "integration navigation count should match the integration Markdown count",
+  );
+
+  for (const markdown of integrationMarkdown) {
+    const output = markdown === "README.md" ? "index.html" : markdown.replace(/\.md$/, ".html");
+    assert.equal(
+      occurrences(integrationNav, `href="../integrations/${output}"`),
+      1,
+      `${markdown} should be linked exactly once from the Integrations navigation`,
+    );
+  }
+});
+
+generatedTest("generated AWS page is active in Providers navigation and pager", () => {
+  const html = readGenerated("providers/aws.html");
+
+  assert.match(html, /<p class="eyebrow">Providers<\/p>/);
+  assert.equal(occurrences(html, 'aria-current="page"'), 1);
+  assert.match(
+    html,
+    /<a class="nav-link active" href="\.\.\/providers\/aws\.html"[^>]*aria-current="page">AWS Provider<\/a>/,
+  );
+
+  const awsIndex = providerMarkdown.indexOf("aws.md");
+  assert.notEqual(awsIndex, -1);
+  const previous = providerOutput(providerMarkdown[awsIndex - 1]);
+  const next = providerOutput(providerMarkdown[awsIndex + 1]);
+  const pager = element(html, "nav", /class="page-nav"/);
+
+  assert.match(pager, new RegExp(escapeRegExp(`href="../providers/${previous}"`)));
+  assert.match(pager, new RegExp(escapeRegExp(`href="../providers/${next}"`)));
+});
+
+generatedTest("homepage presents use-case, pricing, and onboarding paths", () => {
+  const home = readGenerated("index.html");
+  const startNav = navSection(home, "Start");
+  const gettingStarted = readGenerated("getting-started.html");
+  const useCases = readGenerated("use-cases.html");
+  const pricing = readGenerated("pricing.html");
+
+  assert.match(
+    home,
+    /<title>Crabbox — Run Any Repository Command in the Right Box<\/title>/,
+  );
+  assert.match(home, /<meta name="description" content="[^"]+">/);
+  assert.match(home, /<link rel="canonical" href="https:\/\/crabbox\.sh\/">/);
+  assert.match(home, /<meta property="og:title" content="Crabbox — Run Any Repository Command in the Right Box">/);
+  assert.match(home, /navParams\.get\('docs'\)/);
+  assert.match(home, /next\.searchParams\.set\('docs',value\)/);
+  assert.match(
+    home,
+    /<a class="cta-primary" href="getting-started\.html">Run Your First Command<\/a>/,
+  );
+  assert.match(
+    home,
+    /<a class="cta-secondary" href="#home-use-cases-heading">Route Your Workload<\/a>/,
+  );
+  assert.match(home, /<form class="home-job-finder" data-home-job-finder>/);
+  assert.equal(occurrences(home, 'class="home-job-radio sr-only"'), 6, "homepage should expose six job choices");
+  assert.equal(occurrences(home, 'class="home-job-result"'), 6, "every job choice should have a result");
+  assert.equal(occurrences(home, 'data-home-job-radio checked'), 1, "job finder should have one default route");
+  assert.equal(occurrences(home, 'aria-controls="home-job-result-'), 6, "every job choice should identify its result");
+  assert.equal(occurrences(home, "data-copy-text="), 6, "every job result should expose a runnable copy target");
+  assert.doesNotMatch(home, /data-copy-text="[^"]*\$/);
+  assert.doesNotMatch(home, /data-copy-text="[^"]*&lt;name&gt;/);
+  assert.match(home, /homeJobParams\.get\('job'\)/);
+  assert.match(home, /next\.searchParams\.set\('job',value\)/);
+  const useCaseAnchors = [...home.matchAll(/<a href="use-cases\.html#([^"]+)">Open the /g)]
+    .map((match) => match[1]);
+  assert.equal(useCaseAnchors.length, 6);
+  for (const anchor of useCaseAnchors) {
+    assert.match(useCases, new RegExp(`id="${escapeRegExp(anchor)}"`), `homepage use-case anchor ${anchor} should exist`);
+  }
+  const providersSource = fs.readFileSync(path.join(repoRoot, "internal", "cli", "providers.go"), "utf8");
+  const registry = providersSource.match(
+    /func providerRecommendationUseCases\(\) \[\]string \{\s*return \[\]string\{([\s\S]*?)\n\t\}\n\}/,
+  );
+  assert.ok(registry, "provider recommendation registry should be readable");
+  const registered = new Set([...registry[1].matchAll(/"([a-z][a-z0-9-]*)"/g)].map((match) => match[1]));
+  const finderRecommendations = [...home.matchAll(/class="home-job-command-line"><i aria-hidden="true">\$<\/i><b>crabbox providers recommend ([a-z][a-z0-9-]*)/g)]
+    .map((match) => match[1]);
+  assert.equal(finderRecommendations.length, 9, "job finder should expose every intended starting route");
+  assert.deepEqual(
+    [...new Set(finderRecommendations.filter((name) => !registered.has(name)))],
+    [],
+    "job finder recommendations should stay on the canonical CLI surface",
+  );
+  const providerCount = Object.keys(
+    JSON.parse(fs.readFileSync(path.join(providersDir, "provider-metadata.json"), "utf8")),
+  ).length;
+  assert.match(home, new RegExp(`<li>${providerCount} registered providers</li>`));
+  assert.match(home, new RegExp(`Turn ${providerCount} registered providers into a focused comparison path\\.`));
+  assert.match(home, /href="pricing\.html">See Pricing and Cost Boundaries/);
+  assert.match(home, /There is no generic nested mode\./);
+  assert.match(home, /href="features\/nested-execution\.html">Read the exact boundaries/);
+  assert.match(home, /<aside class="home-trust"[^>]*aria-labelledby="home-trust-heading">/);
+  assert.doesNotMatch(
+    home,
+    /<div class="doc-grid/,
+    "homepage should end after its decision journey instead of embedding the full docs README",
+  );
+  assert.match(startNav, /href="getting-started\.html"[^>]*>Getting Started<\/a>/);
+  assert.match(startNav, /href="use-cases\.html"[^>]*>Use Cases<\/a>/);
+  assert.match(startNav, /href="pricing\.html"[^>]*>Pricing and Costs<\/a>/);
+  assert.match(gettingStarted, /<a class="nav-link active" href="getting-started\.html"[^>]*aria-current="page">Getting Started<\/a>/);
+  assert.match(useCases, /<a class="nav-link active" href="use-cases\.html"[^>]*aria-current="page">Use Cases<\/a>/);
+  assert.match(pricing, /<a class="nav-link active" href="pricing\.html"[^>]*aria-current="page">Pricing and Costs<\/a>/);
+  assert.match(gettingStarted, /<nav class="page-nav"/);
+});
+
+test("use-case guide only invokes registered provider recommendations", () => {
+  const providersSource = fs.readFileSync(path.join(repoRoot, "internal", "cli", "providers.go"), "utf8");
+  const registry = providersSource.match(
+    /func providerRecommendationUseCases\(\) \[\]string \{\s*return \[\]string\{([\s\S]*?)\n\t\}\n\}/,
+  );
+  assert.ok(registry, "provider recommendation registry should be readable");
+  const registered = new Set([...registry[1].matchAll(/"([a-z][a-z0-9-]*)"/g)].map((match) => match[1]));
+  const guide = fs.readFileSync(useCasesFile, "utf8");
+  const invoked = [...guide.matchAll(/^crabbox providers recommend(?: ([a-z][a-z0-9-]*))?(?:\s|$)/gm)]
+    .map((match) => match[1])
+    .filter(Boolean);
+
+  assert.ok(invoked.length > 0, "use-case guide should include recommendation examples");
+  assert.deepEqual(
+    [...new Set(invoked.filter((name) => !registered.has(name)))],
+    [],
+    "use-case guide recommendations should stay on the canonical CLI surface",
+  );
+});
+
+generatedTest("provider index renders filterable rows in a scroll region", () => {
+  const html = readGenerated("providers/index.html");
+  const metadata = JSON.parse(fs.readFileSync(path.join(providersDir, "provider-metadata.json"), "utf8"));
+  const filter = element(html, "div", /class="provider-filter"[^>]*data-provider-filter/);
+  const matrixRegion = element(html, "div", /class="table-scroll"[^>]*role="region"/);
+  const rows = [...matrixRegion.matchAll(/<tr data-provider="([^"]+)"[^>]*data-provider-groups="([^"]+)"[^>]*data-provider-search="[^"]+">/g)];
+
+  assert.match(filter, /<input id="provider-filter-input"[^>]*type="search"/);
+  assert.match(filter, /<output[^>]*aria-live="polite"[^>]*data-provider-count>/);
+  assert.match(filter, /data-provider-group-filter="all"[^>]*aria-pressed="true"/);
+  assert.match(filter, /data-provider-empty/);
+  assert.match(matrixRegion, /<table class="provider-matrix">/);
+  assert.match(html, /new URLSearchParams\(location\.search\)/);
+  assert.match(html, /providerParams\.get\('group'\)/);
+  assert.match(html, /providerParams\.get\('q'\)/);
+  assert.equal(
+    occurrences(html, "split(/\\s+/)"),
+    3,
+    "generated search and provider filters should split on whitespace",
+  );
+  assert.equal(rows.length, Object.keys(metadata).length);
+  assert.deepEqual(
+    new Set(rows.map((match) => match[1])),
+    new Set(Object.keys(metadata)),
+    "generated provider rows should match provider metadata",
+  );
+  assert.ok(rows.every((match) => match[2]), "every provider row should have a filter group");
+  const daytona = rows.find((match) => match[1] === "daytona");
+  assert.ok(daytona, "Daytona should be present in the provider matrix");
+  assert.deepEqual(
+    new Set(daytona[2].split(/\s+/)),
+    new Set(["managed-cloud", "team-cloud"]),
+    "Daytona should be discoverable as both a managed sandbox and coordinator-backed provider",
+  );
+});
+
+generatedTest("provider search includes credential and API-key metadata", () => {
+  const html = readGenerated("providers/index.html");
+  const matrixRegion = element(html, "div", /class="table-scroll"[^>]*role="region"/);
+  const searchByProvider = new Map(
+    [...matrixRegion.matchAll(/<tr data-provider="([^"]+)"[^>]*data-provider-search="([^"]*)">/g)]
+      .map((match) => [match[1], match[2]]),
+  );
+
+  for (const [provider, terms] of [
+    ["opencomputer", ["api key", "x-api-key", "crabbox opencomputer api key"]],
+    ["digitalocean", ["api token", "digitalocean token"]],
+    ["linode", ["api token", "linode token"]],
+    ["vultr", ["api key", "vultr api key"]],
+    ["runpod", ["api key", "runpod api key"]],
+    ["vast", ["api key", "crabbox vast api key"]],
+    ["wandb", ["api key", "crabbox wandb api key"]],
+  ]) {
+    const search = searchByProvider.get(provider);
+    assert.ok(search, `${provider} should be indexed in provider search`);
+    for (const term of terms) {
+      assert.match(search, new RegExp(escapeRegExp(term)), `${provider} search should include ${term}`);
+    }
+  }
+
+  assert.match(searchByProvider.get("aws"), /broker-owned credentials/);
+  assert.match(searchByProvider.get("azure"), /defaultazurecredential/);
+  assert.match(searchByProvider.get("gcp"), /google adc/);
+});
+
+generatedTest("generated Features navigation stays capability-focused", () => {
+  const html = readGenerated("features/index.html");
+  const featuresNav = navSection(html, "Features");
+
+  for (const legacy of [
+    "aws",
+    "azure",
+    "aws-private-workspaces",
+    "blacksmith-testbox",
+    "capacity-fallback",
+    "daytona",
+    "delegated-runner-contract",
+    "e2b",
+    "hetzner",
+    "islo",
+    "namespace-devbox",
+    "namespace-devbox-setup",
+    "provider-authoring",
+    "provider-landscape",
+    "provider-live-smoke",
+    "provider-selection",
+    "providers",
+    "semaphore",
+    "slurm-academic-sandboxes",
+    "sprites",
+  ]) {
+    assert.doesNotMatch(featuresNav, new RegExp(`href="\\.\\./features/${legacy}\\.html"`));
+    assert.ok(fs.existsSync(path.join(siteDir, "features", `${legacy}.html`)), `${legacy} legacy page should still build`);
+  }
+
+  assert.match(featuresNav, /href="\.\.\/features\/configuration\.html"/);
+  assert.match(featuresNav, /href="\.\.\/features\/nested-execution\.html"/);
+  assert.match(featuresNav, /href="\.\.\/features\/sync\.html"/);
+  assert.match(featuresNav, /href="\.\.\/features\/artifacts\.html"/);
+});
+
+generatedTest("generated provider markup hides comments and preserves list structure", () => {
+  const indexHtml = readGenerated("providers/index.html");
+  const awsHtml = readGenerated("providers/aws.html");
+
+  assert.doesNotMatch(indexHtml, /BEGIN GENERATED PROVIDER MATRIX|END GENERATED PROVIDER MATRIX/);
+  assertValidListChildren(article(indexHtml), "provider index");
+  assertValidListChildren(article(awsHtml), "AWS provider");
+});
+
+test("Markdown comments remain literal inside fenced code", () => {
+  const html = markdownToHtml(
+    "```html\n<!-- marker -->\n<div>example</div>\n```\n\nVisible paragraph.",
+    "example.md",
+  );
+
+  assert.match(html, /&lt;!-- marker --&gt;/);
+  assert.match(html, /&lt;div&gt;example&lt;\/div&gt;/);
+  assert.match(html, /<p>Visible paragraph\.<\/p>/);
+});
+
+function readGenerated(relativePath) {
+  return fs.readFileSync(path.join(siteDir, relativePath), "utf8");
+}
+
+function navSection(html, heading) {
+  const details = [...html.matchAll(/<details class="nav-section"[^>]*>[\s\S]*?<\/details>/g)];
+  const match = details.find((candidate) => candidate[0].includes(`<h2>${heading}</h2>`));
+  assert.ok(match, `${heading} navigation section should exist`);
+  return match[0];
+}
+
+function article(html) {
+  return element(html, "article", /class="[^"]*\bdoc\b[^"]*"/);
+}
+
+function element(html, tag, attributes) {
+  const openings = new RegExp(`<${tag}\\b[^>]*>`, "g");
+  let opening;
+  while ((opening = openings.exec(html)) && !attributes.test(opening[0])) {
+    // Find the requested element before balancing nested elements of the same type.
+  }
+  assert.ok(opening, `expected generated <${tag}> matching ${attributes}`);
+
+  const tags = new RegExp(`<\\/?${tag}\\b[^>]*>`, "g");
+  tags.lastIndex = opening.index;
+  let depth = 0;
+  let match;
+  while ((match = tags.exec(html))) {
+    depth += match[0].startsWith("</") ? -1 : 1;
+    if (depth === 0) return html.slice(opening.index, tags.lastIndex);
+  }
+  assert.fail(`generated <${tag}> matching ${attributes} is not closed`);
+}
+
+function providerOutput(markdown) {
+  assert.ok(markdown, "AWS should have adjacent provider pages");
+  return markdown === "README.md" ? "index.html" : markdown.replace(/\.md$/, ".html");
+}
+
+function occurrences(haystack, needle) {
+  return haystack.split(needle).length - 1;
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function assertValidListChildren(html, label) {
+  const stack = [];
+  const token = /<\/?([a-zA-Z][\w:-]*)\b[^>]*>/g;
+  let cursor = 0;
+  let match;
+
+  while ((match = token.exec(html))) {
+    const text = html.slice(cursor, match.index);
+    const parent = stack.at(-1);
+    if ((parent === "ul" || parent === "ol") && text.trim()) {
+      assert.fail(`${label} has text directly inside <${parent}>: ${text.trim().slice(0, 80)}`);
+    }
+
+    const tag = match[1].toLowerCase();
+    const closing = match[0].startsWith("</");
+    if (closing) {
+      const index = stack.lastIndexOf(tag);
+      assert.notEqual(index, -1, `${label} has an unmatched </${tag}>`);
+      stack.length = index;
+    } else {
+      if (parent === "ul" || parent === "ol") {
+        assert.equal(tag, "li", `${label} has <${tag}> directly inside <${parent}>`);
+      }
+      if (!voidElements.has(tag) && !match[0].endsWith("/>")) stack.push(tag);
+    }
+    cursor = token.lastIndex;
+  }
+}
+
+const voidElements = new Set([
+  "area",
+  "base",
+  "br",
+  "col",
+  "embed",
+  "hr",
+  "img",
+  "input",
+  "link",
+  "meta",
+  "param",
+  "source",
+  "track",
+  "wbr",
+]);

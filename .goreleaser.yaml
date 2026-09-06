@@ -1,0 +1,65 @@
+version: 2
+
+project_name: crabbox
+
+changelog:
+  disable: true
+
+# This configuration is build-only. Official publication is a later,
+# proof-gated operation on an already verified draft release.
+release:
+  disable: true
+
+before:
+  hooks:
+    # Build the Swift VM daemon so the helper build below can embed it.
+    - sh scripts/build-vmd.sh
+
+builds:
+  - id: crabbox
+    main: ./cmd/crabbox
+    binary: crabbox
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    ldflags:
+      - -s -w -X github.com/openclaw/crabbox/internal/cli.version={{ .Version }}
+    targets:
+      - darwin_amd64
+      - darwin_arm64
+      - linux_amd64
+      - linux_arm64
+      - windows_amd64
+      - windows_arm64
+  - id: crabbox-apple-vm-helper
+    main: ./cmd/crabbox-apple-vm-helper
+    binary: crabbox-apple-vm-helper
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+      - -tags=vmdembed
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    targets:
+      - darwin_arm64
+
+archives:
+  - id: crabbox
+    ids:
+      - crabbox
+      - crabbox-apple-vm-helper
+    allow_different_binary_count: true
+    formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    files:
+      - none*
+
+checksum:
+  name_template: checksums.txt

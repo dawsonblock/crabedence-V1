@@ -1,0 +1,428 @@
+import type { Env } from "./types";
+
+const githubAPIURL = "https://api.github.com";
+const defaultMembershipCacheSeconds = 5 * 60;
+const maxMembershipCacheSeconds = 60 * 60;
+const maxGitHubTeamPages = 10;
+const membershipCacheMaxEntries = 1024;
+
+interface GitHubTeam {
+  slug?: string;
+  organization?: {
+    login?: string;
+  };
+}
+
+interface GitHubUser {
+  id?: number;
+  login?: string;
+}
+
+interface AllowedGitHubTeam {
+  org: string;
+  slug: string;
+}
+
+export interface GitHubMembershipPolicy {
+  org: string;
+  allowedTeams: readonly string[];
+  cacheKey: string;
+}
+
+export interface GitHubMembershipIdentity {
+  accessToken: string;
+  tokenID: string;
+  owner: string;
+  org: string;
+  login: string;
+}
+
+export type GitHubMembershipEnv = Pick<
+  Env,
+  | "CRABBOX_DEFAULT_ORG"
+  | "CRABBOX_GITHUB_ALLOWED_ORG"
+  | "CRABBOX_GITHUB_ALLOWED_ORGS"
+  | "CRABBOX_GITHUB_ALLOWED_TEAM"
+  | "CRABBOX_GITHUB_ALLOWED_TEAMS"
+  | "CRABBOX_GITHUB_REVOKED_USERS"
+  | "CRABBOX_GITHUB_MEMBERSHIP_CACHE_SECONDS"
+>;
+
+const membershipCache = new Map<string, number>();
+const membershipLoads = new Map<string, Promise<void>>();
+
+export async function requireGitHubLoginMembership(
+  accessToken: string,
+  identity: Pick<GitHubMembershipIdentity, "owner" | "login">,
+  requestedOrg: string,
+  env: GitHubMembershipEnv,
+): Promise<string> {
+  requireSafeGitHubRevocationConfig(env);
+  if (githubUserIsRevoked(identity, env)) {
+    throw new GitHubAuthorizationError(`GitHub user ${identity.login} has been revoked.`);
+  }
+  const allowed = allowedGitHubOrgs(env);
+  const requested = requestedOrg.toLowerCase();
+  const org = allowed.includes(requested) ? requested : allowed[0];
+  if (!org) {
+    throw new GitHubAuthorizationError("GitHub login is not configured with an allowed org.");
+  }
+  const policy = githubMembershipPolicy({ ...identity, org }, env);
+  return requireExactGitHubMembership(accessToken, identity.login, policy);
+}
+
+export async function requireCurrentGitHubMembership(
+  identity: GitHubMembershipIdentity,
+  env: GitHubMembershipEnv,
+): Promise<void> {
+  const policy = githubMembershipPolicy(identity, env);
+  const key = membershipCacheKey(identity, policy);
+  const now = Date.now();
+  const cachedUntil = membershipCache.get(key) ?? 0;
+  if (cachedUntil > now) {
+    return;
+  }
+  membershipCache.delete(key);
+  const loading = membershipLoads.get(key);
+  if (loading) {
+    return loading;
+  }
+  const load = requireExactGitHubAccount(identity.accessToken, identity.owner, identity.login)
+    .then(() => requireExactGitHubMembership(identity.accessToken, identity.login, policy))
+    .then(() => {
+      const ttlSeconds = membershipCacheSeconds(env);
+      if (ttlSeconds > 0) {
+        membershipCache.set(key, Date.now() + ttlSeconds * 1000);
+        trimMembershipCache();
+      }
+      return undefined;
+    })
+    .finally(() => membershipLoads.delete(key));
+  membershipLoads.set(key, load);
+  return load;
+}
+
+export async function requireFreshGitHubMembership(
+  identity: GitHubMembershipIdentity,
+  env: GitHubMembershipEnv,
+  normalizedPolicy?: GitHubMembershipPolicy,
+): Promise<void> {
+  const policy = normalizedPolicy ?? githubMembershipPolicy(identity, env);
+  await requireExactGitHubAccount(identity.accessToken, identity.owner, identity.login);
+  await requireExactGitHubMembership(identity.accessToken, identity.login, policy);
+}
+
+export function githubMembershipPolicy(
+  identity: Pick<GitHubMembershipIdentity, "owner" | "org" | "login">,
+  env: GitHubMembershipEnv,
+): GitHubMembershipPolicy {
+  requireSafeGitHubRevocationConfig(env);
+  if (githubUserIsRevoked(identity, env)) {
+    throw new GitHubAuthorizationError(`GitHub user ${identity.login} has been revoked.`);
+  }
+  const org = identity.org.trim().toLowerCase();
+  const allowedOrgs = allowedGitHubOrgs(env);
+  if (!allowedOrgs.includes(org)) {
+    throw new GitHubAuthorizationError(`GitHub organization ${identity.org} is no longer allowed.`);
+  }
+  const configuredTeams = allowedGitHubTeams(env, org)
+    .map((team) => teamKey(team.org, team.slug))
+    .toSorted();
+  const normalizedTeams = [...new Set(configuredTeams)];
+  const allowedTeams = normalizedTeams.filter((team) => team.startsWith(`${org}/`));
+  if (normalizedTeams.length > 0 && allowedTeams.length === 0) {
+    throw new GitHubAuthorizationError(
+      `GitHub organization ${org} has no allowed team configured.`,
+    );
+  }
+  return {
+    org,
+    allowedTeams,
+    cacheKey: JSON.stringify([[...new Set(allowedOrgs)].toSorted(), normalizedTeams]),
+  };
+}
+
+function githubUserIsRevoked(
+  identity: Pick<GitHubMembershipIdentity, "owner">,
+  env: Pick<GitHubMembershipEnv, "CRABBOX_GITHUB_REVOKED_USERS">,
+): boolean {
+  const owner = identity.owner.trim().toLowerCase();
+  return envList(env.CRABBOX_GITHUB_REVOKED_USERS).some((entry) => {
+    if (entry.startsWith("owner:")) return entry.slice("owner:".length) === owner;
+    return entry === owner;
+  });
+}
+
+function requireSafeGitHubRevocationConfig(
+  env: Pick<GitHubMembershipEnv, "CRABBOX_GITHUB_REVOKED_USERS">,
+): void {
+  const invalid = envList(env.CRABBOX_GITHUB_REVOKED_USERS).find((entry) => {
+    if (githubAccountID(entry) !== undefined) return false;
+    return (
+      !entry.startsWith("owner:") || githubAccountID(entry.slice("owner:".length)) === undefined
+    );
+  });
+  if (invalid) {
+    throw new GitHubAuthorizationError(
+      "CRABBOX_GITHUB_REVOKED_USERS contains a mutable or invalid selector. Replace email or login selectors with github:<numeric-id>.",
+    );
+  }
+}
+
+async function requireExactGitHubAccount(
+  accessToken: string,
+  owner: string,
+  login: string,
+): Promise<void> {
+  const expectedID = githubAccountID(owner);
+  if (expectedID === undefined) {
+    throw new GitHubAuthorizationError(
+      "This GitHub session uses a legacy mutable identity. Log in again.",
+    );
+  }
+  const response = await fetch(`${githubAPIURL}/user`, { headers: githubHeaders(accessToken) });
+  if (!response.ok) {
+    throw await githubResponseError(
+      response,
+      `Could not verify GitHub user ${login}: GitHub returned ${response.status}.`,
+    );
+  }
+  const user = (await response.json()) as GitHubUser;
+  if (typeof user.id !== "number" || !Number.isSafeInteger(user.id) || user.id !== expectedID) {
+    throw new GitHubAuthorizationError("The GitHub credential no longer matches this session.");
+  }
+}
+
+export function githubAccountID(owner: string): number | undefined {
+  const match = /^github:([1-9][0-9]*)$/.exec(owner.trim().toLowerCase());
+  if (!match) return undefined;
+  const value = Number(match[1]);
+  return Number.isSafeInteger(value) ? value : undefined;
+}
+
+async function requireExactGitHubMembership(
+  accessToken: string,
+  login: string,
+  policy: GitHubMembershipPolicy,
+): Promise<string> {
+  const exactOrg = policy.org;
+  const response = await fetch(
+    `${githubAPIURL}/user/memberships/orgs/${encodeURIComponent(exactOrg)}`,
+    { headers: githubHeaders(accessToken) },
+  );
+  if (!response.ok) {
+    throw await githubResponseError(
+      response,
+      `GitHub user ${login} is not an active member of ${exactOrg}.`,
+    );
+  }
+  const membership = (await response.json()) as {
+    state?: string;
+    organization?: { login?: string };
+  };
+  if (membership.state !== "active" || membership.organization?.login?.toLowerCase() !== exactOrg) {
+    throw new GitHubAuthorizationError(
+      `GitHub user ${login} is not an active member of ${exactOrg}.`,
+    );
+  }
+  await requireAllowedTeamMembership(accessToken, login, policy);
+  return membership.organization.login || exactOrg;
+}
+
+async function requireAllowedTeamMembership(
+  accessToken: string,
+  login: string,
+  policy: GitHubMembershipPolicy,
+): Promise<void> {
+  if (policy.allowedTeams.length === 0) return;
+  const allowedKeys = new Set(policy.allowedTeams);
+  for (const team of await userGitHubTeams(accessToken)) {
+    const teamOrg = team.organization?.login?.toLowerCase() ?? "";
+    const teamSlug = team.slug?.toLowerCase() ?? "";
+    if (teamOrg && teamSlug && allowedKeys.has(teamKey(teamOrg, teamSlug))) return;
+  }
+  throw new GitHubAuthorizationError(
+    `GitHub user ${login} is not a member of an allowed team in ${policy.org}.`,
+  );
+}
+
+function allowedGitHubOrgs(env: GitHubMembershipEnv): string[] {
+  const raw = env.CRABBOX_GITHUB_ALLOWED_ORGS || env.CRABBOX_GITHUB_ALLOWED_ORG;
+  const configured = envList(raw);
+  if (configured.length > 0) return configured;
+  return envList(env.CRABBOX_DEFAULT_ORG);
+}
+
+function allowedGitHubTeams(env: GitHubMembershipEnv, defaultOrg: string): AllowedGitHubTeam[] {
+  const plural = env.CRABBOX_GITHUB_ALLOWED_TEAMS;
+  const raw =
+    plural === undefined || plural.trim() === "" ? env.CRABBOX_GITHUB_ALLOWED_TEAM : plural;
+  if (raw === undefined || raw.trim() === "") return [];
+  const values = raw.split(",").map((value) => value.trim().toLowerCase());
+  if (values.some((value) => value === "")) throw invalidAllowedTeamConfig();
+  return values.map((value) => parseAllowedGitHubTeam(value, defaultOrg));
+}
+
+function parseAllowedGitHubTeam(value: string, defaultOrg: string): AllowedGitHubTeam {
+  const segments = value.split("/");
+  if (segments.length > 2) throw invalidAllowedTeamConfig();
+  const [org, slug] = segments.length === 2 ? segments : [defaultOrg, segments[0]];
+  if (!validGitHubOrgSelector(org) || !validGitHubTeamSlug(slug)) {
+    throw invalidAllowedTeamConfig();
+  }
+  return { org, slug };
+}
+
+function validGitHubOrgSelector(value: string | undefined): value is string {
+  return Boolean(
+    value &&
+    value.length <= 39 &&
+    /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(value) &&
+    !value.includes("--"),
+  );
+}
+
+function validGitHubTeamSlug(value: string | undefined): value is string {
+  return Boolean(value && value.length <= 100 && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(value));
+}
+
+function invalidAllowedTeamConfig(): GitHubAuthorizationError {
+  return new GitHubAuthorizationError(
+    "CRABBOX_GITHUB_ALLOWED_TEAMS contains an invalid entry. Use team-slug or org/team-slug without empty entries.",
+  );
+}
+
+async function userGitHubTeams(accessToken: string): Promise<GitHubTeam[]> {
+  const teams: GitHubTeam[] = [];
+  for (let page = 1; page <= maxGitHubTeamPages; page += 1) {
+    // oxlint-disable-next-line eslint/no-await-in-loop -- each page determines whether another exists.
+    const response = await fetch(`${githubAPIURL}/user/teams?per_page=100&page=${page}`, {
+      headers: githubHeaders(accessToken),
+    });
+    if (!response.ok) {
+      // oxlint-disable-next-line eslint/no-await-in-loop -- classify the current page response before advancing.
+      throw await githubResponseError(
+        response,
+        `Could not verify GitHub team membership: GitHub returned ${response.status}.`,
+      );
+    }
+    // oxlint-disable-next-line eslint/no-await-in-loop -- parse the current page before continuing.
+    const pageTeams = (await response.json()) as GitHubTeam[];
+    teams.push(...pageTeams);
+    if (pageTeams.length < 100) return teams;
+  }
+  return teams;
+}
+
+function membershipCacheKey(
+  identity: Pick<GitHubMembershipIdentity, "tokenID" | "owner" | "org">,
+  policy: GitHubMembershipPolicy,
+): string {
+  return JSON.stringify([
+    identity.tokenID,
+    identity.owner.toLowerCase(),
+    identity.org.toLowerCase(),
+    policy.cacheKey,
+  ]);
+}
+
+function membershipCacheSeconds(
+  env: Pick<GitHubMembershipEnv, "CRABBOX_GITHUB_MEMBERSHIP_CACHE_SECONDS">,
+): number {
+  const value = Number(env.CRABBOX_GITHUB_MEMBERSHIP_CACHE_SECONDS?.trim());
+  if (!Number.isFinite(value) || value < 0) return defaultMembershipCacheSeconds;
+  return Math.min(maxMembershipCacheSeconds, Math.trunc(value));
+}
+
+function trimMembershipCache(): void {
+  const now = Date.now();
+  for (const [key, expiresAt] of membershipCache) {
+    if (expiresAt <= now) membershipCache.delete(key);
+  }
+  while (membershipCache.size > membershipCacheMaxEntries) {
+    const oldest = membershipCache.keys().next().value;
+    if (oldest === undefined) break;
+    membershipCache.delete(oldest);
+  }
+}
+
+function envList(value: string | undefined): string[] {
+  return (value ?? "")
+    .split(",")
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function teamKey(org: string, slug: string): string {
+  return `${org.toLowerCase()}/${slug.toLowerCase()}`;
+}
+
+function githubHeaders(accessToken: string): Record<string, string> {
+  return {
+    accept: "application/vnd.github+json",
+    authorization: `Bearer ${accessToken}`,
+    "user-agent": "crabbox-coordinator",
+    "x-github-api-version": "2022-11-28",
+  };
+}
+
+async function githubResponseError(response: Response, message: string): Promise<Error> {
+  if (response.status === 429 || response.status >= 500) {
+    return new GitHubTransientError(message);
+  }
+  if (response.status === 401) return new GitHubCredentialError(message);
+  if (response.status !== 403) return new GitHubAuthorizationError(message);
+
+  const sso = response.headers.get("x-github-sso")?.trim().toLowerCase() ?? "";
+  if (/^required(?:;|$)/.test(sso)) return new GitHubCredentialError(message);
+
+  const details = await githubErrorDetails(response);
+  return github403RequiresReauthentication(details)
+    ? new GitHubCredentialError(message)
+    : new GitHubAuthorizationError(message);
+}
+
+async function githubErrorDetails(
+  response: Response,
+): Promise<{ message: string; documentationURL: string }> {
+  try {
+    const body = (await response.json()) as { message?: unknown; documentation_url?: unknown };
+    return {
+      message: typeof body.message === "string" ? body.message.trim().toLowerCase() : "",
+      documentationURL:
+        typeof body.documentation_url === "string"
+          ? body.documentation_url.trim().toLowerCase()
+          : "",
+    };
+  } catch {
+    return { message: "", documentationURL: "" };
+  }
+}
+
+function github403RequiresReauthentication(details: {
+  message: string;
+  documentationURL: string;
+}): boolean {
+  if (
+    details.message === "bad credentials" ||
+    details.message.includes("resource protected by organization saml enforcement") ||
+    details.message.includes("oauth app access restrictions") ||
+    /\b(?:token|credentials?) (?:has |have |is |are )?(?:expired|revoked|invalid)\b/.test(
+      details.message,
+    ) ||
+    /\b(?:expired|revoked|invalid) (?:token|credentials?)\b/.test(details.message)
+  ) {
+    return true;
+  }
+  return (
+    details.documentationURL.startsWith("https://docs.github.com/") &&
+    (details.documentationURL.includes("/token-expiration-and-revocation") ||
+      details.documentationURL.includes("#saml-sso-authentication"))
+  );
+}
+
+export class GitHubAuthorizationError extends Error {}
+
+export class GitHubCredentialError extends GitHubAuthorizationError {}
+
+export class GitHubTransientError extends Error {}

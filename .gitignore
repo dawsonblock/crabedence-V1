@@ -1,0 +1,40 @@
+bin/
+dist/
+dist-release/
+dist-release-unsigned/
+dist-cloudflare/
+/worker/dist-node/
+/worker/dist-cloudflare-dynamic-workers/
+artifacts/
+.crabbox/
+.clawpatch/
+node_modules/
+.wrangler/
+*.test
+coverage.out
+/crabbox
+__pycache__/
+*.pyc
+.pytest_cache/
+.gomu_history.json
+mutation-report.*
+reports/mutation/
+
+# Local env files: never commit API keys, tokens, or user secrets.
+*.env
+!.mac-release.env
+api.env*
+
+# Local planning artifacts from $prepare-plans / $prepare-plans-goals.
+# These are scratch inputs for the current session, not part of the repo.
+PLAN*.md
+plan*.md
+
+# Swift VM daemon build outputs
+vmd/.build/
+internal/applevmhelper/embedded/
+/crabbox-apple-vm-helper
+/crabbox-apple-vm-vmd
+.DS_Store
+**/.DS_Store
+.claude/

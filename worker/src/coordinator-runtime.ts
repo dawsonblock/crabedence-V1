@@ -1,0 +1,429 @@
+export interface CoordinatorStorageView {
+  get<T>(key: string, options?: { noCache?: boolean }): Promise<T | undefined>;
+  put<T>(key: string, value: T, options?: { noCache?: boolean }): Promise<void>;
+  delete(key: string): Promise<unknown>;
+  list<T>(options?: {
+    prefix?: string;
+    limit?: number;
+    startAfter?: string;
+    noCache?: boolean;
+  }): Promise<Map<string, T>>;
+}
+
+export interface CoordinatorLock {
+  /** Release the lock. Safe to call more than once and on storage close. */
+  release(): Promise<void>;
+}
+
+export interface CoordinatorStorage extends CoordinatorStorageView {
+  // Implementations may retry callbacks after serialization conflicts; callbacks must contain
+  // only storage reads/writes and must not perform external or otherwise non-idempotent effects.
+  transaction<T>(callback: (transaction: CoordinatorStorageView) => Promise<T>): Promise<T>;
+  /**
+   * Acquire a mutually exclusive coordinator-instance lease, when the backend
+   * can express one. The lease must be scoped to the storage itself (one
+   * coordinator process per database/state tree) and must be released when the
+   * holder dies or the storage is closed. Backends that cannot express mutual
+   * exclusion — for example Cloudflare Durable Objects, which are intrinsic
+   * singletons — omit the method; runtimes then rely on platform fencing.
+   * Returning undefined means another coordinator instance holds the lease.
+   */
+  acquireCoordinatorLock?(): Promise<CoordinatorLock | undefined>;
+}
+
+export const provisioningDuePrefix = "provisioning-due:";
+export const legacyAlarmKey = "runtime:legacy-alarm";
+
+export interface ProvisioningDueRecord {
+  operationID: string;
+  at: number;
+}
+
+export async function earliestProvisioningWake(
+  storage: CoordinatorStorageView,
+): Promise<number | undefined> {
+  const entries = await storage.list<ProvisioningDueRecord>({
+    prefix: provisioningDuePrefix,
+    limit: 1,
+  });
+  if (entries.size === 0) return undefined;
+  const at = entries.values().next().value?.at;
+  // A malformed index value still needs the bounded controller tick to quarantine it.
+  return typeof at === "number" && Number.isFinite(at) ? at : Date.now();
+}
+
+export async function mergedCoordinatorWake(
+  storage: CoordinatorStorageView,
+): Promise<number | undefined> {
+  const legacy = await storage.get<number | null>(legacyAlarmKey);
+  const provisioning = await earliestProvisioningWake(storage);
+  if (legacy == null) return provisioning;
+  return provisioning === undefined ? legacy : Math.min(legacy, provisioning);
+}
+
+export async function setLegacyWake(storage: CoordinatorStorageView, time?: number): Promise<void> {
+  await storage.put(legacyAlarmKey, time ?? null);
+}
+
+export interface ProvisioningRuntime {
+  commitAndWake<T>(callback: (transaction: CoordinatorStorageView) => Promise<T>): Promise<T>;
+  registerProvisioningTick(tick: () => Promise<void>): void;
+  ownMaintenance(operation: Promise<void>): void;
+}
+
+export type CoordinatorRequestQueue = "direct" | "lifecycle";
+
+export function controlMessageOwnsTransaction(message: unknown): boolean {
+  if (typeof message !== "string") {
+    return false;
+  }
+  try {
+    const input = JSON.parse(message) as { type?: unknown };
+    return input.type === "heartbeat";
+  } catch {
+    return false;
+  }
+}
+
+export function coordinatorRequestQueue(request: Request): CoordinatorRequestQueue {
+  const url = new URL(request.url);
+  const path = url.pathname.split("/").filter(Boolean);
+  const method = request.method.toUpperCase();
+  if (
+    (method === "POST" && path.join("/") === "v1/auth/github/start") ||
+    (method === "GET" && path.join("/") === "portal/login")
+  ) {
+    return "direct";
+  }
+  if (method === "GET" && path.join("/") === "v1/auth/github/callback") {
+    return "direct";
+  }
+  if (
+    path[0] === "v1" &&
+    ((path[1] === "pairing" && (path[2] === "grants" || path[2] === "exchange")) ||
+      path[1] === "devices")
+  ) {
+    return "direct";
+  }
+  if (
+    method === "POST" &&
+    (path.join("/") === "v1/leases" ||
+      path.join("/") === "v1/leases/capability-aware" ||
+      path.join("/") === "v1/leases/from-checkpoint")
+  ) {
+    return "direct";
+  }
+  if (path[0] === "v1" && path[1] === "checkpoints") {
+    return "direct";
+  }
+  if (
+    method === "PUT" &&
+    path[0] === "v1" &&
+    path[1] === "leases" &&
+    path[2] &&
+    (path.length === 3 || (path.length === 4 && path[3] === "from-checkpoint"))
+  ) {
+    return "direct";
+  }
+  if (path[0] === "v1" && path[1] === "workspaces") {
+    return "direct";
+  }
+  if (method === "GET" && path.join("/") === "v1/native-vnc/handoff") {
+    return "direct";
+  }
+  if (method === "POST" && path.join("/") === "v1/internal/scheduled") {
+    return "direct";
+  }
+  if (path[0] === "v1" && path[1] === "ready-pools") {
+    return "direct";
+  }
+  if (
+    path[0] === "v1" &&
+    path[1] === "images" &&
+    path[2] &&
+    ((method === "POST" &&
+      path.length === 4 &&
+      (path[3] === "promote" || path[3] === "promote-catalog")) ||
+      (method === "DELETE" &&
+        (path.length === 3 ||
+          (path.length === 4 && (path[3] === "promote-catalog" || path[3] === "promote")))))
+  ) {
+    // Existing-image mutations intentionally hold the lifecycle queue across provider I/O:
+    // these rare admin calls must validate, re-read, clean up, and publish as one serialized commit.
+    return "lifecycle";
+  }
+  if (path[0] === "v1" && path[1] === "images") {
+    return "direct";
+  }
+  if (
+    path[0] === "v1" &&
+    path[1] === "adapters" &&
+    ((method === "GET" && path.length === 3) || path[3] === "proxy")
+  ) {
+    return "direct";
+  }
+  if (path.join("/") === "v1/pool") {
+    return "direct";
+  }
+  if (path[0] === "v1" && path[1] === "providers" && path[3] === "readiness") {
+    return "direct";
+  }
+  if (
+    path[0] === "v1" &&
+    path[1] === "leases" &&
+    path[2] &&
+    method === "GET" &&
+    path.length === 3
+  ) {
+    return "direct";
+  }
+  if (
+    path[0] === "v1" &&
+    path[1] === "leases" &&
+    path[2] &&
+    method === "POST" &&
+    (path[3] === "heartbeat" ||
+      path[3] === "tailscale" ||
+      path[3] === "release" ||
+      path[3] === "cancel-create")
+  ) {
+    return "direct";
+  }
+  if (
+    path[0] === "v1" &&
+    path[1] === "admin" &&
+    (path[2] === "lease-audit" ||
+      path[2] === "aws-identity" ||
+      path[2] === "providers" ||
+      path[2] === "hosts" ||
+      path[2] === "mac-hosts" ||
+      path[2] === "aws-orphan-sweep" ||
+      path[2] === "azure-orphan-sweep" ||
+      (path[2] === "leases" && method === "POST"))
+  ) {
+    return "direct";
+  }
+  if (
+    method === "POST" &&
+    path[0] === "portal" &&
+    path[1] === "leases" &&
+    path[2] &&
+    path[3] === "release"
+  ) {
+    return "direct";
+  }
+  if (
+    path[0] === "portal" &&
+    ((method === "GET" && (path.length === 1 || path[1] === "admin" || path[1] === "hosts")) ||
+      (method === "POST" && path[1] === "hosts" && path[4] === "vnc"))
+  ) {
+    return "direct";
+  }
+  if (path[0] === "portal" && path[1] === "leases" && path[2] && path[3] === "code") {
+    return "direct";
+  }
+  return "lifecycle";
+}
+
+export async function bufferCoordinatorRequestBody(request: Request): Promise<Request> {
+  if (request.method === "GET" || request.method === "HEAD" || request.body === null) {
+    return request;
+  }
+  const body = await request.arrayBuffer();
+  return new Request(request, { body, method: request.method });
+}
+
+export interface CoordinatorSocketHandlers {
+  message(data: string | ArrayBuffer | Blob): Promise<void> | void;
+  close(code: number, reason: string): void;
+  error(): void;
+}
+
+export interface CoordinatorWebSocketUpgrade {
+  socket: WebSocket;
+  response: Response;
+}
+
+export interface CoordinatorWebSocketUpgradeOptions {
+  maxPayload?: number;
+}
+
+export interface CoordinatorRuntime {
+  readonly storage: CoordinatorStorage;
+  readonly ephemeralWebSocketMaxPayloadBytes: number;
+  runExclusive<T>(callback: () => Promise<T>): Promise<T>;
+  createWebSocketUpgrade(options?: CoordinatorWebSocketUpgradeOptions): CoordinatorWebSocketUpgrade;
+  getWebSockets(): Iterable<WebSocket>;
+  socketAttachment<T>(socket: WebSocket): T | undefined;
+  setSocketAttachment(socket: WebSocket, attachment: unknown): void;
+  acceptWebSocket(
+    socket: WebSocket,
+    attachment: unknown,
+    tags: string[],
+    handlers: CoordinatorSocketHandlers,
+  ): void;
+  acceptEphemeralWebSocket(socket: WebSocket, handlers: CoordinatorSocketHandlers): void;
+  take<T>(key: string): Promise<T | undefined>;
+  getAlarm(): Promise<number | undefined>;
+  scheduleAlarm(time: number): Promise<void>;
+  clearAlarm(): Promise<void>;
+  readonly provisioning?: ProvisioningRuntime;
+}
+
+export class CloudflareCoordinatorRuntime implements CoordinatorRuntime {
+  readonly provisioning: ProvisioningRuntime = this;
+  readonly storage: CoordinatorStorage;
+  readonly ephemeralWebSocketMaxPayloadBytes = 32 * 1024 * 1024;
+  private readonly attachments = new WeakMap<WebSocket, unknown>();
+  private exclusiveTail = Promise.resolve();
+
+  constructor(private readonly state: DurableObjectState) {
+    this.storage = state.storage;
+  }
+
+  async runExclusive<T>(callback: () => Promise<T>): Promise<T> {
+    const predecessor = this.exclusiveTail;
+    let release!: () => void;
+    this.exclusiveTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await predecessor;
+    try {
+      return await callback();
+    } finally {
+      release();
+    }
+  }
+
+  createWebSocketUpgrade(
+    _options?: CoordinatorWebSocketUpgradeOptions,
+  ): CoordinatorWebSocketUpgrade {
+    const pair = new WebSocketPair();
+    return {
+      socket: pair[1],
+      response: new Response(null, { status: 101, webSocket: pair[0] }),
+    };
+  }
+
+  getWebSockets(): Iterable<WebSocket> {
+    return this.state.getWebSockets?.() ?? [];
+  }
+
+  socketAttachment<T>(socket: WebSocket): T | undefined {
+    return (this.attachments.get(socket) ?? socket.deserializeAttachment?.()) as T | undefined;
+  }
+
+  setSocketAttachment(socket: WebSocket, attachment: unknown): void {
+    this.attachments.set(socket, attachment);
+    socket.serializeAttachment?.(attachment);
+  }
+
+  acceptWebSocket(
+    socket: WebSocket,
+    attachment: unknown,
+    tags: string[],
+    handlers: CoordinatorSocketHandlers,
+  ): void {
+    this.attachments.set(socket, attachment);
+    if (typeof this.state.acceptWebSocket === "function") {
+      this.state.acceptWebSocket(socket, tags);
+      socket.serializeAttachment(attachment);
+      return;
+    }
+    socket.accept();
+    socket.addEventListener("message", (event) => {
+      void this.runSocketOperation(attachment, event.data, () => handlers.message(event.data));
+    });
+    socket.addEventListener("close", (event) => {
+      handlers.close(event.code, event.reason);
+    });
+    socket.addEventListener("error", () => {
+      handlers.error();
+    });
+  }
+
+  acceptEphemeralWebSocket(socket: WebSocket, handlers: CoordinatorSocketHandlers): void {
+    socket.accept();
+    socket.addEventListener("message", (event) => {
+      void handlers.message(event.data);
+    });
+    socket.addEventListener("close", (event) => {
+      handlers.close(event.code, event.reason);
+    });
+    socket.addEventListener("error", () => {
+      handlers.error();
+    });
+  }
+
+  async getAlarm(): Promise<number | undefined> {
+    return (await this.state.storage.getAlarm()) ?? undefined;
+  }
+
+  take<T>(key: string): Promise<T | undefined> {
+    return this.state.storage.transaction(async (transaction) => {
+      const value = await transaction.get<T>(key);
+      if (value !== undefined) {
+        await transaction.delete(key);
+      }
+      return value;
+    });
+  }
+
+  async commitAndWake<T>(
+    callback: (transaction: CoordinatorStorageView) => Promise<T>,
+  ): Promise<T> {
+    return this.state.storage.transaction(async (transaction) => {
+      const currentAlarm = await transaction.getAlarm();
+      if ((await transaction.get(legacyAlarmKey)) === undefined) {
+        if (currentAlarm !== null) await transaction.put(legacyAlarmKey, currentAlarm);
+      }
+      const result = await callback(transaction);
+      const wake = await mergedCoordinatorWake(transaction);
+      if (wake === undefined) {
+        if (currentAlarm !== null) await transaction.deleteAlarm();
+      } else if (wake !== currentAlarm || wake <= Date.now()) {
+        // A retained due timestamp may outlive its consumed job; only future wakes are reusable.
+        await transaction.setAlarm(wake);
+      }
+      return result;
+    });
+  }
+
+  registerProvisioningTick(_tick: () => Promise<void>): void {
+    // Constructor recovery is storage-only; provider I/O belongs to a later alarm.
+    this.state.blockConcurrencyWhile(async () => {
+      await this.commitAndWake(async () => undefined);
+    });
+  }
+
+  ownMaintenance(operation: Promise<void>): void {
+    this.state.waitUntil(operation);
+  }
+
+  scheduleAlarm(time: number): Promise<void> {
+    return this.commitAndWake(async (transaction) => setLegacyWake(transaction, time));
+  }
+
+  clearAlarm(): Promise<void> {
+    return this.commitAndWake(async (transaction) => setLegacyWake(transaction));
+  }
+
+  private runSocketOperation<T>(
+    attachment: unknown,
+    message: unknown,
+    callback: () => Promise<T> | T,
+  ): Promise<T> {
+    const operation = async () => callback();
+    if (socketAttachmentKind(attachment) === "control" && !controlMessageOwnsTransaction(message)) {
+      return this.runExclusive(operation);
+    }
+    return operation();
+  }
+}
+
+function socketAttachmentKind(attachment: unknown): string | undefined {
+  if (!attachment || typeof attachment !== "object" || !("kind" in attachment)) {
+    return undefined;
+  }
+  return String(attachment.kind);
+}

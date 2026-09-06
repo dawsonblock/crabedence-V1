@@ -1,0 +1,147 @@
+//go:build linux
+
+package firecracker
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"os/exec"
+	"strings"
+
+	firesdk "github.com/firecracker-microvm/firecracker-go-sdk"
+	fcmodels "github.com/firecracker-microvm/firecracker-go-sdk/client/models"
+	"github.com/sirupsen/logrus"
+)
+
+type sdkMachineFactory struct {
+	LogWriter io.Writer
+}
+
+func firecrackerDrives(rootFSPath, cloudInitPath string) []fcmodels.Drive {
+	return []fcmodels.Drive{
+		{
+			DriveID:      firesdk.String("rootfs"),
+			PathOnHost:   firesdk.String(rootFSPath),
+			IsRootDevice: firesdk.Bool(true),
+			IsReadOnly:   firesdk.Bool(false),
+		},
+		{
+			DriveID:      firesdk.String("cidata"),
+			PathOnHost:   firesdk.String(cloudInitPath),
+			IsRootDevice: firesdk.Bool(false),
+			IsReadOnly:   firesdk.Bool(true),
+		},
+	}
+}
+
+func (f sdkMachineFactory) New(ctx context.Context, launch machineLaunchConfig) (machine, error) {
+	processCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	binary := strings.TrimSpace(launch.BinaryPath)
+	if binary == "" {
+		binary = "firecracker"
+	}
+	sdkConfig := firesdk.Config{
+		SocketPath:      launch.SocketPath,
+		LogPath:         launch.LogPath,
+		LogLevel:        "Info",
+		KernelImagePath: launch.KernelPath,
+		KernelArgs:      launch.KernelArgs,
+		Drives:          firecrackerDrives(launch.RootFSPath, launch.CloudInitPath),
+		NetworkInterfaces: firesdk.NetworkInterfaces{{
+			CNIConfiguration: &firesdk.CNIConfiguration{
+				NetworkName: launch.CNINetwork,
+				IfName:      firecrackerHostInterface,
+				VMIfName:    firecrackerGuestInterface,
+				BinPath:     []string{launch.CNIBinDir},
+				ConfDir:     launch.CNIConfDir,
+				CacheDir:    launch.CNICacheDir,
+				Force:       true,
+			},
+		}},
+		MachineCfg: fcmodels.MachineConfiguration{
+			VcpuCount:  firesdk.Int64(int64(launch.CPUs)),
+			MemSizeMib: firesdk.Int64(int64(launch.MemoryMiB)),
+			Smt:        firesdk.Bool(false),
+		},
+		VMID:  launch.VMID,
+		NetNS: launch.NetNSPath,
+	}
+	cmd := firesdk.VMCommandBuilder{}.
+		WithBin(binary).
+		WithSocketPath(sdkConfig.SocketPath).
+		Build(processCtx)
+
+	logger := logrus.New()
+	if f.LogWriter == nil {
+		logger.SetOutput(io.Discard)
+	} else {
+		logger.SetOutput(f.LogWriter)
+	}
+	logger.SetLevel(logrus.WarnLevel)
+
+	vm, err := firesdk.NewMachine(
+		processCtx,
+		sdkConfig,
+		firesdk.WithProcessRunner(cmd),
+		firesdk.WithLogger(logrus.NewEntry(logger)),
+	)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	return &sdkMachine{machine: vm, cmd: cmd, cancel: cancel, ctx: processCtx}, nil
+}
+
+type sdkMachine struct {
+	machine *firesdk.Machine
+	cmd     *exec.Cmd
+	cancel  context.CancelFunc
+	ctx     context.Context
+}
+
+func (m *sdkMachine) Start(ctx context.Context) error {
+	if m == nil || m.machine == nil {
+		return fmt.Errorf("firecracker machine is unavailable")
+	}
+	if m.ctx != nil {
+		ctx = m.ctx
+	}
+	return m.machine.Start(ctx)
+}
+
+func (m *sdkMachine) Cancel() {
+	if m == nil || m.cancel == nil {
+		return
+	}
+	m.cancel()
+}
+
+func (m *sdkMachine) StopVMM() error {
+	if m == nil || m.machine == nil {
+		return nil
+	}
+	return m.machine.StopVMM()
+}
+
+func (m *sdkMachine) PID() int {
+	if m == nil || m.cmd == nil || m.cmd.Process == nil {
+		return 0
+	}
+	return m.cmd.Process.Pid
+}
+
+func (m *sdkMachine) GuestIP() string {
+	if m == nil || m.machine == nil {
+		return ""
+	}
+	for _, iface := range m.machine.Cfg.NetworkInterfaces {
+		if iface.StaticConfiguration == nil || iface.StaticConfiguration.IPConfiguration == nil {
+			continue
+		}
+		if ip := iface.StaticConfiguration.IPConfiguration.IPAddr.IP.String(); strings.TrimSpace(ip) != "" {
+			return ip
+		}
+	}
+	return ""
+}

@@ -1,0 +1,181 @@
+import { randomBytes } from "node:crypto";
+
+import { describe, expect, it } from "vitest";
+
+import { leaseConfig } from "../src/config";
+import { GCPProvider } from "../src/fleet";
+import { GCPClient } from "../src/gcp";
+import type { Env, LeaseRecord } from "../src/types";
+
+const live = process.env.CRABBOX_GCP_RELEASE_LIVE === "1" ? describe : describe.skip;
+
+live("GCP release ownership live", () => {
+  it("creates, reads, denies a foreign claim, releases the owned instance, and leaves no disk", async () => {
+    const project = requiredEnv("CRABBOX_GCP_PROJECT");
+    const zone = process.env.CRABBOX_GCP_ZONE || "europe-west2-a";
+    const credentialSource = process.env.CRABBOX_GCP_CREDENTIAL_SOURCE?.trim();
+    const env: Env = {
+      FLEET: {} as DurableObjectNamespace,
+      CRABBOX_GCP_PROJECT: project,
+      CRABBOX_GCP_ZONE: zone,
+      CRABBOX_GCP_ROOT_GB: "10",
+    };
+    if (credentialSource) env.CRABBOX_GCP_CREDENTIAL_SOURCE = credentialSource;
+    if (credentialSource !== "metadata") {
+      env.GCP_CLIENT_EMAIL = requiredEnv("GCP_CLIENT_EMAIL");
+      env.GCP_PRIVATE_KEY = requiredEnv("GCP_PRIVATE_KEY");
+    }
+    const client = new GCPClient(env, zone, project);
+    const provider = new GCPProvider(env, undefined, zone, project);
+    const leaseID =
+      process.env.CRABBOX_GCP_RELEASE_LIVE_LEASE_ID || `cbx_${randomBytes(6).toString("hex")}`;
+    const slug = "live-gcp-release";
+    const owner = "live-test@example.com";
+    const config = leaseConfig({
+      provider: "gcp",
+      target: "linux",
+      class: "standard",
+      serverType: "e2-micro",
+      serverTypeExplicit: true,
+      gcpProject: project,
+      gcpZone: zone,
+      gcpRootGB: 10,
+      capacity: { market: "on-demand", fallback: "none" },
+      sshPublicKey: requiredEnv("LIVE_SSH_PUBLIC_KEY"),
+    });
+    let cloudID = "";
+    let ownedLease: LeaseRecord | undefined;
+    let denied = false;
+    let released = false;
+    let testFailed = false;
+    let testError: unknown;
+    try {
+      const machine = await client.createServer(config, leaseID, slug, owner);
+      cloudID = machine.cloudID;
+      const providerResourceID = exactProviderResourceID(
+        machine.providerResourceID,
+        "created machine",
+      );
+      const now = new Date().toISOString();
+      ownedLease = {
+        id: leaseID,
+        slug,
+        provider: "gcp",
+        target: "linux",
+        cloudID,
+        region: zone,
+        providerProject: project,
+        owner,
+        org: "live-proof",
+        profile: "default",
+        class: "standard",
+        serverType: "e2-micro",
+        serverID: 0,
+        providerResourceID,
+        serverName: cloudID,
+        providerKey: "",
+        host: machine.host,
+        sshUser: "crabbox",
+        sshPort: "22",
+        workRoot: "/workspace",
+        keep: false,
+        ttlSeconds: 900,
+        estimatedHourlyUSD: 0,
+        maxEstimatedUSD: 0,
+        state: "active",
+        createdAt: now,
+        updatedAt: now,
+        expiresAt: new Date(Date.now() + 900_000).toISOString(),
+      } satisfies LeaseRecord;
+
+      const readBack = await client.getServer(cloudID);
+      const readBackProviderResourceID = exactProviderResourceID(
+        readBack.providerResourceID,
+        "read-back machine",
+      );
+      expect(readBackProviderResourceID).toBe(providerResourceID);
+      expect(readBack.host).not.toBe("");
+      expect(readBack.labels).toMatchObject({ lease: leaseID, provider: "gcp" });
+
+      await expect(
+        provider.releaseLease({ ...ownedLease, owner: "foreign@example.com" }),
+      ).rejects.toThrow("ownership does not match");
+      denied = true;
+      const afterDenied = await client.getServer(cloudID);
+      expect(afterDenied.providerResourceID).toBe(providerResourceID);
+      expect(afterDenied.labels).toEqual(readBack.labels);
+
+      await provider.releaseLease(ownedLease);
+      released = true;
+      await expect(client.findServer(cloudID)).resolves.toBeUndefined();
+      const disks = await (
+        client as unknown as {
+          gcp<T>(method: string, path: string): Promise<T>;
+        }
+      ).gcp<{ items?: { name?: string }[] }>(
+        "GET",
+        `/zones/${zone}/disks?filter=${encodeURIComponent(`name = ${cloudID}`)}`,
+      );
+      expect(disks.items ?? []).toEqual([]);
+      console.log(JSON.stringify({ provider: "gcp", leaseID, denied, released, residue: 0 }));
+    } catch (error) {
+      testFailed = true;
+      testError = error;
+    }
+
+    let cleanupFailed = false;
+    let cleanupError: unknown;
+    if (!released && ownedLease) {
+      try {
+        await provider.releaseLease(ownedLease);
+      } catch (error) {
+        cleanupFailed = true;
+        cleanupError = error;
+        console.error(
+          JSON.stringify({
+            provider: "gcp",
+            leaseID,
+            cloudID: ownedLease.cloudID,
+            cleanup: "failed",
+            errorType: errorType(error),
+          }),
+        );
+      }
+    } else if (!released && !ownedLease) {
+      console.error(
+        JSON.stringify({
+          provider: "gcp",
+          leaseID,
+          cloudID: cloudID || undefined,
+          cleanup: "manual-required",
+          reason: "exact provider resource identity unavailable",
+        }),
+      );
+    }
+    if (testFailed && cleanupFailed) {
+      throw new AggregateError(
+        [testError, cleanupError],
+        "GCP release verification failed and exact cleanup also failed",
+      );
+    }
+    if (testFailed) throw testError;
+    if (cleanupFailed) throw cleanupError;
+  }, 600_000);
+});
+
+function exactProviderResourceID(value: string | undefined, source: string): string {
+  if (!value || !/^[0-9]+$/.test(value)) {
+    throw new Error(`${source} did not return an exact numeric GCP resource id`);
+  }
+  return value;
+}
+
+function errorType(error: unknown): string {
+  return error instanceof Error ? error.name : typeof error;
+}
+
+function requiredEnv(name: string): string {
+  const value = process.env[name]?.trim();
+  if (!value) throw new Error(`${name} is required`);
+  return value;
+}

@@ -1,0 +1,2571 @@
+package cli
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
+	"runtime"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"nhooyr.io/websocket"
+)
+
+func TestCoordinatorMachineIDAcceptsStringOrNumber(t *testing.T) {
+	for name, input := range map[string]string{
+		"string": `{"id":"i-123","labels":{}}`,
+		"number": `{"id":128694755,"labels":{}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var machine CoordinatorMachine
+			if err := json.Unmarshal([]byte(input), &machine); err != nil {
+				t.Fatal(err)
+			}
+			if machine.ID == "" {
+				t.Fatalf("machine ID was empty")
+			}
+		})
+	}
+}
+
+func TestSplitCurlResponseParsesTrailingStatus(t *testing.T) {
+	body, status, err := splitCurlResponse([]byte("{\"ok\":true}\n200"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != 200 {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if string(body) != `{"ok":true}` {
+		t.Fatalf("body = %q", body)
+	}
+}
+
+func TestDecodeCoordinatorResponseCanReadTextBody(t *testing.T) {
+	var buf bytes.Buffer
+	if err := decodeCoordinatorResponse("GET", "/v1/runs/run_1/logs", 200, strings.NewReader("hello"), &buf); err != nil {
+		t.Fatal(err)
+	}
+	if buf.String() != "hello" {
+		t.Fatalf("body=%q", buf.String())
+	}
+}
+
+func TestCoordinatorRunEvents(t *testing.T) {
+	var createBody map[string]any
+	var eventBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/runs":
+			if err := json.NewDecoder(r.Body).Decode(&createBody); err != nil {
+				t.Fatal(err)
+			}
+			_, _ = w.Write([]byte(`{"run":{"id":"run_123","leaseID":"","owner":"peter@example.com","org":"openclaw","provider":"aws","class":"standard","serverType":"t3.small","command":["pnpm","test"],"label":"smoke","state":"running","phase":"starting","logBytes":0,"logTruncated":false,"startedAt":"2026-05-02T00:00:00Z"}}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/runs/run_123/events":
+			if err := json.NewDecoder(r.Body).Decode(&eventBody); err != nil {
+				t.Fatal(err)
+			}
+			_, _ = w.Write([]byte(`{"event":{"runID":"run_123","seq":2,"type":"sync.started","phase":"sync","createdAt":"2026-05-02T00:00:01Z"}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/runs/run_123/events":
+			if got := r.URL.Query().Get("after"); got != "4" {
+				t.Fatalf("after query=%q", got)
+			}
+			if got := r.URL.Query().Get("limit"); got != "25" {
+				t.Fatalf("limit query=%q", got)
+			}
+			_, _ = w.Write([]byte(`{"events":[{"runID":"run_123","seq":1,"type":"run.started","phase":"starting","createdAt":"2026-05-02T00:00:00Z"}]}`))
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	client := CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
+	run, err := client.CreateRun(context.Background(), "", Config{
+		Provider:   "aws",
+		Class:      "standard",
+		ServerType: "t3.small",
+	}, []string{"pnpm", "test"}, "smoke")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.ID != "run_123" || run.Phase != "starting" {
+		t.Fatalf("run=%#v", run)
+	}
+	if got, ok := createBody["leaseID"].(string); !ok || got != "" {
+		t.Fatalf("leaseID body=%#v", createBody["leaseID"])
+	}
+	if got, ok := createBody["label"].(string); !ok || got != "smoke" {
+		t.Fatalf("label body=%#v", createBody["label"])
+	}
+	event, err := client.AppendRunEvent(context.Background(), run.ID, CoordinatorRunEventInput{Type: "sync.started", Phase: "sync"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if event.Type != "sync.started" || event.Seq != 2 {
+		t.Fatalf("event=%#v", event)
+	}
+	if got, ok := eventBody["type"].(string); !ok || got != "sync.started" {
+		t.Fatalf("event body=%#v", eventBody)
+	}
+	events, err := client.RunEvents(context.Background(), run.ID, 4, 25)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Type != "run.started" {
+		t.Fatalf("events=%#v", events)
+	}
+}
+
+func TestCoordinatorFinishRunSendsLogChunks(t *testing.T) {
+	var finishBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/runs/run_123/finish" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&finishBody); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = w.Write([]byte(`{"run":{"id":"run_123","leaseID":"","owner":"peter@example.com","org":"openclaw","provider":"aws","class":"standard","serverType":"t3.small","command":["pnpm","test"],"state":"failed","phase":"failed","exitCode":1,"logBytes":0,"logTruncated":false,"startedAt":"2026-05-02T00:00:00Z"}}`))
+	}))
+	defer server.Close()
+	client := CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
+	log := strings.Repeat("x", coordinatorRunLogChunkBytes) + "tail"
+	load := 0.42
+	if _, err := client.FinishRun(context.Background(), "run_123", 1, time.Second, 2*time.Second, log, false, nil, &RunTelemetrySummary{End: &LeaseTelemetry{Load1: &load}}, FailureClassification{BlockedStage: "unknown", RetryLikely: "unknown"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	chunks, ok := finishBody["logChunks"].([]any)
+	if !ok {
+		t.Fatalf("logChunks body=%#v", finishBody["logChunks"])
+	}
+	if len(chunks) != 2 {
+		t.Fatalf("logChunks=%d, want 2", len(chunks))
+	}
+	if got := chunks[0].(string); len(got) != coordinatorRunLogChunkBytes {
+		t.Fatalf("first chunk length=%d, want %d", len(got), coordinatorRunLogChunkBytes)
+	}
+	if got := chunks[1].(string); got != "tail" {
+		t.Fatalf("second chunk=%q, want tail", got)
+	}
+	if got := finishBody["log"].(string); len(got) != runLogFallbackPreviewBytes || !strings.HasSuffix(got, "tail") {
+		t.Fatalf("fallback log length=%d suffix=%q", len(got), got[len(got)-4:])
+	}
+	if got := finishBody["telemetry"].(map[string]any)["end"].(map[string]any)["load1"]; got != 0.42 {
+		t.Fatalf("telemetry=%#v", finishBody["telemetry"])
+	}
+	if finishBody["blockedStage"] != "unknown" || finishBody["retryLikely"] != "unknown" {
+		t.Fatalf("classification fields missing: %#v", finishBody)
+	}
+}
+
+func TestCoordinatorFinishRunSendsAndRetrievesTerminalReceipt(t *testing.T) {
+	setAttestTestHome(t)
+	startedAt := time.Date(2026, 8, 23, 10, 0, 0, 0, time.UTC)
+	receipt, err := buildTerminalRunReceipt("", terminalRunReceiptInput{
+		Provider:          "aws",
+		LeaseID:           "cbx_abc123",
+		Slug:              "blue-lobster",
+		RunID:             "run_123",
+		Command:           []string{"go", "test", "./..."},
+		CommandDisplay:    "go test ./...",
+		ExitCode:          1,
+		SyncMs:            100,
+		CommandMs:         1900,
+		StartedAt:         startedAt,
+		EndedAt:           startedAt.Add(2 * time.Second),
+		LogSHA256:         sha256Digest([]byte("failed\n")),
+		RetainedLogSHA256: sha256Digest([]byte("failed\n")),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var finishBody struct {
+		Receipt terminalRunReceipt `json:"receipt"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/runs/run_123/finish":
+			if err := json.NewDecoder(r.Body).Decode(&finishBody); err != nil {
+				t.Fatal(err)
+			}
+			_, _ = w.Write([]byte(`{"run":{"id":"run_123","leaseID":"cbx_abc123","owner":"peter@example.com","org":"example-org","provider":"aws","class":"standard","serverType":"t3.small","command":["go","test","./..."],"state":"failed","phase":"failed","exitCode":1,"logBytes":7,"logTruncated":false,"startedAt":"2026-08-23T10:00:00Z"}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/runs/run_123/receipt":
+			_ = json.NewEncoder(w).Encode(map[string]any{"receipt": receipt})
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client := CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
+	if _, err := client.FinishRun(context.Background(), "run_123", 1, 100*time.Millisecond, 1900*time.Millisecond, "failed\n", false, nil, nil, FailureClassification{}, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	if finishBody.Receipt.Signature != receipt.Signature {
+		t.Fatalf("finish receipt signature=%q", finishBody.Receipt.Signature)
+	}
+	recovered, err := client.RunReceipt(context.Background(), "run_123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.RunID != "run_123" || recovered.ExitCode != 1 {
+		t.Fatalf("recovered receipt=%#v", recovered)
+	}
+}
+
+func TestCoordinatorRunReceiptRejectsMalformedAndOversizedEvidence(t *testing.T) {
+	tests := map[string]any{
+		"unknown field": map[string]any{
+			"schema_version": terminalReceiptSchemaVersion,
+			"unexpected":     true,
+		},
+		"oversized": map[string]any{
+			"schema_version": terminalReceiptSchemaVersion,
+			"command":        strings.Repeat("x", maxTerminalReceiptBytes),
+		},
+	}
+	for name, receipt := range tests {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"receipt": receipt})
+			}))
+			defer server.Close()
+			client := CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
+			if _, err := client.RunReceipt(context.Background(), "run_123"); err == nil ||
+				!strings.Contains(err.Error(), "invalid terminal receipt") {
+				t.Fatalf("RunReceipt error=%v", err)
+			}
+		})
+	}
+}
+
+func TestCurlConfigKeepsBearerTokenInConfig(t *testing.T) {
+	client := CoordinatorClient{
+		BaseURL: "https://example.test",
+		Token:   "secret-token",
+		Access: AccessConfig{
+			ClientID:     "access-client",
+			ClientSecret: "access-secret",
+			Token:        "access-jwt",
+		},
+	}
+	config, cleanup, err := client.curlConfig(context.Background(), "POST", "/v1/leases", []byte(`{"leaseID":"cbx"}`), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+
+	for _, want := range []string{
+		`url = "https://example.test/v1/leases"`,
+		`request = "POST"`,
+		`header = "Authorization: Bearer secret-token"`,
+		`header = "CF-Access-Client-Id: access-client"`,
+		`header = "CF-Access-Client-Secret: access-secret"`,
+		`header = "cf-access-token: access-jwt"`,
+		`header = "Content-Type: application/json"`,
+		`data-binary = "@`,
+	} {
+		if !strings.Contains(config, want) {
+			t.Fatalf("config missing %q:\n%s", want, config)
+		}
+	}
+	for _, line := range strings.Split(config, "\n") {
+		if strings.TrimSpace(line) == "location" {
+			t.Fatalf("credentialed curl config follows redirects:\n%s", config)
+		}
+	}
+	bodyPath := curlConfigValueForTest(t, config, "data-binary")
+	bodyPath = strings.TrimPrefix(bodyPath, "@")
+	if _, err := os.Stat(bodyPath); err != nil {
+		t.Fatalf("body file missing: %v", err)
+	}
+}
+
+func TestCoordinatorHTTPRejectsCrossOriginRedirect(t *testing.T) {
+	var redirected atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		redirected.Add(1)
+	}))
+	defer target.Close()
+
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer broker-token" {
+			t.Errorf("Authorization=%q", got)
+		}
+		if got := r.Header.Get("CF-Access-Client-Secret"); got != "access-secret" {
+			t.Errorf("CF-Access-Client-Secret=%q", got)
+		}
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	defer source.Close()
+
+	client := CoordinatorClient{
+		BaseURL: source.URL,
+		Token:   "broker-token",
+		Access: AccessConfig{
+			ClientID:     "access-client",
+			ClientSecret: "access-secret",
+			Token:        "access-jwt",
+		},
+		Client: source.Client(),
+	}
+	err := client.doHTTP(context.Background(), http.MethodGet, "/v1/health", nil, false, nil)
+	if err == nil || !strings.Contains(err.Error(), "refused cross-origin redirect") {
+		t.Fatalf("error=%v, want cross-origin redirect rejection", err)
+	}
+	if got := redirected.Load(); got != 0 {
+		t.Fatalf("redirect target received %d requests", got)
+	}
+}
+
+func TestCoordinatorHTTPAllowsSameOriginRedirect(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/redirect" {
+			http.Redirect(w, r, "/v1/health", http.StatusFound)
+			return
+		}
+		if r.URL.Path != "/v1/health" {
+			t.Fatalf("path=%q", r.URL.Path)
+		}
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer server.Close()
+
+	client := CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
+	var response map[string]any
+	if err := client.doHTTP(context.Background(), http.MethodGet, "/redirect", nil, false, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response["ok"] != true {
+		t.Fatalf("response=%v", response)
+	}
+}
+
+func TestCoordinatorCurlFallbackDoesNotFollowRedirect(t *testing.T) {
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skip("curl is unavailable")
+	}
+	curlHome := t.TempDir()
+	if err := os.WriteFile(filepath.Join(curlHome, ".curlrc"), []byte("location\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CURL_HOME", curlHome)
+	t.Setenv("HOME", curlHome)
+	var redirected atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		redirected.Add(1)
+	}))
+	defer target.Close()
+
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer broker-token" {
+			t.Errorf("Authorization=%q", got)
+		}
+		if got := r.Header.Get("CF-Access-Client-Secret"); got != "access-secret" {
+			t.Errorf("CF-Access-Client-Secret=%q", got)
+		}
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	defer source.Close()
+
+	client := CoordinatorClient{
+		BaseURL: source.URL,
+		Token:   "broker-token",
+		Access: AccessConfig{
+			ClientID:     "access-client",
+			ClientSecret: "access-secret",
+			Token:        "access-jwt",
+		},
+		Client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, errors.New("forced transport failure")
+		})},
+	}
+	err := client.Health(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "forced transport failure") || !strings.Contains(err.Error(), "curl fallback failed: coordinator GET /v1/health: http 302") {
+		t.Fatalf("error=%v, want transport and curl HTTP 302 errors", err)
+	}
+	if got := redirected.Load(); got != 0 {
+		t.Fatalf("redirect target received %d requests", got)
+	}
+}
+
+func TestCoordinatorHTTPAddsAccessHeaders(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer broker-token" {
+			t.Fatalf("Authorization=%q", got)
+		}
+		if got := r.Header.Get("CF-Access-Client-Id"); got != "access-client" {
+			t.Fatalf("CF-Access-Client-Id=%q", got)
+		}
+		if got := r.Header.Get("CF-Access-Client-Secret"); got != "access-secret" {
+			t.Fatalf("CF-Access-Client-Secret=%q", got)
+		}
+		if got := r.Header.Get("cf-access-token"); got != "access-jwt" {
+			t.Fatalf("cf-access-token=%q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+	client := CoordinatorClient{
+		BaseURL: server.URL,
+		Token:   "broker-token",
+		Access: AccessConfig{
+			ClientID:     "access-client",
+			ClientSecret: "access-secret",
+			Token:        "access-jwt",
+		},
+		Client: server.Client(),
+	}
+	if err := client.Health(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCoordinatorTokenCommandRefreshesBearer(t *testing.T) {
+	t.Setenv("CRABBOX_TOKEN_HELPER", "1")
+	t.Setenv("CRABBOX_TOKEN_HELPER_VALUE", "first-token")
+	var authorizations []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorizations = append(authorizations, r.Header.Get("Authorization"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+	client := CoordinatorClient{
+		BaseURL:      server.URL,
+		TokenCommand: synchronousTestHelperCommand("TestCoordinatorTokenCommandHelper"),
+		Client:       server.Client(),
+	}
+
+	if err := client.Health(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CRABBOX_TOKEN_HELPER_VALUE", "second-token")
+	if err := client.Health(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(authorizations, []string{"Bearer first-token", "Bearer second-token"}) {
+		t.Fatalf("Authorization headers=%q", authorizations)
+	}
+}
+
+func TestCoordinatorChildrenScrubExternalDesktopPassword(t *testing.T) {
+	t.Setenv("CRABBOX_TOKEN_HELPER", "1")
+	t.Setenv("CRABBOX_TOKEN_HELPER_VALUE", "scrubbed-token")
+	t.Setenv("CRABBOX_TOKEN_HELPER_ASSERT_SCRUB", "1")
+	t.Setenv("TEST_ARD_PASSWORD", "must-not-reach-coordinator-child")
+	t.Setenv("CRABBOX_TEST_KEEP", "preserved")
+	cfg := Config{
+		Coordinator:       "https://broker.example.test",
+		CoordTokenCommand: synchronousTestHelperCommand("TestCoordinatorTokenCommandHelper"),
+		Provider:          "external",
+		TargetOS:          targetMacOS,
+	}
+	cfg.External.Connection.Desktop.PasswordEnv = "TEST_ARD_PASSWORD"
+	client, configured, err := newCoordinatorClient(cfg)
+	if err != nil || !configured {
+		t.Fatalf("new coordinator client configured=%t err=%v", configured, err)
+	}
+	if token, err := client.authorizationToken(context.Background()); err != nil || token != "scrubbed-token" {
+		t.Fatalf("token=%q err=%v", token, err)
+	}
+	if runtime.GOOS == "windows" {
+		return
+	}
+	dir := t.TempDir()
+	curlPath := filepath.Join(dir, "curl")
+	curlScript := "#!/bin/sh\nif [ \"${TEST_ARD_PASSWORD+x}\" = x ] || [ \"$CRABBOX_TEST_KEEP\" != preserved ]; then exit 89; fi\ncat >/dev/null\nprintf '{\"ok\":true}\\n200'\n"
+	if err := os.WriteFile(curlPath, []byte(curlScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	client.TokenCommand = nil
+	client.Token = "static-token"
+	var response map[string]any
+	if err := client.doCurl(context.Background(), http.MethodGet, "/v1/health", nil, false, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response["ok"] != true {
+		t.Fatalf("curl response=%v", response)
+	}
+}
+
+func TestCoordinatorOwnerGitScrubsExternalDesktopPassword(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell git fixture")
+	}
+	dir := t.TempDir()
+	gitPath := filepath.Join(dir, "git")
+	script := "#!/bin/sh\nif [ \"${TEST_ARD_PASSWORD+x}\" = x ] || [ \"${CRABBOX_TEST_KEEP+x}\" = x ] || [ \"$GIT_CEILING_DIRECTORIES\" != /safe/root ] || [ \"${GIT_DENIED_ROUTING+x}\" = x ]; then exit 89; fi\nprintf owner@example.test\n"
+	if err := os.WriteFile(gitPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("CRABBOX_OWNER", "")
+	t.Setenv("GIT_AUTHOR_EMAIL", "")
+	t.Setenv("GIT_COMMITTER_EMAIL", "")
+	t.Setenv("TEST_ARD_PASSWORD", "must-not-reach-git")
+	t.Setenv("CRABBOX_TEST_KEEP", "preserved")
+	t.Setenv("GIT_CEILING_DIRECTORIES", "/safe/root")
+	t.Setenv("GIT_DENIED_ROUTING", "remove-me")
+	client := CoordinatorClient{ChildEnvDenylist: []string{"TEST_ARD_PASSWORD", "GIT_DENIED_ROUTING"}}
+	if got := client.localCoordinatorOwner(context.Background()); got != "owner@example.test" {
+		t.Fatalf("owner=%q", got)
+	}
+}
+
+func TestLocalCoordinatorOwnerGitUsesRepositoryEnvironmentWithoutDenylist(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell git fixture")
+	}
+	dir := t.TempDir()
+	gitPath := filepath.Join(dir, "git")
+	script := "#!/bin/sh\nif [ \"${TEST_ARD_PASSWORD+x}\" = x ] || [ \"${CRABBOX_TEST_KEEP+x}\" = x ] || [ \"$GIT_CEILING_DIRECTORIES\" != /safe/root ]; then exit 89; fi\nprintf owner@example.test\n"
+	if err := os.WriteFile(gitPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("CRABBOX_OWNER", "")
+	t.Setenv("GIT_AUTHOR_EMAIL", "")
+	t.Setenv("GIT_COMMITTER_EMAIL", "")
+	t.Setenv("TEST_ARD_PASSWORD", "must-not-reach-git")
+	t.Setenv("CRABBOX_TEST_KEEP", "must-not-reach-git")
+	t.Setenv("GIT_CEILING_DIRECTORIES", "/safe/root")
+	if got := localCoordinatorOwnerWithEnvironment(context.Background(), nil); got != "owner@example.test" {
+		t.Fatalf("owner=%q", got)
+	}
+}
+
+func TestCoordinatorConfiguredAuthRecognizesTokenCommand(t *testing.T) {
+	for name, client := range map[string]*CoordinatorClient{
+		"nil":           nil,
+		"empty":         {},
+		"static token":  {Token: "token"},
+		"token command": {TokenCommand: []string{"token-helper"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			want := name == "static token" || name == "token command"
+			if got := client.hasConfiguredAuth(); got != want {
+				t.Fatalf("hasConfiguredAuth()=%t want %t", got, want)
+			}
+		})
+	}
+}
+
+func TestCoordinatorTokenCommandRejectsMultipleLines(t *testing.T) {
+	t.Setenv("CRABBOX_TOKEN_HELPER", "1")
+	t.Setenv("CRABBOX_TOKEN_HELPER_VALUE", "first\nsecond")
+	client := CoordinatorClient{
+		TokenCommand: synchronousTestHelperCommand("TestCoordinatorTokenCommandHelper"),
+	}
+	if _, err := client.authorizationToken(context.Background()); err == nil || !strings.Contains(err.Error(), "exactly one token line") {
+		t.Fatalf("error=%v, want one-line validation", err)
+	}
+}
+
+func TestCoordinatorTokenCommandHelper(t *testing.T) {
+	if os.Getenv("CRABBOX_TOKEN_HELPER") != "1" {
+		return
+	}
+	if delay, err := time.ParseDuration(os.Getenv("CRABBOX_TOKEN_HELPER_DELAY")); err == nil {
+		time.Sleep(delay)
+	}
+	if os.Getenv("CRABBOX_TOKEN_HELPER_ASSERT_SCRUB") == "1" {
+		if _, present := os.LookupEnv("TEST_ARD_PASSWORD"); present || os.Getenv("CRABBOX_TEST_KEEP") != "preserved" {
+			os.Exit(89)
+		}
+	}
+	_, _ = fmt.Fprintln(os.Stdout, os.Getenv("CRABBOX_TOKEN_HELPER_VALUE"))
+	os.Exit(0)
+}
+
+func TestCoordinatorAdminLeaseAudit(t *testing.T) {
+	var gotQuery url.Values
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/admin/lease-audit" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		gotQuery = r.URL.Query()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"audits":[{"leaseID":"cbx_123","provider":"aws","state":"expired","target":"linux","owner":"alice@example.com","org":"example-org","cloudID":"i-123","cloudStatus":"found","cloudState":"running"}]}`))
+	}))
+	defer server.Close()
+	client := CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
+	audits, err := client.AdminLeaseAudit(context.Background(), "expired", "aws", "alice@example.com", "example-org", 25)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotQuery.Get("state") != "expired" || gotQuery.Get("provider") != "aws" || gotQuery.Get("owner") != "alice@example.com" || gotQuery.Get("org") != "example-org" || gotQuery.Get("limit") != "25" {
+		t.Fatalf("query=%v", gotQuery)
+	}
+	if len(audits) != 1 || audits[0].LeaseID != "cbx_123" || audits[0].CloudStatus != "found" {
+		t.Fatalf("audits=%#v", audits)
+	}
+}
+
+func TestCoordinatorAdminMacHosts(t *testing.T) {
+	var allocateBody map[string]string
+	var dryRunBody map[string]any
+	var seen []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.Method+" "+r.URL.String())
+		if strings.HasPrefix(r.URL.Path, "/v1/admin/hosts") {
+			if got := r.URL.Query().Get("provider"); got != "aws" {
+				t.Fatalf("provider query=%q", got)
+			}
+			if got := r.URL.Query().Get("target"); got != "macos" {
+				t.Fatalf("target query=%q", got)
+			}
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/admin/hosts":
+			if got := r.URL.Query().Get("region"); got != "eu-west-1" {
+				t.Fatalf("region query=%q", got)
+			}
+			if got := r.URL.Query().Get("type"); got != "mac2.metal" {
+				t.Fatalf("type query=%q", got)
+			}
+			if got := r.URL.Query().Get("state"); got != "available" {
+				t.Fatalf("state query=%q", got)
+			}
+			_, _ = w.Write([]byte(`{"hosts":[{"id":"h-000000000001","state":"available","region":"eu-west-1","availabilityZone":"eu-west-1a","instanceType":"mac2.metal","autoPlacement":"off"}]}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/admin/hosts/offerings":
+			if got := r.URL.Query().Get("region"); got != "eu-west-1" {
+				t.Fatalf("offerings region query=%q", got)
+			}
+			if got := r.URL.Query().Get("type"); got != "mac2.metal" {
+				t.Fatalf("offerings type query=%q", got)
+			}
+			_, _ = w.Write([]byte(`{"offerings":[{"region":"eu-west-1","availabilityZone":"eu-west-1a","instanceType":"mac2.metal"}]}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/admin/hosts/quota":
+			if got := r.URL.Query().Get("region"); got != "eu-west-1" {
+				t.Fatalf("quota region query=%q", got)
+			}
+			if got := r.URL.Query().Get("type"); got != "mac2.metal" {
+				t.Fatalf("quota type query=%q", got)
+			}
+			_, _ = w.Write([]byte(`{"quotas":[{"serviceCode":"ec2","quotaCode":"L-MAC2","quotaName":"Running Dedicated mac2 Hosts","value":1,"adjustable":true,"unit":"None"}]}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/admin/hosts/dry-run":
+			if got := r.URL.Query().Get("region"); got != "eu-west-1" {
+				t.Fatalf("dry-run region query=%q", got)
+			}
+			if err := json.NewDecoder(r.Body).Decode(&dryRunBody); err != nil {
+				t.Fatal(err)
+			}
+			_, _ = w.Write([]byte(`{"checks":[{"region":"eu-west-1","availabilityZone":"eu-west-1a","instanceType":"mac2.metal","ok":true,"message":"dry run accepted"}]}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/admin/hosts":
+			if got := r.URL.Query().Get("region"); got != "eu-west-1" {
+				t.Fatalf("allocate region query=%q", got)
+			}
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			allocateBody = mapStringString(body)
+			_, _ = w.Write([]byte(`{"hosts":[{"id":"h-000000000002","state":"available","region":"eu-west-1","availabilityZone":"eu-west-1b","instanceType":"mac1.metal","autoPlacement":"off"}]}`))
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/admin/hosts/h-000000000002":
+			if got := r.URL.Query().Get("region"); got != "eu-west-1" {
+				t.Fatalf("release region query=%q", got)
+			}
+			_, _ = w.Write([]byte(`{"released":["h-000000000002"]}`))
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+	client := &CoordinatorClient{BaseURL: server.URL, Token: "admin-token", Client: server.Client()}
+
+	hosts, err := client.AdminMacHosts(context.Background(), "eu-west-1", "mac2.metal", "available")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hosts) != 1 || hosts[0].ID != "h-000000000001" || hosts[0].InstanceType != "mac2.metal" {
+		t.Fatalf("hosts=%#v", hosts)
+	}
+	offerings, err := client.AdminMacHostOfferings(context.Background(), "eu-west-1", "mac2.metal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(offerings) != 1 || offerings[0].AvailabilityZone != "eu-west-1a" {
+		t.Fatalf("offerings=%#v", offerings)
+	}
+	quotas, err := client.AdminMacHostQuotas(context.Background(), "eu-west-1", "mac2.metal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(quotas) != 1 || quotas[0].QuotaName != "Running Dedicated mac2 Hosts" || quotas[0].Value != 1 {
+		t.Fatalf("quotas=%#v", quotas)
+	}
+	checks, err := client.AdminDryRunAllocateMacHost(context.Background(), "eu-west-1", "mac2.metal", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dryRunBody["type"] != "mac2.metal" || dryRunBody["dryRun"] != nil {
+		t.Fatalf("dryRunBody=%#v", dryRunBody)
+	}
+	if len(checks) != 1 || !checks[0].OK || checks[0].AvailabilityZone != "eu-west-1a" {
+		t.Fatalf("checks=%#v", checks)
+	}
+	allocated, err := client.AdminAllocateMacHost(context.Background(), "eu-west-1", "mac1.metal", "eu-west-1b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if allocateBody["type"] != "mac1.metal" || allocateBody["availabilityZone"] != "eu-west-1b" {
+		t.Fatalf("allocateBody=%#v", allocateBody)
+	}
+	if len(allocated) != 1 || allocated[0].ID != "h-000000000002" {
+		t.Fatalf("allocated=%#v", allocated)
+	}
+	released, err := client.AdminReleaseMacHost(context.Background(), "eu-west-1", "h-000000000002")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(released, []string{"h-000000000002"}) {
+		t.Fatalf("released=%#v", released)
+	}
+	if len(seen) != 6 {
+		t.Fatalf("seen=%#v", seen)
+	}
+}
+
+func TestCoordinatorAdminAWSIdentity(t *testing.T) {
+	var seen string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = r.Method + " " + r.URL.String()
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/admin/providers/identity" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.String())
+		}
+		if got := r.URL.Query().Get("provider"); got != "aws" {
+			t.Fatalf("provider query=%q", got)
+		}
+		if got := r.URL.Query().Get("region"); got != "eu-west-1" {
+			t.Fatalf("region query=%q", got)
+		}
+		_, _ = w.Write([]byte(`{"identity":{"account":"123456789012","arn":"arn:aws:iam::123456789012:user/crabbox","userId":"AIDAEXAMPLE","region":"eu-west-1","policyTarget":{"type":"user","name":"crabbox","source":"iam-user"}}}`))
+	}))
+	defer server.Close()
+	client := &CoordinatorClient{BaseURL: server.URL, Token: "admin-token", Client: server.Client()}
+
+	identity, err := client.AdminAWSIdentity(context.Background(), "eu-west-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if identity.Account != "123456789012" || identity.UserID != "AIDAEXAMPLE" || identity.Region != "eu-west-1" {
+		t.Fatalf("identity=%#v", identity)
+	}
+	if identity.PolicyTarget == nil || identity.PolicyTarget.Type != "user" || identity.PolicyTarget.Name != "crabbox" {
+		t.Fatalf("policyTarget=%#v", identity.PolicyTarget)
+	}
+	if seen != "GET /v1/admin/providers/identity?provider=aws&region=eu-west-1" {
+		t.Fatalf("seen=%q", seen)
+	}
+}
+
+func TestCoordinatorAdminAWSIdentityFallsBackToLegacyRoute(t *testing.T) {
+	var seen []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.Method+" "+r.URL.String())
+		if r.URL.Path == "/v1/admin/providers/identity" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/admin/aws-identity" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.String())
+		}
+		_, _ = w.Write([]byte(`{"identity":{"account":"123456789012","arn":"arn:aws:iam::123456789012:user/crabbox","userId":"AIDAEXAMPLE","region":"eu-west-1"}}`))
+	}))
+	defer server.Close()
+	client := &CoordinatorClient{BaseURL: server.URL, Token: "admin-token", Client: server.Client()}
+
+	identity, err := client.AdminAWSIdentity(context.Background(), "eu-west-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if identity.Account != "123456789012" {
+		t.Fatalf("identity=%#v", identity)
+	}
+	if !reflect.DeepEqual(seen, []string{
+		"GET /v1/admin/providers/identity?provider=aws&region=eu-west-1",
+		"GET /v1/admin/aws-identity?region=eu-west-1",
+	}) {
+		t.Fatalf("seen=%#v", seen)
+	}
+}
+
+func TestCoordinatorLegacyFallbackKeepsNeutralNotFoundContext(t *testing.T) {
+	var seen []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.Method+" "+r.URL.String())
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	client := &CoordinatorClient{BaseURL: server.URL, Token: "admin-token", Client: server.Client()}
+
+	_, err := client.AdminAWSIdentity(context.Background(), "eu-west-1")
+	if err == nil {
+		t.Fatal("expected not found error")
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"/v1/admin/providers/identity?provider=aws&region=eu-west-1",
+		"legacy compatibility route /v1/admin/aws-identity?region=eu-west-1 also returned 404",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("error missing %q:\n%s", want, msg)
+		}
+	}
+	if !reflect.DeepEqual(seen, []string{
+		"GET /v1/admin/providers/identity?provider=aws&region=eu-west-1",
+		"GET /v1/admin/aws-identity?region=eu-west-1",
+	}) {
+		t.Fatalf("seen=%#v", seen)
+	}
+}
+
+func TestCoordinatorHostLegacyFallbackKeepsNeutralNotFoundContext(t *testing.T) {
+	var seen []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.Method+" "+r.URL.String())
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	client := &CoordinatorClient{BaseURL: server.URL, Token: "admin-token", Client: server.Client()}
+
+	_, err := client.AdminMacHostOfferings(context.Background(), "eu-west-1", "mac2.metal")
+	if err == nil {
+		t.Fatal("expected not found error")
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"/v1/admin/hosts/offerings?provider=aws&region=eu-west-1&target=macos&type=mac2.metal",
+		"legacy compatibility route /v1/admin/mac-hosts/offerings?region=eu-west-1&type=mac2.metal also returned 404",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("error missing %q:\n%s", want, msg)
+		}
+	}
+	if !reflect.DeepEqual(seen, []string{
+		"GET /v1/admin/hosts/offerings?provider=aws&region=eu-west-1&target=macos&type=mac2.metal",
+		"GET /v1/admin/mac-hosts/offerings?region=eu-west-1&type=mac2.metal",
+	}) {
+		t.Fatalf("seen=%#v", seen)
+	}
+}
+
+func mapStringString(input map[string]any) map[string]string {
+	out := map[string]string{}
+	for key, value := range input {
+		if text, ok := value.(string); ok {
+			out[key] = text
+		}
+	}
+	return out
+}
+
+func TestHeartbeatRequestBodyOmitsIdleTimeoutForTouch(t *testing.T) {
+	if body := heartbeatRequestBody("", nil, nil); len(body) != 0 {
+		t.Fatalf("touch heartbeat body=%v, want empty", body)
+	}
+	idleTimeout := 45 * time.Minute
+	body := heartbeatRequestBody("aws", &idleTimeout, nil)
+	if body["idleTimeoutSeconds"] != 2700 {
+		t.Fatalf("heartbeat body=%v, want idle timeout seconds", body)
+	}
+	load := 0.42
+	if body["expectedProvider"] != "aws" {
+		t.Fatalf("heartbeat body=%v, want expected provider", body)
+	}
+	body = heartbeatRequestBody("aws", nil, &LeaseTelemetry{Load1: &load})
+	if body["telemetry"] == nil {
+		t.Fatalf("heartbeat body=%v, want telemetry", body)
+	}
+}
+
+func TestCoordinatorTouchAndUpdateHeartbeatBodies(t *testing.T) {
+	var bodies []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/leases/cbx_123/heartbeat" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		data, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(data))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"lease":{"id":"cbx_123","provider":"aws","state":"active","expiresAt":"2026-05-01T00:30:00Z"}}`))
+	}))
+	defer server.Close()
+	client := CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
+	if _, err := client.TouchLeaseForProvider(context.Background(), "cbx_123", "google-cloud"); err != nil {
+		t.Fatal(err)
+	}
+	load := 0.42
+	if _, err := client.TouchLeaseWithTelemetryForProvider(context.Background(), "cbx_123", "google", &LeaseTelemetry{Load1: &load}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.UpdateLeaseIdleTimeoutForProvider(context.Background(), "cbx_123", "google-cloud", 45*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if len(bodies) != 3 || !strings.Contains(bodies[0], `"expectedProvider":"gcp"`) || !strings.Contains(bodies[1], `"expectedProvider":"gcp"`) || !strings.Contains(bodies[1], `"load1":0.42`) || !strings.Contains(bodies[2], `"expectedProvider":"gcp"`) || !strings.Contains(bodies[2], `"idleTimeoutSeconds":2700`) {
+		t.Fatalf("heartbeat bodies=%q", bodies)
+	}
+}
+
+func TestCoordinatorTailscaleUpdateIncludesExpectedProvider(t *testing.T) {
+	var body map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/leases/cbx_123/tailscale" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"lease": CoordinatorLease{
+			ID: "cbx_123", Provider: "aws", State: "active",
+		}})
+	}))
+	defer server.Close()
+	client := CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
+	if _, err := client.UpdateLeaseTailscaleForProvider(context.Background(), "cbx_123", "google-cloud", TailscaleMetadata{
+		Enabled: true, IPv4: "100.64.0.10",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if body["expectedProvider"] != "gcp" || body["ipv4"] != "100.64.0.10" {
+		t.Fatalf("tailscale body=%#v", body)
+	}
+}
+
+func TestCoordinatorMutationTransportsCanonicalizeProviderAliasesAndRejectInvalid(t *testing.T) {
+	tests := []struct {
+		name   string
+		path   string
+		invoke func(context.Context, *CoordinatorClient, string) error
+	}{
+		{
+			name: "release", path: "/v1/leases/cbx_123/release",
+			invoke: func(ctx context.Context, client *CoordinatorClient, provider string) error {
+				_, err := client.ReleaseLeaseForProvider(ctx, "cbx_123", true, provider)
+				return err
+			},
+		},
+		{
+			name: "admin release", path: "/v1/admin/leases/cbx_123/release",
+			invoke: func(ctx context.Context, client *CoordinatorClient, provider string) error {
+				_, err := client.AdminReleaseLeaseForProvider(ctx, "cbx_123", true, provider)
+				return err
+			},
+		},
+		{
+			name: "runtime adapter completion", path: "/v1/leases/cbx_123/release",
+			invoke: func(ctx context.Context, client *CoordinatorClient, provider string) error {
+				_, err := client.CompleteRuntimeAdapterDeleteForProvider(ctx, "cbx_123", provider, "adapter", "workspace", "registration")
+				return err
+			},
+		},
+		{
+			name: "legacy runtime adapter completion", path: "/v1/leases/cbx_123/release",
+			invoke: func(ctx context.Context, client *CoordinatorClient, provider string) error {
+				_, err := client.CompleteLegacyRuntimeAdapterDeleteForProvider(ctx, "cbx_123", provider, "adapter", "workspace")
+				return err
+			},
+		},
+		{
+			name: "heartbeat", path: "/v1/leases/cbx_123/heartbeat",
+			invoke: func(ctx context.Context, client *CoordinatorClient, provider string) error {
+				_, err := client.TouchLeaseForProvider(ctx, "cbx_123", provider)
+				return err
+			},
+		},
+		{
+			name: "tailscale", path: "/v1/leases/cbx_123/tailscale",
+			invoke: func(ctx context.Context, client *CoordinatorClient, provider string) error {
+				_, err := client.UpdateLeaseTailscaleForProvider(ctx, "cbx_123", provider, TailscaleMetadata{Enabled: true})
+				return err
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			requests := 0
+			var body map[string]any
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests++
+				if r.Method != http.MethodPost || r.URL.Path != test.path {
+					t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"lease": CoordinatorLease{ID: "cbx_123", Provider: "gcp"}})
+			}))
+			defer server.Close()
+			client := &CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
+
+			if err := test.invoke(context.Background(), client, "google-cloud"); err != nil {
+				t.Fatal(err)
+			}
+			if requests != 1 || body["expectedProvider"] != "gcp" {
+				t.Fatalf("requests=%d body=%#v", requests, body)
+			}
+			if err := test.invoke(context.Background(), client, "future-cloud"); err == nil {
+				t.Fatal("invalid provider was accepted")
+			}
+			if requests != 1 {
+				t.Fatalf("invalid provider sent request; requests=%d", requests)
+			}
+		})
+	}
+}
+
+func TestCoordinatorHeartbeatRejectsInvalidProviderBeforeStarting(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		requests++
+	}))
+	defer server.Close()
+	client := &CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
+	stop, err := startCoordinatorHeartbeat(context.Background(), client, "cbx_123", "future-cloud", 30*time.Minute, nil, nil, io.Discard)
+	if err == nil || stop != nil {
+		t.Fatalf("stop_present=%t error=%v, want invalid provider rejection", stop != nil, err)
+	}
+	if requests != 0 {
+		t.Fatalf("invalid provider sent %d request(s)", requests)
+	}
+}
+
+func TestCoordinatorAppendRunTelemetry(t *testing.T) {
+	var body string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/runs/run_123/telemetry" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		data, _ := io.ReadAll(r.Body)
+		body = string(data)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"run":{"id":"run_123","leaseID":"cbx_123","owner":"peter@example.com","org":"openclaw","provider":"aws","class":"standard","serverType":"t3.small","command":["sleep","60"],"state":"running","logBytes":0,"logTruncated":false,"startedAt":"2026-05-02T00:00:00Z"}}`))
+	}))
+	defer server.Close()
+	client := CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
+	load := 0.42
+	if _, err := client.AppendRunTelemetry(context.Background(), "run_123", &LeaseTelemetry{Load1: &load}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(body, `"telemetry"`) || !strings.Contains(body, `"load1":0.42`) {
+		t.Fatalf("append telemetry body=%q", body)
+	}
+}
+
+func TestCoordinatorHeartbeatTouchesImmediately(t *testing.T) {
+	touches := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/control" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.URL.Path != "/v1/leases/cbx_123/heartbeat" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		touches <- struct{}{}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"lease":{"id":"cbx_123","provider":"aws","state":"active","expiresAt":"2026-05-01T00:30:00Z"}}`))
+	}))
+	defer server.Close()
+
+	client := CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
+	stop, err := startCoordinatorHeartbeat(context.Background(), &client, "cbx_123", "aws", 30*time.Minute, nil, nil, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+
+	select {
+	case <-touches:
+	case <-time.After(2 * time.Second):
+		t.Fatal("heartbeat did not touch immediately")
+	}
+}
+
+func TestReadyPoolBorrowHeartbeatTouchesImmediately(t *testing.T) {
+	heartbeats := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/ready-pools/shared-linux/heartbeat" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		body, _ := io.ReadAll(r.Body)
+		heartbeats <- string(body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"entry":{"key":"shared-linux","leaseID":"cbx_123","state":"busy","owner":"alice@example.com","org":"example-org","createdAt":"2026-05-01T00:00:00Z","updatedAt":"2026-05-01T00:00:00Z","expiresAt":"2026-05-01T01:00:00Z"}}`))
+	}))
+	defer server.Close()
+
+	client := CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
+	stop := startReadyPoolBorrowHeartbeat(context.Background(), &client, CoordinatorReadyPoolEntry{
+		Key:         "shared-linux",
+		LeaseID:     "cbx_123",
+		BorrowToken: "borrow-token",
+	}, io.Discard)
+	defer stop()
+
+	select {
+	case body := <-heartbeats:
+		if !strings.Contains(body, `"leaseID":"cbx_123"`) || !strings.Contains(body, `"borrowToken":"borrow-token"`) {
+			t.Fatalf("ready-pool heartbeat body=%s", body)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ready-pool heartbeat did not touch immediately")
+	}
+}
+
+func TestReadyPoolBorrowHeartbeatDisablesAfterUnsupportedRoute(t *testing.T) {
+	previousInterval := readyPoolBorrowHeartbeatInterval
+	readyPoolBorrowHeartbeatInterval = 10 * time.Millisecond
+	t.Cleanup(func() { readyPoolBorrowHeartbeatInterval = previousInterval })
+	var requests atomic.Int32
+	first := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		select {
+		case first <- struct{}{}:
+		default:
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	var stderr bytes.Buffer
+	client := CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
+	stop := startReadyPoolBorrowHeartbeat(context.Background(), &client, CoordinatorReadyPoolEntry{
+		Key:         "shared-linux",
+		LeaseID:     "cbx_123",
+		BorrowToken: "borrow-token",
+	}, &stderr)
+	select {
+	case <-first:
+	case <-time.After(2 * time.Second):
+		stop()
+		t.Fatal("ready-pool heartbeat did not start")
+	}
+	time.Sleep(50 * time.Millisecond)
+	stop()
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("unsupported heartbeat requests=%d, want 1", got)
+	}
+	if got := stderr.String(); !strings.Contains(got, "disabling") {
+		t.Fatalf("unsupported heartbeat warning=%q", got)
+	}
+}
+
+func TestCoordinatorReadyPoolReconcileAndReleaseClaim(t *testing.T) {
+	var seen []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		seen = append(seen, r.Method+" "+r.URL.Path+" "+string(body))
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/reconcile") {
+			_, _ = w.Write([]byte(`{"desired":{"key":"shared-linux","minReady":1,"maxReady":2,"criteria":{},"createdAt":"2026-05-01T00:00:00Z","updatedAt":"2026-05-01T00:00:00Z"},"counts":{"ready":0,"busy":0,"draining":0,"quarantined":0,"stale":0,"inFlight":1},"satisfied":false,"reconciling":true,"capped":false,"claim":{"token":"fill-token","key":"shared-linux","criteria":{},"createdAt":"2026-05-01T00:00:00Z","expiresAt":"2026-05-01T00:15:00Z"},"counters":{}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"released":true}`))
+	}))
+	defer server.Close()
+
+	client := CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
+	res, err := client.ReconcileReadyPool(context.Background(), "shared-linux", map[string]any{
+		"minReady": 1,
+		"maxReady": 2,
+		"claim":    true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Claim == nil || res.Claim.Token != "fill-token" || !res.Reconciling {
+		t.Fatalf("reconcile response=%+v", res)
+	}
+	if err := client.ReleaseReadyPoolFillClaim(context.Background(), "shared-linux", res.Claim.Token); err != nil {
+		t.Fatal(err)
+	}
+	if len(seen) != 2 || !strings.Contains(seen[0], `"claim":true`) || !strings.Contains(seen[1], `"claimToken":"fill-token"`) {
+		t.Fatalf("requests=%q", seen)
+	}
+}
+
+func TestCoordinatorHeartbeatIncludesTelemetry(t *testing.T) {
+	bodies := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/control" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.URL.Path != "/v1/leases/cbx_123/heartbeat" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		data, _ := io.ReadAll(r.Body)
+		bodies <- string(data)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"lease":{"id":"cbx_123","provider":"aws","state":"active","expiresAt":"2026-05-01T00:30:00Z"}}`))
+	}))
+	defer server.Close()
+
+	load := 0.77
+	collector := func(context.Context) (*LeaseTelemetry, error) {
+		return &LeaseTelemetry{Load1: &load}, nil
+	}
+	client := CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
+	stop, err := startCoordinatorHeartbeat(context.Background(), &client, "cbx_123", "aws", 30*time.Minute, nil, collector, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+
+	select {
+	case body := <-bodies:
+		if !strings.Contains(body, `"expectedProvider":"aws"`) || !strings.Contains(body, `"load1":0.77`) {
+			t.Fatalf("heartbeat body=%s, want telemetry", body)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("heartbeat did not touch immediately")
+	}
+}
+
+func TestCoordinatorHeartbeatUsesControlWebSocket(t *testing.T) {
+	bodies := make(chan string, 1)
+	httpHeartbeats := make(chan struct{}, 1)
+	handlerDone := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/control":
+			conn, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				t.Errorf("accept control websocket: %v", err)
+				return
+			}
+			defer close(handlerDone)
+			defer conn.CloseNow()
+			_, data, err := conn.Read(r.Context())
+			if err != nil {
+				t.Errorf("read control heartbeat: %v", err)
+				return
+			}
+			bodies <- string(data)
+			_ = conn.Write(r.Context(), websocket.MessageText, []byte(`{"type":"heartbeat","leaseID":"cbx_123","ok":true,"expiresAt":"2026-05-01T00:30:00Z"}`))
+			// A hijacked request's HTTP context does not track peer closure.
+			_, _, _ = conn.Read(r.Context())
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/leases/cbx_123/heartbeat":
+			httpHeartbeats <- struct{}{}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"lease":{"id":"cbx_123","provider":"aws","state":"active","expiresAt":"2026-05-01T00:30:00Z"}}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	load := 0.77
+	collector := func(context.Context) (*LeaseTelemetry, error) {
+		return &LeaseTelemetry{Load1: &load}, nil
+	}
+	client := CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
+	stop, err := startCoordinatorHeartbeat(context.Background(), &client, "cbx_123", "google-cloud", 30*time.Minute, nil, collector, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+
+	select {
+	case body := <-bodies:
+		if !strings.Contains(body, `"type":"heartbeat"`) || !strings.Contains(body, `"expectedProvider":"gcp"`) || !strings.Contains(body, `"load1":0.77`) {
+			t.Fatalf("control heartbeat body=%s", body)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("heartbeat did not use control websocket")
+	}
+	select {
+	case <-httpHeartbeats:
+		t.Fatal("heartbeat fell back to HTTP despite websocket success")
+	default:
+	}
+	stop()
+	select {
+	case <-handlerDone:
+	case <-time.After(time.Second):
+		t.Fatal("control websocket handler did not exit after heartbeat stopped")
+	}
+}
+
+func TestCoordinatorHeartbeatMintsTokenBeforeControlDialTimeout(t *testing.T) {
+	t.Setenv("CRABBOX_TOKEN_HELPER", "1")
+	t.Setenv("CRABBOX_TOKEN_HELPER_VALUE", "slow-token")
+	t.Setenv("CRABBOX_TOKEN_HELPER_DELAY", "1600ms")
+	controlHeartbeats := make(chan struct{}, 1)
+	httpHeartbeats := make(chan struct{}, 1)
+	handlerDone := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/control":
+			if got := r.Header.Get("Authorization"); got != "Bearer slow-token" {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			conn, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				t.Errorf("accept control websocket: %v", err)
+				return
+			}
+			defer close(handlerDone)
+			defer conn.CloseNow()
+			if _, _, err := conn.Read(r.Context()); err != nil {
+				t.Errorf("read control heartbeat: %v", err)
+				return
+			}
+			controlHeartbeats <- struct{}{}
+			_ = conn.Write(r.Context(), websocket.MessageText, []byte(`{"type":"heartbeat","leaseID":"cbx_123","ok":true}`))
+			_, _, _ = conn.Read(r.Context())
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/leases/cbx_123/heartbeat":
+			httpHeartbeats <- struct{}{}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"lease":{"id":"cbx_123","provider":"aws","state":"active","expiresAt":"2026-05-01T00:30:00Z"}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := CoordinatorClient{
+		BaseURL:      server.URL,
+		TokenCommand: synchronousTestHelperCommand("TestCoordinatorTokenCommandHelper"),
+		Client:       server.Client(),
+	}
+	stop, err := startCoordinatorHeartbeat(context.Background(), &client, "cbx_123", "aws", 30*time.Minute, nil, nil, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+
+	select {
+	case <-controlHeartbeats:
+	case <-time.After(4 * time.Second):
+		t.Fatal("slow token mint prevented control websocket heartbeat")
+	}
+	select {
+	case <-httpHeartbeats:
+		t.Fatal("heartbeat fell back to HTTP after successful control websocket dial")
+	default:
+	}
+	stop()
+	select {
+	case <-handlerDone:
+	case <-time.After(time.Second):
+		t.Fatal("control websocket handler did not exit after heartbeat stopped")
+	}
+}
+
+func TestCoordinatorLeaseWatchCancelsWhenLeaseReleased(t *testing.T) {
+	oldInterval := coordinatorLeaseWatchInterval
+	coordinatorLeaseWatchInterval = 10 * time.Millisecond
+	defer func() { coordinatorLeaseWatchInterval = oldInterval }()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/leases/cbx_123" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"lease":{"id":"cbx_123","provider":"aws","state":"released","expiresAt":"2026-05-01T00:30:00Z"}}`))
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	client := CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
+	stop := startCoordinatorLeaseWatch(ctx, &client, "cbx_123", cancel, io.Discard)
+	defer stop()
+
+	select {
+	case <-ctx.Done():
+		if cause := context.Cause(ctx); cause == nil || !strings.Contains(cause.Error(), "became released") {
+			t.Fatalf("cause=%v, want released lease cause", cause)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("lease watcher did not cancel after release")
+	}
+}
+
+func TestCoordinatorCurlFallbackSkipsNonIdempotentAndTimeouts(t *testing.T) {
+	transportErr := &url.Error{Op: "Get", URL: "https://broker.example.test/v1/leases", Err: io.ErrUnexpectedEOF}
+	if !shouldUseCoordinatorCurlFallback(http.MethodGet, false, transportErr) {
+		t.Fatal("GET transport error should use curl fallback")
+	}
+	if shouldUseCoordinatorCurlFallback(http.MethodPost, true, transportErr) {
+		t.Fatal("POST with body should not use curl fallback")
+	}
+	timeoutErr := &url.Error{Op: "Get", URL: "https://broker.example.test/v1/leases", Err: context.DeadlineExceeded}
+	if shouldUseCoordinatorCurlFallback(http.MethodGet, false, timeoutErr) {
+		t.Fatal("deadline exceeded should not use curl fallback")
+	}
+}
+
+func TestCoordinatorCreateLeaseSendsAWSSSHCIDRs(t *testing.T) {
+	var body struct {
+		Provider           string   `json:"provider"`
+		OSImage            string   `json:"os"`
+		AWSSnapshot        string   `json:"awsSnapshot"`
+		AWSSSHCIDRs        []string `json:"awsSSHCIDRs"`
+		AzureLocation      string   `json:"azureLocation"`
+		AzureImage         string   `json:"azureImage"`
+		AzureSnapshot      string   `json:"azureSnapshot"`
+		AzureOSDisk        string   `json:"azureOSDisk"`
+		GCPProject         string   `json:"gcpProject"`
+		GCPZone            string   `json:"gcpZone"`
+		GCPSnapshot        string   `json:"gcpSnapshot"`
+		GCPNetwork         string   `json:"gcpNetwork"`
+		GCPTags            []string `json:"gcpTags"`
+		GCPSSHCIDRs        []string `json:"gcpSSHCIDRs"`
+		GCPRootGB          int64    `json:"gcpRootGB"`
+		SSHFallbackPorts   []string `json:"sshFallbackPorts"`
+		ServerTypeExplicit bool     `json:"serverTypeExplicit"`
+		HostID             string   `json:"hostId"`
+		HostIDCompat       string   `json:"hostID"`
+		Capacity           map[string]any
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/leases" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"lease":{"id":"cbx_123","provider":"aws","state":"active","host":"192.0.2.10"}}`))
+	}))
+	defer server.Close()
+
+	client := CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
+	_, err := client.CreateLease(context.Background(), Config{
+		Provider:            "google",
+		OSImage:             "ubuntu:26.04",
+		osImageExplicit:     true,
+		ServerType:          "t3.small",
+		ServerTypeExplicit:  true,
+		HostID:              "h-000000000001",
+		AWSSnapshot:         "snap-123",
+		AWSSSHCIDRs:         []string{"198.51.100.7/32"},
+		AzureLocation:       "eastus",
+		AzureImage:          "Canonical:0001-com-ubuntu-server-jammy:22_04-lts-gen2:latest",
+		azureImageExplicit:  true,
+		AzureSnapshot:       "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/snapshots/checkpoint",
+		AzureOSDisk:         "managed",
+		AzureOSDiskExplicit: true,
+		GCPProject:          "crabbox-project",
+		gcpProjectExplicit:  true,
+		GCPZone:             "europe-west2-b",
+		GCPImage:            "projects/custom/global/images/crabbox",
+		GCPNetwork:          "crabbox-net",
+		GCPTags:             []string{"crabbox-ci"},
+		GCPSSHCIDRs:         []string{"198.51.100.11/32"},
+		GCPSnapshot:         "projects/crabbox-project/global/snapshots/checkpoint",
+		GCPRootGB:           900,
+		SSHFallbackPorts:    []string{"22", "2022"},
+		Capacity: CapacityConfig{
+			Market:   "spot",
+			Strategy: "most-available",
+			Fallback: "on-demand-after-120s",
+			Hints:    true,
+		},
+	}, "ssh-ed25519 test", false, "cbx_123", "blue-crab")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(body.AWSSSHCIDRs) != 1 || body.AWSSSHCIDRs[0] != "198.51.100.7/32" {
+		t.Fatalf("awsSSHCIDRs=%v", body.AWSSSHCIDRs)
+	}
+	if body.Provider != "gcp" {
+		t.Fatalf("provider=%q want canonical gcp", body.Provider)
+	}
+	if body.OSImage != "ubuntu:26.04" {
+		t.Fatalf("os=%q", body.OSImage)
+	}
+	if body.AzureLocation != "eastus" {
+		t.Fatalf("azureLocation=%q", body.AzureLocation)
+	}
+	if body.AzureImage != "Canonical:0001-com-ubuntu-server-jammy:22_04-lts-gen2:latest" {
+		t.Fatalf("azureImage=%q", body.AzureImage)
+	}
+	if body.AWSSnapshot != "snap-123" || body.AzureSnapshot == "" || body.GCPSnapshot == "" {
+		t.Fatalf("snapshot fields not forwarded: aws=%q azure=%q gcp=%q", body.AWSSnapshot, body.AzureSnapshot, body.GCPSnapshot)
+	}
+	if body.AzureOSDisk != "managed" {
+		t.Fatalf("azureOSDisk=%q", body.AzureOSDisk)
+	}
+	if body.GCPProject != "crabbox-project" || body.GCPZone != "europe-west2-b" || body.GCPNetwork != "crabbox-net" || body.GCPRootGB != 900 {
+		t.Fatalf("unexpected gcp body: %#v", body)
+	}
+	if len(body.GCPTags) != 1 || body.GCPTags[0] != "crabbox-ci" || len(body.GCPSSHCIDRs) != 1 || body.GCPSSHCIDRs[0] != "198.51.100.11/32" {
+		t.Fatalf("unexpected gcp tags/cidrs: tags=%v cidrs=%v", body.GCPTags, body.GCPSSHCIDRs)
+	}
+	if len(body.SSHFallbackPorts) != 2 || body.SSHFallbackPorts[0] != "22" || body.SSHFallbackPorts[1] != "2022" {
+		t.Fatalf("sshFallbackPorts=%v", body.SSHFallbackPorts)
+	}
+	if !body.ServerTypeExplicit {
+		t.Fatal("serverTypeExplicit=false, want true")
+	}
+	if body.HostID != "h-000000000001" || body.HostIDCompat != "h-000000000001" {
+		t.Fatalf("host id fields not forwarded: hostId=%q hostID=%q", body.HostID, body.HostIDCompat)
+	}
+	if body.Capacity != nil {
+		t.Fatalf("default capacity fields should be omitted for mixed-version brokers: %#v", body.Capacity)
+	}
+}
+
+func TestCoordinatorEnsureLeaseUsesFailClosedFixedIDRoute(t *testing.T) {
+	var method, path, bodyLeaseID string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		method, path = r.Method, r.URL.Path
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		bodyLeaseID, _ = body["leaseID"].(string)
+		_ = json.NewEncoder(w).Encode(map[string]any{"lease": CoordinatorLease{ID: bodyLeaseID, State: "active"}})
+	}))
+	defer server.Close()
+
+	client := &CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
+	lease, err := client.EnsureLease(context.Background(), baseConfig(), "ssh-ed25519 test", true, "cbx_abcdef123456", "fixed-route")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if method != http.MethodPut || path != "/v1/leases/cbx_abcdef123456" || bodyLeaseID != "cbx_abcdef123456" {
+		t.Fatalf("request=%s %s leaseID=%q", method, path, bodyLeaseID)
+	}
+	if lease.ID != bodyLeaseID {
+		t.Fatalf("lease=%#v", lease)
+	}
+}
+
+func TestCoordinatorCreateLeaseSendsImageRequirementsOnFailClosedRoute(t *testing.T) {
+	var body struct {
+		ImageRequirements imageRequirements `json:"imageRequirements"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/leases/capability-aware" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = w.Write([]byte(`{"lease":{"id":"cbx_123","provider":"aws","state":"active","host":"192.0.2.10"}}`))
+	}))
+	defer server.Close()
+
+	client := CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
+	requirements := imageRequirements{
+		MinOS:    "26.04",
+		Runtimes: map[string]string{"node": "24"},
+		Browser:  true,
+	}
+	_, err := client.CreateLease(context.Background(), Config{
+		Provider:          "aws",
+		ServerType:        "t3.small",
+		imageRequirements: requirements,
+	}, "ssh-ed25519 test", false, "cbx_123", "blue-crab")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(body.ImageRequirements, requirements) {
+		t.Fatalf("imageRequirements=%#v", body.ImageRequirements)
+	}
+}
+
+func TestCoordinatorImageRequirementsFailClosedOnOlderCoordinator(t *testing.T) {
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	client := CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
+	_, err := client.CreateLease(context.Background(), Config{
+		Provider:          "aws",
+		ServerType:        "t3.small",
+		imageRequirements: imageRequirements{Runtimes: map[string]string{"node": "24"}},
+	}, "ssh-ed25519 test", false, "cbx_123", "blue-crab")
+	if err == nil {
+		t.Fatal("older coordinator unexpectedly accepted image requirements")
+	}
+	if !reflect.DeepEqual(paths, []string{"/v1/leases/capability-aware"}) {
+		t.Fatalf("paths=%v", paths)
+	}
+}
+
+func TestCoordinatorCreateLeaseOmitsImplicitDaytonaArchitecture(t *testing.T) {
+	var bodies []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/leases" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		bodies = append(bodies, body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"lease":{"id":"cbx_123","provider":"daytona","state":"active","host":"ssh.app.daytona.io"}}`))
+	}))
+	defer server.Close()
+
+	client := CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
+	cfg := Config{
+		Provider:         "daytona",
+		Architecture:     ArchitectureAMD64,
+		TargetOS:         targetLinux,
+		SSHFallbackPorts: []string{"22"},
+		TTL:              time.Hour,
+		IdleTimeout:      30 * time.Minute,
+	}
+	if _, err := client.CreateLease(context.Background(), cfg, "ssh-ed25519 test", false, "cbx_123", "blue-crab"); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Architecture = ArchitectureARM64
+	cfg.architectureExplicit = true
+	if _, err := client.CreateLease(context.Background(), cfg, "ssh-ed25519 test", false, "cbx_456", "red-crab"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok := bodies[0]["architecture"]; ok {
+		t.Fatalf("implicit Daytona architecture forwarded: %#v", bodies[0])
+	}
+	if got := bodies[1]["architecture"]; got != ArchitectureARM64 {
+		t.Fatalf("explicit Daytona architecture=%v, want %q", got, ArchitectureARM64)
+	}
+}
+
+func TestCoordinatorRegisterLease(t *testing.T) {
+	var got CoordinatorLeaseRegistration
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut || r.URL.Path != "/v1/leases/cbx_123/registration" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"lease":{"id":"cbx_123","provider":"external","lifecycle":"registered","state":"active"}}`))
+	}))
+	defer server.Close()
+
+	client := CoordinatorClient{BaseURL: server.URL, Token: "token", Client: server.Client()}
+	lease, err := client.RegisterLease(context.Background(), "cbx_123", CoordinatorLeaseRegistration{
+		Slug:               "my-box",
+		Provider:           "external",
+		TargetOS:           targetLinux,
+		Host:               "192.0.2.10",
+		SSHUser:            "runner",
+		SSHPort:            "22",
+		IdleTimeoutSeconds: 1800,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.Lifecycle != "registered" || got.Slug != "my-box" || got.Provider != "external" || got.Host != "192.0.2.10" || got.IdleTimeoutSeconds != 1800 {
+		t.Fatalf("lease=%#v request=%#v", lease, got)
+	}
+}
+
+func TestCoordinatorCreateLeaseForwardsOnlyExplicitAzureImage(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		explicit bool
+		want     bool
+	}{
+		{name: "default omitted"},
+		{name: "explicit forwarded", explicit: true, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var body map[string]any
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != "/v1/leases" {
+					t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"lease":{"id":"cbx_123","provider":"azure","state":"active","host":"192.0.2.10"}}`))
+			}))
+			defer server.Close()
+
+			client := CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
+			_, err := client.CreateLease(context.Background(), Config{
+				Provider:           "azure",
+				AzureLocation:      "eastus",
+				AzureImage:         defaultAzureLinuxImage,
+				azureImageExplicit: tc.explicit,
+				SSHFallbackPorts:   []string{"22"},
+				TTL:                time.Hour,
+				IdleTimeout:        30 * time.Minute,
+			}, "ssh-ed25519 test", false, "cbx_123", "blue-crab")
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, got := body["azureImage"]
+			if got != tc.want {
+				t.Fatalf("azureImage present=%t want %t: %#v", got, tc.want, body)
+			}
+		})
+	}
+}
+
+func TestCoordinatorCreateLeaseOmitsDefaultAzureOSDisk(t *testing.T) {
+	var body map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/leases" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"lease":{"id":"cbx_123","provider":"azure","state":"active","host":"192.0.2.10"}}`))
+	}))
+	defer server.Close()
+
+	client := CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
+	_, err := client.CreateLease(context.Background(), Config{
+		Provider:         "azure",
+		AzureLocation:    "eastus",
+		AzureImage:       defaultAzureLinuxImage,
+		AzureOSDisk:      AzureOSDiskManaged,
+		SSHFallbackPorts: []string{"22"},
+		TTL:              time.Hour,
+		IdleTimeout:      30 * time.Minute,
+	}, "ssh-ed25519 test", false, "cbx_123", "blue-crab")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := body["azureOSDisk"]; ok {
+		t.Fatalf("azureOSDisk forwarded despite default-only config: %#v", body["azureOSDisk"])
+	}
+}
+
+func TestCoordinatorCreateLeaseOmitsAmbientGCPProject(t *testing.T) {
+	clearConfigEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("CRABBOX_CONFIG", "")
+	t.Setenv("GOOGLE_CLOUD_PROJECT", "developer-adc-project")
+
+	var body map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/leases" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"lease":{"id":"cbx_123","provider":"gcp","state":"active","host":"192.0.2.10"}}`))
+	}))
+	defer server.Close()
+
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Provider = "gcp"
+	cfg.ServerType = serverTypeForConfig(cfg)
+	client := CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
+	if _, err := client.CreateLease(context.Background(), cfg, "ssh-ed25519 test", false, "cbx_123", "blue-crab"); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.GCPProject != "developer-adc-project" {
+		t.Fatalf("test setup project=%q", cfg.GCPProject)
+	}
+	if _, ok := body["gcpProject"]; ok {
+		t.Fatalf("ambient ADC project should be omitted so coordinator defaults apply: %#v", body)
+	}
+	if _, ok := body["os"]; ok {
+		t.Fatalf("default os should be omitted so coordinator provider defaults apply: %#v", body)
+	}
+}
+
+func TestCoordinatorCreateLeaseSendsConfiguredGCPProjectDespiteAmbientADC(t *testing.T) {
+	clearConfigEnv(t)
+	home := t.TempDir()
+	configPath := filepath.Join(home, "crabbox.yaml")
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("CRABBOX_CONFIG", configPath)
+	t.Setenv("GOOGLE_CLOUD_PROJECT", "developer-adc-project")
+	if err := os.WriteFile(configPath, []byte(`provider: gcp
+gcp:
+  project: configured-crabbox-project
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var body map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"lease":{"id":"cbx_123","provider":"gcp","state":"active","host":"192.0.2.10"}}`))
+	}))
+	defer server.Close()
+
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ServerType = serverTypeForConfig(cfg)
+	client := CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
+	if _, err := client.CreateLease(context.Background(), cfg, "ssh-ed25519 test", false, "cbx_123", "blue-crab"); err != nil {
+		t.Fatal(err)
+	}
+	if got := body["gcpProject"]; got != "configured-crabbox-project" {
+		t.Fatalf("gcpProject=%#v body=%#v", got, body)
+	}
+}
+
+func TestCoordinatorCreateLeaseSendsExplicitBuiltInGCPDefaults(t *testing.T) {
+	clearConfigEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("CRABBOX_CONFIG", "")
+	t.Setenv("CRABBOX_PROVIDER", "gcp")
+	t.Setenv("CRABBOX_GCP_ZONE", "europe-west2-a")
+	t.Setenv("CRABBOX_GCP_IMAGE", defaultGCPLinuxImage)
+	t.Setenv("CRABBOX_GCP_NETWORK", "default")
+	t.Setenv("CRABBOX_GCP_TAGS", "crabbox-ssh")
+	t.Setenv("CRABBOX_GCP_ROOT_GB", "400")
+
+	var body map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"lease":{"id":"cbx_123","provider":"gcp","state":"active","host":"192.0.2.10"}}`))
+	}))
+	defer server.Close()
+
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ServerType = serverTypeForConfig(cfg)
+	client := CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
+	if _, err := client.CreateLease(context.Background(), cfg, "ssh-ed25519 test", false, "cbx_123", "blue-crab"); err != nil {
+		t.Fatal(err)
+	}
+	if body["gcpZone"] != "europe-west2-a" || body["gcpImage"] != defaultGCPLinuxImage || body["gcpNetwork"] != "default" {
+		t.Fatalf("explicit built-in string defaults not forwarded: %#v", body)
+	}
+	tags, ok := body["gcpTags"].([]any)
+	if !ok || len(tags) != 1 || tags[0] != "crabbox-ssh" {
+		t.Fatalf("explicit built-in tags not forwarded: %#v", body["gcpTags"])
+	}
+	if body["gcpRootGB"] != float64(400) {
+		t.Fatalf("explicit built-in rootGB not forwarded: %#v", body["gcpRootGB"])
+	}
+}
+
+func TestCoordinatorCreateLeaseOmitsBuiltInGCPDefaults(t *testing.T) {
+	var body map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/leases" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"lease":{"id":"cbx_123","provider":"gcp","state":"active","host":"192.0.2.10"}}`))
+	}))
+	defer server.Close()
+
+	cfg := baseConfig()
+	cfg.Provider = "gcp"
+	cfg.ServerType = serverTypeForConfig(cfg)
+	client := CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
+	if _, err := client.CreateLease(context.Background(), cfg, "ssh-ed25519 test", false, "cbx_123", "blue-crab"); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"gcpProject", "gcpZone", "gcpImage", "gcpNetwork", "gcpSubnet", "gcpTags", "gcpSSHCIDRs", "gcpRootGB", "gcpServiceAccount"} {
+		if _, ok := body[key]; ok {
+			t.Fatalf("%s should be omitted so coordinator defaults apply: %#v", key, body)
+		}
+	}
+}
+
+func TestCoordinatorCreateLeaseSendsConfiguredCapacityExtensions(t *testing.T) {
+	var body struct {
+		Capacity map[string]any
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/leases" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"lease":{"id":"cbx_123","provider":"aws","state":"active","host":"192.0.2.10"}}`))
+	}))
+	defer server.Close()
+
+	client := CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
+	_, err := client.CreateLease(context.Background(), Config{
+		Provider: "aws",
+		Capacity: CapacityConfig{
+			Market:            "spot",
+			Strategy:          "most-available",
+			Fallback:          "on-demand-after-120s",
+			Regions:           []string{"eu-west-1", "eu-west-2"},
+			AvailabilityZones: []string{"eu-west-1a"},
+			Hints:             false,
+		},
+	}, "ssh-ed25519 test", false, "cbx_123", "blue-crab")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stringSliceFromJSON(body.Capacity["regions"]); !reflect.DeepEqual(got, []string{"eu-west-1", "eu-west-2"}) {
+		t.Fatalf("capacity.regions=%v", got)
+	}
+	if got := stringSliceFromJSON(body.Capacity["availabilityZones"]); !reflect.DeepEqual(got, []string{"eu-west-1a"}) {
+		t.Fatalf("capacity.availabilityZones=%v", got)
+	}
+	if got, ok := body.Capacity["hints"].(bool); !ok || got {
+		t.Fatalf("capacity.hints=%#v, want false", body.Capacity["hints"])
+	}
+}
+
+func TestCoordinatorLeaseDecodesLegacyCapacityResponse(t *testing.T) {
+	var lease CoordinatorLease
+	if err := json.Unmarshal([]byte(`{"id":"cbx_123","provider":"aws","serverType":"c7a.8xlarge"}`), &lease); err != nil {
+		t.Fatal(err)
+	}
+	if lease.Market != "" || len(lease.ProvisioningAttempts) != 0 || len(lease.CapacityHints) != 0 {
+		t.Fatalf("new capacity fields should be optional: %#v", lease)
+	}
+}
+
+func TestCoordinatorLeaseDecodesProvisioningAttempts(t *testing.T) {
+	var lease CoordinatorLease
+	if err := json.Unmarshal([]byte(`{
+		"id":"cbx_123",
+		"provider":"aws",
+		"serverType":"c7i.24xlarge",
+		"requestedServerType":"c7a.48xlarge",
+		"market":"on-demand",
+		"provisioningAttempts":[{"region":"eu-west-1","serverType":"c7a.48xlarge","market":"spot","category":"policy","message":"not eligible"}],
+		"capacityHints":[{"code":"aws_capacity_routed","message":"AWS launch routed to eu-west-2","action":"keep regions","region":"eu-west-2","market":"on-demand","class":"beast","serverType":"c7i.24xlarge","regionsTried":["eu-west-1","eu-west-2"]}]
+	}`), &lease); err != nil {
+		t.Fatal(err)
+	}
+	if lease.RequestedServerType != "c7a.48xlarge" || lease.ServerType != "c7i.24xlarge" {
+		t.Fatalf("lease=%#v", lease)
+	}
+	if len(lease.ProvisioningAttempts) != 1 || lease.ProvisioningAttempts[0].Category != "policy" {
+		t.Fatalf("attempts=%#v", lease.ProvisioningAttempts)
+	}
+	if lease.Market != "on-demand" || len(lease.CapacityHints) != 1 || lease.CapacityHints[0].Region != "eu-west-2" {
+		t.Fatalf("capacity fields market=%q hints=%#v", lease.Market, lease.CapacityHints)
+	}
+}
+
+func stringSliceFromJSON(value any) []string {
+	items, _ := value.([]any)
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		if s, ok := item.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func TestCoordinatorFallbackSummary(t *testing.T) {
+	summary := coordinatorFallbackSummary(CoordinatorLease{
+		RequestedServerType: "c7a.48xlarge",
+		ServerType:          "c7i.24xlarge",
+		ProvisioningAttempts: []ProvisioningAttempt{{
+			Region:     "eu-west-1",
+			ServerType: "c7a.48xlarge",
+			Market:     "spot",
+			Category:   "policy",
+			Message:    "not eligible",
+		}},
+	})
+	if !strings.Contains(summary, "requested_type=c7a.48xlarge") || !strings.Contains(summary, "attempts=eu-west-1/c7a.48xlarge:policy") {
+		t.Fatalf("summary=%q", summary)
+	}
+}
+
+func TestCoordinatorCapacityHintLines(t *testing.T) {
+	lines := coordinatorCapacityHintLines(CoordinatorLease{
+		CapacityHints: []CapacityHint{{
+			Code:    "aws_capacity_routed",
+			Message: "AWS launch routed to eu-west-2",
+			Action:  "keep multiple regions configured",
+		}},
+	})
+	if len(lines) != 1 || !strings.Contains(lines[0], "aws_capacity_routed") || !strings.Contains(lines[0], "action=keep multiple regions") {
+		t.Fatalf("lines=%#v", lines)
+	}
+}
+
+func TestCoordinatorImageCreateAndPromote(t *testing.T) {
+	var createBody struct {
+		LeaseID  string `json:"leaseID"`
+		Name     string `json:"name"`
+		NoReboot bool   `json:"noReboot"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/images":
+			if r.Method != http.MethodPost {
+				t.Fatalf("method=%s", r.Method)
+			}
+			if err := json.NewDecoder(r.Body).Decode(&createBody); err != nil {
+				t.Fatal(err)
+			}
+			_, _ = w.Write([]byte(`{"image":{"id":"ami-12345678","name":"openclaw-crabbox-test","state":"pending","region":"eu-west-1"}}`))
+		case "/v1/images/ami-12345678":
+			if r.Method == http.MethodDelete {
+				if got := r.URL.Query().Get("kind"); got != "aws-ami" {
+					t.Fatalf("delete kind=%q", got)
+				}
+				_, _ = w.Write([]byte(`{"imageID":"ami-12345678","deleted":true}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"image":{"id":"ami-12345678","name":"openclaw-crabbox-test","state":"available","region":"eu-west-1"}}`))
+		case "/v1/images/ami-12345678/promote":
+			if r.Method != http.MethodPost {
+				t.Fatalf("method=%s", r.Method)
+			}
+			if got := r.URL.Query().Get("target"); got != "macos" {
+				t.Fatalf("promote target=%q", got)
+			}
+			if got := r.URL.Query().Get("os"); got != "ubuntu:26.04" {
+				t.Fatalf("promote os=%q", got)
+			}
+			if got := r.URL.Query().Get("region"); got != "us-east-1" {
+				t.Fatalf("promote region=%q", got)
+			}
+			if got := r.URL.Query().Get("serverType"); got != "mac1.metal" {
+				t.Fatalf("promote serverType=%q", got)
+			}
+			if got := r.URL.Query().Get("architecture"); got != "x86_64_mac" {
+				t.Fatalf("promote architecture=%q", got)
+			}
+			if got := r.URL.Query().Get("fastSnapshotRestore"); got != "true" {
+				t.Fatalf("promote fastSnapshotRestore=%q", got)
+			}
+			if got := r.URL.Query()["fsrAz"]; !reflect.DeepEqual(got, []string{"us-east-1a", "us-east-1b"}) {
+				t.Fatalf("promote fsrAz=%#v", got)
+			}
+			if got := r.URL.Query().Get("osVersion"); got != "15.5" {
+				t.Fatalf("promote osVersion=%q", got)
+			}
+			if got := r.URL.Query()["sdk"]; !reflect.DeepEqual(got, []string{"xcode=16.4"}) {
+				t.Fatalf("promote sdk=%#v", got)
+			}
+			if got := r.URL.Query()["runtime"]; !reflect.DeepEqual(got, []string{"go=1.25", "node=24.2"}) {
+				t.Fatalf("promote runtime=%#v", got)
+			}
+			if r.URL.Query().Get("browser") != "true" || r.URL.Query().Get("desktop") != "true" {
+				t.Fatalf("promote capabilities=%s", r.URL.RawQuery)
+			}
+			_, _ = w.Write([]byte(`{"image":{"id":"ami-12345678","name":"openclaw-crabbox-test","state":"available","region":"eu-west-1","promotedAt":"2026-05-01T12:46:00Z"}}`))
+		case "/v1/images/ami-12345678/fast-snapshot-restore":
+			if r.Method != http.MethodGet {
+				t.Fatalf("method=%s", r.Method)
+			}
+			if got := r.URL.Query().Get("provider"); got != "aws" {
+				t.Fatalf("fsr provider=%q", got)
+			}
+			if got := r.URL.Query().Get("region"); got != "us-east-1" {
+				t.Fatalf("fsr region=%q", got)
+			}
+			if got := r.URL.Query()["fsrAz"]; !reflect.DeepEqual(got, []string{"us-east-1a"}) {
+				t.Fatalf("fsr fsrAz=%#v", got)
+			}
+			_, _ = w.Write([]byte(`{"image":{"id":"ami-12345678","name":"openclaw-crabbox-test","state":"available","region":"us-east-1","fastSnapshotRestores":[{"snapshotID":"snap-root","availabilityZone":"us-east-1a","state":"enabled"}]}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
+	created, err := client.CreateImage(context.Background(), "cbx_123", "openclaw-crabbox-test", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.ID != "ami-12345678" || createBody.LeaseID != "cbx_123" || createBody.Name != "openclaw-crabbox-test" || !createBody.NoReboot {
+		t.Fatalf("created=%#v body=%#v", created, createBody)
+	}
+	if image, err := client.Image(context.Background(), "ami-12345678"); err != nil || image.State != "available" {
+		t.Fatalf("image=%#v err=%v", image, err)
+	}
+	if promoted, err := client.PromoteImage(context.Background(), "ami-12345678", CoordinatorImageRef{Provider: "aws", Region: "us-east-1", Target: "macos", OSImage: defaultOSImage, ServerType: "mac1.metal", Architecture: "x86_64_mac", FastSnapshotRestore: true, FastSnapshotRestoreAZs: []string{"us-east-1a", "us-east-1b"}, Capabilities: imageCapabilities{OSVersion: "15.5", SDKs: map[string]string{"xcode": "16.4"}, Runtimes: map[string]string{"node": "24.2", "go": "1.25"}, Browser: true, Desktop: true}}); err != nil || promoted.PromotedAt == "" {
+		t.Fatalf("promoted=%#v err=%v", promoted, err)
+	}
+	if status, err := client.FastSnapshotRestoreStatus(context.Background(), "ami-12345678", CoordinatorImageRef{Provider: "aws", Region: "us-east-1", FastSnapshotRestoreAZs: []string{"us-east-1a"}}); err != nil || len(status.FastSnapshotRestores) != 1 || status.FastSnapshotRestores[0].State != "enabled" {
+		t.Fatalf("fsr status=%#v err=%v", status, err)
+	}
+	if err := client.DeleteImage(context.Background(), "ami-12345678", CoordinatorImageRef{Provider: "aws", Region: "eu-west-1", Kind: "aws-ami"}); err != nil {
+		t.Fatalf("delete image: %v", err)
+	}
+}
+
+func TestImageFSRStatusAcceptsFlagsAfterImageID(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	var gotPath, gotRegion, gotAuth string
+	var gotAZs []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotRegion = r.URL.Query().Get("region")
+		gotAZs = r.URL.Query()["fsrAz"]
+		gotAuth = r.Header.Get("Authorization")
+		if r.Method != http.MethodGet {
+			t.Fatalf("method=%s", r.Method)
+		}
+		_, _ = w.Write([]byte(`{"image":{"id":"ami-12345678","state":"available","region":"us-west-2","fastSnapshotRestores":[{"snapshotID":"snap-root","availabilityZone":"us-west-2a","state":"enabled"}]}}`))
+	}))
+	defer server.Close()
+
+	t.Setenv("CRABBOX_COORDINATOR", server.URL)
+	t.Setenv("CRABBOX_COORDINATOR_ADMIN_TOKEN", "admin-token")
+	var out bytes.Buffer
+	app := App{Stdout: &out, Stderr: io.Discard}
+	err := app.imageFSRStatus(context.Background(), []string{"ami-12345678", "--region", "us-west-2", "--fsr-az", "us-west-2a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != "/v1/images/ami-12345678/fast-snapshot-restore" || gotRegion != "us-west-2" || !reflect.DeepEqual(gotAZs, []string{"us-west-2a"}) {
+		t.Fatalf("request path=%q region=%q azs=%#v", gotPath, gotRegion, gotAZs)
+	}
+	if gotAuth != "Bearer admin-token" {
+		t.Fatalf("auth=%q", gotAuth)
+	}
+	if !strings.Contains(out.String(), "fsr snapshot=snap-root az=us-west-2a state=enabled") {
+		t.Fatalf("output=%q", out.String())
+	}
+}
+
+func TestImagePromoteSupportsAzureSnapshots(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	var gotProvider, gotRegion, gotTarget string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/images/snapshot-devtools/promote" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		gotProvider = r.URL.Query().Get("provider")
+		gotRegion = r.URL.Query().Get("region")
+		gotTarget = r.URL.Query().Get("target")
+		_, _ = w.Write([]byte(`{"image":{"id":"snapshot-devtools","name":"snapshot-devtools","kind":"azure-os-disk-snapshot","state":"succeeded","region":"westeurope","promotedAt":"2026-07-31T00:00:00Z"}}`))
+	}))
+	defer server.Close()
+
+	t.Setenv("CRABBOX_COORDINATOR", server.URL)
+	t.Setenv("CRABBOX_COORDINATOR_ADMIN_TOKEN", "admin-token")
+	var out bytes.Buffer
+	app := App{Stdout: &out, Stderr: io.Discard}
+	err := app.imagePromote(context.Background(), []string{
+		"--provider", "azure",
+		"--target", "linux",
+		"--region", "westeurope",
+		"snapshot-devtools",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotProvider != "azure" || gotRegion != "westeurope" || gotTarget != "linux" {
+		t.Fatalf("provider=%q region=%q target=%q", gotProvider, gotRegion, gotTarget)
+	}
+	if !strings.Contains(out.String(), "promoted image=snapshot-devtools") {
+		t.Fatalf("output=%q", out.String())
+	}
+
+	err = app.imagePromote(context.Background(), []string{
+		"--provider", "azure",
+		"--fast-snapshot-restore",
+		"snapshot-devtools",
+	})
+	if err == nil || !strings.Contains(err.Error(), "Fast Snapshot Restore is AWS-only") {
+		t.Fatalf("error=%v", err)
+	}
+
+	err = app.imagePromote(context.Background(), []string{
+		"--provider", "azure",
+		"--browser",
+		"snapshot-devtools",
+	})
+	if err == nil || !strings.Contains(err.Error(), "image capability declarations are AWS-only") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestImagePromoteCatalogOnlyValidation(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	sdkOverflow := []string{"ami-variant", "--catalog-only"}
+	for index := range 32 {
+		sdkOverflow = append(sdkOverflow, "--sdk", fmt.Sprintf("sdk%d=1", index))
+	}
+	sdkOverflow = append(sdkOverflow, "--variant-sdk", "extra=1")
+	runtimeOverflow := []string{"ami-variant", "--catalog-only"}
+	for index := range 32 {
+		runtimeOverflow = append(runtimeOverflow, "--runtime", fmt.Sprintf("runtime%d=1", index))
+	}
+	runtimeOverflow = append(runtimeOverflow, "--variant-runtime", "extra=1")
+
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{
+			name: "catalog only requires selector",
+			args: []string{"ami-variant", "--catalog-only", "--sdk", "toolkit=2.0"},
+			want: "--catalog-only requires at least one --variant-sdk or --variant-runtime",
+		},
+		{
+			name: "selector requires catalog only",
+			args: []string{"ami-variant", "--variant-sdk", "toolkit=2.0"},
+			want: "--variant-sdk and --variant-runtime require --catalog-only",
+		},
+		{
+			name: "azure rejects catalog only",
+			args: []string{"ami-variant", "--provider", "azure", "--catalog-only", "--variant-sdk", "toolkit=2.0"},
+			want: "--catalog-only is AWS-only",
+		},
+		{
+			name: "conflicting repeated selector",
+			args: []string{"ami-variant", "--catalog-only", "--variant-sdk", "toolkit=2.0", "--variant-sdk", "toolkit=3.0"},
+			want: "--variant-sdk declares conflicting versions for toolkit",
+		},
+		{
+			name: "conflicting inventory and selector",
+			args: []string{"ami-variant", "--catalog-only", "--sdk", "toolkit=1.0", "--variant-sdk", "toolkit=2.0"},
+			want: "--sdk and --variant-sdk declare conflicting versions for toolkit",
+		},
+		{
+			name: "combined SDK limit",
+			args: sdkOverflow,
+			want: "--sdk and --variant-sdk support at most 32 combined entries",
+		},
+		{
+			name: "combined runtime limit",
+			args: runtimeOverflow,
+			want: "--runtime and --variant-runtime support at most 32 combined entries",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := (App{Stdout: io.Discard, Stderr: io.Discard}).imagePromote(context.Background(), test.args)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error=%v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestImageDeleteCatalogOnlyCoordinatorContract(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("CRABBOX_COORDINATOR_ADMIN_TOKEN", "admin-token")
+
+	t.Run("uses dedicated route and reports retired variants", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodDelete || r.URL.Path != "/v1/images/ami-external/promote-catalog" {
+				t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+			}
+			if got := r.URL.Query().Get("provider"); got != "aws" {
+				t.Fatalf("provider=%q", got)
+			}
+			if got := r.URL.Query().Get("region"); got != "us-east-1" {
+				t.Fatalf("region=%q", got)
+			}
+			_, _ = w.Write([]byte(`{"imageID":"ami-external","catalogOnly":true,"retired":2}`))
+		}))
+		defer server.Close()
+		t.Setenv("CRABBOX_COORDINATOR", server.URL)
+
+		var out bytes.Buffer
+		err := (App{Stdout: &out, Stderr: io.Discard}).imageDelete(context.Background(), []string{
+			"ami-external", "--catalog-only", "--region", "us-east-1",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := out.String(), "retired catalog-only image=ami-external provider=aws variants=2\n"; got != want {
+			t.Fatalf("output=%q, want %q", got, want)
+		}
+	})
+
+	t.Run("old coordinator fails closed", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodDelete || r.URL.Path != "/v1/images/ami-external/promote-catalog" {
+				t.Fatalf("catalog-only retirement fell back to %s %s", r.Method, r.URL.Path)
+			}
+			http.NotFound(w, r)
+		}))
+		defer server.Close()
+		t.Setenv("CRABBOX_COORDINATOR", server.URL)
+
+		err := (App{Stdout: io.Discard, Stderr: io.Discard}).imageDelete(context.Background(), []string{
+			"ami-external", "--catalog-only",
+		})
+		if err == nil || !strings.Contains(err.Error(), "coordinator does not support catalog-only image retirement") {
+			t.Fatalf("error=%v", err)
+		}
+	})
+
+	t.Run("Azure fails before coordinator access", func(t *testing.T) {
+		err := (App{Stdout: io.Discard, Stderr: io.Discard}).imageDelete(context.Background(), []string{
+			"snapshot-variant", "--provider", "azure", "--catalog-only",
+		})
+		if err == nil || !strings.Contains(err.Error(), "--catalog-only is AWS-only") {
+			t.Fatalf("error=%v", err)
+		}
+	})
+
+	t.Run("invalid Region is visible to the operator", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Query().Get("region") != "not-a-region" {
+				t.Fatalf("region=%q", r.URL.Query().Get("region"))
+			}
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"invalid_region","message":"region must be an AWS region name"}`))
+		}))
+		defer server.Close()
+		t.Setenv("CRABBOX_COORDINATOR", server.URL)
+
+		err := (App{Stdout: io.Discard, Stderr: io.Discard}).imageDelete(context.Background(), []string{
+			"ami-external", "--catalog-only", "--region", "not-a-region",
+		})
+		if err == nil || !strings.Contains(err.Error(), "region must be an AWS region name") {
+			t.Fatalf("error=%v", err)
+		}
+	})
+}
+
+func TestImagePromoteCatalogOnlyCoordinatorContract(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	t.Run("interspersed flags merge and coalesce capabilities", func(t *testing.T) {
+		var requests int
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests++
+			if r.Method != http.MethodPost || r.URL.Path != "/v1/images/ami-variant/promote-catalog" {
+				t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+			}
+			if got := r.URL.Query()["sdk"]; !reflect.DeepEqual(got, []string{"toolkit=2.0"}) {
+				t.Fatalf("sdk=%#v", got)
+			}
+			if got := r.URL.Query()["runtime"]; !reflect.DeepEqual(got, []string{"node=24"}) {
+				t.Fatalf("runtime=%#v", got)
+			}
+			var body struct {
+				VariantSelectors imageVariantSelectors `json:"variantSelectors"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			wantSelectors := imageVariantSelectors{
+				SDKs:     map[string]string{"toolkit": "2.0"},
+				Runtimes: map[string]string{"node": "24"},
+			}
+			if !imageVariantSelectorsEqual(body.VariantSelectors, wantSelectors) {
+				t.Fatalf("variantSelectors=%#v", body.VariantSelectors)
+			}
+			_, _ = w.Write([]byte(`{"image":{"id":"ami-variant","name":"variant","state":"available","region":"eu-west-1","catalogOnly":true,"variantSelectors":{"sdks":{"toolkit":"2.0"},"runtimes":{"node":"24"}}}}`))
+		}))
+		defer server.Close()
+		t.Setenv("CRABBOX_COORDINATOR", server.URL)
+		t.Setenv("CRABBOX_COORDINATOR_ADMIN_TOKEN", "admin-token")
+
+		var out bytes.Buffer
+		err := (App{Stdout: &out, Stderr: io.Discard}).imagePromote(context.Background(), []string{
+			"ami-variant",
+			"--catalog-only",
+			"--sdk", "toolkit=2.0",
+			"--variant-sdk", "toolkit=2.0",
+			"--variant-sdk", "toolkit=2.0",
+			"--variant-runtime", "node=24",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if requests != 1 {
+			t.Fatalf("requests=%d", requests)
+		}
+		if got, want := out.String(), "promoted image=ami-variant name=variant state=available region=eu-west-1 catalogOnly=true\n"; got != want {
+			t.Fatalf("output=%q, want %q", got, want)
+		}
+	})
+
+	tests := []struct {
+		name       string
+		status     int
+		response   string
+		want       string
+		forbidPath string
+	}{
+		{
+			name:       "old coordinator does not fall back",
+			status:     http.StatusNotFound,
+			response:   `{"error":"not_found"}`,
+			want:       "coordinator does not support catalog-only image promotion",
+			forbidPath: "/v1/images/ami-variant/promote",
+		},
+		{
+			name:     "response must confirm catalog only",
+			status:   http.StatusOK,
+			response: `{"image":{"id":"ami-variant","name":"variant","state":"available","variantSelectors":{"sdks":{"toolkit":"2.0"}}}}`,
+			want:     "coordinator did not confirm catalog-only promotion",
+		},
+		{
+			name:     "response must confirm selectors",
+			status:   http.StatusOK,
+			response: `{"image":{"id":"ami-variant","name":"variant","state":"available","catalogOnly":true,"variantSelectors":{"sdks":{"other":"2.0"}}}}`,
+			want:     "coordinator did not confirm variant selectors",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if test.forbidPath != "" && r.URL.Path == test.forbidPath {
+					t.Fatalf("catalog-only promotion fell back to %s", r.URL.Path)
+				}
+				w.WriteHeader(test.status)
+				_, _ = w.Write([]byte(test.response))
+			}))
+			defer server.Close()
+			t.Setenv("CRABBOX_COORDINATOR", server.URL)
+			t.Setenv("CRABBOX_COORDINATOR_ADMIN_TOKEN", "admin-token")
+
+			err := (App{Stdout: io.Discard, Stderr: io.Discard}).imagePromote(context.Background(), []string{
+				"--catalog-only", "--variant-sdk", "toolkit=2.0", "ami-variant",
+			})
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error=%v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestImagePromoteOrdinaryOutputCompatibility(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/images/ami-default/promote" {
+			t.Fatalf("path=%q", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"image":{"id":"ami-default","name":"default","state":"available","region":"eu-west-1"}}`))
+	}))
+	defer server.Close()
+	t.Setenv("CRABBOX_COORDINATOR", server.URL)
+	t.Setenv("CRABBOX_COORDINATOR_ADMIN_TOKEN", "admin-token")
+
+	var textOut bytes.Buffer
+	if err := (App{Stdout: &textOut, Stderr: io.Discard}).imagePromote(context.Background(), []string{"ami-default"}); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := textOut.String(), "promoted image=ami-default name=default state=available region=eu-west-1\n"; got != want {
+		t.Fatalf("text output=%q, want %q", got, want)
+	}
+
+	var jsonOut bytes.Buffer
+	if err := (App{Stdout: &jsonOut, Stderr: io.Discard}).imagePromote(context.Background(), []string{"ami-default", "--json"}); err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(jsonOut.Bytes(), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := decoded["catalogOnly"]; ok {
+		t.Fatalf("ordinary JSON gained catalogOnly: %s", jsonOut.String())
+	}
+	if _, ok := decoded["variantSelectors"]; ok {
+		t.Fatalf("ordinary JSON gained variantSelectors: %s", jsonOut.String())
+	}
+}
+
+func TestLeaseStatusRequiresSSHReadiness(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/leases/cbx_123" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"lease":{"id":"cbx_123","slug":"blue-crab","provider":"aws","target":"windows","windowsMode":"normal","state":"active","serverType":"m7i.4xlarge","host":"127.0.0.1","sshUser":"crabbox","sshPort":"22"}}`))
+	}))
+	defer server.Close()
+
+	cfg := Config{
+		Coordinator: server.URL,
+		Provider:    "aws",
+		SSHKey:      filepath.Join(t.TempDir(), "missing-key"),
+	}
+	setProviderSelection(&cfg, "aws", providerSelectionFlag)
+	state, err := (App{}).leaseStatus(context.Background(), cfg, "cbx_123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !state.HasHost {
+		t.Fatalf("HasHost=false, want true")
+	}
+	if state.TargetOS != targetWindows || state.WindowsMode != windowsModeNormal {
+		t.Fatalf("target=%s windowsMode=%s", state.TargetOS, state.WindowsMode)
+	}
+	if state.Ready {
+		t.Fatalf("Ready=true, want false when ssh readiness probe fails")
+	}
+}
+
+func curlConfigValueForTest(t *testing.T, config, key string) string {
+	t.Helper()
+	prefix := key + " = "
+	for _, line := range strings.Split(config, "\n") {
+		if strings.HasPrefix(line, prefix) {
+			var value string
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, prefix)), &value); err != nil {
+				t.Fatal(err)
+			}
+			return value
+		}
+	}
+	t.Fatalf("config key %q missing:\n%s", key, config)
+	return ""
+}

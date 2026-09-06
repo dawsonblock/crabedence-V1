@@ -1,0 +1,1189 @@
+# Provider Backends
+
+This is the contract reference for Crabbox provider backends: the interfaces a
+provider implements, how it registers, what core owns versus what the backend
+owns, and the checklist to land a new one. For the step-by-step walkthrough,
+read [Authoring a provider](features/provider-authoring.md) first, then use this
+page as the reference and review checklist.
+
+Read this when you are:
+
+- adding a new Crabbox provider;
+- choosing between an SSH lease backend and a delegated run backend;
+- adding provider-specific flags or config;
+- reviewing a provider PR for the right ownership boundary;
+- designing a future external provider plugin protocol.
+
+Every provider follows one rule:
+
+**Providers configure backends. Core commands own workflows.**
+
+That keeps `crabbox run`, `warmup`, `list`, `status`, `stop`, `cleanup`, Actions
+hydration, sync, result collection, rendering, and timing consistent across
+providers. A provider describes what it can do and returns a backend object. It
+does not fork the command surface.
+
+## Choose the backend shape
+
+Start by picking the execution model. A provider's `Configure` returns a
+`Backend`, and core inspects which interfaces that value implements.
+
+### SSH lease backend
+
+Use `SSHLeaseBackend` when the provider can hand Crabbox a reachable SSH target.
+
+Examples: Hetzner Cloud, AWS EC2, GCP Compute Engine, Azure VMs, Proxmox, a
+local Docker container, and static BYO SSH hosts.
+
+Core owns the entire workflow after acquisition:
+
+- claim and slug handling;
+- SSH readiness checks;
+- network target resolution;
+- sync and sync guardrails;
+- command wrapping and streaming;
+- JUnit/result collection;
+- Actions runner hydration over SSH;
+- heartbeat/touch;
+- release.
+
+The backend owns only the provider lifecycle:
+
+```go
+type SSHLeaseBackend interface {
+	Backend
+
+	Acquire(ctx context.Context, req AcquireRequest) (LeaseTarget, error)
+	Resolve(ctx context.Context, req ResolveRequest) (LeaseTarget, error)
+	List(ctx context.Context, req ListRequest) ([]LeaseView, error)
+	ReleaseLease(ctx context.Context, req ReleaseLeaseRequest) error
+	Touch(ctx context.Context, req TouchRequest) (Server, error)
+}
+```
+
+Implement this when `LeaseTarget.SSH` can be populated with host, port, user,
+key, work root, target OS, and Windows mode.
+
+When the provider's spec sets `Coordinator: CoordinatorSupported` and a broker
+URL is configured (`CRABBOX_COORDINATOR`), core wraps your `SSHLeaseBackend` in
+a coordinator lease backend automatically (`loadBackend` in
+`internal/cli/provider_backend.go`). Lease lifecycle then flows through the
+broker over HTTP, while sync and command execution still happen directly from
+the CLI to the SSH host. You do not implement that wrapper; you only provide the
+direct backend.
+
+### Delegated run backend
+
+Use `DelegatedRunBackend` when the provider owns execution itself instead of
+exposing a Crabbox-managed SSH target.
+
+Examples: Blacksmith Testbox, Blaxel, E2B, Islo, Modal, Tensorlake,
+[Upstash Box](https://upstash.com/docs/box/overall/quickstart), Superserve,
+Vercel Sandbox, and Azure Container Apps dynamic sessions, where the provider
+owns workspace setup and command streaming.
+
+The delegated backend owns warmup, command execution, output streaming, and
+stop. Core still owns provider selection, config loading, local claims, friendly
+slugs, timing summaries, and normalized list/status rendering.
+
+If the provider needs a custom remote runner model, deployment, or sandbox image
+to translate Crabbox workspaces and commands into provider-native requests, that
+runner must satisfy the
+[Delegated runner contract](features/delegated-runner-contract.md) before the
+provider is treated as merge-ready.
+
+```go
+type DelegatedRunBackend interface {
+	Backend
+
+	Warmup(ctx context.Context, req WarmupRequest) error
+	Run(ctx context.Context, req RunRequest) (RunResult, error)
+	List(ctx context.Context, req ListRequest) ([]LeaseView, error)
+	Status(ctx context.Context, req StatusRequest) (StatusView, error)
+	Stop(ctx context.Context, req StopRequest) error
+}
+```
+
+Delegated backends return normalized `StatusView` values. Rendering stays
+core-owned, so provider packages should not print their own `status` or `list`
+tables unless a compatibility interface explicitly asks for native output.
+
+A delegated backend must reject run/sync options that Crabbox cannot honor
+without a Crabbox-managed SSH target:
+
+```go
+if err := cli.RejectDelegatedSyncOptionsForSpec(spec, req); err != nil {
+	return RunResult{}, err
+}
+```
+
+Providers that declare `FeatureArchiveSync` (an archive upload of the checkout)
+can declare that feature in `spec` so `--sync-only` and `--force-sync-large`
+are allowed while the rest stay rejected. The helper rejects checksum sync,
+full resync, local stdout/stderr captures, capture-on-fail, downloads, artifact
+globs, uploaded scripts, env helpers, `--stop-after`, fresh PR checkouts, and
+`--emit-proof` (unless the provider declares `FeatureRunProof`) unless another
+explicit feature covers the request. Providers that execute source modules
+instead of shell commands may declare `FeatureModuleRun`; then `--script` and
+`--script-stdin` are accepted as module source input, while trailing shell
+command argv remains rejected. Delegated artifact globs require
+`FeatureRunArtifacts`: the backend validates and collects them within `Run`,
+returns them in `RunResult.Artifacts`, and completes collection before cleanup.
+There is no separate post-run artifact dispatch. Delegated single-file downloads
+require `FeatureRunDownloads` and `DelegatedRunDownloadBackend`;
+required artifacts may use either capability, but download-only providers accept
+safe relative file paths instead of globs. Do not pretend a delegated provider
+is SSH-like unless it has a stable SSH contract. If Crabbox cannot run rsync and
+remote commands itself, use `DelegatedRunBackend`.
+
+A hybrid backend implementing both interfaces may declare `FeatureSSHScriptRun`
+alongside `FeatureSSH`. Explicit `--script` / `--script-stdin` then select core's
+SSH run owner before input is read or a lease is acquired. Ordinary commands and
+warmup retain delegation. The capability cannot be combined with
+`FeatureModuleRun`; it does not weaken the delegated option guard or add a
+fallback after SDK errors. The selected backend must implement `SSHLeaseBackend`.
+
+Set `SSHTarget.AuthSecret` when the SSH username contains a provider credential.
+Noninteractive commands, input uploads, workspace-owner probes, and capture
+paths use the existing private OpenSSH config and a fixed host alias. The config
+is removed after the SSH command exits; the credential is never a `user@host`
+process argument. Managed targets without an explicit SSH-config route also
+exclude ambient identity files and agents. Ordinary keyed commands retain their
+multiplexing policy.
+
+`--no-sync` is validated by each adapter, not inferred from `FeatureArchiveSync`:
+some SDK/CLI transports support it without archive sync. An adapter that cannot
+skip transfer must reject it before acquisition or provider execution. Blacksmith
+Testbox does this because its native run command has no supported sync bypass.
+
+### Optional interfaces
+
+Add optional capabilities as small interfaces instead of widening every backend.
+
+Provider-owned idle activity during an SSH run is optional:
+
+```go
+type SSHRunActivityBackend interface {
+	BeginSSHRunActivity(context.Context, LeaseTarget) (stop func(), err error)
+}
+```
+
+Core calls this after lease admission and before remote setup and sync. On
+success, the provider returns a non-nil stop function that cancels and joins all
+activity work; core calls it on every exit. On failure, the provider leaves no
+background work running and core does not begin setup. Idle intervals, request
+budgets, and refresh policy belong to the provider. Daytona reuses its existing
+SDK activity lifecycle for direct SSH script runs.
+
+Provider-specific run admission belongs on the provider, beside config validation:
+
+```go
+type RunOptionsValidator interface {
+	ValidateRunOptions(RunRequest) error
+}
+```
+
+This hook must be side-effect-free: no `Configure`, backend creation, process
+spawning, credential lookup, lease resolution, state writes, or network calls.
+Core combines it with the generic delegated routing guard before normal run
+configuration and before prewarm configures or warms anything for a probe.
+Jobs also use this contract before acquisition or dry-run planning.
+Prewarm projects the actual follow-up flags and config, excluding creation-only
+flags. Its request has `ReuseLease: true` and an empty `ID` until allocation;
+a nonempty `ID` also implies reuse. The display placeholder `<lease>` is never
+a lease identifier. Effective lease settings and opaque provider routing are
+carried in `Options`. `NoSync`, `NoHydrate`, shell mode, and command intent are
+preserved. Runtime-only fields such as `Repo`, `RunID`, and `Env` may be absent;
+concrete claim/cache-volume checks remain in the subsequent run. Normal run
+retains its existing earlier output, environment, and profile preflights.
+
+Backends should reuse their provider's rejection policy defensively before any
+activity in direct `Run` calls. Skipping sync does not skip provider
+initialization; hydration intent is separate.
+
+Requested fixed lease IDs are optional:
+
+```go
+type IdempotentLeaseIDBackend interface {
+	SupportsRequestedLeaseID() bool
+}
+```
+
+Direct AWS, Machine0, and local-container backends implement this capability;
+coordinator-backed leases support it through the coordinator wrapper. External
+backends support it only when their configured protocol explicitly advertises
+idempotent lease IDs. `crabbox warmup --lease-id` rejects other backends before
+provisioning. Built-in direct adapters reuse `core.AcquireFixedLease` for
+durable intent and replay mechanics while keeping resource creation,
+reconciliation, and identity validation provider-owned.
+
+Cleanup is optional:
+
+```go
+type CleanupBackend interface {
+	Backend
+
+	Cleanup(ctx context.Context, req CleanupRequest) error
+}
+```
+
+Pause and resume are optional:
+
+```go
+type PausableBackend interface {
+	Backend
+
+	Pause(ctx context.Context, req PauseRequest) error
+	Resume(ctx context.Context, req ResumeRequest) error
+}
+```
+
+Declare `FeaturePauseResume` when implementing this interface so
+`crabbox providers` exposes the capability.
+
+List JSON compatibility is optional:
+
+```go
+type JSONListBackend interface {
+	Backend
+
+	ListJSON(ctx context.Context, req ListRequest) (any, error)
+}
+```
+
+`JSONListBackend` is a compatibility escape hatch for script-facing JSON shapes.
+Use it only when an existing provider already exposed a JSON schema different
+from the normalized `[]LeaseView` shape. Do not use it for new providers.
+
+Provider doctor checks are optional for direct providers that can prove cheap,
+non-mutating readiness:
+
+```go
+type DoctorBackend interface {
+	Backend
+
+	Doctor(ctx context.Context, req DoctorRequest) (DoctorResult, error)
+}
+```
+
+Use `DoctorBackend` when a provider owns direct credentials or a delegated runner
+outside the coordinator. The check must validate provider-specific readiness
+without creating resources, and it must not treat unrelated coordinator health as
+proof that the provider itself is configured correctly. Expose it through the
+matching provider-level hook so `doctor` does not configure every provider just
+to discover the optional capability:
+
+```go
+type DoctorProvider interface {
+	Provider
+
+	ConfigureDoctor(cfg Config, rt Runtime) (DoctorBackend, error)
+}
+```
+
+Native checkpoint and fork support follow the same pattern through
+`NativeCheckpointProvider` and `NativeCheckpointForkProvider`. Future
+provider-specific capability areas should add similarly narrow interfaces
+rather than widening the base backend. Live provider-owned machine catalogs use
+`ProviderSizeCatalogBackend`; core exposes them through `crabbox providers sizes
+<provider>` while the adapter retains size slugs, region availability, exact
+microcurrency prices, and GPU metadata.
+
+Failed-run evidence for SSH leases is also optional. A supporting backend may
+capture a bounded, per-command baseline immediately before execution and return
+a collector that core calls only after a nonzero exit or command-transport
+failure:
+
+```go
+type SSHRunFailureEvidenceBackend interface {
+	Backend
+	BeginRunFailureEvidence(context.Context, RunFailureEvidenceRequest) (RunFailureEvidenceCollector, error)
+}
+```
+
+The collector keeps provider-native counters and parsing inside the adapter. It
+returns only normalized `RunFailureEvidence` values; initially the sole resource
+exhaustion reason is `memory`. Baseline and collection errors are warnings and
+must never replace the command failure. A fresh collector is created for every
+command, including watch iterations and reused leases, so historical provider
+counters cannot be attributed to a later run.
+
+Exact status/heartbeat claim authorization is optional for providers with a
+runtime-derived ownership scope:
+
+```go
+type StatusTouchClaimAuthorizer interface {
+	AuthorizeStatusTouchClaim(context.Context, LeaseTarget, LeaseClaim) error
+}
+```
+
+Core requires an exact claim for the canonical provider before calling this
+hook. Implementations then own the full authorization decision; only `nil`
+permits a touch. They must validate the canonical lease and resource IDs, a
+non-empty current scope, and all provider-native context, endpoint, account,
+daemon, or immutable runtime identity recorded by the claim. Hydration may
+select the recorded runtime route, but it must not mutate or adopt ownership.
+Providers without this capability retain core's exact static provider-scope
+and resource comparison, plus any `StatusTouchClaimValidator` check.
+
+## Logical lease metadata
+
+Tag-backed adapters share the lease field schema and duplicate-value reduction
+in `internal/providers/shared/tag_labels.go`. DigitalOcean, Linode, and Vultr
+use this contract: contradictory ownership fields stay rejected, state tags
+retain the established precedence, and expiration/activity tags retain the
+largest parsed timestamp. Optional field groups are explicit; using the shared
+schema does not make an adapter accept another provider's metadata.
+
+Adapters still own the wire format: tag length limits, escaping, native API
+updates, and legacy/versioned decoding. In particular, Linode reconstructs its
+chunks before applying the logical schema, and malformed newer values cannot
+fall back to older ownership metadata. Provider/account checks and exact local
+claim fencing remain mandatory; decoded tags alone never authorize deletion.
+
+## Package layout
+
+Built-in providers live under `internal/providers/<name>`. The registry is
+populated by side-effect `init()` registration, gathered in
+`internal/providers/all`:
+
+```text
+internal/providers/all                  # side-effect imports of every provider
+internal/providers/shared               # shared lifecycle observation, operation locks, HTTP safety, and direct SSH helpers
+internal/providers/aws                  # AWS EC2 SSH lease backend (coordinator)
+internal/providers/azure                # Azure VM SSH lease backend (coordinator)
+internal/providers/azuredynamicsessions # Azure Container Apps delegated runner
+internal/providers/gcp                  # GCP Compute Engine SSH lease backend (coordinator)
+internal/providers/hetzner              # Hetzner Cloud SSH lease backend (coordinator)
+internal/providers/linode               # Linode SSH lease backend
+internal/providers/scaleway             # Scaleway SSH lease backend
+internal/providers/proxmox              # Proxmox VE SSH lease backend
+internal/providers/parallels            # Parallels macOS VM host SSH lease backend
+internal/providers/localcontainer       # local Docker container SSH backend
+internal/providers/multipass            # Canonical Multipass local Ubuntu VM SSH backend
+internal/providers/ssh                  # static / BYO SSH backend
+internal/providers/daytona              # Daytona SSH lease + delegated SDK backend
+internal/providers/kubevirt             # generic KubeVirt SSH backend
+internal/providers/external             # executable provider protocol
+internal/providers/tenki                # Tenki sandbox SSH backend
+internal/providers/namespace            # Namespace devbox SSH backend
+internal/providers/namespaceinstance    # Namespace Compute instance SSH backend
+internal/providers/semaphore            # Semaphore SSH lease backend
+internal/providers/sprites              # Sprites SSH backend
+internal/providers/exedev               # exe.dev SSH backend
+internal/providers/runpod               # RunPod GPU pod SSH backend
+internal/providers/nvidiabrev           # NVIDIA Brev GPU workspace SSH backend
+internal/providers/railway              # Railway.app service-control backend
+internal/providers/blacksmith           # Blacksmith Testbox delegated backend
+internal/providers/e2b                  # E2B delegated backend
+internal/providers/islo                 # Islo delegated backend
+internal/providers/modal                # Modal delegated backend
+internal/providers/opencomputer         # OpenComputer delegated backend
+internal/providers/opensandbox          # OpenSandbox delegated backend
+internal/providers/tensorlake           # Tensorlake delegated backend
+internal/providers/upstashbox           # Upstash Box delegated backend
+internal/providers/cloudflare           # Cloudflare Containers delegated backend
+internal/providers/cloudflaresandbox    # Cloudflare Sandbox bridge delegated backend
+internal/providers/crownest             # Crownest Workspace Runs delegated backend
+internal/providers/wandb                # Weights & Biases delegated backend
+```
+
+Each provider package owns registration, provider name, aliases, spec,
+provider-specific flags, backend configuration, provider clients, provider
+lifecycle code, and provider-specific tests. `cmd/crabbox` imports
+`internal/providers/all` for side-effect registration:
+
+```go
+import (
+	"github.com/openclaw/crabbox/internal/cli"
+	_ "github.com/openclaw/crabbox/internal/providers/all"
+)
+```
+
+The core provider contract lives in `internal/cli`:
+
+```text
+internal/cli/provider_backend.go      # interfaces, registry, request/result types
+internal/cli/provider_coordinator.go  # brokered coordinator lease wrapper
+internal/cli/provider_labels.go       # shared direct-provider label helpers
+```
+
+Provider packages may use small exported core helpers for claims, labels, sync
+preflight, timing JSON, and SSH key storage. Keep that helper surface narrow: if
+a provider needs broad command orchestration, the behavior probably belongs in
+core instead.
+
+`ParseCommandIntent` owns the distinction between literal argv and shell source
+for delegated POSIX command adapters. It reuses core shell inference and literal
+argument handling, snapshots the input, and rejects a missing command. The
+result's `Argv` method applies an adapter-supplied shell prefix only when needed;
+`ShellCommand` renders that execution argv for a string transport. An explicitly
+empty shell source remains valid. Pass all three request fields (`Command`,
+`ShellMode`, and `CommandLiteralArgs`) so profile arguments remain literal.
+Adapters retain their shell choice, working directory, environment transport,
+and execution lifecycle. Serialize the classified intent without running shell
+inference again.
+
+`ShellSource` targets a terminal workload in an already selected POSIX shell:
+shell intent stays source in that shell, while literal argv is quoted after
+`exec`. E2B and CubeSandbox use this boundary before their shared envd transport
+selects `/bin/bash -l -c`; SmolVM and Upstash Box likewise retain their existing
+source-only shell boundaries. Shell-local functions, builtins, and state require
+shell intent, not literal argv. Do not insert a second shell or reinterpret the
+rendered source before transport.
+
+`shared.WrapCommandWithShellEnvProfile` accepts execution argv, not unclassified
+user input. Its fallback quotes every word literally before terminal execution;
+it must not infer operators or assignments again. An exact three-word
+`bash -lc <body>` invocation reuses its body inside the existing profile wrapper,
+preserving the single login-shell boundary used by Modal and Tensorlake. Profile
+sourcing is failure-gated without adding global errexit to user source.
+
+Agent Sandbox and Nomad use `shared.ShellWorkspaceCommand` for their common
+POSIX-stdin wrapper: create and enter the workdir, export validated environment
+names in deterministic order, then execute the classified command. Pod and
+allocation readiness, stdin transport, timeout, and exit mapping remain local
+to each adapter. This wrapper is not the SSH command runner, whose environment
+and workspace setup contracts differ.
+
+Claim-only recovery adapters may use `shared.ResolveProviderClaimStrict` to
+resolve an exact provider/scope-bound claim before a slug while preventing a
+canonical lease ID from falling through. `shared.ValidateClaimBinding` compares
+only exact structural fields and required labels; retain the complete resolved
+claim, including its revision, as the snapshot for guarded mutations. Raw
+provider resource IDs, recovery-state interpretation, account and key
+authorization, live endpoint checks, and deletion remain adapter-owned and
+must not be inferred from the shared structural result.
+Use `shared.CloneLabels` for plain writable label copies; it returns an empty
+non-nil map for nil input. Keep preservation helpers local when missing, empty,
+and non-empty source values have provider-specific meaning.
+
+`shared.CommitClaimTouch` owns the exact-snapshot touch transaction used by
+Static SSH, Local Container, and Machine0: require the carried claim, run the
+adapter's authorization, validate an explicit idle replacement, prepare labels
+and one timestamp, then call the existing core claim compare-and-swap once.
+Preparation is deliberately lazy: authorization may first hydrate a recorded
+runtime route. Adapters retain identity checks, persisted-timeout defaults,
+label/TTL representation, and public result projection; they update caches only
+after the committed claim is returned. The helper does not mutate a native
+resource, create a missing claim, or replace core's checkpoint-journal fence.
+
+Lifecycle polling is the exception that belongs in
+`internal/providers/shared`, not command core. `shared.Poll` centralizes only
+the repeated read mechanics: last-success retention, attempt limits,
+context-aware waits, and optional progress. The adapter creates any timeout or
+detached context and maps its cause. It also keeps native state semantics,
+retryability, identity and ownership validation, side effects, diagnostics,
+and exact error text; the helper does not normalize states, mutate claims,
+detach contexts, call provider actions, or log.
+
+Cross-process provider lease serialization also belongs in
+`internal/providers/shared`. `shared.LockLeaseOperation` owns the in-process
+semaphore, advisory file lock, retry cadence, and idempotent release. Adapters
+retain provider-specific lease ID validation, namespace preparation, and
+diagnostics; the provider name selects the existing on-disk lock filename.
+
+Strict one-request/one-response JSON subprocesses may use
+`internal/providers/shared/procjson`. It owns bounded capture, cancellation
+grace, request encoding, and exact single-document decoding. Keep response
+envelopes, versions, identity checks, redaction, and provider error semantics in
+the adapter. Do not use it for noisy CLI output, streaming or NDJSON protocols,
+or commands with ambiguous side effects.
+
+The local command runner preserves caller cancellation/deadline causes when
+its context watcher interrupts a child that then exits by signal. It retains
+the underlying process error and does not relabel observed nonnegative exits,
+post-exit capture cleanup, or output-limit failures as cancellation. This is a
+POSIX signal-termination guarantee; Windows forced-termination codes remain
+unchanged. It does not prove that canceling a bridge stops its remote workload.
+
+Vanilla provider HTTP redirect policy also belongs in
+`internal/providers/shared`. `shared.SecureHTTPClient` clones an injected
+client, rejects destinations outside a trusted `shared.SameOrigin`, preserves
+an existing redirect hook, and otherwise applies the standard redirect limit.
+The adapter supplies the exact refusal error and retains any additional path,
+method, transport, previous-hop, or provider-specific origin policy locally.
+
+Runpod and Hostinger share finite response consumption through
+`shared.DecodeBoundedJSONResponse`: close the body, read at most the adapter's
+limit plus one byte, reject read failures and overflow before interpreting
+HTTP status, then optionally decode one JSON value. The adapter retains its
+typed API error and redaction policy, so capacity retry and purchase ambiguity
+classification remain provider-owned. This does not apply to streaming
+responses or change request construction, redirects, or client timeouts.
+
+## Acquisition stays adapter-owned
+
+SSH lease acquisition is a provider-owned transaction, not a shared sequence of
+create, claim, bootstrap, and cleanup steps. Similar-looking acquisition bodies
+protect different ownership windows, credential dependencies, failure policies,
+and security boundaries. Share small primitives without centralizing their order.
+
+Acquisition already shares the mechanics that have provider-neutral contracts:
+
+- `shared.AcquireAttemptsRetry` retries eligible fresh acquisitions outside the
+  individual provider transaction and preserves bootstrap-failure/keep policy.
+- `core.NewLeaseID` and `core.AllocateDirectLeaseSlug` generate lease identities
+  and collision-safe slugs using inventory selected by the adapter.
+- `core.EnsureTestboxKeyForConfig` creates Crabbox-owned per-lease SSH keys;
+  `core.ProviderKeyForLease` names provider-side keys when applicable.
+- `shared.Poll` repeats observations while the adapter owns readiness predicates,
+  identity checks, side effects, timeouts, and diagnostics.
+- `core.SSHTargetFromConfig` constructs conventional SSH endpoints, and
+  `core.WaitForSSHReady` proves the common SSH bootstrap contract.
+- `shared.ClaimBinding`, `shared.ValidateClaimBinding`,
+  `shared.ResolveProviderClaimStrict`, and `shared.ErrStrictClaimMismatch`
+  validate structural identity and exact provider/scope-bound claim lookup;
+  `shared.CloneLabels` supplies writable label copies.
+- `core.AcquireFixedLease`, `core.FixedAcquireOptions`,
+  `core.FixedLeaseBinding`, and `core.FixedLeaseKind` already share durable
+  fixed-ID intent locking, replay validation, acquired-state commit, and
+  terminal tombstones for AWS, Machine0, and local-container. Their adapters
+  still own exact create attempts, provider reconciliation, and immutable
+  resource identity.
+
+The transaction boundary deliberately remains inside each adapter:
+
+- **Claim-persistence windows:** Lume persists storage-fenced ownership before
+  cloning, DigitalOcean writes a recovery claim after an ambiguous provider
+  mutation, and Hetzner returns an unclaimed successful target for command core
+  to claim. Moving every claim before creation or after readiness changes crash
+  recovery and ownership; purchase recovery records and repeated guarded claim
+  transitions likewise remain in their original provider-defined windows.
+- **Rollback ordering:** Hetzner deletes its provider key before its server;
+  Vultr deletes the instance first and preserves its key when instance deletion
+  fails; Vast detaches its instance key before destruction. Hostinger cannot
+  cancel or delete an already purchased server and may only stop it. A generic
+  cleanup stack cannot preserve these access, ownership, and billing boundaries.
+- **Credential ownership and ambiguous outcomes:** Morph receives a
+  provider-issued private key after boot, and Machine0 materializes a
+  provider-managed key and validates immutable-machine trust. Neither may be
+  forced through `core.EnsureTestboxKeyForConfig`; providers with separately
+  created account keys must also distinguish owned keys, reused keys, and
+  unresolved mutations before deciding what to retain or delete.
+- **`Keep` failure semantics:** Morph may retain a failed acquisition when
+  `Keep` is true; Scaleway normally does the same but forces rollback when
+  `OnAcquired` fails; Hostinger remains financially committed regardless of
+  whether its purchased server is stopped. Other providers intentionally roll
+  back failed creation even with `Keep`, so retention cannot be a global rule.
+- **`OnAcquired` placement:** Lume acknowledges an early provisional identity,
+  Vast acknowledges after readiness but before its final claim, and fixed-ID
+  Machine0 and local-container acknowledge only after durable commit and lock
+  release. Moving the callback changes when controller ownership transfers and
+  which transaction must clean up if acknowledgment fails.
+- **Security-critical bootstrap ordering:** Hyper-V locks down guest SSH before
+  attaching networking; Lume pins authenticated guest identity before accepting
+  SSH; Vast probes initial access, installs required tools, and only then proves
+  full readiness. A universal endpoint-then-SSH sequence would erase required
+  isolation, identity, or staged-bootstrap guarantees.
+
+Review proposals to centralize acquisition orchestration against every existing
+provider: they must preserve exact claim windows, rollback and credential
+ordering, `Keep` failure behavior, callback placement, and security-critical
+bootstrap sequencing. A preparation-only helper for IDs, slugs, and local keys
+was also evaluated across ten compatible providers; its estimated savings of
+only 20–70 lines did not cover the additional state, callback plumbing, and
+semantic tests required by the mechanism. Keep acquisition adapter-owned unless
+a future proposal proves both behavior preservation and meaningful net value.
+## Shared run sequencing and provider authority
+
+`shared.RunDelegatedSandbox` owns the common sandbox run sequence: preflight,
+archive preparation, acquisition or resolution, setup, sync, command execution,
+and one final retention/cleanup decision before timing and session reporting.
+E2B, Modal, Cloudflare Sandbox, OpenSandbox, Nomad's persistent shell
+allocations, Superserve, and Azure Dynamic Sessions use this sequence. The shared
+owner preserves the primary command/cancellation outcome when cleanup also
+fails, reports cleanup-only failure as a failed run, and keeps the session
+marked retained until deletion succeeds. Adapter-held operation locks span
+finalization when present.
+
+Adapters supply operations, not a generic provider API. They retain exact claim
+and account authorization, native creation and ambiguous-create recovery,
+absolute lifetime checks, transport and environment handling, remote command
+cancellation, and verified deletion/claim-removal ordering. A returned resource
+ID alone does not grant cleanup authority: `Acquire` and `Resolve` must bind an
+authorized resource before a session is published. Partial-creation rollback
+stays with the adapter.
+
+An adapter may separate authorized reuse from readiness with `AdmitReuse`.
+OpenSandbox first binds the exact endpoint/ownership marker and repository
+claim in `Resolve`; admission then checks the absolute TTL, resumes if needed,
+rechecks the remaining budget, and only then persists reclaim/activity state.
+Failed admission still returns the authorized retained session and releases its
+lock, but does not refresh activity or suggest rerunning an unusable lease.
+Cancellation before admission cannot trigger resume; cancellation after resume
+is checked before mutating the local claim. Successful admission enables normal
+run finalization. Providers without this extra boundary keep their existing
+resolution behavior.
+
+Superserve keeps its lease-operation lock through final reporting and activates
+reused sandboxes in `AdmitReuse`; failed activation returns the retained session
+without the post-run activity refresh. Its acquisition rollback keeps the
+original create-response ID even when metadata setup fails or returns a different
+ID. Azure Dynamic Sessions supplies deletion behind its original claim snapshot
+and bounds both claim-lock waiting and the stop request. Neither adapter gives
+the shared sequencer authority to discover, adopt, or delete arbitrary resources.
+
+Other delegated backends can adopt this owner when their session model fits;
+do not copy its result, timing, keep-on-failure, and cleanup bookkeeping into a
+new adapter. Distinct operations remain explicit: a finite batch job, a
+stateless local process, a retained billed VPS, and an interactive sandbox do
+not acquire the same deletion policy just because each can execute a command.
+Nomad keeps one provider-owned job-creation operation for warmup and fresh Run,
+and confirms scheduler convergence before removing an unchanged claim. Its reuse
+and retained-activity updates fence the captured claim revision instead of
+adopting a replacement. Docker clone-mode retention must preserve unfetched
+commits.
+
+Supporting mechanics remain reusable independently: `procjson.Exchange` for
+bounded subprocess JSON, `shared.Poll` for observations, operation locks for
+serialization, `core.RunDelegatedArchiveSync` for staged archive replacement,
+and scoped claim helpers for guarded local state. None of these grants native
+resource ownership or proves that canceling transport stopped a remote command.
+
+Archive preparation has one implementation with two caller lifetimes.
+`core.PrepareDelegatedArchive` returns an owned, seekable snapshot and cancels
+its preparation context before provisioning. A later sync charges the saved
+archive duration against a fresh transfer budget, excluding the provisioning
+gap. A sync that prepares its own archive keeps the same deadline continuously
+through archive construction and transfer; manifest planning and guardrails
+remain outside that budget. Both paths close and remove the owned archive on
+success or failure, and remote cleanup keeps its independent bounded context.
+
+## Provider registration
+
+A provider implements `cli.Provider`:
+
+```go
+type Provider interface {
+	Name() string
+	Aliases() []string
+	Spec() ProviderSpec
+
+	RegisterFlags(fs *flag.FlagSet, defaults Config) any
+	ApplyFlags(cfg *Config, fs *flag.FlagSet, values any) error
+
+	Configure(cfg Config, rt Runtime) (Backend, error)
+}
+```
+
+A minimal SSH provider package:
+
+```go
+package example
+
+import (
+	"flag"
+
+	"github.com/openclaw/crabbox/internal/cli"
+)
+
+func init() {
+	cli.RegisterProvider(Provider{})
+}
+
+type Provider struct{}
+
+func (Provider) Name() string      { return "example" }
+func (Provider) Aliases() []string { return nil }
+
+func (Provider) Spec() cli.ProviderSpec {
+	return cli.ProviderSpec{
+		Name: "example",
+		Kind: cli.ProviderKindSSHLease,
+		Targets: []cli.TargetSpec{
+			{OS: "linux"},
+		},
+		Features: cli.FeatureSet{
+			cli.FeatureSSH,
+			cli.FeatureCrabboxSync,
+		},
+		Coordinator: cli.CoordinatorNever,
+	}
+}
+
+func (Provider) RegisterFlags(*flag.FlagSet, cli.Config) any {
+	return cli.NoProviderFlags()
+}
+
+func (Provider) ApplyFlags(*cli.Config, *flag.FlagSet, any) error {
+	return nil
+}
+
+func (p Provider) Configure(cfg cli.Config, rt cli.Runtime) (cli.Backend, error) {
+	return cli.NewExampleLeaseBackend(p.Spec(), cfg, rt), nil
+}
+```
+
+`NewExampleLeaseBackend` stands in for the backend constructor you add for the
+provider. Existing providers use constructors such as `NewAWSLeaseBackend` and
+`NewBlacksmithBackend`.
+
+Then add the side-effect import in `internal/providers/all/all.go`:
+
+```go
+import _ "github.com/openclaw/crabbox/internal/providers/example"
+```
+
+Tests in `internal/cli` do not import `internal/providers/all`, because that
+would create an import cycle. Register test providers from a same-package test
+file when testing core dispatch.
+
+## Provider spec
+
+`ProviderSpec` is command-facing metadata:
+
+```go
+type ProviderSpec struct {
+	Name        string
+	Family      string
+	Kind        ProviderKind
+	Targets     []TargetSpec
+	Features    FeatureSet
+	Coordinator CoordinatorMode
+	// TailscaleEgressOnly marks FeatureTailscale as outbound userspace access,
+	// not a bidirectional peer endpoint.
+	TailscaleEgressOnly bool
+}
+```
+
+Use canonical provider names in docs and config. Aliases are for compatibility
+only. `Family` groups related providers so a flag set by one can route to a
+sibling (for example, the Azure family covers `azure` and
+`azure-dynamic-sessions`); leave it empty to default to the provider name.
+
+Pick `Kind` carefully:
+
+- `ProviderKindSSHLease`: provider returns SSH targets and Crabbox owns sync/run.
+- `ProviderKindDelegatedRun`: provider owns execution and output streaming.
+- `ProviderKindServiceControl`: provider inspects or controls an existing
+  hosted service instead of leasing a run surface (for example `railway` and
+  `fastapi-cloud`).
+
+`Targets` should describe what the provider can actually satisfy. Use `linux`,
+`macos`, or `windows` only for real operating-system targets. Use
+`worker-runtime` for Worker-isolate or module-runtime providers that execute
+source in a hosted runtime without POSIX shell, SSH, filesystem sync, ports, or
+desktop semantics. Do not list `windows`, `macos`, `desktop`, `browser`, or
+`code` unless the backend supports that path end to end.
+
+Feature flags are concrete capability declarations:
+
+```go
+cli.FeatureSSH          // "ssh"
+cli.FeatureCrabboxSync  // "crabbox-sync"
+cli.FeatureArchiveSync  // "archive-sync"
+cli.FeatureCleanup      // "cleanup"
+cli.FeatureDesktop      // "desktop"
+cli.FeatureBrowser      // "browser"
+cli.FeatureCode         // "code"
+cli.FeatureTailscale    // "tailscale"
+cli.FeatureURLBridge    // "url-bridge"
+cli.FeatureCheckpoint   // "workspace-checkpoint"
+cli.FeatureFork         // "workspace-fork"
+cli.FeatureRestore      // "workspace-restore"
+cli.FeatureSnapshot     // "provider-snapshot"
+cli.FeatureCacheVolume  // "cache-volume"
+cli.FeatureRunProof     // "run-proof"
+cli.FeatureRunSession   // "run-session"
+cli.FeatureModuleRun    // "module-run"
+cli.FeatureSSHScriptRun // "ssh-script-run"
+cli.FeatureRunArtifacts // "run-artifacts"
+cli.FeaturePreparedArtifactWorkspace // "prepared-artifact-workspace"
+cli.FeatureRunDownloads // "run-downloads"
+cli.FeaturePauseResume  // "pause-resume"
+cli.FeatureMCP          // "mcp-attachments"
+```
+
+Actions runner hydration is intentionally not a provider feature. It is a core
+SSH-over-Linux/Windows workflow that requires an SSH lease backend, a
+`linux`/`windows` target, and no delegated execution.
+
+Set `CoordinatorSupported` only when the Crabbox broker can provision that
+provider. Today that is the managed cloud set (`aws`, `azure`, `daytona`, `gcp`,
+`hetzner`). A direct-only SSH provider should use `CoordinatorNever`. Even a
+`CoordinatorSupported` provider runs direct from the CLI until a broker URL/token
+is configured.
+
+Checkpoint-related features are reserved for versioned workspaces:
+
+- `FeatureCheckpoint`: provider can create a provider-aware checkpoint.
+- `FeatureFork`: provider can create a new workspace from a checkpoint.
+- `FeatureRestore`: provider can restore an existing workspace to a checkpoint.
+- `FeatureSnapshot`: provider can expose a native snapshot id for Crabbox
+  metadata.
+- `FeatureCacheVolume`: provider can mount keyed rebuildable cache volumes on
+  warmup/run.
+- `FeatureRunProof`: delegated provider can return bounded stream/timing metadata
+  for core `crabbox run --emit-proof` rendering.
+- `FeatureRunSession`: exposes a provider-neutral run-session handle. Delegated
+  adapters may return it in `RunResult`; an explicitly opted-in SSH-lease
+  provider may have core emit it after claim recording. SSH participants must
+  also advertise `FeatureSSH` and `FeatureCleanup`. AWS and `local-container`
+  use this core-owned SSH contract; providers do not construct the handle
+  themselves. A brokered run ID identifies coordinator history, while a direct
+  run ID is only local correlation metadata.
+- `FeatureRunArtifacts`: delegated provider validates and collects bounded run
+  artifact globs within `Run`, including required artifacts. Publication and
+  failure eligibility follow the provider's execution contract.
+- `FeaturePreparedArtifactWorkspace`: artifact supervision can capture a
+  CI-prepared workspace before workload code starts, independently of the
+  workload's entry directory. Requires `FeatureRunArtifacts`; this static fact
+  does not validate a particular lease's binding.
+- `FeatureRunDownloads`: delegated provider can materialize bounded single-file
+  downloads and validate safe relative single-file required artifacts after a
+  successful command.
+- `FeatureModuleRun`: delegated provider accepts `--script` or `--script-stdin`
+  as source module input and does not interpret trailing argv as a shell command.
+- `FeatureMCP`: delegated provider can attach MCP server references during
+  sandbox creation.
+- `FeatureArchiveSync`: provider syncs the checkout as an uploaded archive rather
+  than over rsync.
+- `FeatureURLBridge`: delegated provider can expose a lease's port through the
+  broker URL bridge.
+
+Do not set the checkpoint flags for plain SSH access alone. Generic
+Git/archive/log checkpoints are core-owned and work even when a provider
+advertises no native checkpoint features.
+
+`crabbox providers --json` also exposes a normalized `workspace` array derived
+from these feature flags:
+
+| Feature | Workspace capability |
+| --- | --- |
+| `FeatureCheckpoint` | `checkpoint` |
+| `FeatureFork` | `fork` |
+| `FeatureRestore` | `restore` |
+| `FeatureSnapshot` | `snapshot-ref` |
+
+Use that normalized field for workflow selection and external comparisons. Keep
+provider-specific snapshot names, CRDs, image IDs, and fork engines behind the
+provider adapter.
+
+The same provider matrix exposes normalized run-evidence capabilities:
+
+| Feature | Evidence capability |
+| --- | --- |
+| `FeatureRunProof` | `proof` |
+| `FeatureRunArtifacts` | `artifacts` |
+| `FeatureRunDownloads` | `downloads` |
+| `FeatureURLBridge` | `preview-url` |
+| `FeatureRunSession` | `session` |
+
+`providers recommend run-evidence` requires at least one proof, artifact,
+download, or preview-url capability. A bare session handle is useful metadata,
+but it is not enough by itself to claim the provider returns user-facing
+evidence.
+
+## Flags and config
+
+Provider flags are registered before parsing because Go's `flag` package rejects
+unknown flags. `RegisterFlags` must be cheap and side-effect free. It returns an
+opaque values struct passed back into `ApplyFlags` only after config and common
+flags select the provider.
+
+The same real registration is the source for `crabbox providers describe`.
+Discovery passes `baseConfig()` compiled defaults, attributes flags added by
+each `Provider.RegisterFlags` invocation, and treats everything else registered
+by `run` as a shared command flag. It never calls `ApplyFlags` or `Configure`.
+Do not add a parallel flag inventory.
+
+Pattern for a provider with typed config fields:
+
+```go
+type exampleFlagValues struct {
+	Region *string
+}
+
+func (Provider) RegisterFlags(fs *flag.FlagSet, defaults cli.Config) any {
+	return exampleFlagValues{
+		Region: fs.String("example-region", defaults.Example.Region, "Example region"),
+	}
+}
+
+func (Provider) ApplyFlags(cfg *cli.Config, fs *flag.FlagSet, values any) error {
+	v, ok := values.(exampleFlagValues)
+	if !ok {
+		return nil
+	}
+	if cli.FlagWasSet(fs, "example-region") {
+		cfg.Example.Region = *v.Region
+	}
+	return nil
+}
+```
+
+Custom repeatable string-list values must also implement `flag.Getter` and
+return a defensive `[]string` copy. Discovery supports standard string, bool,
+int, int64, float64, and duration values and fails closed on any other custom
+getter type. Routing names from `ProviderRoutingFlagProvider` and create-only
+names from `ProviderCreationOnlyFlagProvider` must resolve to flags registered
+by that provider.
+
+Register renamed compatibility flags with their canonical spelling and annotate
+them in place with `cli.MarkFlagDeprecated(fs, "old-name", "new-name")`. The
+annotation checks that both registered flags exist, feeds discovery metadata,
+and leaves help, parsing, and provider-owned canonical-wins application logic
+unchanged.
+
+`Config` does not have a generic provider config bag. New provider packages
+should either add typed config fields and use `cli.FlagWasSet` from the provider
+package, or expose a small provider-specific flag helper from `internal/cli` (as
+Blacksmith does) when the config type is not ready to export cleanly.
+
+If a provider needs durable config, add typed config fields in `Config` and env
+overrides in `config.go`.
+
+Never pass provider secrets as command-line arguments. Use environment variables,
+local SDK config, the broker, or a credential store outside repo config.
+
+## Runtime
+
+Backends receive a narrow runtime:
+
+```go
+type Runtime struct {
+	Stdout io.Writer
+	Stderr io.Writer
+	Clock  Clock
+	HTTP   *http.Client
+	Exec   CommandRunner
+}
+```
+
+Use it instead of `App`, global clocks, or package-level command hooks.
+
+Delegated CLI integrations must use `Runtime.Exec`:
+
+```go
+result, err := rt.Exec.Run(ctx, cli.LocalCommandRequest{
+	Name:   "provider-cli",
+	Args:   args,
+	Stdout: rt.Stdout,
+	Stderr: rt.Stderr,
+})
+```
+
+This gives tests a fake command runner and avoids package-level
+`exec.CommandContext` seams. Use `Runtime.Clock` for timing and `Runtime.Stdout`
+/ `Runtime.Stderr` for streaming and warnings.
+
+## Implementing an SSH lease backend
+
+An SSH lease backend returns a complete `LeaseTarget`:
+
+```go
+type LeaseTarget struct {
+	Server      Server
+	SSH         SSHTarget
+	LeaseID     string
+	Coordinator *CoordinatorClient
+}
+```
+
+`Acquire` should:
+
+1. validate direct-provider prerequisites;
+2. mint or accept the lease id handled by the request path;
+3. ensure or install the SSH key;
+4. provision the machine or sandbox;
+5. wait until an address exists;
+6. populate `SSHTarget`;
+7. wait for SSH readiness when the provider owns boot;
+8. mark provider labels/tags as ready;
+9. return `LeaseTarget`.
+
+`Resolve` should accept canonical lease IDs, provider IDs, names, and slugs where
+the provider can support them. It should return the stored per-lease SSH key when
+available.
+
+`List` returns normalized `LeaseView` values. Do not print from `List`; command
+rendering belongs to core.
+
+`Touch` should update provider labels/tags with idle and state metadata when the
+provider supports it. `TouchRequest.IdleTimeoutOverride` is non-nil only for an
+explicit replacement; omission must preserve the persisted timeout. Static and
+local-runtime providers must atomically compare-and-swap lifecycle labels and
+an optional timeout into the exact canonical local claim, then reconstruct
+later `Resolve` results from that claim. `Touch` must require the exact claim
+snapshot carried by `Resolve` and revalidate ownership before the CAS. An
+in-memory-only touch is not durable enough for heartbeat.
+
+`ReleaseLease` should be idempotent where practical. Remove local claims after the
+provider release succeeds or is known to be unnecessary.
+
+If cleanup is meaningful, implement `CleanupBackend`. Cleanup should honor
+`DryRun`, log skip/delete decisions to stderr, and use provider labels to avoid
+deleting unrelated machines.
+
+Direct providers that authorize cleanup from an exact local claim should set
+`DirectSSHBackend.PrepareCleanup`. Core expiration and `keep` filtering runs
+first; the preparation hook then performs read-only provider/account/claim
+validation, attaches the exact revisioned claim snapshot to its returned
+`Server`, and returns a typed skip reason when the candidate is ineligible.
+Shared cleanup then reapplies the expiration/keep gate to both the refreshed
+server and its carried claim, so a renewal observed during preparation wins.
+Dry-run still calls this read-only preparation but never calls `Delete`.
+`CleanupEligible` remains available for unmigrated adapters, but a backend must
+not configure both hooks.
+
+The matching delete path must require the carried snapshot and pass it to
+`RemoveLeaseClaimIfUnchangedAfter`. Put only the provider delete (or a no-op for
+a confirmed-absent resource) in that action: do not read, update, or remove
+claims while the claim lock is held. If recovery must first bind a discovered
+resource, durably CAS that update before the final lock and use the returned
+claim as the new expected snapshot. Remove stored keys only after the locked
+provider action and durable claim removal both succeed. This closes the unsafe
+validate-then-delete window where a lease can be renewed or reclaimed between
+authorization and provider mutation.
+
+## Implementing a delegated run backend
+
+A delegated backend should preserve Crabbox ergonomics while letting the provider
+own the remote workflow.
+
+`Warmup` should:
+
+1. validate provider-specific workflow config;
+2. create or warm the provider resource;
+3. claim the resource locally with provider name and slug;
+4. print the standard warmup summary;
+5. write timing JSON when requested.
+
+`Run` should:
+
+1. reject unsupported Crabbox sync options;
+2. acquire a resource or resolve an existing id/slug;
+3. claim/reclaim the resource for the repo;
+4. stream provider output through `Runtime.Stdout` and `Runtime.Stderr`;
+5. return `RunResult`;
+6. stop temporary resources when `Keep` is false.
+
+`List` and `Status` should return normalized views. If the provider only offers a
+table or lossy native status shape, keep that parsing inside the backend.
+
+`Stop` should stop the provider resource, remove local claims, and remove local
+per-resource keys if the backend created them.
+
+Do not make delegated providers support `crabbox ssh`, `vnc`, `webvnc`,
+`screenshot`, `code`, or Actions runner hydration unless the provider exposes a
+stable connection contract that preserves Crabbox's security boundary.
+
+## Rendering
+
+Backends return values. Core renders output.
+
+`ListRequest` and `StatusRequest` intentionally do not carry JSON flags. The
+command handler decides whether to render human output or JSON.
+
+`JSONListBackend` is the only exception, for compatibility with older
+script-facing JSON schemas. It should not be used for new providers.
+
+That rule keeps `crabbox list --json`, `crabbox status --json`, human tables, and
+future UI/plugin consumers consistent across backend kinds.
+
+## External provider plugins
+
+External process plugins are not implemented yet. Do not add a provider that
+depends on an undocumented stdio protocol.
+
+The intended direction is:
+
+- a built-in Go provider package discovers and configures the external process;
+- the process speaks JSON over stdio;
+- the Go side adapts it to `SSHLeaseBackend` or `DelegatedRunBackend`;
+- core commands still render list/status and own SSH workflows where applicable.
+
+Expected rough command shape:
+
+```text
+provider-plugin capabilities
+provider-plugin acquire
+provider-plugin resolve
+provider-plugin list
+provider-plugin release
+provider-plugin touch
+provider-plugin run
+provider-plugin status
+provider-plugin stop
+```
+
+The external protocol should not bypass the backend interfaces. It is an
+implementation detail behind a normal registered provider.
+
+## Tests
+
+Add tests at the lowest level that proves the contract.
+
+For provider registration:
+
+- canonical name resolves through `ProviderFor`;
+- aliases resolve where promised;
+- `Spec` has the expected kind, targets, features, and coordinator mode;
+- provider-specific flags apply only after selection.
+
+For SSH lease backends:
+
+- acquire success returns a `LeaseTarget` with host, user, port, key, lease id;
+- acquire failure releases partial resources when possible;
+- resolve supports lease id and supported aliases;
+- list returns normalized views without printing;
+- touch updates labels/tags and honors state/idle timeout;
+- release removes claims and provider resources;
+- cleanup honors dry-run.
+
+For delegated run backends:
+
+- sync-only/checksum/force-large options are rejected as the spec dictates;
+- new run acquires, claims, streams, and stops when `Keep=false`;
+- existing id/slug resolves and claims correctly;
+- list/status parse provider output into normalized views;
+- stop removes claims and local keys;
+- all subprocess calls go through `Runtime.Exec`.
+
+Use fake `CommandRunner`, fake clocks, fake HTTP clients, and provider test
+clients. Avoid live provider calls in unit tests.
+
+Run at least:
+
+```sh
+go test -count=1 ./internal/cli ./internal/providers/...
+go test -count=1 ./...
+go vet ./...
+scripts/check-docs.sh
+```
+
+For high-risk provider changes, also run:
+
+```sh
+go test -race -count=1 ./internal/cli
+go build -trimpath -o bin/crabbox ./cmd/crabbox
+```
+
+Add live smoke only when credentials and cost boundaries are explicit.
+
+## Review checklist
+
+Before landing a new backend:
+
+- The provider has a folder under `internal/providers/<name>`.
+- The provider is imported by `internal/providers/all`.
+- `Name` is canonical and docs use that name.
+- Compatibility aliases are intentional and tested.
+- `ProviderSpec.Kind` matches the real execution model.
+- `Family` is set when the provider routes flags to a sibling.
+- Targets and features describe implemented behavior only.
+- Coordinator mode is `CoordinatorNever` unless the broker can provision it.
+- Provider flags are registered before parse and applied only after selection.
+- Secrets are not stored in repo config or passed in argv.
+- `list` and `status` return normalized values instead of printing.
+- Delegated providers reject unsupported sync options.
+- SSH providers do not own core sync/run/rendering.
+- Tests cover command dispatch and backend behavior without live credentials.
+- Docs and the [source map](source-map.md) are updated.
+
+## See also
+
+- [Authoring a provider](features/provider-authoring.md): step-by-step guide.
+- [Provider Reference](providers/README.md): the full provider catalog.
+- [Concepts](concepts.md): how providers fit the lease/run model.

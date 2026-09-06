@@ -1,0 +1,461 @@
+package cloudflaresandbox
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/openclaw/crabbox/internal/providers/shared"
+)
+
+func TestBridgeFallbackBoundsControlAndPreservesExecStream(t *testing.T) {
+	const controlTimeout = 30 * time.Millisecond
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/sandbox/sb_123":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"id":`)
+			w.(http.Flusher).Flush()
+			<-r.Context().Done()
+		case "/v1/sandbox/sb_123/exec":
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "event: stdout\n"+`data: {"chunk":"started"}`+"\n\n")
+			w.(http.Flusher).Flush()
+			time.Sleep(3 * controlTimeout)
+			_, _ = io.WriteString(w, "event: exit\n"+`data: {"exitCode":0}`+"\n\n")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	control, data := cloudflareSandboxHTTPClients(nil, controlTimeout)
+	trusted, _ := url.Parse(server.URL)
+	client := &client{
+		baseURL:  server.URL,
+		token:    "test-token",
+		http:     shared.SecureHTTPClient(control, trusted, cloudflareSandboxRedirectError),
+		dataHTTP: shared.SecureHTTPClient(data, trusted, cloudflareSandboxRedirectError),
+	}
+	started := time.Now()
+	_, err := client.GetSandbox(context.Background(), "sb_123")
+	if err == nil || !strings.Contains(err.Error(), context.DeadlineExceeded.Error()) {
+		t.Fatalf("GetSandbox error=%v, want whole-request deadline", err)
+	}
+	controlElapsed := time.Since(started)
+	if controlElapsed >= time.Second {
+		t.Fatalf("stalled control response bounded after %s, want under 1s", controlElapsed)
+	}
+
+	started = time.Now()
+	result, err := client.Exec(context.Background(), "sb_123", execRequest{Command: "true"}, io.Discard, io.Discard)
+	if err != nil || result.ExitCode != 0 {
+		t.Fatalf("Exec result=%#v err=%v", result, err)
+	}
+	dataElapsed := time.Since(started)
+	if dataElapsed <= controlTimeout {
+		t.Fatalf("exec stream completed in %s, want beyond %s", dataElapsed, controlTimeout)
+	}
+	t.Logf("Cloudflare Sandbox control body bounded in %s; SSE exec completed in %s beyond %s control deadline", controlElapsed.Round(time.Millisecond), dataElapsed.Round(time.Millisecond), controlTimeout)
+}
+
+func TestBridgeInjectedHTTPSettingsArePreservedForBothPlanes(t *testing.T) {
+	transport := &http.Transport{DisableKeepAlives: true}
+	injected := &http.Client{Transport: transport, Timeout: 17 * time.Second}
+	cfg := testConfig()
+	cfg.CloudflareSandbox.BridgeURL = "http://127.0.0.1:8787"
+	api, err := newBridgeClient(cfg, Runtime{HTTP: injected})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := api.(*client)
+	if client.http.Transport != transport || client.dataHTTP.Transport != transport || client.http.Timeout != injected.Timeout || client.dataHTTP.Timeout != injected.Timeout {
+		t.Fatalf("settings=control:(%T,%s) data:(%T,%s)", client.http.Transport, client.http.Timeout, client.dataHTTP.Transport, client.dataHTTP.Timeout)
+	}
+	if injected.CheckRedirect != nil {
+		t.Fatal("constructor mutated injected redirect policy")
+	}
+}
+
+func TestBridgeClientHealthOpenAPIAuthAndNonMutatingDoctorRoutes(t *testing.T) {
+	var requests []struct {
+		method string
+		path   string
+		auth   string
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, struct {
+			method string
+			path   string
+			auth   string
+		}{r.Method, r.URL.Path, r.Header.Get("Authorization")})
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/health":
+			if r.Header.Get("Authorization") != "" {
+				t.Fatalf("health unexpectedly received Authorization header")
+			}
+			writeTestJSON(w, map[string]any{"ok": true, "version": "test"})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/openapi.json":
+			if r.Header.Get("Authorization") != "Bearer cf_sandbox_test_token" {
+				t.Fatalf("openapi Authorization=%q", r.Header.Get("Authorization"))
+			}
+			writeTestJSON(w, map[string]any{"openapi": "3.1.0", "info": map[string]any{"title": "Cloudflare Sandbox Bridge"}})
+		default:
+			t.Fatalf("doctor made unexpected mutating or unknown call: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	cfg := testConfig()
+	cfg.CloudflareSandbox.BridgeURL = server.URL
+	cfg.CloudflareSandbox.Token = "cf_sandbox_test_token"
+	backend := NewBackend((Provider{}).Spec(), cfg, Runtime{HTTP: server.Client()}).(*backend)
+	result, err := backend.Doctor(context.Background(), DoctorRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Provider != providerName || result.Status != "ok" {
+		t.Fatalf("doctor result=%#v", result)
+	}
+	if len(requests) != 2 || requests[0].method != http.MethodGet || requests[0].path != "/health" || requests[1].path != "/v1/openapi.json" {
+		t.Fatalf("requests=%#v", requests)
+	}
+	for _, check := range result.Checks {
+		if check.Details["mutation"] != "false" {
+			t.Fatalf("check missing mutation=false: %#v", check)
+		}
+	}
+}
+
+func TestBridgeClientClassifiesOnlyHTTP404AsNotFound(t *testing.T) {
+	status := http.StatusNotFound
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/sandbox/missing" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, `{"error":"token not found"}`)
+	}))
+	defer server.Close()
+
+	cfg := testConfig()
+	cfg.CloudflareSandbox.BridgeURL = server.URL
+	api, err := newBridgeClient(cfg, Runtime{HTTP: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := api.GetSandbox(context.Background(), "missing"); !isCloudflareSandboxNotFound(err) {
+		t.Fatalf("404 err=%v, want typed not found", err)
+	}
+	status = http.StatusUnauthorized
+	if _, err := api.GetSandbox(context.Background(), "missing"); err == nil || isCloudflareSandboxNotFound(err) {
+		t.Fatalf("401 err=%v, want non-not-found error", err)
+	}
+}
+
+func TestBridgeClientRefusesCrossOriginRedirectBeforeReplay(t *testing.T) {
+	var targetRequests int
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetRequests++
+		t.Errorf("redirect target received %s %s auth=%q", r.Method, r.URL.Path, r.Header.Get("Authorization"))
+		http.Error(w, "unexpected request", http.StatusInternalServerError)
+	}))
+	defer target.Close()
+
+	location := strings.Replace(target.URL, "http://", "http://user:password@", 1) + "/stolen?query-secret=1#fragment-secret"
+	trusted := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", location)
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	}))
+	defer trusted.Close()
+
+	cfg := testConfig()
+	cfg.CloudflareSandbox.BridgeURL = trusted.URL
+	cfg.CloudflareSandbox.Token = "cf_sandbox_test_token"
+	api, err := newBridgeClient(cfg, Runtime{HTTP: trusted.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = api.CreateSandbox(context.Background(), createSandboxRequest{Name: "test"})
+	if err == nil || !strings.Contains(err.Error(), "refused cross-origin redirect") {
+		t.Fatalf("CreateSandbox error = %v, want cross-origin refusal", err)
+	}
+	if targetRequests != 0 {
+		t.Fatalf("redirect target received %d requests, want 0", targetRequests)
+	}
+	for _, secret := range []string{"cf_sandbox_test_token", "user", "password", "query-secret", "fragment-secret"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("redirect error leaked %q: %v", secret, err)
+		}
+	}
+}
+
+func TestBridgeClientFollowsSameOriginRedirect(t *testing.T) {
+	var redirectedAuth, redirectedBody string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/sandbox":
+			http.Redirect(w, r, "/redirected", http.StatusTemporaryRedirect)
+		case "/redirected":
+			redirectedAuth = r.Header.Get("Authorization")
+			body, _ := io.ReadAll(r.Body)
+			redirectedBody = string(body)
+			writeTestJSON(w, sandboxSummary{ID: "sb_123"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	cfg := testConfig()
+	cfg.CloudflareSandbox.BridgeURL = server.URL
+	cfg.CloudflareSandbox.Token = "cf_sandbox_test_token"
+	api, err := newBridgeClient(cfg, Runtime{HTTP: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := api.CreateSandbox(context.Background(), createSandboxRequest{Name: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ID != "sb_123" || redirectedAuth != "Bearer cf_sandbox_test_token" || !strings.Contains(redirectedBody, `"name":"test"`) {
+		t.Fatalf("result=%#v auth=%q body=%q", result, redirectedAuth, redirectedBody)
+	}
+}
+
+func TestBridgeClientPreservesCallerRedirectPolicy(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/redirected", http.StatusFound)
+	}))
+	defer server.Close()
+
+	callerErr := errors.New("caller refused redirect")
+	callerChecks := 0
+	httpClient := server.Client()
+	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+		callerChecks++
+		return callerErr
+	}
+	cfg := testConfig()
+	cfg.CloudflareSandbox.BridgeURL = server.URL
+	api, err := newBridgeClient(cfg, Runtime{HTTP: httpClient})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = api.OpenAPI(context.Background())
+	if err == nil || !strings.Contains(err.Error(), callerErr.Error()) || callerChecks != 1 {
+		t.Fatalf("OpenAPI error = %v, caller checks = %d", err, callerChecks)
+	}
+}
+
+func TestBridgeClientRetainsDefaultRedirectLimitWithoutMutatingSource(t *testing.T) {
+	source := &http.Client{}
+	trusted, _ := url.Parse("http://localhost")
+	secured := shared.SecureHTTPClient(source, trusted, cloudflareSandboxRedirectError)
+	req, err := http.NewRequest(http.MethodGet, "http://localhost/redirected", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := secured.CheckRedirect(req, make([]*http.Request, 10)); err == nil || !strings.Contains(err.Error(), "stopped after 10 redirects") {
+		t.Fatalf("CheckRedirect error = %v, want default redirect limit", err)
+	}
+	if source.CheckRedirect != nil {
+		t.Fatal("secure client mutated caller-provided http.Client")
+	}
+}
+
+func TestBridgeClientRuntimeEndpointShapeIsTypedForPlan02(t *testing.T) {
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		paths = append(paths, r.Method+" "+r.URL.Path+" "+string(body))
+		if r.Header.Get("Authorization") != "Bearer cf_sandbox_test_token" {
+			t.Fatalf("%s %s Authorization=%q", r.Method, r.URL.Path, r.Header.Get("Authorization"))
+		}
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/sandbox":
+			writeTestJSON(w, map[string]any{"id": "sb_123", "status": "running"})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/sandbox/sb_123":
+			writeTestJSON(w, map[string]any{"id": "sb_123", "status": "running"})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/sandbox":
+			writeTestJSON(w, []map[string]any{{"id": "sb_123"}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/sandbox/running":
+			writeTestJSON(w, []map[string]any{{"id": "sb_123", "status": "running"}})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/sandbox/sb_123/exec":
+			writeTestJSON(w, map[string]any{"stdout": "ok\n", "exitCode": 0})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/sandbox/sb_123/files/write":
+			if r.URL.Query().Get("path") != "/tmp/archive.tgz" {
+				t.Fatalf("upload path query=%q", r.URL.RawQuery)
+			}
+			if r.Header.Get("Content-Type") != "application/octet-stream" {
+				t.Fatalf("upload content-type=%q", r.Header.Get("Content-Type"))
+			}
+			if string(body) != "archive" {
+				t.Fatalf("upload body=%q", body)
+			}
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/sandbox/sb_123/persist":
+			writeTestJSON(w, map[string]any{"id": "persist_123"})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/sandbox/sb_123/hydrate":
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/warm-pool":
+			writeTestJSON(w, map[string]any{"ready": 1, "total": 2})
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/sandbox/sb_123":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	cfg := testConfig()
+	cfg.CloudflareSandbox.BridgeURL = server.URL
+	cfg.CloudflareSandbox.Token = "cf_sandbox_test_token"
+	api, err := newBridgeClient(cfg, Runtime{HTTP: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := api.CreateSandbox(context.Background(), createSandboxRequest{Name: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := api.GetSandbox(context.Background(), "sb_123"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := api.ListSandboxes(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := api.ListRunning(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var stdout strings.Builder
+	if _, err := api.Exec(context.Background(), "sb_123", execRequest{Command: "echo ok"}, &stdout, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if stdout.String() != "ok\n" {
+		t.Fatalf("stdout=%q", stdout.String())
+	}
+	if err := api.UploadFile(context.Background(), "sb_123", "/tmp/archive.tgz", strings.NewReader("archive")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := api.Persist(context.Background(), "sb_123", persistRequest{Path: "/workspace"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := api.Hydrate(context.Background(), "sb_123", hydrateRequest{ID: "persist_123"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := api.WarmPool(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := api.DeleteSandbox(context.Background(), "sb_123"); err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 10 {
+		t.Fatalf("paths=%#v", paths)
+	}
+}
+
+func TestBridgeClientExecParsesSSEOutputBeforeExit(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/sandbox/sb_123/exec" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		_, _ = io.WriteString(w, "event: stdout\n")
+		_, _ = io.WriteString(w, `data: {"encoding":"base64","chunk":"`+base64.StdEncoding.EncodeToString([]byte("early\n"))+`"}`+"\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+		_, _ = io.WriteString(w, "event: stderr\n")
+		_, _ = io.WriteString(w, `data: {"encoding":"base64","chunk":"`+base64.StdEncoding.EncodeToString([]byte("warn\n"))+`"}`+"\n\n")
+		_, _ = io.WriteString(w, "event: exit\n")
+		_, _ = io.WriteString(w, `data: {"exitCode":7}`+"\n\n")
+	}))
+	defer server.Close()
+
+	cfg := testConfig()
+	cfg.CloudflareSandbox.BridgeURL = server.URL
+	api, err := newBridgeClient(cfg, Runtime{HTTP: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr strings.Builder
+	result, err := api.Exec(context.Background(), "sb_123", execRequest{Command: "test"}, &stdout, &stderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ExitCode != 7 || stdout.String() != "early\n" || stderr.String() != "warn\n" {
+		t.Fatalf("result=%#v stdout=%q stderr=%q", result, stdout.String(), stderr.String())
+	}
+}
+
+func TestBridgeClientExecLeavesPlainSSEChunksUntouched(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/sandbox/sb_123/exec" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: stdout\n")
+		_, _ = io.WriteString(w, `data: {"chunk":"test"}`+"\n\n")
+		_, _ = io.WriteString(w, "event: stderr\n")
+		_, _ = io.WriteString(w, `data: {"chunk":"done"}`+"\n\n")
+		_, _ = io.WriteString(w, "event: exit\n")
+		_, _ = io.WriteString(w, `data: {"exitCode":0}`+"\n\n")
+	}))
+	defer server.Close()
+
+	cfg := testConfig()
+	cfg.CloudflareSandbox.BridgeURL = server.URL
+	api, err := newBridgeClient(cfg, Runtime{HTTP: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr strings.Builder
+	result, err := api.Exec(context.Background(), "sb_123", execRequest{Command: "test"}, &stdout, &stderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ExitCode != 0 || stdout.String() != "test" || stderr.String() != "done" {
+		t.Fatalf("result=%#v stdout=%q stderr=%q", result, stdout.String(), stderr.String())
+	}
+}
+
+func TestBridgeClientRedactsTokenFromErrors(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"error":"bad cf_sandbox_test_token"}`)
+	}))
+	defer server.Close()
+
+	cfg := testConfig()
+	cfg.CloudflareSandbox.BridgeURL = server.URL
+	cfg.CloudflareSandbox.Token = "cf_sandbox_test_token"
+	api, err := newBridgeClient(cfg, Runtime{HTTP: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = api.OpenAPI(context.Background())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if strings.Contains(err.Error(), "cf_sandbox_test_token") {
+		t.Fatalf("secret leaked in error: %v", err)
+	}
+}
+
+func writeTestJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		panic(err)
+	}
+}

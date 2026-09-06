@@ -1,0 +1,999 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import { adminGrantVersion } from "../src/auth";
+import {
+  CloudflareCoordinatorRuntime,
+  coordinatorRequestQueue,
+  legacyAlarmKey,
+  setLegacyWake,
+  type CoordinatorRuntime,
+  type CoordinatorSocketHandlers,
+  type CoordinatorStorage,
+  type CoordinatorStorageView,
+  type CoordinatorWebSocketUpgradeOptions,
+} from "../src/coordinator-runtime";
+import { FleetCoordinator } from "../src/fleet";
+import { githubAuthRoute } from "../src/oauth";
+import { orgKeyForLabel } from "../src/org-identity";
+import { runtimeAdapterRelayFrameLimit } from "../src/runtime-adapter-relay";
+import type { Env, LeaseRecord } from "../src/types";
+import { ProvisioningTestStorage } from "./provisioning-fixtures";
+
+const exampleOrgKey = orgKeyForLabel("example-org");
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+class MemoryStorage implements CoordinatorStorage {
+  private readonly values = new Map<string, unknown>();
+  beforeGet?: (key: string) => Promise<void>;
+
+  async get<T>(key: string, _options?: { noCache?: boolean }): Promise<T | undefined> {
+    await this.beforeGet?.(key);
+    return this.values.get(key) as T | undefined;
+  }
+
+  async put<T>(key: string, value: T, _options?: { noCache?: boolean }): Promise<void> {
+    this.values.set(key, value);
+  }
+
+  async delete(key: string): Promise<void> {
+    this.values.delete(key);
+  }
+
+  async list<T>({
+    prefix = "",
+    limit,
+    startAfter,
+  }: {
+    prefix?: string;
+    limit?: number;
+    startAfter?: string;
+    noCache?: boolean;
+  } = {}): Promise<Map<string, T>> {
+    const entries = [...this.values]
+      .toSorted(([left], [right]) => left.localeCompare(right))
+      .filter(([key]) => key.startsWith(prefix) && (!startAfter || key > startAfter));
+    return new Map(
+      (limit === undefined ? entries : entries.slice(0, limit)).map(([key, value]) => [
+        key,
+        value as T,
+      ]),
+    );
+  }
+
+  transaction<T>(callback: (transaction: CoordinatorStorageView) => Promise<T>): Promise<T> {
+    return callback(this);
+  }
+
+  value<T>(key: string): T | undefined {
+    return this.values.get(key) as T | undefined;
+  }
+}
+
+class MemoryRuntime implements CoordinatorRuntime {
+  readonly storage = new MemoryStorage();
+  readonly ephemeralWebSocketMaxPayloadBytes = 1024 * 1024;
+  alarmTime?: number;
+  upgradeOptions?: CoordinatorWebSocketUpgradeOptions;
+  acceptedTags?: string[];
+  acceptedAttachment?: unknown;
+  onAcceptWebSocket?: (attachment: unknown) => void;
+  readonly socketCloses: Array<{ code?: number; reason?: string }> = [];
+  private readonly attachments = new WeakMap<WebSocket, unknown>();
+  private exclusiveTail: Promise<void> = Promise.resolve();
+
+  async runExclusive<T>(callback: () => Promise<T>): Promise<T> {
+    const predecessor = this.exclusiveTail;
+    let release!: () => void;
+    this.exclusiveTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await predecessor;
+    try {
+      return await callback();
+    } finally {
+      release();
+    }
+  }
+
+  createWebSocketUpgrade(options?: CoordinatorWebSocketUpgradeOptions): {
+    socket: WebSocket;
+    response: Response;
+  } {
+    this.upgradeOptions = options;
+    return {
+      socket: {
+        readyState: WebSocket.OPEN,
+        send: () => undefined,
+        close: (code?: number, reason?: string) => {
+          this.socketCloses.push({ code, reason });
+        },
+        serializeAttachment: () => undefined,
+      } as unknown as WebSocket,
+      response: new Response(null),
+    };
+  }
+
+  getWebSockets(): Iterable<WebSocket> {
+    return [];
+  }
+
+  socketAttachment<T>(socket: WebSocket): T | undefined {
+    return this.attachments.get(socket) as T | undefined;
+  }
+
+  setSocketAttachment(socket: WebSocket, attachment: unknown): void {
+    this.attachments.set(socket, attachment);
+  }
+
+  acceptWebSocket(
+    socket: WebSocket,
+    attachment: unknown,
+    tags: string[],
+    _handlers: CoordinatorSocketHandlers,
+  ): void {
+    this.attachments.set(socket, attachment);
+    this.acceptedTags = tags;
+    this.acceptedAttachment = attachment;
+    this.onAcceptWebSocket?.(attachment);
+  }
+
+  acceptEphemeralWebSocket(_socket: WebSocket, _handlers: CoordinatorSocketHandlers): void {}
+
+  async take<T>(key: string): Promise<T | undefined> {
+    const value = await this.storage.get<T>(key);
+    if (value !== undefined) {
+      await this.storage.delete(key);
+    }
+    return value;
+  }
+
+  async getAlarm(): Promise<number | undefined> {
+    return this.alarmTime;
+  }
+
+  async scheduleAlarm(time: number): Promise<void> {
+    this.alarmTime = time;
+  }
+
+  async clearAlarm(): Promise<void> {
+    this.alarmTime = undefined;
+  }
+}
+
+describe("coordinator runtimes", () => {
+  it("applies the protocol frame limit to runtime adapter upgrades", async () => {
+    const runtime = new MemoryRuntime();
+    const coordinator = new FleetCoordinator(runtime, {
+      CRABBOX_DEFAULT_ORG: "example-org",
+    } as Env);
+    const headers = {
+      "x-crabbox-owner": "alice@example.com",
+      "x-crabbox-org": "example-org",
+    };
+    const ticketResponse = await coordinator.fetch(
+      new Request("https://coordinator.test/v1/adapters/example-adapter/ticket", {
+        method: "POST",
+        headers: { ...headers, "content-type": "application/json" },
+        body: JSON.stringify({ desktopTimeoutMs: 180_000 }),
+      }),
+    );
+    const { ticket } = (await ticketResponse.json()) as { ticket: string };
+
+    const response = await coordinator.fetch(
+      new Request("https://coordinator.test/v1/adapters/example-adapter/agent", {
+        headers: {
+          ...headers,
+          upgrade: "websocket",
+          authorization: `Bearer ${ticket}`,
+        },
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(runtime.upgradeOptions).toEqual({ maxPayload: runtimeAdapterRelayFrameLimit });
+    expect(runtime.acceptedTags).toEqual(["adapter:example-adapter", "runtime-adapter-agent"]);
+    expect(runtime.acceptedAttachment).toMatchObject({ desktopTimeoutMs: 180_000 });
+    expect(runtime.storage.value("runtime-adapter-identity:example-adapter")).toMatchObject({
+      claimVersion: 1,
+      claimState: "confirmed",
+      confirmedAt: expect.any(String),
+    });
+  });
+
+  it("binds egress sockets to their ticket principal and reauthorizes before acceptance", async () => {
+    const runtime = new MemoryRuntime();
+    const coordinator = new FleetCoordinator(runtime, {
+      CRABBOX_DEFAULT_ORG: "example-org",
+    } as Env);
+    const lease: LeaseRecord = {
+      id: "cbx_000000000001",
+      slug: "shared-egress",
+      provider: "external",
+      lifecycle: "registered",
+      target: "linux",
+      cloudID: "external-shared-egress",
+      owner: "owner@example.com",
+      org: exampleOrgKey,
+      share: { users: { "manager@example.com": "manage" } },
+      profile: "default",
+      class: "default",
+      serverType: "external",
+      serverID: 0,
+      serverName: "shared-egress",
+      providerKey: "external-shared-egress",
+      host: "127.0.0.1",
+      sshUser: "crabbox",
+      sshPort: "22",
+      workRoot: "/work/crabbox",
+      keep: true,
+      ttlSeconds: 3600,
+      estimatedHourlyUSD: 0,
+      maxEstimatedUSD: 0,
+      state: "active",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    };
+    await runtime.storage.put(`lease:${lease.id}`, lease);
+    const managerHeaders = {
+      "x-crabbox-owner": "manager@example.com",
+      "x-crabbox-org": "example-org",
+    };
+    const ownerHeaders = {
+      "x-crabbox-owner": "owner@example.com",
+      "x-crabbox-org": "example-org",
+    };
+    const createTicket = async (sessionID: string): Promise<string> => {
+      const response = await coordinator.fetch(
+        new Request("https://coordinator.test/v1/leases/shared-egress/egress/ticket", {
+          method: "POST",
+          headers: { ...managerHeaders, "content-type": "application/json" },
+          body: JSON.stringify({ role: "host", sessionID }),
+        }),
+      );
+      expect(response.status).toBe(200);
+      return ((await response.json()) as { ticket: string }).ticket;
+    };
+
+    const acceptedTicket = await createTicket("egress_accepted");
+    const accepted = await coordinator.fetch(
+      new Request("https://coordinator.test/v1/leases/shared-egress/egress/host", {
+        headers: {
+          upgrade: "websocket",
+          authorization: `Bearer ${acceptedTicket}`,
+        },
+      }),
+    );
+    expect(accepted.status).toBe(200);
+    expect(runtime.acceptedAttachment).toEqual({
+      kind: "egress-host",
+      leaseID: lease.id,
+      sessionID: "egress_accepted",
+      owner: "manager@example.com",
+      org: exampleOrgKey,
+      admin: false,
+    });
+
+    const revokedTicket = await createTicket("egress_revoked");
+    const downgraded = await coordinator.fetch(
+      new Request("https://coordinator.test/v1/leases/shared-egress/share", {
+        method: "PUT",
+        headers: { ...ownerHeaders, "content-type": "application/json" },
+        body: JSON.stringify({ users: { "manager@example.com": "use" } }),
+      }),
+    );
+    expect(downgraded.status).toBe(200);
+    runtime.acceptedAttachment = undefined;
+    const rejected = await coordinator.fetch(
+      new Request("https://coordinator.test/v1/leases/shared-egress/egress/host", {
+        headers: {
+          upgrade: "websocket",
+          authorization: `Bearer ${revokedTicket}`,
+        },
+      }),
+    );
+    expect(rejected.status).toBe(401);
+    expect(runtime.acceptedAttachment).toBeUndefined();
+    expect(runtime.storage.value(`egress-ticket:${revokedTicket}`)).toBeUndefined();
+
+    const restored = await coordinator.fetch(
+      new Request("https://coordinator.test/v1/leases/shared-egress/share", {
+        method: "PUT",
+        headers: { ...ownerHeaders, "content-type": "application/json" },
+        body: JSON.stringify({ users: { "manager@example.com": "manage" } }),
+      }),
+    );
+    expect(restored.status).toBe(200);
+    const raceTicket = await createTicket("egress_race");
+    runtime.socketCloses.length = 0;
+    let releaseTicketRead!: () => void;
+    const ticketReadBlocked = new Promise<void>((resolve) => {
+      releaseTicketRead = resolve;
+    });
+    let signalTicketRead!: () => void;
+    const ticketReadStarted = new Promise<void>((resolve) => {
+      signalTicketRead = resolve;
+    });
+    runtime.storage.beforeGet = async (key) => {
+      if (key === `egress-ticket:${raceTicket}`) {
+        signalTicketRead();
+        await ticketReadBlocked;
+      }
+    };
+    const acceptance = coordinator.fetch(
+      new Request("https://coordinator.test/v1/leases/shared-egress/egress/host", {
+        headers: {
+          upgrade: "websocket",
+          authorization: `Bearer ${raceTicket}`,
+        },
+      }),
+    );
+    await ticketReadStarted;
+    const concurrentDowngrade = coordinator.fetch(
+      new Request("https://coordinator.test/v1/leases/shared-egress/share", {
+        method: "PUT",
+        headers: { ...ownerHeaders, "content-type": "application/json" },
+        body: JSON.stringify({ users: { "manager@example.com": "use" } }),
+      }),
+    );
+    runtime.storage.beforeGet = undefined;
+    releaseTicketRead();
+    const [raceAccepted, raceDowngraded] = await Promise.all([acceptance, concurrentDowngrade]);
+    expect(raceAccepted.status).toBe(200);
+    expect(raceDowngraded.status).toBe(200);
+    expect(runtime.socketCloses).toContainEqual({ code: 1008, reason: "lease access revoked" });
+  });
+
+  it("reauthorizes WebVNC and Code agent tickets through socket acceptance", async () => {
+    const runtime = new MemoryRuntime();
+    const env = {
+      CRABBOX_DEFAULT_ORG: "example-org",
+      CRABBOX_ADMIN_TOKEN: "admin-token",
+    } as Env;
+    const coordinator = new FleetCoordinator(runtime, env);
+    const currentGrantVersion = await adminGrantVersion(env);
+    const lease: LeaseRecord = {
+      id: "cbx_000000000001",
+      slug: "shared-bridges",
+      provider: "external",
+      lifecycle: "registered",
+      target: "linux",
+      cloudID: "external-shared-bridges",
+      owner: "owner@example.com",
+      org: exampleOrgKey,
+      share: { users: { "manager@example.com": "manage" } },
+      profile: "default",
+      class: "default",
+      serverType: "external",
+      serverID: 0,
+      serverName: "shared-bridges",
+      providerKey: "external-shared-bridges",
+      host: "127.0.0.1",
+      sshUser: "crabbox",
+      sshPort: "22",
+      workRoot: "/work/crabbox",
+      keep: true,
+      ttlSeconds: 3600,
+      estimatedHourlyUSD: 0,
+      maxEstimatedUSD: 0,
+      state: "active",
+      desktop: true,
+      code: true,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    };
+    await runtime.storage.put(`lease:${lease.id}`, lease);
+    const managerHeaders = {
+      "x-crabbox-owner": "manager@example.com",
+      "x-crabbox-org": "example-org",
+    };
+    const ownerHeaders = {
+      "x-crabbox-owner": "owner@example.com",
+      "x-crabbox-org": "example-org",
+    };
+    const adminHeaders = {
+      "x-crabbox-owner": "admin@example.com",
+      "x-crabbox-org": "example-org",
+      "x-crabbox-admin": "true",
+      "x-crabbox-auth": "bearer",
+      "x-crabbox-admin-grant-version": currentGrantVersion,
+      authorization: "Bearer admin-token",
+    };
+    const createTicket = async (
+      kind: "webvnc" | "code",
+      headers: Record<string, string> = managerHeaders,
+    ): Promise<string> => {
+      const response = await coordinator.fetch(
+        new Request(`https://coordinator.test/v1/leases/shared-bridges/${kind}/ticket`, {
+          method: "POST",
+          headers,
+        }),
+      );
+      expect(response.status).toBe(200);
+      return ((await response.json()) as { ticket: string }).ticket;
+    };
+    const connect = async (kind: "webvnc" | "code", ticket: string): Promise<Response> =>
+      await coordinator.fetch(
+        new Request(`https://coordinator.test/v1/leases/shared-bridges/${kind}/agent`, {
+          headers: {
+            upgrade: "websocket",
+            authorization: `Bearer ${ticket}`,
+          },
+        }),
+      );
+
+    const acceptedWebVNCTicket = await createTicket("webvnc");
+    expect((await connect("webvnc", acceptedWebVNCTicket)).status).toBe(200);
+    expect(runtime.acceptedAttachment).toMatchObject({
+      kind: "webvnc-agent",
+      leaseID: lease.id,
+      owner: "manager@example.com",
+      org: exampleOrgKey,
+      admin: false,
+    });
+
+    const acceptedCodeTicket = await createTicket("code");
+    expect((await connect("code", acceptedCodeTicket)).status).toBe(200);
+    expect(runtime.acceptedAttachment).toEqual({
+      kind: "code-agent",
+      leaseID: lease.id,
+      owner: "manager@example.com",
+      org: exampleOrgKey,
+      admin: false,
+    });
+
+    expect((await connect("webvnc", await createTicket("webvnc", adminHeaders))).status).toBe(200);
+    expect(runtime.acceptedAttachment).toMatchObject({
+      kind: "webvnc-agent",
+      leaseID: lease.id,
+      owner: "admin@example.com",
+      org: exampleOrgKey,
+      admin: true,
+      auth: "bearer",
+      adminGrantVersion: currentGrantVersion,
+    });
+    expect((await connect("code", await createTicket("code", adminHeaders))).status).toBe(200);
+    expect(runtime.acceptedAttachment).toMatchObject({
+      kind: "code-agent",
+      leaseID: lease.id,
+      owner: "admin@example.com",
+      org: exampleOrgKey,
+      admin: true,
+      auth: "bearer",
+      adminGrantVersion: currentGrantVersion,
+    });
+
+    const revokedWebVNCTicket = await createTicket("webvnc");
+    const revokedCodeTicket = await createTicket("code");
+    const downgraded = await coordinator.fetch(
+      new Request("https://coordinator.test/v1/leases/shared-bridges/share", {
+        method: "PUT",
+        headers: { ...ownerHeaders, "content-type": "application/json" },
+        body: JSON.stringify({ users: { "manager@example.com": "use" } }),
+      }),
+    );
+    expect(downgraded.status).toBe(200);
+
+    runtime.acceptedAttachment = undefined;
+    expect((await connect("webvnc", revokedWebVNCTicket)).status).toBe(401);
+    expect(runtime.acceptedAttachment).toBeUndefined();
+    expect(runtime.storage.value(`webvnc-ticket:${revokedWebVNCTicket}`)).toBeUndefined();
+
+    expect((await connect("code", revokedCodeTicket)).status).toBe(401);
+    expect(runtime.acceptedAttachment).toBeUndefined();
+    expect(runtime.storage.value(`code-ticket:${revokedCodeTicket}`)).toBeUndefined();
+
+    const expectAtomicAcceptance = async (kind: "webvnc" | "code") => {
+      const restored = await coordinator.fetch(
+        new Request("https://coordinator.test/v1/leases/shared-bridges/share", {
+          method: "PUT",
+          headers: { ...ownerHeaders, "content-type": "application/json" },
+          body: JSON.stringify({ users: { "manager@example.com": "manage" } }),
+        }),
+      );
+      expect(restored.status).toBe(200);
+      const ticket = await createTicket(kind);
+      let ticketRead!: () => void;
+      let allowTicketRead!: () => void;
+      const ticketReadStarted = new Promise<void>((resolve) => {
+        ticketRead = resolve;
+      });
+      const ticketReadMayFinish = new Promise<void>((resolve) => {
+        allowTicketRead = resolve;
+      });
+      runtime.storage.beforeGet = async (key) => {
+        if (key === `${kind}-ticket:${ticket}`) {
+          ticketRead();
+          await ticketReadMayFinish;
+        }
+      };
+
+      runtime.acceptedAttachment = undefined;
+      let roleAtAccept: string | undefined;
+      runtime.onAcceptWebSocket = (attachment) => {
+        if ((attachment as { kind?: string }).kind === `${kind}-agent`) {
+          roleAtAccept = runtime.storage.value<LeaseRecord>(`lease:${lease.id}`)?.share?.users?.[
+            "manager@example.com"
+          ];
+        }
+      };
+      const connecting = connect(kind, ticket);
+      await ticketReadStarted;
+      const revoking = coordinator.fetch(
+        new Request("https://coordinator.test/v1/leases/shared-bridges/share", {
+          method: "PUT",
+          headers: { ...ownerHeaders, "content-type": "application/json" },
+          body: JSON.stringify({ users: { "manager@example.com": "use" } }),
+        }),
+      );
+      allowTicketRead();
+
+      expect((await connecting).status).toBe(200);
+      expect((await revoking).status).toBe(200);
+      expect(runtime.acceptedAttachment).toMatchObject({
+        kind: `${kind}-agent`,
+        leaseID: lease.id,
+      });
+      expect(roleAtAccept).toBe("manage");
+      expect(
+        runtime.storage.value<LeaseRecord>(`lease:${lease.id}`)?.share?.users?.[
+          "manager@example.com"
+        ],
+      ).toBe("use");
+      expect(runtime.storage.value(`${kind}-ticket:${ticket}`)).toBeUndefined();
+      runtime.storage.beforeGet = undefined;
+      runtime.onAcceptWebSocket = undefined;
+    };
+    await expectAtomicAcceptance("webvnc");
+    await expectAtomicAcceptance("code");
+  });
+
+  it("keeps provider-backed portal requests outside the lifecycle queue", () => {
+    for (const [method, path] of [
+      ["GET", "/portal"],
+      ["GET", "/portal/admin/health"],
+      ["GET", "/portal/hosts/aws/h-123"],
+      ["POST", "/portal/hosts/aws/h-123/vnc"],
+      ["POST", "/portal/leases/example/release"],
+      ["POST", "/v1/workspaces"],
+      ["GET", "/v1/workspaces/fleet-is-101"],
+      ["DELETE", "/v1/workspaces/fleet-is-101"],
+      ["GET", "/v1/native-vnc/handoff"],
+      ["GET", "/v1/leases/cbx_abcdef123456"],
+      ["PUT", "/v1/leases/cbx_abcdef123456"],
+      ["PUT", "/v1/leases/cbx_abcdef123456/from-checkpoint"],
+      ["POST", "/v1/leases/from-checkpoint"],
+      ["POST", "/v1/checkpoints"],
+      ["GET", "/v1/checkpoints/chk_example"],
+      ["PATCH", "/v1/checkpoints/chk_example/retention"],
+      ["POST", "/v1/checkpoints/chk_example/use"],
+      ["DELETE", "/v1/checkpoints/chk_example"],
+      ["POST", "/v1/leases/cbx_abcdef123456/tailscale"],
+      ["GET", "/v1/adapters/applied-alice"],
+      ["POST", "/v1/adapters/applied-alice/proxy/v1/workspaces"],
+    ]) {
+      expect(
+        coordinatorRequestQueue(new Request(`https://coordinator.test${path}`, { method })),
+      ).toBe("direct");
+    }
+    expect(coordinatorRequestQueue(new Request("https://coordinator.test/portal/login"))).toBe(
+      "direct",
+    );
+    expect(
+      coordinatorRequestQueue(
+        new Request("https://coordinator.test/v1/auth/github/callback?code=x&state=y"),
+      ),
+    ).toBe("direct");
+    expect(
+      coordinatorRequestQueue(
+        new Request("https://coordinator.test/v1/auth/github/start", { method: "POST" }),
+      ),
+    ).toBe("direct");
+    expect(
+      coordinatorRequestQueue(
+        new Request("https://coordinator.test/v1/adapters/applied-alice/ticket", {
+          method: "POST",
+        }),
+      ),
+    ).toBe("lifecycle");
+  });
+
+  it("serializes existing-image mutations while keeping image reads and creation direct", () => {
+    for (const [method, path] of [
+      ["POST", "/v1/images/ami-1/promote"],
+      ["POST", "/v1/images/ami-1/promote-catalog"],
+      ["DELETE", "/v1/images/ami-1"],
+      ["DELETE", "/v1/images/ami-1/promote-catalog"],
+    ]) {
+      expect(
+        coordinatorRequestQueue(new Request(`https://coordinator.test${path}`, { method })),
+      ).toBe("lifecycle");
+    }
+    for (const [method, path] of [
+      ["POST", "/v1/images"],
+      ["GET", "/v1/images/ami-1"],
+      ["GET", "/v1/images/ami-1/fast-snapshot-restore"],
+    ]) {
+      expect(
+        coordinatorRequestQueue(new Request(`https://coordinator.test${path}`, { method })),
+      ).toBe("direct");
+    }
+  });
+
+  it("does not hold the lifecycle queue across GitHub OAuth requests", async () => {
+    const runtime = new MemoryRuntime();
+    const env = {
+      CRABBOX_DEFAULT_ORG: "example-org",
+      CRABBOX_PUBLIC_URL: "https://coordinator.test",
+      CRABBOX_GITHUB_CLIENT_ID: "github-client",
+      CRABBOX_GITHUB_CLIENT_SECRET: "github-secret",
+      CRABBOX_SHARED_TOKEN: "shared",
+      CRABBOX_SESSION_SECRET: "session-secret",
+    } as Env;
+    const start = await githubAuthRoute(
+      new Request("https://coordinator.test/v1/auth/github/start", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          pollSecretHash: "0".repeat(64),
+          loopbackRedirectURI: `http://127.0.0.1:54321/crabbox/oauth/${"a".repeat(64)}`,
+        }),
+      }),
+      "start",
+      runtime,
+      env,
+    );
+    const startBody = (await start.json()) as { url: string };
+    const state = new URL(startBody.url).searchParams.get("state");
+    expect(state).toBeTruthy();
+
+    let releaseTokenExchange!: () => void;
+    const tokenExchangeBlocked = new Promise<void>((resolve) => {
+      releaseTokenExchange = resolve;
+    });
+    let signalTokenExchange!: () => void;
+    const tokenExchangeStarted = new Promise<void>((resolve) => {
+      signalTokenExchange = resolve;
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<(input: RequestInfo | URL) => Promise<Response>>(async (input) => {
+        const url =
+          typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+        if (url === "https://github.com/login/oauth/access_token") {
+          signalTokenExchange();
+          await tokenExchangeBlocked;
+          return Response.json({ access_token: "github-access-token" });
+        }
+        if (url === "https://api.github.com/user") {
+          return Response.json({ id: 12345, login: "friend", email: "public@example.com" });
+        }
+        if (url === "https://api.github.com/user/emails") {
+          return Response.json([{ email: "friend@example.com", primary: true, verified: true }]);
+        }
+        if (url === "https://api.github.com/user/memberships/orgs/example-org") {
+          return Response.json({
+            state: "active",
+            organization: { login: "example-org" },
+          });
+        }
+        throw new Error(`unexpected GitHub URL: ${url}`);
+      }),
+    );
+
+    const callbackRequest = new Request(
+      `https://coordinator.test/v1/auth/github/callback?code=ok&state=${state}`,
+    );
+    const callback = githubAuthRoute(callbackRequest, "callback", runtime, env);
+    await tokenExchangeStarted;
+
+    await expect(runtime.runExclusive(async () => "lifecycle-completed")).resolves.toBe(
+      "lifecycle-completed",
+    );
+    const duplicate = await githubAuthRoute(callbackRequest, "callback", runtime, env);
+    expect(duplicate.status).toBe(409);
+
+    releaseTokenExchange();
+    await expect(callback).resolves.toMatchObject({ status: 303 });
+  });
+
+  it("runs the fleet coordinator without a Durable Object", async () => {
+    const coordinator = new FleetCoordinator(new MemoryRuntime(), {
+      CRABBOX_DEFAULT_ORG: "example-org",
+    } as Env);
+
+    const response = await coordinator.fetch(new Request("https://coordinator.test/v1/health"));
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ ok: true, fleet: "default" });
+  });
+
+  it("maps Cloudflare alarms and hibernating socket attachments", async () => {
+    const storage = new ProvisioningTestStorage();
+    const deadline = Date.now() + 60_000;
+    await storage.put("ticket:one-time", { ticket: "one-time" });
+    await storage.setAlarm(deadline);
+    const acceptWebSocket = vi.fn<(socket: WebSocket, tags?: string[]) => void>();
+    const state = {
+      storage,
+      acceptWebSocket,
+      getWebSockets: () => [],
+    } as unknown as DurableObjectState;
+    const runtime = new CloudflareCoordinatorRuntime(state);
+    const serializeAttachment = vi.fn<(value: unknown) => void>();
+    const socket = { serializeAttachment } as unknown as WebSocket;
+    const attachment = { kind: "control", clientID: "client-1" };
+
+    runtime.acceptWebSocket(socket, attachment, ["control:client-1"], {
+      message: () => {},
+      close: () => {},
+      error: () => {},
+    });
+    await expect(runtime.take("ticket:one-time")).resolves.toEqual({ ticket: "one-time" });
+    await expect(runtime.getAlarm()).resolves.toBe(deadline);
+    await runtime.scheduleAlarm(deadline);
+    await expect(runtime.getAlarm()).resolves.toBe(deadline);
+    await runtime.clearAlarm();
+
+    expect(acceptWebSocket).toHaveBeenCalledWith(socket, ["control:client-1"]);
+    expect(serializeAttachment).toHaveBeenCalledWith(attachment);
+    expect(runtime.socketAttachment(socket)).toBe(attachment);
+    await expect(storage.get("ticket:one-time")).resolves.toBeUndefined();
+    await expect(runtime.getAlarm()).resolves.toBeUndefined();
+  });
+
+  it("atomically commits durable due work and alarms across rollback and concurrent clear", async () => {
+    const storage = new ProvisioningTestStorage();
+    const runtime = new CloudflareCoordinatorRuntime({ storage } as unknown as DurableObjectState);
+    const at = Date.now() + 60_000;
+    const dueKey = `provisioning-due:${at.toString().padStart(16, "0")}:lease`;
+    await expect(
+      runtime.commitAndWake(async (transaction) => {
+        await transaction.put("operation", { phase: "prepared" });
+        await transaction.put(dueKey, { operationID: "lease", at });
+        throw new Error("rollback");
+      }),
+    ).rejects.toThrow("rollback");
+    expect((await storage.list()).size).toBe(0);
+    await Promise.all([
+      runtime.commitAndWake(async (transaction) => {
+        await transaction.put("operation", { phase: "prepared" });
+        await transaction.put(dueKey, { operationID: "lease", at });
+      }),
+      runtime.clearAlarm(),
+    ]);
+    await expect(runtime.getAlarm()).resolves.toBe(at);
+    await runtime.scheduleAlarm(at + 60_000);
+    await expect(runtime.getAlarm()).resolves.toBe(at);
+    await runtime.clearAlarm();
+    await expect(runtime.getAlarm()).resolves.toBe(at);
+  });
+
+  it.each(["create", "reschedule", "clear"] as const)(
+    "rolls back state, due index, legacy deadline and native alarm when %s alarm writes fail",
+    async (mutation) => {
+      const storage = new ProvisioningTestStorage();
+      const runtime = new CloudflareCoordinatorRuntime({
+        storage,
+      } as unknown as DurableObjectState);
+      const at = Date.now() + 60_000;
+      const dueKey = `provisioning-due:${at.toString().padStart(16, "0")}:lease`;
+      if (mutation !== "create") {
+        await runtime.commitAndWake(async (transaction) => {
+          await transaction.put("operation", { phase: "prepared" });
+          await transaction.put(dueKey, { operationID: "lease", at });
+          await setLegacyWake(transaction, at + 60_000);
+        });
+      }
+      const before = structuredClone(storage.values);
+      storage.listOptions.length = 0;
+      storage.writes.length = 0;
+      storage.failKey = "test:native-alarm";
+      await expect(
+        runtime.commitAndWake(async (transaction) => {
+          await transaction.put("operation", { phase: "changed" });
+          if (mutation === "clear") {
+            await transaction.delete(dueKey);
+            await setLegacyWake(transaction);
+          } else {
+            await transaction.put(dueKey, { operationID: "lease", at });
+            await setLegacyWake(transaction, at - 1000);
+          }
+        }),
+      ).rejects.toThrow("injected storage failure");
+      expect(storage.writes.filter((key) => key === "test:native-alarm")).toHaveLength(1);
+      expect(storage.listOptions).toEqual([{ prefix: "provisioning-due:", limit: 1 }]);
+      expect(storage.values).toEqual(before);
+    },
+  );
+
+  it.each(["empty", "future", "due", "past"] as const)(
+    "constructor repair skips redundant %s alarm writes but rearms consumed deadlines",
+    async (kind) => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      try {
+        const storage = new ProvisioningTestStorage();
+        let initialized: Promise<unknown> | undefined;
+        const runtime = new CloudflareCoordinatorRuntime({
+          storage,
+          blockConcurrencyWhile(callback: () => Promise<unknown>) {
+            initialized = callback();
+            return initialized;
+          },
+        } as unknown as DurableObjectState);
+        const at = Date.now() + (kind === "future" ? 1000 : kind === "past" ? -1000 : 0);
+        if (kind !== "empty") await runtime.scheduleAlarm(at);
+        const before = structuredClone(storage.values);
+        storage.writes.length = 0;
+        storage.listOptions.length = 0;
+        storage.failKey = "test:native-alarm";
+        runtime.registerProvisioningTick(async () => {});
+        const needsRearm = kind === "due" || kind === "past";
+        expect(await Promise.allSettled([initialized])).toEqual([
+          needsRearm
+            ? { status: "rejected", reason: new Error("injected storage failure") }
+            : { status: "fulfilled", value: undefined },
+        ]);
+        expect(storage.writes).toEqual(needsRearm ? ["test:native-alarm"] : []);
+        expect(storage.values).toEqual(before);
+        expect(storage.listOptions).toEqual([{ prefix: "provisioning-due:", limit: 1 }]);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it("reconstructs a missing native alarm from durable due work and preserves an earlier stored wake", async () => {
+    const storage = new ProvisioningTestStorage();
+    const at = Date.now() + 60_000;
+    const dueKey = `provisioning-due:${at.toString().padStart(16, "0")}:lease`;
+    await storage.put(dueKey, { operationID: "lease", at });
+    let initialized: Promise<unknown> | undefined;
+    const state = {
+      storage,
+      blockConcurrencyWhile(callback: () => Promise<unknown>) {
+        initialized = callback();
+        return initialized;
+      },
+    } as unknown as DurableObjectState;
+    const runtime = new CloudflareCoordinatorRuntime(state);
+    runtime.registerProvisioningTick(async () => {});
+    await initialized;
+    expect(await runtime.getAlarm()).toBe(at);
+    await runtime.scheduleAlarm(at - 1000);
+    storage.writes.length = 0;
+    storage.listOptions.length = 0;
+    const reconstructed = new CloudflareCoordinatorRuntime(state);
+    reconstructed.registerProvisioningTick(async () => {});
+    await initialized;
+    expect(await reconstructed.getAlarm()).toBe(at - 1000);
+    expect(await storage.get(legacyAlarmKey)).toBe(at - 1000);
+    expect(storage.writes).toEqual([]);
+    expect(storage.listOptions).toEqual([{ prefix: "provisioning-due:", limit: 1 }]);
+  });
+
+  it("returns from real alarms while one runtime-owned legacy maintenance pass is blocked", async () => {
+    const storage = new ProvisioningTestStorage();
+    const owned: Promise<void>[] = [];
+    let initialization: Promise<unknown> | undefined;
+    const runtime = new CloudflareCoordinatorRuntime({
+      storage,
+      blockConcurrencyWhile<T>(callback: () => Promise<T>) {
+        const run = callback();
+        initialization = run;
+        return run;
+      },
+      waitUntil(task: Promise<void>) {
+        owned.push(task);
+      },
+    } as unknown as DurableObjectState);
+    const coordinator = new FleetCoordinator(runtime, {} as Env);
+    await initialization;
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const maintenance = vi
+      .spyOn(
+        coordinator as unknown as { runScheduledMaintenance: () => Promise<void> },
+        "runScheduledMaintenance",
+      )
+      .mockReturnValue(blocked);
+    await coordinator.alarm();
+    await coordinator.alarm();
+    expect(maintenance).toHaveBeenCalledTimes(1);
+    expect(owned).toHaveLength(1);
+    release();
+    await Promise.all(owned);
+  });
+
+  it("serializes Cloudflare coordinator state transitions", async () => {
+    const state = {
+      storage: {},
+    } as unknown as DurableObjectState;
+    const runtime = new CloudflareCoordinatorRuntime(state);
+    const order: string[] = [];
+    let releaseFirst!: () => void;
+    const firstBlocked = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+
+    const first = runtime.runExclusive(async () => {
+      order.push("first:start");
+      await firstBlocked;
+      order.push("first:end");
+    });
+    const second = runtime.runExclusive(async () => {
+      order.push("second");
+    });
+
+    await Promise.resolve();
+    expect(order).toEqual(["first:start"]);
+    releaseFirst();
+    await Promise.all([first, second]);
+    expect(order).toEqual(["first:start", "first:end", "second"]);
+  });
+
+  it("serializes fallback control socket messages with state transitions", async () => {
+    const state = {
+      storage: {},
+    } as unknown as DurableObjectState;
+    const runtime = new CloudflareCoordinatorRuntime(state);
+    const listeners = new Map<string, EventListener>();
+    const socket = {
+      accept: vi.fn<() => void>(),
+      addEventListener: vi.fn<(type: string, listener: EventListener) => void>((type, listener) => {
+        listeners.set(type, listener);
+      }),
+    } as unknown as WebSocket;
+    const message = vi.fn<() => Promise<void>>(async () => {});
+    let releaseTransition!: () => void;
+    const transitionBlocked = new Promise<void>((resolve) => {
+      releaseTransition = resolve;
+    });
+    const transition = runtime.runExclusive(async () => transitionBlocked);
+    runtime.acceptWebSocket(socket, { kind: "control" }, [], {
+      message,
+      close: () => {},
+      error: () => {},
+    });
+
+    listeners.get("message")?.({ data: "{}" } as MessageEvent);
+    await Promise.resolve();
+    expect(message).not.toHaveBeenCalled();
+
+    releaseTransition();
+    await transition;
+    await vi.waitFor(() => expect(message).toHaveBeenCalledOnce());
+  });
+
+  it("accepts ephemeral sockets without Durable Object hibernation", () => {
+    const acceptWebSocket = vi.fn<(socket: WebSocket, tags?: string[]) => void>();
+    const state = {
+      storage: {},
+      acceptWebSocket,
+    } as unknown as DurableObjectState;
+    const runtime = new CloudflareCoordinatorRuntime(state);
+    const listeners = new Map<string, EventListener>();
+    const socket = {
+      accept: vi.fn<() => void>(),
+      addEventListener: vi.fn<(type: string, listener: EventListener) => void>((type, listener) => {
+        listeners.set(type, listener);
+      }),
+    } as unknown as WebSocket;
+
+    runtime.acceptEphemeralWebSocket(socket, {
+      message: () => {},
+      close: () => {},
+      error: () => {},
+    });
+
+    expect(socket.accept).toHaveBeenCalledOnce();
+    expect(acceptWebSocket).not.toHaveBeenCalled();
+    expect([...listeners.keys()]).toEqual(expect.arrayContaining(["message", "close", "error"]));
+  });
+});

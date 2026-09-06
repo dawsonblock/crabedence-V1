@@ -1,0 +1,441 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GOFLAGS: -mod=readonly -trimpath
+  GOTOOLCHAIN: local
+
+jobs:
+  go-test:
+    name: Go test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Check formatting
+        shell: bash
+        run: |
+          mapfile -t files < <(git ls-files '*.go')
+          if [ "${#files[@]}" -gt 0 ]; then
+            diff="$(gofmt -l "${files[@]}")"
+            if [ -n "$diff" ]; then
+              echo "$diff"
+              exit 1
+            fi
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Deadcode
+        run: |
+          output_file=$(mktemp)
+          go run golang.org/x/tools/cmd/deadcode@v0.45.0 -test ./... > "$output_file"
+          if [ -s "$output_file" ]; then
+            cat "$output_file"
+            exit 1
+          fi
+
+      - name: Test
+        # Leave room for the CLI suite's final parallel timeout fixtures.
+        run: go test -race -timeout=20m ./...
+
+      - name: Require executed Linux supervision fixtures
+        shell: bash
+        run: |
+          go test ./internal/cli -run '^(TestWorkspaceOwnerWSL2Watchdog.*|TestWSL2(OrdinaryShortFrameWatchdogCleansState|MarkerPublicationFailureLeavesUnarmedDiagnosticState|GuardSurvivesPublishedMarkerBeforeArm|ProductionCleanup.*))$' -count=1 -json | tee "$RUNNER_TEMP/wsl-linux-tests.jsonl"
+          python3 - "$RUNNER_TEMP/wsl-linux-tests.jsonl" <<'PY'
+          import json, sys
+          records = [json.loads(line) for line in open(sys.argv[1])]
+          required = (
+              'TestWorkspaceOwnerWSL2WatchdogAllowsCompletedFrameExecution',
+              'TestWSL2OrdinaryShortFrameWatchdogCleansState',
+              'TestWSL2MarkerPublicationFailureLeavesUnarmedDiagnosticState',
+              'TestWSL2GuardSurvivesPublishedMarkerBeforeArm',
+              'TestWSL2ProductionCleanupKillsEntireStagingGroup',
+              'TestWSL2ProductionCleanupFailsClosedWithoutLiveGuard',
+              'TestWSL2ProductionCleanupFailsClosedWhenGuardMarkerChanges',
+              'TestWorkspaceOwnerWSL2WatchdogCleansCompletedFrameAfterLauncherExit',
+              'TestWorkspaceOwnerWSL2WatchdogPreservesIntentionalBackgroundWitness',
+          )
+          for name in required:
+              for action in ('run', 'pass'):
+                  assert any(r.get('Test') == name and r['Action'] == action for r in records), (name, action)
+          assert not any(r['Action'] == 'skip' for r in records), 'native fixture skipped'
+          PY
+
+      - name: Build
+        run: go build -trimpath -o /tmp/crabbox ./cmd/crabbox
+
+  go-modules:
+    name: Go modules
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Test all Go modules
+        run: scripts/test-go-modules.sh
+
+  go-coverage:
+    name: Go coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Coverage
+        run: scripts/check-go-coverage.sh 90.0
+
+  go:
+    name: Go
+    needs: [go-test, go-modules, go-coverage]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Require all Go checks
+        shell: bash
+        env:
+          GO_TEST_RESULT: ${{ needs['go-test'].result }}
+          GO_MODULES_RESULT: ${{ needs['go-modules'].result }}
+          GO_COVERAGE_RESULT: ${{ needs['go-coverage'].result }}
+        run: |
+          printf 'Go test: %s\nGo modules: %s\nGo coverage: %s\n' \
+            "${GO_TEST_RESULT:-missing}" "${GO_MODULES_RESULT:-missing}" "${GO_COVERAGE_RESULT:-missing}"
+          [[ "${GO_TEST_RESULT:-}" == success && "${GO_MODULES_RESULT:-}" == success && "${GO_COVERAGE_RESULT:-}" == success ]]
+
+  go-install:
+    name: Direct Go install
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Verify versioned remote module installation
+        run: scripts/verify-go-install.sh v0.0.0 "$(git rev-parse HEAD)"
+
+  windows-pond-mesh-cancellation:
+    name: Windows Pond Mesh Cancellation
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Test user directory isolation
+        run: go test ./internal/testutil ./internal/providers/aws ./internal/providers/daytona ./internal/providers/digitalocean ./internal/providers/hyperv ./internal/providers/namespace ./internal/providers/scaleway ./internal/providers/vast ./internal/providers/vultr -count=1
+
+      - name: Test native Windows archive preparation ownership
+        run: go test ./internal/providers/blaxel -run '^TestRunPreparesArchiveBeforeCreate$' -count=1 -v
+
+      - name: Test concurrent claim discovery and ownership
+        run: go test ./internal/cli/ -run '^Test(ClaimMetadata|ClaimTransaction|RemoveControllerFile|ConfirmedAbsentStateCleanup|PrivateRunOutput)' -count=1 -v
+
+      - name: Test pond mesh cancellation
+        run: go test ./internal/cli/ -run PondMeshCancel -count=1 -v
+
+      - name: Test native Windows runtime prerequisite
+        run: powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/test-windows-runtime.ps1
+
+      - name: Run required native transport behaviors without skips
+        shell: pwsh
+        run: |
+          $required = @(
+            'TestWindowsNativeStdinRuntime',
+            'TestWindowsNativeStdinCancellation',
+            'TestWindowsSSHStdinReaderBehavior',
+            'TestWindowsWitnessRedirectedStdinUploadBehavior',
+            'TestWSLStageLauncherVerifiesAndConsumesReadyFile',
+            'TestWSLStageLauncherRejectsCorruptOrNonFileStage',
+            'TestWSLStageLauncherRejectsSameNonceValidReplacement',
+            'TestWSLStageLauncherIsFixedAndCarriesDigestBinding',
+            'TestWSLStageLauncherConfirmsOriginalAndCleanupTermination',
+            'TestWSLStageRootPreparationSecuresInheritedWindowsACL',
+            'TestWSLStageRootPreparationRejectsFilesAndReparsePoints',
+            'TestWSLStageFrameworkInputPreamble',
+            'TestWSLStageDelayedInitialHandoff',
+            'TestWSLStageInitialHandoffBudgets',
+            'TestWSLStageBlindingBindsFullAndPartialDigests',
+            'TestWSLStageEntropyFailurePreventsDeliveryAndSpoolCreation',
+            'TestWSLStageBlindingStaysOutOfPublicTransportMetadata',
+            'TestVNCPasswordSSHBoundsWSLStageContext',
+            'TestRunSSHOutputBoundedDiscardsOutputOnDeferredCleanupFailure',
+            'TestPondMeshJobTerminationFailureStillKillsWindowsProcessTree'
+          )
+          $events = @(go test ./internal/cli/ -run ('^(' + ($required -join '|') + ')$') -count=1 -json)
+          $code = $LASTEXITCODE
+          $events | ForEach-Object { Write-Host $_ }
+          if ($code -ne 0) { exit $code }
+          $records = @($events | ForEach-Object { $_ | ConvertFrom-Json })
+          foreach ($name in $required) {
+            foreach ($action in @('run', 'pass')) {
+              if (-not ($records | Where-Object { $_.Test -eq $name -and $_.Action -eq $action })) {
+                throw "required native behavior $name did not $action"
+              }
+            }
+          }
+          if ($records | Where-Object { $_.Action -eq 'skip' }) { throw 'required native behavior was skipped' }
+
+      - name: Test native Windows failure captures and private outputs
+        run: go test ./internal/cli/ -run '^(TestFailureBundle|TestNativeWindowsFailureBundle|TestPrivateRunOutput|TestManagedAttestKeyWindows|TestArtifactOutputWindows)' -count=1 -v
+
+      - name: Test native Windows shared claim cancellation fences
+        run: go test ./internal/cli/ -run '^TestClaim(Shared|FenceContext)' -count=1 -v
+
+      - name: Test Windows SSH and rsync transport selection
+        run: go test ./internal/cli/ -run '^(TestWindowsWSLNativeToolProbeUsesDirectCommandOutput|TestWindowsWSLNativeToolPathsRejectsWindowsShims|TestDirectSSHExecutableSelection|TestSSHCommandContextUsesNativeWindowsOpenSSHEvenWhenPATHSelectsMSYS2|TestResolveWindowsNativeRsyncPairUsesExactSibling|TestResolveWindowsNativeRsyncPairFailsClosedWithoutSibling|TestBindWindowsNativeRsyncSSHPreservesOwnedArguments|TestWindowsNativeRsyncCommandUsesSiblingPairAndEnvironment|TestResolvedSSHCopyCommandUsesNativeWindowsSiblingPair|TestResolvedSSHCopyCommandFailsClosedWithoutNativeWindowsSibling)$' -count=1 -v
+
+      - name: Test native Windows Python and CMake preflight probes
+        run: go test ./internal/cli/ -run '^(TestPythonPreflightToolValidationAndTargetFiltering|TestPythonPreflightWindowsProbeUsesLiteralExecutableAndMissingContract|TestCMakePreflightNativeWindowsPresentAndMissing)$' -count=1 -v
+
+      - name: Test Git workspace coherence
+        run: go test ./internal/cli/ -run '^(TestWindowsGitRootIdentityAcceptsShortAliasAndRejectsDistinctRoot|TestWindowsGitCoherenceRollbackRestoresIndexAfterSymbolicHeadFailure|TestWindowsGitSeedReplacesUnusableExactRootsAfterVerifiedClone|TestWindowsGitCoherenceSupportsDetachedSparseSplitAndLinkedIndexes|TestGitSeedFailurePhaseAndPreservation|TestGitSeedDiagnosticLabelsAndPrivacy|TestWorkspaceOwnerWindowsProtocolBehavior)$' -count=1 -v
+
+      - name: Test Git overlay snapshot capabilities
+        run: go test ./internal/cli/ -run '^(TestOpenGitOverlaySnapshotParentRejectsFilesAndReparsePoints|TestOpenGitOverlaySnapshotParentSupportsMetadataRestoration|TestGitOverlaySnapshotCleanupThawsReadOnlyFiles|TestGitOverlaySnapshotCopiesThroughNestedReadOnlyParents|TestGitOverlaySnapshotCleanupRejectsRootReplacementAndRetriesOriginal)$' -count=1 -v
+
+  connector-lifecycles:
+    name: Connector Lifecycles
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Test source-derived hermetic lifecycle packages
+        run: scripts/test-provider-lifecycles.sh
+
+  apple-vm:
+    name: Apple VM
+    runs-on: macos-15
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Verify Apple Silicon runner
+        run: test "$(uname -m)" = arm64
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24
+
+      - name: Test macOS script compatibility
+        run: PATH="/usr/bin:/bin:$PATH" node --test scripts/mint-aws-devtools-image.test.js
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Vet native helper
+        run: go vet ./internal/applevmhelper ./cmd/crabbox-apple-vm-helper
+
+      - name: Test native helper and provider
+        run: go test -race ./internal/applevmhelper ./internal/providers/applevm
+
+      - name: Build Swift VM daemon
+        run: sh scripts/build-vmd.sh
+
+      - name: Build native helper with embedded daemon
+        run: go build -trimpath -tags vmdembed -o /tmp/crabbox-apple-vm-helper ./cmd/crabbox-apple-vm-helper
+
+      - name: Verify embedded daemon payload
+        run: /tmp/crabbox-apple-vm-helper vmd-info | grep -q '"embedded":true'
+
+  worker:
+    name: Worker
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: crabbox_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d crabbox_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: worker/package-lock.json
+
+      - name: Install
+        run: npm ci
+        working-directory: worker
+
+      - name: Format
+        run: npm run format:check
+        working-directory: worker
+
+      - name: Lint
+        run: npm run lint
+        working-directory: worker
+
+      - name: Typecheck
+        run: npm run check
+        working-directory: worker
+
+      - name: Typecheck Node runtime
+        run: npm run check:node
+        working-directory: worker
+
+      - name: Test
+        run: npm test
+        working-directory: worker
+
+      - name: Test coordinator parity against real PostgreSQL
+        run: npm run test:postgres
+        working-directory: worker
+        env:
+          CRABBOX_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/crabbox_test
+
+      - name: Build
+        run: npm run build
+        working-directory: worker
+
+      - name: Build Cloudflare Dynamic Workers
+        run: npm run build:cloudflare-dynamic-workers
+        working-directory: worker
+
+      - name: Build Node runtime
+        run: npm run build:node
+        working-directory: worker
+
+      - name: Check runtime base image pins
+        run: node scripts/check-docker-base-images.mjs
+
+      - name: Build Node runtime image
+        run: docker build -f worker/Dockerfile.node worker
+
+  scripts:
+    name: Scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Install script dependencies
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+
+      - name: Check generated Linux readiness contracts
+        run: node scripts/generate-linux-readiness.mjs --check
+
+      - name: Check generated bootstrap and OS catalog
+        run: node scripts/generate-bootstrap.mjs --check
+
+      - name: Test
+        run: node --test scripts/*.test.js scripts/*.test.mjs
+
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Check docs
+        run: scripts/check-docs.sh

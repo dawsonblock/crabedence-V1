@@ -1,0 +1,563 @@
+package cli
+
+import (
+	"bytes"
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
+	"encoding/pem"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func init() {
+	RegisterProvider(benchmarkTimingTestProvider{})
+}
+
+type benchmarkTimingTestProvider struct{}
+
+func (benchmarkTimingTestProvider) Name() string      { return "benchmark-timing-test" }
+func (benchmarkTimingTestProvider) Aliases() []string { return nil }
+func (benchmarkTimingTestProvider) Spec() ProviderSpec {
+	return ProviderSpec{
+		Name:        "benchmark-timing-test",
+		Family:      "benchmark-timing-test",
+		Kind:        ProviderKindDelegatedRun,
+		Targets:     []TargetSpec{{OS: targetLinux}},
+		Coordinator: CoordinatorNever,
+	}
+}
+func (benchmarkTimingTestProvider) RegisterFlags(*flag.FlagSet, Config) any { return nil }
+func (benchmarkTimingTestProvider) ApplyFlags(*Config, *flag.FlagSet, any) error {
+	return nil
+}
+func (p benchmarkTimingTestProvider) Configure(_ Config, rt Runtime) (Backend, error) {
+	return benchmarkTimingTestBackend{spec: p.Spec(), stderr: rt.Stderr}, nil
+}
+
+type benchmarkTimingTestBackend struct {
+	spec   ProviderSpec
+	stderr io.Writer
+}
+
+var (
+	benchmarkTimingTestAfterRun func()
+	benchmarkTimingTestRunCalls atomic.Int64
+)
+
+func (b benchmarkTimingTestBackend) Spec() ProviderSpec { return b.spec }
+func (b benchmarkTimingTestBackend) Warmup(context.Context, WarmupRequest) error {
+	return nil
+}
+func (b benchmarkTimingTestBackend) Run(_ context.Context, req RunRequest) (RunResult, error) {
+	benchmarkTimingTestRunCalls.Add(1)
+	result := RunResult{
+		Provider:      b.spec.Name,
+		LeaseID:       "bench_test",
+		Slug:          "benchmark-timing-test",
+		SyncDelegated: true,
+		Command:       250 * time.Millisecond,
+		Total:         time.Second,
+	}
+	if req.TimingJSON {
+		report := timingReportFromDelegatedRunResult(req, result, b.spec.Name, nil)
+		report.SyncMs = 400
+		report.SyncPhases = []TimingPhase{{Name: "archive", Ms: 400}}
+		report.MachineType = "test-medium"
+		if err := writeTimingJSON(b.stderr, report); err != nil {
+			return RunResult{}, err
+		}
+	}
+	if benchmarkTimingTestAfterRun != nil {
+		benchmarkTimingTestAfterRun()
+	}
+	return result, nil
+}
+func (b benchmarkTimingTestBackend) List(context.Context, ListRequest) ([]LeaseView, error) {
+	return nil, nil
+}
+func (b benchmarkTimingTestBackend) Status(context.Context, StatusRequest) (StatusView, error) {
+	return StatusView{}, nil
+}
+func (b benchmarkTimingTestBackend) Stop(context.Context, StopRequest) error { return nil }
+
+func TestTimingReportFromDelegatedRunResultClassifiesRunError(t *testing.T) {
+	report := timingReportFromDelegatedRunResult(RunRequest{RunID: "run_execution"}, RunResult{
+		Provider:      "sandbox-test",
+		SyncDelegated: true,
+		Command:       250 * time.Millisecond,
+		Total:         time.Second,
+		Session:       &RunSessionHandle{RunID: "run_provider"},
+	}, "fallback", context.DeadlineExceeded)
+	if report.ExitCode != 1 {
+		t.Fatalf("ExitCode=%d, want 1", report.ExitCode)
+	}
+	if report.RunStatus != RunStatusTimedOut || report.ErrorKind != RunErrorTimeout {
+		t.Fatalf("runStatus/errorKind=%q/%q", report.RunStatus, report.ErrorKind)
+	}
+	if report.RunID != "run_execution" {
+		t.Fatalf("RunID=%q, want execution metadata run ID", report.RunID)
+	}
+}
+
+func TestBenchRecordAppendsTimingJSONRecord(t *testing.T) {
+	dir := t.TempDir()
+	inputPath := filepath.Join(dir, "timing.json")
+	storePath := filepath.Join(dir, "timings.jsonl")
+	report := TimingReport{
+		Provider:    "aws",
+		LeaseID:     "cbx_123",
+		SyncMs:      100,
+		CommandMs:   900,
+		TotalMs:     1100,
+		ExitCode:    0,
+		MachineType: "c7a.large",
+	}
+	body, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(inputPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	app := App{Stdout: &stdout, Stderr: &stderr}
+	err = app.benchRecord(context.Background(), []string{"--store", storePath, "--timing-json", inputPath, "--command", "pnpm test", "--cold", "--repeat-index", "1"})
+	if err != nil {
+		t.Fatalf("bench record error=%v stderr=%q", err, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "benchmark timing record appended") {
+		t.Fatalf("bench record did not print append destination: %q", stderr.String())
+	}
+
+	records, err := readBenchmarkTimingRecords(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("records=%d want 1", len(records))
+	}
+	record := records[0]
+	if record.SchemaVersion != benchmarkTimingSchemaVersion {
+		t.Fatalf("schemaVersion=%d", record.SchemaVersion)
+	}
+	if record.Timing.Provider != "aws" || record.Timing.TotalMs != 1100 {
+		t.Fatalf("timing=%#v", record.Timing)
+	}
+	if record.Benchmark.CommandDisplay != "pnpm test" {
+		t.Fatalf("commandDisplay=%q", record.Benchmark.CommandDisplay)
+	}
+	if record.Benchmark.CommandFingerprint == "" {
+		t.Fatal("command fingerprint was empty")
+	}
+	if record.Benchmark.ColdRun == nil || !*record.Benchmark.ColdRun {
+		t.Fatalf("coldRun=%v", record.Benchmark.ColdRun)
+	}
+	if record.Benchmark.RepeatIndex != 1 {
+		t.Fatalf("repeatIndex=%d", record.Benchmark.RepeatIndex)
+	}
+	if record.Benchmark.ProviderCategory != "brokerable-cloud" {
+		t.Fatalf("providerCategory=%q", record.Benchmark.ProviderCategory)
+	}
+}
+
+func TestRunDelegatedTimingJSONEmittedOnceWhileRecording(t *testing.T) {
+	dir := t.TempDir()
+	storePath := filepath.Join(dir, "timings.jsonl")
+	receiptPath := filepath.Join(dir, "receipt.json")
+	var stdout, stderr bytes.Buffer
+	app := App{Stdout: &stdout, Stderr: &stderr}
+	err := app.runCommand(context.Background(), []string{
+		"--provider", "benchmark-timing-test",
+		"--timing-json",
+		"--timing-record", storePath,
+		"--attest", receiptPath,
+		"--", "true",
+	})
+	if err != nil {
+		t.Fatalf("run error=%v stderr=%q", err, stderr.String())
+	}
+	lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
+	var emitted TimingReport
+	var timingJSONCount int
+	for _, line := range lines {
+		var candidate TimingReport
+		if err := json.Unmarshal([]byte(line), &candidate); err == nil && candidate.Provider != "" {
+			emitted = candidate
+			timingJSONCount++
+		}
+	}
+	if timingJSONCount != 1 || emitted.Provider != "benchmark-timing-test" {
+		t.Fatalf("delegated timing JSON count=%d want 1; stderr=%q", timingJSONCount, stderr.String())
+	}
+	info, err := os.Stat(receiptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNoReceiptArtifact(t, emitted.Artifacts)
+	confirmation := fmt.Sprintf("artifact kind=receipt path=%s bytes=%d", receiptPath, info.Size())
+	if !strings.Contains(stderr.String(), confirmation) {
+		t.Fatalf("missing delegated receipt confirmation %q: %s", confirmation, stderr.String())
+	}
+	records, err := readBenchmarkTimingRecords(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 || records[0].Timing.Provider != "benchmark-timing-test" {
+		t.Fatalf("records=%#v, want one delegated timing record", records)
+	}
+	if timing := records[0].Timing; timing.SyncMs != 400 || len(timing.SyncPhases) != 1 || timing.SyncPhases[0].Name != "archive" || timing.MachineType != "test-medium" {
+		t.Fatalf("delegated timing metadata=%#v", timing)
+	}
+	if records[0].Timing.RunStatus != RunStatusSucceeded {
+		t.Fatalf("delegated timing runStatus=%q", records[0].Timing.RunStatus)
+	}
+	assertNoReceiptArtifact(t, records[0].Timing.Artifacts)
+}
+
+func TestRunDelegatedCachesReceiptSignerAcrossTimingFailure(t *testing.T) {
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "signer.pem")
+	_, originalKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, replacementKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeBenchmarkTimingTestKey(t, keyPath, originalKey)
+	replacementDER, err := x509.MarshalPKCS8PrivateKey(replacementKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacementPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: replacementDER})
+	benchmarkTimingTestRunCalls.Store(0)
+	benchmarkTimingTestAfterRun = func() {
+		if err := os.Remove(keyPath); err != nil {
+			t.Errorf("remove attest key: %v", err)
+			return
+		}
+		if err := os.WriteFile(keyPath, replacementPEM, 0o600); err != nil {
+			t.Errorf("replace attest key: %v", err)
+		}
+	}
+	t.Cleanup(func() { benchmarkTimingTestAfterRun = nil })
+
+	storePath := filepath.Join(dir, "timings")
+	if err := os.Mkdir(storePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	receiptPath := filepath.Join(dir, "receipt.json")
+	var stdout, stderr bytes.Buffer
+	err = (App{Stdout: &stdout, Stderr: &stderr}).runCommand(context.Background(), []string{
+		"--provider", "benchmark-timing-test",
+		"--timing-json",
+		"--timing-record", storePath,
+		"--attest", receiptPath,
+		"--attest-key", keyPath,
+		"--", "true",
+	})
+	var exitErr ExitError
+	if !AsExitError(err, &exitErr) || exitErr.Code != 2 {
+		t.Fatalf("error=%v, want timing-record exit 2\nstderr=%s", err, stderr.String())
+	}
+	if calls := benchmarkTimingTestRunCalls.Load(); calls != 1 {
+		t.Fatalf("backend run calls=%d, want 1", calls)
+	}
+	data, err := os.ReadFile(receiptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := decodeRunReceipt(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exitCode, ok := receipt["exit_code"].(json.Number); !ok || exitCode.String() != "2" {
+		t.Fatalf("receipt exit=%v, want timing-record exit 2", receipt["exit_code"])
+	}
+	originalPublicKey := originalKey.Public().(ed25519.PublicKey)
+	replacementPublicKey := replacementKey.Public().(ed25519.PublicKey)
+	if got := receipt["public_key"]; got != base64.StdEncoding.EncodeToString(originalPublicKey) {
+		t.Fatalf("receipt public key=%v, want cached original signer", got)
+	}
+	if receipt["public_key"] == base64.StdEncoding.EncodeToString(replacementPublicKey) {
+		t.Fatal("receipt used replacement signer")
+	}
+	var emitted TimingReport
+	for _, line := range strings.Split(stderr.String(), "\n") {
+		var candidate TimingReport
+		if json.Unmarshal([]byte(line), &candidate) == nil && candidate.Provider == "benchmark-timing-test" {
+			emitted = candidate
+		}
+	}
+	if emitted.ExitCode != 2 {
+		t.Fatalf("timing exit=%d, want 2", emitted.ExitCode)
+	}
+	assertNoReceiptArtifact(t, emitted.Artifacts)
+	confirmation := fmt.Sprintf("artifact kind=receipt path=%s bytes=%d", receiptPath, len(data))
+	if !strings.Contains(stderr.String(), confirmation) {
+		t.Fatalf("missing delegated receipt confirmation %q: %s", confirmation, stderr.String())
+	}
+	timingIndex := strings.LastIndex(stderr.String(), `"runnerTotalMs"`)
+	receiptIndex := strings.LastIndex(stderr.String(), "artifact kind=receipt")
+	if timingIndex < 0 || receiptIndex <= timingIndex {
+		t.Fatalf("delegated terminal order must be timing then receipt persistence:\n%s", stderr.String())
+	}
+}
+
+func TestRunDelegatedReceiptPersistenceFailureOmitsReceiptArtifacts(t *testing.T) {
+	dir := t.TempDir()
+	isolateRunTestUserDirs(t, dir)
+	t.Setenv("CRABBOX_CONFIG", filepath.Join(dir, "config.yaml"))
+	keyPath := filepath.Join(dir, "signer.pem")
+	_, key, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeBenchmarkTimingTestKey(t, keyPath, key)
+	receiptPath := filepath.Join(dir, "receipt.json")
+	benchmarkTimingTestAfterRun = func() {
+		if err := os.Mkdir(receiptPath, 0o700); err != nil {
+			t.Errorf("replace receipt destination with directory: %v", err)
+		}
+	}
+	t.Cleanup(func() { benchmarkTimingTestAfterRun = nil })
+
+	storePath := filepath.Join(dir, "timings.jsonl")
+	var stdout, stderr bytes.Buffer
+	err = (App{Stdout: &stdout, Stderr: &stderr}).runCommand(context.Background(), []string{
+		"--provider", "benchmark-timing-test",
+		"--timing-json",
+		"--timing-record", storePath,
+		"--attest", receiptPath,
+		"--attest-key", keyPath,
+		"--", "true",
+	})
+	var exitErr ExitError
+	if !AsExitError(err, &exitErr) || exitErr.Code != 2 {
+		t.Fatalf("error=%v, want receipt persistence exit 2\nstderr=%s", err, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "artifact kind=receipt") {
+		t.Fatalf("failed receipt persistence reported an artifact:\n%s", stderr.String())
+	}
+	var emitted TimingReport
+	for _, line := range strings.Split(stderr.String(), "\n") {
+		var candidate TimingReport
+		if json.Unmarshal([]byte(line), &candidate) == nil && candidate.Provider == "benchmark-timing-test" {
+			emitted = candidate
+		}
+	}
+	if emitted.Provider != "benchmark-timing-test" {
+		t.Fatalf("missing delegated timing JSON: %s", stderr.String())
+	}
+	assertNoReceiptArtifact(t, emitted.Artifacts)
+	records, readErr := readBenchmarkTimingRecords(storePath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(records) != 1 || records[0].Timing.Provider != "benchmark-timing-test" {
+		t.Fatalf("timing records=%#v, want one delegated record", records)
+	}
+	assertNoReceiptArtifact(t, records[0].Timing.Artifacts)
+}
+
+func TestRunDelegatedSignerAcquisitionFailureSkipsBackend(t *testing.T) {
+	dir := t.TempDir()
+	benchmarkTimingTestRunCalls.Store(0)
+	benchmarkTimingTestAfterRun = nil
+	receiptPath := filepath.Join(dir, "receipt.json")
+	var stdout, stderr bytes.Buffer
+	err := (App{Stdout: &stdout, Stderr: &stderr}).runCommand(context.Background(), []string{
+		"--provider", "benchmark-timing-test",
+		"--attest", receiptPath,
+		"--attest-key", filepath.Join(dir, "missing.pem"),
+		"--", "true",
+	})
+	var exitErr ExitError
+	if !AsExitError(err, &exitErr) || exitErr.Code != 2 || !strings.Contains(exitErr.Message, "attest key") {
+		t.Fatalf("error=%v, want signer acquisition exit 2\nstderr=%s", err, stderr.String())
+	}
+	if calls := benchmarkTimingTestRunCalls.Load(); calls != 0 {
+		t.Fatalf("backend run calls=%d, want 0", calls)
+	}
+	if _, statErr := os.Stat(receiptPath); !os.IsNotExist(statErr) {
+		t.Fatalf("receipt exists after signer acquisition failure: %v", statErr)
+	}
+}
+
+func writeBenchmarkTimingTestKey(t *testing.T, path string, key ed25519.PrivateKey) {
+	t.Helper()
+	der, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRunDelegatedTimingRecordDoesNotPrintTimingJSON(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "timings.jsonl")
+	var stdout, stderr bytes.Buffer
+	app := App{Stdout: &stdout, Stderr: &stderr}
+	err := app.runCommand(context.Background(), []string{
+		"--provider", "benchmark-timing-test",
+		"--timing-record", storePath,
+		"--", "true",
+	})
+	if err != nil {
+		t.Fatalf("run error=%v stderr=%q", err, stderr.String())
+	}
+	if strings.Contains(stderr.String(), `"provider":"benchmark-timing-test"`) {
+		t.Fatalf("timing JSON leaked without --timing-json: %q", stderr.String())
+	}
+	records, err := readBenchmarkTimingRecords(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 || records[0].Timing.SyncMs != 400 {
+		t.Fatalf("records=%#v, want one complete delegated timing record", records)
+	}
+}
+
+func TestBenchRunFansOutProvidersAndRepeats(t *testing.T) {
+	dir := t.TempDir()
+	storePath := filepath.Join(dir, "timings.jsonl")
+	var stdout, stderr bytes.Buffer
+	app := App{Stdout: &stdout, Stderr: &stderr}
+	type call struct {
+		args   []string
+		record benchmarkRecordContext
+	}
+	var calls []call
+	err := app.benchRunWithExecutor(context.Background(), []string{"--store", storePath, "--providers", "hetzner,aws", "--repeats", "2", "--cold", "--", "go", "test", "./..."}, func(_ context.Context, args []string, record benchmarkRecordContext) error {
+		copiedArgs := append([]string(nil), args...)
+		calls = append(calls, call{args: copiedArgs, record: record})
+		if record.OnRecord != nil {
+			record.OnRecord()
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("bench run error=%v stderr=%q", err, stderr.String())
+	}
+	if len(calls) != 4 {
+		t.Fatalf("calls=%d want 4", len(calls))
+	}
+	wantArgs := [][]string{
+		{"--provider", "aws", "--timing-record", storePath, "--", "go", "test", "./..."},
+		{"--provider", "aws", "--timing-record", storePath, "--", "go", "test", "./..."},
+		{"--provider", "hetzner", "--timing-record", storePath, "--", "go", "test", "./..."},
+		{"--provider", "hetzner", "--timing-record", storePath, "--", "go", "test", "./..."},
+	}
+	for i, got := range calls {
+		if strings.Join(got.args, "\x00") != strings.Join(wantArgs[i], "\x00") {
+			t.Fatalf("call %d args=%q want %q", i, got.args, wantArgs[i])
+		}
+		if got.record.Source != "bench-run" {
+			t.Fatalf("call %d source=%q", i, got.record.Source)
+		}
+		wantRepeat := i%2 + 1
+		if got.record.RepeatIndex != wantRepeat {
+			t.Fatalf("call %d repeat=%d want %d", i, got.record.RepeatIndex, wantRepeat)
+		}
+		if got.record.ColdRun == nil || !*got.record.ColdRun {
+			t.Fatalf("call %d coldRun=%v", i, got.record.ColdRun)
+		}
+	}
+	if !strings.Contains(stderr.String(), "benchmark run completed path="+storePath+" observations=4 failures=0") {
+		t.Fatalf("stderr=%q", stderr.String())
+	}
+}
+
+func TestBenchmarkReportAggregatesAndMarksInsufficientEvidence(t *testing.T) {
+	now := time.Date(2026, 6, 18, 12, 0, 0, 0, time.UTC)
+	cold := true
+	command := []string{"pnpm", "test"}
+	records := []BenchmarkTimingRecord{
+		newBenchmarkTimingRecord(now.Add(-3*time.Hour), "test", TimingReport{Provider: "aws", MachineType: "c7a.large", SyncMs: 100, CommandMs: 900, TotalMs: 1100, ExitCode: 0}, Repo{Name: "my-app", Head: "abc123"}, command, &cold, 1),
+		newBenchmarkTimingRecord(now.Add(-2*time.Hour), "test", TimingReport{Provider: "aws", MachineType: "c7a.large", SyncMs: 100, CommandMs: 400, TotalMs: 700, ExitCode: 1}, Repo{Name: "my-app", Head: "abc123"}, command, &cold, 2),
+		newBenchmarkTimingRecord(now.Add(-90*time.Minute), "test", TimingReport{Provider: "hetzner", MachineType: "cx22", SyncMs: 200, CommandMs: 1800, TotalMs: 2100, ExitCode: 0}, Repo{Name: "my-app", Head: "abc123"}, command, &cold, 1),
+		newBenchmarkTimingRecord(now.Add(-30*time.Minute), "test", TimingReport{Provider: "hetzner", MachineType: "cx22", SyncMs: 300, CommandMs: 1900, TotalMs: 2300, ExitCode: 0}, Repo{Name: "my-app", Head: "abc123"}, command, &cold, 2),
+	}
+
+	report := buildBenchmarkReport(records, benchmarkReportOptions{StorePath: "timings.jsonl", MinSamples: 2}, now)
+	if report.ObservationCount != 4 || report.MatchedCount != 4 {
+		t.Fatalf("counts observation=%d matched=%d", report.ObservationCount, report.MatchedCount)
+	}
+	if len(report.Groups) != 2 {
+		t.Fatalf("groups=%d want 2: %#v", len(report.Groups), report.Groups)
+	}
+	groups := map[string]benchmarkReportGroup{}
+	for _, group := range report.Groups {
+		groups[group.Provider] = group
+	}
+	aws := groups["aws"]
+	if aws.N != 1 || aws.FailureCount != 1 {
+		t.Fatalf("aws counts n=%d failures=%d", aws.N, aws.FailureCount)
+	}
+	if !aws.InsufficientEvidence || !strings.Contains(aws.Evidence, "insufficient_successful_samples") {
+		t.Fatalf("aws evidence=%q insufficient=%t", aws.Evidence, aws.InsufficientEvidence)
+	}
+	if aws.MedianTotalMs == nil || *aws.MedianTotalMs != 1100 {
+		t.Fatalf("aws median total=%v", aws.MedianTotalMs)
+	}
+	hetzner := groups["hetzner"]
+	if hetzner.N != 2 || hetzner.FailureCount != 0 {
+		t.Fatalf("hetzner counts n=%d failures=%d", hetzner.N, hetzner.FailureCount)
+	}
+	if hetzner.InsufficientEvidence {
+		t.Fatalf("hetzner should have sufficient evidence: %q", hetzner.Evidence)
+	}
+	if hetzner.MedianTotalMs == nil || *hetzner.MedianTotalMs != 2200 {
+		t.Fatalf("hetzner median total=%v", hetzner.MedianTotalMs)
+	}
+}
+
+func TestBenchReportJSONFiltersStoreRows(t *testing.T) {
+	dir := t.TempDir()
+	storePath := filepath.Join(dir, "timings.jsonl")
+	now := time.Date(2026, 6, 18, 12, 0, 0, 0, time.UTC)
+	cold := false
+	command := []string{"go", "test", "./..."}
+	for _, record := range []BenchmarkTimingRecord{
+		newBenchmarkTimingRecord(now.Add(-time.Hour), "test", TimingReport{Provider: "aws", MachineType: "c7a.large", SyncMs: 100, CommandMs: 1000, TotalMs: 1200, ExitCode: 0}, Repo{Name: "my-app"}, command, &cold, 1),
+		newBenchmarkTimingRecord(now.Add(-time.Hour), "test", TimingReport{Provider: "hetzner", MachineType: "cx22", SyncMs: 100, CommandMs: 1500, TotalMs: 1700, ExitCode: 0}, Repo{Name: "my-app"}, command, &cold, 1),
+	} {
+		if err := appendBenchmarkTimingRecord(storePath, record); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var stdout, stderr bytes.Buffer
+	app := App{Stdout: &stdout, Stderr: &stderr}
+	err := app.benchReport(context.Background(), []string{"--store", storePath, "--provider", "aws", "--json"})
+	if err != nil {
+		t.Fatalf("bench report error=%v stderr=%q", err, stderr.String())
+	}
+	var report benchmarkReport
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
+		t.Fatalf("decode report: %v\n%s", err, stdout.String())
+	}
+	if report.ObservationCount != 2 || report.MatchedCount != 1 {
+		t.Fatalf("counts observation=%d matched=%d", report.ObservationCount, report.MatchedCount)
+	}
+	if len(report.Groups) != 1 || report.Groups[0].Provider != "aws" {
+		t.Fatalf("groups=%#v", report.Groups)
+	}
+	if report.Groups[0].InsufficientEvidence != true {
+		t.Fatalf("single sample should be insufficient by default: %#v", report.Groups[0])
+	}
+}

@@ -1,0 +1,85 @@
+name: Crabbox Hydrate
+
+on:
+  workflow_dispatch:
+    inputs:
+      crabbox_id:
+        required: true
+        type: string
+      crabbox_runner_label:
+        required: true
+        type: string
+      crabbox_job:
+        required: false
+        default: hydrate
+        type: string
+      crabbox_keep_alive_minutes:
+        required: false
+        default: "90"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  hydrate:
+    runs-on: [self-hosted, "${{ inputs.crabbox_runner_label }}"]
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24
+
+      - name: Install Worker dependencies
+        run: npm ci --prefix worker
+
+      - name: Record hydrate state
+        shell: bash
+        env:
+          CRABBOX_ID: ${{ inputs.crabbox_id }}
+          CRABBOX_JOB: ${{ inputs.crabbox_job }}
+        run: |
+          case "$CRABBOX_ID" in
+            ""|*[!A-Za-z0-9_-]*)
+              echo "::error::crabbox_id must match [A-Za-z0-9_-]+"
+              exit 2
+              ;;
+          esac
+          case "$CRABBOX_JOB" in
+            *$'\n'*|*$'\r'*)
+              echo "::error::crabbox_job must not contain line breaks"
+              exit 2
+              ;;
+          esac
+          mkdir -p "$HOME/.crabbox/actions"
+          state="$HOME/.crabbox/actions/${CRABBOX_ID}.env"
+          env_file="$HOME/.crabbox/actions/${CRABBOX_ID}.env.sh"
+          services_file="$HOME/.crabbox/actions/${CRABBOX_ID}.services"
+          {
+            echo "export GITHUB_WORKSPACE=$(printf '%q' "$GITHUB_WORKSPACE")"
+            echo "export GITHUB_RUN_ID=$(printf '%q' "$GITHUB_RUN_ID")"
+            echo "export GITHUB_JOB=$(printf '%q' "$CRABBOX_JOB")"
+            echo "export RUNNER_TEMP=$(printf '%q' "$RUNNER_TEMP")"
+            echo "export RUNNER_TOOL_CACHE=$(printf '%q' "$RUNNER_TOOL_CACHE")"
+            echo "export PATH=$(printf '%q' "$PATH")"
+          } > "$env_file"
+          {
+            echo "WORKSPACE=${GITHUB_WORKSPACE}"
+            echo "COMMIT=$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)"
+            echo "RUN_ID=${GITHUB_RUN_ID}"
+            echo "JOB=${CRABBOX_JOB}"
+            echo "ENV_FILE=${env_file}"
+            echo "SERVICES_FILE=${services_file}"
+            echo "READY_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > "${state}.tmp"
+          mv "${state}.tmp" "$state"

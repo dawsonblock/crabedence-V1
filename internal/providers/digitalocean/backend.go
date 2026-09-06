@@ -1,0 +1,1421 @@
+package digitalocean
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared"
+)
+
+type digitalOceanAPI interface {
+	AccountID(context.Context) (string, error)
+	ListCrabboxDroplets(context.Context) ([]droplet, error)
+	GetDroplet(context.Context, int64) (droplet, error)
+	CreateDroplet(context.Context, core.Config, string, string, string, bool, time.Time) (droplet, error)
+	DeleteDroplet(context.Context, int64) error
+	FindSSHKey(context.Context, string, string) (sshKey, bool, error)
+	FindSSHKeyByID(context.Context, int64) (sshKey, bool, error)
+	FindSSHKeyByPublicKey(context.Context, string) (sshKey, bool, error)
+	DeleteSSHKey(context.Context, int64) error
+	ReplaceDropletTags(context.Context, int64, []string, []string) error
+}
+
+type digitalOceanLeaseBackend struct {
+	shared.DirectSSHBackend
+	clientFactory             func(core.Runtime) (digitalOceanAPI, error)
+	waitSSH                   func(context.Context, *core.SSHTarget, string, time.Duration) error
+	recoveryGrace             time.Duration
+	recoveryReconcilePolls    int
+	recoveryReconcileInterval time.Duration
+	acquireConfigErr          error
+}
+
+var claimLeaseTargetForRepoConfig = core.ClaimLeaseTargetForRepoConfigIfUnchanged
+
+const (
+	ambiguousCreateRecoveryGrace    = 2 * time.Minute
+	ambiguousCreateRecoveryPolls    = 3
+	ambiguousCreateRecoveryInterval = 2 * time.Second
+	digitalOceanAccountLabel        = "provider_account"
+	digitalOceanRecoveryKeyIDLabel  = "recovery_key_id"
+	digitalOceanKeyOwnedLabel       = "provider_key_owned"
+)
+
+func NewDigitalOceanLeaseBackend(spec core.ProviderSpec, cfg core.Config, rt core.Runtime) core.Backend {
+	cfg.Provider = providerName
+	acquireConfigErr := validateDigitalOceanAcquireConfig(cfg, core.OSImageWasExplicit(cfg))
+	applyDigitalOceanDefaults(&cfg)
+	b := &digitalOceanLeaseBackend{
+		DirectSSHBackend: shared.DirectSSHBackend{SpecValue: spec, Cfg: cfg, RT: rt, StoredLeaseKeys: true},
+		acquireConfigErr: acquireConfigErr,
+	}
+	b.clientFactory = func(rt core.Runtime) (digitalOceanAPI, error) { return newDigitalOceanClient(rt) }
+	b.waitSSH = func(ctx context.Context, target *core.SSHTarget, phase string, timeout time.Duration) error {
+		return core.WaitForSSHReady(ctx, target, b.RT.Stderr, phase, timeout)
+	}
+	b.Delete = b.deleteServer
+	b.PrepareCleanup = b.prepareCleanup
+	return b
+}
+
+func (b *digitalOceanLeaseBackend) Acquire(ctx context.Context, req core.AcquireRequest) (core.LeaseTarget, error) {
+	return shared.AcquireAttemptsRetry(b.RT, req.Keep, func() (core.LeaseTarget, error) {
+		return b.acquireOnce(ctx, req)
+	})
+}
+
+func (b *digitalOceanLeaseBackend) acquireOnce(ctx context.Context, req core.AcquireRequest) (target core.LeaseTarget, err error) {
+	if b.acquireConfigErr != nil {
+		return core.LeaseTarget{}, b.acquireConfigErr
+	}
+	cfg := b.Cfg
+	if cfg.TargetOS != "" && cfg.TargetOS != core.TargetLinux {
+		return core.LeaseTarget{}, core.Exit(2, "provider=digitalocean only supports target=linux")
+	}
+	if cfg.Tailscale.Enabled && cfg.Tailscale.AuthKey == "" {
+		return core.LeaseTarget{}, core.Exit(2, "direct --tailscale requires %s to contain a Tailscale auth key", cfg.Tailscale.AuthKeyEnv)
+	}
+	client, err := b.clientFactory(b.RT)
+	if err != nil {
+		return core.LeaseTarget{}, err
+	}
+	accountID, err := client.AccountID(ctx)
+	if err != nil {
+		return core.LeaseTarget{}, err
+	}
+	leaseID := core.NewLeaseID()
+	droplets, err := client.ListCrabboxDroplets(ctx)
+	if err != nil {
+		return core.LeaseTarget{}, err
+	}
+	servers := make([]core.Server, 0, len(droplets))
+	for _, item := range droplets {
+		servers = append(servers, serverFromDroplet(item, cfg))
+	}
+	slug, err := core.AllocateDirectLeaseSlug(leaseID, req.RequestedSlug, servers)
+	if err != nil {
+		return core.LeaseTarget{}, err
+	}
+	keyPath, publicKey, err := core.EnsureTestboxKeyForConfig(cfg, leaseID)
+	if err != nil {
+		return core.LeaseTarget{}, err
+	}
+	now := b.now()
+	created := droplet{}
+	committed := false
+	defer func() {
+		if err == nil || committed {
+			return
+		}
+		var ambiguousDroplet *ambiguousDropletCreateError
+		var ambiguousKey *ambiguousSSHKeyCreateError
+		if errors.As(err, &ambiguousDroplet) || errors.As(err, &ambiguousKey) {
+			return
+		}
+		keyID := created.SSHKeyID
+		keyCreated := created.SSHKeyCreated
+		keyOwnershipKnown := created.ID != 0 && created.SSHKeyID > 0
+		cleanupKeyID := int64(0)
+		if keyOwnershipKnown && keyCreated {
+			cleanupKeyID = keyID
+		}
+		var keyCleanup *sshKeyCleanupError
+		if errors.As(err, &keyCleanup) {
+			keyID = keyCleanup.keyID
+			keyCreated = true
+			keyOwnershipKnown = true
+			cleanupKeyID = keyCleanup.keyID
+		}
+		if created.ID == 0 && !keyOwnershipKnown {
+			core.RemoveStoredTestboxKey(leaseID)
+			return
+		}
+		claimErr := b.persistAcquireCleanupClaim(
+			leaseID,
+			slug,
+			cfg,
+			created,
+			keyID,
+			keyCreated,
+			keyOwnershipKnown,
+			req.Repo.Root,
+			accountID,
+			req.Keep,
+			now,
+		)
+		claimPersisted := claimErr == nil
+		if cleanupErr := rollbackDigitalOceanAcquire(client, created.ID, cleanupKeyID); cleanupErr != nil {
+			err = fmt.Errorf("%v; digitalocean cleanup failed: %w", err, errors.Join(claimErr, cleanupErr))
+			return
+		}
+		if keyCleanup != nil {
+			err = keyCleanup.cause
+		}
+		if claimPersisted {
+			core.RemoveLeaseClaim(leaseID)
+		}
+		core.RemoveStoredTestboxKey(leaseID)
+	}()
+	cfg.SSHKey = keyPath
+	cfg.ProviderKey = providerKeyForLease(leaseID)
+	if !cfg.ServerTypeExplicit || cfg.ServerType == "" {
+		cfg.ServerType = digitalOceanServerTypeForClass(cfg.Class)
+	}
+	if cfg.Tailscale.Enabled && cfg.Tailscale.Hostname == "" {
+		cfg.Tailscale.Hostname = core.RenderTailscaleHostname(cfg.Tailscale.HostnameTemplate, leaseID, slug, cfg.Provider)
+	}
+	fmt.Fprintf(b.RT.Stderr, "provisioning provider=digitalocean lease=%s slug=%s type=%s region=%s image=%s keep=%v\n", leaseID, slug, cfg.ServerType, digitalOceanRegion(cfg), digitalOceanImage(cfg), req.Keep)
+	created, err = client.CreateDroplet(ctx, cfg, publicKey, leaseID, slug, req.Keep, now)
+	if err != nil {
+		recovery := ""
+		var ambiguousDroplet *ambiguousDropletCreateError
+		var ambiguousKey *ambiguousSSHKeyCreateError
+		recoveryKeyID := int64(0)
+		recoveryKeyCreated := false
+		recoveryKeyOwnershipKnown := false
+		switch {
+		case errors.As(err, &ambiguousDroplet):
+			recovery = "ambiguous-create"
+			recoveryKeyID = ambiguousDroplet.keyID
+			recoveryKeyCreated = ambiguousDroplet.keyCreated
+			recoveryKeyOwnershipKnown = ambiguousDroplet.keyOwnershipKnown
+		case errors.As(err, &ambiguousKey):
+			recovery = "ambiguous-key-create"
+		}
+		if recovery != "" {
+			if claimErr := b.persistAcquireRecoveryClaim(
+				leaseID,
+				slug,
+				cfg,
+				req.Repo.Root,
+				accountID,
+				req.Keep,
+				now,
+				recovery,
+				recoveryKeyID,
+				recoveryKeyCreated,
+				recoveryKeyOwnershipKnown,
+			); claimErr != nil {
+				return core.LeaseTarget{}, errors.Join(err, fmt.Errorf("persist digitalocean %s recovery: %w", recovery, claimErr))
+			}
+		}
+		return core.LeaseTarget{}, err
+	}
+	waited, waitErr := b.waitForDropletIP(ctx, client, created.ID, 5*time.Minute)
+	if waitErr != nil {
+		return core.LeaseTarget{}, waitErr
+	}
+	waited.SSHKeyID = created.SSHKeyID
+	waited.SSHKeyCreated = created.SSHKeyCreated
+	created = waited
+	server := serverFromDroplet(created, cfg)
+	ssh := core.SSHTargetFromConfig(cfg, server.PublicNet.IPv4.IP)
+	if err := b.waitSSH(ctx, &ssh, "digitalocean bootstrap", core.BootstrapWaitTimeout(cfg)); err != nil {
+		return core.LeaseTarget{}, err
+	}
+	readyTags := leaseTags(cfg, leaseID, slug, "ready", req.Keep, now)
+	if err := client.ReplaceDropletTags(ctx, created.ID, created.Tags, readyTags); err != nil {
+		return core.LeaseTarget{}, err
+	} else {
+		server.Labels = labelsFromTags(readyTags)
+	}
+	server.Labels[digitalOceanAccountLabel] = accountID
+	setDigitalOceanKeyIdentity(server.Labels, created.SSHKeyID, created.SSHKeyCreated, true)
+	server.Status = "ready"
+	claim, err := claimLeaseTargetForRepoConfig(leaseID, slug, cfg, server, ssh, req.Repo.Root, cfg.IdleTimeout, req.Reclaim, core.LeaseClaim{}, false)
+	if err != nil {
+		return core.LeaseTarget{}, err
+	}
+	core.SetServerLeaseClaimSnapshot(&server, claim, true)
+	committed = true
+	fmt.Fprintf(b.RT.Stderr, "provisioned lease=%s droplet=%s type=%s\n", leaseID, server.DisplayID(), cfg.ServerType)
+	return core.LeaseTarget{Server: server, SSH: ssh, LeaseID: leaseID}, nil
+}
+
+func (b *digitalOceanLeaseBackend) persistAcquireRecoveryClaim(
+	leaseID, slug string,
+	cfg core.Config,
+	repoRoot, accountID string,
+	keep bool,
+	now time.Time,
+	recovery string,
+	keyID int64,
+	keyCreated bool,
+	keyOwnershipKnown bool,
+) error {
+	labels := core.DirectLeaseLabels(cfg, leaseID, slug, providerName, "", keep, now)
+	labels["state"] = "provisioning"
+	labels["recovery"] = recovery
+	labels[digitalOceanAccountLabel] = accountID
+	setDigitalOceanKeyIdentity(labels, keyID, keyCreated, keyOwnershipKnown)
+	if repoRoot == "" {
+		var err error
+		repoRoot, err = os.Getwd()
+		if err != nil {
+			return fmt.Errorf("resolve recovery working directory: %w", err)
+		}
+	}
+	server := core.Server{
+		Provider: providerName,
+		Name:     core.LeaseProviderName(leaseID, slug),
+		Labels:   labels,
+	}
+	_, err := claimLeaseTargetForRepoConfig(leaseID, slug, cfg, server, core.SSHTarget{}, repoRoot, cfg.IdleTimeout, false, core.LeaseClaim{}, false)
+	return err
+}
+
+func (b *digitalOceanLeaseBackend) persistAcquireCleanupClaim(
+	leaseID, slug string,
+	cfg core.Config,
+	created droplet,
+	keyID int64,
+	keyCreated, keyOwnershipKnown bool,
+	repoRoot, accountID string,
+	keep bool,
+	now time.Time,
+) error {
+	server := core.Server{
+		Provider: providerName,
+		Name:     core.LeaseProviderName(leaseID, slug),
+	}
+	if created.ID != 0 {
+		server = serverFromDroplet(created, cfg)
+	}
+	if err := validateDropletLabels(server.Labels); err != nil {
+		server.Labels = core.DirectLeaseLabels(cfg, leaseID, slug, providerName, "", keep, now)
+		server.Labels["state"] = "provisioning"
+	}
+	server.Labels["recovery"] = "rollback-cleanup"
+	server.Labels[digitalOceanAccountLabel] = accountID
+	setDigitalOceanKeyIdentity(server.Labels, keyID, keyCreated, keyOwnershipKnown)
+	if repoRoot == "" {
+		var err error
+		repoRoot, err = os.Getwd()
+		if err != nil {
+			return fmt.Errorf("resolve rollback cleanup working directory: %w", err)
+		}
+	}
+	if _, err := claimLeaseTargetForRepoConfig(
+		leaseID,
+		slug,
+		cfg,
+		server,
+		core.SSHTarget{},
+		repoRoot,
+		cfg.IdleTimeout,
+		false,
+		core.LeaseClaim{},
+		false,
+	); err != nil {
+		return fmt.Errorf("persist digitalocean rollback cleanup claim: %w", err)
+	}
+	return nil
+}
+
+func (b *digitalOceanLeaseBackend) Resolve(ctx context.Context, req core.ResolveRequest) (core.LeaseTarget, error) {
+	client, err := b.clientFactory(b.RT)
+	if err != nil {
+		return core.LeaseTarget{}, err
+	}
+	accountID, err := client.AccountID(ctx)
+	if err != nil {
+		return core.LeaseTarget{}, err
+	}
+	droplets, err := client.ListCrabboxDroplets(ctx)
+	if err != nil {
+		return core.LeaseTarget{}, err
+	}
+	servers := make([]core.Server, 0, len(droplets))
+	byID := map[int64]droplet{}
+	for _, item := range droplets {
+		if !isOwnedDroplet(item) {
+			continue
+		}
+		server := serverFromDroplet(item, b.Cfg)
+		servers = append(servers, server)
+		byID[server.ID] = item
+	}
+	if id, ok := parseDropletID(req.ID); ok {
+		if item, found := byID[id]; found {
+			return b.targetFromDroplet(item, req, droplets, accountID)
+		}
+		item, err := client.GetDroplet(ctx, id)
+		if err != nil {
+			if req.ReleaseOnly && isDigitalOceanNotFound(err) {
+				return b.releaseTargetFromClaim(ctx, client, req.ID, accountID)
+			}
+			return core.LeaseTarget{}, err
+		}
+		return b.targetFromDroplet(item, req, appendDropletIfMissing(droplets, item), accountID)
+	}
+	server, leaseID, err := core.FindServerByAlias(servers, req.ID)
+	if err != nil {
+		return core.LeaseTarget{}, err
+	}
+	if leaseID != "" {
+		return b.targetFromDroplet(byID[server.ID], req, droplets, accountID)
+	}
+	if req.ReleaseOnly {
+		return b.releaseTargetFromClaim(ctx, client, req.ID, accountID)
+	}
+	return core.LeaseTarget{}, core.Exit(4, "lease/droplet not found: %s", req.ID)
+}
+
+func (b *digitalOceanLeaseBackend) releaseTargetFromClaim(ctx context.Context, client digitalOceanAPI, id, accountID string) (core.LeaseTarget, error) {
+	var (
+		claim core.LeaseClaim
+		ok    bool
+		err   error
+	)
+	providerScope := core.ProviderClaimScope(providerName, b.Cfg)
+	if dropletID, numeric := parseDropletID(id); numeric {
+		id = strconv.FormatInt(dropletID, 10)
+		claim, ok, err = core.ResolveLeaseClaimForProviderCloudIDScope(id, providerName, providerScope)
+	} else {
+		claim, ok, err = shared.ResolveProviderClaimStrict(id, providerName, providerScope)
+		if errors.Is(err, shared.ErrStrictClaimMismatch) {
+			return core.LeaseTarget{}, core.Exit(2, "digitalocean exact lease identifier %q does not match a valid digitalocean claim", id)
+		}
+	}
+	if err != nil {
+		return core.LeaseTarget{}, err
+	}
+	if !ok || claim.LeaseID == "" {
+		return core.LeaseTarget{}, core.Exit(4, "lease/droplet not found: %s", id)
+	}
+	if err := validateDropletLabels(claim.Labels); err != nil {
+		return core.LeaseTarget{}, err
+	}
+	if err := validateDigitalOceanClaimIdentity(claim, claim.LeaseID, claim.Slug); err != nil {
+		return core.LeaseTarget{}, err
+	}
+	expectedAccountID := strings.TrimSpace(claim.Labels[digitalOceanAccountLabel])
+	if expectedAccountID == "" {
+		return core.LeaseTarget{}, core.Exit(3, "digitalocean lease claim has no account identity; refusing claim-only recovery")
+	}
+	if expectedAccountID != accountID {
+		return core.LeaseTarget{}, core.Exit(3, "digitalocean account mismatch: current account %s does not match lease account %s", accountID, expectedAccountID)
+	}
+	if strings.TrimSpace(claim.CloudID) == "" {
+		recovery := claim.Labels["recovery"]
+		if recovery == "rollback-cleanup" {
+			server := core.Server{Provider: providerName, Name: core.LeaseProviderName(claim.LeaseID, claim.Slug), Labels: claim.Labels}
+			core.SetServerLeaseClaimSnapshot(&server, claim, true)
+			return core.LeaseTarget{LeaseID: claim.LeaseID, Server: server}, nil
+		}
+		if recovery == "ambiguous-key-create" && strings.TrimSpace(claim.Labels[digitalOceanRecoveryKeyIDLabel]) != "" {
+			server := core.Server{Provider: providerName, Name: core.LeaseProviderName(claim.LeaseID, claim.Slug), Labels: claim.Labels}
+			core.SetServerLeaseClaimSnapshot(&server, claim, true)
+			return core.LeaseTarget{LeaseID: claim.LeaseID, Server: server}, nil
+		}
+		if recovery != "ambiguous-create" && recovery != "ambiguous-key-create" {
+			return core.LeaseTarget{}, core.Exit(2, "digitalocean lease claim has invalid recovery state %q for lease=%s", recovery, claim.LeaseID)
+		}
+		grace := b.recoveryGrace
+		if grace <= 0 {
+			grace = ambiguousCreateRecoveryGrace
+		}
+		createdAt, _ := strconv.ParseInt(claim.Labels["created_at"], 10, 64)
+		recoveryName := recovery
+		if recoveryName == "" {
+			recoveryName = "ambiguous-create"
+		}
+		if createdAt <= 0 || b.now().Before(time.Unix(createdAt, 0).Add(grace)) {
+			return core.LeaseTarget{}, core.Exit(4, "digitalocean %s recovery is still pending for lease=%s; retry stop later", recoveryName, claim.LeaseID)
+		}
+		if recovery == "ambiguous-key-create" {
+			if target, found, err := b.reconcilePendingKeyRecovery(ctx, client, claim); err != nil {
+				return core.LeaseTarget{}, err
+			} else if found {
+				return target, nil
+			}
+			return core.LeaseTarget{}, core.Exit(4, "digitalocean ambiguous SSH-key create remains indeterminate for lease=%s; credentials and recovery claim retained", claim.LeaseID)
+		}
+		if target, found, err := b.reconcilePendingRecovery(ctx, client, claim, accountID); err != nil {
+			return core.LeaseTarget{}, err
+		} else if found {
+			return target, nil
+		}
+		return core.LeaseTarget{}, core.Exit(4, "digitalocean ambiguous create remains indeterminate for lease=%s; credentials and recovery claim retained", claim.LeaseID)
+	}
+	dropletID, ok := parseDropletID(claim.CloudID)
+	if !ok {
+		return core.LeaseTarget{}, core.Exit(4, "lease/droplet not found: %s", id)
+	}
+	if item, err := client.GetDroplet(ctx, dropletID); err == nil {
+		labels := labelsFromTags(item.Tags)
+		if err := validateDropletLabels(labels); err != nil {
+			return core.LeaseTarget{}, err
+		}
+		if item.Name != core.LeaseProviderName(claim.LeaseID, claim.Slug) ||
+			labels["crabbox"] != "true" ||
+			labels["created_by"] != "crabbox" ||
+			labels["provider"] != providerName ||
+			labels["lease"] != claim.LeaseID ||
+			labels["slug"] != claim.Slug {
+			return core.LeaseTarget{}, core.Exit(2, "refusing to release DigitalOcean Droplet %d from stale local claim", dropletID)
+		}
+		server := serverFromDroplet(item, core.Config{})
+		server.Labels[digitalOceanAccountLabel] = accountID
+		preserveDigitalOceanKeyIdentity(server.Labels, claim.Labels)
+		core.SetServerLeaseClaimSnapshot(&server, claim, true)
+		return core.LeaseTarget{
+			LeaseID: claim.LeaseID,
+			Server:  server,
+		}, nil
+	} else if !isDigitalOceanNotFound(err) {
+		return core.LeaseTarget{}, err
+	}
+	if expectedAccountID == "" {
+		return core.LeaseTarget{}, core.Exit(3, "digitalocean lease claim has no account identity; refusing claim-only cleanup after Droplet lookup returned not found")
+	}
+	server := core.Server{Provider: providerName, CloudID: claim.CloudID, ID: dropletID, Name: core.LeaseProviderName(claim.LeaseID, claim.Slug), Labels: claim.Labels}
+	core.SetServerLeaseClaimSnapshot(&server, claim, true)
+	return core.LeaseTarget{LeaseID: claim.LeaseID, Server: server}, nil
+}
+
+func (b *digitalOceanLeaseBackend) reconcilePendingRecovery(ctx context.Context, client digitalOceanAPI, claim core.LeaseClaim, accountID string) (core.LeaseTarget, bool, error) {
+	polls, interval := b.recoveryPolling()
+	var target core.LeaseTarget
+	_, err := shared.Poll(ctx, polls, interval, shared.SleepContext,
+		func(ctx context.Context) ([]droplet, error) { return client.ListCrabboxDroplets(ctx) },
+		func(_ context.Context, droplets []droplet, fetchErr error) (bool, error) {
+			if fetchErr != nil {
+				return false, fetchErr
+			}
+			matches := pendingRecoveryMatches(droplets, claim)
+			switch len(matches) {
+			case 1:
+				server := serverFromDroplet(matches[0], b.Cfg)
+				server.Labels[digitalOceanAccountLabel] = accountID
+				preserveDigitalOceanKeyIdentity(server.Labels, claim.Labels)
+				updated, err := persistPendingRecoveryClaim(server, droplets, claim)
+				if err != nil {
+					return false, err
+				}
+				core.SetServerLeaseClaimSnapshot(&server, updated, true)
+				target = core.LeaseTarget{LeaseID: claim.LeaseID, Server: server}
+				return true, nil
+			case 0:
+				return false, nil
+			default:
+				return false, core.Exit(2, "digitalocean ambiguous create recovery found multiple droplets for lease=%s", claim.LeaseID)
+			}
+		}, nil)
+	return target, target.LeaseID != "", err
+}
+
+func (b *digitalOceanLeaseBackend) reconcilePendingKeyRecovery(ctx context.Context, client digitalOceanAPI, claim core.LeaseClaim) (core.LeaseTarget, bool, error) {
+	keyPath, err := core.TestboxKeyPath(claim.LeaseID)
+	if err != nil {
+		return core.LeaseTarget{}, false, err
+	}
+	publicKeyBytes, err := os.ReadFile(keyPath + ".pub")
+	if err != nil {
+		return core.LeaseTarget{}, false, fmt.Errorf("read retained digitalocean SSH public key: %w", err)
+	}
+	publicKey := strings.TrimSpace(string(publicKeyBytes))
+	if publicKey == "" {
+		return core.LeaseTarget{}, false, core.Exit(2, "retained digitalocean SSH public key is empty for lease=%s", claim.LeaseID)
+	}
+	polls, interval := b.recoveryPolling()
+	keyName := providerKeyForLease(claim.LeaseID)
+	var target core.LeaseTarget
+	_, err = shared.Poll(ctx, polls, interval, shared.SleepContext,
+		func(observeCtx context.Context) (*sshKey, error) {
+			key, found, err := client.FindSSHKey(observeCtx, keyName, publicKey)
+			if !found || err != nil {
+				return nil, err
+			}
+			return &key, nil
+		},
+		func(_ context.Context, key *sshKey, fetchErr error) (bool, error) {
+			if fetchErr != nil {
+				return false, fetchErr
+			}
+			if key == nil {
+				return false, nil
+			}
+			if strings.TrimSpace(key.PublicKey) != publicKey {
+				return false, core.Exit(2, "refusing to delete digitalocean SSH key %q with a different public key", keyName)
+			}
+			replacement := claim
+			replacement.Labels = shared.CloneLabels(claim.Labels)
+			setDigitalOceanKeyIdentity(replacement.Labels, key.ID, true, true)
+			updated, err := core.ReplaceLeaseClaimIfUnchangedDurableReturning(claim.LeaseID, claim, replacement)
+			if err != nil {
+				return false, fmt.Errorf("persist recovered digitalocean SSH key identity: %w", err)
+			}
+			server := core.Server{Provider: providerName, Name: core.LeaseProviderName(claim.LeaseID, claim.Slug), Labels: updated.Labels}
+			core.SetServerLeaseClaimSnapshot(&server, updated, true)
+			target = core.LeaseTarget{LeaseID: claim.LeaseID, Server: server}
+			return true, nil
+		}, nil)
+	return target, target.LeaseID != "", err
+}
+
+func (b *digitalOceanLeaseBackend) recoveryPolling() (int, time.Duration) {
+	polls, interval := b.recoveryReconcilePolls, b.recoveryReconcileInterval
+	if polls <= 0 {
+		polls = ambiguousCreateRecoveryPolls
+	}
+	if interval <= 0 {
+		interval = ambiguousCreateRecoveryInterval
+	}
+	return polls, interval
+}
+
+func validateDigitalOceanAcquireConfig(cfg core.Config, osImageExplicit bool) error {
+	if !osImageExplicit ||
+		strings.TrimSpace(cfg.DigitalOcean.Image) != "" ||
+		cfg.OSImage == "ubuntu:24.04" {
+		return nil
+	}
+	return core.Exit(2, "provider=digitalocean does not support --os %s; use --os ubuntu:24.04 or set digitalocean.image explicitly", cfg.OSImage)
+}
+
+func pendingRecoveryMatches(droplets []droplet, claim core.LeaseClaim) []droplet {
+	name := core.LeaseProviderName(claim.LeaseID, claim.Slug)
+	matches := make([]droplet, 0, 1)
+	for _, item := range droplets {
+		labels := labelsFromTags(item.Tags)
+		if isOwnedDroplet(item) &&
+			item.Name == name &&
+			labels["lease"] == claim.LeaseID &&
+			labels["slug"] == claim.Slug {
+			matches = append(matches, item)
+		}
+	}
+	return matches
+}
+
+func appendDropletIfMissing(droplets []droplet, item droplet) []droplet {
+	for _, existing := range droplets {
+		if existing.ID == item.ID {
+			return droplets
+		}
+	}
+	return append(droplets, item)
+}
+
+func (b *digitalOceanLeaseBackend) persistPendingRecoveryServer(server core.Server, droplets []droplet, claim core.LeaseClaim) (core.LeaseClaim, error) {
+	leaseID := server.Labels["lease"]
+	if !isPendingRecoveryClaim(claim, leaseID) {
+		return claim, nil
+	}
+	if err := validateDigitalOceanClaimIdentity(claim, leaseID, server.Labels["slug"]); err != nil {
+		return core.LeaseClaim{}, err
+	}
+	expected := strings.TrimSpace(claim.Labels[digitalOceanAccountLabel])
+	if expected == "" {
+		return core.LeaseClaim{}, core.Exit(3, "digitalocean recovery claim has no account identity; refusing to bind it to the current account")
+	}
+	if expected != server.Labels[digitalOceanAccountLabel] {
+		return core.LeaseClaim{}, core.Exit(3, "digitalocean account mismatch: current account %s does not match lease account %s", server.Labels[digitalOceanAccountLabel], expected)
+	}
+	return persistPendingRecoveryClaim(server, droplets, claim)
+}
+
+func isPendingRecoveryClaim(claim core.LeaseClaim, leaseID string) bool {
+	return claim.LeaseID == leaseID &&
+		claim.Provider == providerName &&
+		strings.TrimSpace(claim.CloudID) == "" &&
+		claim.Labels["recovery"] == "ambiguous-create"
+}
+
+func validateDigitalOceanClaimIdentity(claim core.LeaseClaim, leaseID, slug string) error {
+	binding := shared.ClaimBinding{Provider: providerName, LeaseID: leaseID, Slug: slug}
+	if claim.Slug == "" || claim.ProviderScope != "" || shared.ValidateClaimBinding(claim, binding) != nil {
+		return core.Exit(2, "digitalocean lease claim identity does not match lease=%s slug=%s", leaseID, slug)
+	}
+	return nil
+}
+
+func persistPendingRecoveryClaim(server core.Server, droplets []droplet, claim core.LeaseClaim) (core.LeaseClaim, error) {
+	matches := pendingRecoveryMatches(droplets, claim)
+	if len(matches) > 1 {
+		return core.LeaseClaim{}, core.Exit(2, "digitalocean ambiguous create recovery found multiple droplets for lease=%s", claim.LeaseID)
+	}
+	if len(matches) != 1 || matches[0].ID != server.ID {
+		return core.LeaseClaim{}, core.Exit(2, "refusing to bind digitalocean ambiguous create recovery to mismatched droplet=%d lease=%s", server.ID, claim.LeaseID)
+	}
+	preserveDigitalOceanKeyIdentity(server.Labels, claim.Labels)
+	replacement := claim
+	replacement.CloudID = strconv.FormatInt(server.ID, 10)
+	updated, err := core.ReplaceLeaseClaimIfUnchangedDurableReturning(claim.LeaseID, claim, replacement)
+	if err != nil {
+		return core.LeaseClaim{}, fmt.Errorf("persist recovered digitalocean droplet: %w", err)
+	}
+	return updated, nil
+}
+
+func (b *digitalOceanLeaseBackend) targetFromDroplet(item droplet, req core.ResolveRequest, droplets []droplet, accountID string) (core.LeaseTarget, error) {
+	if err := validateDropletLabels(labelsFromTags(item.Tags)); err != nil {
+		return core.LeaseTarget{}, err
+	}
+	server := serverFromDroplet(item, b.Cfg)
+	server.Labels[digitalOceanAccountLabel] = accountID
+	leaseID := server.Labels["lease"]
+	claim, claimExists, claimErr := core.ReadLeaseClaimWithPresence(leaseID)
+	if claimErr != nil {
+		return core.LeaseTarget{}, fmt.Errorf("read digitalocean lease claim: %w", claimErr)
+	}
+	if claimExists && !req.IsReadOnlyStatus() {
+		if claim.Provider != providerName {
+			return core.LeaseTarget{}, core.Exit(2, "lease=%s is claimed by provider=%s; refusing digitalocean claim rewrite", leaseID, claim.Provider)
+		}
+		if err := validateDigitalOceanClaimIdentity(claim, leaseID, server.Labels["slug"]); err != nil {
+			return core.LeaseTarget{}, err
+		}
+		expectedAccountID := strings.TrimSpace(claim.Labels[digitalOceanAccountLabel])
+		if expectedAccountID == "" {
+			return core.LeaseTarget{}, core.Exit(3, "digitalocean lease claim has no account identity; refusing to bind it to the current account")
+		}
+		if expectedAccountID != accountID {
+			return core.LeaseTarget{}, core.Exit(3, "digitalocean account mismatch: current account %s does not match lease account %s", accountID, expectedAccountID)
+		}
+		liveCloudID := firstNonBlank(server.CloudID, strconv.FormatInt(server.ID, 10))
+		if claim.CloudID != "" && claim.CloudID != liveCloudID {
+			return core.LeaseTarget{}, core.Exit(2, "refusing to resolve DigitalOcean Droplet %d from stale local claim", server.ID)
+		}
+		if claim.CloudID == "" && !isPendingRecoveryClaim(claim, leaseID) {
+			return core.LeaseTarget{}, core.Exit(2, "digitalocean lease claim has no Droplet identity or valid pending recovery state for lease=%s", leaseID)
+		}
+		preserveDigitalOceanKeyIdentity(server.Labels, claim.Labels)
+	} else if !claimExists && req.ReleaseOnly {
+		return core.LeaseTarget{}, core.Exit(2, "digitalocean lease=%s has no exact local claim; refusing release", leaseID)
+	} else if !claimExists && !req.NoLocalStateMutations {
+		if !req.Reclaim {
+			return core.LeaseTarget{}, core.Exit(2, "digitalocean lease=%s is unclaimed; use --reclaim to adopt it explicitly", leaseID)
+		}
+		if req.Repo.Root == "" {
+			return core.LeaseTarget{}, core.Exit(2, "digitalocean lease=%s cannot be reclaimed without a repository root", leaseID)
+		}
+		setDigitalOceanKeyIdentity(server.Labels, 0, false, true)
+	}
+	if req.ReleaseOnly {
+		updated, err := b.persistPendingRecoveryServer(server, droplets, claim)
+		if err != nil {
+			return core.LeaseTarget{}, err
+		}
+		core.SetServerLeaseClaimSnapshot(&server, updated, true)
+		return core.LeaseTarget{Server: server, LeaseID: leaseID}, nil
+	}
+	ssh := core.SSHTargetFromConfig(b.Cfg, server.PublicNet.IPv4.IP)
+	if keyPath, err := core.TestboxKeyPath(leaseID); err == nil {
+		if _, statErr := os.Stat(keyPath); statErr == nil {
+			ssh.Key = keyPath
+		}
+	}
+	if req.Repo.Root != "" && !req.NoLocalStateMutations {
+		updated, err := core.ClaimLeaseTargetForRepoConfigIfUnchanged(leaseID, server.Labels["slug"], b.Cfg, server, ssh, req.Repo.Root, b.Cfg.IdleTimeout, req.Reclaim, claim, claimExists)
+		if err != nil {
+			return core.LeaseTarget{}, err
+		}
+		claim, claimExists = updated, true
+	}
+	if claimExists && !req.IsReadOnlyStatus() {
+		core.SetServerLeaseClaimSnapshot(&server, claim, true)
+	}
+	return core.LeaseTarget{Server: server, SSH: ssh, LeaseID: leaseID}, nil
+}
+
+func (b *digitalOceanLeaseBackend) List(ctx context.Context, req core.ListRequest) ([]core.LeaseView, error) {
+	_ = req
+	client, err := b.clientFactory(b.RT)
+	if err != nil {
+		return nil, err
+	}
+	droplets, err := client.ListCrabboxDroplets(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]core.LeaseView, 0, len(droplets))
+	for _, item := range droplets {
+		if !isOwnedDroplet(item) {
+			continue
+		}
+		out = append(out, serverFromDroplet(item, b.Cfg))
+	}
+	return out, nil
+}
+
+func (b *digitalOceanLeaseBackend) Doctor(ctx context.Context, _ core.DoctorRequest) (core.DoctorResult, error) {
+	client, err := b.clientFactory(b.RT)
+	if err != nil {
+		return core.DoctorResult{}, err
+	}
+	if _, err := client.AccountID(ctx); err != nil {
+		return core.DoctorResult{}, err
+	}
+	droplets, err := client.ListCrabboxDroplets(ctx)
+	if err != nil {
+		return core.DoctorResult{}, err
+	}
+	result := core.InventoryDoctorResult(providerName, len(droplets))
+	result.Message += fmt.Sprintf(" default_type=%s region=%s image=%s", b.Cfg.ServerType, digitalOceanRegion(b.Cfg), digitalOceanImage(b.Cfg))
+	return result, nil
+}
+
+func (b *digitalOceanLeaseBackend) ReleaseLease(ctx context.Context, req core.ReleaseLeaseRequest) error {
+	return b.deleteServer(ctx, b.Cfg, req.Lease.Server)
+}
+
+func (b *digitalOceanLeaseBackend) ReleaseLeaseMessage(lease core.LeaseTarget) string {
+	return fmt.Sprintf("deleted lease=%s droplet=%s name=%s", lease.LeaseID, lease.Server.DisplayID(), lease.Server.Name)
+}
+
+func (b *digitalOceanLeaseBackend) StatusTouchClaimMatches(lease core.LeaseTarget, claim core.LeaseClaim) bool {
+	expected := strings.TrimSpace(claim.Labels[digitalOceanAccountLabel])
+	return expected != "" && expected == strings.TrimSpace(lease.Server.Labels[digitalOceanAccountLabel])
+}
+
+func (b *digitalOceanLeaseBackend) Touch(ctx context.Context, req core.TouchRequest) (core.Server, error) {
+	server := req.Lease.Server
+	if err := validateDropletLabels(server.Labels); err != nil {
+		return core.Server{}, err
+	}
+	client, err := b.clientFactory(b.RT)
+	if err != nil {
+		return core.Server{}, err
+	}
+	item, err := client.GetDroplet(ctx, server.ID)
+	if err != nil {
+		return core.Server{}, err
+	}
+	if err := validateLiveDroplet(item, server); err != nil {
+		return core.Server{}, err
+	}
+	cfg := b.Cfg
+	labels := normalizedDropletLabels(item.Tags)
+	accountID := strings.TrimSpace(server.Labels[digitalOceanAccountLabel])
+	liveTailscale := map[string]string{}
+	for _, key := range tagSchema.Keys() {
+		if value, ok := labels[key]; ok && tagSchema.Exact(key) {
+			liveTailscale[key] = value
+		}
+	}
+	if req.IdleTimeout > 0 {
+		cfg.IdleTimeout = req.IdleTimeout
+		labels = shared.CloneLabels(labels)
+		delete(labels, "idle_timeout")
+		delete(labels, "idle_timeout_secs")
+	}
+	labels = core.TouchDirectLeaseLabels(labels, cfg, req.State, b.now())
+	for key, value := range liveTailscale {
+		labels[key] = value
+	}
+	preserveDigitalOceanKeyIdentity(labels, server.Labels)
+	if accountID != "" {
+		labels[digitalOceanAccountLabel] = accountID
+	}
+	if err := client.ReplaceDropletTags(ctx, server.ID, item.Tags, tagsFromLabels(labels)); err != nil {
+		return core.Server{}, err
+	}
+	server.Labels = labels
+	return server, nil
+}
+
+func (b *digitalOceanLeaseBackend) UpdateTailscaleMetadata(ctx context.Context, lease core.LeaseTarget, meta core.TailscaleMetadata) (core.Server, error) {
+	server := lease.Server
+	if err := validateDropletLabels(server.Labels); err != nil {
+		return core.Server{}, err
+	}
+	expected, err := shared.RequireClaimSnapshot(server, providerName)
+	if err != nil {
+		return core.Server{}, err
+	}
+	if lease.LeaseID != expected.LeaseID {
+		return core.Server{}, core.Exit(2, "digitalocean metadata lease does not match its exact local claim")
+	}
+	client, err := b.clientFactory(b.RT)
+	if err != nil {
+		return core.Server{}, err
+	}
+	accountID, err := client.AccountID(ctx)
+	if err != nil {
+		return core.Server{}, err
+	}
+	if err := validateDigitalOceanCleanupClaim(server, expected, accountID); err != nil {
+		return core.Server{}, err
+	}
+	if expected.CloudNumericID != 0 && expected.CloudNumericID != server.ID {
+		return core.Server{}, core.Exit(2, "digitalocean metadata Droplet identity does not match its exact local claim")
+	}
+	item, err := client.GetDroplet(ctx, server.ID)
+	if err != nil {
+		return core.Server{}, err
+	}
+	if err := validateLiveDroplet(item, server); err != nil {
+		return core.Server{}, err
+	}
+	claimServer := server
+	claimServer.Name = core.LeaseProviderName(expected.LeaseID, expected.Slug)
+	claimServer.Labels = expected.Labels
+	if err := validateLiveDroplet(item, claimServer); err != nil {
+		return core.Server{}, err
+	}
+	labels := normalizedDropletLabels(item.Tags)
+	preserveDigitalOceanKeyIdentity(labels, expected.Labels)
+	labels[digitalOceanAccountLabel] = accountID
+	applyTailscaleMetadata(labels, meta)
+	updatedClaim, server, _, err := core.UpdateLeaseClaimEndpointIfUnchangedAction(lease.LeaseID, expected, func() (core.Server, core.SSHTarget, bool, error) {
+		currentAccountID, err := client.AccountID(ctx)
+		if err != nil {
+			return core.Server{}, core.SSHTarget{}, false, err
+		}
+		if err := validateDigitalOceanCleanupClaim(server, expected, currentAccountID); err != nil {
+			return core.Server{}, core.SSHTarget{}, false, err
+		}
+		if err := client.ReplaceDropletTags(ctx, server.ID, item.Tags, tagsFromLabels(labels)); err != nil {
+			return core.Server{}, core.SSHTarget{}, false, err
+		}
+		updated := serverFromDroplet(item, b.Cfg)
+		updated.Labels = labels
+		return updated, lease.SSH, true, nil
+	})
+	if err != nil {
+		return core.Server{}, err
+	}
+	core.SetServerLeaseClaimSnapshot(&server, updatedClaim, true)
+	return server, nil
+}
+
+func (b *digitalOceanLeaseBackend) Cleanup(ctx context.Context, req core.CleanupRequest) error {
+	servers, err := b.List(ctx, core.ListRequest{Options: req.Options})
+	if err != nil {
+		return err
+	}
+	return b.CleanupServers(ctx, req, servers)
+}
+
+func (b *digitalOceanLeaseBackend) prepareCleanup(ctx context.Context, server core.Server) (core.Server, bool, shared.CleanupSkipReason, error) {
+	prepared, err := b.prepareCleanupServer(ctx, server)
+	if err == nil {
+		return prepared, true, "", nil
+	}
+	eligible, err := shared.CleanupClaimEligible(err)
+	if err != nil {
+		return core.Server{}, false, "", err
+	}
+	return core.Server{}, eligible, shared.CleanupSkipNoExactLocalClaim, nil
+}
+
+func (b *digitalOceanLeaseBackend) prepareCleanupServer(ctx context.Context, server core.Server) (core.Server, error) {
+	if err := validateDropletLabels(server.Labels); err != nil {
+		return core.Server{}, err
+	}
+	client, err := b.clientFactory(b.RT)
+	if err != nil {
+		return core.Server{}, err
+	}
+	accountID, err := client.AccountID(ctx)
+	if err != nil {
+		return core.Server{}, err
+	}
+	leaseID := server.Labels["lease"]
+	claim, exists, err := core.ReadLeaseClaimWithPresence(leaseID)
+	if err != nil {
+		return core.Server{}, fmt.Errorf("read digitalocean cleanup claim: %w", err)
+	}
+	if !exists {
+		return core.Server{}, core.Exit(2, "digitalocean lease=%s has no exact local claim; refusing cleanup", leaseID)
+	}
+	prepared, claim, err := b.recoverCleanupClaim(ctx, client, server, claim, accountID, false)
+	if err != nil {
+		return core.Server{}, err
+	}
+	core.SetServerLeaseClaimSnapshot(&prepared, claim, true)
+	return prepared, nil
+}
+
+func (b *digitalOceanLeaseBackend) recoverCleanupClaim(ctx context.Context, client digitalOceanAPI, server core.Server, claim core.LeaseClaim, accountID string, persist bool) (core.Server, core.LeaseClaim, error) {
+	if err := validateDigitalOceanCleanupClaim(server, claim, accountID); err != nil {
+		return core.Server{}, core.LeaseClaim{}, err
+	}
+	prepared := server
+	prepared.Labels = shared.CloneLabels(server.Labels)
+	prepared.Labels[digitalOceanAccountLabel] = accountID
+	replacement := claim
+	replacement.Labels = shared.CloneLabels(claim.Labels)
+	changed := false
+	if claim.CloudID == "" && claim.Labels["recovery"] == "ambiguous-create" {
+		droplets, err := client.ListCrabboxDroplets(ctx)
+		if err != nil {
+			return core.Server{}, core.LeaseClaim{}, err
+		}
+		matches := pendingRecoveryMatches(droplets, claim)
+		switch len(matches) {
+		case 0:
+			return core.Server{}, core.LeaseClaim{}, core.Exit(4, "digitalocean ambiguous create recovery is still indeterminate for lease=%s; local claim and credentials retained", claim.LeaseID)
+		case 1:
+		default:
+			return core.Server{}, core.LeaseClaim{}, core.Exit(2, "digitalocean ambiguous create recovery found multiple droplets for lease=%s", claim.LeaseID)
+		}
+		if server.ID != 0 && server.ID != matches[0].ID {
+			return core.Server{}, core.LeaseClaim{}, core.Exit(2, "refusing to bind digitalocean ambiguous create recovery to mismatched droplet=%d lease=%s", server.ID, claim.LeaseID)
+		}
+		prepared = serverFromDroplet(matches[0], b.Cfg)
+		prepared.Labels[digitalOceanAccountLabel] = accountID
+		replacement.CloudID = strconv.FormatInt(matches[0].ID, 10)
+		changed = true
+	}
+	keyOwnership := strings.TrimSpace(claim.Labels[digitalOceanKeyOwnedLabel])
+	if keyOwnership == "" && claim.Labels["recovery"] == "ambiguous-key-create" {
+		publicKey, err := retainedDigitalOceanPublicKey(claim.LeaseID)
+		if err != nil {
+			return core.Server{}, core.LeaseClaim{}, err
+		}
+		key, found, err := client.FindSSHKey(ctx, providerKeyForLease(claim.LeaseID), publicKey)
+		if err != nil {
+			return core.Server{}, core.LeaseClaim{}, err
+		}
+		if !found {
+			return core.Server{}, core.LeaseClaim{}, core.Exit(4, "digitalocean ambiguous SSH-key create remains indeterminate for lease=%s; credentials and recovery claim retained", claim.LeaseID)
+		}
+		if key.ID <= 0 {
+			return core.Server{}, core.LeaseClaim{}, core.Exit(2, "digitalocean SSH key recovery returned no immutable key id for lease=%s", claim.LeaseID)
+		}
+		setDigitalOceanKeyIdentity(replacement.Labels, key.ID, true, true)
+		changed = true
+	} else if keyOwnership == "" || keyOwnership == "unknown" {
+		keyID, err := recoverLegacyDigitalOceanKeyIdentity(ctx, client, claim.LeaseID)
+		if err != nil {
+			return core.Server{}, core.LeaseClaim{}, err
+		}
+		delete(replacement.Labels, digitalOceanRecoveryKeyIDLabel)
+		setDigitalOceanKeyIdentity(replacement.Labels, keyID, false, true)
+		changed = true
+	}
+	if changed && persist {
+		var err error
+		claim, err = core.ReplaceLeaseClaimIfUnchangedDurableReturning(claim.LeaseID, claim, replacement)
+		if err != nil {
+			return core.Server{}, core.LeaseClaim{}, fmt.Errorf("persist recovered digitalocean cleanup identity: %w", err)
+		}
+		delete(prepared.Labels, digitalOceanRecoveryKeyIDLabel)
+	}
+	preserveDigitalOceanKeyIdentity(prepared.Labels, claim.Labels)
+	return prepared, claim, nil
+}
+
+func validateDigitalOceanCleanupClaim(server core.Server, claim core.LeaseClaim, accountID string) error {
+	leaseID := server.Labels["lease"]
+	if claim.LeaseID != leaseID || claim.Provider == "" {
+		return core.Exit(2, "digitalocean lease claim is incomplete for lease=%s", leaseID)
+	}
+	if claim.Provider != providerName {
+		return core.Exit(2, "lease=%s is claimed by provider=%s; refusing digitalocean cleanup", leaseID, claim.Provider)
+	}
+	if err := validateDropletLabels(claim.Labels); err != nil {
+		return err
+	}
+	if err := validateDigitalOceanClaimIdentity(claim, leaseID, server.Labels["slug"]); err != nil {
+		return err
+	}
+	if claim.CloudID != "" {
+		if _, ok := parseDropletID(claim.CloudID); !ok {
+			return core.Exit(2, "digitalocean lease=%s has invalid immutable Droplet id %q", leaseID, claim.CloudID)
+		}
+		if liveID := firstNonBlank(server.CloudID, dropletIDString(server.ID)); liveID != "" && liveID != claim.CloudID {
+			return core.Exit(2, "refusing to release DigitalOcean Droplet %d from stale local claim", server.ID)
+		}
+	} else {
+		switch claim.Labels["recovery"] {
+		case "ambiguous-create":
+		case "ambiguous-key-create", "rollback-cleanup":
+			if server.ID != 0 || server.CloudID != "" {
+				return core.Exit(2, "digitalocean key-only recovery claim cannot authorize Droplet cleanup for lease=%s", leaseID)
+			}
+		default:
+			return core.Exit(2, "digitalocean lease claim has no Droplet identity or valid cleanup recovery state for lease=%s", leaseID)
+		}
+	}
+	expectedAccountID := strings.TrimSpace(claim.Labels[digitalOceanAccountLabel])
+	if expectedAccountID == "" {
+		return core.Exit(3, "digitalocean lease claim has no account identity; refusing cleanup")
+	}
+	if expectedAccountID != accountID {
+		return core.Exit(3, "digitalocean account mismatch: current account %s does not match lease account %s", accountID, expectedAccountID)
+	}
+	if current := strings.TrimSpace(server.Labels[digitalOceanAccountLabel]); current != "" && current != accountID {
+		return core.Exit(3, "digitalocean account mismatch: current account %s does not match lease account %s", accountID, current)
+	}
+	for _, key := range []string{digitalOceanRecoveryKeyIDLabel, digitalOceanKeyOwnedLabel} {
+		if live := strings.TrimSpace(server.Labels[key]); live != "" && live != strings.TrimSpace(claim.Labels[key]) {
+			return core.Exit(2, "refusing digitalocean cleanup because live %s does not match the exact claim for lease=%s", key, leaseID)
+		}
+	}
+	return nil
+}
+
+func applyTailscaleMetadata(labels map[string]string, meta core.TailscaleMetadata) {
+	shared.ApplyTailscaleMetadata(labels, meta)
+}
+
+func (b *digitalOceanLeaseBackend) deleteServer(ctx context.Context, _ core.Config, server core.Server) error {
+	if err := validateDropletLabels(server.Labels); err != nil {
+		return err
+	}
+	expectedClaim, err := shared.RequireClaimSnapshot(server, providerName)
+	if err != nil {
+		return err
+	}
+	client, err := b.clientFactory(b.RT)
+	if err != nil {
+		return err
+	}
+	accountID, err := client.AccountID(ctx)
+	if err != nil {
+		return err
+	}
+	server, expectedClaim, err = b.recoverCleanupClaim(ctx, client, server, expectedClaim, accountID, true)
+	if err != nil {
+		return err
+	}
+	leaseID := expectedClaim.LeaseID
+	action := func() error {
+		currentAccountID, err := client.AccountID(ctx)
+		if err != nil {
+			return err
+		}
+		if err := validateDigitalOceanCleanupClaim(server, expectedClaim, currentAccountID); err != nil {
+			return err
+		}
+		dropletID, dropletPresent := int64(0), false
+		if expectedClaim.CloudID != "" {
+			dropletID, _ = parseDropletID(expectedClaim.CloudID)
+			item, getErr := client.GetDroplet(ctx, dropletID)
+			switch {
+			case getErr == nil:
+				expected := core.Server{Provider: providerName, CloudID: expectedClaim.CloudID, ID: dropletID, Name: core.LeaseProviderName(leaseID, expectedClaim.Slug), Labels: expectedClaim.Labels}
+				if err := validateLiveDroplet(item, expected); err != nil {
+					return err
+				}
+				live := serverFromDroplet(item, b.Cfg)
+				live.Labels[digitalOceanAccountLabel] = currentAccountID
+				preserveDigitalOceanKeyIdentity(live.Labels, expectedClaim.Labels)
+				if err := validateDigitalOceanCleanupClaim(live, expectedClaim, currentAccountID); err != nil {
+					return err
+				}
+				dropletPresent = true
+			case !isDigitalOceanNotFound(getErr):
+				return getErr
+			}
+		} else {
+			droplets, err := client.ListCrabboxDroplets(ctx)
+			if err != nil {
+				return err
+			}
+			for _, item := range droplets {
+				labels := normalizedDropletLabels(item.Tags)
+				if item.Name == core.LeaseProviderName(leaseID, expectedClaim.Slug) ||
+					(labels["lease"] == leaseID && labels["slug"] == expectedClaim.Slug) {
+					return core.Exit(2, "digitalocean key-only recovery claim cannot authorize Droplet cleanup for lease=%s", leaseID)
+				}
+			}
+		}
+		keyID, keyPresent := int64(0), false
+		switch strings.TrimSpace(expectedClaim.Labels[digitalOceanKeyOwnedLabel]) {
+		case "true":
+			keyID, err = strconv.ParseInt(strings.TrimSpace(expectedClaim.Labels[digitalOceanRecoveryKeyIDLabel]), 10, 64)
+			if err != nil || keyID <= 0 {
+				return core.Exit(2, "digitalocean lease=%s owns an SSH key but its immutable key id is missing or invalid", leaseID)
+			}
+			keyPresent, err = authorizeDigitalOceanSSHKeyDelete(ctx, client, leaseID, keyID)
+			if err != nil {
+				return err
+			}
+		case "false":
+		default:
+			return core.Exit(4, "digitalocean SSH key ownership remains indeterminate for lease=%s; local claim and credentials retained", leaseID)
+		}
+		if dropletPresent {
+			if err := client.DeleteDroplet(ctx, dropletID); err != nil && !isDigitalOceanNotFound(err) {
+				return err
+			}
+		}
+		if keyPresent {
+			if err := client.DeleteSSHKey(ctx, keyID); err != nil && !isDigitalOceanNotFound(err) {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := core.RemoveLeaseClaimIfUnchangedAfter(leaseID, expectedClaim, action); err != nil {
+		return fmt.Errorf("finalize digitalocean cleanup claim: %w", err)
+	}
+	core.RemoveStoredTestboxKey(leaseID)
+	return nil
+}
+
+func setDigitalOceanKeyIdentity(labels map[string]string, keyID int64, created, known bool) {
+	if !known {
+		return
+	}
+	labels[digitalOceanKeyOwnedLabel] = strconv.FormatBool(created)
+	if keyID > 0 {
+		labels[digitalOceanRecoveryKeyIDLabel] = strconv.FormatInt(keyID, 10)
+	}
+}
+
+func preserveDigitalOceanKeyIdentity(labels, stored map[string]string) {
+	for _, key := range []string{digitalOceanRecoveryKeyIDLabel, digitalOceanKeyOwnedLabel} {
+		if value := strings.TrimSpace(stored[key]); value != "" {
+			labels[key] = value
+		}
+	}
+}
+
+func recoverLegacyDigitalOceanKeyIdentity(ctx context.Context, client digitalOceanAPI, leaseID string) (int64, error) {
+	keyName := providerKeyForLease(leaseID)
+	keyPath, err := core.TestboxKeyPath(leaseID)
+	if err != nil {
+		return 0, err
+	}
+	publicKeyBytes, err := os.ReadFile(keyPath + ".pub")
+	if errors.Is(err, os.ErrNotExist) {
+		_, found, lookupErr := client.FindSSHKey(ctx, keyName, "")
+		if lookupErr != nil {
+			return 0, lookupErr
+		}
+		if found {
+			return 0, core.Exit(4, "digitalocean legacy SSH key migration for lease=%s requires retained local public key while the canonical provider key exists; local claim and credentials retained", leaseID)
+		}
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("read retained digitalocean SSH public key: %w", err)
+	}
+	publicKey := strings.TrimSpace(string(publicKeyBytes))
+	if publicKey == "" {
+		return 0, core.Exit(2, "retained digitalocean SSH public key is empty for lease=%s", leaseID)
+	}
+	key, found, err := client.FindSSHKey(ctx, keyName, publicKey)
+	if err != nil {
+		var conflict *sshKeyConflictError
+		if errors.As(err, &conflict) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	if !found {
+		return 0, nil
+	}
+	if key.ID <= 0 || key.Name != keyName || strings.TrimSpace(key.PublicKey) != publicKey {
+		return 0, core.Exit(2, "digitalocean legacy SSH key recovery returned an invalid exact key identity for lease=%s", leaseID)
+	}
+	return key.ID, nil
+}
+
+func retainedDigitalOceanPublicKey(leaseID string) (string, error) {
+	keyPath, err := core.TestboxKeyPath(leaseID)
+	if err != nil {
+		return "", err
+	}
+	publicKeyBytes, err := os.ReadFile(keyPath + ".pub")
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", core.Exit(4, "digitalocean SSH key deletion for lease=%s requires retained local public key; local claim and credentials retained", leaseID)
+		}
+		return "", fmt.Errorf("read retained digitalocean SSH public key: %w", err)
+	}
+	publicKey := strings.TrimSpace(string(publicKeyBytes))
+	if publicKey == "" {
+		return "", core.Exit(2, "retained digitalocean SSH public key is empty for lease=%s", leaseID)
+	}
+	return publicKey, nil
+}
+
+func authorizeDigitalOceanSSHKeyDelete(ctx context.Context, client digitalOceanAPI, leaseID string, keyID int64) (bool, error) {
+	publicKey, err := retainedDigitalOceanPublicKey(leaseID)
+	if err != nil {
+		return false, err
+	}
+	key, found, err := client.FindSSHKeyByID(ctx, keyID)
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		matched, matchFound, err := client.FindSSHKey(ctx, providerKeyForLease(leaseID), publicKey)
+		if err != nil {
+			return false, err
+		}
+		if matchFound {
+			return false, core.Exit(2, "refusing to delete digitalocean SSH key %d for lease=%s; canonical key still exists with immutable id %d", keyID, leaseID, matched.ID)
+		}
+		matched, matchFound, err = client.FindSSHKeyByPublicKey(ctx, publicKey)
+		if err != nil {
+			return false, err
+		}
+		if matchFound {
+			return false, core.Exit(2, "refusing to delete digitalocean SSH key %d for lease=%s; retained public key still exists with immutable id %d", keyID, leaseID, matched.ID)
+		}
+		return false, nil
+	}
+	if key.ID != keyID || strings.TrimSpace(key.PublicKey) != publicKey {
+		return false, core.Exit(2, "refusing to delete digitalocean SSH key %d for lease=%s; immutable id or public key does not match retained ownership", keyID, leaseID)
+	}
+	return true, nil
+}
+
+func (b *digitalOceanLeaseBackend) waitForDropletIP(ctx context.Context, client digitalOceanAPI, id int64, timeout time.Duration) (droplet, error) {
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	result, err := shared.Poll(waitCtx, 0, 3*time.Second, shared.SleepContext,
+		func(observeCtx context.Context) (droplet, error) {
+			return client.GetDroplet(observeCtx, id)
+		},
+		func(_ context.Context, item droplet, fetchErr error) (bool, error) {
+			if fetchErr != nil {
+				return false, fetchErr
+			}
+			return publicIPv4(item) != "", nil
+		}, nil)
+	if err != nil {
+		if context.Cause(ctx) == nil && errors.Is(context.Cause(waitCtx), context.DeadlineExceeded) && errors.Is(err, context.DeadlineExceeded) {
+			return droplet{}, core.Exit(5, "timed out waiting for DigitalOcean Droplet IP")
+		}
+		return droplet{}, err
+	}
+	return result.Value, nil
+}
+
+func (b *digitalOceanLeaseBackend) now() time.Time {
+	if b.RT.Clock != nil {
+		return b.RT.Clock.Now().UTC()
+	}
+	return time.Now().UTC()
+}
+
+func rollbackDigitalOceanAcquire(client digitalOceanAPI, dropletID, keyID int64) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var errs []error
+	if dropletID != 0 {
+		if err := client.DeleteDroplet(ctx, dropletID); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if keyID > 0 {
+		if err := client.DeleteSSHKey(ctx, keyID); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func validateLiveDroplet(item droplet, expected core.Server) error {
+	labels := normalizedDropletLabels(item.Tags)
+	if err := validateDropletLabels(labels); err != nil {
+		return err
+	}
+	expectedProviderKey := expected.Labels["provider_key"]
+	if expectedProviderKey == "" && expected.Labels["lease"] != "" {
+		expectedProviderKey = providerKeyForLease(expected.Labels["lease"])
+	}
+	if item.ID != expected.ID ||
+		item.Name != expected.Name ||
+		labels["lease"] != expected.Labels["lease"] ||
+		labels["slug"] != expected.Labels["slug"] ||
+		labels["provider_key"] != expectedProviderKey {
+		return core.Exit(2, "refusing to operate on changed DigitalOcean Droplet %d", expected.ID)
+	}
+	return nil
+}
+
+func serverFromDroplet(item droplet, cfg core.Config) core.Server {
+	labels := normalizedDropletLabels(item.Tags)
+	server := core.Server{
+		CloudID:  strconv.FormatInt(item.ID, 10),
+		Provider: providerName,
+		ID:       item.ID,
+		Name:     item.Name,
+		Status:   normalizeDropletStatus(item.Status),
+		Labels:   labels,
+	}
+	server.PublicNet.IPv4.IP = publicIPv4(item)
+	server.ServerType.Name = firstNonBlank(item.Size.Slug, cfg.ServerType)
+	return server
+}
+
+func normalizedDropletLabels(tags []string) map[string]string {
+	labels := labelsFromTags(tags)
+	if labels["provider_key"] == "" && labels["lease"] != "" {
+		labels["provider_key"] = providerKeyForLease(labels["lease"])
+	}
+	return labels
+}
+
+func publicIPv4(item droplet) string {
+	for _, net := range item.Networks.V4 {
+		if net.Type == "public" && net.IPAddress != "" {
+			return net.IPAddress
+		}
+	}
+	return ""
+}
+
+func normalizeDropletStatus(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "active":
+		return "ready"
+	case "":
+		return "unknown"
+	default:
+		return status
+	}
+}
+
+func parseDropletID(id string) (int64, bool) {
+	id = strings.TrimSpace(id)
+	if id == "" || strings.HasPrefix(id, "cbx_") {
+		return 0, false
+	}
+	parsed, err := strconv.ParseInt(id, 10, 64)
+	if err != nil || parsed <= 0 {
+		return 0, false
+	}
+	return parsed, true
+}
+
+func dropletIDString(id int64) string {
+	if id <= 0 {
+		return ""
+	}
+	return strconv.FormatInt(id, 10)
+}
+
+func applyDigitalOceanDefaults(cfg *core.Config) {
+	cfg.Provider = providerName
+	if cfg.TargetOS == "" {
+		cfg.TargetOS = core.TargetLinux
+	}
+	if cfg.DigitalOcean.Region == "" {
+		cfg.DigitalOcean.Region = "nyc3"
+	}
+	if cfg.DigitalOcean.Image == "" {
+		cfg.DigitalOcean.Image = "ubuntu-24-04-x64"
+	}
+	if !cfg.ServerTypeExplicit || cfg.ServerType == "" {
+		cfg.ServerType = digitalOceanServerTypeForClass(cfg.Class)
+	}
+	if !core.IsSSHUserExplicit(cfg) && (cfg.SSHUser == "" || cfg.SSHUser == "crabbox") {
+		cfg.SSHUser = "root"
+	}
+	if !core.IsSSHPortExplicit(cfg) && (cfg.SSHPort == "" || cfg.SSHPort == core.BaseConfig().SSHPort) {
+		cfg.SSHPort = "22"
+	}
+	cfg.SSHFallbackPorts = nil
+}
+
+func firstNonBlank(values ...string) string {
+	return shared.FirstNonBlank(values...)
+}

@@ -1,0 +1,364 @@
+package cli
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"regexp"
+	"sort"
+	"strings"
+	"time"
+)
+
+func (a App) jobList(_ context.Context, args []string) error {
+	fs := newFlagSet("job list", a.Stderr)
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	names := configuredJobNames(cfg)
+	if len(names) == 0 {
+		fmt.Fprintln(a.Stdout, "no jobs configured")
+		return nil
+	}
+	for _, name := range names {
+		job := cfg.Jobs[name]
+		fmt.Fprintf(a.Stdout, "%s provider=%s target=%s hydrate_actions=%t stop=%s\n", name, blank(job.Provider, "-"), blank(job.Target, "-"), job.Hydrate.Actions, blank(job.Stop, "auto"))
+	}
+	return nil
+}
+
+func configuredJobNames(cfg Config) []string {
+	names := make([]string, 0, len(cfg.Jobs))
+	for name := range cfg.Jobs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func (a App) jobRun(ctx context.Context, args []string) (err error) {
+	fs := newFlagSet("job run", a.Stderr)
+	id := fs.String("id", "", "existing lease id or slug")
+	noHydrate := fs.Bool("no-hydrate", false, "skip configured Actions hydration")
+	githubRunner := fs.Bool("github-runner", false, "hydrate by registering a GitHub self-hosted runner instead of local SSH execution")
+	stopOverride := fs.String("stop", "", "stop policy: auto, always, success, failure, never")
+	dryRun := fs.Bool("dry-run", false, "print the planned Crabbox commands without running them")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return exit(2, "usage: crabbox job run <name>")
+	}
+	name := fs.Arg(0)
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	job, ok := cfg.Jobs[name]
+	if !ok {
+		return exit(2, "job %q is not configured", name)
+	}
+	if err := validateJobConfig(name, job); err != nil {
+		return err
+	}
+	stopPolicy := normalizeJobStopPolicy(job.Stop, *stopOverride)
+	if err := validateJobStopPolicy(stopPolicy); err != nil {
+		return err
+	}
+	leaseID := strings.TrimSpace(*id)
+	createdLease := leaseID == ""
+	plannedLease := blank(leaseID, "<lease>")
+	runNoHydrate := *noHydrate || !job.Hydrate.Actions
+	if err := validateJobRunOptions(cfg, job, leaseID); err != nil {
+		return exit(2, "job %q: %v", name, err)
+	}
+	if *dryRun {
+		for _, line := range jobPlanCommands(cfg, name, job, plannedLease, createdLease, runNoHydrate, *githubRunner, stopPolicy) {
+			fmt.Fprintln(a.Stdout, line)
+		}
+		return nil
+	}
+	if createdLease {
+		var out bytes.Buffer
+		warmupApp := App{Stdout: io.MultiWriter(a.Stdout, &out), Stderr: a.Stderr}
+		if err := warmupApp.warmup(ctx, append(jobLeaseCreateArgs(cfg, job), "--keep=true")); err != nil {
+			return err
+		}
+		leaseID = parseWarmupLeaseID(out.String())
+		if leaseID == "" {
+			return exit(2, "job %q could not parse warmup lease id", name)
+		}
+	}
+	shouldStop := false
+	if createdLease {
+		shouldStop = stopPolicy == "" || stopPolicy == "auto" || stopPolicy == "always" || stopPolicy == "success" || stopPolicy == "failure"
+	} else {
+		shouldStop = stopPolicy == "always" || stopPolicy == "success" || stopPolicy == "failure"
+	}
+	defer func() {
+		if !shouldStop {
+			return
+		}
+		if stopPolicy == "success" && err != nil {
+			return
+		}
+		if stopPolicy == "failure" && err == nil {
+			return
+		}
+		stopArgs := append(jobStopRoutingArgs(job), leaseID)
+		if stopErr := a.stop(context.Background(), stopArgs); stopErr != nil && err == nil {
+			err = stopErr
+		}
+	}()
+	if job.Hydrate.Actions && !*noHydrate {
+		if hydrateErr := a.actionsHydrate(ctx, jobActionsHydrateArgs(job, leaseID, *githubRunner)); hydrateErr != nil {
+			err = hydrateErr
+			return err
+		}
+	}
+	err = a.runCommand(ctx, jobRunArgs(cfg, job, leaseID, runNoHydrate))
+	return err
+}
+
+func validateJobRunOptions(cfg Config, job JobConfig, leaseID string) error {
+	if !job.NoSync {
+		return nil
+	}
+	// Reuse run's lease flags and claim routing, with external mutations disabled.
+	// Provider-level validation does not require configuring a backend or auth.
+	fs := newFlagSet("job run options", io.Discard)
+	flags := registerLeaseCreateFlags(fs, cfg)
+	if err := parseFlags(fs, jobLeaseCreateArgsFor(cfg, job, false)); err != nil {
+		return err
+	}
+	if err := applyLeaseCreateFlagsForLeaseMode(&cfg, fs, flags, leaseID, false); err != nil {
+		return err
+	}
+	if !providerSelectionIsActionable(cfg) {
+		return nil
+	}
+	provider, err := ProviderFor(cfg.Provider)
+	if err != nil {
+		return err
+	}
+	if validator, ok := provider.(RunOptionsValidator); ok {
+		command := strings.Fields(job.Command)
+		if job.Shell {
+			command = []string{job.Command}
+		}
+		return validator.ValidateRunOptions(RunRequest{NoSync: job.NoSync, ShellMode: job.Shell, Command: command})
+	}
+	return nil
+}
+
+func validateJobConfig(name string, job JobConfig) error {
+	if strings.TrimSpace(job.Command) == "" && !job.SyncOnly {
+		return exit(2, "job %q requires command or syncOnly", name)
+	}
+	return nil
+}
+
+func normalizeJobStopPolicy(configured, override string) string {
+	if override != "" {
+		return strings.ToLower(strings.TrimSpace(override))
+	}
+	return strings.ToLower(strings.TrimSpace(configured))
+}
+
+func validateJobStopPolicy(policy string) error {
+	switch policy {
+	case "", "auto", "always", "success", "failure", "never":
+		return nil
+	default:
+		return exit(2, "--stop must be auto, always, success, failure, or never")
+	}
+}
+
+func parseWarmupLeaseID(out string) string {
+	re := regexp.MustCompile(`(?m)^leased\s+([^\s]+)\s`)
+	match := re.FindStringSubmatch(out)
+	if len(match) == 2 {
+		return match[1]
+	}
+	return ""
+}
+
+func jobPlanCommands(cfg Config, name string, job JobConfig, leaseID string, createLease, noHydrate, githubRunner bool, stopPolicy string) []string {
+	lines := []string{fmt.Sprintf("# job %s", name)}
+	if createLease {
+		lines = append(lines, "crabbox "+strings.Join(readableShellWords(append([]string{"warmup"}, append(jobLeaseCreateArgs(cfg, job), "--keep=true")...)), " "))
+	}
+	if !noHydrate && job.Hydrate.Actions {
+		lines = append(lines, "crabbox "+strings.Join(readableShellWords(append([]string{"actions", "hydrate"}, jobActionsHydrateArgs(job, leaseID, githubRunner)...)), " "))
+	}
+	lines = append(lines, "crabbox "+strings.Join(readableShellWords(append([]string{"run"}, jobRunArgs(cfg, job, leaseID, noHydrate)...)), " "))
+	if shouldPlanJobStop(createLease, stopPolicy) {
+		lines = append(lines, "crabbox "+strings.Join(readableShellWords(append([]string{"stop"}, jobStopRoutingArgs(job)...)), " ")+" "+leaseID)
+	}
+	return lines
+}
+
+func shouldPlanJobStop(createdLease bool, stopPolicy string) bool {
+	if createdLease && (stopPolicy == "" || stopPolicy == "auto") {
+		return true
+	}
+	switch stopPolicy {
+	case "always", "success", "failure":
+		return true
+	default:
+		return false
+	}
+}
+
+func jobLeaseCreateArgs(cfg Config, job JobConfig) []string {
+	return jobLeaseCreateArgsFor(cfg, job, true)
+}
+
+func jobLeaseCreateArgsFor(cfg Config, job JobConfig, includeCacheVolumes bool) []string {
+	args := jobRoutingArgs(job, true)
+	if job.Profile != "" {
+		args = append(args, "--profile", job.Profile)
+	}
+	if job.Class != "" {
+		args = append(args, "--class", job.Class)
+	}
+	if job.Architecture != "" {
+		args = append(args, "--arch", job.Architecture)
+	}
+	if job.ServerType != "" {
+		args = append(args, "--type", job.ServerType)
+	}
+	if job.Market != "" {
+		args = append(args, "--market", job.Market)
+	}
+	appendDuration := func(flag string, d time.Duration) {
+		if d > 0 {
+			args = append(args, flag, d.String())
+		}
+	}
+	appendDuration("--ttl", job.TTL)
+	appendDuration("--idle-timeout", job.IdleTimeout)
+	if job.Desktop != nil {
+		args = append(args, "--desktop="+fmt.Sprint(*job.Desktop))
+	}
+	if job.DesktopEnv != "" {
+		args = append(args, "--desktop-env", job.DesktopEnv)
+	}
+	if job.Browser != nil {
+		args = append(args, "--browser="+fmt.Sprint(*job.Browser))
+	}
+	if job.Code != nil {
+		args = append(args, "--code="+fmt.Sprint(*job.Code))
+	}
+	providerName := firstNonBlank(job.Provider, cfg.Provider)
+	if includeCacheVolumes && providerSupportsCacheVolumes(providerName) {
+		for _, volume := range CacheVolumeStickyDiskSpecs(cfg.Cache.Volumes) {
+			args = append(args, "--cache-volume", volume)
+		}
+	}
+	return args
+}
+
+func jobRoutingArgs(job JobConfig, includeNetwork bool) []string {
+	var args []string
+	if job.Provider != "" {
+		args = append(args, "--provider", job.Provider)
+	}
+	if job.Target != "" {
+		args = append(args, "--target", job.Target)
+	}
+	if job.WindowsMode != "" {
+		args = append(args, "--windows-mode", job.WindowsMode)
+	}
+	if includeNetwork && job.Network != "" {
+		args = append(args, "--network", job.Network)
+	}
+	return args
+}
+
+func jobStopRoutingArgs(job JobConfig) []string {
+	return jobRoutingArgs(job, false)
+}
+
+func jobActionsHydrateArgs(job JobConfig, leaseID string, githubRunner bool) []string {
+	args := append(jobRoutingArgs(job, true), "--id", leaseID)
+	if githubRunner || job.Hydrate.GitHubRunner {
+		args = append(args, "--github-runner")
+	}
+	if job.Actions.Repo != "" {
+		args = append(args, "--repo", job.Actions.Repo)
+	}
+	if job.Actions.Workflow != "" {
+		args = append(args, "--workflow", job.Actions.Workflow)
+	}
+	if job.Actions.Ref != "" {
+		args = append(args, "--ref", job.Actions.Ref)
+	}
+	if job.Actions.Job != "" {
+		args = append(args, "--job", job.Actions.Job)
+	}
+	if job.Hydrate.WaitTimeout > 0 {
+		args = append(args, "--wait-timeout", job.Hydrate.WaitTimeout.String())
+	}
+	if job.Hydrate.KeepAliveMinutes > 0 {
+		args = append(args, "--keep-alive-minutes", fmt.Sprint(job.Hydrate.KeepAliveMinutes))
+	}
+	for _, field := range job.Actions.Fields {
+		args = append(args, "--field", field)
+	}
+	return args
+}
+
+func jobRunArgs(cfg Config, job JobConfig, leaseID string, noHydrate bool) []string {
+	args := append(jobLeaseCreateArgsFor(cfg, job, false), "--id", leaseID)
+	if noHydrate {
+		args = append(args, "--no-hydrate")
+	}
+	if job.NoSync {
+		args = append(args, "--no-sync")
+	}
+	if job.SyncOnly {
+		args = append(args, "--sync-only")
+	}
+	if job.Checksum != nil {
+		args = append(args, "--checksum="+fmt.Sprint(*job.Checksum))
+	}
+	if job.ForceSyncLarge {
+		args = append(args, "--force-sync-large")
+	}
+	if len(job.JUnit) > 0 {
+		args = append(args, "--junit", strings.Join(job.JUnit, ","))
+	}
+	if strings.TrimSpace(job.Label) != "" {
+		args = append(args, "--label", strings.TrimSpace(job.Label))
+	}
+	for _, glob := range job.ArtifactGlobs {
+		args = append(args, "--artifact-glob", glob)
+	}
+	for _, glob := range job.RequiredArtifacts {
+		args = append(args, "--require-artifact", glob)
+	}
+	for _, download := range job.Downloads {
+		args = append(args, "--download", download)
+	}
+	if strings.TrimSpace(job.Command) == "" {
+		return args
+	}
+	if job.Shell {
+		args = append(args, "--shell", "--", job.Command)
+		return args
+	}
+	args = append(args, "--")
+	args = append(args, strings.Fields(job.Command)...)
+	return args
+}
+
+func providerSupportsCacheVolumes(providerName string) bool {
+	provider, err := ProviderFor(providerName)
+	return err == nil && provider.Spec().Features.Has(FeatureCacheVolume)
+}
