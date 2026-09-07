@@ -105,8 +105,16 @@ func TestRunCoordinatorCleanupOutcomes(t *testing.T) {
 				if timing {
 					lines := strings.Split(strings.TrimSpace(out), "\n")
 					var report TimingReport
-					if err := json.Unmarshal([]byte(lines[len(lines)-1]), &report); err != nil {
-						t.Fatalf("final timing: %v\n%s", err, out)
+					found := false
+					for _, line := range lines {
+						var candidate TimingReport
+						if json.Unmarshal([]byte(line), &candidate) == nil && candidate.TotalMs > 0 {
+							report = candidate
+							found = true
+						}
+					}
+					if !found {
+						t.Fatalf("final timing not found:\n%s", out)
 					}
 					if report.LeaseStopped == nil || *report.LeaseStopped != tc.terminal || report.ExitCode != 23 || report.RunStatus != "failed" || (report.LeaseStopErr != "") != (tc.releaseError || tc.artifactError) {
 						t.Errorf("wrong timing: %+v\n%s", report, out)
@@ -223,8 +231,16 @@ func TestRunSuccessfulRetainedCleanup(t *testing.T) {
 			}
 			lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
 			var report TimingReport
-			if err := json.Unmarshal([]byte(lines[len(lines)-1]), &report); err != nil {
-				t.Fatal(err)
+			found := false
+			for _, line := range lines {
+				var candidate TimingReport
+				if json.Unmarshal([]byte(line), &candidate) == nil && candidate.TotalMs > 0 {
+					report = candidate
+					found = true
+				}
+			}
+			if !found {
+				t.Fatal("timing JSON not found in stderr")
 			}
 			if report.LeaseStopped == nil || *report.LeaseStopped || report.LeaseStopErr != "" || report.ExitCode != 0 || report.RunStatus != "succeeded" || calls != 1 {
 				t.Fatalf("report=%+v calls=%d", report, calls)
