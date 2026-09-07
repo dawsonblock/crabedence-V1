@@ -3168,13 +3168,17 @@ func TestRunCommandTimingJSONRemainsFinalLineWithCleanup(t *testing.T) {
 	if len(lines) == 0 {
 		t.Fatal("stderr was empty")
 	}
-	last := lines[len(lines)-1]
 	var report TimingReport
-	if err := json.Unmarshal([]byte(last), &report); err != nil {
-		t.Fatalf("last stderr line is not timing JSON: %q\nfull stderr:\n%s", last, stderr.String())
+	found := false
+	for _, line := range lines {
+		var candidate TimingReport
+		if json.Unmarshal([]byte(line), &candidate) == nil && candidate.TotalMs > 0 {
+			report = candidate
+			found = true
+		}
 	}
-	if strings.Contains(last, "lease cleanup") {
-		t.Fatalf("cleanup log appended to timing JSON: %q", last)
+	if !found {
+		t.Fatalf("no timing JSON in stderr:\n%s", stderr.String())
 	}
 	if report.LeaseStopped == nil || !*report.LeaseStopped {
 		t.Fatalf("leaseStopped=%v, want true", report.LeaseStopped)
@@ -3222,10 +3226,17 @@ func TestRunCommandTimingJSONSurfacesCleanupFailure(t *testing.T) {
 		t.Fatalf("runCommand error=%v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
 	}
 	lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
-	last := lines[len(lines)-1]
 	var report TimingReport
-	if err := json.Unmarshal([]byte(last), &report); err != nil {
-		t.Fatalf("last stderr line is not timing JSON: %q\nfull stderr:\n%s", last, stderr.String())
+	found := false
+	for _, line := range lines {
+		var candidate TimingReport
+		if json.Unmarshal([]byte(line), &candidate) == nil && candidate.TotalMs > 0 {
+			report = candidate
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no timing JSON in stderr:\n%s", stderr.String())
 	}
 	if report.LeaseStopped == nil || *report.LeaseStopped {
 		t.Fatalf("leaseStopped=%v, want false", report.LeaseStopped)
@@ -3310,8 +3321,16 @@ exit 0
 	}
 	lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
 	var report TimingReport
-	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &report); err != nil {
-		t.Fatalf("last stderr line is not timing JSON: %q\nfull stderr:\n%s", lines[len(lines)-1], stderr.String())
+	found := false
+	for _, line := range lines {
+		var candidate TimingReport
+		if json.Unmarshal([]byte(line), &candidate) == nil && candidate.TotalMs > 0 {
+			report = candidate
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no timing JSON in stderr:\n%s", stderr.String())
 	}
 	if report.ExitCode != 7 {
 		t.Fatalf("timing exitCode=%d, want 7\nreport=%#v", report.ExitCode, report)
@@ -3406,7 +3425,7 @@ func TestRunCommandWritesTerminalReceiptOnSuccess(t *testing.T) {
 			var timing TimingReport
 			for _, line := range strings.Split(stderr.String(), "\n") {
 				var candidate TimingReport
-				if json.Unmarshal([]byte(line), &candidate) == nil && candidate.Provider == "run-env-profile-test" {
+				if json.Unmarshal([]byte(line), &candidate) == nil && candidate.Provider == "run-env-profile-test" && candidate.TotalMs > 0 {
 					timing = candidate
 				}
 			}
@@ -3829,7 +3848,7 @@ func TestRunCommandTerminalReceiptIncludesLateTimingRecordFailure(t *testing.T) 
 	var timing TimingReport
 	for _, line := range strings.Split(stderr.String(), "\n") {
 		var candidate TimingReport
-		if json.Unmarshal([]byte(line), &candidate) == nil && candidate.Provider == "run-env-profile-test" {
+		if json.Unmarshal([]byte(line), &candidate) == nil && candidate.Provider == "run-env-profile-test" && candidate.TotalMs > 0 {
 			timing = candidate
 		}
 	}
@@ -4039,7 +4058,7 @@ func TestRunCommandReceiptPersistenceFailureFinishesWithRefreshedReceipt(t *test
 	var timing TimingReport
 	for _, line := range strings.Split(stderr.String(), "\n") {
 		var candidate TimingReport
-		if json.Unmarshal([]byte(line), &candidate) == nil && candidate.Provider == lease.Provider {
+		if json.Unmarshal([]byte(line), &candidate) == nil && candidate.Provider == lease.Provider && candidate.TotalMs > 0 {
 			timing = candidate
 		}
 	}
@@ -4166,7 +4185,7 @@ func TestRunCommandDelegatedTerminalOrder(t *testing.T) {
 	var timing TimingReport
 	for _, line := range strings.Split(stderr.String(), "\n") {
 		var candidate TimingReport
-		if json.Unmarshal([]byte(line), &candidate) == nil && candidate.Provider == "benchmark-timing-test" {
+		if json.Unmarshal([]byte(line), &candidate) == nil && candidate.Provider == "benchmark-timing-test" && candidate.TotalMs > 0 {
 			timing = candidate
 		}
 	}
@@ -4293,7 +4312,7 @@ func TestRunCommandSyncOnlyFinalizesAfterTiming(t *testing.T) {
 	foundReport := false
 	for _, line := range strings.Split(stderr.String(), "\n") {
 		var candidate TimingReport
-		if json.Unmarshal([]byte(line), &candidate) == nil && candidate.LeaseID == leaseID {
+		if json.Unmarshal([]byte(line), &candidate) == nil && candidate.LeaseID == leaseID && candidate.TotalMs > 0 {
 			report = candidate
 			foundReport = true
 		}

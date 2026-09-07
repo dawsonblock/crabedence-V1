@@ -15,6 +15,18 @@
 - Providers: migrate Tart's `startVM` to use `shared.TimeoutWindowConfirm` internally via `confirmStartup` — the reaper feeds process-exit errors through a buffered `exitedErr` channel consumed by the shared strategy, replacing the legacy `observe` select loop while preserving all abort/handoff/reaper semantics.
 - Providers: migrate Lume's `startVM` to use `shared.FileHandoffConfirm` and `shared.TimeoutWindowConfirm` internally — the owner/ack handoff waits and the final survival window select are all routed through shared strategies, replacing the local `waitForLaunchHandoff` loop.
 - Providers: migrate Tart's `Acquire` to use `ProcessHandle` methods exclusively — `startSupervisedVM` returns `shared.ProcessHandle` (not `*startupProcess`), and `Acquire` uses `handle.Context()`, `handle.Abort()`, and `handle.Handoff()` instead of reaching into private struct fields; `ProcessHandle` gained a `Context() context.Context` method.
+- CLI: bind `RunEvidenceV1` digest into the signed `TerminalRunReceipt` — receipt schema bumped to v3 with `evidence_sha256` field included in the Ed25519 signing payload; v2 receipts still verify for backward compatibility. The evidence digest is an integrity checksum; authenticity is established by the signed receipt binding, not by the digest alone.
+- Worker: add `validateRunEvidence` in `finishRun` — verifies schema, recomputes the canonical digest, cross-binds evidence to run_id/provider/lease_id/exit_code/run_status, and checks receipt `evidence_sha256` binding. Invalid evidence fails closed (400) rather than being stored.
+- CLI: reorder terminal finalization — evidence is constructed from the final timing report after all operations that can change the outcome, then the terminal receipt is rebuilt with the evidence digest before finalizing. Eliminates stale-evidence split-brain between evidence, receipt, and coordinator record.
+- CLI: stop auto-recomputing stale digests in `RunEvidenceV1.MarshalJSON` — a stale digest is preserved so tampering is detectable by the coordinator validator rather than silently repaired.
+- Worker: add evidence to `terminalFinishSHA256` idempotency fingerprint — two finishes with the same receipt but different evidence are now detected as conflicts.
+- Providers: fix `FileHandoffConfirm` event precedence — context cancellation and process exit are checked before readiness, with a final exit re-check before committing readiness. `context.Cause` is used instead of `ctx.Err`. ENOENT is distinguished from I/O errors.
+- Providers: remove aspirational `ProcessStartRequest` fields (`Command`, `Env`, `LogPath`, `Detached`, `StartupConfirm`) that no supervisor consumed; add `Data any` for provider-specific launch context.
+- Providers: route Lume `Acquire` through `lumeProcessSupervisor.Start` with `LumeLaunchContext` carrying bootstrap trust, launch token, and owner callback — preserves all Lume launch protocol semantics while using the shared supervisor abstraction.
+- Providers: harden Lume `ProcessHandle` — `Abort` is idempotent (`sync.Once`), weaker semantics (`Done`=Abort, `Context`=Background) explicitly documented.
+- Providers: fix `FakeProcessSupervisor` — first `Start` can fail when `SetNextStartOK(false)`; `Abort` is idempotent (`sync.Once` on both `aborted` and `done` channels).
+- Worker: release coordinator advisory lock on `NodeCoordinatorRuntime.start` failure — if `scanProvisioning`, `boss.start`, or queue setup throws after the lock is acquired, the lock is released before re-throwing.
+- CLI: populate `command_text`, `started_at`, and `ended_at` in `TimingReport` and `RunEvidenceV1` — previously empty fields are now filled from the run context.
 
 ## 0.50.0 - 2026-09-05
 

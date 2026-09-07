@@ -1583,6 +1583,10 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 			return
 		}
 		report := timingReportFromRunWithActionsURL(cfg.Provider, leaseID, serverSlug(server), timings, time.Since(timings.started), exitCodeForError(err, 7), actionsURL)
+		if !timings.started.IsZero() {
+			report.StartedAt = timings.started.UTC()
+			report.EndedAt = timings.started.UTC().Add(time.Since(timings.started))
+		}
 		populateRunTimingMetadata(&report, cfg, repo, server, leaseID, executionRunID, workdir, nil)
 		report.Label = runLabelValue
 		finalTimingReport = &report
@@ -2317,6 +2321,10 @@ afterSync:
 		if *timingJSON || timingRecordEnabled {
 			total := time.Since(timings.started)
 			report := timingReportFromRunWithActionsURL(cfg.Provider, leaseID, serverSlug(server), timings, total, 0, actionsURL)
+			if !timings.started.IsZero() {
+				report.StartedAt = timings.started.UTC()
+				report.EndedAt = timings.started.UTC().Add(total)
+			}
 			populateRunTimingMetadata(&report, cfg, repo, server, leaseID, executionRunID, workdir, nil)
 			report.Label = runLabelValue
 			finalTimingReport = &report
@@ -2858,6 +2866,11 @@ afterSync:
 		failureClassificationPrinted = true
 	}
 	report := timingReportFromRunWithActionsURL(cfg.Provider, leaseID, serverSlug(server), timings, total, code, actionsURL)
+	report.CommandText = commandDisplay
+	if !timings.started.IsZero() {
+		report.StartedAt = timings.started.UTC()
+		report.EndedAt = timings.started.UTC().Add(total)
+	}
 	populateRunTimingMetadata(&report, cfg, repo, server, leaseID, executionRunID, workdir, runArtifacts)
 	report.Label = runLabelValue
 	report.SchemaValidations = schemaValidationResults

@@ -12,6 +12,9 @@ type TimingReport struct {
 	Provider           string                   `json:"provider"`
 	LeaseID            string                   `json:"leaseId,omitempty"`
 	Slug               string                   `json:"slug,omitempty"`
+	CommandText        string                   `json:"commandText,omitempty"`
+	StartedAt          time.Time                `json:"startedAt,omitempty"`
+	EndedAt            time.Time                `json:"endedAt,omitempty"`
 	RunnerTotalMs      int64                    `json:"runnerTotalMs,omitempty"`
 	RunnerPhases       []RunnerPhase            `json:"runnerPhases,omitempty"`
 	LeaseMs            int64                    `json:"leaseMs,omitempty"`

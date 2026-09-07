@@ -395,25 +395,37 @@ func (b *backend) Acquire(ctx context.Context, req AcquireRequest) (LeaseTarget,
 		return LeaseTarget{}, cleanupUnclaimedVM(err)
 	}
 	defer removeBootstrapTrust(trust)
-	runOwner, err := b.startVM(ctx, cfg, name, trust, launchToken, func(started lumeRunOwner) error {
-		labels["state"] = "starting"
-		labels["run_owner_pending"] = "false"
-		labels["run_owner_pid"] = strconv.Itoa(started.PID)
-		labels["run_owner_started_at"] = started.StartedAt.UTC().Format(time.RFC3339Nano)
-		labels["run_owner_start_identity"] = started.StartIdentity
-		labels["run_owner_boot_identity"] = started.BootIdentity
-		labels["run_log"] = started.LogPath
-		updated, updateErr := core.UpdateLeaseClaimLabelsIfUnchanged(leaseID, persistedClaim, labels)
-		if updateErr == nil {
-			persistedClaim = updated
-		}
-		return updateErr
+	handle, err := b.supervisor.Start(ctx, shared.ProcessStartRequest{
+		Name: name,
+		Keep: req.Keep,
+		Data: &LumeLaunchContext{
+			Trust:       trust,
+			LaunchToken: launchToken,
+			OnStarted: func(started lumeRunOwner) error {
+				labels["state"] = "starting"
+				labels["run_owner_pending"] = "false"
+				labels["run_owner_pid"] = strconv.Itoa(started.PID)
+				labels["run_owner_started_at"] = started.StartedAt.UTC().Format(time.RFC3339Nano)
+				labels["run_owner_start_identity"] = started.StartIdentity
+				labels["run_owner_boot_identity"] = started.BootIdentity
+				labels["run_log"] = started.LogPath
+				updated, updateErr := core.UpdateLeaseClaimLabelsIfUnchanged(leaseID, persistedClaim, labels)
+				if updateErr == nil {
+					persistedClaim = updated
+				}
+				return updateErr
+			},
+		},
 	})
-	owner = runOwner
 	if err != nil {
 		return LeaseTarget{}, cleanupUnclaimedVM(err)
 	}
-	inst, err := b.waitForRunningVM(ctx, cfg, name, runOwner, releaseCapacity)
+	lumeHandle, ok := handle.(*lumeProcessHandle)
+	if !ok {
+		return LeaseTarget{}, cleanupUnclaimedVM(exit(5, "lume supervisor returned unexpected handle type %T", handle))
+	}
+	owner = lumeHandle.Owner()
+	inst, err := b.waitForRunningVM(ctx, cfg, name, owner, releaseCapacity)
 	if err != nil {
 		return LeaseTarget{}, cleanupUnclaimedVM(err)
 	}

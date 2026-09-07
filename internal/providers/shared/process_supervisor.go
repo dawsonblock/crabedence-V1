@@ -17,22 +17,24 @@ type ProcessSupervisor interface {
 	Start(ctx context.Context, req ProcessStartRequest) (ProcessHandle, error)
 }
 
-// ProcessStartRequest configures a supervised process launch. Only Name,
-// Keep, and ObserveTimeout are consumed by the current Tart and Lume
-// supervisors. Command, Env, LogPath, Detached, and StartupConfirm are
-// intentionally omitted from the shared request because each provider
-// owns its own spawn logic (Tart runs `tart run`, Lume runs a wrapper
-// script). If a future provider needs generic command execution, it
-// should define its own request type rather than extending this one.
+// ProcessStartRequest configures a supervised process launch. Name, Keep,
+// and ObserveTimeout are consumed by all supervisors. Data carries
+// provider-specific launch context (e.g. Lume's bootstrap trust, launch
+// token, and owner callback) that the provider's supervisor type-asserts.
+// This is not aspirational — it is the minimal escape hatch for context
+// that is genuinely provider-specific and cannot be generalized.
 type ProcessStartRequest struct {
 	// Name is the VM/instance name for diagnostics.
 	Name string
 	// Keep survives caller context cancellation after a successful handoff.
 	Keep bool
 	// ObserveTimeout is the startup observation window after the process
-	// starts. If StartupConfirm is nil, the process is considered ready if
-	// it survives this window without exiting.
+	// starts.
 	ObserveTimeout time.Duration
+	// Data carries provider-specific launch context. Each provider's
+	// supervisor type-asserts this to its own concrete type. nil is
+	// valid and means "use defaults" (used by tests and the generic path).
+	Data any
 }
 
 // ProcessStartupConfirm waits for the process to become ready. It returns nil

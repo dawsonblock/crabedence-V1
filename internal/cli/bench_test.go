@@ -193,7 +193,9 @@ func TestRunDelegatedTimingJSONEmittedOnceWhileRecording(t *testing.T) {
 	var timingJSONCount int
 	for _, line := range lines {
 		var candidate TimingReport
-		if err := json.Unmarshal([]byte(line), &candidate); err == nil && candidate.Provider != "" {
+		if err := json.Unmarshal([]byte(line), &candidate); err == nil && candidate.Provider != "" && candidate.TotalMs > 0 {
+			// Evidence JSON also has a provider field but lacks totalMs,
+			// so requiring totalMs > 0 distinguishes timing from evidence.
 			emitted = candidate
 			timingJSONCount++
 		}
@@ -298,7 +300,7 @@ func TestRunDelegatedCachesReceiptSignerAcrossTimingFailure(t *testing.T) {
 	var emitted TimingReport
 	for _, line := range strings.Split(stderr.String(), "\n") {
 		var candidate TimingReport
-		if json.Unmarshal([]byte(line), &candidate) == nil && candidate.Provider == "benchmark-timing-test" {
+		if json.Unmarshal([]byte(line), &candidate) == nil && candidate.Provider == "benchmark-timing-test" && candidate.TotalMs > 0 {
 			emitted = candidate
 		}
 	}
@@ -355,7 +357,7 @@ func TestRunDelegatedReceiptPersistenceFailureOmitsReceiptArtifacts(t *testing.T
 	var emitted TimingReport
 	for _, line := range strings.Split(stderr.String(), "\n") {
 		var candidate TimingReport
-		if json.Unmarshal([]byte(line), &candidate) == nil && candidate.Provider == "benchmark-timing-test" {
+		if json.Unmarshal([]byte(line), &candidate) == nil && candidate.Provider == "benchmark-timing-test" && candidate.TotalMs > 0 {
 			emitted = candidate
 		}
 	}

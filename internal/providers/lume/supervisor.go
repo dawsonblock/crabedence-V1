@@ -30,10 +30,30 @@ func (s *lumeProcessSupervisor) StartupConfirm() shared.ProcessStartupConfirm {
 	}
 }
 
+// LumeLaunchContext carries the provider-specific data that Lume's Acquire
+// passes through the supervisor to startVM. It is carried in
+// ProcessStartRequest.Data and type-asserted by lumeProcessSupervisor.Start.
+type LumeLaunchContext struct {
+	Trust       bootstrapTrust
+	LaunchToken string
+	OnStarted   func(lumeRunOwner) error
+}
+
+// Owner returns the underlying lumeRunOwner. This is used by Acquire after
+// a successful supervisor Start to access the owner identity for label
+// persistence and recovery.
+func (h *lumeProcessHandle) Owner() lumeRunOwner { return h.owner }
+
 func (s *lumeProcessSupervisor) Start(ctx context.Context, req shared.ProcessStartRequest) (shared.ProcessHandle, error) {
-	owner, err := s.backend.startVM(ctx, s.backend.configForRun(), req.Name, bootstrapTrust{}, "", func(started lumeRunOwner) error {
-		return nil
-	})
+	trust := bootstrapTrust{}
+	launchToken := ""
+	var onStarted func(lumeRunOwner) error
+	if lc, ok := req.Data.(*LumeLaunchContext); ok && lc != nil {
+		trust = lc.Trust
+		launchToken = lc.LaunchToken
+		onStarted = lc.OnStarted
+	}
+	owner, err := s.backend.startVM(ctx, s.backend.configForRun(), req.Name, trust, launchToken, onStarted)
 	if err != nil {
 		return nil, err
 	}

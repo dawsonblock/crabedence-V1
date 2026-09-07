@@ -1,6 +1,7 @@
 package lume
 
 import (
+	"context"
 	"io"
 	"testing"
 
@@ -50,5 +51,66 @@ func TestLumeProcessHandleContextReturnsBackground(t *testing.T) {
 	// manages its lifecycle internally.
 	if err := h.Context().Err(); err != nil {
 		t.Fatalf("Context() = %v, want background", err)
+	}
+}
+
+func TestLumeSupervisorStartPassesLaunchContext(t *testing.T) {
+	fake := &shared.FakeProcessSupervisor{}
+	fake.SetNextStartOK(true)
+	b := newBackendWithSupervisor(Provider{}.Spec(), core.BaseConfig(), core.Runtime{Stdout: io.Discard, Stderr: io.Discard}, fake).(*backend)
+
+	trust := bootstrapTrust{Dir: "/tmp/test-trust", Challenge: "abc"}
+	token := "test-launch-token"
+	onStarted := func(started lumeRunOwner) error {
+		return nil
+	}
+
+	_, err := b.supervisor.Start(context.Background(), shared.ProcessStartRequest{
+		Name: "test-vm",
+		Keep: true,
+		Data: &LumeLaunchContext{
+			Trust:       trust,
+			LaunchToken: token,
+			OnStarted:   onStarted,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	starts := fake.Starts()
+	if len(starts) != 1 {
+		t.Fatalf("starts = %d, want 1", len(starts))
+	}
+	if starts[0].Request.Name != "test-vm" {
+		t.Fatalf("name = %q, want test-vm", starts[0].Request.Name)
+	}
+	lc, ok := starts[0].Request.Data.(*LumeLaunchContext)
+	if !ok {
+		t.Fatalf("Data = %T, want *LumeLaunchContext", starts[0].Request.Data)
+	}
+	if lc.Trust.Dir != trust.Dir {
+		t.Fatalf("trust.Dir = %q, want %q", lc.Trust.Dir, trust.Dir)
+	}
+	if lc.LaunchToken != token {
+		t.Fatalf("LaunchToken = %q, want %q", lc.LaunchToken, token)
+	}
+	if lc.OnStarted == nil {
+		t.Fatal("OnStarted is nil")
+	}
+}
+
+func TestLumeSupervisorStartWithoutDataUsesDefaults(t *testing.T) {
+	fake := &shared.FakeProcessSupervisor{}
+	fake.SetNextStartOK(true)
+	b := newBackendWithSupervisor(Provider{}.Spec(), core.BaseConfig(), core.Runtime{Stdout: io.Discard, Stderr: io.Discard}, fake).(*backend)
+
+	// Start without Data should not panic and should use defaults.
+	_, err := b.supervisor.Start(context.Background(), shared.ProcessStartRequest{
+		Name: "test-vm",
+		Keep: false,
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
 	}
 }

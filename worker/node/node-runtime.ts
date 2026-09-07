@@ -97,39 +97,53 @@ export class NodeCoordinatorRuntime implements CoordinatorRuntime {
       }
       this.coordinatorLock = lock;
     }
-    await this.scanProvisioning();
-    this.provisioningScanner = setInterval(() => {
-      void this.scanProvisioning();
-    }, 1_000);
-    this.provisioningScanner.unref();
-    await this.boss.start();
-    await this.boss.createQueue(alarmQueue, {
-      // "short" permits one queued successor while the current alarm is active.
-      policy: "short",
-      retryLimit: 5,
-      retryDelay: 5,
-      retryBackoff: true,
-    });
-    await this.boss.createQueue(reconcileQueue, {
-      policy: "exclusive",
-      retryLimit: 5,
-      retryDelay: 5,
-      retryBackoff: true,
-    });
-    await this.boss.work(alarmQueue, { pollingIntervalSeconds: 1 }, async () => {
-      await this.runAlarm();
-    });
-    await this.boss.work(reconcileQueue, { pollingIntervalSeconds: 5 }, async () => {
-      await this.runAlarm();
-    });
-    await this.boss.schedule(reconcileQueue, "*/15 * * * *", null, {
-      tz: "UTC",
-      singletonKey: "reconcile",
-    });
-    await this.boss.send(reconcileQueue, null, {
-      singletonKey: "startup",
-      singletonSeconds: 60,
-    });
+    try {
+      await this.scanProvisioning();
+      this.provisioningScanner = setInterval(() => {
+        void this.scanProvisioning();
+      }, 1_000);
+      this.provisioningScanner.unref();
+      await this.boss.start();
+      await this.boss.createQueue(alarmQueue, {
+        // "short" permits one queued successor while the current alarm is active.
+        policy: "short",
+        retryLimit: 5,
+        retryDelay: 5,
+        retryBackoff: true,
+      });
+      await this.boss.createQueue(reconcileQueue, {
+        policy: "exclusive",
+        retryLimit: 5,
+        retryDelay: 5,
+        retryBackoff: true,
+      });
+      await this.boss.work(alarmQueue, { pollingIntervalSeconds: 1 }, async () => {
+        await this.runAlarm();
+      });
+      await this.boss.work(reconcileQueue, { pollingIntervalSeconds: 5 }, async () => {
+        await this.runAlarm();
+      });
+      await this.boss.schedule(reconcileQueue, "*/15 * * * *", null, {
+        tz: "UTC",
+        singletonKey: "reconcile",
+      });
+      await this.boss.send(reconcileQueue, null, {
+        singletonKey: "startup",
+        singletonSeconds: 60,
+      });
+    } catch (error) {
+      // Release the coordinator lock if startup failed after acquiring it.
+      // This prevents a crashed start from blocking the next replica.
+      if (this.coordinatorLock) {
+        try {
+          await this.coordinatorLock.release();
+        } catch {
+          // Best-effort release; the original error is more important.
+        }
+        this.coordinatorLock = undefined;
+      }
+      throw error;
+    }
   }
 
   setOperationRunner(runner: <T>(callback: () => Promise<T>) => Promise<T>): void {
