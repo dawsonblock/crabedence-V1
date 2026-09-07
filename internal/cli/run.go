@@ -3280,7 +3280,7 @@ func prepareDelegatedTerminalReceipt(path string, key ed25519.PrivateKey, cfg Co
 	// Build evidence from the delegated result.
 	var totalMs, commandMs, syncMs, runnerTotalMs, endToEndMs int64
 	var bootstrapMs, hydrateMs, probeMs, leaseMs int64
-	var startupConfirm *StartupConfirmSummary
+	var startupConfirm *RunEvidenceStartupConfirm
 	if report != nil {
 		totalMs = report.TotalMs
 		commandMs = report.CommandMs
@@ -3291,7 +3291,7 @@ func prepareDelegatedTerminalReceipt(path string, key ed25519.PrivateKey, cfg Co
 		hydrateMs = report.HydrateMs
 		probeMs = report.ProbeMs
 		leaseMs = report.LeaseMs
-		startupConfirm = report.StartupConfirm
+		startupConfirm = StartupConfirmFromSummary(report.StartupConfirm)
 	} else {
 		totalMs = result.Total.Milliseconds()
 		commandMs = result.Command.Milliseconds()

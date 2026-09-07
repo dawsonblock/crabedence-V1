@@ -59,15 +59,65 @@ from the wire (and from the canonical form) when zero-valued:
 | `retry_likely` | string | yes |
 | `failure_hint` | string | yes |
 | `artifacts` | array of artifact objects | yes |
+| `startup_confirm` | startup confirmation object | yes |
 | `started_at`, `ended_at` | RFC 3339 string | yes |
 | `digest` | 64-char lowercase hex | no |
 
-Phase objects (`runner_phases` entries) carry `name` (always), `ms`
-(always), plus omitempty `opaque`, `reason`, `provider`, `leaseId`,
-`slug`, `runId`, `machineType`, `transferCount`, `transferBytes`.
-`sync_phases`/`command_phases` entries carry `name` (always) plus
-omitempty `ms`, `skipped`, `reason`. Artifact entries carry `kind` and
-`path` (always) plus omitempty `bytes`, `sha256`.
+### Nested object schemas
+
+All nested objects use snake_case keys and have an exact allowed-field
+set. Unknown fields in any nested object are rejected.
+
+**RunnerPhase** (`runner_phases` entries):
+
+| Field | Type | omitempty |
+| --- | --- | --- |
+| `name` | string | no |
+| `ms` | integer | no |
+| `opaque` | boolean | yes |
+| `reason` | string | yes |
+| `provider` | string | yes |
+| `lease_id` | string | yes |
+| `slug` | string | yes |
+| `run_id` | string | yes |
+| `machine_type` | string | yes |
+| `transfer_count` | integer | yes |
+| `transfer_bytes` | integer | yes |
+
+**TimingPhase** (`sync_phases`/`command_phases` entries):
+
+| Field | Type | omitempty |
+| --- | --- | --- |
+| `name` | string | no |
+| `ms` | integer | yes |
+| `skipped` | boolean | yes |
+| `reason` | string | yes |
+
+`ms` is optional in sync/command phases: a phase may carry only `name`
+and `skipped` (e.g. `{"name":"sync","skipped":true}`).
+
+**Artifact** (`artifacts` entries):
+
+| Field | Type | omitempty |
+| --- | --- | --- |
+| `kind` | string | no |
+| `path` | string | no |
+| `bytes` | integer | yes |
+| `sha256` | string | yes |
+
+**StartupConfirm** (`startup_confirm`):
+
+| Field | Type | omitempty |
+| --- | --- | --- |
+| `stage` | string | no |
+| `duration_ms` | integer | no |
+| `ready` | boolean | no |
+| `process_exited` | boolean | yes |
+| `retryable` | boolean | yes |
+
+Allowed `stage` values: `"timeout-window"`, `"file-handoff"`,
+`"process-exit"`. `duration_ms` must be non-negative and within the
+IEEE-754 safe range.
 
 All integers must be within the IEEE-754 safe range
 (`-(2^53 - 1)` through `2^53 - 1`). Larger values lose precision when
@@ -154,6 +204,24 @@ masquerade as authenticated binding. A v2 receipt containing
 `evidence_sha256` is rejected outright, and evidence submitted with a v2
 receipt is rejected as unbindable.
 
+## Run-status invariants
+
+`run_status` and `exit_code` must be consistent. Both runtimes enforce
+the identical matrix:
+
+| `run_status` | `exit_code` | `error_kind` |
+| --- | --- | --- |
+| `succeeded` | `== 0` | optional (typically absent) |
+| `failed` | `!= 0` | optional |
+| `timed-out` | any | **required** (must be non-empty) |
+| `canceled` | any | **required** (must be non-empty) |
+
+Evidence violating these invariants is rejected. Specifically:
+- `succeeded` with a non-zero `exit_code` is rejected.
+- `failed` with a zero `exit_code` is rejected.
+- `timed-out` without `error_kind` is rejected.
+- `canceled` without `error_kind` is rejected.
+
 ## Verification order
 
 The coordinator validates in this order (each step fails closed):
@@ -161,7 +229,8 @@ The coordinator validates in this order (each step fails closed):
 1. Evidence is an object and within the size/structure limits (below).
 2. `schema_version == 1` and `evidence_type == "run"`.
 3. Run binding: `provider`, `run_id`, `lease_id`, `exit_code` match the
-   run and finish request; `run_status` is consistent with `exit_code`.
+   run and finish request; `run_status` is consistent with `exit_code`
+   per the [status invariants](#run-status-invariants) above.
 4. `digest` is 64 lowercase hex characters.
 5. Recompute the canonical digest; it must equal `digest`.
 6. A receipt exists, is v3, carries `evidence_sha256`, and it equals

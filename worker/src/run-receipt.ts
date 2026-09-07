@@ -215,16 +215,17 @@ export async function validateRunEvidence(
   if (typeof ev["run_status"] !== "string") {
     return new Error("evidence run_status is required");
   }
-  const expectedStatus = binding.exitCode === 0 ? "succeeded" : "failed";
-  if (
-    ev["run_status"] !== expectedStatus &&
-    ev["run_status"] !== "timed-out" &&
-    ev["run_status"] !== "canceled"
-  ) {
-    return new Error(
-      `evidence run_status ${ev["run_status"]} is inconsistent with exit_code ${binding.exitCode}`,
-    );
-  }
+  // Status invariants (frozen in docs/spec/run-evidence.md):
+  //   succeeded  → exit_code == 0, error_kind optional
+  //   failed     → exit_code != 0, error_kind optional
+  //   timed-out  → error_kind required (non-empty)
+  //   canceled   → error_kind required (non-empty)
+  const statusError = validateRunStatusInvariant(
+    ev["run_status"] as string,
+    ev["exit_code"] as number,
+    ev["error_kind"],
+  );
+  if (statusError) return statusError;
   // Reject unknown top-level fields. The allowed set is frozen by the spec
   // (docs/spec/run-evidence.md). An unknown field would alter the canonical
   // bytes and therefore the digest, producing a valid-but-wrong record.
@@ -264,6 +265,7 @@ export async function validateRunEvidence(
     "retry_likely",
     "failure_hint",
     "artifacts",
+    "startup_confirm",
     "started_at",
     "ended_at",
     "digest",
@@ -302,57 +304,29 @@ export async function validateRunEvidence(
       return new Error("evidence sync_transfer_files must be a non-negative safe integer");
     }
   }
-  // Validate nested phase arrays: each entry must have name (string) and ms (non-negative int).
-  for (const field of ["runner_phases", "sync_phases", "command_phases"] as const) {
-    const value = ev[field];
-    if (value === undefined) continue;
-    if (!Array.isArray(value)) {
-      return new Error(`evidence ${field} must be an array`);
-    }
-    for (let i = 0; i < value.length; i++) {
-      const entry = value[i];
-      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
-        return new Error(`evidence ${field}[${i}] must be an object`);
-      }
-      const rec = entry as Record<string, unknown>;
-      if (typeof rec["name"] !== "string") {
-        return new Error(`evidence ${field}[${i}].name must be a string`);
-      }
-      if (typeof rec["ms"] !== "number" || !Number.isSafeInteger(rec["ms"]) || rec["ms"] < 0) {
-        return new Error(`evidence ${field}[${i}].ms must be a non-negative safe integer`);
-      }
-    }
+  // Validate runner_phases: exact nested schema, ms required.
+  if (ev["runner_phases"] !== undefined) {
+    const err = validateRunnerPhases(ev["runner_phases"]);
+    if (err) return err;
   }
-  // Validate artifacts: each entry must have kind and path (strings).
+  // Validate sync_phases and command_phases: exact nested schema, ms optional.
+  if (ev["sync_phases"] !== undefined) {
+    const err = validateTimingPhases("sync_phases", ev["sync_phases"]);
+    if (err) return err;
+  }
+  if (ev["command_phases"] !== undefined) {
+    const err = validateTimingPhases("command_phases", ev["command_phases"]);
+    if (err) return err;
+  }
+  // Validate artifacts: exact nested schema.
   if (ev["artifacts"] !== undefined) {
-    const artifacts = ev["artifacts"];
-    if (!Array.isArray(artifacts)) {
-      return new Error("evidence artifacts must be an array");
-    }
-    for (let i = 0; i < artifacts.length; i++) {
-      const entry = artifacts[i];
-      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
-        return new Error(`evidence artifacts[${i}] must be an object`);
-      }
-      const rec = entry as Record<string, unknown>;
-      if (typeof rec["kind"] !== "string") {
-        return new Error(`evidence artifacts[${i}].kind must be a string`);
-      }
-      if (typeof rec["path"] !== "string") {
-        return new Error(`evidence artifacts[${i}].path must be a string`);
-      }
-      if (
-        rec["bytes"] !== undefined &&
-        (typeof rec["bytes"] !== "number" ||
-          !Number.isSafeInteger(rec["bytes"]) ||
-          rec["bytes"] < 0)
-      ) {
-        return new Error(`evidence artifacts[${i}].bytes must be a non-negative safe integer`);
-      }
-      if (rec["sha256"] !== undefined && typeof rec["sha256"] !== "string") {
-        return new Error(`evidence artifacts[${i}].sha256 must be a string`);
-      }
-    }
+    const err = validateEvidenceArtifacts(ev["artifacts"]);
+    if (err) return err;
+  }
+  // Validate startup_confirm: exact nested schema.
+  if (ev["startup_confirm"] !== undefined) {
+    const err = validateStartupConfirm(ev["startup_confirm"]);
+    if (err) return err;
   }
   if (
     typeof ev["digest"] !== "string" ||
@@ -380,6 +354,235 @@ export async function validateRunEvidence(
   }
   if (binding.receipt.evidence_sha256 !== ev["digest"]) {
     return new Error("evidence digest does not match receipt evidence_sha256");
+  }
+  return undefined;
+}
+
+// validateRunStatusInvariant enforces the frozen status/exit_code/error_kind
+// matrix from docs/spec/run-evidence.md. Both Go and TypeScript implement
+// the identical rules.
+function validateRunStatusInvariant(
+  runStatus: string,
+  exitCode: number,
+  errorKind: unknown,
+): Error | undefined {
+  if (runStatus === "succeeded") {
+    if (exitCode !== 0) {
+      return new Error("evidence run_status succeeded requires exit_code 0");
+    }
+    return undefined;
+  }
+  if (runStatus === "failed") {
+    if (exitCode === 0) {
+      return new Error("evidence run_status failed requires exit_code != 0");
+    }
+    return undefined;
+  }
+  if (runStatus === "timed-out" || runStatus === "canceled") {
+    if (typeof errorKind !== "string" || errorKind.length === 0) {
+      return new Error(`evidence run_status ${runStatus} requires non-empty error_kind`);
+    }
+    return undefined;
+  }
+  return new Error(`evidence run_status ${runStatus} is not a valid status`);
+}
+
+const RUNNER_PHASE_ALLOWED_FIELDS = new Set([
+  "name",
+  "ms",
+  "opaque",
+  "reason",
+  "provider",
+  "lease_id",
+  "slug",
+  "run_id",
+  "machine_type",
+  "transfer_count",
+  "transfer_bytes",
+]);
+
+function validateRunnerPhases(value: unknown): Error | undefined {
+  if (!Array.isArray(value)) {
+    return new Error("evidence runner_phases must be an array");
+  }
+  for (let i = 0; i < value.length; i++) {
+    const entry = value[i];
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      return new Error(`evidence runner_phases[${i}] must be an object`);
+    }
+    const rec = entry as Record<string, unknown>;
+    for (const key of Object.keys(rec)) {
+      if (!RUNNER_PHASE_ALLOWED_FIELDS.has(key)) {
+        return new Error(
+          `evidence runner_phases[${i}] contains unknown field ${JSON.stringify(key)}`,
+        );
+      }
+    }
+    if (typeof rec["name"] !== "string") {
+      return new Error(`evidence runner_phases[${i}].name must be a string`);
+    }
+    if (typeof rec["ms"] !== "number" || !Number.isSafeInteger(rec["ms"]) || rec["ms"] < 0) {
+      return new Error(`evidence runner_phases[${i}].ms must be a non-negative safe integer`);
+    }
+    if (rec["opaque"] !== undefined && typeof rec["opaque"] !== "boolean") {
+      return new Error(`evidence runner_phases[${i}].opaque must be a boolean`);
+    }
+    if (rec["reason"] !== undefined && typeof rec["reason"] !== "string") {
+      return new Error(`evidence runner_phases[${i}].reason must be a string`);
+    }
+    if (rec["provider"] !== undefined && typeof rec["provider"] !== "string") {
+      return new Error(`evidence runner_phases[${i}].provider must be a string`);
+    }
+    if (rec["lease_id"] !== undefined && typeof rec["lease_id"] !== "string") {
+      return new Error(`evidence runner_phases[${i}].lease_id must be a string`);
+    }
+    if (rec["slug"] !== undefined && typeof rec["slug"] !== "string") {
+      return new Error(`evidence runner_phases[${i}].slug must be a string`);
+    }
+    if (rec["run_id"] !== undefined && typeof rec["run_id"] !== "string") {
+      return new Error(`evidence runner_phases[${i}].run_id must be a string`);
+    }
+    if (rec["machine_type"] !== undefined && typeof rec["machine_type"] !== "string") {
+      return new Error(`evidence runner_phases[${i}].machine_type must be a string`);
+    }
+    if (
+      rec["transfer_count"] !== undefined &&
+      (typeof rec["transfer_count"] !== "number" ||
+        !Number.isSafeInteger(rec["transfer_count"]) ||
+        rec["transfer_count"] < 0)
+    ) {
+      return new Error(
+        `evidence runner_phases[${i}].transfer_count must be a non-negative safe integer`,
+      );
+    }
+    if (
+      rec["transfer_bytes"] !== undefined &&
+      (typeof rec["transfer_bytes"] !== "number" ||
+        !Number.isSafeInteger(rec["transfer_bytes"]) ||
+        rec["transfer_bytes"] < 0)
+    ) {
+      return new Error(
+        `evidence runner_phases[${i}].transfer_bytes must be a non-negative safe integer`,
+      );
+    }
+  }
+  return undefined;
+}
+
+const TIMING_PHASE_ALLOWED_FIELDS = new Set(["name", "ms", "skipped", "reason"]);
+
+function validateTimingPhases(field: string, value: unknown): Error | undefined {
+  if (!Array.isArray(value)) {
+    return new Error(`evidence ${field} must be an array`);
+  }
+  for (let i = 0; i < value.length; i++) {
+    const entry = value[i];
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      return new Error(`evidence ${field}[${i}] must be an object`);
+    }
+    const rec = entry as Record<string, unknown>;
+    for (const key of Object.keys(rec)) {
+      if (!TIMING_PHASE_ALLOWED_FIELDS.has(key)) {
+        return new Error(`evidence ${field}[${i}] contains unknown field ${JSON.stringify(key)}`);
+      }
+    }
+    if (typeof rec["name"] !== "string") {
+      return new Error(`evidence ${field}[${i}].name must be a string`);
+    }
+    // ms is optional in sync/command phases (a phase may carry only name + skipped).
+    if (rec["ms"] !== undefined) {
+      if (typeof rec["ms"] !== "number" || !Number.isSafeInteger(rec["ms"]) || rec["ms"] < 0) {
+        return new Error(`evidence ${field}[${i}].ms must be a non-negative safe integer`);
+      }
+    }
+    if (rec["skipped"] !== undefined && typeof rec["skipped"] !== "boolean") {
+      return new Error(`evidence ${field}[${i}].skipped must be a boolean`);
+    }
+    if (rec["reason"] !== undefined && typeof rec["reason"] !== "string") {
+      return new Error(`evidence ${field}[${i}].reason must be a string`);
+    }
+  }
+  return undefined;
+}
+
+const ARTIFACT_ALLOWED_FIELDS = new Set(["kind", "path", "bytes", "sha256"]);
+
+function validateEvidenceArtifacts(value: unknown): Error | undefined {
+  if (!Array.isArray(value)) {
+    return new Error("evidence artifacts must be an array");
+  }
+  for (let i = 0; i < value.length; i++) {
+    const entry = value[i];
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      return new Error(`evidence artifacts[${i}] must be an object`);
+    }
+    const rec = entry as Record<string, unknown>;
+    for (const key of Object.keys(rec)) {
+      if (!ARTIFACT_ALLOWED_FIELDS.has(key)) {
+        return new Error(`evidence artifacts[${i}] contains unknown field ${JSON.stringify(key)}`);
+      }
+    }
+    if (typeof rec["kind"] !== "string") {
+      return new Error(`evidence artifacts[${i}].kind must be a string`);
+    }
+    if (typeof rec["path"] !== "string") {
+      return new Error(`evidence artifacts[${i}].path must be a string`);
+    }
+    if (
+      rec["bytes"] !== undefined &&
+      (typeof rec["bytes"] !== "number" || !Number.isSafeInteger(rec["bytes"]) || rec["bytes"] < 0)
+    ) {
+      return new Error(`evidence artifacts[${i}].bytes must be a non-negative safe integer`);
+    }
+    if (rec["sha256"] !== undefined && typeof rec["sha256"] !== "string") {
+      return new Error(`evidence artifacts[${i}].sha256 must be a string`);
+    }
+  }
+  return undefined;
+}
+
+const STARTUP_CONFIRM_ALLOWED_FIELDS = new Set([
+  "stage",
+  "duration_ms",
+  "ready",
+  "process_exited",
+  "retryable",
+]);
+
+const STARTUP_CONFIRM_ALLOWED_STAGES = new Set(["timeout-window", "file-handoff", "process-exit"]);
+
+function validateStartupConfirm(value: unknown): Error | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return new Error("evidence startup_confirm must be an object");
+  }
+  const rec = value as Record<string, unknown>;
+  for (const key of Object.keys(rec)) {
+    if (!STARTUP_CONFIRM_ALLOWED_FIELDS.has(key)) {
+      return new Error(`evidence startup_confirm contains unknown field ${JSON.stringify(key)}`);
+    }
+  }
+  if (typeof rec["stage"] !== "string") {
+    return new Error("evidence startup_confirm.stage must be a string");
+  }
+  if (!STARTUP_CONFIRM_ALLOWED_STAGES.has(rec["stage"] as string)) {
+    return new Error(
+      `evidence startup_confirm.stage ${JSON.stringify(rec["stage"])} is not a valid stage`,
+    );
+  }
+  if (typeof rec["duration_ms"] !== "number" || !Number.isSafeInteger(rec["duration_ms"])) {
+    return new Error("evidence startup_confirm.duration_ms must be a safe integer");
+  }
+  if (rec["duration_ms"] < 0) {
+    return new Error("evidence startup_confirm.duration_ms must be non-negative");
+  }
+  if (typeof rec["ready"] !== "boolean") {
+    return new Error("evidence startup_confirm.ready must be a boolean");
+  }
+  if (rec["process_exited"] !== undefined && typeof rec["process_exited"] !== "boolean") {
+    return new Error("evidence startup_confirm.process_exited must be a boolean");
+  }
+  if (rec["retryable"] !== undefined && typeof rec["retryable"] !== "boolean") {
+    return new Error("evidence startup_confirm.retryable must be a boolean");
   }
   return undefined;
 }

@@ -146,12 +146,18 @@ func scanArrayForDuplicateKeys(dec *json.Decoder) error {
 	return nil
 }
 
+// maxJSONSafeInteger is the IEEE-754 safe integer bound (2^53 - 1).
+// Integers crossing the Go↔JavaScript boundary must be within
+// [-(2^53 - 1), 2^53 - 1] to round-trip without precision loss.
+const maxJSONSafeInteger int64 = 9007199254740991
+
 // ValidateRunEvidenceV1 performs semantic validation of a parsed RunEvidenceV1
 // record: schema version, evidence type, run-status/exit-code consistency,
-// timing non-negativity, and structural limits. It does NOT verify the digest.
+// timing non-negativity, safe-integer bounds, and structural limits. It does
+// NOT verify the digest.
 //
 // This is a superset of validateRunEvidenceStructure that also checks semantic
-// invariants (status/exit-code consistency, non-negative timing).
+// invariants (status/exit-code consistency, non-negative timing, safe integers).
 func ValidateRunEvidenceV1(ev RunEvidenceV1) error {
 	if err := validateRunEvidenceStructure(ev); err != nil {
 		return err
@@ -161,6 +167,9 @@ func ValidateRunEvidenceV1(ev RunEvidenceV1) error {
 		return err
 	}
 	if err := validateTimingNonNegative(ev); err != nil {
+		return err
+	}
+	if err := validateSafeIntegers(ev); err != nil {
 		return err
 	}
 	return nil
@@ -224,6 +233,71 @@ func validateTimingNonNegative(ev RunEvidenceV1) error {
 	}
 	if ev.SyncTransferFiles < 0 {
 		return fmt.Errorf("sync_transfer_files must be non-negative, got %d", ev.SyncTransferFiles)
+	}
+	return nil
+}
+
+// validateSafeIntegers checks that every integer crossing the Go↔JavaScript
+// boundary is within the IEEE-754 safe range (-(2^53-1) through 2^53-1).
+// Larger values lose precision when parsed as JavaScript numbers and cannot
+// round-trip a digest.
+func validateSafeIntegers(ev RunEvidenceV1) error {
+	int64Fields := []struct {
+		name  string
+		value int64
+	}{
+		{"total_ms", ev.TotalMs},
+		{"command_ms", ev.CommandMs},
+		{"sync_ms", ev.SyncMs},
+		{"runner_total_ms", ev.RunnerTotalMs},
+		{"end_to_end_ms", ev.EndToEndMs},
+		{"lease_ms", ev.LeaseMs},
+		{"bootstrap_ms", ev.BootstrapMs},
+		{"hydrate_ms", ev.HydrateMs},
+		{"probe_ms", ev.ProbeMs},
+		{"sync_transfer_bytes", ev.SyncTransferBytes},
+	}
+	for _, f := range int64Fields {
+		if f.value > maxJSONSafeInteger || f.value < -maxJSONSafeInteger {
+			return fmt.Errorf("%s exceeds IEEE-754 safe integer range: %d", f.name, f.value)
+		}
+	}
+	if int64(ev.SyncTransferFiles) > maxJSONSafeInteger || ev.SyncTransferFiles < 0 {
+		return fmt.Errorf("sync_transfer_files exceeds IEEE-754 safe integer range: %d", ev.SyncTransferFiles)
+	}
+	// Validate phase timings.
+	for i, p := range ev.RunnerPhases {
+		if p.Ms > maxJSONSafeInteger || p.Ms < 0 {
+			return fmt.Errorf("runner_phases[%d].ms exceeds IEEE-754 safe integer range: %d", i, p.Ms)
+		}
+		if int64(p.TransferCount) > maxJSONSafeInteger || p.TransferCount < 0 {
+			return fmt.Errorf("runner_phases[%d].transfer_count exceeds IEEE-754 safe integer range: %d", i, p.TransferCount)
+		}
+		if p.TransferBytes > maxJSONSafeInteger || p.TransferBytes < 0 {
+			return fmt.Errorf("runner_phases[%d].transfer_bytes exceeds IEEE-754 safe integer range: %d", i, p.TransferBytes)
+		}
+	}
+	for i, p := range ev.SyncPhases {
+		if p.Ms > maxJSONSafeInteger || p.Ms < 0 {
+			return fmt.Errorf("sync_phases[%d].ms exceeds IEEE-754 safe integer range: %d", i, p.Ms)
+		}
+	}
+	for i, p := range ev.CommandPhases {
+		if p.Ms > maxJSONSafeInteger || p.Ms < 0 {
+			return fmt.Errorf("command_phases[%d].ms exceeds IEEE-754 safe integer range: %d", i, p.Ms)
+		}
+	}
+	// Validate artifact bytes.
+	for i, a := range ev.Artifacts {
+		if int64(a.Bytes) > maxJSONSafeInteger || a.Bytes < 0 {
+			return fmt.Errorf("artifacts[%d].bytes exceeds IEEE-754 safe integer range: %d", i, a.Bytes)
+		}
+	}
+	// Validate startup_confirm duration.
+	if ev.StartupConfirm != nil {
+		if ev.StartupConfirm.DurationMs > maxJSONSafeInteger || ev.StartupConfirm.DurationMs < 0 {
+			return fmt.Errorf("startup_confirm.duration_ms exceeds IEEE-754 safe integer range: %d", ev.StartupConfirm.DurationMs)
+		}
 	}
 	return nil
 }

@@ -82,12 +82,12 @@ type RunnerPhase struct {
 	Opaque        bool   `json:"opaque,omitempty"`
 	Reason        string `json:"reason,omitempty"`
 	Provider      string `json:"provider,omitempty"`
-	LeaseID       string `json:"leaseId,omitempty"`
+	LeaseID       string `json:"lease_id,omitempty"`
 	Slug          string `json:"slug,omitempty"`
-	RunID         string `json:"runId,omitempty"`
-	MachineType   string `json:"machineType,omitempty"`
-	TransferCount int    `json:"transferCount,omitempty"`
-	TransferBytes int64  `json:"transferBytes,omitempty"`
+	RunID         string `json:"run_id,omitempty"`
+	MachineType   string `json:"machine_type,omitempty"`
+	TransferCount int    `json:"transfer_count,omitempty"`
+	TransferBytes int64  `json:"transfer_bytes,omitempty"`
 }
 
 type runnerProviderTiming struct {

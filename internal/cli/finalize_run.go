@@ -147,7 +147,7 @@ func BuildTerminalBundle(outcome FinalRunOutcome, key ed25519.PrivateKey) (Termi
 		HydrateMs:      outcome.Timing.HydrateMs,
 		ProbeMs:        outcome.Timing.ProbeMs,
 		Artifacts:      artifactsFromRunArtifacts(outcome.Artifacts),
-		StartupConfirm: outcome.Timing.StartupConfirm,
+		StartupConfirm: StartupConfirmFromSummary(outcome.Timing.StartupConfirm),
 		StartedAt:      outcome.StartedAt,
 		EndedAt:        outcome.EndedAt,
 	}

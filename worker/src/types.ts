@@ -1088,7 +1088,7 @@ export interface RunEvidenceV1 {
   artifacts?: RunEvidenceArtifact[];
 
   // Startup confirmation result (provider qualification evidence)
-  startup_confirm?: StartupConfirmSummary;
+  startup_confirm?: RunEvidenceStartupConfirm;
 
   // Integrity
   started_at?: string;
@@ -1097,11 +1097,11 @@ export interface RunEvidenceV1 {
 }
 
 /**
- * StartupConfirmSummary is a portable summary of the startup confirmation
- * result, persisted in the timing report and evidence for provider
- * qualification.
+ * RunEvidenceStartupConfirm is the frozen wire representation of a startup
+ * confirmation result inside RunEvidenceV1. Field names are snake_case
+ * matching the evidence spec.
  */
-export interface StartupConfirmSummary {
+export interface RunEvidenceStartupConfirm {
   stage: string;
   duration_ms: number;
   ready: boolean;

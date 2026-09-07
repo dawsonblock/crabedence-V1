@@ -75,7 +75,7 @@ type RunEvidenceV1 struct {
 	Artifacts []RunEvidenceArtifact `json:"artifacts,omitempty"`
 
 	// Startup confirmation result (provider qualification evidence)
-	StartupConfirm *StartupConfirmSummary `json:"startup_confirm,omitempty"`
+	StartupConfirm *RunEvidenceStartupConfirm `json:"startup_confirm,omitempty"`
 
 	// Integrity
 	StartedAt string `json:"started_at,omitempty"`
@@ -89,6 +89,25 @@ type RunEvidenceArtifact struct {
 	Path   string `json:"path"`
 	Bytes  int    `json:"bytes,omitempty"`
 	SHA256 string `json:"sha256,omitempty"`
+}
+
+// RunEvidenceStartupConfirm is the frozen wire representation of a startup
+// confirmation result inside RunEvidenceV1. It uses snake_case JSON keys
+// matching the evidence spec, independent of the timing-report's
+// StartupConfirmSummary (which uses camelCase for the timing JSON envelope).
+//
+// The wire field set is frozen:
+//   - stage: one of "timeout-window", "file-handoff", "process-exit"
+//   - duration_ms: non-negative, IEEE-754 safe
+//   - ready: boolean
+//   - process_exited: omitempty boolean
+//   - retryable: omitempty boolean
+type RunEvidenceStartupConfirm struct {
+	Stage         string `json:"stage"`
+	DurationMs    int64  `json:"duration_ms"`
+	Ready         bool   `json:"ready"`
+	ProcessExited bool   `json:"process_exited,omitempty"`
+	Retryable     bool   `json:"retryable,omitempty"`
 }
 
 const runEvidenceSchemaVersion = 1
@@ -138,7 +157,7 @@ type RunEvidenceInput struct {
 
 	Artifacts []RunEvidenceArtifact
 
-	StartupConfirm *StartupConfirmSummary
+	StartupConfirm *RunEvidenceStartupConfirm
 
 	StartedAt time.Time
 	EndedAt   time.Time
@@ -451,22 +470,22 @@ func runnerPhasesCanonical(phases []RunnerPhase) []any {
 			entries["provider"] = p.Provider
 		}
 		if p.LeaseID != "" {
-			entries["leaseId"] = p.LeaseID
+			entries["lease_id"] = p.LeaseID
 		}
 		if p.Slug != "" {
 			entries["slug"] = p.Slug
 		}
 		if p.RunID != "" {
-			entries["runId"] = p.RunID
+			entries["run_id"] = p.RunID
 		}
 		if p.MachineType != "" {
-			entries["machineType"] = p.MachineType
+			entries["machine_type"] = p.MachineType
 		}
 		if p.TransferCount != 0 {
-			entries["transferCount"] = p.TransferCount
+			entries["transfer_count"] = p.TransferCount
 		}
 		if p.TransferBytes != 0 {
-			entries["transferBytes"] = p.TransferBytes
+			entries["transfer_bytes"] = p.TransferBytes
 		}
 		out[i] = sortedOrderedMap(entries)
 	}
@@ -515,10 +534,10 @@ func runEvidenceArtifactsCanonical(artifacts []RunEvidenceArtifact) []any {
 	return out
 }
 
-// startupConfirmCanonical converts a StartupConfirmSummary to a canonical
+// startupConfirmCanonical converts a RunEvidenceStartupConfirm to a canonical
 // (sorted-key) ordered map for JSON serialization. Keys are sorted by Unicode
 // code point order to match the TypeScript stableJSONValue canonicalization.
-func startupConfirmCanonical(sc *StartupConfirmSummary) *orderedMap {
+func startupConfirmCanonical(sc *RunEvidenceStartupConfirm) *orderedMap {
 	entries := map[string]any{
 		"stage":       sc.Stage,
 		"duration_ms": sc.DurationMs,
@@ -531,6 +550,23 @@ func startupConfirmCanonical(sc *StartupConfirmSummary) *orderedMap {
 		entries["retryable"] = sc.Retryable
 	}
 	return sortedOrderedMap(entries)
+}
+
+// StartupConfirmFromSummary converts a timing-report StartupConfirmSummary
+// to the evidence-wire RunEvidenceStartupConfirm type. This is the single
+// conversion point between the timing JSON envelope (camelCase) and the
+// evidence wire format (snake_case).
+func StartupConfirmFromSummary(s *StartupConfirmSummary) *RunEvidenceStartupConfirm {
+	if s == nil {
+		return nil
+	}
+	return &RunEvidenceStartupConfirm{
+		Stage:         s.Stage,
+		DurationMs:    s.DurationMs,
+		Ready:         s.Ready,
+		ProcessExited: s.ProcessExited,
+		Retryable:     s.Retryable,
+	}
 }
 
 // VerifyRunEvidenceDigest returns true if the evidence's digest matches a
@@ -586,7 +622,7 @@ func RunEvidenceFromTimingReport(report TimingReport) RunEvidenceV1 {
 		ResourceExhaustion: report.ResourceExhaustion,
 		RetryLikely:        report.RetryLikely,
 		Artifacts:          artifacts,
-		StartupConfirm:     report.StartupConfirm,
+		StartupConfirm:     StartupConfirmFromSummary(report.StartupConfirm),
 	})
 }
 
@@ -613,7 +649,7 @@ func RunEvidenceFromRunResult(result RunResult) RunEvidenceV1 {
 		CommandMs:      result.Command.Milliseconds(),
 		SyncDelegated:  result.SyncDelegated,
 		Artifacts:      artifacts,
-		StartupConfirm: result.StartupConfirm,
+		StartupConfirm: StartupConfirmFromSummary(result.StartupConfirm),
 	}
 	if result.Session != nil {
 		input.RunID = result.Session.RunID
