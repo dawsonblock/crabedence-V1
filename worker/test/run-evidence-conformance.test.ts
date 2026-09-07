@@ -32,7 +32,12 @@ const binding = {
   leaseID: "",
   provider: "test-provider",
   exitCode: 0,
-  receipt: undefined,
+  receipt: undefined as
+    | {
+        schema_version: number;
+        evidence_sha256?: string;
+      }
+    | undefined,
 };
 
 describe("run-evidence conformance corpus", () => {
@@ -52,6 +57,16 @@ describe("run-evidence conformance corpus", () => {
         runID: typeof ev["run_id"] === "string" ? ev["run_id"] : "",
         leaseID: typeof ev["lease_id"] === "string" ? ev["lease_id"] : "",
       };
+
+      // For accept fixtures, provide a mock v3 receipt that binds the
+      // evidence digest. This allows testing structural validation
+      // without needing a real Ed25519-signed receipt.
+      if (fx.expected === "accept" && typeof ev["digest"] === "string") {
+        localBinding.receipt = {
+          schema_version: 3,
+          evidence_sha256: ev["digest"],
+        };
+      }
 
       const err = await validateRunEvidence(fx.evidence, localBinding);
 

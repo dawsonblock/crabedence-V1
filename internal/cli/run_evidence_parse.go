@@ -260,6 +260,10 @@ func validateTimingNonNegative(ev RunEvidenceV1) error {
 // Larger values lose precision when parsed as JavaScript numbers and cannot
 // round-trip a digest.
 func validateSafeIntegers(ev RunEvidenceV1) error {
+	// exit_code crosses the Go↔JavaScript boundary and must be a safe integer.
+	if int64(ev.ExitCode) > maxJSONSafeInteger || int64(ev.ExitCode) < -maxJSONSafeInteger {
+		return fmt.Errorf("exit_code exceeds IEEE-754 safe integer range: %d", ev.ExitCode)
+	}
 	int64Fields := []struct {
 		name  string
 		value int64
