@@ -10,14 +10,19 @@ import (
 	"time"
 )
 
-// RunEvidenceV1 is a provider-neutral, versioned, machine-verifiable record of
-// a single run's outcome. It normalizes RunResult + TimingReport into a
-// portable format that can be stored, compared, and audited across the CLI,
-// the coordinator, and provider qualification pipelines.
+// RunEvidenceV1 is a provider-neutral, versioned run outcome record. It
+// normalizes RunResult + TimingReport into a portable format that can be
+// stored, compared, and audited across the CLI, the coordinator, and
+// provider qualification pipelines.
 //
 // The record uses snake_case JSON keys to match TerminalRunReceipt and the
 // AWS qualification contract conventions. The digest covers all fields except
-// the digest itself, so any tampering is detectable.
+// the digest itself (SHA-256 over canonical JSON with digest set to "").
+//
+// The digest is an integrity checksum, NOT a cryptographic signature.
+// Authenticity is established by binding the evidence digest into the
+// Ed25519-signed TerminalRunReceipt (evidence_sha256 field in receipt v3+),
+// which the coordinator verifies.
 type RunEvidenceV1 struct {
 	SchemaVersion int    `json:"schema_version"`
 	EvidenceType  string `json:"evidence_type"`
@@ -294,10 +299,13 @@ func RunEvidenceFromRunResult(result RunResult) RunEvidenceV1 {
 	return NewRunEvidence(input)
 }
 
-// MarshalJSON ensures the digest is always consistent when the evidence is
-// serialized. If the digest is empty or stale, it is recomputed.
+// MarshalJSON serializes the evidence. The digest is computed only if it
+// has not been set yet (first serialization after construction). If the
+// digest is already set but stale relative to the fields, it is preserved
+// as-is so that tampering is detectable by the coordinator's validator
+// rather than silently repaired.
 func (ev RunEvidenceV1) MarshalJSON() ([]byte, error) {
-	if ev.Digest == "" || !VerifyRunEvidenceDigest(ev) {
+	if ev.Digest == "" {
 		ev.Digest = runEvidenceDigest(ev)
 	}
 	type alias RunEvidenceV1

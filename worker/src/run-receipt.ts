@@ -1,4 +1,4 @@
-import type { RunRecord, TerminalRunReceipt } from "./types";
+import type { RunEvidenceV1, RunRecord, TerminalRunReceipt } from "./types";
 
 const terminalReceiptMaxBytes = 16 * 1024;
 const terminalReceiptFieldMaxBytes = 4 * 1024;
@@ -102,6 +102,7 @@ export async function terminalFinishSHA256(input: {
   results: unknown;
   telemetry: unknown;
   receipt: TerminalRunReceipt | undefined;
+  evidence: RunEvidenceV1 | undefined;
 }): Promise<string> {
   return sha256Digest(
     encoder.encode(
@@ -116,6 +117,7 @@ export async function terminalFinishSHA256(input: {
         stableJSONValue(input.results),
         stableJSONValue(input.telemetry),
         stableJSONValue(input.receipt),
+        stableJSONValue(input.evidence),
       ]),
     ),
   );
@@ -130,6 +132,97 @@ export function sameTerminalRunBinding(left: RunRecord, right: RunRecord): boole
     left.command.length === right.command.length &&
     left.command.every((argument, index) => argument === right.command[index])
   );
+}
+
+/**
+ * validateRunEvidence checks that a RunEvidenceV1 record is structurally valid
+ * and internally consistent. It verifies:
+ * - schema_version and evidence_type
+ * - digest correctness (SHA-256 over canonical JSON with digest set to "")
+ * - status/exit_code consistency
+ * - bounded field sizes
+ * - run_id/lease_id/provider match the run when provided
+ * - evidence_sha256 in the receipt (when present) matches the evidence digest
+ *
+ * Returns an Error if validation fails, undefined if the evidence is absent.
+ */
+export async function validateRunEvidence(
+  evidence: unknown,
+  binding: {
+    runID: string;
+    leaseID: string;
+    provider: string;
+    exitCode: number;
+    receipt?: TerminalRunReceipt | undefined;
+  },
+): Promise<Error | undefined> {
+  if (evidence === undefined || evidence === null) return undefined;
+  if (typeof evidence !== "object" || Array.isArray(evidence)) {
+    return new Error("evidence must be an object");
+  }
+  const ev = evidence as Record<string, unknown>;
+  if (ev["schema_version"] !== 1) {
+    return new Error("evidence schema_version must be 1");
+  }
+  if (ev["evidence_type"] !== "run") {
+    return new Error("evidence evidence_type must be 'run'");
+  }
+  if (typeof ev["provider"] !== "string" || ev["provider"].length === 0) {
+    return new Error("evidence provider is required");
+  }
+  if (ev["provider"] !== binding.provider) {
+    return new Error("evidence provider does not match run provider");
+  }
+  if (typeof ev["run_id"] === "string" && ev["run_id"] !== binding.runID) {
+    return new Error("evidence run_id does not match run");
+  }
+  if (typeof ev["lease_id"] === "string" && ev["lease_id"] !== binding.leaseID) {
+    return new Error("evidence lease_id does not match run");
+  }
+  if (typeof ev["exit_code"] !== "number" || !Number.isFinite(ev["exit_code"])) {
+    return new Error("evidence exit_code must be a finite number");
+  }
+  if (ev["exit_code"] !== binding.exitCode) {
+    return new Error("evidence exit_code does not match finish exitCode");
+  }
+  if (typeof ev["run_status"] !== "string") {
+    return new Error("evidence run_status is required");
+  }
+  const expectedStatus = binding.exitCode === 0 ? "succeeded" : "failed";
+  if (
+    ev["run_status"] !== expectedStatus &&
+    ev["run_status"] !== "timed-out" &&
+    ev["run_status"] !== "canceled"
+  ) {
+    return new Error(
+      `evidence run_status ${ev["run_status"]} is inconsistent with exit_code ${binding.exitCode}`,
+    );
+  }
+  if (
+    typeof ev["digest"] !== "string" ||
+    ev["digest"].length !== 71 ||
+    !ev["digest"].startsWith("sha256:")
+  ) {
+    return new Error("evidence digest must be a sha256 digest");
+  }
+  // Verify digest: recompute SHA-256 over canonical JSON with digest set to "".
+  const recomputed = await computeEvidenceDigest(ev);
+  if (recomputed !== ev["digest"]) {
+    return new Error("evidence digest mismatch");
+  }
+  // If the receipt binds evidence_sha256, verify it matches.
+  if (binding.receipt?.evidence_sha256) {
+    if (binding.receipt.evidence_sha256 !== ev["digest"]) {
+      return new Error("evidence digest does not match receipt evidence_sha256");
+    }
+  }
+  return undefined;
+}
+
+async function computeEvidenceDigest(ev: Record<string, unknown>): Promise<string> {
+  const canonical = { ...ev, digest: "" };
+  const stable = stableJSONValue(canonical);
+  return sha256Digest(encoder.encode(JSON.stringify(stable)));
 }
 
 function stableJSONValue(value: unknown): unknown {

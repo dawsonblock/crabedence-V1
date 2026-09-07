@@ -41,13 +41,27 @@ func (s *lumeProcessSupervisor) Start(ctx context.Context, req shared.ProcessSta
 }
 
 // lumeProcessHandle wraps a lumeRunOwner and the backend's stop logic to
-// satisfy shared.ProcessHandle.
+// satisfy shared.ProcessHandle. Because Lume's startVM spawns a detached
+// process that the CLI does not directly wait on, Done() and Context()
+// have weaker semantics than Tart's startupProcess:
+//   - Done() is closed when Abort() is called (not on natural child exit,
+//     since the CLI does not own the child's lifecycle after handoff).
+//   - Context() returns context.Background() because Lume does not expose
+//     a process-scoped context.
+//   - Abort() is idempotent and signals the process but does not wait for
+//     reaping (the process is detached).
+//
+// These semantics are intentionally weaker than Tart's. Callers that need
+// process-exit observation should use Tart or a provider that owns its
+// child's lifecycle. See docs/plan/portable-coordinator.md for details.
 type lumeProcessHandle struct {
-	owner   lumeRunOwner
-	backend *backend
-	mu      sync.Mutex
-	aborted bool
-	done    chan struct{}
+	owner     lumeRunOwner
+	backend   *backend
+	mu        sync.Mutex
+	aborted   bool
+	done      chan struct{}
+	doneOnce  sync.Once
+	abortOnce sync.Once
 }
 
 func (h *lumeProcessHandle) ensureDone() chan struct{} {
@@ -71,13 +85,15 @@ func (h *lumeProcessHandle) Kill() error {
 	return signalProcessInterrupt(h.owner.PID)
 }
 
+// Abort is idempotent. It signals the process and closes Done. It does not
+// wait for the process to actually exit because Lume's process is detached.
 func (h *lumeProcessHandle) Abort(readinessErr error) error {
-	h.mu.Lock()
-	h.aborted = true
-	h.mu.Unlock()
-	_ = h.Kill()
-	done := h.ensureDone()
-	close(done)
+	h.abortOnce.Do(func() {
+		_ = h.Kill()
+	})
+	h.doneOnce.Do(func() {
+		close(h.ensureDone())
+	})
 	return readinessErr
 }
 
@@ -103,10 +119,9 @@ func (h *lumeProcessHandle) Done() <-chan struct{} {
 	return h.ensureDone()
 }
 
-// Context returns the process's lifecycle context. Lume's startVM handles
-// the startup lifecycle internally and does not expose a process-scoped
-// context, so we return the background context. Callers use their own
-// context for post-startup operations.
+// Context returns context.Background() because Lume does not expose a
+// process-scoped lifecycle context. Callers should use their own context
+// for post-startup operations.
 func (h *lumeProcessHandle) Context() context.Context {
 	return context.Background()
 }

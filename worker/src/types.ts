@@ -1002,7 +1002,7 @@ export interface RunRecord {
 }
 
 export interface TerminalRunReceipt {
-  schema_version: 2;
+  schema_version: 2 | 3;
   receipt_type: "terminal";
   started_at: string;
   ended_at: string;
@@ -1019,20 +1019,24 @@ export interface TerminalRunReceipt {
   log_sha256: string;
   retained_log_sha256: string;
   log_truncated: boolean;
+  /** SHA-256 digest of the RunEvidenceV1, bound into the signed receipt payload (v3+). */
+  evidence_sha256?: string;
   public_key: string;
   signer: string;
   signature: string;
 }
 
 /**
- * RunEvidenceV1 is a provider-neutral, versioned, machine-verifiable record of
- * a single run's outcome. It normalizes RunResult + TimingReport into a
- * portable format that can be stored, compared, and audited across the CLI,
- * the coordinator, and provider qualification pipelines.
+ * RunEvidenceV1 is a provider-neutral, versioned run outcome record. It
+ * normalizes RunResult + TimingReport into a portable format that can be
+ * stored, compared, and audited across the CLI, the coordinator, and
+ * provider qualification pipelines.
  *
  * The digest covers all fields except the digest itself (SHA-256 over the
- * canonical JSON encoding with digest set to ""), so any tampering is
- * detectable. This mirrors the TerminalRunReceipt signing model.
+ * canonical JSON encoding with digest set to ""). The digest is an integrity
+ * checksum, NOT a cryptographic signature. Authenticity is established by
+ * binding the evidence digest into the Ed25519-signed TerminalRunReceipt
+ * (evidence_sha256 field in receipt v3+), which the coordinator verifies.
  */
 export interface RunEvidenceV1 {
   schema_version: 1;

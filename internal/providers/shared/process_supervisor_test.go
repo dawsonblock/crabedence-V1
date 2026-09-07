@@ -11,9 +11,8 @@ func TestFakeProcessSupervisorRecordsStarts(t *testing.T) {
 	sup.SetNextStartOK(true)
 
 	h1, err := sup.Start(context.Background(), ProcessStartRequest{
-		Name:    "test-vm-1",
-		Keep:    false,
-		Command: []string{"tart", "run", "test-vm-1"},
+		Name: "test-vm-1",
+		Keep: false,
 	})
 	if err != nil {
 		t.Fatalf("start 1: %v", err)
@@ -23,9 +22,8 @@ func TestFakeProcessSupervisorRecordsStarts(t *testing.T) {
 	}
 
 	h2, err := sup.Start(context.Background(), ProcessStartRequest{
-		Name:    "test-vm-2",
-		Keep:    true,
-		Command: []string{"lume", "run", "test-vm-2"},
+		Name: "test-vm-2",
+		Keep: true,
 	})
 	if err != nil {
 		t.Fatalf("start 2: %v", err)
@@ -77,15 +75,42 @@ func TestFakeProcessHandleAbortAndHandoff(t *testing.T) {
 
 func TestFakeProcessSupervisorStartFailure(t *testing.T) {
 	sup := &FakeProcessSupervisor{}
-	// First start succeeds (nextStartOK defaults to false, but first call
-	// always succeeds to allow initial setup).
+	// nextStartOK defaults to false, so the first start fails.
 	_, err := sup.Start(context.Background(), ProcessStartRequest{Name: "first"})
-	if err != nil {
-		t.Fatalf("first start: %v", err)
-	}
-	// Second start fails because nextStartOK is false.
-	_, err = sup.Start(context.Background(), ProcessStartRequest{Name: "second"})
 	if err == nil {
-		t.Fatal("expected failure on second start")
+		t.Fatal("expected failure when nextStartOK is false")
+	}
+	// After SetNextStartOK(true), the next start succeeds.
+	sup.SetNextStartOK(true)
+	_, err = sup.Start(context.Background(), ProcessStartRequest{Name: "second"})
+	if err != nil {
+		t.Fatalf("second start: %v", err)
+	}
+}
+
+func TestFakeProcessHandleAbortIsIdempotent(t *testing.T) {
+	sup := &FakeProcessSupervisor{}
+	sup.SetNextStartOK(true)
+	h, err := sup.Start(context.Background(), ProcessStartRequest{Name: "test"})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	fh := sup.Handles()[0].(*fakeProcessHandle)
+	cause := errors.New("readiness failed")
+	if err := h.Abort(cause); err != cause {
+		t.Fatalf("first abort: got %v, want %v", err, cause)
+	}
+	// Second abort should not panic and should return the new error.
+	cause2 := errors.New("second abort")
+	if err := h.Abort(cause2); err != cause2 {
+		t.Fatalf("second abort: got %v, want %v", err, cause2)
+	}
+	if !fh.Aborted() {
+		t.Fatal("abort not recorded")
+	}
+	select {
+	case <-h.Done():
+	default:
+		t.Fatal("Done not closed after abort")
 	}
 }

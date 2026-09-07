@@ -405,7 +405,7 @@ func TestVerifyRejectsTamperedReceipts(t *testing.T) {
 		{
 			name: "unsupported schema version",
 			mutate: func(t *testing.T, path string, receipt map[string]any) []byte {
-				receipt["schema_version"] = 2
+				receipt["schema_version"] = 99
 				return marshalReceipt(t, receipt)
 			},
 			wantCode: 2,

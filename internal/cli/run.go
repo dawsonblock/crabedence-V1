@@ -481,6 +481,7 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 	var finalizeTerminalRun func()
 	var finalTimingReport *timingReport
 	var runEvidence *RunEvidenceV1
+	var runEvidenceDigest string
 	var artifactChangeResults []ArtifactChangeResult
 	var timingRecordRepo Repo
 	var timingRecordCommand []string
@@ -523,10 +524,6 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 		}
 		frozenAt := time.Now()
 		report, hasReport := snapshotFinalTimingReport(frozenAt)
-		if hasReport {
-			ev := RunEvidenceFromTimingReport(report)
-			runEvidence = &ev
-		}
 		if hasReport && timingRecordEnabled {
 			recordColdRun := timingRecordColdRun
 			if benchmarkCtx.ColdRun != nil {
@@ -558,6 +555,19 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 				if prepareTerminalRun != nil {
 					prepareTerminalRun()
 				}
+			}
+		}
+		// After all operations that can change the final outcome, freeze
+		// evidence from the final timing report. This ensures evidence and
+		// terminal receipt agree on the final exit code and status.
+		if hasReport {
+			ev := RunEvidenceFromTimingReport(report)
+			runEvidence = &ev
+			runEvidenceDigest = ev.Digest
+			// Re-prepare the terminal receipt with the evidence digest so
+			// the signed receipt cryptographically binds the evidence.
+			if prepareTerminalRun != nil {
+				prepareTerminalRun()
 			}
 		}
 		if hasReport && runEvidence != nil && *timingJSON {
@@ -2604,6 +2614,7 @@ afterSync:
 			LogSHA256:         terminalLog.FullSHA256,
 			RetainedLogSHA256: sha256Digest([]byte(terminalLog.Log)),
 			LogTruncated:      terminalLog.Truncated,
+			EvidenceSHA256:    runEvidenceDigest,
 		})
 	}
 	prepareTerminalRun = func() {

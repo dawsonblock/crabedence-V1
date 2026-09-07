@@ -313,7 +313,12 @@ import {
   type ProviderReconciliationObservation,
   type ProviderReconciliationQuarantine,
 } from "./provider-reconciliation";
-import { sameTerminalRunBinding, terminalFinishSHA256, verifyTerminalReceipt } from "./run-receipt";
+import {
+  sameTerminalRunBinding,
+  terminalFinishSHA256,
+  validateRunEvidence,
+  verifyTerminalReceipt,
+} from "./run-receipt";
 import {
   readRuntimeAdapterRelayBody,
   runtimeAdapterProxyPath,
@@ -14748,6 +14753,7 @@ export class FleetCoordinator {
       results: input.results,
       telemetry: input.telemetry,
       receipt: input.receipt,
+      evidence: input.evidence,
     });
     if (run.state !== "running") {
       return run.terminalFinishSHA256 === requestedFingerprint
@@ -14775,6 +14781,23 @@ export class FleetCoordinator {
           { status: 400 },
         );
       }
+    }
+    // Verify evidence before persisting it. Invalid evidence fails closed.
+    const evidenceError = await validateRunEvidence(input.evidence, {
+      runID,
+      leaseID: run.leaseID,
+      provider: run.provider,
+      exitCode,
+      receipt,
+    });
+    if (evidenceError) {
+      return json(
+        {
+          error: "invalid_evidence",
+          message: evidenceError.message,
+        },
+        { status: 400 },
+      );
     }
     const terminalLogPrefix = runTerminalLogPrefix(
       runID,

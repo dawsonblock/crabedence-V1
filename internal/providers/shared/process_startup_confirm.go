@@ -2,6 +2,7 @@ package shared
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -13,15 +14,13 @@ import (
 // exiting. This is Tart's default behavior — a VM that doesn't crash within
 // the startup window is presumed booted.
 type TimeoutWindowConfirm struct {
-	// Timeout is the survival window. If zero, the caller's ObserveTimeout
-	// from ProcessStartRequest is used.
+	// Timeout is the survival window. If zero, defaults to 2s.
 	Timeout time.Duration
 }
 
 func (c TimeoutWindowConfirm) Wait(ctx context.Context, _ ProcessHandle, exited <-chan error) error {
 	timeout := c.Timeout
 	if timeout <= 0 {
-		// Fall back to a reasonable default if the caller didn't set one.
 		timeout = 2 * time.Second
 	}
 	timer := time.NewTimer(timeout)
@@ -43,6 +42,12 @@ func (c TimeoutWindowConfirm) Wait(ctx context.Context, _ ProcessHandle, exited 
 // is Lume's launch-gate protocol: the wrapper script writes its PID, waits
 // for a gate file, then writes an ack file. If the process exits before the
 // file appears, the wait fails.
+//
+// Event precedence is: context cancellation > process exit > readiness.
+// This means even if the expected file exists, the wait fails if the context
+// is already cancelled or the process has already exited. This prevents
+// false-positive readiness when the process died after writing the file but
+// before the caller observed it.
 type FileHandoffConfirm struct {
 	// Path is the file to poll.
 	Path string
@@ -68,19 +73,81 @@ func (c FileHandoffConfirm) Wait(ctx context.Context, _ ProcessHandle, exited <-
 	defer deadline.Stop()
 	defer ticker.Stop()
 	for {
-		if data, err := os.ReadFile(c.Path); err == nil && strings.TrimSpace(string(data)) == c.ExpectedContent {
-			return nil
+		// Check cancellation and exit BEFORE readiness, so that a file
+		// left behind by a dead process does not produce false success.
+		select {
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		case err := <-exited:
+			if err != nil {
+				return fmt.Errorf("process exited before handoff: %w", err)
+			}
+			return fmt.Errorf("process exited before handoff")
+		default:
+		}
+		// Check readiness. Distinguish "file not ready yet" (continue)
+		// from actual I/O errors (fail immediately).
+		if ready, err := c.checkReady(); err != nil {
+			return fmt.Errorf("read handoff file %s: %w", c.Path, err)
+		} else if ready {
+			// Re-check exit one more time before committing readiness,
+			// to close the race between file-write and process-death.
+			select {
+			case <-ctx.Done():
+				return context.Cause(ctx)
+			case err := <-exited:
+				if err != nil {
+					return fmt.Errorf("process exited before handoff: %w", err)
+				}
+				return fmt.Errorf("process exited before handoff")
+			default:
+				return nil
+			}
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return context.Cause(ctx)
 		case err := <-exited:
-			return fmt.Errorf("process exited before handoff: %v", err)
+			if err != nil {
+				return fmt.Errorf("process exited before handoff: %w", err)
+			}
+			return fmt.Errorf("process exited before handoff")
 		case <-deadline.C:
 			return fmt.Errorf("timed out waiting for %s", c.Path)
 		case <-ticker.C:
 		}
 	}
+}
+
+// checkReady returns (true, nil) if the file exists with expected content,
+// (false, nil) if the file is not yet ready (missing or wrong content), or
+// (false, err) for unexpected I/O errors (permission denied, etc.).
+func (c FileHandoffConfirm) checkReady() (bool, error) {
+	data, err := os.ReadFile(c.Path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		// Treat "file exists but not ready" as not-ready rather than
+		// an error — the file may be mid-write.
+		if isTransientFileError(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return strings.TrimSpace(string(data)) == c.ExpectedContent, nil
+}
+
+// isTransientFileError returns true for errors that are likely to resolve
+// on retry (file being written, temporary lock, etc.).
+func isTransientFileError(err error) bool {
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) {
+		// EACCES on a file being created can be transient in some
+		// filesystems; treat it as not-ready rather than fatal.
+		return true
+	}
+	return false
 }
 
 // ProcessExitConfirm waits for the process to exit (used when the process

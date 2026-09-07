@@ -17,26 +17,22 @@ type ProcessSupervisor interface {
 	Start(ctx context.Context, req ProcessStartRequest) (ProcessHandle, error)
 }
 
-// ProcessStartRequest configures a supervised process launch.
+// ProcessStartRequest configures a supervised process launch. Only Name,
+// Keep, and ObserveTimeout are consumed by the current Tart and Lume
+// supervisors. Command, Env, LogPath, Detached, and StartupConfirm are
+// intentionally omitted from the shared request because each provider
+// owns its own spawn logic (Tart runs `tart run`, Lume runs a wrapper
+// script). If a future provider needs generic command execution, it
+// should define its own request type rather than extending this one.
 type ProcessStartRequest struct {
 	// Name is the VM/instance name for diagnostics.
 	Name string
-	// Command is the executable and arguments.
-	Command []string
-	// Env is the child environment.
-	Env []string
 	// Keep survives caller context cancellation after a successful handoff.
 	Keep bool
-	// LogPath is the stderr capture path. Empty uses a temporary file.
-	LogPath string
-	// Detached sets a new session (setsid) for the child on POSIX.
-	Detached bool
 	// ObserveTimeout is the startup observation window after the process
 	// starts. If StartupConfirm is nil, the process is considered ready if
 	// it survives this window without exiting.
 	ObserveTimeout time.Duration
-	// StartupConfirm waits for readiness. nil uses the timeout window.
-	StartupConfirm ProcessStartupConfirm
 }
 
 // ProcessStartupConfirm waits for the process to become ready. It returns nil
@@ -116,11 +112,12 @@ func (s *FakeProcessSupervisor) Handles() []ProcessHandle {
 
 // Start implements ProcessSupervisor. It records the request and returns a
 // fake handle. The handle's PID increments per call to avoid collisions.
+// If SetNextStartOK(false) has been called, Start returns context.Canceled.
 func (s *FakeProcessSupervisor) Start(_ context.Context, req ProcessStartRequest) (ProcessHandle, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.starts = append(s.starts, FakeProcessStart{Request: req})
-	if !s.nextStartOK && len(s.handles) > 0 {
+	if !s.nextStartOK {
 		return nil, context.Canceled
 	}
 	h := &fakeProcessHandle{
@@ -133,11 +130,13 @@ func (s *FakeProcessSupervisor) Start(_ context.Context, req ProcessStartRequest
 }
 
 type fakeProcessHandle struct {
-	pid     int
-	done    chan struct{}
-	aborted chan struct{}
-	handed  bool
-	killed  bool
+	pid       int
+	done      chan struct{}
+	aborted   chan struct{}
+	handed    bool
+	killed    bool
+	abortOnce sync.Once
+	doneOnce  sync.Once
 }
 
 func (h *fakeProcessHandle) PID() int              { return h.pid }
@@ -149,8 +148,12 @@ func (h *fakeProcessHandle) Context() context.Context {
 }
 
 func (h *fakeProcessHandle) Abort(readinessErr error) error {
-	close(h.aborted)
-	close(h.done)
+	h.abortOnce.Do(func() {
+		close(h.aborted)
+	})
+	h.doneOnce.Do(func() {
+		close(h.done)
+	})
 	return readinessErr
 }
 
