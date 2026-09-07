@@ -72,18 +72,21 @@ func (s *lumeProcessSupervisor) Start(ctx context.Context, req shared.ProcessSta
 
 // lumeProcessHandle wraps a lumeRunOwner and the backend's stop logic to
 // satisfy shared.ProcessHandle. Because Lume's startVM spawns a detached
-// process that the CLI does not directly wait on, Done() and Context()
-// have weaker semantics than Tart's startupProcess:
-//   - Done() is closed when Abort() is called (not on natural child exit,
-//     since the CLI does not own the child's lifecycle after handoff).
-//   - Context() returns context.Background() because Lume does not expose
-//     a process-scoped context.
-//   - Abort() is idempotent and signals the process but does not wait for
-//     reaping (the process is detached).
+// process that the CLI does not directly wait on, this handle implements
+// shared.ProcessHandle, shared.ProcessKiller, shared.ProcessHandoff,
+// shared.ProcessStderr, and shared.DetachedProcess — but NOT
+// shared.ExitObservable, shared.ReapableProcess, or
+// shared.LifecycleContextProvider.
 //
-// These semantics are intentionally weaker than Tart's. Callers that need
-// process-exit observation should use Tart or a provider that owns its
-// child's lifecycle. See docs/plan/portable-coordinator.md for details.
+// The previous monolithic ProcessHandle forced Lume to implement Done() and
+// Context() with weaker semantics that did not truthfully represent the
+// process's lifecycle. With the capability split, Lume explicitly advertises
+// that it is detached, and callers that need exit observation or
+// process-scoped context must use a provider that truthfully implements
+// those interfaces (e.g. Tart).
+//
+// Abort() is idempotent and signals the process but does not wait for
+// reaping (the process is detached).
 type lumeProcessHandle struct {
 	owner     lumeRunOwner
 	backend   *backend
@@ -94,14 +97,9 @@ type lumeProcessHandle struct {
 	abortOnce sync.Once
 }
 
-func (h *lumeProcessHandle) ensureDone() chan struct{} {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.done == nil {
-		h.done = make(chan struct{})
-	}
-	return h.done
-}
+// Detached returns true because Lume's process is detached from the CLI's
+// lifecycle. The CLI does not own the child process after handoff.
+func (h *lumeProcessHandle) Detached() bool { return true }
 
 func (h *lumeProcessHandle) PID() int { return h.owner.PID }
 
@@ -145,18 +143,27 @@ func (h *lumeProcessHandle) Stderr() string {
 	return string(data)
 }
 
-func (h *lumeProcessHandle) Done() <-chan struct{} {
-	return h.ensureDone()
+// ensureDone and the Done method are retained as internal infrastructure
+// for Abort's signaling, but Done() is NOT exported as part of the
+// ExitObservable interface. Lume does not implement ExitObservable because
+// its Done channel is only closed on Abort, not on natural process exit.
+func (h *lumeProcessHandle) ensureDone() chan struct{} {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.done == nil {
+		h.done = make(chan struct{})
+	}
+	return h.done
 }
 
-// Context returns context.Background() because Lume does not expose a
-// process-scoped lifecycle context. Callers should use their own context
-// for post-startup operations.
-func (h *lumeProcessHandle) Context() context.Context {
-	return context.Background()
-}
-
-// Compile-time checks.
+// Compile-time checks. Lume implements ProcessHandle (PID + Abort),
+// ProcessKiller, ProcessHandoff, ProcessStderr, and DetachedProcess.
+// It does NOT implement ExitObservable, ReapableProcess, or
+// LifecycleContextProvider because its process is detached.
 var _ shared.ProcessSupervisor = (*lumeProcessSupervisor)(nil)
 var _ shared.ProcessHandle = (*lumeProcessHandle)(nil)
+var _ shared.ProcessKiller = (*lumeProcessHandle)(nil)
+var _ shared.ProcessHandoff = (*lumeProcessHandle)(nil)
+var _ shared.ProcessStderr = (*lumeProcessHandle)(nil)
+var _ shared.DetachedProcess = (*lumeProcessHandle)(nil)
 var _ LumeHandle = (*lumeProcessHandle)(nil)

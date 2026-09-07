@@ -42,15 +42,33 @@ func TestLumeSupervisorReturnsFileHandoffConfirm(t *testing.T) {
 	}
 }
 
-func TestLumeProcessHandleContextReturnsBackground(t *testing.T) {
+func TestLumeProcessHandleDoesNotImplementLifecycleContextProvider(t *testing.T) {
+	// Lume's process is detached, so it does NOT implement
+	// LifecycleContextProvider. Callers that need a process-scoped context
+	// should use a provider that truthfully implements it (e.g. Tart).
 	h := &lumeProcessHandle{}
-	if h.Context() == nil {
-		t.Fatal("Context() returned nil")
+	if _, ok := any(h).(shared.LifecycleContextProvider); ok {
+		t.Fatal("lumeProcessHandle should NOT implement LifecycleContextProvider (detached process)")
 	}
-	// Lume's context should never be cancelled (background) since Lume
-	// manages its lifecycle internally.
-	if err := h.Context().Err(); err != nil {
-		t.Fatalf("Context() = %v, want background", err)
+}
+
+func TestLumeProcessHandleDoesNotImplementExitObservable(t *testing.T) {
+	// Lume's process is detached, so it does NOT implement ExitObservable.
+	// Its Done channel is only closed on Abort, not on natural process exit.
+	h := &lumeProcessHandle{}
+	if _, ok := any(h).(shared.ExitObservable); ok {
+		t.Fatal("lumeProcessHandle should NOT implement ExitObservable (detached process)")
+	}
+}
+
+func TestLumeProcessHandleImplementsDetachedProcess(t *testing.T) {
+	h := &lumeProcessHandle{}
+	dp, ok := any(h).(shared.DetachedProcess)
+	if !ok {
+		t.Fatal("lumeProcessHandle should implement DetachedProcess")
+	}
+	if !dp.Detached() {
+		t.Fatal("Detached() should return true for Lume")
 	}
 }
 

@@ -101,7 +101,9 @@ func applyDefaults(cfg *Config) {
 // startSupervisedVM routes VM start through the injectable ProcessSupervisor.
 // When the supervisor is the default tartProcessSupervisor, this is equivalent
 // to calling startVM directly. When a test injects a fake, no real process is
-// spawned. The returned ProcessHandle provides Context, Abort, and Handoff.
+// spawned. The returned ProcessHandle implements FullProcessHandle (Context,
+// Abort, Handoff, Kill, Stderr, Done) when the default Tart supervisor is
+// used; callers type-assert to the capability interfaces they need.
 func (b *backend) startSupervisedVM(ctx context.Context, name string, keep bool) (shared.ProcessHandle, error) {
 	handle, err := b.supervisor.Start(ctx, shared.ProcessStartRequest{
 		Name:           name,
@@ -222,7 +224,13 @@ func (b *backend) Acquire(ctx context.Context, req AcquireRequest) (target Lease
 		}
 		acquireErr = errors.Join(acquireErr, cleanup())
 	}()
-	ctx = startup.Context()
+	// Tart's startupProcess implements LifecycleContextProvider. Type-assert
+	// to get the process-scoped context for post-startup operations.
+	lcp, ok := startup.(shared.LifecycleContextProvider)
+	if !ok {
+		return LeaseTarget{}, fmt.Errorf("tart supervisor returned handle without lifecycle context capability")
+	}
+	ctx = lcp.Context()
 	ip, err := b.waitForIP(ctx, name)
 	if err != nil {
 		return LeaseTarget{}, err
@@ -259,7 +267,12 @@ func (b *backend) Acquire(ctx context.Context, req AcquireRequest) (target Lease
 	if err != nil {
 		return LeaseTarget{}, err
 	}
-	if err := startup.Handoff(); err != nil {
+	// Handoff is the acquisition commit point. Type-assert to ProcessHandoff.
+	handoff, ok := startup.(shared.ProcessHandoff)
+	if !ok {
+		return LeaseTarget{}, fmt.Errorf("tart supervisor returned handle without handoff capability")
+	}
+	if err := handoff.Handoff(); err != nil {
 		return LeaseTarget{}, err
 	}
 	cleanupKey = false

@@ -41,8 +41,15 @@ type ProcessStartRequest struct {
 // StartupConfirmResult and an error: the result is populated even on failure,
 // so callers can record startup evidence (stage, duration, outcome) for
 // provider qualification.
+//
+// The Wait signature no longer takes a ProcessHandle parameter. The
+// strategies only need the caller's context and the process-exit error
+// channel (exited). The exit channel is provided by the supervisor, which
+// derives it from the process's exit observation (if available). This
+// change ensures startup confirmation strategies request only the
+// capabilities they actually require.
 type ProcessStartupConfirm interface {
-	Wait(ctx context.Context, handle ProcessHandle, exited <-chan error) (StartupConfirmResult, error)
+	Wait(ctx context.Context, exited <-chan error) (StartupConfirmResult, error)
 }
 
 // StartupConfirmResult captures the outcome of a startup confirmation wait.
@@ -65,32 +72,12 @@ type StartupConfirmResult struct {
 	Retryable bool
 }
 
-// ProcessHandle controls a started process. It is returned by Start and is
-// the sole interface for lifecycle control after spawn.
-type ProcessHandle interface {
-	// PID returns the operating-system process ID.
-	PID() int
-	// Kill sends SIGKILL (or equivalent) to the process. Returns
-	// os.ErrProcessDone if the process has already exited.
-	Kill() error
-	// Abort snapshots diagnostics, cancels readiness, kills the process if
-	// still running, reaps it, and closes the log. Returns the joined error.
-	Abort(readinessErr error) error
-	// Handoff is the acquisition commit point. It closes the log, detaches
-	// the startup context, and (for non-keep) installs a caller-context
-	// watcher that kills the process when the caller is cancelled.
-	Handoff() error
-	// Stderr returns captured startup diagnostics (valid after Abort).
-	Stderr() string
-	// Done is closed when the process has exited and been reaped.
-	Done() <-chan struct{}
-	// Context returns the process's lifecycle context. It is cancelled when
-	// the process exits, so callers can use it for operations that should
-	// abort if the process dies (e.g. waitForIP). After Handoff, the context
-	// is detached from the caller and may or may not remain live depending
-	// on the provider.
-	Context() context.Context
-}
+// ProcessHandle is now defined in process_capabilities.go as a narrow
+// interface with only PID() and Abort(). The previous monolithic interface
+// that included Kill, Handoff, Stderr, Done, and Context has been split
+// into capability interfaces (ProcessKiller, ProcessHandoff, ProcessStderr,
+// ExitObservable, LifecycleContextProvider, DetachedProcess).
+// FullProcessHandle is the backward-compatible superset.
 
 // FakeProcessSupervisor is a test-only ProcessSupervisor that never spawns
 // real processes. It records Start calls and returns configurable handles.
@@ -197,3 +184,6 @@ func (h *fakeProcessHandle) Aborted() bool {
 
 // HandedOff is a test helper that returns whether Handoff was called.
 func (h *fakeProcessHandle) HandedOff() bool { return h.handed }
+
+// Compile-time check that *fakeProcessHandle satisfies FullProcessHandle.
+var _ FullProcessHandle = (*fakeProcessHandle)(nil)

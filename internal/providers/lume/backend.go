@@ -889,7 +889,7 @@ exec "$@"`
 		Timeout:         2 * time.Second,
 		PollInterval:    10 * time.Millisecond,
 	}
-	if _, err := ownerConfirm.Wait(ctx, nil, exitCh); err != nil {
+	if _, err := ownerConfirm.Wait(ctx, exitCh); err != nil {
 		_ = cmd.Process.Kill()
 		return owner, exit(2, "lume run %s: establish launch handoff: %v", name, err)
 	}
@@ -909,7 +909,7 @@ exec "$@"`
 		Timeout:         2 * time.Second,
 		PollInterval:    10 * time.Millisecond,
 	}
-	if _, err := ackConfirm.Wait(ctx, nil, exitCh); err != nil {
+	if _, err := ackConfirm.Wait(ctx, exitCh); err != nil {
 		_ = cmd.Process.Kill()
 		return owner, exit(2, "lume run %s: confirm launch gate: %v", name, err)
 	}
@@ -917,7 +917,7 @@ exec "$@"`
 	// begins. Use the shared TimeoutWindowConfirm strategy instead of a local
 	// select — semantically identical but routed through the shared interface.
 	survivalConfirm := shared.TimeoutWindowConfirm{Timeout: b.startupObserveTimeout}
-	if _, err := survivalConfirm.Wait(ctx, nil, exitCh); err != nil {
+	if _, err := survivalConfirm.Wait(ctx, exitCh); err != nil {
 		_ = detachedStderr.Sync()
 		if _, seekErr := detachedStderr.Seek(0, io.SeekStart); seekErr == nil {
 			_, _ = io.Copy(&stderrBuf, io.LimitReader(detachedStderr, 64<<10))
@@ -985,7 +985,7 @@ func waitForLaunchHandoff(ctx context.Context, path, expected string, exitCh <-c
 		Timeout:         2 * time.Second,
 		PollInterval:    10 * time.Millisecond,
 	}
-	_, err := confirm.Wait(ctx, nil, exitCh)
+	_, err := confirm.Wait(ctx, exitCh)
 	return err
 }
 

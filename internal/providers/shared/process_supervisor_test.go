@@ -51,7 +51,12 @@ func TestFakeProcessHandleAbortAndHandoff(t *testing.T) {
 	}
 	fh := sup.Handles()[0].(*fakeProcessHandle)
 
-	if err := h.Handoff(); err != nil {
+	// Handoff is a capability interface — type-assert to use it.
+	handoff, ok := h.(ProcessHandoff)
+	if !ok {
+		t.Fatal("handle does not implement ProcessHandoff")
+	}
+	if err := handoff.Handoff(); err != nil {
 		t.Fatalf("handoff: %v", err)
 	}
 	if !fh.HandedOff() {
@@ -66,8 +71,13 @@ func TestFakeProcessHandleAbortAndHandoff(t *testing.T) {
 		t.Fatal("abort not recorded")
 	}
 
+	// Done is a capability interface — type-assert to use it.
+	obs, ok := h.(ExitObservable)
+	if !ok {
+		t.Fatal("handle does not implement ExitObservable")
+	}
 	select {
-	case <-h.Done():
+	case <-obs.Done():
 	default:
 		t.Fatal("Done not closed after abort")
 	}
@@ -108,8 +118,12 @@ func TestFakeProcessHandleAbortIsIdempotent(t *testing.T) {
 	if !fh.Aborted() {
 		t.Fatal("abort not recorded")
 	}
+	obs, ok := h.(ExitObservable)
+	if !ok {
+		t.Fatal("handle does not implement ExitObservable")
+	}
 	select {
-	case <-h.Done():
+	case <-obs.Done():
 	default:
 		t.Fatal("Done not closed after abort")
 	}

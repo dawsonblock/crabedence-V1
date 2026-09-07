@@ -51,9 +51,34 @@ func TestStartSupervisedVMUsesInjectedSupervisor(t *testing.T) {
 	}
 }
 
-func TestStartupProcessSatisfiesProcessHandle(t *testing.T) {
-	// Compile-time check that *startupProcess implements shared.ProcessHandle.
-	var _ shared.ProcessHandle = (*startupProcess)(nil)
+func TestStartupProcessSatisfiesFullProcessHandle(t *testing.T) {
+	// Compile-time check that *startupProcess implements shared.FullProcessHandle
+	// (ProcessHandle + ProcessKiller + ProcessHandoff + ProcessStderr +
+	// ExitObservable + LifecycleContextProvider). Tart owns its child's
+	// lifecycle and can truthfully implement all capabilities.
+	var _ shared.FullProcessHandle = (*startupProcess)(nil)
+}
+
+func TestStartupProcessImplementsExitObservable(t *testing.T) {
+	// Tart's startupProcess implements ExitObservable because it can
+	// truthfully observe process exit (Done is closed when the process
+	// exits and is reaped).
+	var _ shared.ExitObservable = (*startupProcess)(nil)
+}
+
+func TestStartupProcessImplementsLifecycleContextProvider(t *testing.T) {
+	// Tart's startupProcess implements LifecycleContextProvider because it
+	// exposes a process-scoped lifecycle context.
+	var _ shared.LifecycleContextProvider = (*startupProcess)(nil)
+}
+
+func TestStartupProcessDoesNotImplementDetachedProcess(t *testing.T) {
+	// Tart's startupProcess does NOT implement DetachedProcess because
+	// Tart owns its child's lifecycle.
+	p := &startupProcess{}
+	if _, ok := any(p).(shared.DetachedProcess); ok {
+		t.Fatal("startupProcess should NOT implement DetachedProcess (Tart owns lifecycle)")
+	}
 }
 
 func TestStartupProcessContextReturnsLifecycleContext(t *testing.T) {
@@ -80,7 +105,13 @@ func TestStartSupervisedVMReturnsProcessHandle(t *testing.T) {
 	if handle == nil {
 		t.Fatal("handle is nil")
 	}
-	if handle.Context() == nil {
+	// The fake handle implements FullProcessHandle, which includes
+	// LifecycleContextProvider. Verify via type assertion.
+	lcp, ok := handle.(shared.LifecycleContextProvider)
+	if !ok {
+		t.Fatal("handle does not implement LifecycleContextProvider")
+	}
+	if lcp.Context() == nil {
 		t.Fatal("Context() returned nil")
 	}
 }

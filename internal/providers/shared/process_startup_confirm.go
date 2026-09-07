@@ -19,7 +19,7 @@ type TimeoutWindowConfirm struct {
 	Timeout time.Duration
 }
 
-func (c TimeoutWindowConfirm) Wait(ctx context.Context, _ ProcessHandle, exited <-chan error) (StartupConfirmResult, error) {
+func (c TimeoutWindowConfirm) Wait(ctx context.Context, exited <-chan error) (StartupConfirmResult, error) {
 	start := time.Now()
 	timeout := c.Timeout
 	if timeout <= 0 {
@@ -82,7 +82,7 @@ type FileHandoffConfirm struct {
 	FileReader func(path string) ([]byte, error)
 }
 
-func (c FileHandoffConfirm) Wait(ctx context.Context, _ ProcessHandle, exited <-chan error) (StartupConfirmResult, error) {
+func (c FileHandoffConfirm) Wait(ctx context.Context, exited <-chan error) (StartupConfirmResult, error) {
 	start := time.Now()
 	timeout := c.Timeout
 	if timeout <= 0 {
@@ -259,7 +259,7 @@ type ProcessExitConfirm struct {
 	Timeout time.Duration
 }
 
-func (c ProcessExitConfirm) Wait(ctx context.Context, _ ProcessHandle, exited <-chan error) (StartupConfirmResult, error) {
+func (c ProcessExitConfirm) Wait(ctx context.Context, exited <-chan error) (StartupConfirmResult, error) {
 	start := time.Now()
 	var timeoutCh <-chan time.Time
 	if c.Timeout > 0 {
