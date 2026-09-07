@@ -22,6 +22,7 @@ const terminalReceiptFields = [
   "log_sha256",
   "retained_log_sha256",
   "log_truncated",
+  "evidence_sha256",
   "public_key",
   "signer",
   "signature",
@@ -248,11 +249,18 @@ function parseTerminalReceipt(value: unknown): TerminalRunReceipt {
     throw new Error("terminal receipt has unknown fields");
   }
   for (const field of terminalReceiptFields) {
-    if ((field === "lease_id" || field === "slug") && record[field] === undefined) continue;
+    if (
+      (field === "lease_id" || field === "slug" || field === "evidence_sha256") &&
+      record[field] === undefined
+    )
+      continue;
     if (record[field] === undefined) throw new Error(`terminal receipt is missing ${field}`);
   }
   const receipt = record as unknown as TerminalRunReceipt;
-  if (receipt.schema_version !== 2 || receipt.receipt_type !== "terminal") {
+  if (
+    (receipt.schema_version !== 2 && receipt.schema_version !== 3) ||
+    receipt.receipt_type !== "terminal"
+  ) {
     throw new Error("unsupported terminal receipt");
   }
   for (const field of [
@@ -299,13 +307,24 @@ function parseTerminalReceipt(value: unknown): TerminalRunReceipt {
       throw new Error(`invalid terminal receipt ${field}`);
     }
   }
+  if (receipt.evidence_sha256 !== undefined && !/^[0-9a-f]{64}$/u.test(receipt.evidence_sha256)) {
+    throw new Error("invalid terminal receipt evidence_sha256");
+  }
   return receipt;
 }
 
 function terminalReceiptSigningBytes(receipt: TerminalRunReceipt): Uint8Array {
+  // v2 receipts do not include evidence_sha256 in the signing payload.
+  // v3+ receipts append evidence_sha256 before public_key/signer.
+  const fields =
+    receipt.schema_version >= 3
+      ? terminalReceiptSigningFields
+      : terminalReceiptSigningFields.filter((field) => field !== "evidence_sha256");
+  const prefix =
+    receipt.schema_version >= 3 ? "crabbox-terminal-receipt-v3\0" : "crabbox-terminal-receipt-v2\0";
   return lengthPrefixedPayload(
-    "crabbox-terminal-receipt-v2\0",
-    terminalReceiptSigningFields.map((field) => String(receipt[field] ?? "")),
+    prefix,
+    fields.map((field) => String((receipt as unknown as Record<string, unknown>)[field] ?? "")),
   );
 }
 

@@ -157,7 +157,7 @@ func TestRunnerPhasesDoNotChangeTerminalReceiptV2(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if receipt.SchemaVersion != 2 || strings.Contains(string(encoded), "runner") {
+	if receipt.SchemaVersion != 3 || strings.Contains(string(encoded), "runner") {
 		t.Fatalf("receipt changed with runner telemetry: %s", encoded)
 	}
 }

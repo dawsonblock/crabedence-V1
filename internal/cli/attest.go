@@ -426,7 +426,7 @@ func validateTerminalRunReceipt(receipt terminalRunReceipt) error {
 			return fmt.Errorf("invalid %s", name)
 		}
 	}
-	if receipt.EvidenceSHA256 != "" && !validSHA256Digest(receipt.EvidenceSHA256) {
+	if receipt.EvidenceSHA256 != "" && !validHexDigest(receipt.EvidenceSHA256, sha256.Size) {
 		return fmt.Errorf("invalid evidence_sha256")
 	}
 	pub, err := base64.StdEncoding.DecodeString(receipt.PublicKey)
@@ -732,6 +732,17 @@ func validSHA256Digest(value string) bool {
 	}
 	decoded, err := hex.DecodeString(strings.TrimPrefix(value, "sha256:"))
 	return err == nil && len(decoded) == sha256.Size
+}
+
+// validHexDigest checks that value is a lowercase hex string encoding
+// exactly nBytes bytes. Used for evidence_sha256, which stores the raw
+// hex digest matching the evidence record's digest field (no "sha256:" prefix).
+func validHexDigest(value string, nBytes int) bool {
+	if len(value) != nBytes*2 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
 }
 
 func writeRunReceipt(path, keyPath string, in runReceiptInput) (runArtifact, error) {

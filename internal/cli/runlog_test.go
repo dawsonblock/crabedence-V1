@@ -413,28 +413,69 @@ func TestTerminalLogFinishRunWireGolden(t *testing.T) {
 	if err := json.Unmarshal(data, &fixtures); err != nil {
 		t.Fatal(err)
 	}
-	for _, fixture := range fixtures {
-		t.Run(fixture.Name, func(t *testing.T) {
-			var raw []byte
-			for _, part := range fixture.Raw {
-				b, err := hex.DecodeString(part.Hex)
-				if err != nil {
-					t.Fatal(err)
-				}
-				raw = append(raw, bytes.Repeat(b, part.Count)...)
-			}
-			actual := captureTerminalLogWire(t, raw)
-			encoded, err := json.Marshal(actual)
+	regen := os.Getenv("REGEN_GOLDEN") == "1"
+	for idx, fixture := range fixtures {
+		if !regen {
+			fixture := fixture
+			t.Run(fixture.Name, func(t *testing.T) {
+				runTerminalLogFinishRunWireGoldenCase(t, fixture)
+			})
+			continue
+		}
+		var raw []byte
+		for _, part := range fixture.Raw {
+			b, err := hex.DecodeString(part.Hex)
 			if err != nil {
 				t.Fatal(err)
 			}
-			var decoded map[string]any
-			if err := json.Unmarshal(encoded, &decoded); err != nil {
-				t.Fatal(err)
-			}
-			if !reflect.DeepEqual(decoded, fixture.Finish) {
-				t.Fatalf("FinishRun JSON differs from golden for %s", fixture.Name)
-			}
-		})
+			raw = append(raw, bytes.Repeat(b, part.Count)...)
+		}
+		actual := captureTerminalLogWire(t, raw)
+		encoded, err := json.Marshal(actual)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var decoded map[string]any
+		if err := json.Unmarshal(encoded, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		fixture.Finish = decoded
+		fixtures[idx] = fixture
+	}
+	if regen {
+		out, err := json.MarshalIndent(fixtures, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, '\n')
+		if err := os.WriteFile("testdata/terminal-log-wire.json", out, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func runTerminalLogFinishRunWireGoldenCase(t *testing.T, fixture terminalLogWireFixture) {
+	t.Helper()
+	var raw []byte
+	for _, part := range fixture.Raw {
+		b, err := hex.DecodeString(part.Hex)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw = append(raw, bytes.Repeat(b, part.Count)...)
+	}
+	actual := captureTerminalLogWire(t, raw)
+	encoded, err := json.Marshal(actual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(decoded, fixture.Finish) {
+		expected, _ := json.MarshalIndent(fixture.Finish, "", "  ")
+		actualJSON, _ := json.MarshalIndent(decoded, "", "  ")
+		t.Fatalf("FinishRun JSON differs from golden for %s\nexpected:\n%s\nactual:\n%s", fixture.Name, expected, actualJSON)
 	}
 }
