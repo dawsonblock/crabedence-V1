@@ -1,0 +1,592 @@
+{
+  "description": "Shared Go↔TypeScript evidence conformance corpus. Both runtimes must accept or reject each fixture identically.",
+  "fixtures": [
+    {
+      "name": "minimal-success",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "ordinary-failure",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 1,
+        "run_status": "failed",
+        "error_kind": "command-exit",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "timeout-with-error-kind",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 124,
+        "run_status": "timed-out",
+        "error_kind": "timeout",
+        "total_ms": 5000,
+        "command_ms": 4900,
+        "sync_ms": 0,
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "cancellation-with-error-kind",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 130,
+        "run_status": "canceled",
+        "error_kind": "canceled",
+        "total_ms": 200,
+        "command_ms": 100,
+        "sync_ms": 0,
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "startup-confirm-timeout-window",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "tart",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 1000,
+        "command_ms": 500,
+        "sync_ms": 200,
+        "startup_confirm": {
+          "stage": "timeout-window",
+          "duration_ms": 812,
+          "ready": true
+        },
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "startup-confirm-file-handoff-with-exit",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "lume",
+        "exit_code": 1,
+        "run_status": "failed",
+        "error_kind": "provider-error",
+        "total_ms": 500,
+        "command_ms": 300,
+        "sync_ms": 0,
+        "startup_confirm": {
+          "stage": "file-handoff",
+          "duration_ms": 250,
+          "ready": false,
+          "process_exited": true,
+          "retryable": false
+        },
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "skipped-sync-phase-without-ms",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 0,
+        "sync_phases": [
+          {"name": "sync", "skipped": true}
+        ],
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "runner-phases-with-snake-case",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 1000,
+        "command_ms": 500,
+        "sync_ms": 200,
+        "runner_phases": [
+          {
+            "name": "lease",
+            "ms": 100,
+            "provider": "tart",
+            "lease_id": "cbx_abc",
+            "run_id": "run_123",
+            "machine_type": "m1"
+          }
+        ],
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "all-optional-fields",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "lease_id": "cbx_lease",
+        "slug": "test-slug",
+        "run_id": "run_abc",
+        "label": "test-label",
+        "machine_type": "m1",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "command_text": "echo hello",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "runner_total_ms": 80,
+        "end_to_end_ms": 120,
+        "lease_ms": 10,
+        "bootstrap_ms": 5,
+        "hydrate_ms": 3,
+        "probe_ms": 2,
+        "sync_delegated": true,
+        "sync_mode": "rsync",
+        "sync_transfer_files": 10,
+        "sync_transfer_bytes": 1024,
+        "sync_fallback_reason": "permission-denied",
+        "blocked_stage": "hydrate",
+        "resource_exhaustion": "memory",
+        "retry_likely": "transient",
+        "failure_hint": "check logs",
+        "started_at": "2024-01-01T00:00:00Z",
+        "ended_at": "2024-01-01T00:01:00Z",
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "multiple-artifacts",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "artifacts": [
+          {"kind": "log", "path": "/tmp/log.txt", "bytes": 1024, "sha256": "abc123"},
+          {"kind": "junit", "path": "/tmp/results.xml"}
+        ],
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "empty-arrays",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "runner_phases": [],
+        "sync_phases": [],
+        "command_phases": [],
+        "artifacts": [],
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "unicode-command-text",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "command_text": "echo \u00e9\u4e16\u754c\ud55c\uad6d",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "unicode-line-separator",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "command_text": "echo \u2028line2",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "unicode-paragraph-separator",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "command_text": "echo \u2029para2",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "max-safe-integer-timing",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 9007199254740991,
+        "command_ms": 9007199254740991,
+        "sync_ms": 0,
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "unknown-top-level-field",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "evil_field": "malicious",
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "unknown field"
+    },
+    {
+      "name": "unknown-nested-phase-field",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "sync_phases": [
+          {"name": "sync", "ms": 10, "evil": "data"}
+        ],
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "unknown field"
+    },
+    {
+      "name": "unknown-startup-field",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "startup_confirm": {
+          "stage": "timeout-window",
+          "duration_ms": 100,
+          "ready": true,
+          "evil": "data"
+        },
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "unknown field"
+    },
+    {
+      "name": "unsafe-integer-timing",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 9007199254740992,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "safe integer"
+    },
+    {
+      "name": "negative-timing",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": -1,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "non-negative"
+    },
+    {
+      "name": "uppercase-digest",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "digest": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "wrong-schema-version",
+      "evidence": {
+        "schema_version": 2,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "schema_version"
+    },
+    {
+      "name": "wrong-evidence-type",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "batch",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "evidence_type"
+    },
+    {
+      "name": "timeout-without-error-kind",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 124,
+        "run_status": "timed-out",
+        "total_ms": 5000,
+        "command_ms": 4900,
+        "sync_ms": 0,
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "error_kind"
+    },
+    {
+      "name": "canceled-without-error-kind",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 130,
+        "run_status": "canceled",
+        "total_ms": 200,
+        "command_ms": 100,
+        "sync_ms": 0,
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "error_kind"
+    },
+    {
+      "name": "success-with-nonzero-exit",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 1,
+        "run_status": "succeeded",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "exit_code"
+    },
+    {
+      "name": "failure-with-zero-exit",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "failed",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "exit_code"
+    },
+    {
+      "name": "wrong-startup-stage",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "startup_confirm": {
+          "stage": "invalid-stage",
+          "duration_ms": 100,
+          "ready": true
+        },
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "stage"
+    },
+    {
+      "name": "wrong-startup-ready-type",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "startup_confirm": {
+          "stage": "timeout-window",
+          "duration_ms": 100,
+          "ready": "yes"
+        },
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "ready"
+    },
+    {
+      "name": "runner-phase-camel-case",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "runner_phases": [
+          {"name": "lease", "ms": 10, "leaseId": "cbx_abc"}
+        ],
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "unknown field"
+    },
+    {
+      "name": "negative-startup-duration",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "startup_confirm": {
+          "stage": "timeout-window",
+          "duration_ms": -1,
+          "ready": true
+        },
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "non-negative"
+    }
+  ]
+}

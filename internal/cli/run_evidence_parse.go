@@ -172,6 +172,24 @@ func ValidateRunEvidenceV1(ev RunEvidenceV1) error {
 	if err := validateSafeIntegers(ev); err != nil {
 		return err
 	}
+	if err := validateStartupConfirm(ev); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateStartupConfirm validates the startup_confirm nested object.
+func validateStartupConfirm(ev RunEvidenceV1) error {
+	if ev.StartupConfirm == nil {
+		return nil
+	}
+	sc := ev.StartupConfirm
+	switch sc.Stage {
+	case "timeout-window", "file-handoff", "process-exit":
+		// valid
+	default:
+		return fmt.Errorf("startup_confirm.stage must be one of timeout-window/file-handoff/process-exit, got %q", sc.Stage)
+	}
 	return nil
 }
 
@@ -295,7 +313,10 @@ func validateSafeIntegers(ev RunEvidenceV1) error {
 	}
 	// Validate startup_confirm duration.
 	if ev.StartupConfirm != nil {
-		if ev.StartupConfirm.DurationMs > maxJSONSafeInteger || ev.StartupConfirm.DurationMs < 0 {
+		if ev.StartupConfirm.DurationMs < 0 {
+			return fmt.Errorf("startup_confirm.duration_ms must be non-negative, got %d", ev.StartupConfirm.DurationMs)
+		}
+		if ev.StartupConfirm.DurationMs > maxJSONSafeInteger {
 			return fmt.Errorf("startup_confirm.duration_ms exceeds IEEE-754 safe integer range: %d", ev.StartupConfirm.DurationMs)
 		}
 	}
