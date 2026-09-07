@@ -37,11 +37,32 @@ type ProcessStartRequest struct {
 	Data any
 }
 
-// ProcessStartupConfirm waits for the process to become ready. It returns nil
-// when the process is ready, or an error if it exits or the context is
-// cancelled before readiness.
+// ProcessStartupConfirm waits for the process to become ready. It returns a
+// StartupConfirmResult and an error: the result is populated even on failure,
+// so callers can record startup evidence (stage, duration, outcome) for
+// provider qualification.
 type ProcessStartupConfirm interface {
-	Wait(ctx context.Context, handle ProcessHandle, exited <-chan error) error
+	Wait(ctx context.Context, handle ProcessHandle, exited <-chan error) (StartupConfirmResult, error)
+}
+
+// StartupConfirmResult captures the outcome of a startup confirmation wait.
+// It is populated even when Wait returns an error, so callers can record
+// structured startup evidence for provider qualification.
+type StartupConfirmResult struct {
+	// Stage identifies the confirmation strategy: "timeout-window",
+	// "file-handoff", or "process-exit".
+	Stage string
+	// Duration is the elapsed time from Wait start to outcome.
+	Duration time.Duration
+	// Ready is true if the process was confirmed ready.
+	Ready bool
+	// ProcessExited is true if the process exited during confirmation
+	// (distinguishing exit-based failures from timeout/cancellation).
+	ProcessExited bool
+	// Retryable is true if the failure is likely to succeed on retry
+	// (e.g. timeout, transient file error). False for process exits and
+	// persistent I/O errors.
+	Retryable bool
 }
 
 // ProcessHandle controls a started process. It is returned by Start and is

@@ -12,9 +12,15 @@ func TestTimeoutWindowConfirmSurvivesWindow(t *testing.T) {
 	confirm := TimeoutWindowConfirm{Timeout: 50 * time.Millisecond}
 	exited := make(chan error, 1)
 	// Don't send on exited — simulate a surviving process.
-	err := confirm.Wait(context.Background(), nil, exited)
+	result, err := confirm.Wait(context.Background(), nil, exited)
 	if err != nil {
 		t.Fatalf("wait: %v", err)
+	}
+	if !result.Ready {
+		t.Fatalf("expected Ready=true, got false")
+	}
+	if result.Stage != "timeout-window" {
+		t.Fatalf("expected Stage=timeout-window, got %s", result.Stage)
 	}
 }
 
@@ -22,9 +28,12 @@ func TestTimeoutWindowConfirmDetectsExit(t *testing.T) {
 	confirm := TimeoutWindowConfirm{Timeout: 5 * time.Second}
 	exited := make(chan error, 1)
 	exited <- nil // Process exited immediately.
-	err := confirm.Wait(context.Background(), nil, exited)
+	result, err := confirm.Wait(context.Background(), nil, exited)
 	if err == nil {
 		t.Fatal("expected exit error, got nil")
+	}
+	if !result.ProcessExited {
+		t.Fatalf("expected ProcessExited=true, got false")
 	}
 }
 
@@ -33,7 +42,7 @@ func TestTimeoutWindowConfirmDetectsContextCancellation(t *testing.T) {
 	exited := make(chan error, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	err := confirm.Wait(ctx, nil, exited)
+	_, err := confirm.Wait(ctx, nil, exited)
 	if err == nil {
 		t.Fatal("expected context error, got nil")
 	}
@@ -57,9 +66,15 @@ func TestFileHandoffConfirmWaitsForFile(t *testing.T) {
 		PollInterval:    10 * time.Millisecond,
 	}
 	exited := make(chan error, 1)
-	err := confirm.Wait(context.Background(), nil, exited)
+	result, err := confirm.Wait(context.Background(), nil, exited)
 	if err != nil {
 		t.Fatalf("wait: %v", err)
+	}
+	if !result.Ready {
+		t.Fatalf("expected Ready=true")
+	}
+	if result.Stage != "file-handoff" {
+		t.Fatalf("expected Stage=file-handoff, got %s", result.Stage)
 	}
 }
 
@@ -73,9 +88,12 @@ func TestFileHandoffConfirmTimesOut(t *testing.T) {
 		PollInterval:    10 * time.Millisecond,
 	}
 	exited := make(chan error, 1)
-	err := confirm.Wait(context.Background(), nil, exited)
+	result, err := confirm.Wait(context.Background(), nil, exited)
 	if err == nil {
 		t.Fatal("expected timeout error, got nil")
+	}
+	if !result.Retryable {
+		t.Fatalf("expected Retryable=true for timeout")
 	}
 }
 
@@ -90,9 +108,12 @@ func TestFileHandoffConfirmDetectsExit(t *testing.T) {
 	}
 	exited := make(chan error, 1)
 	exited <- nil
-	err := confirm.Wait(context.Background(), nil, exited)
+	result, err := confirm.Wait(context.Background(), nil, exited)
 	if err == nil {
 		t.Fatal("expected exit error, got nil")
+	}
+	if !result.ProcessExited {
+		t.Fatalf("expected ProcessExited=true")
 	}
 }
 
@@ -100,16 +121,22 @@ func TestProcessExitConfirmReturnsExitError(t *testing.T) {
 	confirm := ProcessExitConfirm{Timeout: 5 * time.Second}
 	exited := make(chan error, 1)
 	exited <- nil
-	err := confirm.Wait(context.Background(), nil, exited)
+	result, err := confirm.Wait(context.Background(), nil, exited)
 	if err != nil {
 		t.Fatalf("wait: %v", err)
+	}
+	if !result.Ready {
+		t.Fatalf("expected Ready=true for exit code 0")
+	}
+	if !result.ProcessExited {
+		t.Fatalf("expected ProcessExited=true")
 	}
 }
 
 func TestProcessExitConfirmTimesOut(t *testing.T) {
 	confirm := ProcessExitConfirm{Timeout: 50 * time.Millisecond}
 	exited := make(chan error, 1)
-	err := confirm.Wait(context.Background(), nil, exited)
+	_, err := confirm.Wait(context.Background(), nil, exited)
 	if err == nil {
 		t.Fatal("expected timeout error, got nil")
 	}
@@ -131,7 +158,7 @@ func TestFileHandoffConfirmContextCancelBeatsReadyFile(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // Already cancelled.
 	exited := make(chan error, 1)
-	err := confirm.Wait(ctx, nil, exited)
+	_, err := confirm.Wait(ctx, nil, exited)
 	if err == nil {
 		t.Fatal("expected context error when context is already cancelled, got nil")
 	}
@@ -152,7 +179,7 @@ func TestFileHandoffConfirmExitBeatsReadyFile(t *testing.T) {
 	}
 	exited := make(chan error, 1)
 	exited <- nil // Process already exited.
-	err := confirm.Wait(context.Background(), nil, exited)
+	_, err := confirm.Wait(context.Background(), nil, exited)
 	if err == nil {
 		t.Fatal("expected exit error when process already exited, got nil")
 	}
@@ -170,7 +197,7 @@ func TestFileHandoffConfirmDetectsContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	exited := make(chan error, 1)
-	err := confirm.Wait(ctx, nil, exited)
+	_, err := confirm.Wait(ctx, nil, exited)
 	if err == nil {
 		t.Fatal("expected context error, got nil")
 	}

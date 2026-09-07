@@ -39,6 +39,16 @@ type LumeLaunchContext struct {
 	OnStarted   func(lumeRunOwner) error
 }
 
+// LumeHandle is a ProcessHandle that also exposes Lume's run-owner identity.
+// The Lume supervisor returns handles that satisfy this interface; Acquire
+// uses it to extract provider-specific context (owner PID, boot identity,
+// log path) without reaching into a concrete struct. Tests may substitute
+// any handle implementing both shared.ProcessHandle and Owner().
+type LumeHandle interface {
+	shared.ProcessHandle
+	Owner() lumeRunOwner
+}
+
 // Owner returns the underlying lumeRunOwner. This is used by Acquire after
 // a successful supervisor Start to access the owner identity for label
 // persistence and recovery.
@@ -149,3 +159,4 @@ func (h *lumeProcessHandle) Context() context.Context {
 // Compile-time checks.
 var _ shared.ProcessSupervisor = (*lumeProcessSupervisor)(nil)
 var _ shared.ProcessHandle = (*lumeProcessHandle)(nil)
+var _ LumeHandle = (*lumeProcessHandle)(nil)

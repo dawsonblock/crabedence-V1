@@ -13,11 +13,16 @@ const retryableTransactionErrorCodes = new Set(["40001", "40P01"]);
 // Session-scoped advisory lock: exactly one coordinator process may run against
 // a database. A crashed holder loses its session, so the lock frees itself.
 const coordinatorAdvisoryLockName = "crabbox.coordinator";
+// Liveness probe interval for the dedicated lock session. PostgreSQL frees the
+// advisory lock on session death without notifying the holder, so the holder
+// must actively verify its session is still alive.
+const lockHeartbeatIntervalMs = 10_000;
 
 export class PostgresCoordinatorStorage implements CoordinatorStorage {
   readonly pool: Pool;
   private readonly view: PostgresCoordinatorStorageView;
   private lockClient: PoolClient | undefined;
+  private lockRelease: (() => Promise<void>) | undefined;
 
   constructor(connectionString: string, pool?: Pool) {
     this.pool =
@@ -60,7 +65,7 @@ export class PostgresCoordinatorStorage implements CoordinatorStorage {
 
   async acquireCoordinatorLock(): Promise<CoordinatorLock | undefined> {
     if (this.lockClient) {
-      return { release: async () => {} };
+      return { release: async () => {}, onLost: () => {} };
     }
     const client = await this.pool.connect();
     try {
@@ -77,9 +82,54 @@ export class PostgresCoordinatorStorage implements CoordinatorStorage {
       throw error;
     }
     this.lockClient = client;
-    const release = async () => {
-      if (this.lockClient !== client) return;
+    let released = false;
+    const lostCallbacks: Array<() => void> = [];
+    let heartbeat: ReturnType<typeof setInterval> | undefined;
+    const teardownListeners = () => {
+      if (heartbeat) {
+        clearInterval(heartbeat);
+        heartbeat = undefined;
+      }
+      client.removeAllListeners("error");
+      client.removeAllListeners("end");
+    };
+    // Session loss means authority loss: PostgreSQL has already freed the
+    // advisory lock, so a replacement coordinator may start at any moment.
+    // Report it immediately and stop trusting this connection.
+    const lost = (reason: string) => {
+      if (released || this.lockClient !== client) return;
       this.lockClient = undefined;
+      released = true;
+      teardownListeners();
+      // The session is dead; evict the client from the pool rather than
+      // returning a broken connection for reuse.
+      client.release(new Error(`coordinator advisory-lock session lost: ${reason}`));
+      for (const callback of lostCallbacks) {
+        try {
+          callback();
+        } catch {
+          // A misbehaving subscriber must not suppress the others.
+        }
+      }
+    };
+    client.on("error", (error) =>
+      lost(error instanceof Error ? error.message : "connection error"),
+    );
+    client.on("end", () => lost("connection ended"));
+    // Belt-and-braces liveness probe on the exact session holding the lock:
+    // some failure modes (killed backend, NAT timeout) never emit a client
+    // event, but a query on the dead session always fails.
+    heartbeat = setInterval(() => {
+      void client
+        .query("select 1")
+        .catch((error) => lost(error instanceof Error ? error.message : "heartbeat failed"));
+    }, lockHeartbeatIntervalMs);
+    heartbeat.unref();
+    const release = async () => {
+      if (released || this.lockClient !== client) return;
+      this.lockClient = undefined;
+      released = true;
+      teardownListeners();
       try {
         await client.query("select pg_advisory_unlock(hashtext($1))", [
           coordinatorAdvisoryLockName,
@@ -88,19 +138,23 @@ export class PostgresCoordinatorStorage implements CoordinatorStorage {
         client.release();
       }
     };
-    return { release };
+    this.lockRelease = release;
+    return {
+      release,
+      onLost: (callback: () => void) => {
+        lostCallbacks.push(callback);
+      },
+    };
   }
 
   async close(): Promise<void> {
-    const client = this.lockClient;
-    this.lockClient = undefined;
-    if (client) {
+    const release = this.lockRelease;
+    this.lockRelease = undefined;
+    if (release) {
       try {
-        await client.query("select pg_advisory_unlock(hashtext($1))", [
-          coordinatorAdvisoryLockName,
-        ]);
-      } finally {
-        client.release();
+        await release();
+      } catch {
+        // A dead lock session cannot be unlocked; PostgreSQL already freed it.
       }
     }
     await this.pool.end();

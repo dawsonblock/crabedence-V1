@@ -3,6 +3,7 @@ import { vi } from "vitest";
 import { NodeCoordinatorRuntime } from "../node/node-runtime";
 import { AsyncMutex, fleetRequestQueue } from "../node/server-support";
 import { routeCoordinatorRequest } from "../src/coordinator-entry";
+import type { CoordinatorLock } from "../src/coordinator-runtime";
 import { FleetCoordinator, FleetDurableObject } from "../src/fleet";
 import { orgKeyForLabel } from "../src/org-identity";
 import type { Env, LeaseRecord, ProviderMachine } from "../src/types";
@@ -217,6 +218,7 @@ export function parityProvider(calls: ParityProviderCalls, behavior: ParityProvi
 
 export class ParityStorage extends ProvisioningTestStorage {
   private coordinatorLockHeld = false;
+  private lockLostCallbacks: Array<() => void> = [];
 
   // NodeCoordinatorRuntime drives these PostgresCoordinatorStorage lifecycle
   // methods; initialize/ready are no-ops so committed state survives restarts.
@@ -228,14 +230,27 @@ export class ParityStorage extends ProvisioningTestStorage {
     this.coordinatorLockHeld = false;
   }
 
-  async acquireCoordinatorLock(): Promise<{ release(): Promise<void> } | undefined> {
+  async acquireCoordinatorLock(): Promise<CoordinatorLock | undefined> {
     if (this.coordinatorLockHeld) return undefined;
     this.coordinatorLockHeld = true;
+    const release = async () => {
+      this.coordinatorLockHeld = false;
+      this.lockLostCallbacks = [];
+    };
     return {
-      release: async () => {
-        this.coordinatorLockHeld = false;
+      release,
+      onLost: (callback: () => void) => {
+        this.lockLostCallbacks.push(callback);
       },
     };
+  }
+
+  /** Simulate the advisory-lock session dying (network drop, DB restart). */
+  simulateLockLost(): void {
+    const callbacks = this.lockLostCallbacks;
+    this.lockLostCallbacks = [];
+    this.coordinatorLockHeld = false;
+    for (const callback of callbacks) callback();
   }
 }
 

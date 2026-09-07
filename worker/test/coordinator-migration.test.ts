@@ -146,6 +146,74 @@ describe("coordinator migration", () => {
     // Extra target keys are reported but do not by themselves fail verification.
     expect(verification.unexpected).toEqual(["extra:key"]);
   });
+
+  it("enforces planned state inside import transactions (TOCTOU)", async () => {
+    // A TOCTOU gap exists when the pre-import plan reads target state outside
+    // any transaction, and a concurrent writer changes that state before the
+    // transactional write. The import must re-classify each entry inside the
+    // transaction and apply the conflict policy there, not trust the plan.
+    const source = await sourceStorage();
+    const document = await exportCoordinatorState(source);
+
+    // Target starts empty; the plan will classify all entries as "write".
+    const target = new ParityStorage();
+    // Inject a concurrent write between plan and commit: the transaction
+    // callback writes a conflicting value before the import's own put.
+    const originalTransaction = target.transaction.bind(target);
+    let transactionCallCount = 0;
+    target.transaction = vi.fn(async (callback: (tx: typeof target) => Promise<unknown>) => {
+      transactionCallCount += 1;
+      if (transactionCallCount === 1) {
+        // Simulate a concurrent writer landing a conflicting value for run:run_1
+        // just before the import's transaction opens (or inside it, before the
+        // import's read). The in-transaction re-classification must detect this.
+        await target.put("run:run_1", { id: "run_1", state: "raced" });
+      }
+      return originalTransaction(callback);
+    }) as typeof target.transaction;
+
+    // onConflict=fail: the in-transaction conflict must abort the import.
+    const fail = await importCoordinatorState(document, target);
+    expect(fail.applied).toBe(false);
+    expect(fail.errors.join(" ")).toContain("run:run_1");
+    // The raced value must be preserved (the transaction rolled back).
+    expect(await target.get<{ state: string }>("run:run_1")).toMatchObject({ state: "raced" });
+
+    // onConflict=skip: the in-transaction conflict must skip the raced key.
+    const skip = await importCoordinatorState(document, target, { onConflict: "skip" });
+    expect(skip.applied).toBe(true);
+    expect(await target.get<{ state: string }>("run:run_1")).toMatchObject({ state: "raced" });
+    // Non-conflicting keys should still be written.
+    expect(await target.get("lease:cbx_000000000001")).toBeDefined();
+
+    // onConflict=overwrite: the in-transaction conflict must overwrite.
+    const overwrite = await importCoordinatorState(document, target, {
+      onConflict: "overwrite",
+    });
+    expect(overwrite.applied).toBe(true);
+    expect(await target.get<{ state: string }>("run:run_1")).toMatchObject({
+      state: "finished",
+    });
+  });
+
+  it("skips unchanged keys inside import transactions (TOCTOU)", async () => {
+    // A key that was classified as "write" in the plan may already exist with
+    // the same value by the time the transaction runs (a concurrent writer
+    // wrote the identical value). The in-transaction re-classification must
+    // detect this and skip, not blindly overwrite.
+    const source = await sourceStorage();
+    const document = await exportCoordinatorState(source);
+    const target = new ParityStorage();
+
+    // Pre-populate one key with the same value the import would write.
+    const existingEntry = document.entries.find((entry) => entry.key === "run:run_1")!;
+    await target.put("run:run_1", existingEntry.value);
+
+    const result = await importCoordinatorState(document, target);
+    expect(result.applied).toBe(true);
+    // run:run_1 should be counted as skipped, not written.
+    expect(result.written).toBe(document.entries.length - 1);
+  });
 });
 
 describe("coordinator migration endpoints", () => {

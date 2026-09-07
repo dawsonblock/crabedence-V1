@@ -20,7 +20,8 @@ type TimeoutWindowConfirm struct {
 	Timeout time.Duration
 }
 
-func (c TimeoutWindowConfirm) Wait(ctx context.Context, _ ProcessHandle, exited <-chan error) error {
+func (c TimeoutWindowConfirm) Wait(ctx context.Context, _ ProcessHandle, exited <-chan error) (StartupConfirmResult, error) {
+	start := time.Now()
 	timeout := c.Timeout
 	if timeout <= 0 {
 		timeout = 2 * time.Second
@@ -29,14 +30,30 @@ func (c TimeoutWindowConfirm) Wait(ctx context.Context, _ ProcessHandle, exited 
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
-		return context.Cause(ctx)
+		return StartupConfirmResult{
+			Stage:     "timeout-window",
+			Duration:  time.Since(start),
+			Retryable: true,
+		}, context.Cause(ctx)
 	case err := <-exited:
 		if err != nil {
-			return fmt.Errorf("process exited during startup: %w", err)
+			return StartupConfirmResult{
+				Stage:         "timeout-window",
+				Duration:      time.Since(start),
+				ProcessExited: true,
+			}, fmt.Errorf("process exited during startup: %w", err)
 		}
-		return fmt.Errorf("process exited unexpectedly during startup")
+		return StartupConfirmResult{
+			Stage:         "timeout-window",
+			Duration:      time.Since(start),
+			ProcessExited: true,
+		}, fmt.Errorf("process exited unexpectedly during startup")
 	case <-timer.C:
-		return nil
+		return StartupConfirmResult{
+			Stage:    "timeout-window",
+			Duration: time.Since(start),
+			Ready:    true,
+		}, nil
 	}
 }
 
@@ -61,7 +78,8 @@ type FileHandoffConfirm struct {
 	PollInterval time.Duration
 }
 
-func (c FileHandoffConfirm) Wait(ctx context.Context, _ ProcessHandle, exited <-chan error) error {
+func (c FileHandoffConfirm) Wait(ctx context.Context, _ ProcessHandle, exited <-chan error) (StartupConfirmResult, error) {
+	start := time.Now()
 	timeout := c.Timeout
 	if timeout <= 0 {
 		timeout = 2 * time.Second
@@ -79,43 +97,90 @@ func (c FileHandoffConfirm) Wait(ctx context.Context, _ ProcessHandle, exited <-
 		// left behind by a dead process does not produce false success.
 		select {
 		case <-ctx.Done():
-			return context.Cause(ctx)
+			return StartupConfirmResult{
+				Stage:     "file-handoff",
+				Duration:  time.Since(start),
+				Retryable: true,
+			}, context.Cause(ctx)
 		case err := <-exited:
 			if err != nil {
-				return fmt.Errorf("process exited before handoff: %w", err)
+				return StartupConfirmResult{
+					Stage:         "file-handoff",
+					Duration:      time.Since(start),
+					ProcessExited: true,
+				}, fmt.Errorf("process exited before handoff: %w", err)
 			}
-			return fmt.Errorf("process exited before handoff")
+			return StartupConfirmResult{
+				Stage:         "file-handoff",
+				Duration:      time.Since(start),
+				ProcessExited: true,
+			}, fmt.Errorf("process exited before handoff")
 		default:
 		}
 		// Check readiness. Distinguish "file not ready yet" (continue)
 		// from actual I/O errors (fail immediately).
 		if ready, err := c.checkReady(); err != nil {
-			return fmt.Errorf("read handoff file %s: %w", c.Path, err)
+			return StartupConfirmResult{
+				Stage:    "file-handoff",
+				Duration: time.Since(start),
+			}, fmt.Errorf("read handoff file %s: %w", c.Path, err)
 		} else if ready {
 			// Re-check exit one more time before committing readiness,
 			// to close the race between file-write and process-death.
 			select {
 			case <-ctx.Done():
-				return context.Cause(ctx)
+				return StartupConfirmResult{
+					Stage:     "file-handoff",
+					Duration:  time.Since(start),
+					Retryable: true,
+				}, context.Cause(ctx)
 			case err := <-exited:
 				if err != nil {
-					return fmt.Errorf("process exited before handoff: %w", err)
+					return StartupConfirmResult{
+						Stage:         "file-handoff",
+						Duration:      time.Since(start),
+						ProcessExited: true,
+					}, fmt.Errorf("process exited before handoff: %w", err)
 				}
-				return fmt.Errorf("process exited before handoff")
+				return StartupConfirmResult{
+					Stage:         "file-handoff",
+					Duration:      time.Since(start),
+					ProcessExited: true,
+				}, fmt.Errorf("process exited before handoff")
 			default:
-				return nil
+				return StartupConfirmResult{
+					Stage:    "file-handoff",
+					Duration: time.Since(start),
+					Ready:    true,
+				}, nil
 			}
 		}
 		select {
 		case <-ctx.Done():
-			return context.Cause(ctx)
+			return StartupConfirmResult{
+				Stage:     "file-handoff",
+				Duration:  time.Since(start),
+				Retryable: true,
+			}, context.Cause(ctx)
 		case err := <-exited:
 			if err != nil {
-				return fmt.Errorf("process exited before handoff: %w", err)
+				return StartupConfirmResult{
+					Stage:         "file-handoff",
+					Duration:      time.Since(start),
+					ProcessExited: true,
+				}, fmt.Errorf("process exited before handoff: %w", err)
 			}
-			return fmt.Errorf("process exited before handoff")
+			return StartupConfirmResult{
+				Stage:         "file-handoff",
+				Duration:      time.Since(start),
+				ProcessExited: true,
+			}, fmt.Errorf("process exited before handoff")
 		case <-deadline.C:
-			return fmt.Errorf("timed out waiting for %s", c.Path)
+			return StartupConfirmResult{
+				Stage:     "file-handoff",
+				Duration:  time.Since(start),
+				Retryable: true,
+			}, fmt.Errorf("timed out waiting for %s", c.Path)
 		case <-ticker.C:
 		}
 	}
@@ -177,7 +242,8 @@ type ProcessExitConfirm struct {
 	Timeout time.Duration
 }
 
-func (c ProcessExitConfirm) Wait(ctx context.Context, _ ProcessHandle, exited <-chan error) error {
+func (c ProcessExitConfirm) Wait(ctx context.Context, _ ProcessHandle, exited <-chan error) (StartupConfirmResult, error) {
+	start := time.Now()
 	var timeoutCh <-chan time.Time
 	if c.Timeout > 0 {
 		timer := time.NewTimer(c.Timeout)
@@ -186,11 +252,27 @@ func (c ProcessExitConfirm) Wait(ctx context.Context, _ ProcessHandle, exited <-
 	}
 	select {
 	case <-ctx.Done():
-		return context.Cause(ctx)
+		return StartupConfirmResult{
+			Stage:     "process-exit",
+			Duration:  time.Since(start),
+			Retryable: true,
+		}, context.Cause(ctx)
 	case <-timeoutCh:
-		return fmt.Errorf("process did not exit within %s", c.Timeout)
+		return StartupConfirmResult{
+			Stage:     "process-exit",
+			Duration:  time.Since(start),
+			Retryable: true,
+		}, fmt.Errorf("process did not exit within %s", c.Timeout)
 	case err := <-exited:
-		return err
+		result := StartupConfirmResult{
+			Stage:         "process-exit",
+			Duration:      time.Since(start),
+			ProcessExited: true,
+		}
+		if err == nil {
+			result.Ready = true
+		}
+		return result, err
 	}
 }
 

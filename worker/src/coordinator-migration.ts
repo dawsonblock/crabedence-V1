@@ -255,43 +255,99 @@ export async function importCoordinatorState(
   if (options.dryRun) {
     return { ...plan, applied: false, batches: 0, written: 0, skipped: 0 };
   }
-  const conflictKeys = new Set(plan.conflicts.map((conflict) => conflict.key));
-  const unchangedChecks = await Promise.all(
-    validation.document.entries.map(async (entry) => {
-      if (conflictKeys.has(entry.key)) return { key: entry.key, unchanged: false };
-      const existing = await target.get(entry.key);
-      const unchanged =
-        existing !== undefined &&
-        (await sha256Hex(canonicalCoordinatorJSON(existing))) === entry.sha256;
-      return { key: entry.key, unchanged };
-    }),
-  );
-  const unchangedKeys = new Set(
-    unchangedChecks.filter((check) => check.unchanged).map((check) => check.key),
-  );
-  const pending = validation.document.entries.filter(
-    (entry) =>
-      !unchangedKeys.has(entry.key) && !(onConflict === "skip" && conflictKeys.has(entry.key)),
-  );
   const batchSize = options.batchSize ?? coordinatorImportBatchSize;
+  const entries = validation.document.entries;
   let written = 0;
   let batches = 0;
-  for (let offset = 0; offset < pending.length; offset += batchSize) {
-    const batch = pending.slice(offset, offset + batchSize);
-    // oxlint-disable-next-line eslint/no-await-in-loop -- batches commit sequentially to bound each transaction.
-    await target.transaction(async (transaction) => {
-      await Promise.all(batch.map((entry) => transaction.put(entry.key, entry.value)));
-    });
-    written += batch.length;
-    batches += 1;
+  let skipped = 0;
+  // Enforce the planned state inside each import transaction. The pre-import
+  // plan reads target state outside any transaction; between that read and the
+  // transactional write, another writer could change the target. To close that
+  // TOCTOU gap, each batch transaction re-classifies every entry against the
+  // in-transaction state and applies the conflict policy there, so the write
+  // decision and the write itself commit atomically.
+  try {
+    for (let offset = 0; offset < entries.length; offset += batchSize) {
+      const batch = entries.slice(offset, offset + batchSize);
+      // oxlint-disable-next-line eslint/no-await-in-loop -- batches commit sequentially to bound each transaction.
+      const batchResult = await target.transaction(async (transaction) => {
+        const classified = await Promise.all(
+          batch.map(async (entry) => {
+            const existing = await transaction.get(entry.key);
+            if (existing === undefined) return { entry, action: "write" as const };
+            const existingSha256 = await sha256Hex(canonicalCoordinatorJSON(existing));
+            if (existingSha256 === entry.sha256) return { entry, action: "skip" as const };
+            return { entry, action: "conflict" as const, existingSha256 };
+          }),
+        );
+        const writes: CoordinatorExportEntry[] = [];
+        let batchSkipped = 0;
+        for (const result of classified) {
+          if (result.action === "write") {
+            writes.push(result.entry);
+          } else if (result.action === "skip") {
+            batchSkipped += 1;
+          } else {
+            // result.action === "conflict"
+            if (onConflict === "overwrite") {
+              writes.push(result.entry);
+            } else if (onConflict === "skip") {
+              batchSkipped += 1;
+            } else {
+              // onConflict === "fail": abort the entire import. The transaction
+              // will roll back, leaving no partial writes from this batch.
+              throw new ImportConflictError(result.entry.key, result.existingSha256);
+            }
+          }
+        }
+        await Promise.all(writes.map((entry) => transaction.put(entry.key, entry.value)));
+        return { written: writes.length, skipped: batchSkipped };
+      });
+      written += batchResult.written;
+      skipped += batchResult.skipped;
+      batches += 1;
+    }
+  } catch (error) {
+    if (error instanceof ImportConflictError) {
+      // Earlier batches may have already committed; report honestly.
+      return {
+        ...plan,
+        applied: batches > 0,
+        batches,
+        written,
+        skipped,
+        errors: [
+          ...plan.errors,
+          `import aborted at batch ${batches + 1}: key "${error.key}" changed ` +
+            `between plan and commit (existing sha256: ${error.existingSha256})`,
+        ],
+      };
+    }
+    throw error;
   }
   return {
     ...plan,
     applied: true,
     batches,
     written,
-    skipped: plan.total - written - plan.unchanged,
+    skipped,
   };
+}
+
+/**
+ * Thrown inside an import transaction when `onConflict === "fail"` and a key
+ * has changed between the pre-import plan and the in-transaction write. The
+ * transaction rolls back; the caller surfaces the conflict.
+ */
+export class ImportConflictError extends Error {
+  readonly key: string;
+  readonly existingSha256: string;
+  constructor(key: string, existingSha256: string) {
+    super(`import aborted: key "${key}" changed between plan and commit`);
+    this.name = "ImportConflictError";
+    this.key = key;
+    this.existingSha256 = existingSha256;
+  }
 }
 
 export async function verifyCoordinatorImport(

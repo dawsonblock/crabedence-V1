@@ -117,7 +117,8 @@ func (p *startupProcess) reap() {
 // routed through the shared interface so providers can plug in their own.
 func (p *startupProcess) confirmStartup(ctx context.Context, timeout time.Duration) error {
 	confirm := shared.TimeoutWindowConfirm{Timeout: timeout}
-	return confirm.Wait(ctx, p, p.exitedErr)
+	_, err := confirm.Wait(ctx, p, p.exitedErr)
+	return err
 }
 
 // observe is retained for backward compatibility; it delegates to

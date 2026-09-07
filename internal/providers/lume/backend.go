@@ -420,13 +420,15 @@ func (b *backend) Acquire(ctx context.Context, req AcquireRequest) (LeaseTarget,
 	if err != nil {
 		return LeaseTarget{}, cleanupUnclaimedVM(err)
 	}
-	// The shared ProcessSupervisor interface is structurally satisfied by
-	// lumeProcessHandle, but Lume's detached-process model means the handle
-	// carries provider-specific launch context (owner callback, boot
-	// identity, CAS label) that core does not understand. This assertion is
-	// in the Lume provider adapter, not in core, so it does not violate the
-	// architecture boundary — it is the provider extracting its own context.
-	lumeHandle, ok := handle.(*lumeProcessHandle)
+	// The shared ProcessSupervisor returns shared.ProcessHandle, but Lume's
+	// detached-process model means the handle carries provider-specific launch
+	// context (owner callback, boot identity, CAS label) that core does not
+	// understand. The LumeHandle interface extends ProcessHandle with Owner(),
+	// so this assertion is to an interface, not a concrete struct — tests
+	// may substitute any handle implementing both. This is in the Lume
+	// provider adapter, not in core, so it does not violate the architecture
+	// boundary.
+	lumeHandle, ok := handle.(LumeHandle)
 	if !ok {
 		return LeaseTarget{}, cleanupUnclaimedVM(exit(5, "lume supervisor returned unexpected handle type %T", handle))
 	}
@@ -887,7 +889,7 @@ exec "$@"`
 		Timeout:         2 * time.Second,
 		PollInterval:    10 * time.Millisecond,
 	}
-	if err := ownerConfirm.Wait(ctx, nil, exitCh); err != nil {
+	if _, err := ownerConfirm.Wait(ctx, nil, exitCh); err != nil {
 		_ = cmd.Process.Kill()
 		return owner, exit(2, "lume run %s: establish launch handoff: %v", name, err)
 	}
@@ -907,7 +909,7 @@ exec "$@"`
 		Timeout:         2 * time.Second,
 		PollInterval:    10 * time.Millisecond,
 	}
-	if err := ackConfirm.Wait(ctx, nil, exitCh); err != nil {
+	if _, err := ackConfirm.Wait(ctx, nil, exitCh); err != nil {
 		_ = cmd.Process.Kill()
 		return owner, exit(2, "lume run %s: confirm launch gate: %v", name, err)
 	}
@@ -915,7 +917,7 @@ exec "$@"`
 	// begins. Use the shared TimeoutWindowConfirm strategy instead of a local
 	// select — semantically identical but routed through the shared interface.
 	survivalConfirm := shared.TimeoutWindowConfirm{Timeout: b.startupObserveTimeout}
-	if err := survivalConfirm.Wait(ctx, nil, exitCh); err != nil {
+	if _, err := survivalConfirm.Wait(ctx, nil, exitCh); err != nil {
 		_ = detachedStderr.Sync()
 		if _, seekErr := detachedStderr.Seek(0, io.SeekStart); seekErr == nil {
 			_, _ = io.Copy(&stderrBuf, io.LimitReader(detachedStderr, 64<<10))
@@ -983,7 +985,8 @@ func waitForLaunchHandoff(ctx context.Context, path, expected string, exitCh <-c
 		Timeout:         2 * time.Second,
 		PollInterval:    10 * time.Millisecond,
 	}
-	return confirm.Wait(ctx, nil, exitCh)
+	_, err := confirm.Wait(ctx, nil, exitCh)
+	return err
 }
 
 func lumeRunLogPath(name string) (string, error) {

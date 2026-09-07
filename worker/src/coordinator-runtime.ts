@@ -13,6 +13,15 @@ export interface CoordinatorStorageView {
 export interface CoordinatorLock {
   /** Release the lock. Safe to call more than once and on storage close. */
   release(): Promise<void>;
+  /**
+   * Subscribe to authority loss, when the backend can detect it. A
+   * session-scoped advisory lock silently frees itself when the holding
+   * session dies (network drop, database restart, idle timeout); the
+   * holder must then stop acting as the coordinator, because a replacement
+   * can legitimately acquire authority at any moment. Backends that cannot
+   * detect loss may omit this; the callback must never fire after release.
+   */
+  onLost?(callback: () => void): void;
 }
 
 export interface CoordinatorStorage extends CoordinatorStorageView {

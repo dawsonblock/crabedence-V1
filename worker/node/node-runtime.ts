@@ -67,6 +67,9 @@ export class NodeCoordinatorRuntime implements CoordinatorRuntime {
   private provisioningScanner?: ReturnType<typeof setInterval>;
   private coordinatorLock: CoordinatorLock | undefined;
   private bossStarted = false;
+  private authorityLost = false;
+  private stopped = false;
+  private readonly authorityLostCallbacks: Array<() => void> = [];
   private readonly maintenance = new Set<Promise<void>>();
 
   constructor(connectionString: string) {
@@ -97,6 +100,10 @@ export class NodeCoordinatorRuntime implements CoordinatorRuntime {
         );
       }
       this.coordinatorLock = lock;
+      // Losing the advisory-lock session means losing coordinator authority:
+      // PostgreSQL has already freed the lock, so a replacement replica can
+      // start at any moment. Fail closed immediately.
+      lock.onLost?.(() => this.handleCoordinatorAuthorityLost());
     }
     try {
       await this.scanProvisioning();
@@ -171,6 +178,45 @@ export class NodeCoordinatorRuntime implements CoordinatorRuntime {
     return this.operationRunner(callback);
   }
 
+  /**
+   * True once the coordinator advisory-lock session died. The process no
+   * longer holds coordinator authority and must stop mutating coordinator
+   * state; callers should fail closed (for example, HTTP 503).
+   */
+  lostAuthority(): boolean {
+    return this.authorityLost;
+  }
+
+  /**
+   * Register a callback invoked when coordinator authority is lost (the
+   * advisory-lock session died). The server uses this to begin an orderly
+   * shutdown; without a registered callback the runtime stops itself.
+   */
+  onAuthorityLost(callback: () => void): void {
+    this.authorityLostCallbacks.push(callback);
+  }
+
+  private handleCoordinatorAuthorityLost(): void {
+    if (this.shuttingDown || this.authorityLost) return;
+    this.authorityLost = true;
+    console.error("coordinator advisory-lock session lost; authority lost, shutting down");
+    // Stop timers and sockets first so no further coordinator work starts.
+    this.beginShutdown();
+    if (this.authorityLostCallbacks.length > 0) {
+      for (const callback of this.authorityLostCallbacks) {
+        try {
+          callback();
+        } catch (error) {
+          console.error("coordinator authority-lost callback failed", error);
+        }
+      }
+    } else {
+      void this.stop().catch((error) =>
+        console.error("coordinator shutdown after authority loss failed", error),
+      );
+    }
+  }
+
   beginShutdown(): void {
     this.shuttingDown = true;
     clearInterval(this.pingInterval);
@@ -184,6 +230,10 @@ export class NodeCoordinatorRuntime implements CoordinatorRuntime {
   }
 
   async stop(): Promise<void> {
+    // Idempotent: authority-loss shutdown and an orderly server shutdown can
+    // both race to stop the runtime; the second call must be a no-op.
+    if (this.stopped) return;
+    this.stopped = true;
     this.beginShutdown();
     await Promise.allSettled(this.socketClosures ?? []);
     await this.drainSocketOperations();
