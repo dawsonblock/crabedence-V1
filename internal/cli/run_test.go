@@ -4286,12 +4286,20 @@ func TestRunCommandDelegatedTerminalOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	receipt, err := decodeRunReceipt(data)
+	// V3 delegated receipts must be decoded with decodeTerminalRunReceipt,
+	// not decodeRunReceipt (which is V1-only and rejects V3 fields).
+	receipt, err := decodeTerminalRunReceipt(data)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if exitCode, ok := receipt["exit_code"].(json.Number); !ok || exitCode.String() != "0" {
-		t.Fatalf("delegated receipt exit=%v", receipt["exit_code"])
+	if receipt.ExitCode != 0 {
+		t.Fatalf("delegated receipt exit=%d, want 0", receipt.ExitCode)
+	}
+	if receipt.SchemaVersion != terminalReceiptSchemaVersion {
+		t.Fatalf("delegated receipt schema_version=%d, want %d", receipt.SchemaVersion, terminalReceiptSchemaVersion)
+	}
+	if receipt.EvidenceSHA256 == "" {
+		t.Fatal("delegated V3 receipt must have evidence_sha256 binding")
 	}
 	var timing TimingReport
 	for _, line := range strings.Split(stderr.String(), "\n") {

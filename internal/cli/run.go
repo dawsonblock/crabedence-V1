@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"crypto/ed25519"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -1090,6 +1091,7 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 		}
 		delegatedReceiptEligible := runErr == nil || FinalizeRunResult(result, runErr).ErrorKind == RunErrorCommandExit
 		var preparedDelegatedReceipt *preparedRunReceipt
+		var preparedDelegatedEvidence *RunEvidenceV1
 		preparedDelegatedExitCode := -1
 		delegatedPreparationAttempted := false
 		prepareTerminalRun = func() {
@@ -1110,25 +1112,51 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 			delegatedPreparationAttempted = true
 			preparedDelegatedExitCode = finalResult.ExitCode
 			preparedDelegatedReceipt = nil
-			prepared, receiptErr := prepareDelegatedRunReceipt(attestPath, delegatedReceiptKey, cfg, finalResult, runReq)
+			preparedDelegatedEvidence = nil
+			prepared, receipt, evidence, receiptErr := prepareDelegatedTerminalReceipt(attestPath, delegatedReceiptKey, cfg, finalResult, runReq, finalTimingReport)
 			if receiptErr != nil {
 				err = errors.Join(err, receiptErr)
 				runFailure = errors.Join(runFailure, receiptErr)
 				return
 			}
 			preparedDelegatedReceipt = &prepared
+			preparedDelegatedEvidence = &evidence
+			// Self-verify the receipt signature and evidence binding before
+			// persistence. This catches signing bugs and binding errors.
+			if verifyErr := verifyTerminalRunReceiptSignature(receipt); verifyErr != nil {
+				err = errors.Join(err, fmt.Errorf("self-verify delegated terminal receipt: %w", verifyErr))
+				runFailure = errors.Join(runFailure, fmt.Errorf("self-verify delegated terminal receipt: %w", verifyErr))
+				preparedDelegatedReceipt = nil
+				return
+			}
+			if receipt.EvidenceSHA256 != evidence.Digest {
+				err = errors.Join(err, fmt.Errorf("self-verify delegated evidence binding: receipt evidence_sha256 %s != evidence digest %s", receipt.EvidenceSHA256, evidence.Digest))
+				runFailure = errors.Join(runFailure, fmt.Errorf("self-verify delegated evidence binding: receipt evidence_sha256 %s != evidence digest %s", receipt.EvidenceSHA256, evidence.Digest))
+				preparedDelegatedReceipt = nil
+				return
+			}
 		}
 		finalizeTerminalRun = func() {
 			if preparedDelegatedReceipt == nil {
 				return
 			}
+			// Local receipt file write: auxiliary error. A write failure cannot
+			// retroactively change the execution outcome.
 			receipt, receiptErr := persistPreparedRunReceipt(*preparedDelegatedReceipt)
 			if receiptErr != nil {
-				err = errors.Join(err, receiptErr)
-				runFailure = errors.Join(runFailure, receiptErr)
+				auxErr := &AuxiliaryError{Op: "write receipt file", Err: receiptErr}
+				err = errors.Join(err, auxErr)
+				runFailure = errors.Join(runFailure, auxErr)
+				fmt.Fprintf(a.Stderr, "warning: receipt file write failed (execution outcome unchanged): %v\n", receiptErr)
 				return
 			}
 			fmt.Fprintf(a.Stderr, "artifact kind=receipt path=%s bytes=%d\n", receipt.Path, receipt.Bytes)
+			// Emit evidence to stderr if --timing-json is set.
+			if preparedDelegatedEvidence != nil && *timingJSON {
+				if writeErr := WriteEvidenceJSON(a.Stderr, *preparedDelegatedEvidence); writeErr != nil {
+					fmt.Fprintf(a.Stderr, "warning: evidence JSON output failed: %v\n", writeErr)
+				}
+			}
 		}
 		if runErr == nil || result.Command > 0 || result.Total > 0 {
 			a.syncExternalRunnersBestEffort(ctx, cfg, backend)
@@ -3170,7 +3198,7 @@ func writeDelegatedRunReceipt(path, keyPath string, cfg Config, result RunResult
 	if err != nil {
 		return runArtifact{}, exit(2, "attest key: %v", err)
 	}
-	prepared, err := prepareDelegatedRunReceipt(path, key, cfg, result, req)
+	prepared, _, _, err := prepareDelegatedTerminalReceipt(path, key, cfg, result, req, nil)
 	if err != nil {
 		return runArtifact{}, err
 	}
@@ -3200,6 +3228,160 @@ func prepareDelegatedRunReceipt(path string, key ed25519.PrivateKey, cfg Config,
 	}
 	receipt.Provider = firstNonBlank(receipt.Provider, cfg.Provider)
 	return prepareRunReceipt(path, key, receipt)
+}
+
+// prepareDelegatedTerminalReceipt builds a V3 terminal receipt with evidence
+// binding for a delegated run. This replaces the legacy V1
+// prepareDelegatedRunReceipt path, ensuring delegated providers participate in
+// the same authenticated evidence/receipt relationship as managed SSH.
+//
+// The function:
+//  1. Builds RunEvidenceV1 from the delegated RunResult and timing report.
+//  2. Builds a TerminalRunReceiptV3 with evidence_sha256 binding.
+//  3. Self-verifies the signature and evidence binding.
+//  4. Returns the prepared receipt file for local persistence.
+//
+// The timing report provides the timing fields. If report is nil, the result's
+// own durations are used.
+func prepareDelegatedTerminalReceipt(path string, key ed25519.PrivateKey, cfg Config, result RunResult, req RunRequest, report *TimingReport) (preparedRunReceipt, terminalRunReceipt, RunEvidenceV1, error) {
+	if key == nil {
+		return preparedRunReceipt{}, terminalRunReceipt{}, RunEvidenceV1{}, fmt.Errorf("delegated terminal receipt requires a signing key")
+	}
+
+	command := strings.TrimSpace(result.CommandText)
+	if command == "" {
+		command = runCommandDisplay(req.Command, req.ShellMode)
+	}
+	if command == "" {
+		command = strings.Join(req.Command, " ")
+	}
+	if command == "" {
+		command = "(delegated)"
+	}
+	provider := result.Provider
+	leaseID := result.LeaseID
+	slug := result.Slug
+	if session := result.Session; session != nil {
+		provider = firstNonBlank(provider, session.Provider)
+		leaseID = firstNonBlank(leaseID, session.LeaseID)
+		slug = firstNonBlank(slug, session.Slug)
+	}
+	// Config provider is the last resort fallback.
+	provider = firstNonBlank(provider, cfg.Provider)
+	runID := delegatedRunID(req, result)
+	if runID == "" {
+		// V3 receipts require a non-empty run_id. If no run ID was provided
+		// in the request or session, generate a deterministic one from the
+		// command and provider identity.
+		digest := sha256Digest([]byte(command + ":" + provider + ":" + leaseID))
+		runID = "run_delegated_" + strings.TrimPrefix(digest, "sha256:")[:16]
+	}
+
+	// Build evidence from the delegated result.
+	var totalMs, commandMs, syncMs, runnerTotalMs, endToEndMs int64
+	if report != nil {
+		totalMs = report.TotalMs
+		commandMs = report.CommandMs
+		syncMs = report.SyncMs
+		runnerTotalMs = report.RunnerTotalMs
+		endToEndMs = report.EndToEndMs
+	} else {
+		totalMs = result.Total.Milliseconds()
+		commandMs = result.Command.Milliseconds()
+	}
+	evidenceInput := RunEvidenceInput{
+		Provider:      provider,
+		LeaseID:       leaseID,
+		Slug:          slug,
+		RunID:         runID,
+		CommandText:   command,
+		ExitCode:      result.ExitCode,
+		RunStatus:     result.Status,
+		ErrorKind:     result.ErrorKind,
+		TotalMs:       totalMs,
+		CommandMs:     commandMs,
+		SyncMs:        syncMs,
+		RunnerTotalMs: runnerTotalMs,
+		EndToEndMs:    endToEndMs,
+		Artifacts:     artifactsFromRunArtifacts(result.Artifacts),
+	}
+	if report != nil {
+		evidenceInput.RunnerPhases = report.RunnerPhases
+		evidenceInput.SyncPhases = report.SyncPhases
+		evidenceInput.CommandPhases = report.CommandPhases
+		evidenceInput.SyncDelegated = report.SyncDelegated
+		evidenceInput.SyncSkipped = report.SyncSkipped
+		evidenceInput.SyncMode = report.SyncMode
+		evidenceInput.SyncTransferFiles = report.SyncTransferFiles
+		evidenceInput.SyncTransferBytes = report.SyncTransferBytes
+		evidenceInput.SyncFallbackReason = report.SyncFallbackReason
+		evidenceInput.BlockedStage = report.BlockedStage
+		evidenceInput.RetryLikely = report.RetryLikely
+		if report.StartedAt.IsZero() {
+			evidenceInput.StartedAt = time.Now()
+		} else {
+			evidenceInput.StartedAt = report.StartedAt
+		}
+		if report.EndedAt.IsZero() {
+			evidenceInput.EndedAt = time.Now()
+		} else {
+			evidenceInput.EndedAt = report.EndedAt
+		}
+	} else {
+		evidenceInput.StartedAt = time.Now()
+		evidenceInput.EndedAt = time.Now()
+	}
+	evidence := NewRunEvidence(evidenceInput)
+
+	// Build the V3 receipt with evidence binding.
+	// Delegated runs don't have a terminal log, so we use the empty-string
+	// SHA-256 digest for log_sha256 and retained_log_sha256.
+	startedAt := evidenceInput.StartedAt
+	endedAt := evidenceInput.EndedAt
+	emptyLogDigest := sha256Digest([]byte(""))
+	receipt, err := buildTerminalRunReceiptWithKey(key, terminalRunReceiptInput{
+		Provider:          provider,
+		LeaseID:           leaseID,
+		Slug:              slug,
+		RunID:             runID,
+		Command:           req.Command,
+		CommandDisplay:    command,
+		ExitCode:          result.ExitCode,
+		SyncMs:            syncMs,
+		CommandMs:         commandMs,
+		StartedAt:         startedAt,
+		EndedAt:           endedAt,
+		LogSHA256:         emptyLogDigest,
+		RetainedLogSHA256: emptyLogDigest,
+		EvidenceSHA256:    evidence.Digest,
+	})
+	if err != nil {
+		return preparedRunReceipt{}, terminalRunReceipt{}, RunEvidenceV1{}, fmt.Errorf("build delegated terminal receipt: %w", err)
+	}
+
+	// Self-verify: confirm the signature is valid and the evidence binding
+	// is correct before persisting.
+	if verifyErr := verifyTerminalRunReceiptSignature(receipt); verifyErr != nil {
+		return preparedRunReceipt{}, terminalRunReceipt{}, RunEvidenceV1{}, fmt.Errorf("self-verify delegated terminal receipt signature: %w", verifyErr)
+	}
+	if receipt.EvidenceSHA256 != evidence.Digest {
+		return preparedRunReceipt{}, terminalRunReceipt{}, RunEvidenceV1{}, fmt.Errorf("self-verify delegated evidence binding: receipt evidence_sha256 %s != evidence digest %s", receipt.EvidenceSHA256, evidence.Digest)
+	}
+
+	// Prepare the receipt file for persistence.
+	encoded, err := json.MarshalIndent(receipt, "", "  ")
+	if err != nil {
+		return preparedRunReceipt{}, terminalRunReceipt{}, RunEvidenceV1{}, fmt.Errorf("encode delegated terminal receipt: %w", err)
+	}
+	encoded = append(encoded, '\n')
+	if len(encoded) > maxTerminalReceiptBytes {
+		return preparedRunReceipt{}, terminalRunReceipt{}, RunEvidenceV1{}, fmt.Errorf("delegated terminal receipt exceeds %d bytes", maxTerminalReceiptBytes)
+	}
+	prepared := preparedRunReceipt{
+		artifact: runArtifact{Kind: "receipt", Path: path, Bytes: len(encoded)},
+		encoded:  encoded,
+	}
+	return prepared, receipt, evidence, nil
 }
 
 func delegatedRunID(req RunRequest, result RunResult) string {
