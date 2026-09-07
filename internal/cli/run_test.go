@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
@@ -3455,6 +3456,119 @@ func TestRunCommandWritesTerminalReceiptOnSuccess(t *testing.T) {
 			}
 			if receipt.RetainedLogSHA256 != sha256Digest([]byte(retained)) || receipt.LogTruncated != lossy {
 				t.Fatal("receipt does not bind retained representation")
+			}
+		})
+	}
+}
+
+// TestRunCommandBindsEvidenceDigestIntoSignedReceipt proves the normal
+// success path rebuilds the terminal receipt after evidence is frozen, so
+// the signed v3 receipt carries the evidence digest. Regression test for
+// the memoization bug where prepareTerminalRun keyed only on the exit
+// code: the evidence digest changed ("" → digest) but the exit code did
+// not, so the second preparation was skipped and the signed receipt was
+// left without the evidence binding. Also proves evidence is collected
+// even without --timing-json, since the receipt still binds a digest.
+func TestRunCommandBindsEvidenceDigestIntoSignedReceipt(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		timingJSON bool
+	}{
+		{name: "with-timing-json", timingJSON: true},
+		{name: "without-timing-json", timingJSON: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			isolateRunTestUserDirs(t, dir)
+			sshPath := filepath.Join(dir, "ssh")
+			receiptPath := filepath.Join(dir, "receipt.json")
+			keyPath := filepath.Join(dir, "signer.pem")
+			_, key, err := ed25519.GenerateKey(rand.Reader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeRunTestAttestKey(t, keyPath, key)
+
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			go func() {
+				for {
+					conn, err := listener.Accept()
+					if err != nil {
+						return
+					}
+					_ = conn.Close()
+				}
+			}()
+			_, sshPort, err := net.SplitHostPort(listener.Addr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			installWorkspaceOwnerAwareSSH(t, sshPath, "#!/bin/sh\nexit 0\n")
+			t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			t.Setenv("CRABBOX_FAKE_SSH_PORT", sshPort)
+			t.Setenv("CRABBOX_CONFIG", filepath.Join(dir, ".crabbox.yaml"))
+
+			var stdout, stderr bytes.Buffer
+			args := []string{
+				"--provider", "run-env-profile-test",
+				"--no-sync",
+				"--attest", receiptPath,
+				"--attest-key", keyPath,
+			}
+			if tc.timingJSON {
+				args = append(args, "--timing-json")
+			}
+			args = append(args, "--", "true")
+			if err := (App{Stdout: &stdout, Stderr: &stderr}).runCommand(context.Background(), args); err != nil {
+				t.Fatalf("runCommand error=%v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+			}
+
+			data, err := os.ReadFile(receiptPath)
+			if err != nil {
+				t.Fatalf("read terminal receipt: %v", err)
+			}
+			receipt, err := decodeTerminalRunReceipt(data)
+			if err != nil {
+				t.Fatalf("decode terminal receipt: %v", err)
+			}
+			if receipt.SchemaVersion != terminalReceiptSchemaVersion {
+				t.Fatalf("receipt schema_version=%d, want %d", receipt.SchemaVersion, terminalReceiptSchemaVersion)
+			}
+			if receipt.EvidenceSHA256 == "" {
+				t.Fatal("signed receipt does not bind the evidence digest (memoization skipped the rebuild, or evidence was not collected)")
+			}
+			if !validHexDigest(receipt.EvidenceSHA256, sha256.Size) {
+				t.Fatalf("receipt evidence_sha256=%q is not a raw hex digest", receipt.EvidenceSHA256)
+			}
+
+			if !tc.timingJSON {
+				// Without --timing-json no evidence JSON is printed, but the
+				// receipt must still bind the internally collected evidence.
+				return
+			}
+			// With --timing-json the evidence JSON is emitted to stderr; its
+			// digest must exactly match the receipt binding.
+			var evidence RunEvidenceV1
+			found := false
+			for _, line := range strings.Split(stderr.String(), "\n") {
+				var candidate RunEvidenceV1
+				if json.Unmarshal([]byte(line), &candidate) == nil && candidate.EvidenceType == "run" && candidate.Digest != "" {
+					evidence = candidate
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("no evidence JSON in stderr:\n%s", stderr.String())
+			}
+			if !VerifyRunEvidenceDigest(evidence) {
+				t.Fatalf("emitted evidence digest %q is stale", evidence.Digest)
+			}
+			if receipt.EvidenceSHA256 != evidence.Digest {
+				t.Fatalf("receipt evidence_sha256=%q does not match evidence digest=%q", receipt.EvidenceSHA256, evidence.Digest)
 			}
 		})
 	}

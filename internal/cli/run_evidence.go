@@ -223,9 +223,29 @@ func runEvidenceDigest(ev RunEvidenceV1) string {
 // stableJSONValue implementation. This is NOT RFC 8785, but it is a
 // well-defined, portable, locale-independent canonicalization that both
 // implementations share. The digest field is set to "" before serialization.
+//
+// String contents are serialized without HTML escaping: Go's default
+// json.Marshal escapes '<', '>', and '&' as \u003c, \u003e, and \u0026,
+// while JavaScript's JSON.stringify emits them raw. Since the digest is
+// computed over these exact bytes on both sides, the encoders must agree.
 func canonicalEvidenceJSON(ev RunEvidenceV1) ([]byte, error) {
-	m := evidenceToOrderedMap(ev)
-	return json.Marshal(m)
+	return marshalNoEscape(evidenceToOrderedMap(ev))
+}
+
+// marshalNoEscape serializes v as JSON with HTML escaping disabled,
+// byte-for-byte matching JavaScript's JSON.stringify for the value shapes
+// evidence uses (valid UTF-8 strings, booleans, integers within the
+// IEEE-754 safe range, arrays, and objects). With SetEscapeHTML(false),
+// Go also stops escaping U+2028/U+2029, matching JSON.stringify.
+func marshalNoEscape(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	// Encode appends a trailing newline; trim it.
+	return bytes.TrimSuffix(buf.Bytes(), []byte{'\n'}), nil
 }
 
 // orderedMap is a map that preserves insertion order for JSON serialization.
@@ -252,13 +272,13 @@ func (m *orderedMap) MarshalJSON() ([]byte, error) {
 		if i > 0 {
 			buf.WriteByte(',')
 		}
-		keyBytes, err := json.Marshal(key)
+		keyBytes, err := marshalNoEscape(key)
 		if err != nil {
 			return nil, err
 		}
 		buf.Write(keyBytes)
 		buf.WriteByte(':')
-		valBytes, err := json.Marshal(m.values[key])
+		valBytes, err := marshalNoEscape(m.values[key])
 		if err != nil {
 			return nil, err
 		}
@@ -340,13 +360,13 @@ func evidenceToOrderedMap(ev RunEvidenceV1) *orderedMap {
 		raw["sync_fallback_reason"] = ev.SyncFallbackReason
 	}
 	if len(ev.RunnerPhases) > 0 {
-		raw["runner_phases"] = ev.RunnerPhases
+		raw["runner_phases"] = runnerPhasesCanonical(ev.RunnerPhases)
 	}
 	if len(ev.SyncPhases) > 0 {
-		raw["sync_phases"] = ev.SyncPhases
+		raw["sync_phases"] = timingPhasesCanonical(ev.SyncPhases)
 	}
 	if len(ev.CommandPhases) > 0 {
-		raw["command_phases"] = ev.CommandPhases
+		raw["command_phases"] = timingPhasesCanonical(ev.CommandPhases)
 	}
 	if ev.BlockedStage != "" {
 		raw["blocked_stage"] = ev.BlockedStage
@@ -361,7 +381,7 @@ func evidenceToOrderedMap(ev RunEvidenceV1) *orderedMap {
 		raw["failure_hint"] = ev.FailureHint
 	}
 	if len(ev.Artifacts) > 0 {
-		raw["artifacts"] = ev.Artifacts
+		raw["artifacts"] = runEvidenceArtifactsCanonical(ev.Artifacts)
 	}
 	if ev.StartedAt != "" {
 		raw["started_at"] = ev.StartedAt
@@ -371,18 +391,109 @@ func evidenceToOrderedMap(ev RunEvidenceV1) *orderedMap {
 	}
 	raw["digest"] = ev.Digest
 
-	// Sort keys by Unicode code point order.
-	keys := make([]string, 0, len(raw))
-	for k := range raw {
+	return sortedOrderedMap(raw)
+}
+
+// sortedOrderedMap builds an orderedMap from entries with keys sorted by
+// Unicode code point order, matching the TypeScript stableJSONValue
+// canonicalization. Nested objects (phases, artifacts) must use this too:
+// the TypeScript side sorts keys recursively at every level, while Go's
+// default struct marshaling preserves field-declaration order, which
+// differs from sorted order (e.g. "ms" sorts before "name").
+func sortedOrderedMap(entries map[string]any) *orderedMap {
+	keys := make([]string, 0, len(entries))
+	for k := range entries {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-
 	m := newOrderedMap()
 	for _, k := range keys {
-		m.set(k, raw[k])
+		m.set(k, entries[k])
 	}
 	return m
+}
+
+// runnerPhasesCanonical converts runner phases to sorted-key ordered maps,
+// preserving each field's omitempty wire semantics.
+func runnerPhasesCanonical(phases []RunnerPhase) []any {
+	out := make([]any, len(phases))
+	for i, p := range phases {
+		entries := map[string]any{
+			"name": p.Name,
+			"ms":   p.Ms,
+		}
+		if p.Opaque {
+			entries["opaque"] = p.Opaque
+		}
+		if p.Reason != "" {
+			entries["reason"] = p.Reason
+		}
+		if p.Provider != "" {
+			entries["provider"] = p.Provider
+		}
+		if p.LeaseID != "" {
+			entries["leaseId"] = p.LeaseID
+		}
+		if p.Slug != "" {
+			entries["slug"] = p.Slug
+		}
+		if p.RunID != "" {
+			entries["runId"] = p.RunID
+		}
+		if p.MachineType != "" {
+			entries["machineType"] = p.MachineType
+		}
+		if p.TransferCount != 0 {
+			entries["transferCount"] = p.TransferCount
+		}
+		if p.TransferBytes != 0 {
+			entries["transferBytes"] = p.TransferBytes
+		}
+		out[i] = sortedOrderedMap(entries)
+	}
+	return out
+}
+
+// timingPhasesCanonical converts timing phases to sorted-key ordered maps,
+// preserving each field's omitempty wire semantics.
+func timingPhasesCanonical(phases []TimingPhase) []any {
+	out := make([]any, len(phases))
+	for i, p := range phases {
+		entries := map[string]any{
+			"name": p.Name,
+		}
+		if p.Ms != 0 {
+			entries["ms"] = p.Ms
+		}
+		if p.Skipped {
+			entries["skipped"] = p.Skipped
+		}
+		if p.Reason != "" {
+			entries["reason"] = p.Reason
+		}
+		out[i] = sortedOrderedMap(entries)
+	}
+	return out
+}
+
+// runEvidenceArtifactsCanonical converts artifacts to sorted-key ordered
+// maps, preserving each field's omitempty wire semantics.
+func runEvidenceArtifactsCanonical(artifacts []RunEvidenceArtifact) []any {
+	out := make([]any, len(artifacts))
+	for i, a := range artifacts {
+		entries := map[string]any{
+			"kind": a.Kind,
+			"path": a.Path,
+		}
+		if a.Bytes != 0 {
+			entries["bytes"] = a.Bytes
+		}
+		if a.SHA256 != "" {
+			entries["sha256"] = a.SHA256
+		}
+		out[i] = sortedOrderedMap(entries)
+	}
+	return out
 }
 
 // VerifyRunEvidenceDigest returns true if the evidence's digest matches a

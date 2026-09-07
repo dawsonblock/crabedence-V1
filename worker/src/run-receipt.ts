@@ -4,6 +4,7 @@ const terminalReceiptMaxBytes = 16 * 1024;
 const terminalReceiptFieldMaxBytes = 4 * 1024;
 const terminalReceiptIdentityMaxBytes = 256;
 const terminalReceiptClockSkewMs = 30_000;
+const runEvidenceMaxBytes = 64 * 1024;
 const terminalReceiptFields = [
   "schema_version",
   "receipt_type",
@@ -160,6 +161,9 @@ export async function validateRunEvidence(
   if (evidence === undefined || evidence === null) return undefined;
   if (typeof evidence !== "object" || Array.isArray(evidence)) {
     return new Error("evidence must be an object");
+  }
+  if (encoder.encode(JSON.stringify(evidence)).byteLength > runEvidenceMaxBytes) {
+    return new Error("evidence is too large");
   }
   const ev = evidence as Record<string, unknown>;
   if (ev["schema_version"] !== 1) {
