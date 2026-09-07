@@ -138,7 +138,12 @@ describe("NodeCoordinatorRuntime", () => {
         onLost?: (callback: () => void) => void;
       }>;
     };
-    storage.acquireCoordinatorLock = vi.fn(async () => ({
+    storage.acquireCoordinatorLock = vi.fn<
+      () => Promise<{
+        release(): Promise<void>;
+        onLost?: (callback: () => void) => void;
+      }>
+    >(async () => ({
       release,
       onLost: (callback: () => void) => {
         onLostCallback = callback;
@@ -178,7 +183,12 @@ describe("NodeCoordinatorRuntime", () => {
         onLost?: (callback: () => void) => void;
       }>;
     };
-    storage.acquireCoordinatorLock = vi.fn(async () => ({
+    storage.acquireCoordinatorLock = vi.fn<
+      () => Promise<{
+        release(): Promise<void>;
+        onLost?: (callback: () => void) => void;
+      }>
+    >(async () => ({
       release,
       onLost: (callback: () => void) => {
         onLostCallback = callback;

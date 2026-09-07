@@ -6,9 +6,8 @@ import { describe, expect, it } from "vitest";
 
 import { validateRunEvidence } from "../src/run-receipt.ts";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
 const fixturesPath = join(
-  __dirname,
+  dirname(fileURLToPath(import.meta.url)),
   "../../internal/cli/testdata/run-evidence-conformance/fixtures.json",
 );
 
@@ -37,15 +36,12 @@ const binding = {
 };
 
 describe("run-evidence conformance corpus", () => {
-  if (file.fixtures.length === 0) {
-    it("should have fixtures", () => {
-      expect.fail("no conformance fixtures found");
-    });
-    return;
-  }
+  it("should have fixtures", () => {
+    expect(file.fixtures.length).toBeGreaterThan(0);
+  });
 
   for (const fx of file.fixtures) {
-    it(fx.name, async () => {
+    it(`fixture: ${fx.name}`, async () => {
       // Adjust binding to match the evidence's exit_code and provider so
       // binding checks don't interfere with structural validation tests.
       const ev = fx.evidence as Record<string, unknown>;
