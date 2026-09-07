@@ -9,13 +9,14 @@ import (
 // frozen run-status invariant (Phase 4 of the evidence hardening plan).
 //
 // Rules:
-//   exit_code == 0 + run_status=succeeded       → valid (error_kind optional)
-//   exit_code != 0 + run_status=failed          → valid (error_kind optional)
-//   any exit_code + run_status=timed-out        → valid only if error_kind set
-//   any exit_code + run_status=canceled         → valid only if error_kind set
-//   any other run_status                        → invalid
-//   succeeded + exit_code != 0                  → invalid
-//   failed + exit_code == 0                     → invalid
+//
+//	exit_code == 0 + run_status=succeeded       → valid (error_kind optional)
+//	exit_code != 0 + run_status=failed          → valid (error_kind optional)
+//	any exit_code + run_status=timed-out        → valid only if error_kind set
+//	any exit_code + run_status=canceled         → valid only if error_kind set
+//	any other run_status                        → invalid
+//	succeeded + exit_code != 0                  → invalid
+//	failed + exit_code == 0                     → invalid
 func TestRunStatusInvariantMatrix(t *testing.T) {
 	cases := []struct {
 		name      string
