@@ -282,19 +282,23 @@ func TestRunDelegatedCachesReceiptSignerAcrossTimingFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	receipt, err := decodeRunReceipt(data)
+	receipt, err := decodeTerminalRunReceipt(data)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if exitCode, ok := receipt["exit_code"].(json.Number); !ok || exitCode.String() != "2" {
-		t.Fatalf("receipt exit=%v, want timing-record exit 2", receipt["exit_code"])
+	// Stage 4 immutability: the receipt binds the execution outcome (exit
+	// code 0 from `true`), not the auxiliary timing-record write failure.
+	// The CLI exit code is 2 (auxiliary error), but the signed execution
+	// record remains immutable at exit code 0.
+	if receipt.ExitCode != 0 {
+		t.Fatalf("receipt exit=%d, want immutable execution outcome 0 (timing-record failure is auxiliary)", receipt.ExitCode)
 	}
 	originalPublicKey := originalKey.Public().(ed25519.PublicKey)
 	replacementPublicKey := replacementKey.Public().(ed25519.PublicKey)
-	if got := receipt["public_key"]; got != base64.StdEncoding.EncodeToString(originalPublicKey) {
-		t.Fatalf("receipt public key=%v, want cached original signer", got)
+	if receipt.PublicKey != base64.StdEncoding.EncodeToString(originalPublicKey) {
+		t.Fatalf("receipt public key=%q, want cached original signer", receipt.PublicKey)
 	}
-	if receipt["public_key"] == base64.StdEncoding.EncodeToString(replacementPublicKey) {
+	if receipt.PublicKey == base64.StdEncoding.EncodeToString(replacementPublicKey) {
 		t.Fatal("receipt used replacement signer")
 	}
 	var emitted TimingReport
@@ -304,8 +308,8 @@ func TestRunDelegatedCachesReceiptSignerAcrossTimingFailure(t *testing.T) {
 			emitted = candidate
 		}
 	}
-	if emitted.ExitCode != 2 {
-		t.Fatalf("timing exit=%d, want 2", emitted.ExitCode)
+	if emitted.ExitCode != 0 {
+		t.Fatalf("timing exit=%d, want immutable execution outcome 0 (timing-record failure is auxiliary)", emitted.ExitCode)
 	}
 	assertNoReceiptArtifact(t, emitted.Artifacts)
 	confirmation := fmt.Sprintf("artifact kind=receipt path=%s bytes=%d", receiptPath, len(data))

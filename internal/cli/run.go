@@ -478,11 +478,23 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 	var runFailure error
 	returnedRunError := &err
 	recorder := &runRecorder{}
-	var prepareTerminalRun func()
-	var finalizeTerminalRun func()
 	var finalTimingReport *timingReport
 	var runEvidence *RunEvidenceV1
-	var runEvidenceDigest string
+	// Stage 4: FinalRunOutcome → BuildTerminalBundle replaces the old
+	// prepareTerminalRun/finalizeTerminalRun closure pattern. Each path
+	// (managed SSH and delegated) sets buildFinalOutcome to capture its
+	// path-specific state. The defer calls it once after the timing report
+	// is frozen, then BuildTerminalBundle produces an immutable bundle.
+	// No re-prepare: post-outcome errors are auxiliary and cannot mutate
+	// the signed execution record.
+	var buildFinalOutcome func(report timingReport) FinalRunOutcome
+	var terminalBundleKey ed25519.PrivateKey
+	var terminalBundleAttestPath string
+	var terminalBundleCommitTarget *SSHTarget
+	// coordinatorCommitFallback is called by the defer when no terminal
+	// bundle was built (e.g. --sync-only). It commits a bare coordinator
+	// record without cryptographic receipt/evidence binding.
+	var coordinatorCommitFallback func()
 	var artifactChangeResults []ArtifactChangeResult
 	var timingRecordRepo Repo
 	var timingRecordCommand []string
@@ -520,11 +532,32 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 		if finalizeFailureDigest != nil {
 			finalizeFailureDigest()
 		}
-		if prepareTerminalRun != nil {
-			prepareTerminalRun()
-		}
 		frozenAt := time.Now()
 		report, hasReport := snapshotFinalTimingReport(frozenAt)
+		// Build the terminal bundle BEFORE any auxiliary operations
+		// (timing record write, timing JSON write). This ensures the
+		// bundle captures the execution outcome immutably — auxiliary
+		// failures cannot mutate the signed execution record. The bundle
+		// is self-verified by BuildTerminalBundle before being returned.
+		var bundle *TerminalBundleV1
+		if hasReport && buildFinalOutcome != nil && terminalBundleKey != nil {
+			outcome := buildFinalOutcome(report)
+			b, buildErr := BuildTerminalBundle(outcome, terminalBundleKey)
+			if buildErr != nil {
+				err = errors.Join(err, buildErr)
+				runFailure = errors.Join(runFailure, buildErr)
+			} else {
+				bundle = &b
+				runEvidence = &b.Evidence
+			}
+		} else if hasReport {
+			// No signing key: build evidence only (for --timing-json output).
+			ev := RunEvidenceFromTimingReport(report)
+			runEvidence = &ev
+		}
+		// Auxiliary operations: timing record write and timing JSON write.
+		// Failures here are auxiliary errors — they affect the CLI exit
+		// code but cannot retroactively change the signed execution record.
 		if hasReport && timingRecordEnabled {
 			recordColdRun := timingRecordColdRun
 			if benchmarkCtx.ColdRun != nil {
@@ -537,10 +570,6 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 				}
 				err = errors.Join(err, writeErr)
 				runFailure = errors.Join(runFailure, writeErr)
-				if prepareTerminalRun != nil {
-					prepareTerminalRun()
-				}
-				report, _ = snapshotFinalTimingReport(frozenAt)
 			} else {
 				if benchmarkCtx.OnRecord != nil {
 					benchmarkCtx.OnRecord()
@@ -553,22 +582,6 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 				timingErr := exit(7, "write timing JSON: %v", writeErr)
 				err = errors.Join(err, timingErr)
 				runFailure = errors.Join(runFailure, timingErr)
-				if prepareTerminalRun != nil {
-					prepareTerminalRun()
-				}
-			}
-		}
-		// After all operations that can change the final outcome, freeze
-		// evidence from the final timing report. This ensures evidence and
-		// terminal receipt agree on the final exit code and status.
-		if hasReport {
-			ev := RunEvidenceFromTimingReport(report)
-			runEvidence = &ev
-			runEvidenceDigest = ev.Digest
-			// Re-prepare the terminal receipt with the evidence digest so
-			// the signed receipt cryptographically binds the evidence.
-			if prepareTerminalRun != nil {
-				prepareTerminalRun()
 			}
 		}
 		if hasReport && runEvidence != nil && *timingJSON {
@@ -578,8 +591,45 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 				runFailure = errors.Join(runFailure, timingErr)
 			}
 		}
-		if finalizeTerminalRun != nil {
-			finalizeTerminalRun()
+		// Persist the terminal bundle. All persistence failures are
+		// auxiliary errors — they cannot retroactively change the execution
+		// outcome. The signed receipt and evidence were already built
+		// immutably by BuildTerminalBundle.
+		if bundle != nil {
+			if terminalBundleAttestPath != "" {
+				prepared, prepareErr := prepareTerminalRunReceipt(terminalBundleAttestPath, bundle.Receipt)
+				if prepareErr != nil {
+					auxErr := &AuxiliaryError{Op: "prepare receipt file", Err: prepareErr}
+					err = errors.Join(err, auxErr)
+					runFailure = errors.Join(runFailure, auxErr)
+					fmt.Fprintf(a.Stderr, "warning: receipt file prepare failed (execution outcome unchanged): %v\n", prepareErr)
+				} else {
+					artifact, writeErr := persistPreparedRunReceipt(prepared)
+					if writeErr != nil {
+						auxErr := &AuxiliaryError{Op: "write receipt file", Err: writeErr}
+						err = errors.Join(err, auxErr)
+						runFailure = errors.Join(runFailure, auxErr)
+						fmt.Fprintf(a.Stderr, "warning: receipt file write failed (execution outcome unchanged): %v\n", writeErr)
+					} else {
+						fmt.Fprintf(a.Stderr, "artifact kind=receipt path=%s bytes=%d\n", artifact.Path, artifact.Bytes)
+					}
+				}
+			}
+			if terminalBundleCommitTarget != nil {
+				if finishErr := CommitTerminalBundle(ctx, recorder, *terminalBundleCommitTarget, *bundle); finishErr != nil {
+					auxErr := &AuxiliaryError{Op: "coordinator commit", Err: finishErr}
+					err = errors.Join(err, auxErr)
+					runFailure = errors.Join(runFailure, auxErr)
+					fmt.Fprintf(a.Stderr, "warning: coordinator commit failed (execution outcome unchanged): %v\n", finishErr)
+				} else if a.runOutcome != nil {
+					a.runOutcome.ExitCode = bundle.Receipt.ExitCode
+				}
+			}
+		}
+		// If no terminal bundle was built but a fallback coordinator
+		// commit is registered (e.g. --sync-only), call it now.
+		if bundle == nil && coordinatorCommitFallback != nil {
+			coordinatorCommitFallback()
 		}
 		recorder.Failed(runFailure)
 	}()
@@ -1090,71 +1140,71 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 			finalTimingReport = &report
 		}
 		delegatedReceiptEligible := runErr == nil || FinalizeRunResult(result, runErr).ErrorKind == RunErrorCommandExit
-		var preparedDelegatedReceipt *preparedRunReceipt
-		var preparedDelegatedEvidence *RunEvidenceV1
-		preparedDelegatedExitCode := -1
-		delegatedPreparationAttempted := false
-		prepareTerminalRun = func() {
-			if attestPath == "" || !delegatedReceiptEligible {
-				return
-			}
-			finalResult := result
-			finalFailure := runFailure
-			if finalFailure == nil {
-				finalFailure = err
-			}
-			if finalResult.ExitCode == 0 && finalFailure != nil {
-				finalResult.ExitCode = exitCodeForError(finalFailure, 7)
-			}
-			if delegatedPreparationAttempted && preparedDelegatedExitCode == finalResult.ExitCode {
-				return
-			}
-			delegatedPreparationAttempted = true
-			preparedDelegatedExitCode = finalResult.ExitCode
-			preparedDelegatedReceipt = nil
-			preparedDelegatedEvidence = nil
-			prepared, receipt, evidence, receiptErr := prepareDelegatedTerminalReceipt(attestPath, delegatedReceiptKey, cfg, finalResult, runReq, finalTimingReport)
-			if receiptErr != nil {
-				err = errors.Join(err, receiptErr)
-				runFailure = errors.Join(runFailure, receiptErr)
-				return
-			}
-			preparedDelegatedReceipt = &prepared
-			preparedDelegatedEvidence = &evidence
-			// Self-verify the receipt signature and evidence binding before
-			// persistence. This catches signing bugs and binding errors.
-			if verifyErr := verifyTerminalRunReceiptSignature(receipt); verifyErr != nil {
-				err = errors.Join(err, fmt.Errorf("self-verify delegated terminal receipt: %w", verifyErr))
-				runFailure = errors.Join(runFailure, fmt.Errorf("self-verify delegated terminal receipt: %w", verifyErr))
-				preparedDelegatedReceipt = nil
-				return
-			}
-			if receipt.EvidenceSHA256 != evidence.Digest {
-				err = errors.Join(err, fmt.Errorf("self-verify delegated evidence binding: receipt evidence_sha256 %s != evidence digest %s", receipt.EvidenceSHA256, evidence.Digest))
-				runFailure = errors.Join(runFailure, fmt.Errorf("self-verify delegated evidence binding: receipt evidence_sha256 %s != evidence digest %s", receipt.EvidenceSHA256, evidence.Digest))
-				preparedDelegatedReceipt = nil
-				return
-			}
-		}
-		finalizeTerminalRun = func() {
-			if preparedDelegatedReceipt == nil {
-				return
-			}
-			// Local receipt file write: auxiliary error. A write failure cannot
-			// retroactively change the execution outcome.
-			receipt, receiptErr := persistPreparedRunReceipt(*preparedDelegatedReceipt)
-			if receiptErr != nil {
-				auxErr := &AuxiliaryError{Op: "write receipt file", Err: receiptErr}
-				err = errors.Join(err, auxErr)
-				runFailure = errors.Join(runFailure, auxErr)
-				fmt.Fprintf(a.Stderr, "warning: receipt file write failed (execution outcome unchanged): %v\n", receiptErr)
-				return
-			}
-			fmt.Fprintf(a.Stderr, "artifact kind=receipt path=%s bytes=%d\n", receipt.Path, receipt.Bytes)
-			// Emit evidence to stderr if --timing-json is set.
-			if preparedDelegatedEvidence != nil && *timingJSON {
-				if writeErr := WriteEvidenceJSON(a.Stderr, *preparedDelegatedEvidence); writeErr != nil {
-					fmt.Fprintf(a.Stderr, "warning: evidence JSON output failed: %v\n", writeErr)
+		// Stage 4: Set buildFinalOutcome so the defer can build an immutable
+		// TerminalBundleV1 via BuildTerminalBundle. This replaces the old
+		// prepareTerminalRun/finalizeTerminalRun closure pattern.
+		if attestPath != "" && delegatedReceiptEligible && delegatedReceiptKey != nil {
+			terminalBundleKey = delegatedReceiptKey
+			terminalBundleAttestPath = attestPath
+			terminalBundleCommitTarget = nil // delegated runs don't commit via recorder
+			delegatedResult := result
+			delegatedReq := runReq
+			delegatedCfg := cfg
+			delegatedRunErr := runErr
+			buildFinalOutcome = func(report timingReport) FinalRunOutcome {
+				finalResult := delegatedResult
+				finalFailure := runFailure
+				if finalFailure == nil {
+					finalFailure = err
+				}
+				if finalFailure == nil {
+					finalFailure = delegatedRunErr
+				}
+				if finalResult.ExitCode == 0 && finalFailure != nil {
+					finalResult.ExitCode = exitCodeForError(finalFailure, 7)
+				}
+				command := strings.TrimSpace(finalResult.CommandText)
+				if command == "" {
+					command = runCommandDisplay(delegatedReq.Command, delegatedReq.ShellMode)
+				}
+				if command == "" {
+					command = strings.Join(delegatedReq.Command, " ")
+				}
+				if command == "" {
+					command = "(delegated)"
+				}
+				provider := finalResult.Provider
+				leaseID := finalResult.LeaseID
+				slug := finalResult.Slug
+				actionsURL := finalResult.ActionsURL
+				if session := finalResult.Session; session != nil {
+					provider = firstNonBlank(provider, session.Provider)
+					leaseID = firstNonBlank(leaseID, session.LeaseID)
+					slug = firstNonBlank(slug, session.Slug)
+					actionsURL = firstNonBlank(actionsURL, session.ActionsURL)
+				}
+				provider = firstNonBlank(provider, delegatedCfg.Provider)
+				runID := delegatedRunID(delegatedReq, finalResult)
+				if runID == "" {
+					digest := sha256Digest([]byte(command + ":" + provider + ":" + leaseID))
+					runID = "run_delegated_" + strings.TrimPrefix(digest, "sha256:")[:16]
+				}
+				finalized := FinalizeRunResult(finalResult, finalFailure)
+				return FinalRunOutcome{
+					ExitCode:    finalResult.ExitCode,
+					RunStatus:   finalized.Status,
+					ErrorKind:   finalized.ErrorKind,
+					Command:     delegatedReq.Command,
+					CommandText: command,
+					Timing:      report,
+					Artifacts:   report.Artifacts,
+					Provider:    provider,
+					LeaseID:     leaseID,
+					Slug:        slug,
+					RunID:       runID,
+					ActionsURL:  actionsURL,
+					StartedAt:   report.StartedAt,
+					EndedAt:     report.EndedAt,
 				}
 			}
 		}
@@ -2360,7 +2410,7 @@ afterSync:
 			report.Label = runLabelValue
 			finalTimingReport = &report
 		}
-		finalizeTerminalRun = func() {
+		finalizeSyncOnlyCoordinator := func() {
 			finalFailure := runFailure
 			if finalFailure == nil {
 				finalFailure = err
@@ -2376,6 +2426,7 @@ afterSync:
 				runFailure = errors.Join(runFailure, finishErr)
 			}
 		}
+		coordinatorCommitFallback = finalizeSyncOnlyCoordinator
 		return nil
 	}
 	recorder.Event("bootstrap.waiting", "bootstrap", "waiting for SSH before command")
@@ -2621,136 +2672,91 @@ afterSync:
 	var results *TestResultSummary
 	classification := FailureClassification{}
 	attestPath := strings.TrimSpace(*attestOut)
-	var preparedTerminalReceipt terminalRunReceipt
-	var preparedTerminalReceiptFile *preparedRunReceipt
-	preparedTerminalExitCode := -1
-	preparedTerminalEvidenceDigest := ""
-	terminalPreparationAttempted := false
 	terminalLog := logBuffer.Snapshot()
-	buildTerminalReceipt := func(finalCode int) (terminalRunReceipt, error) {
-		startedAt := recorder.startedAt
-		endedAt := time.Time{}
-		if !startedAt.IsZero() && !recorder.attachedAt.IsZero() {
-			endedAt = startedAt.Add(time.Since(recorder.attachedAt))
-		}
-		if startedAt.IsZero() {
-			startedAt = commandStart
-		}
-		if endedAt.IsZero() {
-			endedAt = startedAt.Add(time.Since(startedAt))
-		}
-		return buildTerminalRunReceiptWithKey(terminalReceiptKey, terminalRunReceiptInput{
-			Provider:          cfg.Provider,
-			LeaseID:           leaseID,
-			Slug:              serverSlug(server),
-			RunID:             executionRunID,
-			Command:           recordCommand,
-			CommandDisplay:    commandDisplay,
-			ExitCode:          finalCode,
-			SyncMs:            timings.sync.Milliseconds(),
-			CommandMs:         timings.command.Milliseconds(),
-			StartedAt:         startedAt,
-			EndedAt:           endedAt,
-			LogSHA256:         terminalLog.FullSHA256,
-			RetainedLogSHA256: sha256Digest([]byte(terminalLog.Log)),
-			LogTruncated:      terminalLog.Truncated,
-			EvidenceSHA256:    runEvidenceDigest,
-		})
-	}
-	prepareTerminalRun = func() {
-		if timings.command == 0 {
-			timings.command = time.Since(commandStart)
-		}
-		finalCode := code
-		finalFailure := runFailure
-		if finalFailure == nil {
-			finalFailure = err
-		}
-		if finalCode == 0 && finalFailure != nil {
-			finalCode = exitCodeForError(finalFailure, 7)
-		}
-		if recorder.runID == "" && attestPath == "" {
-			return
-		}
-		if finalCode != 0 && classification.BlockedStage == "" {
-			classificationLog := commandFailureLog
-			if finalFailure != nil {
-				classificationLog = strings.TrimSpace(classificationLog + "\n" + finalFailure.Error())
-			}
-			classification = classifyRunOutcomeFailure(finalCode, classificationLog, commandFailurePhases, failureEvidence, false)
-		}
-		if terminalPreparationAttempted && preparedTerminalExitCode == finalCode && preparedTerminalEvidenceDigest == runEvidenceDigest {
-			return
-		}
-		terminalPreparationAttempted = true
-		preparedTerminalExitCode = finalCode
-		preparedTerminalEvidenceDigest = runEvidenceDigest
-		preparedTerminalReceiptFile = nil
-		receipt, receiptErr := buildTerminalReceipt(finalCode)
-		if receiptErr != nil {
-			err = errors.Join(err, receiptErr)
-			recordRunFailure(&runFailure, receiptErr)
-			return
-		}
-		prepared, receiptErr := prepareTerminalRunReceipt(attestPath, receipt)
-		if receiptErr != nil {
-			err = errors.Join(err, receiptErr)
-			recordRunFailure(&runFailure, receiptErr)
-			return
-		}
-		// Self-verify the generated receipt: confirm the signature is valid
-		// and the evidence_sha256 binding matches the evidence digest. This
-		// catches signing bugs, key mismatches, and binding errors before
-		// the bundle reaches the coordinator. (Phase 8: self-verify.)
-		if verifyErr := verifyTerminalRunReceiptSignature(receipt); verifyErr != nil {
-			err = errors.Join(err, fmt.Errorf("self-verify terminal receipt signature: %w", verifyErr))
-			recordRunFailure(&runFailure, verifyErr)
-			return
-		}
-		if receipt.EvidenceSHA256 != "" && runEvidence.Digest != "" {
-			if receipt.EvidenceSHA256 != runEvidence.Digest {
-				err = errors.Join(err, fmt.Errorf("self-verify evidence binding: receipt evidence_sha256 %s != evidence digest %s", receipt.EvidenceSHA256, runEvidence.Digest))
-				recordRunFailure(&runFailure, fmt.Errorf("evidence binding mismatch"))
-				return
+	// Stage 4: Set buildFinalOutcome so the defer can build an immutable
+	// TerminalBundleV1 via BuildTerminalBundle. This replaces the old
+	// prepareTerminalRun/finalizeTerminalRun closure pattern with a single
+	// atomic build step. The closure captures the SSH path's local state
+	// (code, timings, recordCommand, etc.) and combines it with the frozen
+	// timing report to produce a FinalRunOutcome.
+	sshTarget := target
+	sshCode := code
+	sshRecordCommand := recordCommand
+	sshCommandDisplay := commandDisplay
+	sshExecutionRunID := executionRunID
+	sshCommandStart := commandStart
+	sshCommandFailurePhases := commandFailurePhases
+	sshFailureEvidence := failureEvidence
+	sshCommandFailureLog := commandFailureLog
+	sshTerminalReceiptKey := terminalReceiptKey
+	sshServer := server
+	sshLeaseID := leaseID
+	sshCfg := cfg
+	sshRecorder := recorder
+	sshAttestPath := attestPath
+	sshCoord := coord
+	if sshRecorder.runID != "" || sshAttestPath != "" {
+		if sshTerminalReceiptKey != nil {
+			terminalBundleKey = sshTerminalReceiptKey
+			terminalBundleAttestPath = sshAttestPath
+			if sshCoord != nil && !*syncOnly {
+				terminalBundleCommitTarget = &sshTarget
 			}
 		}
-		preparedTerminalReceipt = receipt
-		preparedTerminalReceiptFile = &prepared
-	}
-	finalizeTerminalRun = func() {
-		if preparedTerminalReceiptFile == nil {
-			return
-		}
-		// Local receipt file write: auxiliary error. A write failure cannot
-		// retroactively change the execution outcome. The signed receipt was
-		// already built from the immutable FinalRunOutcome; we persist it as-is
-		// and report any failure as an auxiliary error.
-		if attestPath != "" {
-			artifact, writeErr := persistPreparedRunReceipt(*preparedTerminalReceiptFile)
-			if writeErr != nil {
-				auxErr := &AuxiliaryError{Op: "write receipt file", Err: writeErr}
-				err = errors.Join(err, auxErr)
-				recordRunFailure(&runFailure, auxErr)
-				fmt.Fprintf(a.Stderr, "warning: receipt file write failed (execution outcome unchanged): %v\n", writeErr)
-			} else {
-				fmt.Fprintf(a.Stderr, "artifact kind=receipt path=%s bytes=%d\n", artifact.Path, artifact.Bytes)
+		buildFinalOutcome = func(report timingReport) FinalRunOutcome {
+			finalCode := sshCode
+			finalFailure := runFailure
+			if finalFailure == nil {
+				finalFailure = err
 			}
-		}
-		// Coordinator commit: auxiliary error. A coordinator failure cannot
-		// retroactively change the execution outcome. The signed receipt and
-		// evidence were already built from the immutable FinalRunOutcome; we
-		// send them as-is and report any failure as an auxiliary error.
-		//
-		// The previous code rebuilt the receipt with a failure exit code on
-		// coordinator commit failure, turning a successful remote execution
-		// into a failed signed execution. That violated the immutability rule.
-		if finishErr := recorder.Finish(ctx, target, preparedTerminalReceipt.ExitCode, timings.sync, timings.command, terminalLog.Log, terminalLog.Truncated, results, classification, &preparedTerminalReceipt, runEvidence); finishErr != nil {
-			auxErr := &AuxiliaryError{Op: "coordinator commit", Err: finishErr}
-			err = errors.Join(err, auxErr)
-			recordRunFailure(&runFailure, auxErr)
-			fmt.Fprintf(a.Stderr, "warning: coordinator commit failed (execution outcome unchanged): %v\n", finishErr)
-		} else if a.runOutcome != nil {
-			a.runOutcome.ExitCode = preparedTerminalReceipt.ExitCode
+			if finalCode == 0 && finalFailure != nil {
+				finalCode = exitCodeForError(finalFailure, 7)
+			}
+			finalClassification := classification
+			if finalCode != 0 && finalClassification.BlockedStage == "" {
+				classificationLog := sshCommandFailureLog
+				if finalFailure != nil {
+					classificationLog = strings.TrimSpace(classificationLog + "\n" + finalFailure.Error())
+				}
+				finalClassification = classifyRunOutcomeFailure(finalCode, classificationLog, sshCommandFailurePhases, sshFailureEvidence, false)
+			}
+			startedAt := sshRecorder.startedAt
+			endedAt := time.Time{}
+			if !startedAt.IsZero() && !sshRecorder.attachedAt.IsZero() {
+				endedAt = startedAt.Add(time.Since(sshRecorder.attachedAt))
+			}
+			if startedAt.IsZero() {
+				startedAt = sshCommandStart
+			}
+			if endedAt.IsZero() {
+				endedAt = startedAt.Add(time.Since(startedAt))
+			}
+			finalized := report
+			if finalized.RunStatus == "" {
+				if finalCode == 0 {
+					finalized.RunStatus = RunStatusSucceeded
+				} else {
+					finalized.RunStatus = RunStatusFailed
+				}
+			}
+			return FinalRunOutcome{
+				ExitCode:       finalCode,
+				RunStatus:      finalized.RunStatus,
+				ErrorKind:      finalized.ErrorKind,
+				Command:        sshRecordCommand,
+				CommandText:    sshCommandDisplay,
+				Timing:         report,
+				Classification: finalClassification,
+				Results:        results,
+				Artifacts:      report.Artifacts,
+				TerminalLog:    terminalLog,
+				StartedAt:      startedAt,
+				EndedAt:        endedAt,
+				Provider:       sshCfg.Provider,
+				LeaseID:        sshLeaseID,
+				Slug:           serverSlug(sshServer),
+				RunID:          sshExecutionRunID,
+			}
 		}
 	}
 	if code != 0 || streamErr != nil {

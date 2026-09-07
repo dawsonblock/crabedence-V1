@@ -154,6 +154,13 @@ func BuildTerminalBundle(outcome FinalRunOutcome, key ed25519.PrivateKey) (Termi
 	evidence := NewRunEvidence(evidenceInput)
 
 	// Build the receipt from the outcome.
+	// Delegated runs have an empty terminal log; use the SHA-256 of the
+	// empty string for log digests when FullSHA256 is not set.
+	logSHA256 := outcome.TerminalLog.FullSHA256
+	if logSHA256 == "" {
+		logSHA256 = sha256Digest([]byte(""))
+	}
+	retainedLogSHA256 := sha256Digest([]byte(outcome.TerminalLog.Log))
 	receipt, err := buildTerminalRunReceiptWithKey(key, terminalRunReceiptInput{
 		Provider:          outcome.Provider,
 		LeaseID:           outcome.LeaseID,
@@ -166,8 +173,8 @@ func BuildTerminalBundle(outcome FinalRunOutcome, key ed25519.PrivateKey) (Termi
 		CommandMs:         outcome.Timing.CommandMs,
 		StartedAt:         outcome.StartedAt,
 		EndedAt:           outcome.EndedAt,
-		LogSHA256:         outcome.TerminalLog.FullSHA256,
-		RetainedLogSHA256: sha256Digest([]byte(outcome.TerminalLog.Log)),
+		LogSHA256:         logSHA256,
+		RetainedLogSHA256: retainedLogSHA256,
 		LogTruncated:      outcome.TerminalLog.Truncated,
 		EvidenceSHA256:    evidence.Digest,
 	})
@@ -180,8 +187,8 @@ func BuildTerminalBundle(outcome FinalRunOutcome, key ed25519.PrivateKey) (Termi
 		Receipt:           receipt,
 		TerminalLog:       outcome.TerminalLog.Log,
 		LogTruncated:      outcome.TerminalLog.Truncated,
-		LogSHA256:         outcome.TerminalLog.FullSHA256,
-		RetainedLogSHA256: sha256Digest([]byte(outcome.TerminalLog.Log)),
+		LogSHA256:         logSHA256,
+		RetainedLogSHA256: retainedLogSHA256,
 		Results:           outcome.Results,
 		Classification:    outcome.Classification,
 		SyncMs:            outcome.Timing.SyncMs,

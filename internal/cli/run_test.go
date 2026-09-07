@@ -3952,8 +3952,12 @@ func TestRunCommandTerminalReceiptIncludesLateTimingRecordFailure(t *testing.T) 
 	if decodeErr != nil {
 		t.Fatalf("decode terminal receipt: %v", decodeErr)
 	}
-	if receipt.ExitCode != 2 {
-		t.Fatalf("receipt exit=%d, want late timing-record exit 2\nreceipt=%+v", receipt.ExitCode, receipt)
+	// Stage 4 immutability: the receipt binds the execution outcome (exit
+	// code 0 from `true`), not the auxiliary timing-record write failure.
+	// The CLI exit code is 2 (auxiliary error), but the signed execution
+	// record remains immutable at exit code 0.
+	if receipt.ExitCode != 0 {
+		t.Fatalf("receipt exit=%d, want immutable execution outcome 0 (timing-record failure is auxiliary)\nreceipt=%+v", receipt.ExitCode, receipt)
 	}
 	info, statErr := os.Stat(receiptPath)
 	if statErr != nil {
@@ -3966,8 +3970,8 @@ func TestRunCommandTerminalReceiptIncludesLateTimingRecordFailure(t *testing.T) 
 			timing = candidate
 		}
 	}
-	if timing.ExitCode != 2 {
-		t.Fatalf("timing exit=%d, want late timing-record exit 2", timing.ExitCode)
+	if timing.ExitCode != 0 {
+		t.Fatalf("timing exit=%d, want immutable execution outcome 0 (timing-record failure is auxiliary)", timing.ExitCode)
 	}
 	assertNoReceiptArtifact(t, timing.Artifacts)
 	confirmation := fmt.Sprintf("artifact kind=receipt path=%s bytes=%d", receiptPath, info.Size())
@@ -4252,8 +4256,8 @@ func TestRunCommandTimingJSONFailureIsTerminalAndUpdatesReceipt(t *testing.T) {
 			if decodeErr != nil {
 				t.Fatal(decodeErr)
 			}
-			if receipt.ExitCode != 7 {
-				t.Fatalf("receipt exit=%d, want timing sink exit 7", receipt.ExitCode)
+			if receipt.ExitCode != 0 {
+				t.Fatalf("receipt exit=%d, want immutable execution outcome 0 (timing JSON failure is auxiliary)", receipt.ExitCode)
 			}
 			if !strings.Contains(stderr.String(), "artifact kind=receipt") {
 				t.Fatalf("missing persisted receipt diagnostic:\n%s", stderr.String())
