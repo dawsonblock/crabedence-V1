@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -139,15 +141,30 @@ func (c FileHandoffConfirm) checkReady() (bool, error) {
 }
 
 // isTransientFileError returns true for errors that are likely to resolve
-// on retry (file being written, temporary lock, etc.).
+// on retry (file being written, temporary lock, etc.). It uses an explicit
+// errno allowlist rather than treating every *os.PathError as transient,
+// since many PathErrors (EACCES due to permissions, ENOTDIR, ELOOP, etc.)
+// represent persistent configuration or filesystem problems that should
+// fail immediately rather than poll until timeout.
 func isTransientFileError(err error) bool {
 	var pathErr *os.PathError
-	if errors.As(err, &pathErr) {
-		// EACCES on a file being created can be transient in some
-		// filesystems; treat it as not-ready rather than fatal.
-		return true
+	if !errors.As(err, &pathErr) {
+		return false
 	}
-	return false
+	errno, ok := pathErr.Err.(syscall.Errno)
+	if !ok {
+		return false
+	}
+	switch errno {
+	case syscall.ENOENT, fs.ErrNotExist:
+		// File doesn't exist yet — may appear during startup.
+		return true
+	case syscall.EAGAIN, syscall.EINTR:
+		// Resource temporarily unavailable / interrupted — retryable.
+		return true
+	default:
+		return false
+	}
 }
 
 // ProcessExitConfirm waits for the process to exit (used when the process

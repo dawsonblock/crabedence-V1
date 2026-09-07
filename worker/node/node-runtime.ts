@@ -66,6 +66,7 @@ export class NodeCoordinatorRuntime implements CoordinatorRuntime {
   private wakeHintPending = false;
   private provisioningScanner?: ReturnType<typeof setInterval>;
   private coordinatorLock: CoordinatorLock | undefined;
+  private bossStarted = false;
   private readonly maintenance = new Set<Promise<void>>();
 
   constructor(connectionString: string) {
@@ -104,6 +105,7 @@ export class NodeCoordinatorRuntime implements CoordinatorRuntime {
       }, 1_000);
       this.provisioningScanner.unref();
       await this.boss.start();
+      this.bossStarted = true;
       await this.boss.createQueue(alarmQueue, {
         // "short" permits one queued successor while the current alarm is active.
         policy: "short",
@@ -132,8 +134,23 @@ export class NodeCoordinatorRuntime implements CoordinatorRuntime {
         singletonSeconds: 60,
       });
     } catch (error) {
-      // Release the coordinator lock if startup failed after acquiring it.
-      // This prevents a crashed start from blocking the next replica.
+      // Reverse-order unwind of any partially initialized resources.
+      // This prevents a failed start from leaving orphaned intervals,
+      // pg-boss workers, or other state that a replacement replica would
+      // conflict with. The coordinator lock is released LAST, only after
+      // all coordinator duties have been torn down.
+      if (this.provisioningScanner) {
+        clearInterval(this.provisioningScanner);
+        this.provisioningScanner = undefined;
+      }
+      if (this.bossStarted) {
+        try {
+          await this.boss.stop({ graceful: false, timeout: 5_000 });
+        } catch {
+          // Best-effort; the original error is more important.
+        }
+        this.bossStarted = false;
+      }
       if (this.coordinatorLock) {
         try {
           await this.coordinatorLock.release();
@@ -175,6 +192,7 @@ export class NodeCoordinatorRuntime implements CoordinatorRuntime {
     await this.drainMaintenance();
     if (this.wakeHintRun) await boundedWakeHint(this.wakeHintRun);
     await this.boss.stop({ graceful: true, timeout: 10_000 });
+    this.bossStarted = false;
     // Release the replica lock only after every coordinator duty has drained, so
     // a replacement cannot overlap with a still-finishing instance.
     await this.coordinatorLock?.release();

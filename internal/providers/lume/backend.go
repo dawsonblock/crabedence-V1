@@ -420,6 +420,12 @@ func (b *backend) Acquire(ctx context.Context, req AcquireRequest) (LeaseTarget,
 	if err != nil {
 		return LeaseTarget{}, cleanupUnclaimedVM(err)
 	}
+	// The shared ProcessSupervisor interface is structurally satisfied by
+	// lumeProcessHandle, but Lume's detached-process model means the handle
+	// carries provider-specific launch context (owner callback, boot
+	// identity, CAS label) that core does not understand. This assertion is
+	// in the Lume provider adapter, not in core, so it does not violate the
+	// architecture boundary — it is the provider extracting its own context.
 	lumeHandle, ok := handle.(*lumeProcessHandle)
 	if !ok {
 		return LeaseTarget{}, cleanupUnclaimedVM(exit(5, "lume supervisor returned unexpected handle type %T", handle))

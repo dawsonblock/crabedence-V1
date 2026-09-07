@@ -1,0 +1,20 @@
+{
+  "evidence": {
+    "command_ms": 3000,
+    "command_text": "npm test",
+    "digest": "724a033bc9ea65bf46bde14011cf07eb0fcab5c809084a3b4eb89f5dfdb384cb",
+    "ended_at": "2026-01-15T12:30:05Z",
+    "evidence_type": "run",
+    "exit_code": 0,
+    "label": "ci",
+    "lease_id": "cbx_abc123",
+    "machine_type": "cpx21",
+    "provider": "hetzner",
+    "run_id": "run_test001",
+    "run_status": "succeeded",
+    "schema_version": 1,
+    "started_at": "2026-01-15T12:30:00Z",
+    "sync_ms": 2000,
+    "total_ms": 5000
+  }
+}

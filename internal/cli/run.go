@@ -1075,7 +1075,10 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 		runnerObservedStartedAt = time.Now()
 		result, runErr := delegated.Run(ctx, runReq)
 		delegatedProviderEndedAt = time.Now()
-		if *timingJSON || timingRecordEnabled {
+		// Always capture the timing report internally so evidence can be
+		// constructed unconditionally. The --timing-json flag controls
+		// stderr output, not whether provenance exists.
+		{
 			report := timingReportFromDelegatedRunResult(runReq, result, backend.Spec().Name, runErr)
 			if delegatedTimingCapture != nil && delegatedTimingCapture.report != nil {
 				report = *delegatedTimingCapture.report
@@ -2593,6 +2596,7 @@ afterSync:
 	var preparedTerminalReceipt terminalRunReceipt
 	var preparedTerminalReceiptFile *preparedRunReceipt
 	preparedTerminalExitCode := -1
+	preparedTerminalEvidenceDigest := ""
 	terminalPreparationAttempted := false
 	terminalLog := logBuffer.Snapshot()
 	buildTerminalReceipt := func(finalCode int) (terminalRunReceipt, error) {
@@ -2647,11 +2651,12 @@ afterSync:
 			}
 			classification = classifyRunOutcomeFailure(finalCode, classificationLog, commandFailurePhases, failureEvidence, false)
 		}
-		if terminalPreparationAttempted && preparedTerminalExitCode == finalCode {
+		if terminalPreparationAttempted && preparedTerminalExitCode == finalCode && preparedTerminalEvidenceDigest == runEvidenceDigest {
 			return
 		}
 		terminalPreparationAttempted = true
 		preparedTerminalExitCode = finalCode
+		preparedTerminalEvidenceDigest = runEvidenceDigest
 		preparedTerminalReceiptFile = nil
 		receipt, receiptErr := buildTerminalReceipt(finalCode)
 		if receiptErr != nil {
@@ -2913,9 +2918,10 @@ afterSync:
 		labelField = fmt.Sprintf(" label=%q", runLabelValue)
 	}
 	fmt.Fprintf(a.Stderr, "run details provider=%s lease=%s slug=%s run=%s%s type=%s repo=%s workdir=%s actions=%s stop_command=%q idle_timeout=%s\n", cfg.Provider, leaseID, blank(serverSlug(server), "-"), executionRunID, labelField, blank(server.ServerType.Name, "-"), repo.Root, workdir, blank(actionsURL, "-"), report.StopCommand, cfg.IdleTimeout)
-	if *timingJSON || timingRecordEnabled {
-		finalTimingReport = &report
-	}
+	// Always capture the final timing report internally so evidence can be
+	// constructed unconditionally. The --timing-json flag controls stderr
+	// output, not whether provenance exists.
+	finalTimingReport = &report
 	if code != 0 {
 		digest := runFailureDigestInput{
 			Provider:              cfg.Provider,

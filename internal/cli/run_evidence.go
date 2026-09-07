@@ -1,11 +1,13 @@
 package cli
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"time"
 )
@@ -202,18 +204,185 @@ func NewRunEvidence(input RunEvidenceInput) RunEvidenceV1 {
 }
 
 // runEvidenceDigest computes a SHA-256 over the canonical JSON encoding of the
-// evidence record, excluding the digest field itself. Uses a type alias to
-// avoid recursing into MarshalJSON.
+// evidence record, excluding the digest field itself. Canonicalization uses
+// lexicographic code-point key ordering (matching the TypeScript coordinator's
+// stableJSONValue) to ensure both implementations produce identical bytes.
 func runEvidenceDigest(ev RunEvidenceV1) string {
 	clone := ev
 	clone.Digest = ""
-	type alias RunEvidenceV1
-	data, err := json.Marshal(alias(clone))
+	data, err := canonicalEvidenceJSON(clone)
 	if err != nil {
 		return ""
 	}
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
+}
+
+// canonicalEvidenceJSON serializes the evidence as JSON with keys sorted by
+// Unicode code point order (lexicographic), matching the TypeScript
+// stableJSONValue implementation. This is NOT RFC 8785, but it is a
+// well-defined, portable, locale-independent canonicalization that both
+// implementations share. The digest field is set to "" before serialization.
+func canonicalEvidenceJSON(ev RunEvidenceV1) ([]byte, error) {
+	m := evidenceToOrderedMap(ev)
+	return json.Marshal(m)
+}
+
+// orderedMap is a map that preserves insertion order for JSON serialization.
+type orderedMap struct {
+	keys   []string
+	values map[string]any
+}
+
+func newOrderedMap() *orderedMap {
+	return &orderedMap{values: make(map[string]any)}
+}
+
+func (m *orderedMap) set(key string, value any) {
+	if _, exists := m.values[key]; !exists {
+		m.keys = append(m.keys, key)
+	}
+	m.values[key] = value
+}
+
+func (m *orderedMap) MarshalJSON() ([]byte, error) {
+	var buf bytes.Buffer
+	buf.WriteByte('{')
+	for i, key := range m.keys {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		keyBytes, err := json.Marshal(key)
+		if err != nil {
+			return nil, err
+		}
+		buf.Write(keyBytes)
+		buf.WriteByte(':')
+		valBytes, err := json.Marshal(m.values[key])
+		if err != nil {
+			return nil, err
+		}
+		buf.Write(valBytes)
+	}
+	buf.WriteByte('}')
+	return buf.Bytes(), nil
+}
+
+// evidenceToOrderedMap converts RunEvidenceV1 to an ordered map with keys
+// sorted by Unicode code point order, matching the TypeScript
+// stableJSONValue canonicalization.
+func evidenceToOrderedMap(ev RunEvidenceV1) *orderedMap {
+	// Collect all non-omitted fields into a map, then sort keys.
+	raw := map[string]any{}
+	raw["schema_version"] = ev.SchemaVersion
+	raw["evidence_type"] = ev.EvidenceType
+	raw["provider"] = ev.Provider
+	if ev.LeaseID != "" {
+		raw["lease_id"] = ev.LeaseID
+	}
+	if ev.Slug != "" {
+		raw["slug"] = ev.Slug
+	}
+	if ev.RunID != "" {
+		raw["run_id"] = ev.RunID
+	}
+	if ev.Label != "" {
+		raw["label"] = ev.Label
+	}
+	if ev.MachineType != "" {
+		raw["machine_type"] = ev.MachineType
+	}
+	raw["exit_code"] = ev.ExitCode
+	raw["run_status"] = ev.RunStatus
+	if ev.ErrorKind != "" {
+		raw["error_kind"] = ev.ErrorKind
+	}
+	if ev.CommandText != "" {
+		raw["command_text"] = ev.CommandText
+	}
+	raw["total_ms"] = ev.TotalMs
+	raw["command_ms"] = ev.CommandMs
+	raw["sync_ms"] = ev.SyncMs
+	if ev.RunnerTotalMs != 0 {
+		raw["runner_total_ms"] = ev.RunnerTotalMs
+	}
+	if ev.EndToEndMs != 0 {
+		raw["end_to_end_ms"] = ev.EndToEndMs
+	}
+	if ev.LeaseMs != 0 {
+		raw["lease_ms"] = ev.LeaseMs
+	}
+	if ev.BootstrapMs != 0 {
+		raw["bootstrap_ms"] = ev.BootstrapMs
+	}
+	if ev.HydrateMs != 0 {
+		raw["hydrate_ms"] = ev.HydrateMs
+	}
+	if ev.ProbeMs != 0 {
+		raw["probe_ms"] = ev.ProbeMs
+	}
+	if ev.SyncDelegated {
+		raw["sync_delegated"] = ev.SyncDelegated
+	}
+	if ev.SyncSkipped {
+		raw["sync_skipped"] = ev.SyncSkipped
+	}
+	if ev.SyncMode != "" {
+		raw["sync_mode"] = ev.SyncMode
+	}
+	if ev.SyncTransferFiles != 0 {
+		raw["sync_transfer_files"] = ev.SyncTransferFiles
+	}
+	if ev.SyncTransferBytes != 0 {
+		raw["sync_transfer_bytes"] = ev.SyncTransferBytes
+	}
+	if ev.SyncFallbackReason != "" {
+		raw["sync_fallback_reason"] = ev.SyncFallbackReason
+	}
+	if len(ev.RunnerPhases) > 0 {
+		raw["runner_phases"] = ev.RunnerPhases
+	}
+	if len(ev.SyncPhases) > 0 {
+		raw["sync_phases"] = ev.SyncPhases
+	}
+	if len(ev.CommandPhases) > 0 {
+		raw["command_phases"] = ev.CommandPhases
+	}
+	if ev.BlockedStage != "" {
+		raw["blocked_stage"] = ev.BlockedStage
+	}
+	if ev.ResourceExhaustion != "" {
+		raw["resource_exhaustion"] = ev.ResourceExhaustion
+	}
+	if ev.RetryLikely != "" {
+		raw["retry_likely"] = ev.RetryLikely
+	}
+	if ev.FailureHint != "" {
+		raw["failure_hint"] = ev.FailureHint
+	}
+	if len(ev.Artifacts) > 0 {
+		raw["artifacts"] = ev.Artifacts
+	}
+	if ev.StartedAt != "" {
+		raw["started_at"] = ev.StartedAt
+	}
+	if ev.EndedAt != "" {
+		raw["ended_at"] = ev.EndedAt
+	}
+	raw["digest"] = ev.Digest
+
+	// Sort keys by Unicode code point order.
+	keys := make([]string, 0, len(raw))
+	for k := range raw {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	m := newOrderedMap()
+	for _, k := range keys {
+		m.set(k, raw[k])
+	}
+	return m
 }
 
 // VerifyRunEvidenceDigest returns true if the evidence's digest matches a
@@ -302,17 +471,17 @@ func RunEvidenceFromRunResult(result RunResult) RunEvidenceV1 {
 	return NewRunEvidence(input)
 }
 
-// MarshalJSON serializes the evidence. The digest is computed only if it
-// has not been set yet (first serialization after construction). If the
-// digest is already set but stale relative to the fields, it is preserved
-// as-is so that tampering is detectable by the coordinator's validator
-// rather than silently repaired.
+// MarshalJSON serializes the evidence using canonical (sorted-key) JSON.
+// The digest is computed only if it has not been set yet (first
+// serialization after construction). If the digest is already set but
+// stale relative to the fields, it is preserved as-is so that tampering
+// is detectable by the coordinator's validator rather than silently
+// repaired.
 func (ev RunEvidenceV1) MarshalJSON() ([]byte, error) {
 	if ev.Digest == "" {
 		ev.Digest = runEvidenceDigest(ev)
 	}
-	type alias RunEvidenceV1
-	return json.Marshal(alias(ev))
+	return canonicalEvidenceJSON(ev)
 }
 
 // WriteEvidenceJSON writes the evidence as a single JSON object to w. It is

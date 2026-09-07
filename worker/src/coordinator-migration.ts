@@ -82,7 +82,7 @@ function canonicalize(value: unknown): unknown {
   if (value && typeof value === "object") {
     return Object.fromEntries(
       Object.entries(value as Record<string, unknown>)
-        .toSorted(([left], [right]) => left.localeCompare(right))
+        .toSorted(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
         .map(([key, entry]) => [key, canonicalize(entry)]),
     );
   }
@@ -95,7 +95,7 @@ export async function exportCoordinatorState(
   const records = await storage.list<unknown>();
   const entries: CoordinatorExportEntry[] = await Promise.all(
     [...records]
-      .toSorted(([left], [right]) => left.localeCompare(right))
+      .toSorted(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
       .map(async ([key, value]) => ({
         key,
         value,
@@ -168,7 +168,9 @@ export async function validateCoordinatorExport(
     errors.push("entryCount does not match entries length");
   }
   if (errors.length === 0) {
-    const digest = await exportDigest(entries.toSorted((a, b) => a.key.localeCompare(b.key)));
+    const digest = await exportDigest(
+      entries.toSorted((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0)),
+    );
     if (document["digest"] !== digest) {
       errors.push("digest does not match entries");
     }
@@ -181,7 +183,9 @@ export async function validateCoordinatorExport(
       exportedAt: String(document["exportedAt"] ?? ""),
       entryCount: rawEntries.length,
       digest: String(document["digest"]),
-      entries: entries.toSorted((left, right) => left.key.localeCompare(right.key)),
+      entries: entries.toSorted((left, right) =>
+        left.key < right.key ? -1 : left.key > right.key ? 1 : 0,
+      ),
     },
     errors: [],
   };

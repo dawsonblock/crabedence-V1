@@ -201,21 +201,30 @@ export async function validateRunEvidence(
   }
   if (
     typeof ev["digest"] !== "string" ||
-    ev["digest"].length !== 71 ||
-    !ev["digest"].startsWith("sha256:")
+    ev["digest"].length !== 64 ||
+    !/^[0-9a-f]{64}$/u.test(ev["digest"])
   ) {
-    return new Error("evidence digest must be a sha256 digest");
+    return new Error("evidence digest must be a 64-character hex string");
   }
   // Verify digest: recompute SHA-256 over canonical JSON with digest set to "".
   const recomputed = await computeEvidenceDigest(ev);
   if (recomputed !== ev["digest"]) {
     return new Error("evidence digest mismatch");
   }
-  // If the receipt binds evidence_sha256, verify it matches.
-  if (binding.receipt?.evidence_sha256) {
-    if (binding.receipt.evidence_sha256 !== ev["digest"]) {
-      return new Error("evidence digest does not match receipt evidence_sha256");
-    }
+  // Evidence authenticity requires a signed v3 receipt binding. Without it,
+  // the evidence is only integrity-protected, not authenticated. Reject
+  // unbound evidence to prevent unsigned tampering from being stored.
+  if (!binding.receipt) {
+    return new Error("evidence requires a signed terminal receipt binding");
+  }
+  if (binding.receipt.schema_version < 3) {
+    return new Error("evidence requires a v3 terminal receipt; v2 receipts cannot bind evidence");
+  }
+  if (!binding.receipt.evidence_sha256) {
+    return new Error("evidence requires receipt.evidence_sha256 binding");
+  }
+  if (binding.receipt.evidence_sha256 !== ev["digest"]) {
+    return new Error("evidence digest does not match receipt evidence_sha256");
   }
   return undefined;
 }
@@ -223,7 +232,10 @@ export async function validateRunEvidence(
 async function computeEvidenceDigest(ev: Record<string, unknown>): Promise<string> {
   const canonical = { ...ev, digest: "" };
   const stable = stableJSONValue(canonical);
-  return sha256Digest(encoder.encode(JSON.stringify(stable)));
+  const digest = new Uint8Array(
+    await crypto.subtle.digest("SHA-256", encoder.encode(JSON.stringify(stable))),
+  );
+  return [...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function stableJSONValue(value: unknown): unknown {
@@ -231,7 +243,13 @@ function stableJSONValue(value: unknown): unknown {
   if (!value || typeof value !== "object") return value ?? null;
   return Object.fromEntries(
     Object.entries(value)
-      .toSorted(([left], [right]) => left.localeCompare(right))
+      .toSorted(([left], [right]) => {
+        // Code-point comparison, NOT locale-aware ordering.
+        // This matches the Go sort.Strings canonicalization.
+        if (left < right) return -1;
+        if (left > right) return 1;
+        return 0;
+      })
       .map(([key, entry]) => [key, stableJSONValue(entry)]),
   );
 }
@@ -262,6 +280,11 @@ function parseTerminalReceipt(value: unknown): TerminalRunReceipt {
     receipt.receipt_type !== "terminal"
   ) {
     throw new Error("unsupported terminal receipt");
+  }
+  // v2 receipts must not carry evidence_sha256 — it would be an unsigned
+  // field that could masquerade as authenticated evidence binding.
+  if (receipt.schema_version < 3 && receipt.evidence_sha256 !== undefined) {
+    throw new Error("v2 terminal receipt must not contain evidence_sha256");
   }
   for (const field of [
     "started_at",
