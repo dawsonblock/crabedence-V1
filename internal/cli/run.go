@@ -3279,31 +3279,43 @@ func prepareDelegatedTerminalReceipt(path string, key ed25519.PrivateKey, cfg Co
 
 	// Build evidence from the delegated result.
 	var totalMs, commandMs, syncMs, runnerTotalMs, endToEndMs int64
+	var bootstrapMs, hydrateMs, probeMs, leaseMs int64
+	var startupConfirm *StartupConfirmSummary
 	if report != nil {
 		totalMs = report.TotalMs
 		commandMs = report.CommandMs
 		syncMs = report.SyncMs
 		runnerTotalMs = report.RunnerTotalMs
 		endToEndMs = report.EndToEndMs
+		bootstrapMs = report.BootstrapMs
+		hydrateMs = report.HydrateMs
+		probeMs = report.ProbeMs
+		leaseMs = report.LeaseMs
+		startupConfirm = report.StartupConfirm
 	} else {
 		totalMs = result.Total.Milliseconds()
 		commandMs = result.Command.Milliseconds()
 	}
 	evidenceInput := RunEvidenceInput{
-		Provider:      provider,
-		LeaseID:       leaseID,
-		Slug:          slug,
-		RunID:         runID,
-		CommandText:   command,
-		ExitCode:      result.ExitCode,
-		RunStatus:     result.Status,
-		ErrorKind:     result.ErrorKind,
-		TotalMs:       totalMs,
-		CommandMs:     commandMs,
-		SyncMs:        syncMs,
-		RunnerTotalMs: runnerTotalMs,
-		EndToEndMs:    endToEndMs,
-		Artifacts:     artifactsFromRunArtifacts(result.Artifacts),
+		Provider:       provider,
+		LeaseID:        leaseID,
+		Slug:           slug,
+		RunID:          runID,
+		CommandText:    command,
+		ExitCode:       result.ExitCode,
+		RunStatus:      result.Status,
+		ErrorKind:      result.ErrorKind,
+		TotalMs:        totalMs,
+		CommandMs:      commandMs,
+		SyncMs:         syncMs,
+		RunnerTotalMs:  runnerTotalMs,
+		EndToEndMs:     endToEndMs,
+		LeaseMs:        leaseMs,
+		BootstrapMs:    bootstrapMs,
+		HydrateMs:      hydrateMs,
+		ProbeMs:        probeMs,
+		Artifacts:      artifactsFromRunArtifacts(result.Artifacts),
+		StartupConfirm: startupConfirm,
 	}
 	if report != nil {
 		evidenceInput.RunnerPhases = report.RunnerPhases
@@ -3316,6 +3328,7 @@ func prepareDelegatedTerminalReceipt(path string, key ed25519.PrivateKey, cfg Co
 		evidenceInput.SyncTransferBytes = report.SyncTransferBytes
 		evidenceInput.SyncFallbackReason = report.SyncFallbackReason
 		evidenceInput.BlockedStage = report.BlockedStage
+		evidenceInput.ResourceExhaustion = report.ResourceExhaustion
 		evidenceInput.RetryLikely = report.RetryLikely
 		if report.StartedAt.IsZero() {
 			evidenceInput.StartedAt = time.Now()

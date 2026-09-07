@@ -516,19 +516,21 @@ func runEvidenceArtifactsCanonical(artifacts []RunEvidenceArtifact) []any {
 }
 
 // startupConfirmCanonical converts a StartupConfirmSummary to a canonical
-// (sorted-key) ordered map for JSON serialization.
+// (sorted-key) ordered map for JSON serialization. Keys are sorted by Unicode
+// code point order to match the TypeScript stableJSONValue canonicalization.
 func startupConfirmCanonical(sc *StartupConfirmSummary) *orderedMap {
-	m := newOrderedMap()
-	m.set("stage", sc.Stage)
-	m.set("duration_ms", sc.DurationMs)
-	m.set("ready", sc.Ready)
+	entries := map[string]any{
+		"stage":       sc.Stage,
+		"duration_ms": sc.DurationMs,
+		"ready":       sc.Ready,
+	}
 	if sc.ProcessExited {
-		m.set("process_exited", sc.ProcessExited)
+		entries["process_exited"] = sc.ProcessExited
 	}
 	if sc.Retryable {
-		m.set("retryable", sc.Retryable)
+		entries["retryable"] = sc.Retryable
 	}
-	return m
+	return sortedOrderedMap(entries)
 }
 
 // VerifyRunEvidenceDigest returns true if the evidence's digest matches a

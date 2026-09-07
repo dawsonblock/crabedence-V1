@@ -69,7 +69,7 @@ type LifecycleContextProvider interface {
 // Callers should check this before attempting to use ExitObservable,
 // ReapableProcess, or LifecycleContextProvider:
 //
-//	if _, detached := handle.(DetachedProcess); detached && handle.(DetachedProcess).Detached() {
+//	if dp, ok := handle.(DetachedProcess); ok && dp.Detached() {
 //	    // Cannot observe exit, reap, or use process-scoped context.
 //	}
 type DetachedProcess interface {
