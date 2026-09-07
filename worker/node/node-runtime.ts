@@ -244,8 +244,16 @@ export class NodeCoordinatorRuntime implements CoordinatorRuntime {
     await this.boss.stop({ graceful: true, timeout: 10_000 });
     this.bossStarted = false;
     // Release the replica lock only after every coordinator duty has drained, so
-    // a replacement cannot overlap with a still-finishing instance.
-    await this.coordinatorLock?.release();
+    // a replacement cannot overlap with a still-finishing instance. Wrap the
+    // release: if the advisory-lock session already died (authority loss or a
+    // broken backend), pg_advisory_unlock on the dead connection throws. That
+    // is not a shutdown failure — PostgreSQL has already freed the lock — so
+    // log and continue rather than rejecting the orderly shutdown.
+    try {
+      await this.coordinatorLock?.release();
+    } catch (error) {
+      console.error("coordinator lock release during shutdown failed (continuing)", error);
+    }
     this.coordinatorLock = undefined;
     await this.storage.close();
   }

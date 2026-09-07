@@ -130,12 +130,21 @@ export class PostgresCoordinatorStorage implements CoordinatorStorage {
       this.lockClient = undefined;
       released = true;
       teardownListeners();
+      let unlockError: Error | undefined;
       try {
         await client.query("select pg_advisory_unlock(hashtext($1))", [
           coordinatorAdvisoryLockName,
         ]);
+      } catch (error) {
+        // The unlock query failed — the connection is likely dead. Capture
+        // the error so the client is evicted from the pool below rather than
+        // recycled for reuse by other queries.
+        unlockError = error instanceof Error ? error : new Error(String(error));
       } finally {
-        client.release();
+        // Pass any unlock error to release() so pg evicts the broken client
+        // instead of returning it to the pool. A dead connection reused for
+        // the next query would surface as an opaque later failure.
+        client.release(unlockError);
       }
     };
     this.lockRelease = release;

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"strings"
 	"syscall"
@@ -206,11 +205,14 @@ func (c FileHandoffConfirm) checkReady() (bool, error) {
 }
 
 // isTransientFileError returns true for errors that are likely to resolve
-// on retry (file being written, temporary lock, etc.). It uses an explicit
-// errno allowlist rather than treating every *os.PathError as transient,
-// since many PathErrors (EACCES due to permissions, ENOTDIR, ELOOP, etc.)
-// represent persistent configuration or filesystem problems that should
-// fail immediately rather than poll until timeout.
+// on retry (file being written, temporary lock, stale handle, etc.). It uses
+// an explicit errno allowlist rather than treating every *os.PathError as
+// transient, since many PathErrors (EACCES due to permissions, ENOTDIR,
+// ELOOP, etc.) represent persistent configuration or filesystem problems
+// that should fail immediately rather than poll until timeout.
+//
+// ENOENT is handled by the caller via errors.Is(err, os.ErrNotExist) before
+// this function is reached, so it is not listed here.
 func isTransientFileError(err error) bool {
 	var pathErr *os.PathError
 	if !errors.As(err, &pathErr) {
@@ -221,11 +223,15 @@ func isTransientFileError(err error) bool {
 		return false
 	}
 	switch errno {
-	case syscall.ENOENT, fs.ErrNotExist:
-		// File doesn't exist yet — may appear during startup.
-		return true
 	case syscall.EAGAIN, syscall.EINTR:
 		// Resource temporarily unavailable / interrupted — retryable.
+		return true
+	case syscall.ESTALE:
+		// Stale NFS file handle — typically resolves on retry.
+		return true
+	case syscall.EBUSY, syscall.ETXTBSY:
+		// Device or text file briefly locked (e.g. binary being written) —
+		// can resolve once the writer releases it.
 		return true
 	default:
 		return false

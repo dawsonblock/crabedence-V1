@@ -282,6 +282,44 @@ describe("RunEvidenceV1", () => {
     expect(error?.message).toContain("requires a signed terminal receipt binding");
   });
 
+  it("rejects a v3 receipt with evidence_sha256 when the evidence body is absent", async () => {
+    // A v3 receipt carrying evidence_sha256 binds a specific evidence digest.
+    // If the evidence body is omitted, the binding dangles: the run would be
+    // marked terminal with a signed receipt referencing evidence that was
+    // never stored. This must be rejected so a terminal run can never
+    // reference missing evidence.
+    const [first] = await loadGoldenCases();
+    const receipt = stubV3Receipt(first.evidence, first.evidence.digest);
+    const error = await validateRunEvidence(undefined, {
+      runID: first.evidence.run_id ?? "",
+      leaseID: first.evidence.lease_id ?? "",
+      provider: first.evidence.provider,
+      exitCode: first.evidence.exit_code,
+      receipt,
+    });
+    expect(error).toBeDefined();
+    expect(error?.message).toContain("receipt binds evidence_sha256 but no evidence was provided");
+  });
+
+  it("accepts absent evidence when the receipt has no evidence_sha256 binding", async () => {
+    // The mirror case: a v2 receipt (or a v3 receipt with no evidence_sha256)
+    // does not bind evidence, so absent evidence is valid — there is nothing
+    // to authenticate. This must NOT be rejected by the dangling-binding
+    // check, or ordinary runs without evidence would break.
+    const [first] = await loadGoldenCases();
+    const v2 = stubV3Receipt(first.evidence, first.evidence.digest);
+    delete (v2 as Partial<TerminalRunReceipt>).evidence_sha256;
+    const receipt: TerminalRunReceipt = { ...v2, schema_version: 2 };
+    const error = await validateRunEvidence(undefined, {
+      runID: first.evidence.run_id ?? "",
+      leaseID: first.evidence.lease_id ?? "",
+      provider: first.evidence.provider,
+      exitCode: first.evidence.exit_code,
+      receipt,
+    });
+    expect(error).toBeUndefined();
+  });
+
   it("rejects evidence with a v2 receipt (cannot bind evidence)", async () => {
     const [first] = await loadGoldenCases();
     const v2 = stubV3Receipt(first.evidence, first.evidence.digest);

@@ -2883,7 +2883,13 @@ function canonicalJSON(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalJSON).join(",")}]`;
   if (value && typeof value === "object") {
     return `{${Object.entries(value as Record<string, unknown>)
-      .toSorted(([left], [right]) => left.localeCompare(right))
+      // Code-point comparison, NOT locale-aware ordering. localeCompare is
+      // locale/environment-dependent and produces different bytes (and thus
+      // different SHA-256 digests) for the same input across runtimes. This
+      // must match stableJSONValue (run-receipt.ts) and canonicalize
+      // (coordinator-migration.ts) so registry identity, policy, and request
+      // hashes are deterministic across platforms.
+      .toSorted(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
       .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJSON(entry)}`)
       .join(",")}}`;
   }

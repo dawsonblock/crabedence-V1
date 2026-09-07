@@ -162,7 +162,18 @@ export async function validateRunEvidence(
     receipt?: TerminalRunReceipt | undefined;
   },
 ): Promise<Error | undefined> {
-  if (evidence === undefined || evidence === null) return undefined;
+  if (evidence === undefined || evidence === null) {
+    // A v3 receipt that carries evidence_sha256 binds a specific evidence
+    // digest. If the evidence body is absent, the binding dangles: the run
+    // is marked terminal with a signed receipt referencing evidence that
+    // was never stored. Reject this so a terminal run can never reference
+    // missing evidence. (v2 receipts cannot bind evidence and are handled
+    // by terminal-receipt validation before this point.)
+    if (binding.receipt && binding.receipt.schema_version >= 3 && binding.receipt.evidence_sha256) {
+      return new Error("receipt binds evidence_sha256 but no evidence was provided");
+    }
+    return undefined;
+  }
   if (typeof evidence !== "object" || Array.isArray(evidence)) {
     return new Error("evidence must be an object");
   }

@@ -113,7 +113,14 @@ export async function exportCoordinatorState(
 }
 
 async function exportDigest(entries: CoordinatorExportEntry[]): Promise<string> {
-  return sha256Hex(entries.map((entry) => `${entry.key}:${entry.sha256}`).join("\n"));
+  // Sort defensively by key before hashing. Callers already sort, but a
+  // future caller that passes an unsorted array would produce a silently
+  // wrong digest. The comparator is code-point order (matching canonicalize
+  // above) so the digest is deterministic across platforms.
+  const sorted = entries.toSorted((left, right) =>
+    left.key < right.key ? -1 : left.key > right.key ? 1 : 0,
+  );
+  return sha256Hex(sorted.map((entry) => `${entry.key}:${entry.sha256}`).join("\n"));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

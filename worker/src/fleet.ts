@@ -24725,7 +24725,14 @@ function canonicalJSONStringify(value: unknown): string {
   if (value && typeof value === "object") {
     const entries = Object.entries(value as Record<string, unknown>)
       .filter(([, item]) => item !== undefined)
-      .toSorted(([left], [right]) => left.localeCompare(right));
+      // Code-point comparison, NOT locale-aware ordering. localeCompare is
+      // locale/environment-dependent and produces different bytes (and thus
+      // different SHA-256 digests) for the same input across runtimes. This
+      // must match stableJSONValue (run-receipt.ts) and canonicalize
+      // (coordinator-migration.ts) so fixedRequestFingerprint,
+      // fixedLeaseCreateIntentHash, and cleanupRunEvidence are deterministic
+      // across platforms.
+      .toSorted(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
     return `{${entries
       .map(([key, item]) => `${JSON.stringify(key)}:${canonicalJSONStringify(item)}`)
       .join(",")}}`;
