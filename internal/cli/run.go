@@ -2693,47 +2693,34 @@ afterSync:
 		if preparedTerminalReceiptFile == nil {
 			return
 		}
-		localReceiptPersisted := attestPath == ""
+		// Local receipt file write: auxiliary error. A write failure cannot
+		// retroactively change the execution outcome. The signed receipt was
+		// already built from the immutable FinalRunOutcome; we persist it as-is
+		// and report any failure as an auxiliary error.
 		if attestPath != "" {
 			artifact, writeErr := persistPreparedRunReceipt(*preparedTerminalReceiptFile)
 			if writeErr != nil {
-				err = errors.Join(err, writeErr)
-				recordRunFailure(&runFailure, writeErr)
-				prepareTerminalRun()
-				if preparedTerminalReceiptFile == nil || preparedTerminalReceipt.ExitCode == 0 {
-					return
-				}
+				auxErr := &AuxiliaryError{Op: "write receipt file", Err: writeErr}
+				err = errors.Join(err, auxErr)
+				recordRunFailure(&runFailure, auxErr)
+				fmt.Fprintf(a.Stderr, "warning: receipt file write failed (execution outcome unchanged): %v\n", writeErr)
 			} else {
-				localReceiptPersisted = true
 				fmt.Fprintf(a.Stderr, "artifact kind=receipt path=%s bytes=%d\n", artifact.Path, artifact.Bytes)
 			}
 		}
+		// Coordinator commit: auxiliary error. A coordinator failure cannot
+		// retroactively change the execution outcome. The signed receipt and
+		// evidence were already built from the immutable FinalRunOutcome; we
+		// send them as-is and report any failure as an auxiliary error.
+		//
+		// The previous code rebuilt the receipt with a failure exit code on
+		// coordinator commit failure, turning a successful remote execution
+		// into a failed signed execution. That violated the immutability rule.
 		if finishErr := recorder.Finish(ctx, target, preparedTerminalReceipt.ExitCode, timings.sync, timings.command, terminalLog.Log, terminalLog.Truncated, results, classification, &preparedTerminalReceipt, runEvidence); finishErr != nil {
-			err = errors.Join(err, finishErr)
-			recordRunFailure(&runFailure, finishErr)
-			if localReceiptPersisted && attestPath != "" && preparedTerminalReceipt.ExitCode == 0 {
-				// The coordinator commit is now ambiguous. Preserve the exact receipt
-				// sent remotely, but make the local CLI failure impossible to miss.
-				failedReceipt, receiptErr := buildTerminalReceipt(exitCodeForError(finishErr, 7))
-				if receiptErr != nil {
-					err = errors.Join(err, receiptErr)
-					recordRunFailure(&runFailure, receiptErr)
-				} else {
-					failedPrepared, prepareErr := prepareTerminalRunReceipt(attestPath, failedReceipt)
-					if prepareErr != nil {
-						err = errors.Join(err, prepareErr)
-						recordRunFailure(&runFailure, prepareErr)
-					} else if artifact, writeErr := persistPreparedRunReceipt(failedPrepared); writeErr != nil {
-						err = errors.Join(err, writeErr)
-						recordRunFailure(&runFailure, writeErr)
-					} else {
-						fmt.Fprintf(a.Stderr, "artifact kind=receipt path=%s bytes=%d\n", artifact.Path, artifact.Bytes)
-					}
-				}
-			}
-			if a.runOutcome != nil {
-				a.runOutcome.Recorded = false
-			}
+			auxErr := &AuxiliaryError{Op: "coordinator commit", Err: finishErr}
+			err = errors.Join(err, auxErr)
+			recordRunFailure(&runFailure, auxErr)
+			fmt.Fprintf(a.Stderr, "warning: coordinator commit failed (execution outcome unchanged): %v\n", finishErr)
 		} else if a.runOutcome != nil {
 			a.runOutcome.ExitCode = preparedTerminalReceipt.ExitCode
 		}
