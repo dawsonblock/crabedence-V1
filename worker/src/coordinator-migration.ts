@@ -50,7 +50,27 @@ export interface CoordinatorImportPlan {
 export interface CoordinatorImportOptions {
   /** Plan only: validate the document and compare keys without writing. */
   dryRun?: boolean;
-  /** How to treat keys that already exist with different values. */
+  /**
+   * How to treat keys that already exist with different values.
+   *
+   * Conflict semantics (frozen):
+   * - "fail" (default): Global all-or-nothing. All conflicts are detected
+   *   upfront before any write. If any conflict exists, the entire import
+   *   is aborted — no entries are written, no batches are applied. This
+   *   is the only mode that guarantees atomicity across the full import.
+   * - "skip": Conflicting entries are skipped; non-conflicting entries are
+   *   written in batches. Partial application is possible: if a later
+   *   batch fails, earlier batches have already been committed. The result
+   *   reports `written` (successfully applied) and `skipped` (conflicts
+   *   bypassed). Resume by re-running with the same document — already-
+   *   written entries are detected as unchanged.
+   * - "overwrite": Conflicting entries are overwritten with the incoming
+   *   value. Same partial-batch semantics as "skip".
+   *
+   * For "skip" and "overwrite", the import is NOT atomic across batches.
+   * A batch boundary failure leaves earlier batches committed. Use "fail"
+   * when atomicity is required, or run a verification pass afterward.
+   */
   onConflict?: "fail" | "skip" | "overwrite";
   /** Entries per transaction; bounds individual commit size. */
   batchSize?: number;
