@@ -1282,6 +1282,12 @@ type RunResult struct {
 	LogExcerpt    string
 	ActionsURL    string
 	Artifacts     []RunArtifact
+
+	// StartupConfirm is the structured startup confirmation result, if the
+	// provider performed startup confirmation. It is populated even on
+	// failure, so callers can record startup evidence for provider
+	// qualification.
+	StartupConfirm *StartupConfirmSummary
 }
 
 type RunStatus string

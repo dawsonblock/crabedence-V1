@@ -74,6 +74,9 @@ type RunEvidenceV1 struct {
 	// Artifacts
 	Artifacts []RunEvidenceArtifact `json:"artifacts,omitempty"`
 
+	// Startup confirmation result (provider qualification evidence)
+	StartupConfirm *StartupConfirmSummary `json:"startup_confirm,omitempty"`
+
 	// Integrity
 	StartedAt string `json:"started_at,omitempty"`
 	EndedAt   string `json:"ended_at,omitempty"`
@@ -135,6 +138,8 @@ type RunEvidenceInput struct {
 
 	Artifacts []RunEvidenceArtifact
 
+	StartupConfirm *StartupConfirmSummary
+
 	StartedAt time.Time
 	EndedAt   time.Time
 }
@@ -192,6 +197,7 @@ func NewRunEvidence(input RunEvidenceInput) RunEvidenceV1 {
 		RetryLikely:        input.RetryLikely,
 		FailureHint:        input.FailureHint,
 		Artifacts:          input.Artifacts,
+		StartupConfirm:     input.StartupConfirm,
 	}
 	if !input.StartedAt.IsZero() {
 		ev.StartedAt = input.StartedAt.UTC().Format(time.RFC3339Nano)
@@ -393,6 +399,9 @@ func evidenceToOrderedMap(ev RunEvidenceV1) *orderedMap {
 	if len(ev.Artifacts) > 0 {
 		raw["artifacts"] = runEvidenceArtifactsCanonical(ev.Artifacts)
 	}
+	if ev.StartupConfirm != nil {
+		raw["startup_confirm"] = startupConfirmCanonical(ev.StartupConfirm)
+	}
 	if ev.StartedAt != "" {
 		raw["started_at"] = ev.StartedAt
 	}
@@ -506,6 +515,22 @@ func runEvidenceArtifactsCanonical(artifacts []RunEvidenceArtifact) []any {
 	return out
 }
 
+// startupConfirmCanonical converts a StartupConfirmSummary to a canonical
+// (sorted-key) ordered map for JSON serialization.
+func startupConfirmCanonical(sc *StartupConfirmSummary) *orderedMap {
+	m := newOrderedMap()
+	m.set("stage", sc.Stage)
+	m.set("duration_ms", sc.DurationMs)
+	m.set("ready", sc.Ready)
+	if sc.ProcessExited {
+		m.set("process_exited", sc.ProcessExited)
+	}
+	if sc.Retryable {
+		m.set("retryable", sc.Retryable)
+	}
+	return m
+}
+
 // VerifyRunEvidenceDigest returns true if the evidence's digest matches a
 // freshly computed digest over its content (excluding the digest field).
 func VerifyRunEvidenceDigest(ev RunEvidenceV1) bool {
@@ -559,6 +584,7 @@ func RunEvidenceFromTimingReport(report TimingReport) RunEvidenceV1 {
 		ResourceExhaustion: report.ResourceExhaustion,
 		RetryLikely:        report.RetryLikely,
 		Artifacts:          artifacts,
+		StartupConfirm:     report.StartupConfirm,
 	})
 }
 
@@ -574,17 +600,18 @@ func RunEvidenceFromRunResult(result RunResult) RunEvidenceV1 {
 		})
 	}
 	input := RunEvidenceInput{
-		Provider:      result.Provider,
-		LeaseID:       result.LeaseID,
-		Slug:          result.Slug,
-		CommandText:   result.CommandText,
-		ExitCode:      result.ExitCode,
-		RunStatus:     result.Status,
-		ErrorKind:     result.ErrorKind,
-		TotalMs:       result.Total.Milliseconds(),
-		CommandMs:     result.Command.Milliseconds(),
-		SyncDelegated: result.SyncDelegated,
-		Artifacts:     artifacts,
+		Provider:       result.Provider,
+		LeaseID:        result.LeaseID,
+		Slug:           result.Slug,
+		CommandText:    result.CommandText,
+		ExitCode:       result.ExitCode,
+		RunStatus:      result.Status,
+		ErrorKind:      result.ErrorKind,
+		TotalMs:        result.Total.Milliseconds(),
+		CommandMs:      result.Command.Milliseconds(),
+		SyncDelegated:  result.SyncDelegated,
+		Artifacts:      artifacts,
+		StartupConfirm: result.StartupConfirm,
 	}
 	if result.Session != nil {
 		input.RunID = result.Session.RunID

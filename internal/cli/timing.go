@@ -55,6 +55,18 @@ type TimingReport struct {
 
 	LeaseStopped *bool  `json:"leaseStopped,omitempty"`
 	LeaseStopErr string `json:"leaseStopError,omitempty"`
+
+	StartupConfirm *StartupConfirmSummary `json:"startupConfirm,omitempty"`
+}
+
+// StartupConfirmSummary is a portable summary of the startup confirmation
+// result, persisted in the timing report for provider qualification.
+type StartupConfirmSummary struct {
+	Stage         string `json:"stage"`
+	DurationMs    int64  `json:"durationMs"`
+	Ready         bool   `json:"ready"`
+	ProcessExited bool   `json:"processExited,omitempty"`
+	Retryable     bool   `json:"retryable,omitempty"`
 }
 
 type TimingPhase struct {
@@ -123,6 +135,9 @@ func TimingReportWithRunResult(report TimingReport, result RunResult, err error)
 	}
 	if report.ErrorKind == "" {
 		report.ErrorKind = result.ErrorKind
+	}
+	if result.StartupConfirm != nil && report.StartupConfirm == nil {
+		report.StartupConfirm = result.StartupConfirm
 	}
 	return report
 }

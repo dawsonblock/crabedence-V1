@@ -39,6 +39,8 @@ type startupProcess struct {
 	transferred  bool
 	stopLifetime func() bool
 	lifetimeDone chan struct{}
+
+	startupConfirmResult shared.StartupConfirmResult
 }
 
 func (b *backend) startVM(ctx context.Context, name string, keep bool) (*startupProcess, error) {
@@ -117,8 +119,16 @@ func (p *startupProcess) reap() {
 // routed through the shared interface so providers can plug in their own.
 func (p *startupProcess) confirmStartup(ctx context.Context, timeout time.Duration) error {
 	confirm := shared.TimeoutWindowConfirm{Timeout: timeout}
-	_, err := confirm.Wait(ctx, p, p.exitedErr)
+	result, err := confirm.Wait(ctx, p.exitedErr)
+	p.startupConfirmResult = result
 	return err
+}
+
+// StartupConfirmResult returns the structured startup confirmation result
+// captured during confirmStartup. It is populated even on failure, so
+// callers can record startup evidence for provider qualification.
+func (p *startupProcess) StartupConfirmResult() shared.StartupConfirmResult {
+	return p.startupConfirmResult
 }
 
 // observe is retained for backward compatibility; it delegates to

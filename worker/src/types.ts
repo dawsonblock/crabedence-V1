@@ -1087,10 +1087,26 @@ export interface RunEvidenceV1 {
   // Artifacts
   artifacts?: RunEvidenceArtifact[];
 
+  // Startup confirmation result (provider qualification evidence)
+  startup_confirm?: StartupConfirmSummary;
+
   // Integrity
   started_at?: string;
   ended_at?: string;
   digest: string;
+}
+
+/**
+ * StartupConfirmSummary is a portable summary of the startup confirmation
+ * result, persisted in the timing report and evidence for provider
+ * qualification.
+ */
+export interface StartupConfirmSummary {
+  stage: string;
+  duration_ms: number;
+  ready: boolean;
+  process_exited?: boolean;
+  retryable?: boolean;
 }
 
 export interface RunnerPhaseEntry {
