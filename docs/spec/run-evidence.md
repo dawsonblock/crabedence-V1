@@ -287,3 +287,20 @@ REGEN_GOLDEN=1 go test -run TestRegenerateEvidenceGoldenFixture ./internal/cli/.
 
 Any change to this specification requires regenerating the fixtures and
 passing both runtimes' golden tests in the same commit.
+
+## TerminalBundleV1 scope
+
+`TerminalBundleV1` is an **internal-only** aggregate (Option A). It
+groups evidence, receipt, and terminal log metadata for in-process
+atomic persistence. The coordinator API continues to transport receipt,
+evidence, and terminal log metadata as separate fields.
+
+This decision is deliberate: the wire-level contract is the pair
+(`RunEvidenceV1`, `TerminalRunReceiptV3`), bound by
+`evidence_sha256`. `TerminalBundleV1` is the production finalizer's
+internal representation, not a wire type.
+
+A future revision may promote `TerminalBundleV1` to a wire-level
+envelope (Option B), but that requires a separate spec amendment and
+coordinator API change. Do not assume wire-level bundle semantics
+until that amendment exists.

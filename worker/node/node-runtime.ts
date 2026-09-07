@@ -161,26 +161,32 @@ export class NodeCoordinatorRuntime implements CoordinatorRuntime {
         retryDelay: 5,
         retryBackoff: true,
       });
+      if (this.startupAbort?.signal.aborted) throw new Error("startup aborted: authority lost");
       await this.boss.createQueue(reconcileQueue, {
         policy: "exclusive",
         retryLimit: 5,
         retryDelay: 5,
         retryBackoff: true,
       });
+      if (this.startupAbort?.signal.aborted) throw new Error("startup aborted: authority lost");
       await this.boss.work(alarmQueue, { pollingIntervalSeconds: 1 }, async () => {
         await this.runAlarm();
       });
+      if (this.startupAbort?.signal.aborted) throw new Error("startup aborted: authority lost");
       await this.boss.work(reconcileQueue, { pollingIntervalSeconds: 5 }, async () => {
         await this.runAlarm();
       });
+      if (this.startupAbort?.signal.aborted) throw new Error("startup aborted: authority lost");
       await this.boss.schedule(reconcileQueue, "*/15 * * * *", null, {
         tz: "UTC",
         singletonKey: "reconcile",
       });
+      if (this.startupAbort?.signal.aborted) throw new Error("startup aborted: authority lost");
       await this.boss.send(reconcileQueue, null, {
         singletonKey: "startup",
         singletonSeconds: 60,
       });
+      if (this.startupAbort?.signal.aborted) throw new Error("startup aborted: authority lost");
       // Startup complete: transition to running and remove the startup
       // abort callback. Authority loss from now on is handled by the
       // normal authority-lost callbacks.

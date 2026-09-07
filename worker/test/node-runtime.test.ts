@@ -732,3 +732,144 @@ describe("NodeCoordinatorRuntime", () => {
     expect(release).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("NodeCoordinatorRuntime startup fault injection", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    delete (mocks.storage as Record<string, unknown>)["acquireCoordinatorLock"];
+    const storage = new ProvisioningTestStorage();
+    mocks.storage.get.mockImplementation((key) => storage.get(key));
+    mocks.storage.put.mockImplementation((key, value) => storage.put(key, value));
+    mocks.storage.delete.mockImplementation((key) => storage.delete(key));
+    mocks.storage.transaction.mockImplementation((callback) => storage.transaction(callback));
+    mocks.storage.list.mockImplementation((options) =>
+      storage.list(options as Parameters<CoordinatorStorageView["list"]>[0]),
+    );
+  });
+
+  function makeLock() {
+    const release = vi.fn<() => Promise<void>>(async () => {});
+    let onLostCallback: (() => void) | undefined;
+    const onLost = (callback: () => void) => {
+      onLostCallback = callback;
+    };
+    return {
+      release,
+      onLost,
+      triggerLost: () => onLostCallback?.(),
+      hasLostCallback: () => onLostCallback !== undefined,
+    };
+  }
+
+  function setupLock() {
+    const lock = makeLock();
+    const storage = mocks.storage as typeof mocks.storage & {
+      acquireCoordinatorLock: () => Promise<{
+        release(): Promise<void>;
+        onLost?: (callback: () => void) => void;
+      }>;
+    };
+    storage.acquireCoordinatorLock = vi.fn<
+      () => Promise<{
+        release(): Promise<void>;
+        onLost?: (callback: () => void) => void;
+      }>
+    >(async () => ({ release: lock.release, onLost: lock.onLost }));
+    return lock;
+  }
+
+  const faultStages = [
+    {
+      name: "boss.start",
+      setup: () => {
+        mocks.boss.start.mockRejectedValueOnce(new Error("boss start failed"));
+      },
+    },
+    {
+      name: "createQueue",
+      setup: () => {
+        mocks.boss.createQueue.mockRejectedValueOnce(new Error("createQueue failed"));
+      },
+    },
+    {
+      name: "work registration",
+      setup: () => {
+        mocks.boss.work.mockRejectedValueOnce(new Error("work registration failed"));
+      },
+    },
+    {
+      name: "schedule",
+      setup: () => {
+        mocks.boss.schedule.mockRejectedValueOnce(new Error("schedule failed"));
+      },
+    },
+    {
+      name: "send startup reconciliation",
+      setup: () => {
+        mocks.boss.send.mockRejectedValueOnce(new Error("send failed"));
+      },
+    },
+  ];
+
+  for (const stage of faultStages) {
+    it(`fails cleanly on startup fault at ${stage.name}`, async () => {
+      const lock = setupLock();
+      stage.setup();
+
+      const runtime = new NodeCoordinatorRuntime("postgresql://example.invalid/test");
+      await expect(runtime.start(async () => {})).rejects.toThrow();
+
+      // Runtime state is deterministic: stopped.
+      expect(runtime.getLifecycleState()).toBe("stopped");
+      // Lock was released during cleanup.
+      expect(lock.release).toHaveBeenCalledTimes(1);
+      // pg-boss was stopped if it was started.
+      if (stage.name !== "boss.start") {
+        expect(mocks.boss.stop).toHaveBeenCalled();
+      }
+    });
+  }
+
+  for (const stage of faultStages) {
+    it(`handles authority loss during startup at ${stage.name}`, async () => {
+      const lock = setupLock();
+
+      // Make the target stage's operation block so we can trigger
+      // authority loss while it's pending. The abort check after the
+      // stage will then catch the abort.
+      let resolveStage: () => void;
+      const stagePromise = new Promise<void>((resolve) => {
+        resolveStage = resolve;
+      });
+
+      if (stage.name === "boss.start") {
+        mocks.boss.start.mockReturnValueOnce(stagePromise);
+      } else if (stage.name === "createQueue") {
+        mocks.boss.createQueue.mockReturnValueOnce(stagePromise);
+      } else if (stage.name === "work registration") {
+        mocks.boss.work.mockReturnValueOnce(stagePromise.then(() => "worker-id"));
+      } else if (stage.name === "schedule") {
+        mocks.boss.schedule.mockReturnValueOnce(stagePromise);
+      } else if (stage.name === "send startup reconciliation") {
+        mocks.boss.send.mockReturnValueOnce(stagePromise.then(() => "job-id"));
+      }
+
+      const runtime = new NodeCoordinatorRuntime("postgresql://example.invalid/test");
+      const startPromise = runtime.start(async () => {});
+
+      // Wait for the lock to be acquired and the blocking stage to be
+      // reached, then trigger authority loss and resolve the stage.
+      await vi.waitFor(() => expect(lock.hasLostCallback()).toBe(true));
+      // Give the runtime a tick to reach the blocking operation.
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      lock.triggerLost();
+      resolveStage!();
+
+      await expect(startPromise).rejects.toThrow();
+      expect(runtime.lostAuthority()).toBe(true);
+      expect(runtime.getLifecycleState()).toBe("stopped");
+      // Lock was released during cleanup.
+      expect(lock.release).toHaveBeenCalledTimes(1);
+    });
+  }
+});
