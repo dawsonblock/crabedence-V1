@@ -1147,6 +1147,46 @@ export interface RunFinishRequest {
   evidence?: RunEvidenceV1;
 }
 
+/**
+ * TerminalBundleV1 is the atomic terminal record: evidence, receipt, and
+ * terminal log bound together as a single unit. The bundle is self-verified
+ * before being sent to the coordinator. The coordinator atomically persists
+ * all parts in a single transaction.
+ *
+ * The bundle replaces the previous pattern of sending evidence and receipt
+ * as separate fields that could be independently accepted or rejected. With
+ * TerminalBundleV1, either the entire bundle is accepted or it is rejected.
+ *
+ * The coordinator's finishRun endpoint already accepts receipt and evidence
+ * as part of RunFinishRequest and persists them atomically in a single
+ * storage transaction. TerminalBundleV1 documents this contract explicitly.
+ */
+export interface TerminalBundleV1 {
+  /** Schema version for the bundle format itself. */
+  bundle_schema_version: 1;
+  /** RunEvidenceV1 record. */
+  evidence: RunEvidenceV1;
+  /** Signed TerminalRunReceiptV3. */
+  receipt: TerminalRunReceipt;
+  /** Terminal log content (may be truncated). */
+  terminal_log?: string;
+  /** Whether the terminal log was truncated. */
+  log_truncated?: boolean;
+  /** SHA-256 of the full (untruncated) terminal log. */
+  log_sha256?: string;
+  /** SHA-256 of the retained (possibly truncated) log. */
+  retained_log_sha256?: string;
+  /** Test result summary (if any). */
+  results?: TestResultSummary;
+  /** Failure classification (if any). */
+  blocked_stage?: string;
+  retry_likely?: string;
+  /** Sync phase duration in milliseconds. */
+  sync_ms?: number;
+  /** Command phase duration in milliseconds. */
+  command_ms?: number;
+}
+
 export interface RunTelemetryRequest {
   telemetry?: Partial<LeaseTelemetry>;
 }
