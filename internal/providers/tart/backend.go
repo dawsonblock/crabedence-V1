@@ -101,8 +101,8 @@ func applyDefaults(cfg *Config) {
 // startSupervisedVM routes VM start through the injectable ProcessSupervisor.
 // When the supervisor is the default tartProcessSupervisor, this is equivalent
 // to calling startVM directly. When a test injects a fake, no real process is
-// spawned. The returned *startupProcess satisfies shared.ProcessHandle.
-func (b *backend) startSupervisedVM(ctx context.Context, name string, keep bool) (*startupProcess, error) {
+// spawned. The returned ProcessHandle provides Context, Abort, and Handoff.
+func (b *backend) startSupervisedVM(ctx context.Context, name string, keep bool) (shared.ProcessHandle, error) {
 	handle, err := b.supervisor.Start(ctx, shared.ProcessStartRequest{
 		Name:           name,
 		Keep:           keep,
@@ -111,18 +111,7 @@ func (b *backend) startSupervisedVM(ctx context.Context, name string, keep bool)
 	if err != nil {
 		return nil, err
 	}
-	// The default supervisor returns *startupProcess; a fake returns a
-	// fakeProcessHandle. For the fake path, return a minimal stub that
-	// satisfies the Acquire path's abort/handoff/ctx usage.
-	sp, ok := handle.(*startupProcess)
-	if !ok {
-		return &startupProcess{
-			ctx:    ctx,
-			done:   make(chan struct{}),
-			cancel: func(error) {},
-		}, nil
-	}
-	return sp, nil
+	return handle, nil
 }
 
 func (b *backend) Spec() ProviderSpec { return b.spec }
@@ -218,7 +207,7 @@ func (b *backend) Acquire(ctx context.Context, req AcquireRequest) (target Lease
 			return
 		}
 		// Reap our exact child and preserve its failure before name-based cleanup.
-		acquireErr = startup.abort(acquireErr)
+		acquireErr = startup.Abort(acquireErr)
 		cleanup := cleanupUnclaimedVM
 		if publishedClaim.LeaseID != "" {
 			cleanup = func() error {
@@ -233,7 +222,7 @@ func (b *backend) Acquire(ctx context.Context, req AcquireRequest) (target Lease
 		}
 		acquireErr = errors.Join(acquireErr, cleanup())
 	}()
-	ctx = startup.ctx
+	ctx = startup.Context()
 	ip, err := b.waitForIP(ctx, name)
 	if err != nil {
 		return LeaseTarget{}, err
@@ -270,7 +259,7 @@ func (b *backend) Acquire(ctx context.Context, req AcquireRequest) (target Lease
 	if err != nil {
 		return LeaseTarget{}, err
 	}
-	if err := startup.handoff(); err != nil {
+	if err := startup.Handoff(); err != nil {
 		return LeaseTarget{}, err
 	}
 	cleanupKey = false

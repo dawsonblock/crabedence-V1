@@ -11,6 +11,10 @@
 - Providers: add MXC test coverage with a `fakeCommandRunner` that exercises `Run`, `Warmup`, `Stop`, `Status`, `List`, and option-rejection paths without requiring a real `wxc-exec.exe` binary.
 - Providers: add shared `ProcessStartupConfirm` strategies (`TimeoutWindowConfirm`, `FileHandoffConfirm`, `ProcessExitConfirm`) in `internal/providers/shared/process_startup_confirm.go` — standardizes startup readiness detection across providers; Tart and Lume supervisors expose their strategy via `StartupConfirm()`.
 - Providers: add `RunEvidenceV1` (`internal/cli/run_evidence.go`, `worker/src/types.ts`) — provider-neutral, versioned, machine-verifiable run outcome record with SHA-256 integrity digest; normalizes `RunResult` and `TimingReport` into a portable format with outcome, timing, phases, failure classification, and artifacts.
+- CLI: wire `RunEvidenceV1` into the run path — evidence is constructed from the finalized timing report, emitted to stderr alongside timing JSON when `--timing-json` is set, and sent to the coordinator via `FinishRun`; the worker stores it on `RunRecord`.
+- Providers: migrate Tart's `startVM` to use `shared.TimeoutWindowConfirm` internally via `confirmStartup` — the reaper feeds process-exit errors through a buffered `exitedErr` channel consumed by the shared strategy, replacing the legacy `observe` select loop while preserving all abort/handoff/reaper semantics.
+- Providers: migrate Lume's `startVM` to use `shared.FileHandoffConfirm` and `shared.TimeoutWindowConfirm` internally — the owner/ack handoff waits and the final survival window select are all routed through shared strategies, replacing the local `waitForLaunchHandoff` loop.
+- Providers: migrate Tart's `Acquire` to use `ProcessHandle` methods exclusively — `startSupervisedVM` returns `shared.ProcessHandle` (not `*startupProcess`), and `Acquire` uses `handle.Context()`, `handle.Abort()`, and `handle.Handoff()` instead of reaching into private struct fields; `ProcessHandle` gained a `Context() context.Context` method.
 
 ## 0.50.0 - 2026-09-05
 

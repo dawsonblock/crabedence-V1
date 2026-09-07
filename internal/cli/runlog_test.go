@@ -369,7 +369,7 @@ func captureTerminalLogWire(t *testing.T, raw []byte) map[string]any {
 	}))
 	defer server.Close()
 	client := CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
-	if _, err := client.FinishRun(t.Context(), "run_unicode", 0, 0, time.Second, retained.Log, retained.Truncated, nil, nil, FailureClassification{}, &receipt); err != nil {
+	if _, err := client.FinishRun(t.Context(), "run_unicode", 0, 0, time.Second, retained.Log, retained.Truncated, nil, nil, FailureClassification{}, &receipt, nil); err != nil {
 		t.Fatal(err)
 	}
 	var joined strings.Builder

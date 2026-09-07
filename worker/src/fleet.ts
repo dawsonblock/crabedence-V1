@@ -14819,6 +14819,7 @@ export class FleetCoordinator {
         if (input.results) next.results = boundedTestResults(input.results);
         if (telemetry) next.telemetry = mergeRunTelemetry(next.telemetry, telemetry);
         if (receipt) next.terminalReceipt = receipt;
+        if (input.evidence) next.evidence = input.evidence;
         next.terminalFinishSHA256 = requestedFingerprint;
         next.terminalLogPrefix = terminalLogPrefix;
         const seq = (next.eventCount ?? 0) + 1;

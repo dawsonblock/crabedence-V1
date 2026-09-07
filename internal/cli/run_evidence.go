@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 )
@@ -301,6 +302,14 @@ func (ev RunEvidenceV1) MarshalJSON() ([]byte, error) {
 	}
 	type alias RunEvidenceV1
 	return json.Marshal(alias(ev))
+}
+
+// WriteEvidenceJSON writes the evidence as a single JSON object to w. It is
+// the evidence analogue of writeTimingJSON.
+func WriteEvidenceJSON(w io.Writer, ev RunEvidenceV1) error {
+	encoder := json.NewEncoder(w)
+	encoder.SetEscapeHTML(false)
+	return encoder.Encode(ev)
 }
 
 // RunEvidenceSummary returns a one-line human-readable summary of the evidence.

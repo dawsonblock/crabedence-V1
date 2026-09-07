@@ -480,6 +480,7 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 	var prepareTerminalRun func()
 	var finalizeTerminalRun func()
 	var finalTimingReport *timingReport
+	var runEvidence *RunEvidenceV1
 	var artifactChangeResults []ArtifactChangeResult
 	var timingRecordRepo Repo
 	var timingRecordCommand []string
@@ -522,6 +523,10 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 		}
 		frozenAt := time.Now()
 		report, hasReport := snapshotFinalTimingReport(frozenAt)
+		if hasReport {
+			ev := RunEvidenceFromTimingReport(report)
+			runEvidence = &ev
+		}
 		if hasReport && timingRecordEnabled {
 			recordColdRun := timingRecordColdRun
 			if benchmarkCtx.ColdRun != nil {
@@ -553,6 +558,13 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 				if prepareTerminalRun != nil {
 					prepareTerminalRun()
 				}
+			}
+		}
+		if hasReport && runEvidence != nil && *timingJSON {
+			if writeErr := WriteEvidenceJSON(a.Stderr, *runEvidence); writeErr != nil {
+				timingErr := exit(7, "write evidence JSON: %v", writeErr)
+				err = errors.Join(err, timingErr)
+				runFailure = errors.Join(runFailure, timingErr)
 			}
 		}
 		if finalizeTerminalRun != nil {
@@ -2310,7 +2322,7 @@ afterSync:
 				finalCode = exitCodeForError(finalFailure, 7)
 				classification = ClassifyRunFailure(finalCode, finalFailure.Error(), nil)
 			}
-			if finishErr := recorder.Finish(ctx, target, finalCode, timings.sync, 0, "", false, nil, classification, nil); finishErr != nil {
+			if finishErr := recorder.Finish(ctx, target, finalCode, timings.sync, 0, "", false, nil, classification, nil, nil); finishErr != nil {
 				err = errors.Join(err, finishErr)
 				runFailure = errors.Join(runFailure, finishErr)
 			}
@@ -2656,7 +2668,7 @@ afterSync:
 				fmt.Fprintf(a.Stderr, "artifact kind=receipt path=%s bytes=%d\n", artifact.Path, artifact.Bytes)
 			}
 		}
-		if finishErr := recorder.Finish(ctx, target, preparedTerminalReceipt.ExitCode, timings.sync, timings.command, terminalLog.Log, terminalLog.Truncated, results, classification, &preparedTerminalReceipt); finishErr != nil {
+		if finishErr := recorder.Finish(ctx, target, preparedTerminalReceipt.ExitCode, timings.sync, timings.command, terminalLog.Log, terminalLog.Truncated, results, classification, &preparedTerminalReceipt, runEvidence); finishErr != nil {
 			err = errors.Join(err, finishErr)
 			recordRunFailure(&runFailure, finishErr)
 			if localReceiptPersisted && attestPath != "" && preparedTerminalReceipt.ExitCode == 0 {

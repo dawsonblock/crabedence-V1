@@ -65,6 +65,12 @@ type ProcessHandle interface {
 	Stderr() string
 	// Done is closed when the process has exited and been reaped.
 	Done() <-chan struct{}
+	// Context returns the process's lifecycle context. It is cancelled when
+	// the process exits, so callers can use it for operations that should
+	// abort if the process dies (e.g. waitForIP). After Handoff, the context
+	// is detached from the caller and may or may not remain live depending
+	// on the provider.
+	Context() context.Context
 }
 
 // FakeProcessSupervisor is a test-only ProcessSupervisor that never spawns
@@ -138,6 +144,9 @@ func (h *fakeProcessHandle) PID() int              { return h.pid }
 func (h *fakeProcessHandle) Kill() error           { h.killed = true; return nil }
 func (h *fakeProcessHandle) Stderr() string        { return "" }
 func (h *fakeProcessHandle) Done() <-chan struct{} { return h.done }
+func (h *fakeProcessHandle) Context() context.Context {
+	return context.Background()
+}
 
 func (h *fakeProcessHandle) Abort(readinessErr error) error {
 	close(h.aborted)

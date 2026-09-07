@@ -103,6 +103,14 @@ func (h *lumeProcessHandle) Done() <-chan struct{} {
 	return h.ensureDone()
 }
 
+// Context returns the process's lifecycle context. Lume's startVM handles
+// the startup lifecycle internally and does not expose a process-scoped
+// context, so we return the background context. Callers use their own
+// context for post-startup operations.
+func (h *lumeProcessHandle) Context() context.Context {
+	return context.Background()
+}
+
 // Compile-time checks.
 var _ shared.ProcessSupervisor = (*lumeProcessSupervisor)(nil)
 var _ shared.ProcessHandle = (*lumeProcessHandle)(nil)

@@ -846,7 +846,7 @@ func TestRunRecorderSuppressesMissingEventEndpoint(t *testing.T) {
 	}
 	stdout.Flush()
 	rec.waitForOutputEvents(time.Second)
-	rec.Finish(context.Background(), SSHTarget{TargetOS: targetWindows}, 0, time.Second, time.Second, "ok", false, nil, FailureClassification{}, nil)
+	rec.Finish(context.Background(), SSHTarget{TargetOS: targetWindows}, 0, time.Second, time.Second, "ok", false, nil, FailureClassification{}, nil, nil)
 
 	if eventRequests != 1 {
 		t.Fatalf("event requests=%d, want 1", eventRequests)
@@ -955,7 +955,7 @@ func TestRunRecorderFinishFailureDiagnostics(t *testing.T) {
 					})},
 				}
 				rec := &runRecorder{coord: client, runID: "run_123", stderr: io.Discard}
-				err := rec.Finish(t.Context(), SSHTarget{}, 1, 0, 100*time.Millisecond, "", false, nil, FailureClassification{}, &receipt)
+				err := rec.Finish(t.Context(), SSHTarget{}, 1, 0, 100*time.Millisecond, "", false, nil, FailureClassification{}, &receipt, nil)
 				var exitErr ExitError
 				if !AsExitError(err, &exitErr) || exitErr.Code != 7 || rec.finished {
 					t.Fatalf("Finish error=%v recorded=%v, want unrecorded exit 7", err, rec.finished)
@@ -999,7 +999,7 @@ func TestRunRecorderFinishRetriesIdenticalCommit(t *testing.T) {
 		runID:  "run_123",
 		stderr: io.Discard,
 	}
-	if err := rec.Finish(context.Background(), SSHTarget{}, 7, time.Second, 2*time.Second, "failed\n", false, nil, FailureClassification{}, nil); err != nil {
+	if err := rec.Finish(context.Background(), SSHTarget{}, 7, time.Second, 2*time.Second, "failed\n", false, nil, FailureClassification{}, nil, nil); err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
 	if attempts != 2 || !rec.finished {
@@ -1054,7 +1054,7 @@ func TestRunRecorderFinishVerifiesPersistedReceiptAfterSuccess(t *testing.T) {
 		runID:  "run_123",
 		stderr: io.Discard,
 	}
-	if err := rec.Finish(context.Background(), SSHTarget{}, 1, 0, 100*time.Millisecond, "", false, nil, FailureClassification{}, &receipt); err != nil {
+	if err := rec.Finish(context.Background(), SSHTarget{}, 1, 0, 100*time.Millisecond, "", false, nil, FailureClassification{}, &receipt, nil); err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
 	if finishRequests != 1 || receiptRequests != 1 || !rec.finished {
@@ -1084,7 +1084,7 @@ func TestRunRecorderFinishRejectsLegacySuccessWithoutReceiptPersistence(t *testi
 		runID:  "run_123",
 		stderr: io.Discard,
 	}
-	err := rec.Finish(context.Background(), SSHTarget{}, 1, 0, 100*time.Millisecond, "", false, nil, FailureClassification{}, &receipt)
+	err := rec.Finish(context.Background(), SSHTarget{}, 1, 0, 100*time.Millisecond, "", false, nil, FailureClassification{}, &receipt, nil)
 	var exitErr ExitError
 	if !AsExitError(err, &exitErr) || exitErr.Code != 7 || !strings.Contains(exitErr.Message, "verify persisted terminal receipt") {
 		t.Fatalf("Finish error=%v, want fail-closed receipt verification", err)
@@ -1116,7 +1116,7 @@ func TestRunRecorderFinishRecoversCommittedReceiptAfterLostResponse(t *testing.T
 		runID:  "run_123",
 		stderr: io.Discard,
 	}
-	if err := rec.Finish(context.Background(), SSHTarget{}, 1, 0, 100*time.Millisecond, "", false, nil, FailureClassification{}, &receipt); err != nil {
+	if err := rec.Finish(context.Background(), SSHTarget{}, 1, 0, 100*time.Millisecond, "", false, nil, FailureClassification{}, &receipt, nil); err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
 	if finishRequests != 1 || receiptRequests != 1 || !rec.finished {

@@ -143,7 +143,7 @@ func TestCoordinatorFinishRunSendsLogChunks(t *testing.T) {
 	client := CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
 	log := strings.Repeat("x", coordinatorRunLogChunkBytes) + "tail"
 	load := 0.42
-	if _, err := client.FinishRun(context.Background(), "run_123", 1, time.Second, 2*time.Second, log, false, nil, &RunTelemetrySummary{End: &LeaseTelemetry{Load1: &load}}, FailureClassification{BlockedStage: "unknown", RetryLikely: "unknown"}, nil); err != nil {
+	if _, err := client.FinishRun(context.Background(), "run_123", 1, time.Second, 2*time.Second, log, false, nil, &RunTelemetrySummary{End: &LeaseTelemetry{Load1: &load}}, FailureClassification{BlockedStage: "unknown", RetryLikely: "unknown"}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	chunks, ok := finishBody["logChunks"].([]any)
@@ -167,6 +167,48 @@ func TestCoordinatorFinishRunSendsLogChunks(t *testing.T) {
 	}
 	if finishBody["blockedStage"] != "unknown" || finishBody["retryLikely"] != "unknown" {
 		t.Fatalf("classification fields missing: %#v", finishBody)
+	}
+}
+
+func TestCoordinatorFinishRunSendsEvidence(t *testing.T) {
+	var finishBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/runs/run_ev/finish" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&finishBody); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = w.Write([]byte(`{"run":{"id":"run_ev","leaseID":"","owner":"alice@example.com","org":"example-org","provider":"hetzner","class":"standard","serverType":"cpx21","command":["npm","test"],"state":"succeeded","phase":"succeeded","exitCode":0,"logBytes":0,"logTruncated":false,"startedAt":"2026-05-02T00:00:00Z"}}`))
+	}))
+	defer server.Close()
+	client := CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
+	ev := NewRunEvidence(RunEvidenceInput{
+		Provider:  "hetzner",
+		LeaseID:   "cbx_ev001",
+		ExitCode:  0,
+		TotalMs:   5000,
+		CommandMs: 3000,
+		SyncMs:    2000,
+	})
+	if _, err := client.FinishRun(context.Background(), "run_ev", 0, 2*time.Second, 3*time.Second, "", false, nil, nil, FailureClassification{}, nil, &ev); err != nil {
+		t.Fatal(err)
+	}
+	evidence, ok := finishBody["evidence"].(map[string]any)
+	if !ok {
+		t.Fatalf("evidence missing from body: %#v", finishBody)
+	}
+	if evidence["schema_version"] != float64(1) {
+		t.Fatalf("schema_version=%v", evidence["schema_version"])
+	}
+	if evidence["provider"] != "hetzner" {
+		t.Fatalf("provider=%v", evidence["provider"])
+	}
+	if evidence["run_status"] != "succeeded" {
+		t.Fatalf("run_status=%v", evidence["run_status"])
+	}
+	if evidence["digest"] == nil || evidence["digest"] == "" {
+		t.Fatal("digest missing")
 	}
 }
 
@@ -210,7 +252,7 @@ func TestCoordinatorFinishRunSendsAndRetrievesTerminalReceipt(t *testing.T) {
 	defer server.Close()
 
 	client := CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
-	if _, err := client.FinishRun(context.Background(), "run_123", 1, 100*time.Millisecond, 1900*time.Millisecond, "failed\n", false, nil, nil, FailureClassification{}, &receipt); err != nil {
+	if _, err := client.FinishRun(context.Background(), "run_123", 1, 100*time.Millisecond, 1900*time.Millisecond, "failed\n", false, nil, nil, FailureClassification{}, &receipt, nil); err != nil {
 		t.Fatal(err)
 	}
 	if finishBody.Receipt.Signature != receipt.Signature {

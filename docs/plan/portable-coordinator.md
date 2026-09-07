@@ -320,16 +320,28 @@ coordinator's durable control-plane problem.
   failure classification, and artifacts. Constructed via
   `NewRunEvidence`, `RunEvidenceFromTimingReport`, or
   `RunEvidenceFromRunResult`; verified via `VerifyRunEvidenceDigest`.
+- [x] `RunEvidenceV1` wired into the CLI run path: evidence is constructed
+  from the finalized `TimingReport` in the deferred cleanup, emitted to
+  stderr alongside timing JSON when `--timing-json` is set, and passed to
+  `CoordinatorClient.FinishRun` via a new `evidence` parameter. The worker
+  `RunFinishRequest` and `RunRecord` now accept `evidence?: RunEvidenceV1`,
+  and `finishRun` stores it on the `RunRecord`.
+- [x] Tart `startVM` migrated to use `ProcessStartupConfirm` internally:
+  `confirmStartup` delegates to `shared.TimeoutWindowConfirm.Wait` using
+  the caller's context and a new `exitedErr` channel fed by the reaper.
+  The legacy `observe` method is retained as a compatibility wrapper.
+- [x] Lume `startVM` migrated to use `shared.FileHandoffConfirm` and
+  `shared.TimeoutWindowConfirm` internally: the owner/ack handoff waits
+  and the final survival window select are all routed through shared
+  strategies. The legacy `waitForLaunchHandoff` is retained as a
+  compatibility wrapper.
+- [x] Tart `Acquire` migrated to use `ProcessHandle` methods exclusively:
+  `startSupervisedVM` returns `shared.ProcessHandle` (not `*startupProcess`),
+  and `Acquire` uses `handle.Context()`, `handle.Abort()`, and
+  `handle.Handoff()` instead of reaching into private struct fields.
+  `ProcessHandle` gained a `Context() context.Context` method that returns
+  the process's lifecycle context (cancelled when the process exits).
 
 ### Remaining
 
-- Consolidate Tart's kqueue wait and Lume's file-handoff startup confirmation
-  behind a shared `ProcessStartupConfirm` strategy. *(Strategies defined and
-  wired; the existing `startVM` implementations still own their internal
-  readiness logic — a full migration to the shared strategies is a future
-  refactor.)*
-- Migrate Tart's `Acquire` path to use `ProcessHandle` methods exclusively
-  (currently bridges to `*startupProcess` for `ctx` access).
-- Wire `RunEvidenceV1` into the CLI run path and coordinator `finishRun`
-  so evidence is produced and stored for every run.
 - External provider plugin architecture.

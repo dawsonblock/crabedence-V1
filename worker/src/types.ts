@@ -998,6 +998,7 @@ export interface RunRecord {
   terminalReceipt?: TerminalRunReceipt;
   terminalFinishSHA256?: string;
   terminalLogPrefix?: string;
+  evidence?: RunEvidenceV1;
 }
 
 export interface TerminalRunReceipt {
@@ -1139,6 +1140,7 @@ export interface RunFinishRequest {
   results?: TestResultSummary;
   telemetry?: RunTelemetrySummary;
   receipt?: TerminalRunReceipt;
+  evidence?: RunEvidenceV1;
 }
 
 export interface RunTelemetryRequest {

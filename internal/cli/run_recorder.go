@@ -209,7 +209,7 @@ func (r *runRecorder) StreamWriter(stream string) *runEventStreamWriter {
 	return &runEventStreamWriter{recorder: r, stream: stream}
 }
 
-func (r *runRecorder) Finish(ctx context.Context, target SSHTarget, exitCode int, sync, command time.Duration, log string, truncated bool, results *TestResultSummary, classification FailureClassification, receipt *terminalRunReceipt) error {
+func (r *runRecorder) Finish(ctx context.Context, target SSHTarget, exitCode int, sync, command time.Duration, log string, truncated bool, results *TestResultSummary, classification FailureClassification, receipt *terminalRunReceipt, evidence *RunEvidenceV1) error {
 	if r == nil || r.runID == "" || r.finished {
 		return nil
 	}
@@ -224,7 +224,7 @@ func (r *runRecorder) Finish(ctx context.Context, target SSHTarget, exitCode int
 	attempts := 0
 	for attempt := 1; attempt <= runRecorderFinishAttempts && ctx.Err() == nil; attempt++ {
 		attempts = attempt
-		_, finishErr := r.coord.FinishRun(ctx, r.runID, exitCode, sync, command, log, truncated, results, telemetry, classification, receipt)
+		_, finishErr := r.coord.FinishRun(ctx, r.runID, exitCode, sync, command, log, truncated, results, telemetry, classification, receipt, evidence)
 		if finishErr == nil && receipt == nil {
 			r.finished = true
 			return nil

@@ -863,7 +863,13 @@ exec "$@"`
 	}
 	exitCh := make(chan error, 1)
 	go func() { exitCh <- cmd.Wait() }()
-	if err := waitForLaunchHandoff(ctx, handoff.OwnerPath, strconv.Itoa(owner.PID), exitCh); err != nil {
+	ownerConfirm := shared.FileHandoffConfirm{
+		Path:            handoff.OwnerPath,
+		ExpectedContent: strconv.Itoa(owner.PID),
+		Timeout:         2 * time.Second,
+		PollInterval:    10 * time.Millisecond,
+	}
+	if err := ownerConfirm.Wait(ctx, nil, exitCh); err != nil {
 		_ = cmd.Process.Kill()
 		return owner, exit(2, "lume run %s: establish launch handoff: %v", name, err)
 	}
@@ -877,30 +883,36 @@ exec "$@"`
 		_ = cmd.Process.Kill()
 		return owner, exit(2, "lume run %s: release launch gate: %v", name, err)
 	}
-	if err := waitForLaunchHandoff(ctx, handoff.AckPath, "ready", exitCh); err != nil {
+	ackConfirm := shared.FileHandoffConfirm{
+		Path:            handoff.AckPath,
+		ExpectedContent: "ready",
+		Timeout:         2 * time.Second,
+		PollInterval:    10 * time.Millisecond,
+	}
+	if err := ackConfirm.Wait(ctx, nil, exitCh); err != nil {
 		_ = cmd.Process.Kill()
 		return owner, exit(2, "lume run %s: confirm launch gate: %v", name, err)
 	}
-	select {
-	case <-ctx.Done():
-		_ = cmd.Process.Signal(os.Interrupt)
-		return owner, exit(2, "lume run %s: context cancelled during startup", name)
-	case err := <-exitCh:
+	// After the ack, the launcher has exec'd into lume and the survival window
+	// begins. Use the shared TimeoutWindowConfirm strategy instead of a local
+	// select — semantically identical but routed through the shared interface.
+	survivalConfirm := shared.TimeoutWindowConfirm{Timeout: b.startupObserveTimeout}
+	if err := survivalConfirm.Wait(ctx, nil, exitCh); err != nil {
 		_ = detachedStderr.Sync()
 		if _, seekErr := detachedStderr.Seek(0, io.SeekStart); seekErr == nil {
 			_, _ = io.Copy(&stderrBuf, io.LimitReader(detachedStderr, 64<<10))
 		}
 		detail := strings.TrimSpace(stderrBuf.String())
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			_ = cmd.Process.Signal(os.Interrupt)
+			return owner, exit(2, "lume run %s: context cancelled during startup: %v", name, err)
+		}
 		if detail != "" {
 			return owner, exit(2, "lume run %s failed during startup: %s", name, detail)
 		}
-		if err != nil {
-			return owner, exit(2, "lume run %s failed during startup: %v", name, err)
-		}
-		return owner, exit(2, "lume run %s exited unexpectedly during startup", name)
-	case <-time.After(b.startupObserveTimeout):
-		return owner, nil
+		return owner, exit(2, "lume run %s failed during startup: %v", name, err)
 	}
+	return owner, nil
 }
 
 type launchHandoff struct {
@@ -944,25 +956,16 @@ func prepareLaunchHandoff(token string) (launchHandoff, error) {
 	return handoff, nil
 }
 
+// waitForLaunchHandoff is retained for backward compatibility; new code uses
+// shared.FileHandoffConfirm directly. It delegates to the shared strategy.
 func waitForLaunchHandoff(ctx context.Context, path, expected string, exitCh <-chan error) error {
-	deadline := time.NewTimer(2 * time.Second)
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer deadline.Stop()
-	defer ticker.Stop()
-	for {
-		if data, err := os.ReadFile(path); err == nil && strings.TrimSpace(string(data)) == expected {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case err := <-exitCh:
-			return fmt.Errorf("launcher exited before handoff: %v", err)
-		case <-deadline.C:
-			return fmt.Errorf("timed out waiting for %s", filepath.Base(path))
-		case <-ticker.C:
-		}
+	confirm := shared.FileHandoffConfirm{
+		Path:            path,
+		ExpectedContent: expected,
+		Timeout:         2 * time.Second,
+		PollInterval:    10 * time.Millisecond,
 	}
+	return confirm.Wait(ctx, nil, exitCh)
 }
 
 func lumeRunLogPath(name string) (string, error) {

@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
 const startupDiagnosticLimit = 64 << 10
@@ -23,6 +25,8 @@ type startupProcess struct {
 	caller context.Context
 	ctx    context.Context
 	done   chan struct{}
+
+	exitedErr chan error // buffered, size 1; fed by reap for shared startup confirm
 
 	mu           sync.Mutex
 	cancel       context.CancelCauseFunc
@@ -57,13 +61,13 @@ func (b *backend) startVM(ctx context.Context, name string, keep bool) (*startup
 		detachCommand(cmd)
 	}
 	startupCtx, cancel := context.WithCancelCause(ctx)
-	p := &startupProcess{cmd: cmd, name: name, keep: keep, caller: ctx, ctx: startupCtx, cancel: cancel, log: log, done: make(chan struct{})}
+	p := &startupProcess{cmd: cmd, name: name, keep: keep, caller: ctx, ctx: startupCtx, cancel: cancel, log: log, done: make(chan struct{}), exitedErr: make(chan error, 1)}
 	if err := cmd.Start(); err != nil {
 		cancel(nil)
 		return nil, errors.Join(exit(2, "tart run %s: %v", name, err), p.closeLog())
 	}
 	go p.reap()
-	if err := p.observe(b.startupObserveTimeout); err != nil {
+	if err := p.confirmStartup(ctx, b.startupObserveTimeout); err != nil {
 		return nil, p.abort(err)
 	}
 	return p, nil
@@ -87,6 +91,13 @@ func (p *startupProcess) reap() {
 		default:
 			p.failure = exit(2, "tart run %s exited unexpectedly during startup", p.name)
 		}
+		// Feed the shared startup-confirm channel before cancelling. The
+		// channel is buffered (size 1) so this never blocks even if the
+		// confirm has already timed out.
+		select {
+		case p.exitedErr <- p.failure:
+		default:
+		}
 		if !p.stopping {
 			p.cancel(p.failure)
 		}
@@ -99,14 +110,20 @@ func (p *startupProcess) reap() {
 	close(p.done)
 }
 
+// confirmStartup delegates to the shared ProcessStartupConfirm strategy
+// (TimeoutWindowConfirm) instead of the legacy observe loop. The shared
+// strategy selects on the caller's context, the reaper's exitedErr channel,
+// and the timeout timer — semantically identical to the former observe but
+// routed through the shared interface so providers can plug in their own.
+func (p *startupProcess) confirmStartup(ctx context.Context, timeout time.Duration) error {
+	confirm := shared.TimeoutWindowConfirm{Timeout: timeout}
+	return confirm.Wait(ctx, p, p.exitedErr)
+}
+
+// observe is retained for backward compatibility; it delegates to
+// confirmStartup with the startupProcess's own context.
 func (p *startupProcess) observe(timeout time.Duration) error {
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	select {
-	case <-p.ctx.Done():
-	case <-timer.C:
-	}
-	return context.Cause(p.ctx)
+	return p.confirmStartup(p.ctx, timeout)
 }
 
 // capture and closeLog run with mu held (or before the reaper starts).
@@ -235,6 +252,11 @@ func (p *startupProcess) Stderr() string {
 }
 
 func (p *startupProcess) Done() <-chan struct{} { return p.done }
+
+// Context returns the process's lifecycle context. It is cancelled when the
+// reaper detects process exit, so callers can use it for operations that
+// should abort if the VM dies (e.g. waitForIP).
+func (p *startupProcess) Context() context.Context { return p.ctx }
 
 // Abort is the exported ProcessHandle wrapper for abort.
 func (p *startupProcess) Abort(readinessErr error) error { return p.abort(readinessErr) }
