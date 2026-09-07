@@ -8,6 +8,10 @@ import type { RunEvidenceV1, TerminalRunReceipt } from "../src/types";
 interface GoldenCase {
   name: string;
   evidence: RunEvidenceV1;
+  canonical_json: string;
+  sha256: string;
+  expected_validation: "pass" | "fail";
+  expected_failure?: string;
 }
 
 async function loadGoldenCases(): Promise<GoldenCase[]> {
@@ -16,6 +20,31 @@ async function loadGoldenCases(): Promise<GoldenCase[]> {
     "utf8",
   );
   return JSON.parse(raw) as GoldenCase[];
+}
+
+// Independent implementation of the canonicalization rules from
+// docs/spec/run-evidence.md, deliberately NOT imported from the worker
+// source: if the worker's canonicalizer diverges from the spec, this
+// reproduction is what catches it.
+function specCanonicalize(value: unknown): string {
+  const stable = specStable(value);
+  return JSON.stringify(stable);
+}
+
+function specStable(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(specStable);
+  if (!value || typeof value !== "object") return value ?? null;
+  return Object.fromEntries(
+    Object.entries(value)
+      .toSorted(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+      .map(([key, entry]) => [key, specStable(entry)]),
+  );
+}
+
+async function specDigest(evidence: Record<string, unknown>): Promise<string> {
+  const bytes = new TextEncoder().encode(specCanonicalize({ ...evidence, digest: "" }));
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  return [...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function stubV3Receipt(evidence: RunEvidenceV1, digest: string): TerminalRunReceipt {
@@ -132,15 +161,31 @@ describe("RunEvidenceV1", () => {
   // the RunEvidenceV1 wire format. The cases deliberately cover the
   // canonicalization edge cases: HTML-significant characters, non-ASCII
   // Unicode, nested phase arrays, artifacts, integers at the IEEE-754
-  // safe boundary, and a minimal record with omitted fields.
-  it("validates every Go-generated golden evidence fixture case", async () => {
+  // safe boundary, a minimal record with omitted fields, and a tampered
+  // record whose stale digest must be rejected.
+  it("reproduces every fixture's canonical bytes and digest from the spec", async () => {
     const cases = await loadGoldenCases();
-    expect(cases.length).toBeGreaterThanOrEqual(6);
-    for (const { name, evidence } of cases) {
+    expect(cases.length).toBeGreaterThanOrEqual(7);
+    const digests = await Promise.all(
+      cases.map(({ evidence }) => specDigest(evidence as unknown as Record<string, unknown>)),
+    );
+    cases.forEach(({ name, evidence, canonical_json: canonicalJSON, sha256 }, index) => {
       // The digest must be a raw 64-char hex string (no sha256: prefix).
       expect(evidence.digest, `${name}: digest format`).toMatch(/^[0-9a-f]{64}$/u);
-      expect(evidence.digest, `${name}: digest must not be prefixed`).not.toMatch(/^sha256:/);
-    }
+      // Byte-identical canonicalization: the spec implementation must
+      // reproduce the Go-generated canonical bytes exactly.
+      const reproduced = specCanonicalize({ ...evidence, digest: "" });
+      expect(reproduced, `${name}: canonical bytes differ from fixture`).toBe(canonicalJSON);
+      // The spec-recomputed digest must match the fixture's sha256 —
+      // for tampered cases this is the digest the tamperer failed to
+      // update to, proving the tamper is detectable.
+      expect(digests[index], `${name}: spec digest differs from fixture sha256`).toBe(sha256);
+    });
+  });
+
+  it("accepts every pass fixture through the worker validator", async () => {
+    const cases = (await loadGoldenCases()).filter((entry) => entry.expected_validation === "pass");
+    expect(cases.length).toBeGreaterThanOrEqual(6);
     const results = await Promise.all(
       cases.map(async ({ name, evidence }) => {
         const error = await validateRunEvidence(evidence, {
@@ -158,10 +203,49 @@ describe("RunEvidenceV1", () => {
     }
   });
 
+  it("rejects every fail fixture with the recorded failure reason", async () => {
+    const cases = (await loadGoldenCases()).filter((entry) => entry.expected_validation === "fail");
+    expect(cases.length).toBeGreaterThanOrEqual(1);
+    const results = await Promise.all(
+      cases.map(async ({ name, evidence, expected_failure: expectedFailure }) => {
+        expect(expectedFailure, `${name}: fail case needs expected_failure`).toBeTruthy();
+        const error = await validateRunEvidence(evidence, {
+          runID: evidence.run_id ?? "",
+          leaseID: evidence.lease_id ?? "",
+          provider: evidence.provider,
+          exitCode: evidence.exit_code,
+          receipt: stubV3Receipt(evidence, evidence.digest),
+        });
+        return { name, error, expectedFailure };
+      }),
+    );
+    for (const { name, error, expectedFailure } of results) {
+      expect(error, `${name}: expected validation to fail`).toBeDefined();
+      expect(error?.message, `${name}: unexpected failure reason`).toContain(expectedFailure!);
+    }
+  });
+
   it("rejects tampered golden evidence (digest mismatch)", async () => {
     const [first] = await loadGoldenCases();
     const tampered = { ...first.evidence, total_ms: first.evidence.total_ms + 1 };
     const error = await validateRunEvidence(tampered, {
+      runID: first.evidence.run_id ?? "",
+      leaseID: first.evidence.lease_id ?? "",
+      provider: first.evidence.provider,
+      exitCode: first.evidence.exit_code,
+      receipt: stubV3Receipt(first.evidence, first.evidence.digest),
+    });
+    expect(error).toBeDefined();
+    expect(error?.message).toContain("evidence digest mismatch");
+  });
+
+  it("rejects evidence with an unknown field (digest covers the whole object)", async () => {
+    const [first] = await loadGoldenCases();
+    const extended = {
+      ...first.evidence,
+      injected_field: "attacker-controlled",
+    } as unknown as RunEvidenceV1;
+    const error = await validateRunEvidence(extended, {
       runID: first.evidence.run_id ?? "",
       leaseID: first.evidence.lease_id ?? "",
       provider: first.evidence.provider,
@@ -328,5 +412,65 @@ describe("RunEvidenceV1", () => {
     });
     expect(error).toBeDefined();
     expect(error?.message).toContain("too large");
+  });
+
+  it("rejects a single string field exceeding the byte limit", async () => {
+    const [first] = await loadGoldenCases();
+    const longField = {
+      ...first.evidence,
+      failure_hint: "x".repeat(5 * 1024), // under the 64 KiB total, over the 4 KiB field limit
+      digest: first.evidence.digest,
+    } as unknown as RunEvidenceV1;
+    const error = await validateRunEvidence(longField, {
+      runID: first.evidence.run_id ?? "",
+      leaseID: first.evidence.lease_id ?? "",
+      provider: first.evidence.provider,
+      exitCode: first.evidence.exit_code,
+      receipt: stubV3Receipt(first.evidence, first.evidence.digest),
+    });
+    expect(error).toBeDefined();
+    expect(error?.message).toContain("string field exceeds byte limit");
+  });
+
+  it("rejects phase arrays exceeding the entry limit", async () => {
+    const [first] = await loadGoldenCases();
+    const tooManyPhases = {
+      ...first.evidence,
+      runner_phases: Array.from({ length: 65 }, (_, i) => ({ name: `p${i}`, ms: 1 })),
+      digest: first.evidence.digest,
+    } as unknown as RunEvidenceV1;
+    const error = await validateRunEvidence(tooManyPhases, {
+      runID: first.evidence.run_id ?? "",
+      leaseID: first.evidence.lease_id ?? "",
+      provider: first.evidence.provider,
+      exitCode: first.evidence.exit_code,
+      receipt: stubV3Receipt(first.evidence, first.evidence.digest),
+    });
+    expect(error).toBeDefined();
+    expect(error?.message).toContain("runner_phases exceeds");
+  });
+
+  it("rejects deeply nested evidence", async () => {
+    const [first] = await loadGoldenCases();
+    // Build a chain of nested objects well past the depth limit but tiny
+    // in total bytes, so only the depth check can catch it.
+    let deep: Record<string, unknown> = { leaf: "x" };
+    for (let i = 0; i < 20; i++) {
+      deep = { nested: deep };
+    }
+    const deepEvidence = {
+      ...first.evidence,
+      failure_hint: deep,
+      digest: first.evidence.digest,
+    } as unknown as RunEvidenceV1;
+    const error = await validateRunEvidence(deepEvidence, {
+      runID: first.evidence.run_id ?? "",
+      leaseID: first.evidence.lease_id ?? "",
+      provider: first.evidence.provider,
+      exitCode: first.evidence.exit_code,
+      receipt: stubV3Receipt(first.evidence, first.evidence.digest),
+    });
+    expect(error).toBeDefined();
+    expect(error?.message).toContain("nesting depth");
   });
 });

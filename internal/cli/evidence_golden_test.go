@@ -9,9 +9,17 @@ import (
 )
 
 // evidenceGoldenCase is one entry in the cross-language golden fixture.
+// CanonicalJSON is the exact canonical bytes of the evidence with digest
+// set to "" — both runtimes must reproduce these bytes, not merely agree
+// on the digest. ExpectedValidation is "pass" or "fail"; failing cases
+// carry ExpectedFailure, a substring of the expected rejection reason.
 type evidenceGoldenCase struct {
-	Name     string        `json:"name"`
-	Evidence RunEvidenceV1 `json:"evidence"`
+	Name               string        `json:"name"`
+	Evidence           RunEvidenceV1 `json:"evidence"`
+	CanonicalJSON      string        `json:"canonical_json"`
+	SHA256             string        `json:"sha256"`
+	ExpectedValidation string        `json:"expected_validation"`
+	ExpectedFailure    string        `json:"expected_failure,omitempty"`
 }
 
 // TestEvidenceGoldenFixtureValidates loads the cross-language golden
@@ -33,8 +41,20 @@ func TestEvidenceGoldenFixtureValidates(t *testing.T) {
 			if ev.Digest == "" {
 				t.Fatal("golden evidence has empty digest")
 			}
-			if !VerifyRunEvidenceDigest(ev) {
-				t.Fatalf("golden evidence digest %q does not match recomputed digest", ev.Digest)
+			switch tc.ExpectedValidation {
+			case "pass":
+				if !VerifyRunEvidenceDigest(ev) {
+					t.Fatalf("golden evidence digest %q does not match recomputed digest", ev.Digest)
+				}
+			case "fail":
+				if VerifyRunEvidenceDigest(ev) {
+					t.Fatalf("tampered golden case %s unexpectedly validates", tc.Name)
+				}
+				if tc.ExpectedFailure == "" {
+					t.Fatalf("failing case %s has no expected_failure", tc.Name)
+				}
+			default:
+				t.Fatalf("case %s has invalid expected_validation %q", tc.Name, tc.ExpectedValidation)
 			}
 			if ev.SchemaVersion != 1 {
 				t.Fatalf("golden evidence schema_version=%d, want 1", ev.SchemaVersion)
@@ -64,14 +84,15 @@ func TestEvidenceGoldenFixtureDigestIsRawHex(t *testing.T) {
 }
 
 // TestEvidenceGoldenFixtureCanonicalBytesMatchJS proves the Go
-// canonicalization produces exactly the bytes JavaScript's
-// JSON.stringify(stableJSONValue(...)) produces for the same evidence.
-// It does so by re-serializing each golden case with the canonical
-// encoder and hashing it — the resulting digest must equal the recorded
-// digest, and the raw bytes must not contain \u003c/\u003e/\u0026 escape
-// sequences (which Go's default json.Marshal would emit and JS would not).
+// canonicalization produces exactly the canonical bytes recorded in the
+// fixture (which the TypeScript test independently reproduces from the
+// same spec). The bytes must not contain \u003c/\u003e/\u0026 escape
+// sequences, which Go's default json.Marshal would emit and JS would not.
 func TestEvidenceGoldenFixtureCanonicalBytesMatchJS(t *testing.T) {
 	for _, tc := range loadEvidenceGoldenCases(t) {
+		if tc.CanonicalJSON == "" {
+			t.Fatalf("%s: golden case has no canonical_json", tc.Name)
+		}
 		ev := tc.Evidence
 		clone := ev
 		clone.Digest = ""
@@ -79,10 +100,16 @@ func TestEvidenceGoldenFixtureCanonicalBytesMatchJS(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: canonical encode: %v", tc.Name, err)
 		}
+		if string(data) != tc.CanonicalJSON {
+			t.Fatalf("%s: canonical bytes differ from fixture:\n got: %s\nwant: %s", tc.Name, data, tc.CanonicalJSON)
+		}
 		for _, esc := range []string{`\u003c`, `\u003e`, `\u0026`} {
 			if strings.Contains(string(data), esc) {
 				t.Fatalf("%s: canonical bytes contain %s (HTML escaping must be disabled for JS parity): %s", tc.Name, esc, data)
 			}
+		}
+		if tc.SHA256 == "" || tc.SHA256 != runEvidenceDigest(ev) {
+			t.Fatalf("%s: fixture sha256 %q does not match recomputed digest %q", tc.Name, tc.SHA256, runEvidenceDigest(ev))
 		}
 	}
 }
@@ -110,116 +137,136 @@ func TestRegenerateEvidenceGoldenFixture(t *testing.T) {
 	}
 	started := time.Date(2026, 1, 15, 12, 30, 0, 0, time.UTC)
 	ended := started.Add(5 * time.Second)
-	cases := []evidenceGoldenCase{
-		{
-			Name: "basic",
-			Evidence: NewRunEvidence(RunEvidenceInput{
-				Provider:    "hetzner",
-				LeaseID:     "cbx_abc123",
-				RunID:       "run_test001",
-				Label:       "ci",
-				MachineType: "cpx21",
-				CommandText: "npm test",
-				ExitCode:    0,
-				StartedAt:   started,
-				EndedAt:     ended,
-				TotalMs:     5000,
-				CommandMs:   3000,
-				SyncMs:      2000,
-			}),
-		},
-		{
-			Name: "html-chars",
-			Evidence: NewRunEvidence(RunEvidenceInput{
-				Provider:    "aws",
-				LeaseID:     "cbx_html001",
-				RunID:       "run_html001",
-				CommandText: `grep '<root>' log && echo "a & b < c"`,
-				ExitCode:    0,
-				StartedAt:   started,
-				EndedAt:     ended,
-				TotalMs:     1234,
-				CommandMs:   1000,
-				SyncMs:      234,
-			}),
-		},
-		{
-			Name: "unicode",
-			Evidence: NewRunEvidence(RunEvidenceInput{
-				Provider:    "daytona",
-				LeaseID:     "cbx_uni001",
-				RunID:       "run_uni001",
-				Label:       "生态系-テスト",
-				MachineType: "m7i.large",
-				CommandText: `echo "héllo wörld 🚀 中文 тест"`,
-				ExitCode:    0,
-				StartedAt:   started,
-				EndedAt:     ended,
-				TotalMs:     900,
-				CommandMs:   700,
-				SyncMs:      200,
-			}),
-		},
-		{
-			Name: "nested-phases-artifacts",
-			Evidence: NewRunEvidence(RunEvidenceInput{
-				Provider:    "gcp",
-				LeaseID:     "cbx_nest001",
-				RunID:       "run_nest001",
-				CommandText: "pytest -q",
-				ExitCode:    1,
-				StartedAt:   started,
-				EndedAt:     ended.Add(3 * time.Second),
-				TotalMs:     8000,
-				CommandMs:   6000,
-				SyncMs:      2000,
-				RunnerPhases: []RunnerPhase{
-					{Name: "command", Ms: 6000},
-					{Name: "cleanup", Ms: 300},
-				},
-				SyncPhases: []TimingPhase{
-					{Name: "rsync", Ms: 1500},
-					{Name: "git_hydrate", Ms: 500},
-				},
-				CommandPhases: []TimingPhase{
-					{Name: "exec", Ms: 5900},
-					{Name: "teardown", Ms: 100},
-				},
-				Artifacts: []RunEvidenceArtifact{
-					{Kind: "junit", Path: "test-results.xml", Bytes: 2048, SHA256: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
-					{Kind: "log", Path: "out.log", Bytes: 65536},
-				},
-				BlockedStage: "user-command",
-				RetryLikely:  "true",
-			}),
-		},
-		{
-			Name: "large-ints",
-			Evidence: NewRunEvidence(RunEvidenceInput{
-				Provider:          "azure",
-				LeaseID:           "cbx_big001",
-				RunID:             "run_big001",
-				CommandText:       "dd if=/dev/zero of=/tmp/z bs=1M count=8192",
-				ExitCode:          0,
-				StartedAt:         started,
-				EndedAt:           ended,
-				TotalMs:           45000,
-				CommandMs:         42000,
-				SyncMs:            3000,
-				SyncTransferFiles: 9007199254740000,
-				SyncTransferBytes: 9007199254740991, // 2^53-1: IEEE-754 safe boundary
-			}),
-		},
-		{
-			Name: "minimal",
-			Evidence: NewRunEvidence(RunEvidenceInput{
-				Provider:  "tart",
-				ExitCode:  0,
-				TotalMs:   10,
-				CommandMs: 10,
-			}),
-		},
+	// goldenPass wraps a valid evidence record as an expected-pass case,
+	// recording its exact canonical bytes and digest.
+	goldenPass := func(name string, ev RunEvidenceV1) evidenceGoldenCase {
+		clone := ev
+		clone.Digest = ""
+		data, err := canonicalEvidenceJSON(clone)
+		if err != nil {
+			t.Fatalf("%s: canonical encode: %v", name, err)
+		}
+		return evidenceGoldenCase{
+			Name:               name,
+			Evidence:           ev,
+			CanonicalJSON:      string(data),
+			SHA256:             ev.Digest,
+			ExpectedValidation: "pass",
+		}
 	}
+	basic := NewRunEvidence(RunEvidenceInput{
+		Provider:    "hetzner",
+		LeaseID:     "cbx_abc123",
+		RunID:       "run_test001",
+		Label:       "ci",
+		MachineType: "cpx21",
+		CommandText: "npm test",
+		ExitCode:    0,
+		StartedAt:   started,
+		EndedAt:     ended,
+		TotalMs:     5000,
+		CommandMs:   3000,
+		SyncMs:      2000,
+	})
+	cases := []evidenceGoldenCase{
+		goldenPass("basic", basic),
+		goldenPass("html-chars", NewRunEvidence(RunEvidenceInput{
+			Provider:    "aws",
+			LeaseID:     "cbx_html001",
+			RunID:       "run_html001",
+			CommandText: `grep '<root>' log && echo "a & b < c"`,
+			ExitCode:    0,
+			StartedAt:   started,
+			EndedAt:     ended,
+			TotalMs:     1234,
+			CommandMs:   1000,
+			SyncMs:      234,
+		})),
+		goldenPass("unicode", NewRunEvidence(RunEvidenceInput{
+			Provider:    "daytona",
+			LeaseID:     "cbx_uni001",
+			RunID:       "run_uni001",
+			Label:       "生态系-テスト",
+			MachineType: "m7i.large",
+			CommandText: `echo "héllo wörld 🚀 中文 тест"`,
+			ExitCode:    0,
+			StartedAt:   started,
+			EndedAt:     ended,
+			TotalMs:     900,
+			CommandMs:   700,
+			SyncMs:      200,
+		})),
+		goldenPass("nested-phases-artifacts", NewRunEvidence(RunEvidenceInput{
+			Provider:    "gcp",
+			LeaseID:     "cbx_nest001",
+			RunID:       "run_nest001",
+			CommandText: "pytest -q",
+			ExitCode:    1,
+			StartedAt:   started,
+			EndedAt:     ended.Add(3 * time.Second),
+			TotalMs:     8000,
+			CommandMs:   6000,
+			SyncMs:      2000,
+			RunnerPhases: []RunnerPhase{
+				{Name: "command", Ms: 6000},
+				{Name: "cleanup", Ms: 300},
+			},
+			SyncPhases: []TimingPhase{
+				{Name: "rsync", Ms: 1500},
+				{Name: "git_hydrate", Ms: 500},
+			},
+			CommandPhases: []TimingPhase{
+				{Name: "exec", Ms: 5900},
+				{Name: "teardown", Ms: 100},
+			},
+			Artifacts: []RunEvidenceArtifact{
+				{Kind: "junit", Path: "test-results.xml", Bytes: 2048, SHA256: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+				{Kind: "log", Path: "out.log", Bytes: 65536},
+			},
+			BlockedStage: "user-command",
+			RetryLikely:  "true",
+		})),
+		goldenPass("large-ints", NewRunEvidence(RunEvidenceInput{
+			Provider:          "azure",
+			LeaseID:           "cbx_big001",
+			RunID:             "run_big001",
+			CommandText:       "dd if=/dev/zero of=/tmp/z bs=1M count=8192",
+			ExitCode:          0,
+			StartedAt:         started,
+			EndedAt:           ended,
+			TotalMs:           45000,
+			CommandMs:         42000,
+			SyncMs:            3000,
+			SyncTransferFiles: 9007199254740000,
+			SyncTransferBytes: 9007199254740991, // 2^53-1: IEEE-754 safe boundary
+		})),
+		goldenPass("minimal", NewRunEvidence(RunEvidenceInput{
+			Provider:  "tart",
+			ExitCode:  0,
+			TotalMs:   10,
+			CommandMs: 10,
+		})),
+	}
+	// Tampered variant: the content is mutated but the digest is left
+	// stale, so digest recomputation must reject it. sha256 records the
+	// digest the tampered content actually hashes to (proving the tamper
+	// is detectable, not that the record is valid).
+	tampered := basic
+	tampered.TotalMs += 1
+	tamperedClone := tampered
+	tamperedClone.Digest = ""
+	tamperedData, err := canonicalEvidenceJSON(tamperedClone)
+	if err != nil {
+		t.Fatalf("tampered canonical encode: %v", err)
+	}
+	cases = append(cases, evidenceGoldenCase{
+		Name:               "tampered-total-ms",
+		Evidence:           tampered,
+		CanonicalJSON:      string(tamperedData),
+		SHA256:             runEvidenceDigest(tampered),
+		ExpectedValidation: "fail",
+		ExpectedFailure:    "evidence digest mismatch",
+	})
 	out, err := json.MarshalIndent(cases, "", "  ")
 	if err != nil {
 		t.Fatal(err)

@@ -320,6 +320,13 @@ coordinator's durable control-plane problem.
   failure classification, and artifacts. Constructed via
   `NewRunEvidence`, `RunEvidenceFromTimingReport`, or
   `RunEvidenceFromRunResult`; verified via `VerifyRunEvidenceDigest`.
+  The frozen wire contract — canonicalization, raw-hex digest, receipt v3
+  binding, verification order, and size limits — is specified in
+  [docs/spec/run-evidence.md](../spec/run-evidence.md), with shared
+  golden fixtures (`internal/cli/testdata/evidence-golden.json`)
+  validated by both Go and TypeScript. Evidence is collected for every
+  completed run regardless of `--timing-json`, and the coordinator
+  accepts evidence only with a fully verified v3 receipt binding.
 - [x] `RunEvidenceV1` wired into the CLI run path: evidence is constructed
   from the finalized `TimingReport` in the deferred cleanup, emitted to
   stderr alongside timing JSON when `--timing-json` is set, and passed to

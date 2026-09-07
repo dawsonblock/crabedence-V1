@@ -5,6 +5,10 @@ const terminalReceiptFieldMaxBytes = 4 * 1024;
 const terminalReceiptIdentityMaxBytes = 256;
 const terminalReceiptClockSkewMs = 30_000;
 const runEvidenceMaxBytes = 64 * 1024;
+const runEvidenceMaxPhaseEntries = 64;
+const runEvidenceMaxArtifacts = 64;
+const runEvidenceMaxFieldBytes = 4 * 1024;
+const runEvidenceMaxDepth = 8;
 const terminalReceiptFields = [
   "schema_version",
   "receipt_type",
@@ -165,6 +169,10 @@ export async function validateRunEvidence(
   if (encoder.encode(JSON.stringify(evidence)).byteLength > runEvidenceMaxBytes) {
     return new Error("evidence is too large");
   }
+  // Structural limits bound the cost of the recursive canonicalization
+  // below so evidence cannot become a resource-exhaustion vector.
+  const limitError = checkEvidenceLimits(evidence as Record<string, unknown>);
+  if (limitError) return limitError;
   const ev = evidence as Record<string, unknown>;
   if (ev["schema_version"] !== 1) {
     return new Error("evidence schema_version must be 1");
@@ -229,6 +237,53 @@ export async function validateRunEvidence(
   }
   if (binding.receipt.evidence_sha256 !== ev["digest"]) {
     return new Error("evidence digest does not match receipt evidence_sha256");
+  }
+  return undefined;
+}
+
+// checkEvidenceLimits enforces the structural bounds from the run-evidence
+// spec (docs/spec/run-evidence.md) before the recursive canonicalization
+// runs: per-array phase/artifact counts, per-string byte length, and
+// total nesting depth. Each limit fails closed with a specific reason.
+function checkEvidenceLimits(ev: Record<string, unknown>): Error | undefined {
+  for (const field of ["runner_phases", "sync_phases", "command_phases"] as const) {
+    const value = ev[field];
+    if (value === undefined) continue;
+    if (!Array.isArray(value) || value.length > runEvidenceMaxPhaseEntries) {
+      return new Error(`evidence ${field} exceeds ${runEvidenceMaxPhaseEntries} entries`);
+    }
+  }
+  const artifacts = ev["artifacts"];
+  if (artifacts !== undefined) {
+    if (!Array.isArray(artifacts) || artifacts.length > runEvidenceMaxArtifacts) {
+      return new Error(`evidence artifacts exceeds ${runEvidenceMaxArtifacts} entries`);
+    }
+  }
+  return checkEvidenceValueLimits(ev, 1);
+}
+
+function checkEvidenceValueLimits(value: unknown, depth: number): Error | undefined {
+  if (depth > runEvidenceMaxDepth) {
+    return new Error(`evidence exceeds nesting depth ${runEvidenceMaxDepth}`);
+  }
+  if (typeof value === "string") {
+    if (encoder.encode(value).byteLength > runEvidenceMaxFieldBytes) {
+      return new Error("evidence string field exceeds byte limit");
+    }
+    return undefined;
+  }
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      const error = checkEvidenceValueLimits(entry, depth + 1);
+      if (error) return error;
+    }
+    return undefined;
+  }
+  if (value && typeof value === "object") {
+    for (const entry of Object.values(value)) {
+      const error = checkEvidenceValueLimits(entry, depth + 1);
+      if (error) return error;
+    }
   }
   return undefined;
 }
