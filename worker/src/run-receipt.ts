@@ -206,6 +206,9 @@ export async function validateRunEvidence(
   if (typeof ev["exit_code"] !== "number" || !Number.isFinite(ev["exit_code"])) {
     return new Error("evidence exit_code must be a finite number");
   }
+  if (!Number.isSafeInteger(ev["exit_code"])) {
+    return new Error("evidence exit_code must be a safe integer");
+  }
   if (ev["exit_code"] !== binding.exitCode) {
     return new Error("evidence exit_code does not match finish exitCode");
   }
@@ -221,6 +224,135 @@ export async function validateRunEvidence(
     return new Error(
       `evidence run_status ${ev["run_status"]} is inconsistent with exit_code ${binding.exitCode}`,
     );
+  }
+  // Reject unknown top-level fields. The allowed set is frozen by the spec
+  // (docs/spec/run-evidence.md). An unknown field would alter the canonical
+  // bytes and therefore the digest, producing a valid-but-wrong record.
+  const allowedFields = new Set([
+    "schema_version",
+    "evidence_type",
+    "provider",
+    "lease_id",
+    "slug",
+    "run_id",
+    "label",
+    "machine_type",
+    "exit_code",
+    "run_status",
+    "error_kind",
+    "command_text",
+    "total_ms",
+    "command_ms",
+    "sync_ms",
+    "runner_total_ms",
+    "end_to_end_ms",
+    "lease_ms",
+    "bootstrap_ms",
+    "hydrate_ms",
+    "probe_ms",
+    "sync_delegated",
+    "sync_skipped",
+    "sync_mode",
+    "sync_transfer_files",
+    "sync_transfer_bytes",
+    "sync_fallback_reason",
+    "runner_phases",
+    "sync_phases",
+    "command_phases",
+    "blocked_stage",
+    "resource_exhaustion",
+    "retry_likely",
+    "failure_hint",
+    "artifacts",
+    "started_at",
+    "ended_at",
+    "digest",
+  ]);
+  for (const key of Object.keys(ev)) {
+    if (!allowedFields.has(key)) {
+      return new Error(`evidence contains unknown field ${JSON.stringify(key)}`);
+    }
+  }
+  // Validate timing fields: must be safe integers, non-negative where applicable.
+  const timingFields: Array<string> = [
+    "total_ms",
+    "command_ms",
+    "sync_ms",
+    "runner_total_ms",
+    "end_to_end_ms",
+    "lease_ms",
+    "bootstrap_ms",
+    "hydrate_ms",
+    "probe_ms",
+    "sync_transfer_bytes",
+  ];
+  for (const field of timingFields) {
+    const value = ev[field];
+    if (value === undefined) continue;
+    if (typeof value !== "number" || !Number.isSafeInteger(value)) {
+      return new Error(`evidence ${field} must be a safe integer`);
+    }
+    if (value < 0) {
+      return new Error(`evidence ${field} must be non-negative`);
+    }
+  }
+  if (ev["sync_transfer_files"] !== undefined) {
+    const value = ev["sync_transfer_files"];
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+      return new Error("evidence sync_transfer_files must be a non-negative safe integer");
+    }
+  }
+  // Validate nested phase arrays: each entry must have name (string) and ms (non-negative int).
+  for (const field of ["runner_phases", "sync_phases", "command_phases"] as const) {
+    const value = ev[field];
+    if (value === undefined) continue;
+    if (!Array.isArray(value)) {
+      return new Error(`evidence ${field} must be an array`);
+    }
+    for (let i = 0; i < value.length; i++) {
+      const entry = value[i];
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        return new Error(`evidence ${field}[${i}] must be an object`);
+      }
+      const rec = entry as Record<string, unknown>;
+      if (typeof rec["name"] !== "string") {
+        return new Error(`evidence ${field}[${i}].name must be a string`);
+      }
+      if (typeof rec["ms"] !== "number" || !Number.isSafeInteger(rec["ms"]) || rec["ms"] < 0) {
+        return new Error(`evidence ${field}[${i}].ms must be a non-negative safe integer`);
+      }
+    }
+  }
+  // Validate artifacts: each entry must have kind and path (strings).
+  if (ev["artifacts"] !== undefined) {
+    const artifacts = ev["artifacts"];
+    if (!Array.isArray(artifacts)) {
+      return new Error("evidence artifacts must be an array");
+    }
+    for (let i = 0; i < artifacts.length; i++) {
+      const entry = artifacts[i];
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        return new Error(`evidence artifacts[${i}] must be an object`);
+      }
+      const rec = entry as Record<string, unknown>;
+      if (typeof rec["kind"] !== "string") {
+        return new Error(`evidence artifacts[${i}].kind must be a string`);
+      }
+      if (typeof rec["path"] !== "string") {
+        return new Error(`evidence artifacts[${i}].path must be a string`);
+      }
+      if (
+        rec["bytes"] !== undefined &&
+        (typeof rec["bytes"] !== "number" ||
+          !Number.isSafeInteger(rec["bytes"]) ||
+          rec["bytes"] < 0)
+      ) {
+        return new Error(`evidence artifacts[${i}].bytes must be a non-negative safe integer`);
+      }
+      if (rec["sha256"] !== undefined && typeof rec["sha256"] !== "string") {
+        return new Error(`evidence artifacts[${i}].sha256 must be a string`);
+      }
+    }
   }
   if (
     typeof ev["digest"] !== "string" ||
@@ -302,10 +434,22 @@ function checkEvidenceValueLimits(value: unknown, depth: number): Error | undefi
 async function computeEvidenceDigest(ev: Record<string, unknown>): Promise<string> {
   const canonical = { ...ev, digest: "" };
   const stable = stableJSONValue(canonical);
-  const digest = new Uint8Array(
-    await crypto.subtle.digest("SHA-256", encoder.encode(JSON.stringify(stable))),
-  );
+  // Go's json.Encoder escapes U+2028/U+2029 even with SetEscapeHTML(false);
+  // JavaScript's JSON.stringify emits them raw. Escape them to match Go's
+  // canonical bytes so both runtimes produce identical SHA-256 digests.
+  const json = escapeJSONSeparators(JSON.stringify(stable));
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", encoder.encode(json)));
   return [...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+// escapeJSONSeparators replaces raw U+2028 (LINE SEPARATOR) and U+2029
+// (PARAGRAPH SEPARATOR) with their \u2028/\u2029 escape sequences. Go's
+// json.Encoder escapes these even with SetEscapeHTML(false), but JavaScript's
+// JSON.stringify emits them as raw UTF-8 bytes, producing different canonical
+// bytes and therefore different SHA-256 digests. This post-processing step
+// makes both runtimes produce byte-identical canonical JSON.
+function escapeJSONSeparators(s: string): string {
+  return s.replaceAll("\u2028", "\\u2028").replaceAll("\u2029", "\\u2029");
 }
 
 function stableJSONValue(value: unknown): unknown {

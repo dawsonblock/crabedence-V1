@@ -250,34 +250,18 @@ func TestIsTransientFileErrorClassification(t *testing.T) {
 
 // TestFileHandoffConfirmFailsImmediatelyOnPermissionDenied verifies that a
 // persistent filesystem error (EACCES) surfaces immediately with the real
-// cause, not after polling until timeout. This is the regression guard for
-// the plan's "persistent FS errors never degrade into timeouts" gate.
+// cause, not after polling until timeout. This uses an injected file reader
+// to return EACCES deterministically, so it works regardless of whether the
+// test runs as root (where chmod 000 would not prevent reads).
 func TestFileHandoffConfirmFailsImmediatelyOnPermissionDenied(t *testing.T) {
-	// Create a directory with no read permission for the ack file path.
-	// On Unix, ReadFile inside it returns EACCES, which isTransientFileError
-	// classifies as persistent, so Wait must return the EACCES error
-	// immediately rather than timing out.
-	dir := t.TempDir()
-	parent := filepath.Join(dir, "noperm")
-	if err := os.Mkdir(parent, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	ackPath := filepath.Join(parent, "ack")
-	// Write the file, then strip parent read/search permission so ReadFile
-	// fails with EACCES. Restore in a defer so cleanup can remove it.
-	if err := os.WriteFile(ackPath, []byte("ready"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(parent, 0o000); err != nil {
-		t.Fatal(err)
-	}
-	defer os.Chmod(parent, 0o755) //nolint:errcheck
-
 	confirm := FileHandoffConfirm{
-		Path:            ackPath,
+		Path:            "/fake/path/ack",
 		ExpectedContent: "ready",
 		Timeout:         2 * time.Second,
 		PollInterval:    10 * time.Millisecond,
+		FileReader: func(path string) ([]byte, error) {
+			return nil, &os.PathError{Op: "open", Path: path, Err: syscall.EACCES}
+		},
 	}
 	exited := make(chan error, 1)
 	start := time.Now()
@@ -289,5 +273,35 @@ func TestFileHandoffConfirmFailsImmediatelyOnPermissionDenied(t *testing.T) {
 	// Must fail well before the 2s timeout — immediate means immediate.
 	if elapsed > 500*time.Millisecond {
 		t.Fatalf("EACCES took %s to surface; persistent error should fail immediately, not poll", elapsed)
+	}
+}
+
+// TestFileHandoffConfirmRetriesOnTransientError verifies that transient
+// filesystem errors (EAGAIN) are retried, not treated as immediate failures.
+func TestFileHandoffConfirmRetriesOnTransientError(t *testing.T) {
+	calls := 0
+	confirm := FileHandoffConfirm{
+		Path:            "/fake/path/ack",
+		ExpectedContent: "ready",
+		Timeout:         2 * time.Second,
+		PollInterval:    10 * time.Millisecond,
+		FileReader: func(path string) ([]byte, error) {
+			calls++
+			if calls < 3 {
+				return nil, &os.PathError{Op: "open", Path: path, Err: syscall.EAGAIN}
+			}
+			return []byte("ready"), nil
+		},
+	}
+	exited := make(chan error, 1)
+	result, err := confirm.Wait(context.Background(), nil, exited)
+	if err != nil {
+		t.Fatalf("expected success after retries, got: %v", err)
+	}
+	if !result.Ready {
+		t.Fatal("expected Ready=true after transient retries")
+	}
+	if calls < 3 {
+		t.Fatalf("expected at least 3 calls, got %d", calls)
 	}
 }

@@ -208,14 +208,24 @@ func NewRunEvidence(input RunEvidenceInput) RunEvidenceV1 {
 // lexicographic code-point key ordering (matching the TypeScript coordinator's
 // stableJSONValue) to ensure both implementations produce identical bytes.
 func runEvidenceDigest(ev RunEvidenceV1) string {
+	b, err := runEvidenceDigestBytes(ev)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+// runEvidenceDigestBytes returns the lowercase hex SHA-256 digest of the
+// canonical JSON encoding of the evidence record (with digest set to "").
+func runEvidenceDigestBytes(ev RunEvidenceV1) ([]byte, error) {
 	clone := ev
 	clone.Digest = ""
 	data, err := canonicalEvidenceJSON(clone)
 	if err != nil {
-		return ""
+		return nil, err
 	}
 	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:])
+	return []byte(hex.EncodeToString(sum[:])), nil
 }
 
 // canonicalEvidenceJSON serializes the evidence as JSON with keys sorted by

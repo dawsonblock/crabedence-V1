@@ -2886,14 +2886,22 @@ function canonicalJSON(value: unknown): string {
       // Code-point comparison, NOT locale-aware ordering. localeCompare is
       // locale/environment-dependent and produces different bytes (and thus
       // different SHA-256 digests) for the same input across runtimes. This
-      // must match stableJSONValue (run-receipt.ts) and canonicalize
+      // must match stableJSONValue (run-revidence.ts) and canonicalize
       // (coordinator-migration.ts) so registry identity, policy, and request
       // hashes are deterministic across platforms.
       .toSorted(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
-      .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJSON(entry)}`)
+      .map(([key, entry]) => `${escapeJSONSeparators(JSON.stringify(key))}:${canonicalJSON(entry)}`)
       .join(",")}}`;
   }
-  return JSON.stringify(value) ?? "null";
+  return escapeJSONSeparators(JSON.stringify(value) ?? "null");
+}
+
+// escapeJSONSeparators replaces raw U+2028/U+2029 with \u2028/\u2029 to match
+// Go's json.Encoder behavior (which escapes them even with SetEscapeHTML(false)).
+// JavaScript's JSON.stringify emits them raw, producing different canonical
+// bytes and therefore different SHA-256 digests.
+function escapeJSONSeparators(s: string): string {
+  return s.replaceAll("\u2028", "\\u2028").replaceAll("\u2029", "\\u2029");
 }
 
 function record(value: unknown): Record<string, unknown> {

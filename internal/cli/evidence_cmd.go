@@ -74,13 +74,18 @@ func (a App) evidenceVerify(ctx context.Context, args []string) error {
 		return exit(2, "read evidence: %v", err)
 	}
 
-	var ev RunEvidenceV1
-	if err := json.Unmarshal(data, &ev); err != nil {
-		return exit(2, "malformed evidence: %v", err)
+	// Use the strict parser: rejects unknown fields, duplicate keys, trailing
+	// data, and incorrect JSON types. This is the cryptographic boundary — a
+	// lenient parser could silently accept a malformed record that produces
+	// different canonical bytes and therefore a wrong digest.
+	ev, err := ParseRunEvidenceV1(data)
+	if err != nil {
+		fmt.Fprintf(a.Stdout, "FAIL %s parse: %v\n", evidencePath, err)
+		return ExitError{Code: 1}
 	}
 
-	// Check 1: schema and structural limits.
-	if err := validateRunEvidenceStructure(ev); err != nil {
+	// Check 1: schema, structural limits, and semantic invariants.
+	if err := ValidateRunEvidenceV1(ev); err != nil {
 		fmt.Fprintf(a.Stdout, "FAIL %s structural_validation: %v\n", evidencePath, err)
 		return ExitError{Code: 1}
 	}

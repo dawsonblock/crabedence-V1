@@ -74,7 +74,13 @@ export interface CoordinatorImportVerification {
 }
 
 export function canonicalCoordinatorJSON(value: unknown): string {
-  return JSON.stringify(canonicalize(value));
+  // Escape U+2028/U+2029 to match Go's json.Encoder behavior. See
+  // escapeJSONSeparators in run-receipt.ts for the rationale.
+  return escapeJSONSeparators(JSON.stringify(canonicalize(value)));
+}
+
+function escapeJSONSeparators(s: string): string {
+  return s.replaceAll("\u2028", "\\u2028").replaceAll("\u2029", "\\u2029");
 }
 
 function canonicalize(value: unknown): unknown {

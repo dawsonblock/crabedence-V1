@@ -2670,6 +2670,22 @@ afterSync:
 			recordRunFailure(&runFailure, receiptErr)
 			return
 		}
+		// Self-verify the generated receipt: confirm the signature is valid
+		// and the evidence_sha256 binding matches the evidence digest. This
+		// catches signing bugs, key mismatches, and binding errors before
+		// the bundle reaches the coordinator. (Phase 8: self-verify.)
+		if verifyErr := verifyTerminalRunReceiptSignature(receipt); verifyErr != nil {
+			err = errors.Join(err, fmt.Errorf("self-verify terminal receipt signature: %w", verifyErr))
+			recordRunFailure(&runFailure, verifyErr)
+			return
+		}
+		if receipt.EvidenceSHA256 != "" && runEvidence.Digest != "" {
+			if receipt.EvidenceSHA256 != runEvidence.Digest {
+				err = errors.Join(err, fmt.Errorf("self-verify evidence binding: receipt evidence_sha256 %s != evidence digest %s", receipt.EvidenceSHA256, runEvidence.Digest))
+				recordRunFailure(&runFailure, fmt.Errorf("evidence binding mismatch"))
+				return
+			}
+		}
 		preparedTerminalReceipt = receipt
 		preparedTerminalReceiptFile = &prepared
 	}

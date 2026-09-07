@@ -75,6 +75,11 @@ type FileHandoffConfirm struct {
 	Timeout time.Duration
 	// PollInterval is the file-check interval. If zero, defaults to 10ms.
 	PollInterval time.Duration
+	// FileReader, if non-nil, replaces os.ReadFile for the readiness check.
+	// This allows tests to inject deterministic filesystem errors (EACCES,
+	// ENOTDIR, ELOOP, etc.) without depending on OS privilege semantics.
+	// Production code leaves this nil and uses os.ReadFile.
+	FileReader func(path string) ([]byte, error)
 }
 
 func (c FileHandoffConfirm) Wait(ctx context.Context, _ ProcessHandle, exited <-chan error) (StartupConfirmResult, error) {
@@ -189,7 +194,13 @@ func (c FileHandoffConfirm) Wait(ctx context.Context, _ ProcessHandle, exited <-
 // (false, nil) if the file is not yet ready (missing or wrong content), or
 // (false, err) for unexpected I/O errors (permission denied, etc.).
 func (c FileHandoffConfirm) checkReady() (bool, error) {
-	data, err := os.ReadFile(c.Path)
+	var data []byte
+	var err error
+	if c.FileReader != nil {
+		data, err = c.FileReader(c.Path)
+	} else {
+		data, err = os.ReadFile(c.Path)
+	}
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return false, nil

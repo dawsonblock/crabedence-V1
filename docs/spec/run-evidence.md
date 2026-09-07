@@ -102,9 +102,15 @@ Canonicalization rules:
    escaped; control characters `U+0008`/`U+0009`/`U+000A`/`U+000C`/
    `U+000D` as `\b`/`\t`/`\n`/`\f`/`\r`, other characters below
    `U+0020` as `\u00XX`. **No HTML escaping**: `<`, `>`, `&` are emitted
-   raw, as are `U+2028` and `U+2029`. (Go implementations must use
-   `json.Encoder` with `SetEscapeHTML(false)`; Go's default
-   `json.Marshal` escapes `<`, `>`, `&` and is not canonical.)
+   raw. **Line/paragraph separators escaped**: `U+2028` (LINE SEPARATOR)
+   and `U+2029` (PARAGRAPH SEPARATOR) are emitted as `\u2028` and
+   `\u2029` respectively, not as raw UTF-8 bytes. This matches Go's
+   `json.Encoder` behavior (which escapes them even with
+   `SetEscapeHTML(false)`); JavaScript's `JSON.stringify` emits them raw
+   and must post-process to escape them. All other Unicode characters
+   above `U+0020` (except `U+2028`/`U+2029`) are emitted as raw UTF-8.
+   (Go implementations must use `json.Encoder` with `SetEscapeHTML(false)`;
+   Go's default `json.Marshal` escapes `<`, `>`, `&` and is not canonical.)
 4. **Numbers**: integers only, serialized as their decimal digits with no
    exponent or fraction part.
 5. **Field set**: exactly the non-omitted fields from the table above.

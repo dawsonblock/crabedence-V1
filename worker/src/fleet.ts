@@ -24734,10 +24734,21 @@ function canonicalJSONStringify(value: unknown): string {
       // across platforms.
       .toSorted(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
     return `{${entries
-      .map(([key, item]) => `${JSON.stringify(key)}:${canonicalJSONStringify(item)}`)
+      .map(
+        ([key, item]) =>
+          `${escapeJSONSeparators(JSON.stringify(key))}:${canonicalJSONStringify(item)}`,
+      )
       .join(",")}}`;
   }
-  return JSON.stringify(value) ?? "null";
+  return escapeJSONSeparators(JSON.stringify(value) ?? "null");
+}
+
+// escapeJSONSeparators replaces raw U+2028/U+2029 with \u2028/\u2029 to match
+// Go's json.Encoder behavior (which escapes them even with SetEscapeHTML(false)).
+// JavaScript's JSON.stringify emits them raw, producing different canonical
+// bytes and therefore different SHA-256 digests.
+function escapeJSONSeparators(s: string): string {
+  return s.replaceAll("\u2028", "\\u2028").replaceAll("\u2029", "\\u2029");
 }
 
 function sanitizeTelemetryTimestamp(value: string | undefined, now: Date): string {

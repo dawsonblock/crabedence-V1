@@ -202,5 +202,94 @@
     "sha256": "a239566d5d893a51bb15add5a7183dc985a5784e04c2a49dbbb5b5a03696bdb7",
     "expected_validation": "fail",
     "expected_failure": "evidence digest mismatch"
+  },
+  {
+    "name": "line-separator",
+    "evidence": {
+      "command_ms": 100,
+      "command_text": "echo hello\u2028world",
+      "digest": "05294018bdb16079f171c3845ba68d4e6ba2930c3e15924d9b2915bbc671384a",
+      "ended_at": "2026-01-15T12:30:05Z",
+      "evidence_type": "run",
+      "exit_code": 0,
+      "lease_id": "cbx_sep001",
+      "provider": "aws",
+      "run_id": "run_ls001",
+      "run_status": "succeeded",
+      "schema_version": 1,
+      "started_at": "2026-01-15T12:30:00Z",
+      "sync_ms": 50,
+      "total_ms": 150
+    },
+    "canonical_json": "{\"command_ms\":100,\"command_text\":\"echo hello\\u2028world\",\"digest\":\"\",\"ended_at\":\"2026-01-15T12:30:05Z\",\"evidence_type\":\"run\",\"exit_code\":0,\"lease_id\":\"cbx_sep001\",\"provider\":\"aws\",\"run_id\":\"run_ls001\",\"run_status\":\"succeeded\",\"schema_version\":1,\"started_at\":\"2026-01-15T12:30:00Z\",\"sync_ms\":50,\"total_ms\":150}",
+    "sha256": "05294018bdb16079f171c3845ba68d4e6ba2930c3e15924d9b2915bbc671384a",
+    "expected_validation": "pass"
+  },
+  {
+    "name": "paragraph-separator",
+    "evidence": {
+      "command_ms": 100,
+      "command_text": "echo hello\u2029world",
+      "digest": "427b1bbb5ca6fe20b31c542962375395804ae3500a72028fb9dba1d87b05b6c5",
+      "ended_at": "2026-01-15T12:30:05Z",
+      "evidence_type": "run",
+      "exit_code": 0,
+      "lease_id": "cbx_sep001",
+      "provider": "aws",
+      "run_id": "run_ps001",
+      "run_status": "succeeded",
+      "schema_version": 1,
+      "started_at": "2026-01-15T12:30:00Z",
+      "sync_ms": 50,
+      "total_ms": 150
+    },
+    "canonical_json": "{\"command_ms\":100,\"command_text\":\"echo hello\\u2029world\",\"digest\":\"\",\"ended_at\":\"2026-01-15T12:30:05Z\",\"evidence_type\":\"run\",\"exit_code\":0,\"lease_id\":\"cbx_sep001\",\"provider\":\"aws\",\"run_id\":\"run_ps001\",\"run_status\":\"succeeded\",\"schema_version\":1,\"started_at\":\"2026-01-15T12:30:00Z\",\"sync_ms\":50,\"total_ms\":150}",
+    "sha256": "427b1bbb5ca6fe20b31c542962375395804ae3500a72028fb9dba1d87b05b6c5",
+    "expected_validation": "pass"
+  },
+  {
+    "name": "combined-separators",
+    "evidence": {
+      "command_ms": 100,
+      "command_text": "echo \u2028line1\u2029para2\u2028end",
+      "digest": "d6e1a229dfe20ffb159a8a481e54b4dc55a8271618c28e104138de66a2c6b591",
+      "ended_at": "2026-01-15T12:30:05Z",
+      "evidence_type": "run",
+      "exit_code": 0,
+      "lease_id": "cbx_sep001",
+      "provider": "aws",
+      "run_id": "run_cs001",
+      "run_status": "succeeded",
+      "schema_version": 1,
+      "started_at": "2026-01-15T12:30:00Z",
+      "sync_ms": 50,
+      "total_ms": 150
+    },
+    "canonical_json": "{\"command_ms\":100,\"command_text\":\"echo \\u2028line1\\u2029para2\\u2028end\",\"digest\":\"\",\"ended_at\":\"2026-01-15T12:30:05Z\",\"evidence_type\":\"run\",\"exit_code\":0,\"lease_id\":\"cbx_sep001\",\"provider\":\"aws\",\"run_id\":\"run_cs001\",\"run_status\":\"succeeded\",\"schema_version\":1,\"started_at\":\"2026-01-15T12:30:00Z\",\"sync_ms\":50,\"total_ms\":150}",
+    "sha256": "d6e1a229dfe20ffb159a8a481e54b4dc55a8271618c28e104138de66a2c6b591",
+    "expected_validation": "pass"
+  },
+  {
+    "name": "unicode-escaping",
+    "evidence": {
+      "command_ms": 100,
+      "command_text": "echo \"\u2028\u2029héllo🚀\u2028\"",
+      "digest": "5b82d3a303cd40a56194b57f42f81d7f334ccf849c81c219500ac80d0d09edc3",
+      "ended_at": "2026-01-15T12:30:05Z",
+      "evidence_type": "run",
+      "exit_code": 0,
+      "label": "生态系\u2028テスト",
+      "lease_id": "cbx_sep001",
+      "provider": "aws",
+      "run_id": "run_ue001",
+      "run_status": "succeeded",
+      "schema_version": 1,
+      "started_at": "2026-01-15T12:30:00Z",
+      "sync_ms": 50,
+      "total_ms": 150
+    },
+    "canonical_json": "{\"command_ms\":100,\"command_text\":\"echo \\\"\\u2028\\u2029héllo🚀\\u2028\\\"\",\"digest\":\"\",\"ended_at\":\"2026-01-15T12:30:05Z\",\"evidence_type\":\"run\",\"exit_code\":0,\"label\":\"生态系\\u2028テスト\",\"lease_id\":\"cbx_sep001\",\"provider\":\"aws\",\"run_id\":\"run_ue001\",\"run_status\":\"succeeded\",\"schema_version\":1,\"started_at\":\"2026-01-15T12:30:00Z\",\"sync_ms\":50,\"total_ms\":150}",
+    "sha256": "5b82d3a303cd40a56194b57f42f81d7f334ccf849c81c219500ac80d0d09edc3",
+    "expected_validation": "pass"
   }
 ]

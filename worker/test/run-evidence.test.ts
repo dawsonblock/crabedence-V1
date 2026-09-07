@@ -28,7 +28,13 @@ async function loadGoldenCases(): Promise<GoldenCase[]> {
 // reproduction is what catches it.
 function specCanonicalize(value: unknown): string {
   const stable = specStable(value);
-  return JSON.stringify(stable);
+  // Match Go's json.Encoder behavior: escape U+2028/U+2029 that
+  // JSON.stringify would emit raw, producing different canonical bytes.
+  return escapeJSONSeparators(JSON.stringify(stable));
+}
+
+function escapeJSONSeparators(s: string): string {
+  return s.replaceAll("\u2028", "\\u2028").replaceAll("\u2029", "\\u2029");
 }
 
 function specStable(value: unknown): unknown {
@@ -253,7 +259,12 @@ describe("RunEvidenceV1", () => {
       receipt: stubV3Receipt(first.evidence, first.evidence.digest),
     });
     expect(error).toBeDefined();
-    expect(error?.message).toContain("evidence digest mismatch");
+    // Unknown fields are rejected before the digest check, since an unknown
+    // field would alter canonical bytes and produce a wrong digest. Both
+    // rejections are valid; the important thing is that the record is rejected.
+    expect(
+      error?.message.includes("unknown field") || error?.message.includes("digest mismatch"),
+    ).toBe(true);
   });
 
   it("rejects a receipt whose evidence_sha256 does not match the evidence digest", async () => {
