@@ -35,6 +35,20 @@ const bridgeDataAttachmentKinds = new Set([
   "runtime-adapter-agent",
 ]);
 
+/**
+ * Explicit coordinator lifecycle states. The runtime transitions through
+ * these states in order:
+ *   idle → starting → running → shutting-down → stopped
+ * Authority loss can force a transition from running → shutting-down → stopped
+ * or from starting → shutting-down → stopped (authority lost during startup).
+ */
+export type CoordinatorLifecycleState =
+  | "idle"
+  | "starting"
+  | "running"
+  | "shutting-down"
+  | "stopped";
+
 export interface NodeUpgradeContext {
   request: IncomingMessage;
   socket: Duplex;
@@ -71,6 +85,9 @@ export class NodeCoordinatorRuntime implements CoordinatorRuntime {
   private stopped = false;
   private readonly authorityLostCallbacks: Array<() => void> = [];
   private readonly maintenance = new Set<Promise<void>>();
+  // Stage 8: explicit lifecycle state and startup abort controller.
+  private lifecycleState: CoordinatorLifecycleState = "idle";
+  private startupAbort?: AbortController;
 
   constructor(connectionString: string) {
     this.storage = new PostgresCoordinatorStorage(connectionString);
@@ -88,12 +105,31 @@ export class NodeCoordinatorRuntime implements CoordinatorRuntime {
 
   async start(alarmHandler: () => Promise<void>): Promise<void> {
     this.alarmHandler = alarmHandler;
+    this.lifecycleState = "starting";
+    this.startupAbort = new AbortController();
+    // Register the authority-lost handler BEFORE acquiring the lock, so
+    // that authority loss during startup (e.g., the lock session dies
+    // mid-startup) triggers fail-closed cleanup immediately.
+    const onStartupAbort = () => {
+      // Abort startup if authority is lost before startup completes.
+      // The startupAbort controller is cleared once startup succeeds,
+      // so a non-undefined value means we're still starting.
+      if (this.startupAbort) {
+        console.error("coordinator authority lost during startup; aborting");
+        this.startupAbort.abort();
+      }
+    };
+    this.authorityLostCallbacks.push(onStartupAbort);
     await this.storage.initialize();
     if (this.storage.acquireCoordinatorLock) {
       // Multi-replica operation is unsafe until bridge ownership is
       // externalized; a contended lock means a second replica is starting.
       const lock = await this.storage.acquireCoordinatorLock();
       if (!lock) {
+        this.lifecycleState = "stopped";
+        // Remove the startup abort callback before throwing.
+        const idx = this.authorityLostCallbacks.indexOf(onStartupAbort);
+        if (idx >= 0) this.authorityLostCallbacks.splice(idx, 1);
         throw new Error(
           "coordinator advisory lock is held by another instance; refusing to start " +
             "(run exactly one coordinator replica per database)",
@@ -106,13 +142,18 @@ export class NodeCoordinatorRuntime implements CoordinatorRuntime {
       lock.onLost?.(() => this.handleCoordinatorAuthorityLost());
     }
     try {
+      // Check for startup abort before each major stage.
+      if (this.startupAbort?.signal.aborted) throw new Error("startup aborted: authority lost");
       await this.scanProvisioning();
+      if (this.startupAbort?.signal.aborted) throw new Error("startup aborted: authority lost");
       this.provisioningScanner = setInterval(() => {
         void this.scanProvisioning();
       }, 1_000);
       this.provisioningScanner.unref();
+      if (this.startupAbort?.signal.aborted) throw new Error("startup aborted: authority lost");
       await this.boss.start();
       this.bossStarted = true;
+      if (this.startupAbort?.signal.aborted) throw new Error("startup aborted: authority lost");
       await this.boss.createQueue(alarmQueue, {
         // "short" permits one queued successor while the current alarm is active.
         policy: "short",
@@ -140,7 +181,15 @@ export class NodeCoordinatorRuntime implements CoordinatorRuntime {
         singletonKey: "startup",
         singletonSeconds: 60,
       });
+      // Startup complete: transition to running and remove the startup
+      // abort callback. Authority loss from now on is handled by the
+      // normal authority-lost callbacks.
+      this.lifecycleState = "running";
+      const idx = this.authorityLostCallbacks.indexOf(onStartupAbort);
+      if (idx >= 0) this.authorityLostCallbacks.splice(idx, 1);
+      this.startupAbort = undefined;
     } catch (error) {
+      this.lifecycleState = "shutting-down";
       // Reverse-order unwind of any partially initialized resources.
       // This prevents a failed start from leaving orphaned intervals,
       // pg-boss workers, or other state that a replacement replica would
@@ -166,8 +215,22 @@ export class NodeCoordinatorRuntime implements CoordinatorRuntime {
         }
         this.coordinatorLock = undefined;
       }
+      // Remove the startup abort callback.
+      const idx = this.authorityLostCallbacks.indexOf(onStartupAbort);
+      if (idx >= 0) this.authorityLostCallbacks.splice(idx, 1);
+      this.startupAbort = undefined;
+      this.lifecycleState = "stopped";
       throw error;
     }
+  }
+
+  /**
+   * Returns the current lifecycle state of the coordinator runtime.
+   * This is useful for diagnostics and for tests that need to verify
+   * state transitions.
+   */
+  getLifecycleState(): CoordinatorLifecycleState {
+    return this.lifecycleState;
   }
 
   setOperationRunner(runner: <T>(callback: () => Promise<T>) => Promise<T>): void {
@@ -218,6 +281,9 @@ export class NodeCoordinatorRuntime implements CoordinatorRuntime {
   }
 
   beginShutdown(): void {
+    if (this.lifecycleState !== "stopped") {
+      this.lifecycleState = "shutting-down";
+    }
     this.shuttingDown = true;
     clearInterval(this.pingInterval);
     clearInterval(this.provisioningScanner);
@@ -256,6 +322,7 @@ export class NodeCoordinatorRuntime implements CoordinatorRuntime {
     }
     this.coordinatorLock = undefined;
     await this.storage.close();
+    this.lifecycleState = "stopped";
   }
 
   runWithUpgrade<T>(context: NodeUpgradeContext, callback: () => Promise<T>): Promise<T> {

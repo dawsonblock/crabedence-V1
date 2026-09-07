@@ -99,6 +99,109 @@ describe("NodeCoordinatorRuntime", () => {
     expect(release).toHaveBeenCalledTimes(1);
   });
 
+  it("transitions through explicit lifecycle states", async () => {
+    const runtime = new NodeCoordinatorRuntime("postgresql://example.invalid/test");
+    expect(runtime.getLifecycleState()).toBe("idle");
+
+    await runtime.start(async () => {});
+    expect(runtime.getLifecycleState()).toBe("running");
+
+    await runtime.stop();
+    expect(runtime.getLifecycleState()).toBe("stopped");
+  });
+
+  it("transitions to stopped when the coordinator lock is contended", async () => {
+    const runtime = new NodeCoordinatorRuntime("postgresql://example.invalid/test");
+    const storage = mocks.storage as typeof mocks.storage & {
+      acquireCoordinatorLock: () => Promise<undefined>;
+    };
+    storage.acquireCoordinatorLock = vi.fn<() => Promise<undefined>>(async () => undefined);
+
+    await expect(runtime.start(async () => {})).rejects.toThrow(/advisory lock/);
+    expect(runtime.getLifecycleState()).toBe("stopped");
+  });
+
+  it("transitions to stopped on startup failure", async () => {
+    const runtime = new NodeCoordinatorRuntime("postgresql://example.invalid/test");
+    mocks.boss.start.mockRejectedValueOnce(new Error("pg-boss start failed"));
+
+    await expect(runtime.start(async () => {})).rejects.toThrow("pg-boss start failed");
+    expect(runtime.getLifecycleState()).toBe("stopped");
+  });
+
+  it("handles authority loss during startup via abort controller", async () => {
+    const release = vi.fn<() => Promise<void>>(async () => {});
+    let onLostCallback: (() => void) | undefined;
+    const storage = mocks.storage as typeof mocks.storage & {
+      acquireCoordinatorLock: () => Promise<{
+        release(): Promise<void>;
+        onLost?: (callback: () => void) => void;
+      }>;
+    };
+    storage.acquireCoordinatorLock = vi.fn(async () => ({
+      release,
+      onLost: (callback: () => void) => {
+        onLostCallback = callback;
+      },
+    }));
+
+    // Make boss.start block so we can trigger authority loss mid-startup.
+    let resolveBossStart: () => void;
+    const bossStartPromise = new Promise<void>((resolve) => {
+      resolveBossStart = resolve;
+    });
+    mocks.boss.start.mockReturnValueOnce(bossStartPromise);
+
+    const runtime = new NodeCoordinatorRuntime("postgresql://example.invalid/test");
+    const startPromise = runtime.start(async () => {});
+
+    // Wait for the lock to be acquired (the onLost callback is registered).
+    await vi.waitFor(() => expect(onLostCallback).toBeDefined());
+
+    // Trigger authority loss during startup.
+    onLostCallback!();
+
+    // Resolve boss.start so the startup can proceed (it should abort).
+    resolveBossStart!();
+
+    await expect(startPromise).rejects.toThrow(/startup aborted|authority lost/);
+    expect(runtime.getLifecycleState()).toBe("stopped");
+    expect(runtime.lostAuthority()).toBe(true);
+  });
+
+  it("calls onAuthorityLost callback when authority is lost after startup", async () => {
+    let onLostCallback: (() => void) | undefined;
+    const release = vi.fn<() => Promise<void>>(async () => {});
+    const storage = mocks.storage as typeof mocks.storage & {
+      acquireCoordinatorLock: () => Promise<{
+        release(): Promise<void>;
+        onLost?: (callback: () => void) => void;
+      }>;
+    };
+    storage.acquireCoordinatorLock = vi.fn(async () => ({
+      release,
+      onLost: (callback: () => void) => {
+        onLostCallback = callback;
+      },
+    }));
+
+    const runtime = new NodeCoordinatorRuntime("postgresql://example.invalid/test");
+    let callbackCalled = false;
+    runtime.onAuthorityLost(() => {
+      callbackCalled = true;
+    });
+
+    await runtime.start(async () => {});
+    expect(runtime.getLifecycleState()).toBe("running");
+
+    // Trigger authority loss after startup.
+    onLostCallback!();
+
+    expect(callbackCalled).toBe(true);
+    expect(runtime.lostAuthority()).toBe(true);
+    expect(runtime.getLifecycleState()).toBe("shutting-down");
+  });
+
   it("allows an active alarm to enqueue one successor", async () => {
     const runtime = new NodeCoordinatorRuntime("postgresql://example.invalid/test");
 
