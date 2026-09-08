@@ -1,0 +1,7 @@
+command=go test -count=1 -timeout=60s -run TestRunEvidenceConformanceCorpus ./internal/cli/
+started_at=2026-09-08T22:27:03Z
+---
+ok  	github.com/openclaw/crabbox/internal/cli	0.039s
+---
+finished_at=2026-09-08T22:27:08Z
+exit=0

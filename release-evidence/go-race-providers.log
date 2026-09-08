@@ -1,0 +1,9 @@
+command=go test -race -count=1 -timeout=120s ./internal/providers/tart/ ./internal/providers/lume/ ./internal/providers/shared/
+started_at=2026-09-08T22:25:31Z
+---
+ok  	github.com/openclaw/crabbox/internal/providers/tart	87.629s
+ok  	github.com/openclaw/crabbox/internal/providers/lume	2.720s
+ok  	github.com/openclaw/crabbox/internal/providers/shared	2.087s
+---
+finished_at=2026-09-08T22:27:01Z
+exit=0

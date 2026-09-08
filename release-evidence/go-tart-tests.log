@@ -1,5 +1,7 @@
-+ go test -timeout=120s ./internal/providers/tart/
+command=go test -count=1 -timeout=120s ./internal/providers/tart/
+started_at=2026-09-08T22:23:50Z
 ---
-ok  	github.com/openclaw/crabbox/internal/providers/tart	(cached)
+ok  	github.com/openclaw/crabbox/internal/providers/tart	79.050s
 ---
+finished_at=2026-09-08T22:25:10Z
 exit=0

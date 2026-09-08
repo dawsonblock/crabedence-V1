@@ -1,4 +1,4 @@
-commit 96fcf5e2a4f24eb1efb30ad96288717b7423ea6c
+commit ea7b981d790c247c650be9f00f6719c558d08d89
 Author: dawsonblock <dawsonblock@users.noreply.github.com>
-Date: Tue Sep 8 00:28:17 2026 -0600
-Subject: test: complete provider evidence tests, live authority fencing, and release qualification
+Date: Tue Sep 8 16:08:23 2026 -0600
+Subject: fix: V2/V3 receipt contract symmetry, release qualification pipeline, production-wrapper fencing

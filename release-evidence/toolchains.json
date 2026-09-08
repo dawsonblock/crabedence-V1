@@ -2,5 +2,9 @@
   "go": "go version go1.26.5 darwin/arm64",
   "node": "v22.22.3",
   "npm": "10.9.8",
-  "worker_package_version": "0.50.0"
+  "git": "git version 2.52.0",
+  "postgres_client": "psql (PostgreSQL) 14.20 (Homebrew)",
+  "worker_package_version": "0.50.0",
+  "go_os": "darwin",
+  "go_arch": "arm64"
 }

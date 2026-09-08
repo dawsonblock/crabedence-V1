@@ -1,4 +1,6 @@
-+ go vet ./...
+command=go vet ./...
+started_at=2026-09-08T22:23:38Z
 ---
 ---
+finished_at=2026-09-08T22:23:40Z
 exit=0

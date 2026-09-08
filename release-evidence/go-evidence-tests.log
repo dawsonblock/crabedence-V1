@@ -1,5 +1,7 @@
-+ go test -timeout=120s -run TestTerminalReceipt|TestTerminalLog|TestRunEvidence|TestFinalizeRun|TestEvidence ./internal/cli/
+command=go test -count=1 -timeout=120s -run TestTerminalReceipt|TestTerminalLog|TestRunEvidence|TestFinalizeRun|TestEvidence|TestCoordinatorFinish|TestCoordinatorRunReceipt|TestReceipt|TestRunRecorder|TestTiming ./internal/cli/
+started_at=2026-09-08T22:23:40Z
 ---
-ok  	github.com/openclaw/crabbox/internal/cli	(cached)
+ok  	github.com/openclaw/crabbox/internal/cli	2.634s
 ---
+finished_at=2026-09-08T22:23:50Z
 exit=0

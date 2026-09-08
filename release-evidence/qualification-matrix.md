@@ -1,33 +1,71 @@
-# Crabedence v1 Hardening — Qualification Matrix
+# Crabedence V1 Hardening — Qualification Matrix
 
 **Branch:** `release/crabedence-v1-hardening`
-**Source commit:** `ad20b9bd434ca551e27fa3404f2af10624944ba8`
-**Date:** 2026-09-07
+**Source commit:** `ea7b981d790c247c650be9f00f6719c558d08d89`
+**Git tree:** `08efe8b75e4a8bbdf01d7f7a91cfbd2b085d37d3`
+**Date:** 2026-09-08T22:27:17Z
+**Release status:** PASS (16/16 gates passed)
+
+## Toolchains
+
+| Tool | Version |
+|------|---------|
+| Go | go version go1.26.5 darwin/arm64 |
+| Node | v22.22.3 |
 
 ## Gate Results
 
-| Gate | Status | Details |
-|------|--------|---------|
-| `go vet` | PASS | evidence/receipt/tart/lume/shared packages |
-| Go evidence/receipt tests | PASS | 7.8s |
-| Go race tests | PASS | evidence/receipt/tart/lume with race detector |
-| Go tart provider tests | PASS | 81.3s |
-| Go lume provider tests | PASS | 1.6s |
-| Go shared provider tests | PASS | 1.0s |
-| Worker typecheck (`tsc --noEmit`) | PASS | |
-| Worker tests (Vitest) | PASS | 2845 passed, 11 skipped (2856) |
-| Worker format (`oxfmt --check`) | PASS | |
-| Worker lint (`oxlint`) | PASS | 0 errors, 0 warnings |
-| Worker build (`wrangler dry-run`) | PASS | |
-| PostgreSQL authority fencing (live) | PASS | 3 tests, real PostgreSQL with `pg_terminate_backend` |
-| PostgreSQL coordinator parity (live) | PASS | 4 tests, real PostgreSQL restart parity |
-| Cross-language conformance | PASS | Go and TypeScript share fixtures; 94 TS conformance tests |
+| Gate | Status | Log |
+|------|--------|-----|
+| `source_manifest` | PASS | `source-manifest-verify.log` |
+| `go-vet` | PASS | `go-vet.log` |
+| `go-evidence-tests` | PASS | `go-evidence-tests.log` |
+| `go-tart-tests` | PASS | `go-tart-tests.log` |
+| `go-lume-tests` | PASS | `go-lume-tests.log` |
+| `go-shared-tests` | PASS | `go-shared-tests.log` |
+| `go-race-evidence` | PASS | `go-race-evidence.log` |
+| `go-race-providers` | PASS | `go-race-providers.log` |
+| `postgres-fencing` | PASS | `postgres-fencing.log` |
+| `postgres-parity` | PASS | `postgres-parity.log` |
+| `cross-language-conformance` | PASS | `cross-language-conformance.log` |
+| `worker-typecheck` | PASS | `worker-typecheck.log` |
+| `worker-tests` | PASS | `worker-tests.log` |
+| `worker-format` | PASS | `worker-format.log` |
+| `worker-lint` | PASS | `worker-lint.log` |
+| `worker-build` | PASS | `worker-build.log` |
 
 ## Release Invariants
 
-1. **Authority fencing (linearizable drain):** Only one coordinator can mutate authoritative state. Mutations admitted before coordinator-session loss may complete while holding the global mutation fence; no mutation admitted by a replacement coordinator can execute until those transactions complete. New mutations from the old coordinator fail closed after authority loss. See `docs/features/portable-coordinator.md` § Coordinator authority and fencing.
-2. **Startup evidence:** Provider startup confirmation produces structured evidence for success, timeout, early exit, cancellation, handoff failure, and acquisition failure.
-3. **Cross-language determinism:** Go and TypeScript canonicalization produce identical SHA-256 digests for shared fixtures.
-4. **Receipt binding:** Every V3 terminal receipt is evidence-bound (`evidence_sha256` required), Ed25519-signed, millisecond-precision, and self-verified before persistence. V2 receipts are legacy and cannot bind evidence.
-5. **Immutable finalization:** Successful remote execution cannot be retroactively changed to failed by local write or coordinator commit failures.
-6. **Capability interfaces:** Providers advertise only lifecycle capabilities they possess (Tart: ExitObservable; Lume: DetachedProcess only).
+- **CRAB-V1-001:** V3 receipt always binds evidence_sha256
+- **CRAB-V1-002:** V2 receipt can never contain evidence_sha256
+- **CRAB-V1-003:** receipt evidence digest equals canonical RunEvidenceV1 SHA-256
+- **CRAB-V1-004:** Go and TypeScript produce identical canonical evidence
+- **CRAB-V1-005:** Go and TypeScript accept/reject identical receipt/evidence domains
+- **CRAB-V1-006:** startup confirmation failure evidence survives to RunEvidenceV1
+- **CRAB-V1-007:** detached providers never advertise exit observability
+- **CRAB-V1-008:** persistence failure cannot alter FinalRunOutcome
+- **CRAB-V1-009:** new mutations fail after coordinator authority loss
+- **CRAB-V1-010:** replacement mutations cannot overlap pre-admitted old-coordinator mutations
+- **CRAB-V1-011:** qualified source tree equals packaged source tree
+- **CRAB-V1-012:** every mandatory qualification gate was executed and passed
+
+## Provenance
+
+- Commit: `ea7b981d790c247c650be9f00f6719c558d08d89`
+- Tree: `08efe8b75e4a8bbdf01d7f7a91cfbd2b085d37d3`
+- Branch: `release/crabedence-v1-hardening`
+- Dirty: false (clean working tree required)
+
+## Verification
+
+To verify this release artifact:
+
+```bash
+./scripts/verify-release-artifact.sh
+```
+
+To check release admission:
+
+```bash
+./scripts/check-release-admission.sh
+```

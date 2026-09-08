@@ -1,4 +1,5 @@
-+ npm run format:check --prefix worker
+command=npm run format:check --prefix worker
+started_at=2026-09-08T22:27:16Z
 ---
 
 > @openclaw/crabbox-worker@0.50.0 format:check
@@ -9,4 +10,5 @@ Checking formatting...
 All matched files use the correct format.
 Finished in 71ms on 139 files using 12 threads.
 ---
+finished_at=2026-09-08T22:27:16Z
 exit=0

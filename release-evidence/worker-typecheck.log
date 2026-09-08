@@ -1,8 +1,10 @@
-+ npm run check --prefix worker
+command=npm run check --prefix worker
+started_at=2026-09-08T22:27:08Z
 ---
 
 > @openclaw/crabbox-worker@0.50.0 check
 > tsc --noEmit
 
 ---
+finished_at=2026-09-08T22:27:08Z
 exit=0
