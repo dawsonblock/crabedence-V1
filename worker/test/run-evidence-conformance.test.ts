@@ -71,14 +71,17 @@ describe("run-evidence conformance corpus", () => {
       const err = await validateRunEvidence(fx.evidence, localBinding);
 
       if (fx.expected === "reject") {
+        // eslint-disable-next-line vitest/no-conditional-expect
         expect(err, `expected rejection but evidence was accepted`).toBeInstanceOf(Error);
         if (fx.error_contains && err instanceof Error) {
+          // eslint-disable-next-line vitest/no-conditional-expect
           expect(
             err.message.toLowerCase(),
             `expected error containing "${fx.error_contains}"`,
           ).toContain(fx.error_contains.toLowerCase());
         }
       } else {
+        // eslint-disable-next-line vitest/no-conditional-expect
         expect(
           err,
           `expected acceptance but got error: ${err instanceof Error ? err.message : String(err)}`,

@@ -1,0 +1,69 @@
++ npm run build --prefix worker
+---
+
+> @openclaw/crabbox-worker@0.50.0 prebuild
+> node scripts/vendor-novnc.mjs
+
+
+> @openclaw/crabbox-worker@0.50.0 build
+> wrangler deploy --dry-run --outdir dist
+
+
+ ⛅️ wrangler 4.127.0 (update available 4.129.1)
+───────────────────────────────────────────────
+✨ Read 8 files from the assets directory /Users/dawsonblock/Downloads/crabbox-main/worker/public
+Total Upload: 2806.17 KiB / gzip: 550.53 KiB
+Your Worker has access to the following bindings:
+Binding                                                                                            Resource                     
+env.FLEET (FleetDurableObject)                                                                     Durable Object               
+env.CF_VERSION_METADATA                                                                            Worker Version Metadata      
+env.CRABBOX_DEFAULT_ORG ("openclaw")                                                               Environment Variable         
+env.CRABBOX_GITHUB_ALLOWED_ORG ("openclaw")                                                        Environment Variable         
+env.CRABBOX_PUBLIC_URL ("https://crabbox.openclaw.ai")                                             Environment Variable         
+env.CRABBOX_WORKSPACE_PROVIDER ("aws")                                                             Environment Variable         
+env.CRABBOX_WORKSPACE_CLASS ("standard")                                                           Environment Variable         
+env.CRABBOX_WORKSPACE_PREWARM_COUNT ("1")                                                          Environment Variable         
+env.CRABBOX_USER_TOKEN_TTL_SECONDS ("15552000")                                                    Environment Variable         
+env.CRABBOX_RUN_RETENTION_DAYS ("30")                                                              Environment Variable         
+env.CRABBOX_ARTIFACTS_BACKEND ("r2")                                                               Environment Variable         
+env.CRABBOX_ARTIFACTS_BUCKET ("openclaw-crabbox-artifacts")                                        Environment Variable         
+env.CRABBOX_ARTIFACTS_PREFIX ("crabbox-artifacts")                                                 Environment Variable         
+env.CRABBOX_ARTIFACTS_REGION ("auto")                                                              Environment Variable         
+env.CRABBOX_ARTIFACTS_ENDPOINT_URL ("https://91b59577e757131d68d55a471fe32...")                    Environment Variable         
+env.CRABBOX_AWS_REGION ("eu-west-1")                                                               Environment Variable         
+env.CRABBOX_CAPACITY_REGIONS ("eu-west-1,eu-west-2,eu-central-1,us-e...")                          Environment Variable         
+env.CRABBOX_AZURE_REGIONS ("eastus2,centralus,westus3,westeurope,...")                             Environment Variable         
+env.CRABBOX_AZURE_WINDOWS_ARM64_IMAGE ("MicrosoftWindowsDesktop:windows11prev...")                 Environment Variable         
+env.CRABBOX_DAYTONA_API_URL ("https://app.daytona.io/api")                                         Environment Variable         
+env.CRABBOX_DAYTONA_USER ("daytona")                                                               Environment Variable         
+env.CRABBOX_DAYTONA_WORK_ROOT ("/home/daytona/crabbox")                                            Environment Variable         
+env.CRABBOX_DAYTONA_SSH_GATEWAY_HOST ("ssh.app.daytona.io")                                        Environment Variable         
+env.CRABBOX_DAYTONA_SSH_ACCESS_MINUTES ("120")                                                     Environment Variable         
+env.CRABBOX_AWS_ORPHAN_SWEEP_ENABLED ("1")                                                         Environment Variable         
+env.CRABBOX_AWS_ORPHAN_SWEEP_DELETE ("1")                                                          Environment Variable         
+env.CRABBOX_AWS_ORPHAN_SWEEP_INTERVAL_SECONDS ("3600")                                             Environment Variable         
+env.CRABBOX_AWS_ORPHAN_SWEEP_GRACE_SECONDS ("900")                                                 Environment Variable         
+env.CRABBOX_AWS_MAC_HOST_SWEEP_RELEASE ("1")                                                       Environment Variable         
+env.CRABBOX_AZURE_ORPHAN_SWEEP_ENABLED ("1")                                                       Environment Variable         
+env.CRABBOX_AZURE_ORPHAN_SWEEP_DELETE ("1")                                                        Environment Variable         
+env.CRABBOX_AZURE_ORPHAN_SWEEP_INTERVAL_SECONDS ("3600")                                           Environment Variable         
+env.CRABBOX_AZURE_ORPHAN_SWEEP_GRACE_SECONDS ("900")                                               Environment Variable         
+env.CRABBOX_CAPACITY_HINTS ("1")                                                                   Environment Variable         
+env.CRABBOX_CAPACITY_LARGE_CLASSES ("beast")                                                       Environment Variable         
+env.CRABBOX_MAX_ACTIVE_LEASES ("20")                                                               Environment Variable         
+env.CRABBOX_MAX_ACTIVE_LEASES_PER_OWNER ("10")                                                     Environment Variable         
+env.CRABBOX_MAX_ACTIVE_LEASES_PER_ORG ("20")                                                       Environment Variable         
+env.CRABBOX_MAX_CHECKPOINTS ("20")                                                                 Environment Variable         
+env.CRABBOX_MAX_CHECKPOINTS_PER_OWNER ("10")                                                       Environment Variable         
+env.CRABBOX_MAX_CHECKPOINTS_PER_ORG ("20")                                                         Environment Variable         
+env.CRABBOX_MAX_CHECKPOINT_USE_CLAIMS ("16")                                                       Environment Variable         
+env.CRABBOX_MAX_CHECKPOINT_USE_CLAIMS_PER_OWNER ("64")                                             Environment Variable         
+env.CRABBOX_MAX_CHECKPOINT_USE_CLAIMS_TOTAL ("256")                                                Environment Variable         
+env.CRABBOX_MAX_ACTIVE_LEASES_PER_CAPACITY_ADMIN ("20")                                            Environment Variable         
+env.CRABBOX_MAX_MONTHLY_USD ("50000")                                                              Environment Variable         
+env.CRABBOX_MAX_MONTHLY_USD_PER_OWNER ("25000")                                                    Environment Variable         
+env.CRABBOX_MAX_MONTHLY_USD_PER_ORG ("50000")                                                      Environment Variable         
+
+--dry-run: exiting now.
+---
+exit=0

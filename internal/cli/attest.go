@@ -87,6 +87,10 @@ type terminalRunReceiptInput struct {
 	RetainedLogSHA256 string
 	LogTruncated      bool
 	EvidenceSHA256    string
+	// SchemaVersion overrides the default V3 schema. Set to
+	// terminalReceiptV2SchemaVersion for legacy V2 receipts that do not
+	// bind evidence. Zero means use the default (V3).
+	SchemaVersion int
 }
 
 type preparedRunReceipt struct {
@@ -340,8 +344,12 @@ func buildTerminalRunReceiptWithKey(key ed25519.PrivateKey, in terminalRunReceip
 	// the Truncate(time.Millisecond) applied to the timestamps above.
 	truncatedStartedAt := in.StartedAt.UTC().Truncate(time.Millisecond)
 	truncatedEndedAt := in.EndedAt.UTC().Truncate(time.Millisecond)
+	schemaVersion := terminalReceiptSchemaVersion
+	if in.SchemaVersion != 0 {
+		schemaVersion = in.SchemaVersion
+	}
 	receipt := terminalRunReceipt{
-		SchemaVersion:     terminalReceiptSchemaVersion,
+		SchemaVersion:     schemaVersion,
 		ReceiptType:       terminalReceiptType,
 		StartedAt:         truncatedStartedAt.Format(time.RFC3339Nano),
 		EndedAt:           truncatedEndedAt.Format(time.RFC3339Nano),
@@ -432,7 +440,11 @@ func validateTerminalRunReceipt(receipt terminalRunReceipt) error {
 			return fmt.Errorf("invalid %s", name)
 		}
 	}
-	if receipt.EvidenceSHA256 != "" && !validHexDigest(receipt.EvidenceSHA256, sha256.Size) {
+	if receipt.EvidenceSHA256 == "" {
+		if receipt.SchemaVersion >= terminalReceiptSchemaVersion {
+			return fmt.Errorf("v3 terminal receipt must bind evidence_sha256")
+		}
+	} else if !validHexDigest(receipt.EvidenceSHA256, sha256.Size) {
 		return fmt.Errorf("invalid evidence_sha256")
 	}
 	pub, err := base64.StdEncoding.DecodeString(receipt.PublicKey)

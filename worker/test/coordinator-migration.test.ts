@@ -161,7 +161,9 @@ describe("coordinator migration", () => {
     // callback writes a conflicting value before the import's own put.
     const originalTransaction = target.transaction.bind(target);
     let transactionCallCount = 0;
-    target.transaction = vi.fn(async (callback: (tx: typeof target) => Promise<unknown>) => {
+    target.transaction = vi.fn<
+      (callback: (tx: typeof target) => Promise<unknown>) => Promise<unknown>
+    >(async (callback: (tx: typeof target) => Promise<unknown>) => {
       transactionCallCount += 1;
       if (transactionCallCount === 1) {
         // Simulate a concurrent writer landing a conflicting value for run:run_1

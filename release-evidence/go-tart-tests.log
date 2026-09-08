@@ -1,0 +1,5 @@
++ go test -timeout=120s ./internal/providers/tart/
+---
+ok  	github.com/openclaw/crabbox/internal/providers/tart	(cached)
+---
+exit=0

@@ -1,5 +1,4 @@
-ad20b9bd434ca551e27fa3404f2af10624944ba8
-dawsonblock
-dawsonblock@users.noreply.github.com
-2026-09-07 20:07:26 -0600
-fix: close cross-runtime evidence validator gaps, terminal bundle self-verification, and auxiliary failure semantics
+commit 96fcf5e2a4f24eb1efb30ad96288717b7423ea6c
+Author: dawsonblock <dawsonblock@users.noreply.github.com>
+Date: Tue Sep 8 00:28:17 2026 -0600
+Subject: test: complete provider evidence tests, live authority fencing, and release qualification

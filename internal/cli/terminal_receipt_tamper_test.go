@@ -175,11 +175,13 @@ func TestTerminalReceiptInvalidEvidenceSHA256FailsValidation(t *testing.T) {
 	}
 }
 
-func TestTerminalReceiptEmptyEvidenceSHA256PassesValidation(t *testing.T) {
-	// An empty evidence_sha256 is allowed (e.g., for delegated receipts
-	// that don't bind evidence). The signature still covers the empty value.
+func TestTerminalReceiptEmptyEvidenceSHA256RejectedForV3(t *testing.T) {
+	// V3 receipts MUST bind evidence_sha256. An empty evidence_sha256 is
+	// rejected so that schema_version 3 has a clean semantic meaning:
+	// V3 == authenticated evidence binding.
 	receipt := buildTestReceipt(t)
 	receipt.EvidenceSHA256 = ""
+	receipt.SchemaVersion = terminalReceiptSchemaVersion
 	// Re-sign because the evidence_sha256 changed.
 	pub, priv, _ := ed25519.GenerateKey(nil)
 	receipt.PublicKey = base64.StdEncoding.EncodeToString(pub)
@@ -187,11 +189,10 @@ func TestTerminalReceiptEmptyEvidenceSHA256PassesValidation(t *testing.T) {
 	receipt.Signature = base64.StdEncoding.EncodeToString(
 		ed25519.Sign(priv, terminalReceiptSigningBytes(receipt)),
 	)
-	if err := validateTerminalRunReceipt(receipt); err != nil {
-		t.Fatalf("validation should pass with empty evidence_sha256: %v", err)
-	}
-	if err := verifyTerminalRunReceiptSignature(receipt); err != nil {
-		t.Fatalf("signature verification should pass with empty evidence_sha256: %v", err)
+	if err := validateTerminalRunReceipt(receipt); err == nil {
+		t.Fatal("validation should reject V3 receipt with empty evidence_sha256")
+	} else if !strings.Contains(err.Error(), "v3 terminal receipt must bind evidence_sha256") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

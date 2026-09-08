@@ -159,6 +159,7 @@ func TestTerminalReceiptSignsNonzeroExitAndBindsCommand(t *testing.T) {
 		EndedAt:           endedAt,
 		LogSHA256:         sha256Digest([]byte("failed\n")),
 		RetainedLogSHA256: sha256Digest([]byte("failed\n")),
+		EvidenceSHA256:    "0000000000000000000000000000000000000000000000000000000000000000",
 	})
 	if err != nil {
 		t.Fatalf("build terminal receipt: %v", err)
@@ -189,6 +190,7 @@ func TestTerminalReceiptSignsNonzeroExitAndBindsCommand(t *testing.T) {
 		EndedAt:           endedAt,
 		LogSHA256:         sha256Digest([]byte("failed\n")),
 		RetainedLogSHA256: sha256Digest([]byte("failed\n")),
+		EvidenceSHA256:    "0000000000000000000000000000000000000000000000000000000000000000",
 	}); err != nil {
 		t.Fatalf("verify terminal receipt: %v", err)
 	}
@@ -212,6 +214,7 @@ func TestTerminalReceiptRejectsBindingMismatches(t *testing.T) {
 		EndedAt:           endedAt,
 		LogSHA256:         logDigest,
 		RetainedLogSHA256: logDigest,
+		SchemaVersion:     terminalReceiptV2SchemaVersion,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -228,6 +231,7 @@ func TestTerminalReceiptRejectsBindingMismatches(t *testing.T) {
 		EndedAt:           endedAt,
 		LogSHA256:         logDigest,
 		RetainedLogSHA256: logDigest,
+		SchemaVersion:     terminalReceiptV2SchemaVersion,
 	}
 	tests := map[string]func(*terminalRunReceiptInput){
 		"provider":  func(binding *terminalRunReceiptInput) { binding.Provider = "gcp" },
@@ -267,6 +271,7 @@ func TestTerminalReceiptBoundsLongCommandDisplayWithoutLosingArgvBinding(t *test
 		EndedAt:           startedAt.Add(time.Second),
 		LogSHA256:         sha256Digest(nil),
 		RetainedLogSHA256: sha256Digest(nil),
+		SchemaVersion:     terminalReceiptV2SchemaVersion,
 	})
 	if err != nil {
 		t.Fatal(err)

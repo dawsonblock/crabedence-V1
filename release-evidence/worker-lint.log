@@ -1,0 +1,10 @@
++ npm run lint --prefix worker
+---
+
+> @openclaw/crabbox-worker@0.50.0 lint
+> oxlint --config .oxlintrc.json .
+
+Found 0 warnings and 0 errors.
+Finished in 90ms on 130 files with 145 rules using 12 threads.
+---
+exit=0

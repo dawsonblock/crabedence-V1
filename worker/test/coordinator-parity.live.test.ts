@@ -161,6 +161,7 @@ runLive("postgres coordinator parity (live)", () => {
         authorityLost = true;
         break;
       }
+      // eslint-disable-next-line no-await-in-loop
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
     expect(authorityLost, "coordinator should detect advisory-lock session death").toBe(true);

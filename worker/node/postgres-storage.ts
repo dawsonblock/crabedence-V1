@@ -406,11 +406,16 @@ export class PostgresCoordinatorStorage implements CoordinatorStorage {
           rollbackError instanceof Error
             ? rollbackError
             : new Error("PostgreSQL rollback failed", { cause: rollbackError });
-        throw new AggregateError(
-          [error, rollbackError],
+        const wrappedRollback =
+          rollbackError instanceof Error
+            ? rollbackError
+            : new Error(String(rollbackError), { cause: rollbackError });
+        const aggregateError = new AggregateError(
+          [error, wrappedRollback],
           "PostgreSQL transaction failed and rollback also failed",
           { cause: error },
         );
+        throw aggregateError;
       }
       throw error;
     } finally {

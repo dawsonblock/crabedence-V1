@@ -1,0 +1,12 @@
++ npm run format:check --prefix worker
+---
+
+> @openclaw/crabbox-worker@0.50.0 format:check
+> oxfmt --check .
+
+Checking formatting...
+
+All matched files use the correct format.
+Finished in 71ms on 139 files using 12 threads.
+---
+exit=0

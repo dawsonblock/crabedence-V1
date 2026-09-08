@@ -183,7 +183,9 @@ runLive("PostgreSQL authority fencing (live)", () => {
     // Retry finding the xact lock holder for up to 2 seconds.
     let xactPID: number | undefined;
     for (let i = 0; i < 20 && xactPID === undefined; i++) {
+      // eslint-disable-next-line no-await-in-loop
       await new Promise((resolve) => setTimeout(resolve, 100));
+      // eslint-disable-next-line no-await-in-loop
       xactPID = await findXactLockHolderPID(adminPool, pidA);
     }
 
@@ -211,12 +213,14 @@ runLive("PostgreSQL authority fencing (live)", () => {
     // event fires asynchronously after pg_terminate_backend).
     let authorityLost = false;
     for (let i = 0; i < 30 && !authorityLost; i++) {
+      // eslint-disable-next-line no-await-in-loop
       await new Promise((resolve) => setTimeout(resolve, 100));
       if (aLostAuthority) {
         authorityLost = true;
         break;
       }
       try {
+        // eslint-disable-next-line no-await-in-loop
         await storageA.put("fencing-test:rejected", { value: "no" });
       } catch {
         authorityLost = true;
@@ -225,7 +229,9 @@ runLive("PostgreSQL authority fencing (live)", () => {
     expect(authorityLost).toBe(true);
 
     // A's new mutations should be rejected (authority lost).
-    await expect(storageA.put("fencing-test:rejected", { value: "no" })).rejects.toThrow();
+    await expect(storageA.put("fencing-test:rejected", { value: "no" })).rejects.toThrow(
+      "authority",
+    );
 
     // Coordinator B can acquire the session lock (A's session is dead).
     // But B's mutations should block on the xact lock held by A's
@@ -239,14 +245,16 @@ runLive("PostgreSQL authority fencing (live)", () => {
     // B's mutation should block because A's xact lock is still held.
     // Use a timeout to verify it blocks rather than completing immediately.
     let bMutationDone = false;
-    const bMutationPromise = storageB
-      .put("fencing-test:b-key", { value: "from-B" })
-      .then(() => {
+    const bMutationPromise = storageB.put("fencing-test:b-key", { value: "from-B" }).then(
+      () => {
         bMutationDone = true;
-      })
-      .catch(() => {
+        return undefined;
+      },
+      () => {
         bMutationDone = true;
-      });
+        return undefined;
+      },
+    );
     await new Promise((resolve) => setTimeout(resolve, 500));
     expect(bMutationDone).toBe(false); // B is blocked by A's xact lock
 
@@ -307,9 +315,11 @@ runLive("PostgreSQL authority fencing (live)", () => {
     await new Promise((resolve) => setTimeout(resolve, 500));
 
     // All mutations should be rejected.
-    await expect(storage.put("fencing-test:post-loss", { value: "no" })).rejects.toThrow();
-    await expect(storage.delete("fencing-test:post-loss")).rejects.toThrow();
-    await expect(storage.take("fencing-test:post-loss")).rejects.toThrow();
+    await expect(storage.put("fencing-test:post-loss", { value: "no" })).rejects.toThrow(
+      "authority",
+    );
+    await expect(storage.delete("fencing-test:post-loss")).rejects.toThrow("authority");
+    await expect(storage.take("fencing-test:post-loss")).rejects.toThrow("authority");
 
     // A replacement coordinator can acquire the lock.
     const storageB = new PostgresCoordinatorStorage(databaseURL);

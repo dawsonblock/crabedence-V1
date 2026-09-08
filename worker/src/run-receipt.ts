@@ -172,6 +172,9 @@ export async function validateRunEvidence(
     if (binding.receipt && binding.receipt.schema_version >= 3 && binding.receipt.evidence_sha256) {
       return new Error("receipt binds evidence_sha256 but no evidence was provided");
     }
+    // V3 receipts must bind evidence_sha256. If the receipt is V3 but has
+    // no evidence_sha256, parseTerminalReceipt already rejected it. If
+    // there is no receipt at all, there is nothing to authenticate.
     return undefined;
   }
   if (typeof evidence !== "object" || Array.isArray(evidence)) {
@@ -762,6 +765,12 @@ function parseTerminalReceipt(value: unknown): TerminalRunReceipt {
   // field that could masquerade as authenticated evidence binding.
   if (receipt.schema_version < 3 && receipt.evidence_sha256 !== undefined) {
     throw new Error("v2 terminal receipt must not contain evidence_sha256");
+  }
+  // v3 receipts MUST bind evidence_sha256. Schema version 3 has a clean
+  // semantic meaning: V3 == authenticated evidence binding. An empty or
+  // missing evidence_sha256 on a V3 receipt is rejected.
+  if (receipt.schema_version >= 3 && receipt.evidence_sha256 === undefined) {
+    throw new Error("v3 terminal receipt must bind evidence_sha256");
   }
   for (const field of [
     "started_at",

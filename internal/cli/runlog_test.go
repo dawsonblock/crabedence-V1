@@ -350,6 +350,7 @@ func captureTerminalLogWire(t *testing.T, raw []byte) map[string]any {
 		Provider: "aws", RunID: "run_unicode", Command: []string{"synthetic-output"}, CommandDisplay: "synthetic-output",
 		ExitCode: 0, CommandMs: 1000, StartedAt: started, EndedAt: started.Add(time.Second),
 		LogSHA256: retained.FullSHA256, RetainedLogSHA256: sha256Digest([]byte(retained.Log)), LogTruncated: retained.Truncated,
+		SchemaVersion: terminalReceiptV2SchemaVersion,
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -313,10 +313,10 @@ describe("RunEvidenceV1", () => {
   });
 
   it("accepts absent evidence when the receipt has no evidence_sha256 binding", async () => {
-    // The mirror case: a v2 receipt (or a v3 receipt with no evidence_sha256)
-    // does not bind evidence, so absent evidence is valid — there is nothing
-    // to authenticate. This must NOT be rejected by the dangling-binding
-    // check, or ordinary runs without evidence would break.
+    // The mirror case: a v2 receipt does not bind evidence, so absent
+    // evidence is valid — there is nothing to authenticate. This must NOT
+    // be rejected by the dangling-binding check, or ordinary runs without
+    // evidence would break. (V3 receipts must bind evidence_sha256.)
     const [first] = await loadGoldenCases();
     const v2 = stubV3Receipt(first.evidence, first.evidence.digest);
     delete (v2 as Partial<TerminalRunReceipt>).evidence_sha256;

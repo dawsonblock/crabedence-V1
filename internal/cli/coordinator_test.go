@@ -229,6 +229,7 @@ func TestCoordinatorFinishRunSendsAndRetrievesTerminalReceipt(t *testing.T) {
 		EndedAt:           startedAt.Add(2 * time.Second),
 		LogSHA256:         sha256Digest([]byte("failed\n")),
 		RetainedLogSHA256: sha256Digest([]byte("failed\n")),
+		SchemaVersion:     terminalReceiptV2SchemaVersion,
 	})
 	if err != nil {
 		t.Fatal(err)

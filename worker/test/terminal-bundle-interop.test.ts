@@ -119,7 +119,7 @@ describe("Go-generated terminal bundle interop (production verifier)", () => {
         logTruncated: golden.receipt.log_truncated,
         observedAt: new Date(golden.receipt.ended_at),
       }),
-    ).rejects.toThrow();
+    ).rejects.toThrow("terminal receipt");
   });
 
   it("rejects a receipt with mismatched log content", async () => {

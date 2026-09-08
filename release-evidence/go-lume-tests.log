@@ -1,0 +1,5 @@
++ go test -timeout=60s ./internal/providers/lume/
+---
+ok  	github.com/openclaw/crabbox/internal/providers/lume	(cached)
+---
+exit=0

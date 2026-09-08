@@ -149,6 +149,7 @@ func TestRunnerPhasesDoNotChangeTerminalReceiptV2(t *testing.T) {
 		EndedAt:           time.Unix(101, 0),
 		LogSHA256:         sha256Digest(nil),
 		RetainedLogSHA256: sha256Digest(nil),
+		EvidenceSHA256:    "0000000000000000000000000000000000000000000000000000000000000000",
 	})
 	if err != nil {
 		t.Fatal(err)

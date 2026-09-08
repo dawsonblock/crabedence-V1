@@ -1025,6 +1025,7 @@ func runRecorderTestReceipt(t *testing.T) terminalRunReceipt {
 		EndedAt:           startedAt.Add(100 * time.Millisecond),
 		LogSHA256:         sha256Digest(nil),
 		RetainedLogSHA256: sha256Digest(nil),
+		SchemaVersion:     terminalReceiptV2SchemaVersion,
 	})
 	if err != nil {
 		t.Fatal(err)

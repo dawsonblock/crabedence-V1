@@ -59,6 +59,20 @@ vi.mock("../node/postgres-storage", () => ({
 import { NodeCoordinatorRuntime } from "../node/node-runtime";
 import { AsyncMutex } from "../node/server-support";
 
+function makeLock() {
+  const release = vi.fn<() => Promise<void>>(async () => {});
+  let onLostCallback: (() => void) | undefined;
+  const onLost = (callback: () => void) => {
+    onLostCallback = callback;
+  };
+  return {
+    release,
+    onLost,
+    triggerLost: () => onLostCallback?.(),
+    hasLostCallback: () => onLostCallback !== undefined,
+  };
+}
+
 describe("NodeCoordinatorRuntime", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -748,20 +762,6 @@ describe("NodeCoordinatorRuntime startup fault injection", () => {
     );
   });
 
-  function makeLock() {
-    const release = vi.fn<() => Promise<void>>(async () => {});
-    let onLostCallback: (() => void) | undefined;
-    const onLost = (callback: () => void) => {
-      onLostCallback = callback;
-    };
-    return {
-      release,
-      onLost,
-      triggerLost: () => onLostCallback?.(),
-      hasLostCallback: () => onLostCallback !== undefined,
-    };
-  }
-
   function setupLock() {
     const lock = makeLock();
     const storage = mocks.storage as typeof mocks.storage & {
@@ -818,7 +818,7 @@ describe("NodeCoordinatorRuntime startup fault injection", () => {
       stage.setup();
 
       const runtime = new NodeCoordinatorRuntime("postgresql://example.invalid/test");
-      await expect(runtime.start(async () => {})).rejects.toThrow();
+      await expect(runtime.start(async () => {})).rejects.toThrow("failed");
 
       // Runtime state is deterministic: stopped.
       expect(runtime.getLifecycleState()).toBe("stopped");
@@ -826,6 +826,7 @@ describe("NodeCoordinatorRuntime startup fault injection", () => {
       expect(lock.release).toHaveBeenCalledTimes(1);
       // pg-boss was stopped if it was started.
       if (stage.name !== "boss.start") {
+        // eslint-disable-next-line vitest/no-conditional-expect
         expect(mocks.boss.stop).toHaveBeenCalled();
       }
     });
@@ -866,7 +867,7 @@ describe("NodeCoordinatorRuntime startup fault injection", () => {
       lock.triggerLost();
       resolveStage!();
 
-      await expect(startPromise).rejects.toThrow();
+      await expect(startPromise).rejects.toThrow("authority");
       expect(runtime.lostAuthority()).toBe(true);
       expect(runtime.getLifecycleState()).toBe("stopped");
       // Lock was released during cleanup.

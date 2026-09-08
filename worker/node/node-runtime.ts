@@ -39,10 +39,12 @@ function raceStartupStage<T>(signal: AbortSignal, stage: Promise<T>): Promise<T>
       (value) => {
         signal.removeEventListener("abort", onAbort);
         resolve(value);
+        return undefined;
       },
       (error) => {
         signal.removeEventListener("abort", onAbort);
         reject(error);
+        return undefined;
       },
     );
   });
