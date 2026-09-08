@@ -124,4 +124,50 @@ runLive("postgres coordinator parity (live)", () => {
     const inspect = await replacement.fetch(replacement.request("GET", "/v1/leases"));
     expect(inspect.status).toBe(200);
   });
+
+  it("detects advisory-lock session death and fails closed", async () => {
+    const f = await liveFixture();
+    // The coordinator is running and holding the advisory lock. Find
+    // the PID of the lock-holding backend by querying pg_stat_activity
+    // for the coordinator advisory lock query.
+    const storage = f.storage as unknown as {
+      pool: { query: (text: string, params?: unknown[]) => Promise<{ rows: Array<{ pid: number }> }> };
+    };
+    const result = await storage.pool.query(
+      `select pid from pg_stat_activity
+       where query like '%pg_try_advisory_lock%'
+         and state = 'idle'
+       order by query_start desc
+       limit 1`,
+    );
+    expect(result.rows.length).toBeGreaterThan(0);
+    const pid = result.rows[0]!.pid;
+
+    // Terminate the lock-holding backend. PostgreSQL will free the
+    // advisory lock and emit an error/end event on the client connection.
+    await storage.pool.query("select pg_terminate_backend($1)", [pid]);
+
+    // The coordinator should detect authority loss and fail closed.
+    // Wait for the authority-loss callback to fire (the node runtime
+    // registers it on the lock's onLost callback).
+    // Give the coordinator up to 5 seconds to detect the loss.
+    const deadline = Date.now() + 5_000;
+    let authorityLost = false;
+    const runtime = f as unknown as { runtime?: { authorityLost: boolean } };
+    while (Date.now() < deadline) {
+      if (runtime.runtime?.authorityLost) {
+        authorityLost = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    expect(authorityLost, "coordinator should detect advisory-lock session death").toBe(true);
+
+    // A replacement should be able to acquire the lock now that the
+    // old session is dead and PostgreSQL has freed the advisory lock.
+    const replacement = await liveFixture();
+    const inspect = await replacement.fetch(replacement.request("GET", "/v1/leases"));
+    expect(inspect.status).toBe(200);
+    await replacement.stop();
+  });
 });
