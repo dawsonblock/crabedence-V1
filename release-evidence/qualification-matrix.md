@@ -1,9 +1,9 @@
 # Crabedence V1 Hardening — Qualification Matrix
 
 **Branch:** `release/crabedence-v1-hardening`
-**Source commit:** `ea7b981d790c247c650be9f00f6719c558d08d89`
-**Git tree:** `08efe8b75e4a8bbdf01d7f7a91cfbd2b085d37d3`
-**Date:** 2026-09-08T22:27:17Z
+**Source commit:** `a8d2cda3348a1744bf9e40e0ab5411721770005d`
+**Git tree:** `2f4949028ebb80f5f369f2fba69fa714ea60438f`
+**Date:** 2026-09-08T23:30:23Z
 **Release status:** PASS (16/16 gates passed)
 
 ## Toolchains
@@ -51,8 +51,8 @@
 
 ## Provenance
 
-- Commit: `ea7b981d790c247c650be9f00f6719c558d08d89`
-- Tree: `08efe8b75e4a8bbdf01d7f7a91cfbd2b085d37d3`
+- Commit: `a8d2cda3348a1744bf9e40e0ab5411721770005d`
+- Tree: `2f4949028ebb80f5f369f2fba69fa714ea60438f`
 - Branch: `release/crabedence-v1-hardening`
 - Dirty: false (clean working tree required)
 

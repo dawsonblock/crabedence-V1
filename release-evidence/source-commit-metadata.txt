@@ -1,4 +1,4 @@
-commit ea7b981d790c247c650be9f00f6719c558d08d89
+commit a8d2cda3348a1744bf9e40e0ab5411721770005d
 Author: dawsonblock <dawsonblock@users.noreply.github.com>
-Date: Tue Sep 8 16:08:23 2026 -0600
-Subject: fix: V2/V3 receipt contract symmetry, release qualification pipeline, production-wrapper fencing
+Date: Tue Sep 8 17:23:56 2026 -0600
+Subject: fix: shared V2/V3 contract fixture, GitHub attestation pipeline, RC2 release machinery

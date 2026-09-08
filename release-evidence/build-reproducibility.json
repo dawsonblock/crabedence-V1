@@ -1,8 +1,8 @@
 {
-  "source_commit": "ea7b981d790c247c650be9f00f6719c558d08d89",
-  "source_tree": "08efe8b75e4a8bbdf01d7f7a91cfbd2b085d37d3",
+  "source_commit": "a8d2cda3348a1744bf9e40e0ab5411721770005d",
+  "source_tree": "2f4949028ebb80f5f369f2fba69fa714ea60438f",
   "go_sum_sha256": "b44a5b99cd8ed88b352ac5ca84add6a871d5a0a0f0b9c6fc6a62ed3791a61373",
   "package_lock_sha256": "4838bb9aee967e90c255bec46fd62abe6ae01512cfc3c4468954fe9fe32e690d",
-  "build_timestamp": "2026-09-08T22:22:18Z",
+  "build_timestamp": "2026-09-08T23:24:29Z",
   "platform": "Darwin/arm64"
 }

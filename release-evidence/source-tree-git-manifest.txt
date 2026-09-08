@@ -34,6 +34,8 @@ b7db70a64907f8328c0ad974d6bf8b4aa153cb7f  .github/workflows/image-qualification-
 4a2cc7d4bd10b0f041a302474db4f331174fef82  .github/workflows/image-qualification.yml
 88face15566016fcd82ba2f0be54c01065958829  .github/workflows/pages.yml
 e88d7844a3e81ca149fcd3f8b4dae5e87c7ea2f3  .github/workflows/release-assets.yml
+bd28403c55e8cc4821ff7a755224fe480e248b38  .github/workflows/release-qualification.yml
+5a19f184dfc745cf31e4f72e8a03eb98a7b67dda  .github/workflows/release-rc.yml
 409cf6acfe58ccea56d3d174e406392eb8a5d3b5  .github/workflows/verify-homebrew.yml
 0d9694c1b00de2867e8c02cdd09d32974bae3f37  .github/workflows/zed-extension-e2e.yml
 4ebf942989dc51ecbbab4f3334ece5612263fc98  .gitignore
@@ -46,6 +48,7 @@ a45fd52cc5891570d6299fab38643103c3955474  .node-version
 c6d2a30e1b9e1045dd901a83ad66acfbba7aa05e  LICENSE
 62d08cfc8bb802ca38d338437a84c3e3b53e9756  README.md
 43e4103552676f593c5ca392d42ecb6e5caf328a  SECURITY.md
+b45d009457872be3b377e3f383e2308c7eb96bb0  VERIFY-RELEASE.md
 0c21e1fd36f13e335ca40732cf5ca4da73834e16  VISION.md
 4fd145e20e56519c5b9af3b9b414da48b757da8a  cmd/crabbox-apple-vm-helper/main.go
 d959d730fe1de390ec74ddcc3952813d46562fdf  cmd/crabbox/blacksmith_stop_reconciliation_test.go
@@ -355,7 +358,7 @@ dbce7c33d0333e0a0be53314d18ba321ce7a3d28  internal/cli/artifacts_open_windows_te
 4513b0ce9ac99dac85406c5a0b4be9ee1a7aa2da  internal/cli/artifacts_publish.go
 d66dde23915cefefb2e7bff3306b91442ba5ad39  internal/cli/artifacts_publish_unix_test.go
 7c18a1cb9895c62a8d87ca54e09fa7277811fb54  internal/cli/artifacts_test.go
-1400b75c7e1e6357886cfc90dbbf0e1f2d5ec23f  internal/cli/attest.go
+17be71b61c0971121b812e9622f4e79aaa6dbe2e  internal/cli/attest.go
 7f2f412e3dbf7e7a330e82ad3ae3a7be17474a08  internal/cli/attest_test.go
 0974ab24cdf04fb0c3e47ad24911ae9fb5aab1d5  internal/cli/auth.go
 e7e48dc437764ceb29c4639e2e54fbe770a64531  internal/cli/auth_test.go
@@ -695,6 +698,7 @@ bda68866899d1324232821ed602793e4b58e6fa3  internal/cli/ready_pool.go
 b061dc043d70dd3fa2e17f09a27b8d7726b622b8  internal/cli/ready_pool_scrub_test.go
 a092718b7f055a936d5c0ca3d6ef30e00bc1ac34  internal/cli/ready_pool_test.go
 71ea899bcd9057959092be3884922c4b5e050c2f  internal/cli/receipt.go
+4e8491bc2372195ddf6471d5269d3a5c9eec2bf6  internal/cli/receipt_contract_conformance_test.go
 b5b75573b4bd307b958983dd809ae2c09fde2135  internal/cli/receipt_test.go
 e6f61b5a6db7bc9bf6ea7102df7bb7d64361c02a  internal/cli/repo.go
 5f020aa3730bcdb35a084ca43f83683f2e630804  internal/cli/repo_test.go
@@ -850,6 +854,7 @@ ac5b7226bd18a88c37b042e48fe8c38cbfff940b  internal/cli/terminal_receipt_tamper_t
 5f835a0bcc0c0bfdc304c5b9488935060269fdbb  internal/cli/testdata/pond_acl/acls.input.hujson
 4ada3f6be28c3b0474fe86e5a7ff5cbb08f08303  internal/cli/testdata/pond_acl/grants.golden.hujson
 2ba6e1e4900bccccf040165d410ba7561b98fcbf  internal/cli/testdata/pond_acl/grants.input.hujson
+da27223f3991a031d3092ce1f212c28dab84f260  internal/cli/testdata/receipt-contract/fixtures.json
 4239902bdfb02a177823ad6d20c0228dabfa6385  internal/cli/testdata/run-evidence-conformance/fixtures.json
 44f2f5fc6e4b2d5112b14c48478b982c52640bac  internal/cli/testdata/shell-chain-diagnostics.json
 2143ab4468433d4fc1818078376667b201fc6731  internal/cli/testdata/terminal-bundle-golden.json
@@ -1847,6 +1852,7 @@ efa4fa5b7346b8469ada0ff99cc190af618a72aa  recipes/bootstrap/v1/wslTruffleHogInst
 3dfc35e676bbe0dbdba1a046f68e1f69e7ac6d77  recipes/linux/v1/linux-minimal.json
 9987067936f2fad1dae9b9a1ad49d18f7d74be18  recipes/linux/v1/manifest.schema.json
 71c8acc38e6ed124802485dd14599446a9ff4a41  recipes/linux/v1/profile.schema.json
+32da35e0a0b335c00f7b287d0bd9dd6c1d27a735  release/qualification-schema.json
 fd67a5474554258b3782dbcf27e2b7cee66f2157  release/records/v0.37.0.json
 2411eeb8e2aeb84afcafd7d454318c2cf52d899a  release/records/v0.37.1.json
 2514c48dfa696418eba95ec99ab0b3ebd2549ab6  release/records/v0.38.0.json
@@ -1941,7 +1947,7 @@ a6249996e26fc460708388a8a5c1cf7ec66917eb  scripts/generate-bootstrap.mjs
 5cc306e227d661983df0eecc3af171d4ba518241  scripts/generate-linux-readiness.test.mjs
 d35897d271a698e925183364aa81d5a9b1af757f  scripts/generate-provider-matrix.mjs
 15f10283bf2e501c625d3e340dc10ba731f1d504  scripts/generate-qualification-matrix.sh
-9d5ab423bcc376ecedcad9ab49e4719c330c1c84  scripts/generate-release-evidence.sh
+606db8141faa15754e9e31544c548f43b49c91b2  scripts/generate-release-evidence.sh
 be957908fb64eea5228ef8284ff9d6739124d210  scripts/herdr-plugin.test.js
 f741aa8e74a89110b34aaf08e18daf88a9785189  scripts/homebrew-release.test.js
 3222397561491a7f831f8b61de2cc7c2761fa024  scripts/hydrate-workflow.test.js
@@ -2084,6 +2090,7 @@ a9763f530aa77f949309f047900f5f78e99661d4  scripts/verify-homebrew-release.sh
 3cb773840d7666e5453e623a82c92d5ce12d81be  scripts/verify-release-artifact.sh
 60f0c10b9fd19f60515ab1d369566b8432ef5e66  scripts/verify-release-source.sh
 60d2304298f53f24b4657d78e483e29b57ec090b  scripts/verify-release.sh
+da207bba86a42d4ab2d3dd8ff86f8d8d39a6e7af  scripts/verify-source-manifest.sh
 017b38e4c83603bab34117c74e39da4f2d345a88  scripts/wandb-smoke.sh
 4d6ebf1642266e2309271efeb45cba11848c22b7  scripts/wandb-smoke.test.js
 defdff46dc296f8aa401e8fe3e6165990623e293  scripts/windows-runtime.generated.ps1
@@ -2179,7 +2186,7 @@ c3c118077f94080f8029bcaa2dc5e4d3bebee483  worker/src/os-image.ts
 d351622e1f88064876e87f0704ffe9bd2e3e4a7c  worker/src/provider-reconciliation.ts
 77543f43367fb861978be497798ef8b2059c1ebc  worker/src/provisioning-attempts.ts
 220e09580ac0c2c2873de7f1b49f8ee01bc73161  worker/src/provisioning-material.ts
-ec923a8a6b1a67fe1e626c378762bf456c21c16b  worker/src/run-receipt.ts
+f0fb59edbb3039a7ee6f371348720db7117cdc0e  worker/src/run-receipt.ts
 9164d5a43fc4adf76193f701d8a166fc58594a32  worker/src/runtime-adapter-relay.ts
 765456cba6d4d79294f5d87c728df6d9d7f92716  worker/src/slug.ts
 421ca80bcf090c3174f35fd95d6ea04454176afb  worker/src/ssh2-agent.cjs
@@ -2241,9 +2248,10 @@ d1d27431dce16dedb47f64f563c0b05bb096ceb8  worker/test/postgres-storage.test.ts
 d2c6705fd9fd70c4b3f7a7eef0843642eee08d12  worker/test/provider-reconciliation.test.ts
 71eaeee65a419972dea349490b04d2a6bc4c6e65  worker/test/provisioning-attempts.test.ts
 0916262339993665c77bff4c20dd9407c4333357  worker/test/provisioning-fixtures.ts
+e8b3baee6e7280c8a437315c85d712c0d2766518  worker/test/receipt-contract-conformance.test.ts
 520d9756b7a17af2f5e891e337ad703a0e5cec9d  worker/test/run-evidence-conformance.test.ts
 31086461114cac64a374e159fb5d25495428b265  worker/test/run-evidence.test.ts
-99c50d25587112f2267cf1b50456a7b520c323dc  worker/test/run-receipt.test.ts
+9b15dfa343e9b8700b73cdb62de27b168f3879d5  worker/test/run-receipt.test.ts
 9181e43129d5ad77b7153468e8ce4a9111504e40  worker/test/runtime-adapter-relay.test.ts
 c5babe2bb55b309875ede29b69ee39e549015ab6  worker/test/server-support.test.ts
 d6a922e0316d3b3fee03a60f12d09a6124940abb  worker/test/slug.test.ts

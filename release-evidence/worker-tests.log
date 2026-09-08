@@ -1,5 +1,5 @@
 command=npm test --prefix worker
-started_at=2026-09-08T22:27:08Z
+started_at=2026-09-08T23:30:13Z
 ---
 
 > @openclaw/crabbox-worker@0.50.0 test
@@ -18,54 +18,53 @@ coordinator authority lost during startup; aborting
 [90mstderr[2m | test/aws.test.ts[2m > [22m[2maws provider[2m > [22m[2mbinds canonical SSH key reuse and deletion to lease ownership tags
 [22m[39mAWS SSH key cleanup skipped unowned key lease=cbx_abcdef123456 key=crabbox-cbx-abcdef123456
 
- [32m✓[39m test/node-build.test.ts [2m([22m[2m1 test[22m[2m)[22m[33m 557[2mms[22m[39m
-     [33m[2m✓[22m[39m loads external CommonJS dependencies before validating configuration [33m 556[2mms[22m[39m
- [32m✓[39m test/aws-inventory.test.ts [2m([22m[2m22 tests[22m[2m)[22m[32m 224[2mms[22m[39m
-[90mstderr[2m | test/fleet.test.ts[2m > [22m[2mruntime adapter relay[2m > [22m[2mretries transient restored-lease reconciliation without dropping sockets
-[22m[39mcould not reconcile restored bridges storage unavailable
-
- [32m✓[39m test/bridge-tickets.test.ts [2m([22m[2m84 tests[22m[2m)[22m[32m 172[2mms[22m[39m
- [32m✓[39m test/pairing.test.ts [2m([22m[2m32 tests[22m[2m)[22m[32m 221[2mms[22m[39m
- [32m✓[39m test/hetzner-cleanup.test.ts [2m([22m[2m82 tests[22m[2m)[22m[32m 112[2mms[22m[39m
+ [32m✓[39m test/node-build.test.ts [2m([22m[2m1 test[22m[2m)[22m[33m 524[2mms[22m[39m
+     [33m[2m✓[22m[39m loads external CommonJS dependencies before validating configuration [33m 523[2mms[22m[39m
+ [32m✓[39m test/aws-inventory.test.ts [2m([22m[2m22 tests[22m[2m)[22m[32m 280[2mms[22m[39m
 [90mstderr[2m | test/node-runtime.test.ts[2m > [22m[2mNodeCoordinatorRuntime[2m > [22m[2mloses authority and fires callbacks when the advisory-lock session dies
 [22m[39mcoordinator advisory-lock session lost; authority lost, shutting down
 
 [90mstderr[2m | test/node-runtime.test.ts[2m > [22m[2mNodeCoordinatorRuntime[2m > [22m[2mstops itself when authority is lost and no callback is registered
 [22m[39mcoordinator advisory-lock session lost; authority lost, shutting down
 
+ [32m✓[39m test/cloudflare-dynamic-worker-runner.test.ts [2m([22m[2m77 tests[22m[2m)[22m[32m 143[2mms[22m[39m
 [90mstderr[2m | test/node-runtime.test.ts[2m > [22m[2mNodeCoordinatorRuntime[2m > [22m[2mkeeps stop() idempotent when authority loss and stop() race
 [22m[39mcoordinator advisory-lock session lost; authority lost, shutting down
 
- [32m✓[39m test/aws.test.ts [2m([22m[2m76 tests[22m[2m)[22m[33m 662[2mms[22m[39m
+[90mstderr[2m | test/fleet.test.ts[2m > [22m[2mruntime adapter relay[2m > [22m[2mretries transient restored-lease reconciliation without dropping sockets
+[22m[39mcould not reconcile restored bridges storage unavailable
+
 [90mstderr[2m | test/node-runtime.test.ts[2m > [22m[2mNodeCoordinatorRuntime startup fault injection[2m > [22m[2mhandles authority loss during startup at boss.start
 [22m[39mcoordinator advisory-lock session lost; authority lost, shutting down
 coordinator authority lost during startup; aborting
 
- [32m✓[39m test/postgres-storage.test.ts [2m([22m[2m34 tests[22m[2m)[22m[33m 450[2mms[22m[39m
-[90mstderr[2m | test/coordinator-parity.test.ts[2m > [22m[2mnode coordinator authority loss[2m > [22m[2mmarks authority as lost when the advisory-lock session dies
-[22m[39mcoordinator advisory-lock session lost; authority lost, shutting down
-
-[90mstderr[2m | test/coordinator-parity.test.ts[2m > [22m[2mnode coordinator authority loss[2m > [22m[2minvokes registered authority-lost callbacks exactly once
-[22m[39mcoordinator advisory-lock session lost; authority lost, shutting down
-
-[90mstderr[2m | test/coordinator-parity.test.ts[2m > [22m[2mnode coordinator authority loss[2m > [22m[2mallows a replacement to acquire the lock after authority loss
-[22m[39mcoordinator advisory-lock session lost; authority lost, shutting down
-
-[90mstderr[2m | test/coordinator-parity.test.ts[2m > [22m[2mnode coordinator authority loss[2m > [22m[2mkeeps stop() idempotent when authority loss and orderly shutdown race
-[22m[39mcoordinator advisory-lock session lost; authority lost, shutting down
-
-[90mstderr[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mretries persisted Hetzner SSH key cleanup before forgetting the failed lease
-[22m[39mlease cleanup failed lease=cbx_8d8d742c672c provider=hetzner cloud=: temporary cleanup failure
-
- [32m✓[39m test/coordinator-parity.test.ts [2m([22m[2m46 tests[22m[2m | [22m[33m1 skipped[39m[2m)[22m[32m 177[2mms[22m[39m
- [32m✓[39m test/daytona.test.ts [2m([22m[2m74 tests[22m[2m)[22m[32m 150[2mms[22m[39m
-[90mstderr[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mbinds canonical Hetzner SSH key reuse, creation, and deletion to lease labels
-[22m[39mHetzner SSH key cleanup skipped unowned key lease=cbx_abcdef123456 key=crabbox-cbx-abcdef123456
-
- [32m✓[39m test/aws-qualification-authority.test.ts [2m([22m[2m40 tests[22m[2m)[22m[33m 481[2mms[22m[39m
+ [32m✓[39m test/pairing.test.ts [2m([22m[2m32 tests[22m[2m)[22m[32m 240[2mms[22m[39m
 [90mstderr[2m | test/node-runtime.test.ts[2m > [22m[2mNodeCoordinatorRuntime startup fault injection[2m > [22m[2mhandles authority loss during startup at createQueue
 [22m[39mcoordinator advisory-lock session lost; authority lost, shutting down
 coordinator authority lost during startup; aborting
+
+ [32m✓[39m test/http.test.ts [2m([22m[2m94 tests[22m[2m)[22m[32m 283[2mms[22m[39m
+[90mstderr[2m | test/node-runtime.test.ts[2m > [22m[2mNodeCoordinatorRuntime startup fault injection[2m > [22m[2mhandles authority loss during startup at work registration
+[22m[39mcoordinator advisory-lock session lost; authority lost, shutting down
+coordinator authority lost during startup; aborting
+
+[90mstderr[2m | test/node-runtime.test.ts[2m > [22m[2mNodeCoordinatorRuntime startup fault injection[2m > [22m[2mhandles authority loss during startup at schedule
+[22m[39mcoordinator advisory-lock session lost; authority lost, shutting down
+coordinator authority lost during startup; aborting
+
+ [32m✓[39m test/bridge-tickets.test.ts [2m([22m[2m84 tests[22m[2m)[22m[32m 199[2mms[22m[39m
+[90mstderr[2m | test/node-runtime.test.ts[2m > [22m[2mNodeCoordinatorRuntime startup fault injection[2m > [22m[2mhandles authority loss during startup at send startup reconciliation
+[22m[39mcoordinator advisory-lock session lost; authority lost, shutting down
+coordinator authority lost during startup; aborting
+
+ [32m✓[39m test/node-runtime.test.ts [2m([22m[2m42 tests[22m[2m)[22m[33m 1013[2mms[22m[39m
+ [32m✓[39m test/postgres-storage.test.ts [2m([22m[2m34 tests[22m[2m)[22m[33m 463[2mms[22m[39m
+ [32m✓[39m test/aws.test.ts [2m([22m[2m76 tests[22m[2m)[22m[33m 801[2mms[22m[39m
+[90mstderr[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mretries persisted Hetzner SSH key cleanup before forgetting the failed lease
+[22m[39mlease cleanup failed lease=cbx_abb43879e1f7 provider=hetzner cloud=: temporary cleanup failure
+
+[90mstderr[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mbinds canonical Hetzner SSH key reuse, creation, and deletion to lease labels
+[22m[39mHetzner SSH key cleanup skipped unowned key lease=cbx_abcdef123456 key=crabbox-cbx-abcdef123456
 
 [90mstderr[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mretries a rejected Hetzner DELETE429 through broker backoff and fresh ownership
 [22m[39mlease cleanup failed lease=cbx_000000000000 provider=hetzner cloud=123: hetzner DELETE /servers/123: http 429: {"error":{"code":"rate_limit_exceeded","message":"request rejected"}}
@@ -115,10 +114,11 @@ coordinator authority lost during startup; aborting
 [90mstderr[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mretains broker Hetzner cleanup debt on action storage failure
 [22m[39mlease cleanup failed lease=cbx_000000000000 provider=hetzner cloud=123: unresolved Hetzner delete acknowledgement; retained dispatch requires resolution
 
+ [32m✓[39m test/aws-qualification-authority.test.ts [2m([22m[2m40 tests[22m[2m)[22m[33m 541[2mms[22m[39m
+ [32m✓[39m test/hetzner-cleanup.test.ts [2m([22m[2m82 tests[22m[2m)[22m[32m 192[2mms[22m[39m
 [90mstderr[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2masserts Hetzner 'canonical' key cleanup before DELETE with 'receipt'
 [22m[39mlease cleanup failed lease=cbx_000000000000 provider=hetzner cloud=123: lease cleanup evidence changed
 
- [32m✓[39m test/cloudflare-dynamic-worker-runner.test.ts [2m([22m[2m77 tests[22m[2m)[22m[32m 148[2mms[22m[39m
 [90mstderr[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2masserts Hetzner 'retained ID' key cleanup before DELETE with 'receipt'
 [22m[39mlease cleanup failed lease=cbx_000000000000 provider=hetzner cloud=123: lease cleanup evidence changed
 
@@ -127,10 +127,6 @@ coordinator authority lost during startup; aborting
 
 [90mstderr[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mretries real Hetzner key cleanup under a fresh claim with its confirmed journal
 [22m[39mlease cleanup failed lease=cbx_000000000000 provider=hetzner cloud=123: hetzner DELETE /ssh_keys/7: http 503: {"error":{"code":"server_error"}}
-
-[90mstderr[2m | test/node-runtime.test.ts[2m > [22m[2mNodeCoordinatorRuntime startup fault injection[2m > [22m[2mhandles authority loss during startup at work registration
-[22m[39mcoordinator advisory-lock session lost; authority lost, shutting down
-coordinator authority lost during startup; aborting
 
 [90mstderr[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mretries real Hetzner key-only cleanup after definite create rejection (retention: none)
 [22m[39mlease cleanup failed lease=cbx_abcdef123456 provider=hetzner cloud=: hetzner DELETE /ssh_keys/7: http 503: {"error":{"code":"server_error"}}
@@ -174,28 +170,18 @@ coordinator authority lost during startup; aborting
 [90mstderr[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mkeeps accepted workspace creates successful when post-persist maintenance fails
 [22m[39mworkspace prewarm maintenance deferred: maintenance error code=10000
 
-[90mstderr[2m | test/node-runtime.test.ts[2m > [22m[2mNodeCoordinatorRuntime startup fault injection[2m > [22m[2mhandles authority loss during startup at schedule
-[22m[39mcoordinator advisory-lock session lost; authority lost, shutting down
-coordinator authority lost during startup; aborting
-
-[90mstderr[2m | test/node-runtime.test.ts[2m > [22m[2mNodeCoordinatorRuntime startup fault injection[2m > [22m[2mhandles authority loss during startup at send startup reconciliation
-[22m[39mcoordinator advisory-lock session lost; authority lost, shutting down
-coordinator authority lost during startup; aborting
-
- [32m✓[39m test/node-runtime.test.ts [2m([22m[2m42 tests[22m[2m)[22m[33m 1016[2mms[22m[39m
+ [32m✓[39m test/daytona.test.ts [2m([22m[2m74 tests[22m[2m)[22m[32m 177[2mms[22m[39m
 [90mstderr[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mkeeps failed workspace cleanup retryable until provider deletion succeeds
-[22m[39mlease cleanup failed lease=cbx_9e546b8d9efc provider=hetzner cloud=123: provider cleanup throttled
+[22m[39mlease cleanup failed lease=cbx_e83f0047e809 provider=hetzner cloud=123: provider cleanup throttled
 
- [32m✓[39m test/gcp.test.ts [2m([22m[2m78 tests[22m[2m)[22m[32m 108[2mms[22m[39m
- [32m✓[39m test/github-membership.test.ts [2m([22m[2m41 tests[22m[2m | [22m[33m1 skipped[39m[2m)[22m[32m 106[2mms[22m[39m
- [32m✓[39m test/cloudflare-container-runner.test.ts [2m([22m[2m18 tests[22m[2m)[22m[32m 144[2mms[22m[39m
- [32m✓[39m test/azure.test.ts [2m([22m[2m133 tests[22m[2m)[22m[32m 156[2mms[22m[39m
+ [32m✓[39m test/github-membership.test.ts [2m([22m[2m41 tests[22m[2m | [22m[33m1 skipped[39m[2m)[22m[32m 80[2mms[22m[39m
 [90mstderr[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mbacks off durable Hetzner server and SSH key cleanup after rollback failure
 [22m[39mlease cleanup failed lease=cbx_abcdef123456 provider=hetzner cloud=123: temporary cleanup failure
 
 [90mstderr[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mroutes portal release of a workspace lease through workspace cleanup state
-[22m[39mlease cleanup failed lease=cbx_d7b012a8a4ae provider=hetzner cloud=123: provider cleanup throttled
+[22m[39mlease cleanup failed lease=cbx_4b6e185c3905 provider=hetzner cloud=123: provider cleanup throttled
 
+ [32m✓[39m test/azure.test.ts [2m([22m[2m133 tests[22m[2m)[22m[32m 156[2mms[22m[39m
 [90mstdout[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mretains managed Daytona uncertain-create cleanup for 'fixed' with release='none', responseLost=true, cancelAttempt=false
 [22m[39mmanaged-daytona-uncertain-create {"method":"PUT","release":"none","responseLost":true,"nativeLifecycle":{"autoStopInterval":0,"autoDeleteInterval":-1},"checkpoints":[{"state":"failed","cloudID":"","resourceMayExist":true,"requestStartedAt":"2026-08-28T12:00:00.000Z"},{"state":"failed","cloudID":"","resourceMayExist":true,"requestStartedAt":"2026-08-28T12:00:00.000Z"},{"state":"failed","cloudID":"","resourceMayExist":true,"requestStartedAt":"2026-08-28T12:00:00.000Z"}],"nextAlarm":null,"providerRequests":["POST /api/sandbox"],"deleted":[],"resourceStillExists":true}
 
@@ -205,9 +191,11 @@ coordinator authority lost during startup; aborting
 [90mstdout[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mretains managed Daytona uncertain-create cleanup for 'fixed' with release='after', responseLost=true, cancelAttempt=false
 [22m[39mmanaged-daytona-uncertain-create {"method":"PUT","release":"after","responseLost":true,"nativeLifecycle":{"autoStopInterval":0,"autoDeleteInterval":-1},"checkpoints":[{"state":"failed","cloudID":"","resourceMayExist":true,"requestStartedAt":"2026-08-28T12:00:00.000Z"},{"state":"released","cloudID":"","resourceMayExist":true,"requestStartedAt":"2026-08-28T12:00:00.000Z","releaseDeletesServer":true},{"state":"released","cloudID":"","resourceMayExist":true,"requestStartedAt":"2026-08-28T12:00:00.000Z","releaseDeletesServer":true}],"nextAlarm":null,"providerRequests":["POST /api/sandbox"],"deleted":[],"resourceStillExists":true}
 
+ [32m✓[39m test/gcp.test.ts [2m([22m[2m78 tests[22m[2m)[22m[32m 153[2mms[22m[39m
 [90mstdout[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mretains managed Daytona uncertain-create cleanup for 'fixed' with release='retain', responseLost=true, cancelAttempt=false
 [22m[39mmanaged-daytona-uncertain-create {"method":"PUT","release":"retain","responseLost":true,"nativeLifecycle":{"autoStopInterval":0,"autoDeleteInterval":-1},"checkpoints":[{"state":"failed","cloudID":"","resourceMayExist":true,"requestStartedAt":"2026-08-28T12:00:00.000Z"},{"state":"released","cloudID":"","resourceMayExist":true,"requestStartedAt":"2026-08-28T12:00:00.000Z","releaseDeletesServer":false},{"state":"released","cloudID":"","resourceMayExist":true,"requestStartedAt":"2026-08-28T12:00:00.000Z","releaseDeletesServer":false}],"nextAlarm":null,"providerRequests":["POST /api/sandbox"],"deleted":[],"resourceStillExists":true}
 
+ [32m✓[39m test/cloudflare-container-runner.test.ts [2m([22m[2m18 tests[22m[2m)[22m[32m 151[2mms[22m[39m
 [90mstdout[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mretains managed Daytona uncertain-create cleanup for 'fixed' with release='retainDuring', responseLost=true, cancelAttempt=false
 [22m[39mmanaged-daytona-uncertain-create {"method":"PUT","release":"retainDuring","responseLost":true,"nativeLifecycle":{"autoStopInterval":0,"autoDeleteInterval":-1},"checkpoints":[{"state":"released","cloudID":"","resourceMayExist":true,"requestStartedAt":"2026-08-28T12:00:00.000Z","releaseDeletesServer":false},{"state":"released","cloudID":"","resourceMayExist":true,"requestStartedAt":"2026-08-28T12:00:00.000Z","releaseDeletesServer":false},{"state":"released","cloudID":"","resourceMayExist":true,"requestStartedAt":"2026-08-28T12:00:00.000Z","releaseDeletesServer":false}],"nextAlarm":null,"providerRequests":["POST /api/sandbox"],"deleted":[],"resourceStillExists":true}
 
@@ -220,7 +208,6 @@ coordinator authority lost during startup; aborting
 [90mstdout[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mretains managed Daytona uncertain-create cleanup for 'fixed' with release='retain', responseLost=false, cancelAttempt=false
 [22m[39mmanaged-daytona-uncertain-create {"method":"PUT","release":"retain","responseLost":false,"nativeLifecycle":{"autoStopInterval":0,"autoDeleteInterval":-1},"checkpoints":[{"state":"active","cloudID":"b1d5afbd-9eda-4ead-9fa5-52c3238e691a"},{"state":"released","cloudID":"b1d5afbd-9eda-4ead-9fa5-52c3238e691a","releaseDeletesServer":false},{"state":"released","cloudID":"b1d5afbd-9eda-4ead-9fa5-52c3238e691a","releaseDeletesServer":false}],"nextAlarm":null,"providerRequests":["POST /api/sandbox","GET /api/sandbox/b1d5afbd-9eda-4ead-9fa5-52c3238e691a","POST /api/sandbox/b1d5afbd-9eda-4ead-9fa5-52c3238e691a/ssh-access"],"deleted":[],"resourceStillExists":true}
 
- [32m✓[39m test/http.test.ts [2m([22m[2m94 tests[22m[2m)[22m[33m 324[2mms[22m[39m
 [90mstdout[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mretains managed Daytona uncertain-create cleanup for 'fixed' with release='retainDuring', responseLost=false, cancelAttempt=false
 [22m[39mmanaged-daytona-uncertain-create {"method":"PUT","release":"retainDuring","responseLost":false,"nativeLifecycle":{"autoStopInterval":0,"autoDeleteInterval":-1},"checkpoints":[{"state":"released","cloudID":"b1d5afbd-9eda-4ead-9fa5-52c3238e691a","resourceMayExist":false,"releaseDeletesServer":false},{"state":"released","cloudID":"b1d5afbd-9eda-4ead-9fa5-52c3238e691a","resourceMayExist":false,"releaseDeletesServer":false},{"state":"released","cloudID":"b1d5afbd-9eda-4ead-9fa5-52c3238e691a","resourceMayExist":false,"releaseDeletesServer":false}],"nextAlarm":null,"providerRequests":["POST /api/sandbox"],"deleted":[],"resourceStillExists":true}
 
@@ -233,6 +220,7 @@ coordinator authority lost during startup; aborting
 [90mstdout[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mretains managed Daytona uncertain-create cleanup for 'ordinary' with release='after', responseLost=true, cancelAttempt=false
 [22m[39mmanaged-daytona-uncertain-create {"method":"POST","release":"after","responseLost":true,"nativeLifecycle":{"autoStopInterval":0,"autoDeleteInterval":-1},"checkpoints":[{"state":"failed","cloudID":"","resourceMayExist":true,"requestStartedAt":"2026-08-28T12:00:00.000Z"},{"state":"released","cloudID":"","resourceMayExist":true,"requestStartedAt":"2026-08-28T12:00:00.000Z","releaseDeletesServer":true},{"state":"released","cloudID":"","resourceMayExist":true,"requestStartedAt":"2026-08-28T12:00:00.000Z","releaseDeletesServer":true}],"nextAlarm":null,"providerRequests":["POST /api/sandbox"],"deleted":[],"resourceStillExists":true}
 
+ [32m✓[39m test/oauth-browser-binding.test.ts [2m([22m[2m11 tests[22m[2m)[22m[32m 101[2mms[22m[39m
 [90mstdout[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mretains managed Daytona uncertain-create cleanup for 'ordinary' with release='retain', responseLost=true, cancelAttempt=false
 [22m[39mmanaged-daytona-uncertain-create {"method":"POST","release":"retain","responseLost":true,"nativeLifecycle":{"autoStopInterval":0,"autoDeleteInterval":-1},"checkpoints":[{"state":"failed","cloudID":"","resourceMayExist":true,"requestStartedAt":"2026-08-28T12:00:00.000Z"},{"state":"released","cloudID":"","resourceMayExist":true,"requestStartedAt":"2026-08-28T12:00:00.000Z","releaseDeletesServer":false},{"state":"released","cloudID":"","resourceMayExist":true,"requestStartedAt":"2026-08-28T12:00:00.000Z","releaseDeletesServer":false}],"nextAlarm":null,"providerRequests":["POST /api/sandbox"],"deleted":[],"resourceStillExists":true}
 
@@ -245,9 +233,22 @@ coordinator authority lost during startup; aborting
 [90mstdout[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mretains managed Daytona uncertain-create cleanup for 'ordinary' with release='after', responseLost=false, cancelAttempt=false
 [22m[39mmanaged-daytona-uncertain-create {"method":"POST","release":"after","responseLost":false,"nativeLifecycle":{"autoStopInterval":0,"autoDeleteInterval":-1},"checkpoints":[{"state":"active","cloudID":"b1d5afbd-9eda-4ead-9fa5-52c3238e691a"},{"state":"released","cloudID":"b1d5afbd-9eda-4ead-9fa5-52c3238e691a","releaseDeletesServer":true},{"state":"released","cloudID":"b1d5afbd-9eda-4ead-9fa5-52c3238e691a"}],"nextAlarm":null,"providerRequests":["POST /api/sandbox","GET /api/sandbox/b1d5afbd-9eda-4ead-9fa5-52c3238e691a","POST /api/sandbox/b1d5afbd-9eda-4ead-9fa5-52c3238e691a/ssh-access","GET /api/sandbox/b1d5afbd-9eda-4ead-9fa5-52c3238e691a","DELETE /api/sandbox/b1d5afbd-9eda-4ead-9fa5-52c3238e691a","GET /api/sandbox/b1d5afbd-9eda-4ead-9fa5-52c3238e691a"],"deleted":["b1d5afbd-9eda-4ead-9fa5-52c3238e691a"],"resourceStillExists":false}
 
+[90mstderr[2m | test/coordinator-parity.test.ts[2m > [22m[2mnode coordinator authority loss[2m > [22m[2mmarks authority as lost when the advisory-lock session dies
+[22m[39mcoordinator advisory-lock session lost; authority lost, shutting down
+
+[90mstderr[2m | test/coordinator-parity.test.ts[2m > [22m[2mnode coordinator authority loss[2m > [22m[2minvokes registered authority-lost callbacks exactly once
+[22m[39mcoordinator advisory-lock session lost; authority lost, shutting down
+
+[90mstderr[2m | test/coordinator-parity.test.ts[2m > [22m[2mnode coordinator authority loss[2m > [22m[2mallows a replacement to acquire the lock after authority loss
+[22m[39mcoordinator advisory-lock session lost; authority lost, shutting down
+
+[90mstderr[2m | test/coordinator-parity.test.ts[2m > [22m[2mnode coordinator authority loss[2m > [22m[2mkeeps stop() idempotent when authority loss and orderly shutdown race
+[22m[39mcoordinator advisory-lock session lost; authority lost, shutting down
+
 [90mstdout[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mretains managed Daytona uncertain-create cleanup for 'ordinary' with release='retain', responseLost=false, cancelAttempt=false
 [22m[39mmanaged-daytona-uncertain-create {"method":"POST","release":"retain","responseLost":false,"nativeLifecycle":{"autoStopInterval":0,"autoDeleteInterval":-1},"checkpoints":[{"state":"active","cloudID":"b1d5afbd-9eda-4ead-9fa5-52c3238e691a"},{"state":"released","cloudID":"b1d5afbd-9eda-4ead-9fa5-52c3238e691a","releaseDeletesServer":false},{"state":"released","cloudID":"b1d5afbd-9eda-4ead-9fa5-52c3238e691a","releaseDeletesServer":false}],"nextAlarm":null,"providerRequests":["POST /api/sandbox","GET /api/sandbox/b1d5afbd-9eda-4ead-9fa5-52c3238e691a","POST /api/sandbox/b1d5afbd-9eda-4ead-9fa5-52c3238e691a/ssh-access"],"deleted":[],"resourceStillExists":true}
 
+ [32m✓[39m test/coordinator-parity.test.ts [2m([22m[2m46 tests[22m[2m | [22m[33m1 skipped[39m[2m)[22m[32m 267[2mms[22m[39m
 [90mstdout[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mretains managed Daytona uncertain-create cleanup for 'ordinary' with release='retainDuring', responseLost=false, cancelAttempt=false
 [22m[39mmanaged-daytona-uncertain-create {"method":"POST","release":"retainDuring","responseLost":false,"nativeLifecycle":{"autoStopInterval":0,"autoDeleteInterval":-1},"checkpoints":[{"state":"released","cloudID":"b1d5afbd-9eda-4ead-9fa5-52c3238e691a","resourceMayExist":false,"releaseDeletesServer":false},{"state":"released","cloudID":"b1d5afbd-9eda-4ead-9fa5-52c3238e691a","resourceMayExist":false,"releaseDeletesServer":false},{"state":"released","cloudID":"b1d5afbd-9eda-4ead-9fa5-52c3238e691a","resourceMayExist":false,"releaseDeletesServer":false}],"nextAlarm":null,"providerRequests":["POST /api/sandbox"],"deleted":[],"resourceStillExists":true}
 
@@ -284,7 +285,6 @@ coordinator authority lost during startup; aborting
 [90mstdout[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mretains managed Daytona uncertain-create cleanup for 'ordinary' with release='after', responseLost=true, cancelAttempt=true
 [22m[39mmanaged-daytona-uncertain-create {"method":"POST","release":"after","responseLost":true,"nativeLifecycle":{"autoStopInterval":0,"autoDeleteInterval":-1},"checkpoints":[{"state":"failed","cloudID":"","resourceMayExist":true,"requestStartedAt":"2026-08-28T12:00:00.000Z"},{"state":"released","cloudID":"","resourceMayExist":true,"requestStartedAt":"2026-08-28T12:00:00.000Z","releaseDeletesServer":true},{"state":"released","cloudID":"","resourceMayExist":true,"requestStartedAt":"2026-08-28T12:00:00.000Z","releaseDeletesServer":true}],"nextAlarm":null,"providerRequests":["POST /api/sandbox"],"deleted":[],"resourceStillExists":true}
 
- [32m✓[39m test/coordinator-migration.test.ts [2m([22m[2m9 tests[22m[2m)[22m[32m 57[2mms[22m[39m
 [90mstderr[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mkeeps managed Daytona cleanup unresolved after key context loss
 [22m[39mlease cleanup failed lease=cbx_abcdef123492 provider=daytona cloud=1111174a-fdee-48e0-9e15-ffadbd323d42: Daytona cleanup unresolved for lease cbx_abcdef123492: an authoritative sandbox UUID and its original API, organization, and credential context are required; no provider mutation attempted
 
@@ -294,21 +294,21 @@ coordinator authority lost during startup; aborting
 [90mstderr[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mkeeps managed Daytona cleanup unresolved after api context loss
 [22m[39mlease cleanup failed lease=cbx_abcdef123492 provider=daytona cloud=1111174a-fdee-48e0-9e15-ffadbd323d42: Daytona cleanup unresolved for lease cbx_abcdef123492: an authoritative sandbox UUID and its original API, organization, and credential context are required; no provider mutation attempted
 
+ [32m✓[39m test/capacity.test.ts [2m([22m[2m33 tests[22m[2m)[22m[32m 136[2mms[22m[39m
 [90mstderr[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mkeeps managed Daytona cleanup unresolved after legacy context loss
 [22m[39mlease cleanup failed lease=cbx_abcdef123492 provider=daytona cloud=1111174a-fdee-48e0-9e15-ffadbd323d42: Daytona cleanup unresolved for lease cbx_abcdef123492: an authoritative sandbox UUID and its original API, organization, and credential context are required; no provider mutation attempted
 
 [90mstderr[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mkeeps managed Daytona cleanup unresolved after legacy context loss
 [22m[39mlease cleanup failed lease=cbx_abcdef123492 provider=daytona cloud=1111174a-fdee-48e0-9e15-ffadbd323d42: Daytona cleanup unresolved for lease cbx_abcdef123492: an authoritative sandbox UUID and its original API, organization, and credential context are required; no provider mutation attempted
 
- [32m✓[39m test/capacity.test.ts [2m([22m[2m33 tests[22m[2m)[22m[32m 144[2mms[22m[39m
- [32m✓[39m test/oauth-browser-binding.test.ts [2m([22m[2m11 tests[22m[2m)[22m[32m 69[2mms[22m[39m
- [32m✓[39m test/server-support.test.ts [2m([22m[2m21 tests[22m[2m)[22m[32m 79[2mms[22m[39m
+ [32m✓[39m test/server-support.test.ts [2m([22m[2m21 tests[22m[2m)[22m[32m 85[2mms[22m[39m
 [90mstderr[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mkeeps expired leases active when provider cleanup fails and retries later
 [22m[39mlease cleanup failed lease=cbx_000000000001 provider=aws cloud=i-000000000001: aws terminate throttled X-API-Key: [redacted]
 
 [90mstderr[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mkeeps provider cleanup failures active even when the cloud instance is already gone
 [22m[39mlease cleanup failed lease=cbx_000000000001 provider=aws cloud=i-000000000001: aws instance not found: i-000000000001
 
+ [32m✓[39m test/aws-private.test.ts [2m([22m[2m23 tests[22m[2m)[22m[32m 186[2mms[22m[39m
 [90mstderr[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mfails legacy Azure deferred cleanup closed without a persisted claim and scope
 [22m[39mazure deferred cleanup failed name=crabbox-deferred location=eastus: refusing Azure deferred cleanup for crabbox-deferred: canonical lease claim and provider scope were not persisted
 
@@ -327,20 +327,11 @@ coordinator authority lost during startup; aborting
 [90mstderr[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mdeletes only coordinator-owned Azure orphan sweep candidates
 [22m[39mazure orphan sweep mode=delete scanned=7 candidates=2 terminated=0 errors=0
 
-[90mstdout[2m | test/private-aws-workspace.test.ts[2m > [22m[2mprivate AWS workspaces[2m > [22m[2mrecovers an ambiguous private launch and resumes idempotent SSM bootstrap
-[22m[39m{"component":"crabbox_private_aws_workspace","event":"create_accepted","region":"us-west-2","instance_type":"t3a.small","lease_id":"cbx_a3d4d3770b10"}
-
 [90mstderr[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mdeletes only coordinator-owned Azure orphan sweep candidates
 [22m[39mazure orphan sweep mode=delete scanned=7 candidates=2 terminated=1 errors=0
 
-[90mstdout[2m | test/private-aws-workspace.test.ts[2m > [22m[2mprivate AWS workspaces[2m > [22m[2mrecovers an ambiguous private launch and resumes idempotent SSM bootstrap
-[22m[39m{"component":"crabbox_private_aws_workspace","event":"recovered_ready","lease_id":"cbx_a3d4d3770b10","cloud_id":"i-recovered123","region":"us-west-2","instance_type":"t3a.small","ssm_command_id":"command-recovered123"}
-
 [90mstderr[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mkeeps Azure candidates report-only when provider labels do not match the lease
 [22m[39mazure orphan sweep mode=delete scanned=1 candidates=1 terminated=0 errors=0
-
-[90mstdout[2m | test/private-aws-workspace.test.ts[2m > [22m[2mprivate AWS workspaces[2m > [22m[2mrecovers only to retire an ambiguous launch after delete
-[22m[39m{"component":"crabbox_private_aws_workspace","event":"create_accepted","region":"us-west-2","instance_type":"t3a.small","lease_id":"cbx_e9bc94d47c59"}
 
 [90mstderr[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mpreserves Azure quarantine state when inventory fails
 [22m[39mazure orphan sweep inventory failed; inspect the sweep record for details
@@ -348,14 +339,8 @@ coordinator authority lost during startup; aborting
 [90mstderr[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mpreserves Azure quarantine state when inventory fails
 [22m[39mazure orphan sweep mode=delete scanned=0 candidates=0 terminated=0 errors=1
 
-[90mstdout[2m | test/private-aws-workspace.test.ts[2m > [22m[2mprivate AWS workspaces[2m > [22m[2mrecovers only to retire an ambiguous launch after delete
-[22m[39m{"component":"crabbox_private_aws_workspace","event":"delete_requested","lease_id":"cbx_e9bc94d47c59","region":"us-west-2"}
-
 [90mstderr[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mbacks off Azure inventory while its reconciliation circuit is open
 [22m[39mazure orphan sweep mode=report scanned=0 candidates=0 terminated=0 errors=1
-
-[90mstdout[2m | test/private-aws-workspace.test.ts[2m > [22m[2mprivate AWS workspaces[2m > [22m[2mdoes not reactivate when delete arrives during recovered bootstrap
-[22m[39m{"component":"crabbox_private_aws_workspace","event":"create_accepted","region":"us-west-2","instance_type":"t3a.small","lease_id":"cbx_513d753870b0"}
 
 [90mstderr[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mpreserves AWS quarantine when EC2 Mac host inventory fails
 [22m[39maws orphan sweep inventory failed; inspect the sweep record for details
@@ -363,66 +348,82 @@ coordinator authority lost during startup; aborting
 [90mstderr[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mpreserves AWS quarantine when EC2 Mac host inventory fails
 [22m[39maws orphan sweep mode=delete scanned=0 candidates=0 terminated=0 mac_hosts=0 mac_hosts_released=0 errors=1
 
-[90mstdout[2m | test/private-aws-workspace.test.ts[2m > [22m[2mprivate AWS workspaces[2m > [22m[2mdoes not reactivate when delete arrives during recovered bootstrap
-[22m[39m{"component":"crabbox_private_aws_workspace","event":"delete_requested","lease_id":"cbx_513d753870b0","region":"us-west-2"}
-
- [32m✓[39m test/private-aws-workspace.test.ts [2m([22m[2m8 tests[22m[2m)[22m[32m 84[2mms[22m[39m
 [90mstderr[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mreleases stale pending EC2 Mac hosts during the AWS orphan sweep
 [22m[39maws orphan sweep mode=delete scanned=0 candidates=0 terminated=0 mac_hosts=1 mac_hosts_released=1 errors=0
 
- [32m✓[39m test/bootstrap.test.ts [2m([22m[2m30 tests[22m[2m)[22m[32m 51[2mms[22m[39m
 [90mstderr[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mkeeps tag-only EC2 Mac hosts report-only in release mode
 [22m[39maws orphan sweep mode=delete scanned=0 candidates=0 terminated=0 mac_hosts=1 mac_hosts_released=0 errors=0
 
- [32m✓[39m test/run-evidence-conformance.test.ts [2m([22m[2m94 tests[22m[2m)[22m[32m 32[2mms[22m[39m
- [32m✓[39m test/bootstrap-private.test.ts [2m([22m[2m2 tests[22m[2m)[22m[32m 25[2mms[22m[39m
- [32m✓[39m test/artifacts.test.ts [2m([22m[2m12 tests[22m[2m)[22m[32m 45[2mms[22m[39m
- [32m✓[39m test/coordinator-runtime.test.ts [2m([22m[2m21 tests[22m[2m)[22m[32m 84[2mms[22m[39m
- [32m✓[39m test/run-evidence.test.ts [2m([22m[2m25 tests[22m[2m)[22m[32m 33[2mms[22m[39m
+ [32m✓[39m test/run-evidence.test.ts [2m([22m[2m25 tests[22m[2m)[22m[32m 66[2mms[22m[39m
+ [32m✓[39m test/artifacts.test.ts [2m([22m[2m12 tests[22m[2m)[22m[32m 48[2mms[22m[39m
+ [32m✓[39m test/bootstrap.test.ts [2m([22m[2m30 tests[22m[2m)[22m[32m 51[2mms[22m[39m
+[90mstdout[2m | test/private-aws-workspace.test.ts[2m > [22m[2mprivate AWS workspaces[2m > [22m[2mrecovers an ambiguous private launch and resumes idempotent SSM bootstrap
+[22m[39m{"component":"crabbox_private_aws_workspace","event":"create_accepted","region":"us-west-2","instance_type":"t3a.small","lease_id":"cbx_fe26e11abdd1"}
+
+[90mstdout[2m | test/private-aws-workspace.test.ts[2m > [22m[2mprivate AWS workspaces[2m > [22m[2mrecovers an ambiguous private launch and resumes idempotent SSM bootstrap
+[22m[39m{"component":"crabbox_private_aws_workspace","event":"recovered_ready","lease_id":"cbx_fe26e11abdd1","cloud_id":"i-recovered123","region":"us-west-2","instance_type":"t3a.small","ssm_command_id":"command-recovered123"}
+
+[90mstdout[2m | test/private-aws-workspace.test.ts[2m > [22m[2mprivate AWS workspaces[2m > [22m[2mrecovers only to retire an ambiguous launch after delete
+[22m[39m{"component":"crabbox_private_aws_workspace","event":"create_accepted","region":"us-west-2","instance_type":"t3a.small","lease_id":"cbx_72a08c0766ab"}
+
+ [32m✓[39m test/coordinator-migration.test.ts [2m([22m[2m9 tests[22m[2m)[22m[32m 55[2mms[22m[39m
+[90mstdout[2m | test/private-aws-workspace.test.ts[2m > [22m[2mprivate AWS workspaces[2m > [22m[2mrecovers only to retire an ambiguous launch after delete
+[22m[39m{"component":"crabbox_private_aws_workspace","event":"delete_requested","lease_id":"cbx_72a08c0766ab","region":"us-west-2"}
+
+[90mstdout[2m | test/private-aws-workspace.test.ts[2m > [22m[2mprivate AWS workspaces[2m > [22m[2mdoes not reactivate when delete arrives during recovered bootstrap
+[22m[39m{"component":"crabbox_private_aws_workspace","event":"create_accepted","region":"us-west-2","instance_type":"t3a.small","lease_id":"cbx_a2d1f335c857"}
+
+ [32m✓[39m test/coordinator-runtime.test.ts [2m([22m[2m21 tests[22m[2m)[22m[32m 72[2mms[22m[39m
+[90mstdout[2m | test/private-aws-workspace.test.ts[2m > [22m[2mprivate AWS workspaces[2m > [22m[2mdoes not reactivate when delete arrives during recovered bootstrap
+[22m[39m{"component":"crabbox_private_aws_workspace","event":"delete_requested","lease_id":"cbx_a2d1f335c857","region":"us-west-2"}
+
+ [32m✓[39m test/private-aws-workspace.test.ts [2m([22m[2m8 tests[22m[2m)[22m[32m 73[2mms[22m[39m
+ [32m✓[39m test/run-evidence-conformance.test.ts [2m([22m[2m94 tests[22m[2m)[22m[32m 47[2mms[22m[39m
+ [32m✓[39m test/aws-deployment.test.ts [2m([22m[2m36 tests[22m[2m)[22m[32m 39[2mms[22m[39m
+ [32m✓[39m test/coordinator-parity-socket.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 56[2mms[22m[39m
+ [32m✓[39m test/usage.test.ts [2m([22m[2m23 tests[22m[2m)[22m[32m 28[2mms[22m[39m
+ [32m✓[39m test/bootstrap-private.test.ts [2m([22m[2m2 tests[22m[2m)[22m[32m 22[2mms[22m[39m
+ [32m✓[39m test/code-origin.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 20[2mms[22m[39m
+ [32m✓[39m test/portal-theme.test.ts [2m([22m[2m2 tests[22m[2m)[22m[32m 18[2mms[22m[39m
+ [32m✓[39m test/runtime-adapter-relay.test.ts [2m([22m[2m6 tests[22m[2m)[22m[32m 20[2mms[22m[39m
+ [32m✓[39m test/marketplace.test.ts [2m([22m[2m24 tests[22m[2m)[22m[32m 17[2mms[22m[39m
+ [32m✓[39m test/run-receipt.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 8[2mms[22m[39m
 [90mstderr[2m | test/checkpoints.test.ts[2m > [22m[2mcoordinator-managed checkpoints[2m > [22m[2mreschedules an exhausted unindexed legacy failure through verified provider absence
 [22m[39mlease cleanup failed lease=cbx_000000000001 provider=gcp cloud=source-vm: AWS credentials are required
 
 [90mstderr[2m | test/checkpoints.test.ts[2m > [22m[2mcoordinator-managed checkpoints[2m > [22m[2mreschedules an exhausted unindexed legacy failure through verified provider absence
 [22m[39mlease cleanup failed lease=cbx_000000000001 provider=gcp cloud=source-vm: AWS credentials are required
 
- [32m✓[39m test/aws-private.test.ts [2m([22m[2m23 tests[22m[2m)[22m[32m 176[2mms[22m[39m
-[90mstderr[2m | test/checkpoints.test.ts[2m > [22m[2mcoordinator-managed checkpoints[2m > [22m[2mkeeps failed mutations scheduled beyond the diagnostic threshold until absence is verified
-[22m[39mlease cleanup failed lease=cbx_000000000001 provider=gcp cloud=source-vm: AWS credentials are required
-
-[90mstderr[2m | test/checkpoints.test.ts[2m > [22m[2mcoordinator-managed checkpoints[2m > [22m[2mkeeps failed mutations scheduled beyond the diagnostic threshold until absence is verified
-[22m[39mlease cleanup failed lease=cbx_000000000001 provider=gcp cloud=source-vm: AWS credentials are required
-
- [32m✓[39m test/usage.test.ts [2m([22m[2m23 tests[22m[2m)[22m[32m 22[2mms[22m[39m
- [32m✓[39m test/aws-deployment.test.ts [2m([22m[2m36 tests[22m[2m)[22m[32m 35[2mms[22m[39m
- [32m✓[39m test/code-origin.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 23[2mms[22m[39m
- [32m✓[39m test/coordinator-parity-socket.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 38[2mms[22m[39m
- [32m✓[39m test/portal-theme.test.ts [2m([22m[2m2 tests[22m[2m)[22m[32m 22[2mms[22m[39m
- [32m✓[39m test/runtime-adapter-relay.test.ts [2m([22m[2m6 tests[22m[2m)[22m[32m 18[2mms[22m[39m
- [32m✓[39m test/config.test.ts [2m([22m[2m55 tests[22m[2m)[22m[32m 32[2mms[22m[39m
- [32m✓[39m test/marketplace.test.ts [2m([22m[2m24 tests[22m[2m)[22m[32m 15[2mms[22m[39m
  [32m✓[39m test/terminal-bundle-interop.test.ts [2m([22m[2m6 tests[22m[2m)[22m[32m 13[2mms[22m[39m
- [32m✓[39m test/wrangler-config.test.ts [2m([22m[2m6 tests[22m[2m)[22m[32m 4[2mms[22m[39m
- [32m✓[39m test/run-receipt.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 11[2mms[22m[39m
- [32m✓[39m test/bootstrap-shared.test.ts [2m([22m[2m12 tests[22m[2m)[22m[32m 7[2mms[22m[39m
- [32m✓[39m test/slug.test.ts [2m([22m[2m8 tests[22m[2m)[22m[32m 7[2mms[22m[39m
- [32m✓[39m test/tailscale.test.ts [2m([22m[2m10 tests[22m[2m)[22m[32m 6[2mms[22m[39m
- [32m✓[39m test/expiring-token-cache.test.ts [2m([22m[2m6 tests[22m[2m)[22m[32m 6[2mms[22m[39m
- [32m✓[39m test/provider-reconciliation.test.ts [2m([22m[2m8 tests[22m[2m)[22m[32m 6[2mms[22m[39m
+[90mstderr[2m | test/checkpoints.test.ts[2m > [22m[2mcoordinator-managed checkpoints[2m > [22m[2mkeeps failed mutations scheduled beyond the diagnostic threshold until absence is verified
+[22m[39mlease cleanup failed lease=cbx_000000000001 provider=gcp cloud=source-vm: AWS credentials are required
+
+[90mstderr[2m | test/checkpoints.test.ts[2m > [22m[2mcoordinator-managed checkpoints[2m > [22m[2mkeeps failed mutations scheduled beyond the diagnostic threshold until absence is verified
+[22m[39mlease cleanup failed lease=cbx_000000000001 provider=gcp cloud=source-vm: AWS credentials are required
+
+ [32m✓[39m test/config.test.ts [2m([22m[2m55 tests[22m[2m)[22m[32m 34[2mms[22m[39m
  [32m✓[39m test/provider-labels.test.ts [2m([22m[2m8 tests[22m[2m)[22m[32m 4[2mms[22m[39m
- [32m✓[39m test/aws-credentials.test.ts [2m([22m[2m2 tests[22m[2m)[22m[32m 4[2mms[22m[39m
- [32m✓[39m test/image-capabilities.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 4[2mms[22m[39m
+ [32m✓[39m test/receipt-contract-conformance.test.ts [2m([22m[2m10 tests[22m[2m)[22m[32m 8[2mms[22m[39m
+ [32m✓[39m test/wrangler-config.test.ts [2m([22m[2m6 tests[22m[2m)[22m[32m 5[2mms[22m[39m
+ [32m✓[39m test/bootstrap-shared.test.ts [2m([22m[2m12 tests[22m[2m)[22m[32m 6[2mms[22m[39m
+ [32m✓[39m test/tailscale.test.ts [2m([22m[2m10 tests[22m[2m)[22m[32m 7[2mms[22m[39m
+ [32m✓[39m test/expiring-token-cache.test.ts [2m([22m[2m6 tests[22m[2m)[22m[32m 8[2mms[22m[39m
+ [32m✓[39m test/provider-reconciliation.test.ts [2m([22m[2m8 tests[22m[2m)[22m[32m 5[2mms[22m[39m
+ [32m✓[39m test/slug.test.ts [2m([22m[2m8 tests[22m[2m)[22m[32m 7[2mms[22m[39m
+ [32m✓[39m test/image-capabilities.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 3[2mms[22m[39m
  [32m✓[39m test/os-image.test.ts [2m([22m[2m2 tests[22m[2m)[22m[32m 3[2mms[22m[39m
- [32m✓[39m test/provisioning-attempts.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 6[2mms[22m[39m
- [32m✓[39m test/timing-safe-auth.test.ts [2m([22m[2m2 tests[22m[2m)[22m[32m 4[2mms[22m[39m
+ [32m✓[39m test/provisioning-attempts.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 3[2mms[22m[39m
+ [32m✓[39m test/aws-credentials.test.ts [2m([22m[2m2 tests[22m[2m)[22m[32m 3[2mms[22m[39m
  [32m✓[39m test/ssh2-poly1305.test.ts [2m([22m[2m1 test[22m[2m)[22m[32m 2[2mms[22m[39m
+ [32m✓[39m test/timing-safe-auth.test.ts [2m([22m[2m2 tests[22m[2m)[22m[32m 2[2mms[22m[39m
  [2m[90m↓[39m[22m test/artifacts.live.test.ts [2m([22m[2m1 test[22m[2m | [22m[33m1 skipped[39m[2m)[22m
+ [2m[90m↓[39m[22m test/postgres-authority-fencing.live.test.ts [2m([22m[2m4 tests[22m[2m | [22m[33m4 skipped[39m[2m)[22m
 [90mstderr[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mdrains invalid typed ready returns while explicit drain and release skip identity reads
 [22m[39mlease cleanup failed lease=cbx_000000000099 provider=aws cloud=i-0123456789abcdef0: provider release failed
 
- [2m[90m↓[39m[22m test/postgres-authority-fencing.live.test.ts [2m([22m[2m4 tests[22m[2m | [22m[33m4 skipped[39m[2m)[22m
- [32m✓[39m test/checkpoints.test.ts [2m([22m[2m325 tests[22m[2m)[22m[33m 1743[2mms[22m[39m
-     [33m[2m✓[22m[39m retains only the latest 256 ordered checkpoint audit events and still prunes tombstones [33m 313[2mms[22m[39m
  [2m[90m↓[39m[22m test/gcp-release.live.test.ts [2m([22m[2m1 test[22m[2m | [22m[33m1 skipped[39m[2m)[22m
+ [2m[90m↓[39m[22m test/coordinator-parity.live.test.ts [2m([22m[2m4 tests[22m[2m | [22m[33m4 skipped[39m[2m)[22m
+ [32m✓[39m test/checkpoints.test.ts [2m([22m[2m325 tests[22m[2m)[22m[33m 1897[2mms[22m[39m
 [90mstderr[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mkeeps deferred release cleanup retryable after provider failure
 [22m[39mlease cleanup failed lease=cbx_000000000097 provider=hetzner cloud=123: provider cleanup throttled
 
@@ -438,7 +439,6 @@ coordinator authority lost during startup; aborting
 [90mstderr[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mretries transient legacy GCP cleanup failure before capture without rebinding identity
 [22m[39mlease cleanup failed lease=cbx_abcdef123456 provider=gcp cloud=crabbox-blue-lobster: GCP lookup temporarily unavailable
 
- [2m[90m↓[39m[22m test/coordinator-parity.live.test.ts [2m([22m[2m4 tests[22m[2m | [22m[33m4 skipped[39m[2m)[22m
 [90mstderr[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mretries transient legacy GCP cleanup failure after capture without rebinding identity
 [22m[39mlease cleanup failed lease=cbx_abcdef123456 provider=gcp cloud=crabbox-blue-lobster: GCP strict lookup temporarily unavailable
 
@@ -514,8 +514,8 @@ coordinator authority lost during startup; aborting
 [90mstderr[2m | test/fleet.test.ts[2m > [22m[2mfleet lease identity and idle[2m > [22m[2mretains AWS cleanup debt when termination is not acknowledged (private=true)
 [22m[39mlease cleanup failed lease=cbx_abcdef123456 provider=aws cloud=i-active-instance: aws TerminateInstances: http 400: InvalidInstanceID.NotFound
 
- [32m✓[39m test/lease-provisioning.test.ts [2m([22m[2m61 tests[22m[2m)[22m[33m 3155[2mms[22m[39m
-     [33m[2m✓[22m[39m keeps a tokenless, non-opt-in initial caller on the synchronous facade [33m 1009[2mms[22m[39m
+ [32m✓[39m test/lease-provisioning.test.ts [2m([22m[2m61 tests[22m[2m)[22m[33m 3176[2mms[22m[39m
+     [33m[2m✓[22m[39m keeps a tokenless, non-opt-in initial caller on the synchronous facade [33m 1008[2mms[22m[39m
 [90mstderr[2m | test/fleet.test.ts[2m > [22m[2msynthetic acknowledgement reliability[2m > [22m[2mpreserves an earlier http acknowledgement wake when delayed maintenance fails
 [22m[39mcoordinator maintenance failed; scheduling retry
 
@@ -570,14 +570,16 @@ coordinator authority lost during startup; aborting
 [90mstderr[2m | test/fleet.test.ts[2m > [22m[2msynthetic acknowledgement reliability[2m > [22m[2mrecovers queued cleanup after reconstruction (alarm write failure=true)
 [22m[39mlease cleanup failed lease=cbx_aacc00000001 provider=hetzner cloud=123: synthetic provider deletion failure
 
- [32m✓[39m test/fleet.test.ts [2m([22m[2m968 tests[22m[2m)[22m[33m 5380[2mms[22m[39m
-     [33m[2m✓[22m[39m commits the Go FinishRun UTF-8 wire golden: replacement-expansion [33m 520[2mms[22m[39m
+ [32m✓[39m test/fleet.test.ts [2m([22m[2m968 tests[22m[2m)[22m[33m 5873[2mms[22m[39m
+     [33m[2m✓[22m[39m commits the Go FinishRun UTF-8 wire golden: two-byte-tail [33m 309[2mms[22m[39m
+     [33m[2m✓[22m[39m commits the Go FinishRun UTF-8 wire golden: three-byte-tail [33m 566[2mms[22m[39m
+     [33m[2m✓[22m[39m commits the Go FinishRun UTF-8 wire golden: replacement-expansion [33m 516[2mms[22m[39m
 
-[2m Test Files [22m [1m[32m55 passed[39m[22m[2m | [22m[33m4 skipped[39m[90m (59)[39m
-[2m      Tests [22m [1m[32m2847 passed[39m[22m[2m | [22m[33m12 skipped[39m[90m (2859)[39m
-[2m   Start at [22m 16:27:09
-[2m   Duration [22m 6.92s[2m (transform 10.28s, setup 0ms, import 17.12s, tests 16.65s, environment 3ms)[22m
+[2m Test Files [22m [1m[32m56 passed[39m[22m[2m | [22m[33m4 skipped[39m[90m (60)[39m
+[2m      Tests [22m [1m[32m2857 passed[39m[22m[2m | [22m[33m12 skipped[39m[90m (2869)[39m
+[2m   Start at [22m 17:30:13
+[2m   Duration [22m 7.44s[2m (transform 11.37s, setup 0ms, import 17.22s, tests 17.87s, environment 3ms)[22m
 
 ---
-finished_at=2026-09-08T22:27:16Z
+finished_at=2026-09-08T23:30:21Z
 exit=0

@@ -1,5 +1,5 @@
 command=npm run build --prefix worker
-started_at=2026-09-08T22:27:16Z
+started_at=2026-09-08T23:30:21Z
 ---
 
 > @openclaw/crabbox-worker@0.50.0 prebuild
@@ -10,10 +10,10 @@ started_at=2026-09-08T22:27:16Z
 > wrangler deploy --dry-run --outdir dist
 
 
- ⛅️ wrangler 4.127.0 (update available 4.130.0)
-───────────────────────────────────────────────
+ ⛅️ wrangler 4.127.0
+────────────────────
 ✨ Read 8 files from the assets directory /Users/dawsonblock/Downloads/crabbox-main/worker/public
-Total Upload: 2806.17 KiB / gzip: 550.53 KiB
+Total Upload: 2806.14 KiB / gzip: 550.53 KiB
 Your Worker has access to the following bindings:
 Binding                                                                                            Resource                     
 env.FLEET (FleetDurableObject)                                                                     Durable Object               
@@ -67,5 +67,5 @@ env.CRABBOX_MAX_MONTHLY_USD_PER_ORG ("50000")                                   
 
 --dry-run: exiting now.
 ---
-finished_at=2026-09-08T22:27:17Z
+finished_at=2026-09-08T23:30:23Z
 exit=0

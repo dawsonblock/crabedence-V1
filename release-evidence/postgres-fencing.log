@@ -1,5 +1,5 @@
 command=npx vitest run --no-file-parallelism test/postgres-authority-fencing.live.test.ts
-started_at=2026-09-08T22:27:01Z
+started_at=2026-09-08T23:30:04Z
 ---
 
 [1m[30m[46m RUN [49m[39m[22m [36mv5.0.0 [39m[90m/Users/dawsonblock/Downloads/crabbox-main[39m
@@ -8,9 +8,9 @@ started_at=2026-09-08T22:27:01Z
 
 [2m Test Files [22m [33m1 skipped[39m[90m (1)[39m
 [2m      Tests [22m [33m4 skipped[39m[90m (4)[39m
-[2m   Start at [22m 16:27:02
-[2m   Duration [22m 140ms[2m (transform 61%, import 36%, worker 3%)[22m
+[2m   Start at [22m 17:30:05
+[2m   Duration [22m 157ms[2m (transform 64%, import 33%, worker 3%)[22m
 
 ---
-finished_at=2026-09-08T22:27:02Z
+finished_at=2026-09-08T23:30:06Z
 exit=0

@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "source": {
-    "commit": "ea7b981d790c247c650be9f00f6719c558d08d89",
-    "tree": "08efe8b75e4a8bbdf01d7f7a91cfbd2b085d37d3",
+    "commit": "a8d2cda3348a1744bf9e40e0ab5411721770005d",
+    "tree": "2f4949028ebb80f5f369f2fba69fa714ea60438f",
     "branch": "release/crabedence-v1-hardening",
     "dirty": false
   },
@@ -18,7 +18,7 @@
     "os": "Darwin",
     "os_version": "25.2.0",
     "arch": "arm64",
-    "date": "2026-09-08T22:27:17Z"
+    "date": "2026-09-08T23:30:23Z"
   },
   "gates": [{"name":"source_manifest","status":"PASS","exit":0,"log":"source-manifest-verify.log"},{"name":"go-vet","status":"PASS","exit":0,"log":"go-vet.log"},{"name":"go-evidence-tests","status":"PASS","exit":0,"log":"go-evidence-tests.log"},{"name":"go-tart-tests","status":"PASS","exit":0,"log":"go-tart-tests.log"},{"name":"go-lume-tests","status":"PASS","exit":0,"log":"go-lume-tests.log"},{"name":"go-shared-tests","status":"PASS","exit":0,"log":"go-shared-tests.log"},{"name":"go-race-evidence","status":"PASS","exit":0,"log":"go-race-evidence.log"},{"name":"go-race-providers","status":"PASS","exit":0,"log":"go-race-providers.log"},{"name":"postgres-fencing","status":"PASS","exit":0,"log":"postgres-fencing.log"},{"name":"postgres-parity","status":"PASS","exit":0,"log":"postgres-parity.log"},{"name":"cross-language-conformance","status":"PASS","exit":0,"log":"cross-language-conformance.log"},{"name":"worker-typecheck","status":"PASS","exit":0,"log":"worker-typecheck.log"},{"name":"worker-tests","status":"PASS","exit":0,"log":"worker-tests.log"},{"name":"worker-format","status":"PASS","exit":0,"log":"worker-format.log"},{"name":"worker-lint","status":"PASS","exit":0,"log":"worker-lint.log"},{"name":"worker-build","status":"PASS","exit":0,"log":"worker-build.log"}],
   "gate_summary": {
