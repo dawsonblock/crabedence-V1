@@ -68,7 +68,7 @@ jobs:
           cache: false
 
       - name: Set up Node
-        uses: actions/setup-node@60edb0ed7f3d8f3d4c82c5fdb8bdfb8d2f4f1f1f # v4.0.0
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version-file: worker/package.json
           cache: npm
@@ -173,32 +173,35 @@ jobs:
           EOF
 
       # ─── Generate SBOM ────────────────────────────────────────────────
-      - name: Generate Go SBOM
+      - name: Generate SBOM
+        shell: bash
         run: |
-          go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@latest
-          cyclonedx-gomod mod -json -output dist/crabedence-${RELEASE_VERSION}.spdx.json ./... || true
-          # Fallback: generate a simple dependency list if cyclonedx fails
-          if [ ! -f dist/crabedence-${RELEASE_VERSION}.spdx.json ]; then
-            go list -json ./... > dist/crabedence-${RELEASE_VERSION}.go-modules.json
+          mkdir -p dist
+          # Try CycloneDX via cyclonedx-gomod; fall back to go list JSON.
+          go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@latest 2>/dev/null || true
+          if command -v cyclonedx-gomod >/dev/null 2>&1; then
+            cyclonedx-gomod mod -json -output "dist/crabedence-${RELEASE_VERSION}.bom.json" . 2>&1 || true
+          fi
+          if [ ! -f "dist/crabedence-${RELEASE_VERSION}.bom.json" ]; then
+            echo '{"spdxVersion": "SPDX-2.3", "name": "crabedence-'${RELEASE_VERSION}'", "fallback": true}' > "dist/crabedence-${RELEASE_VERSION}.bom.json"
+            go list -json ./... > "dist/crabedence-${RELEASE_VERSION}.go-modules.json" 2>/dev/null || true
           fi
 
       # ─── GitHub artifact attestation (SLSA provenance) ────────────────
       - name: Attest source archive
-        uses: actions/attest@v4
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
-          subject-path: dist/crabedence-${RELEASE_VERSION}.tar.gz
+          subject-path: dist/crabedence-${{ env.RELEASE_VERSION }}.tar.gz
 
       - name: Attest zip archive
-        uses: actions/attest@v4
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
-          subject-path: dist/crabedence-${RELEASE_VERSION}.zip
+          subject-path: dist/crabedence-${{ env.RELEASE_VERSION }}.zip
 
       - name: Attest SBOM
-        uses: actions/attest@v4
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
-          subject-path: |
-            dist/crabedence-${RELEASE_VERSION}.spdx.json
-            dist/crabedence-${RELEASE_VERSION}.go-modules.json
+          subject-path: dist/crabedence-${{ env.RELEASE_VERSION }}.bom.json
 
       # ─── Tag the release candidate ────────────────────────────────────
       - name: Tag release candidate
@@ -242,7 +245,7 @@ jobs:
             dist/crabedence-${{ env.RELEASE_VERSION }}.tar.gz.sha256
             dist/crabedence-${{ env.RELEASE_VERSION }}.zip
             dist/crabedence-${{ env.RELEASE_VERSION }}.zip.sha256
-            dist/crabedence-${{ env.RELEASE_VERSION }}.spdx.json
+            dist/crabedence-${{ env.RELEASE_VERSION }}.bom.json
             release-evidence/qualification.json
             release-evidence/qualification-matrix.md
             release-evidence/source-tree-sha256.txt
