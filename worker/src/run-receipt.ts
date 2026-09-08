@@ -769,7 +769,7 @@ function parseTerminalReceipt(value: unknown): TerminalRunReceipt {
   // v3 receipts MUST bind evidence_sha256. Schema version 3 has a clean
   // semantic meaning: V3 == authenticated evidence binding. An empty or
   // missing evidence_sha256 on a V3 receipt is rejected.
-  if (receipt.schema_version >= 3 && receipt.evidence_sha256 === undefined) {
+  if (receipt.schema_version >= 3 && !receipt.evidence_sha256) {
     throw new Error("v3 terminal receipt must bind evidence_sha256");
   }
   for (const field of [
@@ -817,7 +817,7 @@ function parseTerminalReceipt(value: unknown): TerminalRunReceipt {
     }
   }
   if (receipt.evidence_sha256 !== undefined && !/^[0-9a-f]{64}$/u.test(receipt.evidence_sha256)) {
-    throw new Error("invalid terminal receipt evidence_sha256");
+    throw new Error("invalid evidence_sha256");
   }
   return receipt;
 }

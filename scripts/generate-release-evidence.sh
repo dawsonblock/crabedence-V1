@@ -233,7 +233,7 @@ run_gate go-shared-tests go test -count=1 -timeout=60s ./internal/providers/shar
 
 # Phase 9: Go race evidence
 run_gate go-race-evidence go test -race -count=1 -timeout=120s \
-  -run "TestTerminalReceipt|TestTerminalLog|TestRunEvidence|TestFinalizeRun|TestEvidence" \
+  -run "TestTerminalReceipt|TestTerminalLog|TestRunEvidence|TestFinalizeRun|TestEvidence|TestReceiptContract" \
   ./internal/cli/
 run_gate go-race-providers go test -race -count=1 -timeout=120s \
   ./internal/providers/tart/ ./internal/providers/lume/ ./internal/providers/shared/
@@ -252,7 +252,9 @@ run_gate postgres-parity \
 echo ""
 echo "=== Cross-language conformance ==="
 run_gate cross-language-conformance \
-  go test -count=1 -timeout=60s -run "TestRunEvidenceConformanceCorpus" ./internal/cli/
+  go test -count=1 -timeout=60s \
+  -run "TestRunEvidenceConformanceCorpus|TestReceiptContractConformance" \
+  ./internal/cli/
 
 # ─── Phase 15: Worker gates ────────────────────────────────────────────────
 echo ""

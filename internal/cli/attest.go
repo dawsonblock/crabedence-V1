@@ -448,7 +448,7 @@ func validateTerminalRunReceipt(receipt terminalRunReceipt) error {
 		if receipt.SchemaVersion < terminalReceiptSchemaVersion {
 			return fmt.Errorf("v2 terminal receipt must not contain evidence_sha256")
 		}
-		if !validHexDigest(receipt.EvidenceSHA256, sha256.Size) {
+		if !validLowercaseHexDigest(receipt.EvidenceSHA256, sha256.Size) {
 			return fmt.Errorf("invalid evidence_sha256")
 		}
 	}
@@ -766,6 +766,22 @@ func validHexDigest(value string, nBytes int) bool {
 	}
 	_, err := hex.DecodeString(value)
 	return err == nil
+}
+
+// validLowercaseHexDigest validates a bare hexadecimal digest that must be
+// lowercase. This matches the TypeScript regex /^[0-9a-f]{64}$/ used for
+// evidence_sha256. Go's hex.DecodeString accepts uppercase, so we add an
+// explicit lowercase check for cross-language parity.
+func validLowercaseHexDigest(value string, nBytes int) bool {
+	if len(value) != nBytes*2 {
+		return false
+	}
+	for _, c := range value {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
 }
 
 func writeRunReceipt(path, keyPath string, in runReceiptInput) (runArtifact, error) {

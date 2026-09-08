@@ -1,0 +1,251 @@
+name: Release RC
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. v1.0.0-rc.2)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+env:
+  GOFLAGS: -mod=readonly -trimpath
+  GOTOOLCHAIN: local
+
+jobs:
+  build-and-attest:
+    name: Build, Qualify, Attest, and Publish RC
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: crabbox
+          POSTGRES_PASSWORD: crabbox
+          POSTGRES_DB: crabbox_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U crabbox"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      CRABBOX_TEST_DATABASE_URL: postgres://crabbox:crabbox@localhost:5432/crabbox_test
+      RELEASE_VERSION: ${{ inputs.version }}
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Verify clean working tree
+        shell: bash
+        run: |
+          if [ -n "$(git status --porcelain --untracked-files=all -- . ':(exclude)release-evidence/')" ]; then
+            echo "ERROR: working tree is not clean"
+            git status --porcelain
+            exit 1
+          fi
+
+      - name: Record source provenance
+        shell: bash
+        run: |
+          echo "COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "TREE=$(git rev-parse HEAD^{tree})" >> "$GITHUB_ENV"
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Set up Node
+        uses: actions/setup-node@60edb0ed7f3d8f3d4c82c5fdb8bdfb8d2f4f1f1f # v4.0.0
+        with:
+          node-version-file: worker/package.json
+          cache: npm
+          cache-dependency-path: worker/package-lock.json
+
+      - name: Install Worker dependencies
+        run: npm ci --prefix worker
+
+      # ─── Full qualification matrix ─────────────────────────────────────
+      - name: Go formatting check
+        run: |
+          mapfile -t files < <(git ls-files '*.go')
+          if [ "${#files[@]}" -gt 0 ]; then
+            diff="$(gofmt -l "${files[@]}")"
+            if [ -n "$diff" ]; then
+              echo "$diff"
+              exit 1
+            fi
+          fi
+
+      - name: Go vet
+        run: go vet ./...
+
+      - name: Go tests (uncached)
+        run: go test -count=1 -timeout=20m ./internal/cli/ ./internal/providers/shared/ ./internal/providers/tart/ ./internal/providers/lume/
+
+      - name: Go race tests (uncached)
+        run: go test -race -count=1 -timeout=20m -run "TestTerminalReceipt|TestTerminalLog|TestRunEvidence|TestFinalizeRun|TestEvidence|TestReceiptContract" ./internal/cli/
+
+      - name: Go race tests (providers)
+        run: go test -race -count=1 -timeout=20m ./internal/providers/tart/ ./internal/providers/lume/ ./internal/providers/shared/
+
+      - name: Worker typecheck
+        run: npm run check --prefix worker
+
+      - name: Worker format check
+        run: npm run format:check --prefix worker
+
+      - name: Worker lint
+        run: npm run lint --prefix worker
+
+      - name: Worker tests
+        run: npm test --prefix worker
+
+      - name: Worker build
+        run: npm run build --prefix worker
+
+      - name: Live PostgreSQL authority fencing
+        run: npx vitest run --no-file-parallelism test/postgres-authority-fencing.live.test.ts
+
+      - name: Live PostgreSQL coordinator parity
+        run: npx vitest run --no-file-parallelism test/coordinator-parity.live.test.ts
+
+      - name: Cross-language conformance
+        run: go test -count=1 -timeout=60s -run "TestRunEvidenceConformanceCorpus|TestReceiptContractConformance" ./internal/cli/
+
+      # ─── Generate release evidence ─────────────────────────────────────
+      - name: Generate release evidence
+        run: bash scripts/generate-release-evidence.sh
+
+      - name: Check release admission
+        run: bash scripts/check-release-admission.sh
+
+      - name: Verify release artifact
+        run: bash scripts/verify-release-artifact.sh
+
+      # ─── Build artifact from the same clean checkout ──────────────────
+      - name: Build source archive
+        shell: bash
+        run: |
+          mkdir -p dist
+          # Create a source archive from the exact Git commit.
+          git archive --format=tar.gz --prefix="crabedence-${RELEASE_VERSION}/" \
+            -o "dist/crabedence-${RELEASE_VERSION}.tar.gz" HEAD
+          # Also create a zip for convenience.
+          git archive --format=zip --prefix="crabedence-${RELEASE_VERSION}/" \
+            -o "dist/crabedence-${RELEASE_VERSION}.zip" HEAD
+
+      - name: Calculate artifact SHA-256
+        id: artifact_hash
+        shell: bash
+        run: |
+          cd dist
+          sha256sum "crabedence-${RELEASE_VERSION}.tar.gz" > "crabedence-${RELEASE_VERSION}.tar.gz.sha256"
+          sha256sum "crabedence-${RELEASE_VERSION}.zip" > "crabedence-${RELEASE_VERSION}.zip.sha256"
+          echo "tar_sha256=$(cut -d ' ' -f1 < "crabedence-${RELEASE_VERSION}.tar.gz.sha256")" >> "$GITHUB_OUTPUT"
+          echo "zip_sha256=$(cut -d ' ' -f1 < "crabedence-${RELEASE_VERSION}.zip.sha256")" >> "$GITHUB_OUTPUT"
+
+      - name: Generate artifact.json
+        shell: bash
+        run: |
+          cat > release-evidence/artifact.json << EOF
+          {
+            "name": "crabedence-${RELEASE_VERSION}.tar.gz",
+            "sha256": "${{ steps.artifact_hash.outputs.tar_sha256 }}",
+            "zip_name": "crabedence-${RELEASE_VERSION}.zip",
+            "zip_sha256": "${{ steps.artifact_hash.outputs.zip_sha256 }}",
+            "source_commit": "$COMMIT",
+            "source_tree": "$TREE",
+            "release_version": "$RELEASE_VERSION"
+          }
+          EOF
+
+      # ─── Generate SBOM ────────────────────────────────────────────────
+      - name: Generate Go SBOM
+        run: |
+          go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@latest
+          cyclonedx-gomod mod -json -output dist/crabedence-${RELEASE_VERSION}.spdx.json ./... || true
+          # Fallback: generate a simple dependency list if cyclonedx fails
+          if [ ! -f dist/crabedence-${RELEASE_VERSION}.spdx.json ]; then
+            go list -json ./... > dist/crabedence-${RELEASE_VERSION}.go-modules.json
+          fi
+
+      # ─── GitHub artifact attestation (SLSA provenance) ────────────────
+      - name: Attest source archive
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/crabedence-${RELEASE_VERSION}.tar.gz
+
+      - name: Attest zip archive
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/crabedence-${RELEASE_VERSION}.zip
+
+      - name: Attest SBOM
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            dist/crabedence-${RELEASE_VERSION}.spdx.json
+            dist/crabedence-${RELEASE_VERSION}.go-modules.json
+
+      # ─── Tag the release candidate ────────────────────────────────────
+      - name: Tag release candidate
+        shell: bash
+        run: |
+          git tag -a "$RELEASE_VERSION" -m "Crabedence $RELEASE_VERSION"
+          git push origin "$RELEASE_VERSION"
+
+      # ─── Publish as GitHub prerelease ────────────────────────────────
+      - name: Create GitHub prerelease
+        uses: softprops/action-gh-release@da05d552573c0665c5c2d700a395b64d3f1ccf12 # v2.3.2
+        with:
+          tag_name: ${{ env.RELEASE_VERSION }}
+          name: Crabedence ${{ inputs.version }}
+          prerelease: true
+          body: |
+            ## Crabedence ${{ inputs.version }}
+
+            ### Source provenance
+            - **Commit:** `${{ env.COMMIT }}`
+            - **Tree:** `${{ env.TREE }}`
+            - **Branch:** `${{ github.ref_name }}`
+
+            ### Artifact hashes
+            - **tar.gz SHA-256:** `${{ steps.artifact_hash.outputs.tar_sha256 }}`
+            - **zip SHA-256:** `${{ steps.artifact_hash.outputs.zip_sha256 }}`
+
+            ### Verification
+            See [VERIFY-RELEASE.md](./VERIFY-RELEASE.md) for instructions on how to verify this release artifact.
+
+            ```bash
+            # Verify artifact attestation
+            gh attestation verify dist/crabedence-${{ inputs.version }}.tar.gz \
+              --repo ${{ github.repository }}
+            ```
+
+            ### Qualification
+            All 16 mandatory gates passed. See `qualification.json` for details.
+          files: |
+            dist/crabedence-${{ env.RELEASE_VERSION }}.tar.gz
+            dist/crabedence-${{ env.RELEASE_VERSION }}.tar.gz.sha256
+            dist/crabedence-${{ env.RELEASE_VERSION }}.zip
+            dist/crabedence-${{ env.RELEASE_VERSION }}.zip.sha256
+            dist/crabedence-${{ env.RELEASE_VERSION }}.spdx.json
+            release-evidence/qualification.json
+            release-evidence/qualification-matrix.md
+            release-evidence/source-tree-sha256.txt
+            release-evidence/provenance.json
+            release-evidence/artifact.json
+            release-evidence/SHA256SUMS

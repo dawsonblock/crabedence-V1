@@ -140,7 +140,7 @@ describe("terminal run receipt", () => {
         name: "v3_malformed_evidence_fail",
         schema: 3,
         evidence: malformedDigest,
-        expectParseError: "invalid terminal receipt evidence_sha256",
+        expectParseError: "invalid evidence_sha256",
       },
       { name: "v3_valid_evidence_pass", schema: 3, evidence: validDigest, expectParseError: null },
     ];
