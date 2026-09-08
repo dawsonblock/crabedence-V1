@@ -444,8 +444,13 @@ func validateTerminalRunReceipt(receipt terminalRunReceipt) error {
 		if receipt.SchemaVersion >= terminalReceiptSchemaVersion {
 			return fmt.Errorf("v3 terminal receipt must bind evidence_sha256")
 		}
-	} else if !validHexDigest(receipt.EvidenceSHA256, sha256.Size) {
-		return fmt.Errorf("invalid evidence_sha256")
+	} else {
+		if receipt.SchemaVersion < terminalReceiptSchemaVersion {
+			return fmt.Errorf("v2 terminal receipt must not contain evidence_sha256")
+		}
+		if !validHexDigest(receipt.EvidenceSHA256, sha256.Size) {
+			return fmt.Errorf("invalid evidence_sha256")
+		}
 	}
 	pub, err := base64.StdEncoding.DecodeString(receipt.PublicKey)
 	if err != nil || len(pub) != ed25519.PublicKeySize {

@@ -364,4 +364,99 @@ runLive("PostgreSQL authority fencing (live)", () => {
       await lockB2.release();
     }
   }, 10_000);
+
+  it("production-wrapper transaction blocks replacement during in-flight mutation", async () => {
+    // Phase 11: Production-wrapper fencing test.
+    // Uses the real storageA.transaction() API (not manual SQL) to prove
+    // that AsyncLocalStorage + mutation fence + authority loss + replacement
+    // coordinator work as one integrated system.
+    const adminPool = new Pool({ connectionString: databaseURL });
+    adminPool.on("error", () => {});
+    cleanups.push(() => adminPool.end());
+
+    await clearStaleLocks(adminPool);
+
+    const storageA = new PostgresCoordinatorStorage(databaseURL);
+    cleanups.push(() => storageA.close());
+    await storageA.initialize();
+
+    const lockA = await storageA.acquireCoordinatorLock();
+    expect(lockA).toBeDefined();
+    if (!lockA) return;
+
+    // Start a production transaction that holds the mutation fence.
+    let txDone = false;
+    let releaseTx!: () => void;
+    const txPromise = storageA.transaction(async (tx) => {
+      // Put a value inside the transaction — this uses AsyncLocalStorage
+      // to reuse the transaction's client and xact lock.
+      await tx.put("fencing-test:prod-tx", { value: "in-flight" });
+      // Block until the test signals the transaction to commit.
+      await new Promise<void>((resolve) => {
+        releaseTx = resolve;
+      });
+      txDone = true;
+    });
+
+    // Wait for A's transaction to acquire the xact lock.
+    let xactPID: number | undefined;
+    for (let i = 0; i < 20 && xactPID === undefined; i++) {
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      // eslint-disable-next-line no-await-in-loop
+      xactPID = await findXactLockHolderPID(adminPool, undefined);
+    }
+    expect(xactPID).toBeDefined();
+
+    // Kill A's lock session — simulate authority loss.
+    const pidA = await findLockHolderPID(adminPool);
+    expect(pidA).toBeDefined();
+    if (pidA) {
+      await adminPool.query("SELECT pg_terminate_backend($1)", [pidA]);
+    }
+
+    // Wait for A to detect authority loss.
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    // B acquires coordinator authority.
+    const storageB = new PostgresCoordinatorStorage(databaseURL);
+    cleanups.push(() => storageB.close());
+    const lockB = await storageB.acquireCoordinatorLock();
+    expect(lockB).toBeDefined();
+
+    // B's mutation should block on A's in-flight transaction fence.
+    let bDone = false;
+    const bPromise = storageB.put("fencing-test:prod-b", { value: "from-B" }).then(
+      () => {
+        bDone = true;
+        return undefined;
+      },
+      () => {
+        bDone = true;
+        return undefined;
+      },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(bDone).toBe(false); // B is blocked
+
+    // Release A's transaction — it should commit (holds the xact lock).
+    releaseTx!();
+    await txPromise;
+    expect(txDone).toBe(true);
+
+    // B's mutation should now proceed.
+    await bPromise;
+    expect(bDone).toBe(true);
+
+    // Verify A's transaction committed.
+    const value = await storageB.get<{ value: string }>("fencing-test:prod-tx");
+    expect(value).toEqual({ value: "in-flight" });
+
+    // Cleanup.
+    await storageB.delete("fencing-test:prod-tx");
+    await storageB.delete("fencing-test:prod-b");
+    if (lockB) {
+      await lockB.release();
+    }
+  }, 30_000);
 });

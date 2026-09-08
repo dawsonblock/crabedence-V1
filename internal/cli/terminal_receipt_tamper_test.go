@@ -196,6 +196,83 @@ func TestTerminalReceiptEmptyEvidenceSHA256RejectedForV3(t *testing.T) {
 	}
 }
 
+func TestTerminalReceiptV2V3ContractMatrix(t *testing.T) {
+	// Full V2/V3 evidence_sha256 contract matrix. Both Go and TypeScript
+	// must produce identical acceptance outcomes for each case.
+	// V2 + no evidence     → valid (legacy)
+	// V2 + evidence present → INVALID
+	// V2 + malformed evidence → INVALID
+	// V3 + no evidence      → INVALID
+	// V3 + malformed evidence → INVALID
+	// V3 + valid evidence   → valid
+	validDigest := "0000000000000000000000000000000000000000000000000000000000000000"
+	malformedDigest := "not-a-hex-digest"
+
+	tests := []struct {
+		name           string
+		schemaVersion  int
+		evidenceSHA256 string
+		wantErr        string // empty string means expect PASS
+	}{
+		{"v2_no_evidence_pass", terminalReceiptV2SchemaVersion, "", ""},
+		{"v2_evidence_present_fail", terminalReceiptV2SchemaVersion, validDigest, "v2 terminal receipt must not contain evidence_sha256"},
+		{"v2_malformed_evidence_fail", terminalReceiptV2SchemaVersion, malformedDigest, "v2 terminal receipt must not contain evidence_sha256"},
+		{"v3_no_evidence_fail", terminalReceiptSchemaVersion, "", "v3 terminal receipt must bind evidence_sha256"},
+		{"v3_malformed_evidence_fail", terminalReceiptSchemaVersion, malformedDigest, "invalid evidence_sha256"},
+		{"v3_valid_evidence_pass", terminalReceiptSchemaVersion, validDigest, ""},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			receipt := buildTestReceipt(t)
+			receipt.SchemaVersion = tc.schemaVersion
+			receipt.EvidenceSHA256 = tc.evidenceSHA256
+			// Re-sign because schema/evidence changed.
+			pub, priv, _ := ed25519.GenerateKey(nil)
+			receipt.PublicKey = base64.StdEncoding.EncodeToString(pub)
+			receipt.Signer = attestFingerprint(pub)
+			receipt.Signature = base64.StdEncoding.EncodeToString(
+				ed25519.Sign(priv, terminalReceiptSigningBytes(receipt)),
+			)
+			err := validateTerminalRunReceipt(receipt)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("expected PASS but got error: %v", err)
+				}
+			} else {
+				if err == nil {
+					t.Fatalf("expected FAIL with %q but validation passed", tc.wantErr)
+				}
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("expected error containing %q but got: %v", tc.wantErr, err)
+				}
+			}
+		})
+	}
+}
+
+func TestTerminalReceiptV2RejectsInjectedUnsignedEvidence(t *testing.T) {
+	// A signed V2 receipt carrying an injected unsigned evidence_sha256
+	// field must be rejected before it can masquerade as authenticated
+	// evidence binding.
+	receipt := buildTestReceipt(t)
+	receipt.SchemaVersion = terminalReceiptV2SchemaVersion
+	receipt.EvidenceSHA256 = "" // V2 has no evidence
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	receipt.PublicKey = base64.StdEncoding.EncodeToString(pub)
+	receipt.Signer = attestFingerprint(pub)
+	receipt.Signature = base64.StdEncoding.EncodeToString(
+		ed25519.Sign(priv, terminalReceiptSigningBytes(receipt)),
+	)
+	// Now inject an unsigned evidence_sha256 into the V2 receipt.
+	receipt.EvidenceSHA256 = "0000000000000000000000000000000000000000000000000000000000000000"
+	if err := validateTerminalRunReceipt(receipt); err == nil {
+		t.Fatal("validation should reject V2 receipt with injected evidence_sha256")
+	} else if !strings.Contains(err.Error(), "v2 terminal receipt must not contain evidence_sha256") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestTerminalReceiptJSONTamperingDetected(t *testing.T) {
 	receipt := buildTestReceipt(t)
 	// Serialize to JSON, tamper with a field, deserialize, and verify.
