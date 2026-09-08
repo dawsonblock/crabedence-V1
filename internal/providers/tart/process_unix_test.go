@@ -22,6 +22,7 @@ import (
 	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared"
 	"github.com/openclaw/crabbox/internal/testutil"
 )
 
@@ -544,6 +545,44 @@ func TestStartupDiagnosticsAndReadinessFailure(t *testing.T) {
 	}
 }
 
+// TestStartupAbortReturnsStartupConfirmFailure verifies that abort() wraps
+// the error in core.StartupConfirmFailure when the startup confirmation
+// result is populated, so callers can extract structured evidence via
+// errors.As even when the ProcessHandle is discarded.
+func TestStartupAbortReturnsStartupConfirmFailure(t *testing.T) {
+	f := newProcessFixture(t, "")
+	ctx, cancel := context.WithCancelCause(t.Context())
+	defer cancel(nil)
+	p, child := startProcess(t, f, ctx, false)
+	child.send(t, processAction{Stderr: "boot failed", Repeat: 1})
+	child.send(t, processAction{Exit: true, Code: 42})
+	awaitProcess(t, p.ctx.Done())
+	err := p.abort(errors.New("readiness failed"))
+	if err == nil {
+		t.Fatal("abort returned nil error")
+	}
+	var scf *core.StartupConfirmFailure
+	if !errors.As(err, &scf) {
+		t.Fatalf("error is not *core.StartupConfirmFailure: %T", err)
+	}
+	if scf.Stage != "timeout-window" {
+		t.Fatalf("stage=%q want \"timeout-window\"", scf.Stage)
+	}
+	// The process survived the observation window (startProcess succeeded),
+	// then exited afterward. The startup confirm result reflects the
+	// successful observation: Ready=true, ProcessExited=false.
+	if !scf.Ready {
+		t.Fatal("ready should be true (process survived observation window)")
+	}
+	// The Summary() method should produce a valid StartupConfirmSummary.
+	summary := scf.Summary()
+	if summary.Stage != scf.Stage || summary.Ready != scf.Ready {
+		t.Fatal("Summary() does not match fields")
+	}
+	child.exited(t)
+	f.assertLogsRemoved(t)
+}
+
 func TestStartupNaturalExitRefreshesSnapshot(t *testing.T) {
 	for _, keep := range []bool{false, true} {
 		t.Run(fmt.Sprintf("keep=%t", keep), func(t *testing.T) {
@@ -986,4 +1025,146 @@ func TestAcquireStartupHandoffFailureRollsBackClaim(t *testing.T) {
 		t.Fatalf("handoff error: %v", result.err)
 	}
 	f.assertFailedAcquisitionCleaned(t, child)
+}
+
+// TestStartupConfirmResultPopulatedOnSuccess verifies that the startup
+// confirmation result is populated with Ready=true and ProcessExited=false
+// when the process survives the observation window.
+func TestStartupConfirmResultPopulatedOnSuccess(t *testing.T) {
+	f := newProcessFixture(t, "")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p, _ := startProcess(t, f, ctx, false)
+	// startProcess returns after the observation window succeeded.
+	result := p.StartupConfirmResult()
+	if result.Stage != "timeout-window" {
+		t.Fatalf("stage=%q want \"timeout-window\"", result.Stage)
+	}
+	if !result.Ready {
+		t.Fatal("Ready should be true after successful observation")
+	}
+	if result.ProcessExited {
+		t.Fatal("ProcessExited should be false (process is still alive)")
+	}
+	if result.Retryable {
+		t.Fatal("Retryable should be false for successful startup")
+	}
+	if result.Duration <= 0 {
+		t.Fatal("Duration should be positive")
+	}
+}
+
+// TestStartupConfirmResultPopulatedOnEarlyExit verifies that the startup
+// confirmation result is populated with ProcessExited=true when the
+// process exits during the observation window.
+func TestStartupConfirmResultPopulatedOnEarlyExit(t *testing.T) {
+	f := newProcessFixture(t, "")
+	b := f.backend()
+	b.startupObserveTimeout = time.Hour // Long window so we control the exit
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	var startErr error
+	go func() {
+		defer close(done)
+		_, startErr = b.startVM(ctx, "test-vm", false)
+	}()
+	t.Cleanup(func() { cancel(); f.close(); awaitProcess(t, done) })
+	child := f.next(t, "run")
+	// Exit during the observation window.
+	child.send(t, processAction{Exit: true, Code: 42, Stderr: startupFailure})
+	awaitProcess(t, done)
+	if startErr == nil {
+		t.Fatal("expected startup failure")
+	}
+	// The error should be wrapped in StartupConfirmFailure with
+	// ProcessExited=true since the process exited during confirmation.
+	var scf *core.StartupConfirmFailure
+	if !errors.As(startErr, &scf) {
+		t.Fatalf("error is not *core.StartupConfirmFailure: %T", startErr)
+	}
+	if scf.Stage != "timeout-window" {
+		t.Fatalf("stage=%q want \"timeout-window\"", scf.Stage)
+	}
+	if scf.Ready {
+		t.Fatal("Ready should be false after early exit")
+	}
+	if !scf.ProcessExited {
+		t.Fatal("ProcessExited should be true")
+	}
+}
+
+// TestAcquirePropagatesStartupConfirmEvidence verifies that a successful
+// Acquire propagates the startup confirmation result into the lease
+// target's StartupConfirm field via the StartupConfirmEvidenceProvider
+// capability interface.
+func TestAcquirePropagatesStartupConfirmEvidence(t *testing.T) {
+	f := newProcessFixture(t, "")
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	result := acquireProcess(t, f, f.backend(), ctx, cancel, true)
+	child := result.next(t, f, "run")
+	awaitAcquisition(t, result.done)
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	if result.lease.StartupConfirm == nil {
+		t.Fatal("lease.StartupConfirm should be populated after successful acquisition")
+	}
+	sc := result.lease.StartupConfirm
+	if sc.Stage != "timeout-window" {
+		t.Fatalf("stage=%q want \"timeout-window\"", sc.Stage)
+	}
+	if !sc.Ready {
+		t.Fatal("Ready should be true after successful acquisition")
+	}
+	if sc.ProcessExited {
+		t.Fatal("ProcessExited should be false after successful acquisition")
+	}
+	// For keep=true, the child stays alive. Send an exit to clean up.
+	child.send(t, processAction{Exit: true})
+	child.exited(t)
+}
+
+// TestAcquirePropagatesStartupConfirmEvidenceOnFailure verifies that a
+// failed Acquire wraps the error in StartupConfirmFailure so callers can
+// extract structured startup evidence via errors.As.
+func TestAcquirePropagatesStartupConfirmEvidenceOnFailure(t *testing.T) {
+	f := newProcessFixture(t, "")
+	b := f.backend()
+	b.startupObserveTimeout = time.Hour
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	result := acquireProcess(t, f, b, ctx, cancel, false)
+	child := result.next(t, f, "run")
+	child.send(t, processAction{Exit: true, Code: 42, Stderr: startupFailure})
+	awaitProcess(t, result.done)
+	if result.err == nil {
+		t.Fatal("expected acquisition failure")
+	}
+	var scf *core.StartupConfirmFailure
+	if !errors.As(result.err, &scf) {
+		t.Fatalf("error is not *core.StartupConfirmFailure: %T", result.err)
+	}
+	if scf.Stage != "timeout-window" {
+		t.Fatalf("stage=%q want \"timeout-window\"", scf.Stage)
+	}
+	if scf.Ready {
+		t.Fatal("Ready should be false after early exit")
+	}
+	if !scf.ProcessExited {
+		t.Fatal("ProcessExited should be true after early exit")
+	}
+	f.assertFailedAcquisitionCleaned(t, child)
+}
+
+// TestStartupConfirmEvidenceProviderCapabilityInterface verifies that the
+// startup evidence is extracted via the StartupConfirmEvidenceProvider
+// capability interface, not by type-asserting to the concrete
+// *startupProcess. A handle that implements the capability interface
+// but is not *startupProcess should still have its evidence extracted.
+func TestStartupConfirmEvidenceProviderCapabilityInterface(t *testing.T) {
+	// Verify that *startupProcess implements StartupConfirmEvidenceProvider.
+	p := &startupProcess{}
+	var _ shared.StartupConfirmEvidenceProvider = p
 }

@@ -39,6 +39,7 @@ const mocks = vi.hoisted(() => {
     put: vi.fn<(key: string, value: unknown) => Promise<void>>(async () => {}),
     delete: vi.fn<(key: string) => Promise<void>>(async () => {}),
     take: vi.fn<(key: string) => Promise<unknown>>(async () => undefined),
+    markAuthorityLost: vi.fn<() => void>(),
   };
   return { boss, storage };
 });

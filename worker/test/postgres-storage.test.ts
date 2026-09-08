@@ -62,14 +62,15 @@ describe("PostgresCoordinatorStorage", () => {
     const client = {
       query: clientQuery,
       release,
-      on: vi.fn(),
-      removeAllListeners: vi.fn(),
+      on: vi.fn<() => void>(),
+      removeAllListeners: vi.fn<() => void>(),
     } as unknown as PoolClient;
     const connect = vi.fn<() => Promise<PoolClient>>(async () => client);
     const pool = {
       query: fakePoolQuery(),
       connect,
       end: fakePoolEnd(),
+      on: vi.fn<() => void>(),
     } as unknown as Pool;
     const storage = new PostgresCoordinatorStorage("postgres://unused", pool);
 
@@ -102,6 +103,7 @@ describe("PostgresCoordinatorStorage", () => {
       query: fakePoolQuery(),
       connect: vi.fn<() => Promise<PoolClient>>(async () => client),
       end: fakePoolEnd(),
+      on: vi.fn<() => void>(),
     } as unknown as Pool;
     const storage = new PostgresCoordinatorStorage("postgres://unused", pool);
 
@@ -117,13 +119,14 @@ describe("PostgresCoordinatorStorage", () => {
     const client = {
       query: clientQuery,
       release,
-      on: vi.fn(),
-      removeAllListeners: vi.fn(),
+      on: vi.fn<() => void>(),
+      removeAllListeners: vi.fn<() => void>(),
     } as unknown as PoolClient;
     const pool = {
       query: fakePoolQuery(),
       connect: vi.fn<() => Promise<PoolClient>>(async () => client),
       end: fakePoolEnd(),
+      on: vi.fn<() => void>(),
     } as unknown as Pool;
     const storage = new PostgresCoordinatorStorage("postgres://unused", pool);
 
@@ -142,7 +145,9 @@ describe("PostgresCoordinatorStorage", () => {
 
     await storage.put("lease:1", { state: "active" });
 
-    expect(pool.query).toHaveBeenCalledWith(
+    // put() goes through fencedMutation → connect → clientQuery, so the
+    // insert is on the checked-out client, not the pool.
+    expect(pool.clientQuery).toHaveBeenCalledWith(
       expect.stringContaining("on conflict (key) do update"),
       ["lease:1", '{"state":"active"}', '{"state":"active"}'],
     );
@@ -155,7 +160,7 @@ describe("PostgresCoordinatorStorage", () => {
     await storage.put("runlog:1", "before\0after");
     const value = await storage.get<string>("runlog:1");
 
-    expect(pool.query).toHaveBeenCalledWith(expect.stringContaining("$2::jsonb"), [
+    expect(pool.clientQuery).toHaveBeenCalledWith(expect.stringContaining("$2::jsonb"), [
       "runlog:1",
       '"before�after"',
       '"before\\u0000after"',
@@ -169,7 +174,7 @@ describe("PostgresCoordinatorStorage", () => {
 
     await storage.put("runlog:1", { "before\0after": "value" });
 
-    expect(pool.query).toHaveBeenCalledWith(expect.stringContaining("$2::jsonb"), [
+    expect(pool.clientQuery).toHaveBeenCalledWith(expect.stringContaining("$2::jsonb"), [
       "runlog:1",
       '{"before�after":"value"}',
       '{"before\\u0000after":"value"}',
@@ -214,11 +219,15 @@ describe("PostgresCoordinatorStorage", () => {
 
     const value = await storage.take<{ ticket: string }>("handoff:1");
 
-    expect(pool.query).toHaveBeenCalledWith(
-      expect.stringContaining("delete from crabbox.coordinator_kv"),
-      ["handoff:1"],
+    // take() goes through fencedMutation → connect → clientQuery, so the
+    // delete is on the checked-out client. Find the delete call (preceded
+    // by begin + xact_lock).
+    const deleteCall = pool.clientQuery.mock.calls.find(
+      ([sql]) => typeof sql === "string" && sql.includes("delete from crabbox.coordinator_kv"),
     );
-    expect(String(pool.query.mock.calls[0]?.[0])).toContain("returning case");
+    expect(deleteCall).toBeDefined();
+    expect(deleteCall?.[1]).toEqual(["handoff:1"]);
+    expect(String(deleteCall?.[0])).toContain("returning case");
     expect(value).toEqual({ ticket: "one-time" });
   });
 
@@ -235,6 +244,7 @@ describe("PostgresCoordinatorStorage", () => {
     expect(pool.query).not.toHaveBeenCalled();
     expect(clientQuery.mock.calls.map(([sql]) => String(sql).trim().split(/\s+/, 1)[0])).toEqual([
       "begin",
+      "select",
       "insert",
       "delete",
       "commit",
@@ -242,6 +252,7 @@ describe("PostgresCoordinatorStorage", () => {
     expect(String(clientQuery.mock.calls[0]?.[0]).trim()).toBe(
       "begin isolation level serializable",
     );
+    expect(String(clientQuery.mock.calls[1]?.[0]).trim()).toContain("pg_advisory_xact_lock");
     expect(release).toHaveBeenCalledOnce();
   });
 
@@ -258,6 +269,7 @@ describe("PostgresCoordinatorStorage", () => {
 
     expect(clientQuery.mock.calls.map(([sql]) => String(sql).trim().split(/\s+/, 1)[0])).toEqual([
       "begin",
+      "select",
       "insert",
       "rollback",
     ]);
@@ -285,10 +297,12 @@ describe("PostgresCoordinatorStorage", () => {
     expect(clients).toHaveLength(2);
     expect(clients[0]?.query.mock.calls.map(([sql]) => String(sql).trim())).toEqual([
       "begin isolation level serializable",
+      "select pg_advisory_xact_lock(hashtext($1))",
       "rollback",
     ]);
     expect(clients[1]?.query.mock.calls.map(([sql]) => String(sql).trim())).toEqual([
       "begin isolation level serializable",
+      "select pg_advisory_xact_lock(hashtext($1))",
       "commit",
     ]);
     expect(clients[0]?.release).toHaveBeenCalledWith();
@@ -314,6 +328,7 @@ describe("PostgresCoordinatorStorage", () => {
     for (const client of clients) {
       expect(client.query.mock.calls.map(([sql]) => String(sql).trim())).toEqual([
         "begin isolation level serializable",
+        "select pg_advisory_xact_lock(hashtext($1))",
         "rollback",
       ]);
       expect(client.release).toHaveBeenCalledWith();
@@ -446,7 +461,11 @@ describe("PostgresCoordinatorStorage", () => {
         finishCheckpointUse(storage, id, claim.token, principal, true),
       ).rejects.toMatchObject({ code: "checkpoint_in_use" });
       expect(injected).toBe(true);
-      expect(connections).toBe(2);
+      // The injected put inside the commit hook goes through fencedMutation
+      // (put → fencedMutation → connect), adding one connection compared to
+      // the old direct-pool path. Total: outer tx (1) + injected put tx (1)
+      // + retry tx (1) = 3.
+      expect(connections).toBe(3);
       expect(await storage.get(checkpointKey(id))).toEqual(before);
       expect(await storage.list({ prefix: `checkpoint-use:${id}:` })).toHaveLength(1);
       expect(await storage.get(`create-attempt:${leaseID}`)).toMatchObject({ state: "canceled" });
@@ -1020,6 +1039,7 @@ describe("PostgresCoordinatorStorage", () => {
     expect((observed as AggregateError).cause).toBe(originalError);
     expect(clientQuery.mock.calls.map(([sql]) => String(sql).trim())).toEqual([
       "begin isolation level serializable",
+      "select pg_advisory_xact_lock(hashtext($1))",
       "rollback",
     ]);
     expect(callbackInvocations).toBe(1);
@@ -1313,7 +1333,12 @@ function statefulFakePool(): Pool {
   const connect = vi.fn<() => Promise<PoolClient>>(
     async () => ({ query, release: vi.fn<() => void>() }) as unknown as PoolClient,
   );
-  return { query, connect, end: vi.fn<() => Promise<void>>() } as unknown as Pool;
+  return {
+    query,
+    connect,
+    end: vi.fn<() => Promise<void>>(),
+    on: vi.fn<() => void>(),
+  } as unknown as Pool;
 }
 
 function fakePoolQuery() {
@@ -1330,8 +1355,21 @@ function fakePool(rows: QueryResultRow[] = []) {
   const query = vi.fn<(text: string, values?: unknown[]) => Promise<QueryResult<QueryResultRow>>>(
     async () => queryResult(rows),
   );
+  const clientQuery = vi.fn<
+    (text: string, values?: unknown[]) => Promise<QueryResult<QueryResultRow>>
+  >(async () => queryResult(rows));
+  const release = vi.fn<(error?: Error | boolean) => void>();
+  const client = { query: clientQuery, release } as unknown as PoolClient;
+  const connect = vi.fn<() => Promise<PoolClient>>(async () => client);
   const end = vi.fn<() => Promise<void>>(async () => undefined);
-  return { query, end } as unknown as Pool & { query: typeof query };
+  const on = vi.fn<(event: string, listener: () => void) => void>();
+  return {
+    query,
+    connect,
+    end,
+    clientQuery,
+    on,
+  } as unknown as Pool & { query: typeof query; clientQuery: typeof clientQuery };
 }
 
 function fakeTransactionalPool(rollbackError?: Error) {
@@ -1348,7 +1386,9 @@ function fakeTransactionalPool(rollbackError?: Error) {
     async () => queryResult([]),
   );
   const end = vi.fn<() => Promise<void>>(async () => undefined);
-  const pool = { query, connect, end } as unknown as Pool & { query: typeof query };
+  const pool = { query, connect, end, on: vi.fn<() => void>() } as unknown as Pool & {
+    query: typeof query;
+  };
   return { pool, clientQuery, connect, release };
 }
 
@@ -1367,13 +1407,18 @@ function fakeRetryTransactionalPool() {
     async () => queryResult([]),
   );
   const end = vi.fn<() => Promise<void>>(async () => undefined);
-  const pool = { query, connect, end } as unknown as Pool & { query: typeof query };
+  const pool = { query, connect, end, on: vi.fn<() => void>() } as unknown as Pool & {
+    query: typeof query;
+  };
   return { pool, clients, connect };
 }
 
 function fakeContendedCheckpointPool(): Pool {
   let committed = new Map<string, string>();
   let revision = 0;
+  // Track which revision each key was last modified at, so concurrent
+  // transactions that touch different keys don't spuriously conflict.
+  const keyLastModified = new Map<string, number>();
   const execute = (
     values: Map<string, string>,
     text: string,
@@ -1411,12 +1456,16 @@ function fakeContendedCheckpointPool(): Pool {
     (text: string, parameters?: unknown[]) => Promise<QueryResult<QueryResultRow>>
   >(async (text, parameters) => {
     const result = execute(committed, text, parameters);
-    if (/^\s*(insert|delete)/i.test(text)) revision++;
+    if (/^\s*(insert|delete)/i.test(text)) {
+      revision++;
+      keyLastModified.set(String(parameters[0]), revision);
+    }
     return result;
   });
   const connect = vi.fn<() => Promise<PoolClient>>(async () => {
     let snapshot = new Map<string, string>();
     let startedAt = 0;
+    const modifiedKeys = new Set<string>();
     const clientQuery = vi.fn<
       (text: string, parameters?: unknown[]) => Promise<QueryResult<QueryResultRow>>
     >(async (text, parameters) => {
@@ -1424,20 +1473,51 @@ function fakeContendedCheckpointPool(): Pool {
       if (sql.startsWith("begin")) {
         snapshot = new Map(committed);
         startedAt = revision;
+        modifiedKeys.clear();
         return queryResult([]);
       }
       if (sql === "rollback") return queryResult([]);
       if (sql === "commit") {
-        if (revision !== startedAt) throw postgresError("40001", "checkpoint claim contention");
-        committed = snapshot;
+        // Check if any key this transaction modified was also modified by
+        // a transaction that committed since this one started. This mirrors
+        // PostgreSQL's serializable conflict detection: concurrent writes
+        // to different keys don't conflict.
+        for (const key of modifiedKeys) {
+          const lastMod = keyLastModified.get(key);
+          if (lastMod !== undefined && lastMod > startedAt) {
+            throw postgresError("40001", "checkpoint claim contention");
+          }
+        }
+        // Apply only this transaction's modifications to the committed map,
+        // rather than replacing the entire map. This allows concurrent
+        // transactions that touch different keys to both commit.
+        for (const key of modifiedKeys) {
+          if (snapshot.has(key)) {
+            committed.set(key, snapshot.get(key)!);
+          } else {
+            committed.delete(key);
+          }
+        }
         revision++;
+        for (const key of modifiedKeys) {
+          keyLastModified.set(key, revision);
+        }
         return queryResult([]);
+      }
+      // Track which keys this transaction modifies.
+      if (/^\s*(insert|delete)/i.test(text) && parameters[0] !== undefined) {
+        modifiedKeys.add(String(parameters[0]));
       }
       return execute(snapshot, text, parameters);
     });
     return { query: clientQuery, release: vi.fn<() => void>() } as unknown as PoolClient;
   });
-  return { query, connect, end: vi.fn<() => Promise<void>>() } as unknown as Pool;
+  return {
+    query,
+    connect,
+    end: vi.fn<() => Promise<void>>(),
+    on: vi.fn<() => void>(),
+  } as unknown as Pool;
 }
 
 function transactionClientQuery() {

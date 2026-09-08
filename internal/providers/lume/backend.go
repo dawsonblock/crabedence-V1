@@ -906,7 +906,11 @@ exec "$@"`
 	}
 	if _, err := ownerConfirm.Wait(ctx, exitCh); err != nil {
 		_ = cmd.Process.Kill()
-		return owner, exit(2, "lume run %s: establish launch handoff: %v", name, err)
+		return owner, &core.StartupConfirmFailure{
+			Stage:     "file-handoff",
+			Retryable: true,
+			Err:       exit(2, "lume run %s: establish launch handoff: %v", name, err),
+		}
 	}
 	if len(onStarted) > 0 && onStarted[0] != nil {
 		if err := onStarted[0](owner); err != nil {
@@ -926,7 +930,11 @@ exec "$@"`
 	}
 	if _, err := ackConfirm.Wait(ctx, exitCh); err != nil {
 		_ = cmd.Process.Kill()
-		return owner, exit(2, "lume run %s: confirm launch gate: %v", name, err)
+		return owner, &core.StartupConfirmFailure{
+			Stage:     "file-handoff",
+			Retryable: true,
+			Err:       exit(2, "lume run %s: confirm launch gate: %v", name, err),
+		}
 	}
 	// After the ack, the launcher has exec'd into lume and the survival window
 	// begins. Use the shared TimeoutWindowConfirm strategy instead of a local
@@ -939,16 +947,24 @@ exec "$@"`
 			_, _ = io.Copy(&stderrBuf, io.LimitReader(detachedStderr, 64<<10))
 		}
 		detail := strings.TrimSpace(stderrBuf.String())
+		owner.StartupConfirm = survivalResult
+		var baseErr error
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			_ = cmd.Process.Signal(os.Interrupt)
-			owner.StartupConfirm = survivalResult
-			return owner, exit(2, "lume run %s: context cancelled during startup: %v", name, err)
+			baseErr = exit(2, "lume run %s: context cancelled during startup: %v", name, err)
+		} else if detail != "" {
+			baseErr = exit(2, "lume run %s failed during startup: %s", name, detail)
+		} else {
+			baseErr = exit(2, "lume run %s failed during startup: %v", name, err)
 		}
-		owner.StartupConfirm = survivalResult
-		if detail != "" {
-			return owner, exit(2, "lume run %s failed during startup: %s", name, detail)
+		return owner, &core.StartupConfirmFailure{
+			Stage:         survivalResult.Stage,
+			DurationMs:    survivalResult.Duration.Milliseconds(),
+			Ready:         survivalResult.Ready,
+			ProcessExited: survivalResult.ProcessExited,
+			Retryable:     survivalResult.Retryable,
+			Err:           baseErr,
 		}
-		return owner, exit(2, "lume run %s failed during startup: %v", name, err)
 	}
 	owner.StartupConfirm = survivalResult
 	return owner, nil

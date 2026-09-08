@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"math"
 	"strings"
@@ -67,6 +68,48 @@ type StartupConfirmSummary struct {
 	Ready         bool   `json:"ready"`
 	ProcessExited bool   `json:"processExited,omitempty"`
 	Retryable     bool   `json:"retryable,omitempty"`
+}
+
+// StartupConfirmFailure is a typed error that carries the structured startup
+// confirmation evidence from a failed acquisition. It allows the CLI run
+// path to extract the startup confirm result (stage, duration, outcome)
+// from a wrapped provider error and propagate it into the timing report
+// and RunEvidenceV1, even when the ProcessHandle is discarded on failure.
+//
+// Use errors.As to extract it from a wrapped error chain:
+//
+//	var scf *StartupConfirmFailure
+//	if errors.As(err, &scf) {
+//	    summary := scf.Summary()
+//	}
+type StartupConfirmFailure struct {
+	Stage         string
+	DurationMs    int64
+	Ready         bool
+	ProcessExited bool
+	Retryable     bool
+	Err           error
+}
+
+func (e *StartupConfirmFailure) Error() string {
+	if e.Err != nil {
+		return e.Err.Error()
+	}
+	return fmt.Sprintf("startup confirmation failed at stage %s", e.Stage)
+}
+
+func (e *StartupConfirmFailure) Unwrap() error { return e.Err }
+
+// Summary converts the failure into a StartupConfirmSummary for the
+// timing report and RunEvidenceV1.
+func (e *StartupConfirmFailure) Summary() StartupConfirmSummary {
+	return StartupConfirmSummary{
+		Stage:         e.Stage,
+		DurationMs:    e.DurationMs,
+		Ready:         e.Ready,
+		ProcessExited: e.ProcessExited,
+		Retryable:     e.Retryable,
+	}
 }
 
 type TimingPhase struct {

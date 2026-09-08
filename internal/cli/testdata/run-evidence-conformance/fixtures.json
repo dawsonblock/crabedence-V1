@@ -3802,6 +3802,241 @@
         "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
       },
       "expected": "reject"
+    },
+    {
+      "name": "unpaired-high-surrogate",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "command_text": "echo \ud800"
+      },
+      "expected": "reject",
+      "error_contains": "surrogate"
+    },
+    {
+      "name": "unpaired-low-surrogate",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "command_text": "echo \udc00"
+      },
+      "expected": "reject",
+      "error_contains": "surrogate"
+    },
+    {
+      "name": "fractional-timestamp-milliseconds",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 5000,
+        "command_ms": 3000,
+        "sync_ms": 2000,
+        "started_at": "2026-01-15T12:30:00.123Z",
+        "ended_at": "2026-01-15T12:30:05.123Z",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "fractional-timestamp-microseconds",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 5000,
+        "command_ms": 3000,
+        "sync_ms": 2000,
+        "started_at": "2026-01-15T12:30:00.123456Z",
+        "ended_at": "2026-01-15T12:30:05.123456Z",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "startup-confirm-full",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 5000,
+        "command_ms": 3000,
+        "sync_ms": 2000,
+        "startup_confirm": {
+          "stage": "file-handoff",
+          "duration_ms": 500,
+          "ready": true,
+          "process_exited": false,
+          "retryable": false
+        },
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "startup-confirm-failed",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 1,
+        "run_status": "failed",
+        "error_kind": "startup",
+        "total_ms": 500,
+        "command_ms": 0,
+        "sync_ms": 0,
+        "startup_confirm": {
+          "stage": "process-exit",
+          "duration_ms": 100,
+          "ready": false,
+          "process_exited": true,
+          "retryable": true
+        },
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "empty-command-text",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "command_text": "",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "multiple-runner-phases",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 5000,
+        "command_ms": 3000,
+        "sync_ms": 2000,
+        "runner_phases": [
+          {"name": "connect.ssh", "ms": 100},
+          {"name": "sync", "ms": 2000},
+          {"name": "command", "ms": 3000},
+          {"name": "artifacts", "ms": 500},
+          {"name": "cleanup", "ms": 200}
+        ],
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "artifacts-full",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 5000,
+        "command_ms": 3000,
+        "sync_ms": 2000,
+        "artifacts": [
+          {"path": "test-results.xml", "kind": "junit", "bytes": 2048, "sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+          {"path": "out.log", "kind": "log", "bytes": 65536}
+        ],
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "negative-sync-ms",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": -1,
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject",
+      "error_contains": "sync_ms"
+    },
+    {
+      "name": "negative-command-ms",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 100,
+        "command_ms": -1,
+        "sync_ms": 30,
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject",
+      "error_contains": "command_ms"
+    },
+    {
+      "name": "wrong-schema-version",
+      "evidence": {
+        "schema_version": 2,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject",
+      "error_contains": "schema_version"
+    },
+    {
+      "name": "wrong-evidence-type",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "execution",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject",
+      "error_contains": "evidence_type"
     }
   ]
 }

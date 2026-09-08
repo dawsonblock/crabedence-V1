@@ -277,11 +277,11 @@ func (b *backend) Acquire(ctx context.Context, req AcquireRequest) (target Lease
 	}
 	cleanupKey = false
 	// Propagate the startup confirmation result into the lease target so
-	// it reaches the timing report and RunEvidenceV1. Type-assert to
-	// *startupProcess to access StartupConfirmResult(); test fakes that
-	// don't implement this method are skipped.
-	if sp, ok := startup.(*startupProcess); ok {
-		if sc := sp.StartupConfirmResult(); sc.Stage != "" {
+	// it reaches the timing report and RunEvidenceV1. Use the capability
+	// interface rather than the concrete type; test fakes that don't
+	// implement this method are skipped.
+	if ep, ok := startup.(shared.StartupConfirmEvidenceProvider); ok {
+		if sc := ep.StartupConfirmResult(); sc.Stage != "" {
 			lease.StartupConfirm = &core.StartupConfirmSummary{
 				Stage:         sc.Stage,
 				DurationMs:    sc.Duration.Milliseconds(),

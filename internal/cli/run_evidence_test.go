@@ -75,6 +75,35 @@ func TestRunEvidenceDigestDetectsTampering(t *testing.T) {
 	}
 }
 
+func TestNewRunEvidenceTruncatesTimestampsToMilliseconds(t *testing.T) {
+	// Sub-millisecond precision must be truncated so Go and TypeScript
+	// produce identical timestamp strings for cross-language digest
+	// compatibility.
+	startedAt := time.Date(2026, 1, 15, 12, 30, 0, 123456789, time.UTC)
+	endedAt := time.Date(2026, 1, 15, 12, 30, 5, 987654321, time.UTC)
+	ev := NewRunEvidence(RunEvidenceInput{
+		Provider:  "hetzner",
+		ExitCode:  0,
+		TotalMs:   5000,
+		CommandMs: 3000,
+		SyncMs:    2000,
+		StartedAt: startedAt,
+		EndedAt:   endedAt,
+	})
+	wantStarted := "2026-01-15T12:30:00.123Z"
+	wantEnded := "2026-01-15T12:30:05.987Z"
+	if ev.StartedAt != wantStarted {
+		t.Fatalf("started_at = %q, want %q", ev.StartedAt, wantStarted)
+	}
+	if ev.EndedAt != wantEnded {
+		t.Fatalf("ended_at = %q, want %q", ev.EndedAt, wantEnded)
+	}
+	// Digest must verify with the truncated timestamps.
+	if !VerifyRunEvidenceDigest(ev) {
+		t.Fatal("digest verification failed with truncated timestamps")
+	}
+}
+
 func TestRunEvidenceMarshalJSONRecomputesDigest(t *testing.T) {
 	ev := RunEvidenceV1{
 		SchemaVersion: 1,

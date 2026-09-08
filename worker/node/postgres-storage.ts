@@ -1,3 +1,5 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+
 import { Pool, type PoolClient, type QueryResult, type QueryResultRow } from "pg";
 
 import type {
@@ -13,16 +15,40 @@ const retryableTransactionErrorCodes = new Set(["40001", "40P01"]);
 // Session-scoped advisory lock: exactly one coordinator process may run against
 // a database. A crashed holder loses its session, so the lock frees itself.
 const coordinatorAdvisoryLockName = "crabbox.coordinator";
+// Transaction-scoped advisory lock for fencing mutations. Uses a DIFFERENT
+// key from the session lock because PostgreSQL advisory locks are exclusive
+// across sessions regardless of lock duration (session vs transaction).
+// If both used the same key, the coordinator's own mutations would block
+// on the session lock held by the lock client (a different connection).
+// The mutation fence key prevents a replacement coordinator from starting
+// mutations while an in-flight transaction from the old coordinator is
+// still running, even after the old session lock is released.
+const coordinatorMutationFenceName = "crabbox.coordinator.mutation";
 // Liveness probe interval for the dedicated lock session. PostgreSQL frees the
 // advisory lock on session death without notifying the holder, so the holder
 // must actively verify its session is still alive.
 const lockHeartbeatIntervalMs = 10_000;
+
+/**
+ * AsyncLocalStorage tracking the current transaction's PoolClient. When a
+ * mutation method (put, delete, take) is called inside an active
+ * transaction, it uses this client directly instead of starting a nested
+ * fenced transaction. This prevents deadlocks and redundant xact lock
+ * acquisition while ensuring all mutations are fenced.
+ */
+const currentTransactionClient = new AsyncLocalStorage<PoolClient>();
 
 export class PostgresCoordinatorStorage implements CoordinatorStorage {
   readonly pool: Pool;
   private readonly view: PostgresCoordinatorStorageView;
   private lockClient: PoolClient | undefined;
   private lockRelease: (() => Promise<void>) | undefined;
+  // Fencing flag: once authority is lost, all mutations must fail closed.
+  // This is set by markAuthorityLost() which is called from the lock's
+  // onLost callback. A process-level boolean alone is insufficient for
+  // split-brain safety, so mutations also acquire a transaction-scoped
+  // advisory lock that shares the session lock's namespace.
+  private authorityLost = false;
 
   constructor(connectionString: string, pool?: Pool) {
     this.pool =
@@ -36,6 +62,10 @@ export class PostgresCoordinatorStorage implements CoordinatorStorage {
           10_000,
         ),
       });
+    // Suppress uncaught error events from idle connections that die when
+    // the lock backend is terminated. The lock-loss callback handles
+    // authority loss; pool-level errors are informational only.
+    this.pool.on("error", () => {});
     this.view = new PostgresCoordinatorStorageView(storageQuery(this.pool));
   }
 
@@ -100,7 +130,13 @@ export class PostgresCoordinatorStorage implements CoordinatorStorage {
       if (released || this.lockClient !== client) return;
       this.lockClient = undefined;
       released = true;
+      this.authorityLost = true;
       teardownListeners();
+      // Re-attach a noop error handler so the client doesn't emit an
+      // uncaught 'error' event during pool eviction. The session is dead;
+      // further errors are expected and informational only.
+      client.on("error", () => {});
+      client.on("end", () => {});
       // The session is dead; evict the client from the pool rather than
       // returning a broken connection for reuse.
       client.release(new Error(`coordinator advisory-lock session lost: ${reason}`));
@@ -130,6 +166,9 @@ export class PostgresCoordinatorStorage implements CoordinatorStorage {
       this.lockClient = undefined;
       released = true;
       teardownListeners();
+      // Re-attach noop handlers to prevent uncaught errors during release.
+      client.on("error", () => {});
+      client.on("end", () => {});
       let unlockError: Error | undefined;
       try {
         await client.query("select pg_advisory_unlock(hashtext($1))", [
@@ -169,20 +208,67 @@ export class PostgresCoordinatorStorage implements CoordinatorStorage {
     await this.pool.end();
   }
 
+  /**
+   * Mark this storage as having lost coordinator authority. All subsequent
+   * mutations (put, delete, take, transaction) will fail closed by throwing
+   * an AuthorityLostError. This is called from the lock's onLost callback
+   * and from the runtime's handleCoordinatorAuthorityLost.
+   */
+  markAuthorityLost(): void {
+    this.authorityLost = true;
+  }
+
+  /** Check authority before any mutation. Throws if authority was lost. */
+  private assertAuthority(): void {
+    if (this.authorityLost) {
+      throw new AuthorityLostError(
+        "coordinator authority lost; refusing mutation after advisory-lock session death",
+      );
+    }
+  }
+
   async get<T>(key: string, _options?: { noCache?: boolean }): Promise<T | undefined> {
     return this.view.get<T>(key);
   }
 
   async put<T>(key: string, value: T, _options?: { noCache?: boolean }): Promise<void> {
-    await this.view.put(key, value);
+    this.assertAuthority();
+    const client = currentTransactionClient.getStore();
+    if (client) {
+      // Inside an active transaction: use the transaction's client directly.
+      // The xact lock is already held by the enclosing transaction.
+      await new PostgresCoordinatorStorageView(storageQuery(client)).put(key, value);
+      return;
+    }
+    // Outside a transaction: start a new fenced transaction.
+    await this.fencedMutation((c) =>
+      new PostgresCoordinatorStorageView(storageQuery(c)).put(key, value),
+    );
   }
 
   async delete(key: string): Promise<void> {
-    await this.view.delete(key);
+    this.assertAuthority();
+    const client = currentTransactionClient.getStore();
+    if (client) {
+      await new PostgresCoordinatorStorageView(storageQuery(client)).delete(key);
+      return;
+    }
+    await this.fencedMutation((c) =>
+      new PostgresCoordinatorStorageView(storageQuery(c)).delete(key),
+    );
   }
 
   async take<T>(key: string): Promise<T | undefined> {
-    const result = await this.pool.query<{ encoded_value: unknown }>(
+    this.assertAuthority();
+    const client = currentTransactionClient.getStore();
+    if (client) {
+      return this.takeWithClient<T>(client, key);
+    }
+    return this.fencedMutation((c) => this.takeWithClient<T>(c, key));
+  }
+
+  private async takeWithClient<T>(client: PoolClient, key: string): Promise<T | undefined> {
+    const result = await client.query<{ encoded_value: unknown }>(
       `
         delete from ${table}
         where key = $1
@@ -234,11 +320,32 @@ export class PostgresCoordinatorStorage implements CoordinatorStorage {
   private async transactionAttempt<T>(
     callback: (transaction: CoordinatorStorageView) => Promise<T>,
   ): Promise<T> {
+    this.assertAuthority();
     const client = await this.pool.connect();
     let releaseError: Error | undefined;
     try {
       await client.query("begin isolation level serializable");
-      const result = await callback(new PostgresCoordinatorStorageView(storageQuery(client)));
+      // Acquire a transaction-scoped advisory lock that shares the same
+      // namespace as the session-scoped coordinator lock. This ensures
+      // that while this mutation transaction is in-flight, no replacement
+      // coordinator can acquire the session lock and begin its own
+      // mutations. The lock auto-releases on commit/rollback.
+      await client.query("select pg_advisory_xact_lock(hashtext($1))", [
+        coordinatorMutationFenceName,
+      ]);
+      // Re-check authority after acquiring the xact lock: the lock session
+      // may have died while we were waiting for the xact lock (e.g., behind
+      // another in-flight mutation on this same coordinator). If so, abort
+      // before executing the callback.
+      if (this.authorityLost) {
+        await client.query("rollback");
+        throw new AuthorityLostError(
+          "coordinator authority lost while acquiring transaction fence",
+        );
+      }
+      const result = await currentTransactionClient.run(client, () =>
+        callback(new PostgresCoordinatorStorageView(storageQuery(client))),
+      );
       await client.query("commit");
       return result;
     } catch (error) {
@@ -255,6 +362,55 @@ export class PostgresCoordinatorStorage implements CoordinatorStorage {
           { cause: error },
         );
         throw aggregate;
+      }
+      throw error;
+    } finally {
+      if (releaseError) {
+        client.release(releaseError);
+      } else {
+        client.release();
+      }
+    }
+  }
+
+  /**
+   * fencedMutation executes a single-key mutation inside a fenced
+   * transaction. Unlike transaction(), it does not retry on serialization
+   * failures — single-key operations either commit or fail, and the
+   * fence is effective either way. This is used by put, delete, and take
+   * when called outside an existing transaction.
+   */
+  private async fencedMutation<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
+    this.assertAuthority();
+    const client = await this.pool.connect();
+    let releaseError: Error | undefined;
+    try {
+      await client.query("begin isolation level serializable");
+      await client.query("select pg_advisory_xact_lock(hashtext($1))", [
+        coordinatorMutationFenceName,
+      ]);
+      if (this.authorityLost) {
+        await client.query("rollback");
+        throw new AuthorityLostError(
+          "coordinator authority lost while acquiring transaction fence",
+        );
+      }
+      const result = await currentTransactionClient.run(client, () => fn(client));
+      await client.query("commit");
+      return result;
+    } catch (error) {
+      try {
+        await client.query("rollback");
+      } catch (rollbackError) {
+        releaseError =
+          rollbackError instanceof Error
+            ? rollbackError
+            : new Error("PostgreSQL rollback failed", { cause: rollbackError });
+        throw new AggregateError(
+          [error, rollbackError],
+          "PostgreSQL transaction failed and rollback also failed",
+          { cause: error },
+        );
       }
       throw error;
     } finally {
@@ -386,4 +542,17 @@ function escapeLike(value: string): string {
 function positiveInt(value: string | undefined, fallback: number): number {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+/**
+ * Thrown when a mutation is attempted after the coordinator has lost
+ * authority (the advisory-lock session died). This is a fencing error:
+ * the mutation was refused because the coordinator can no longer prove
+ * it is the single writer.
+ */
+export class AuthorityLostError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AuthorityLostError";
+  }
 }

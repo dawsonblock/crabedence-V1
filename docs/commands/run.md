@@ -563,15 +563,16 @@ context-neutral; put patch- or fix-specific claims in repository-owned template
 fields only when the run actually proves them.
 
 Use `--attest <path>` to write a signed receipt after a command completes,
-including non-zero exits. SSH terminal receipts use schema v2 and bind the final
-run outcome, raw command digest, timing, retained-log digest, and full observed
-stream digest. Delegated providers retain schema v1 when they report a
-definitive command exit. Check local receipts with [`crabbox verify`](verify.md).
-Secondary cleanup errors do not suppress a receipt for an already-observed
-delegated command exit; provider/transport failures without a definitive exit
-do not produce that receipt.
+including non-zero exits. Terminal receipts use schema v3 and bind the
+evidence SHA-256 digest, final run outcome, raw command digest, timing,
+retained-log digest, and full observed stream digest via an Ed25519
+signature. All providers (SSH and delegated) now use the same V3
+evidence-bound receipt model. Check local receipts with
+[`crabbox verify`](verify.md). Secondary cleanup errors do not suppress a
+receipt for an already-observed command exit; provider/transport failures
+without a definitive exit do not produce that receipt.
 
-Brokered runs submit a schema v2 terminal receipt with the finish request even
+Brokered runs submit a schema v3 terminal receipt with the finish request even
 when `--attest` is omitted. The CLI verifies that the coordinator returns the
 exact persisted receipt before treating the finish as recorded, so a
 coordinator that predates receipt storage fails closed instead of silently
@@ -791,7 +792,7 @@ failure bundles and the deferred digest, so one-shot deletion does not lose it.
 For [Local Container](../providers/local-container.md#memory-failure-evidence),
 actual container settings, total runtime RAM, and swap are separate observations,
 not an exact effective or free-memory bound.
-Runner timing is unsigned local telemetry. It is not part of receipt v2, does
+Runner timing is unsigned local telemetry. It is not part of receipt v3, does
 not change signing, and must not be treated as attested evidence. App
 finalization emits the failure digest, timing record, timing JSON, local receipt
 persistence, and coordinator finish in that order after cleanup. Timing sink

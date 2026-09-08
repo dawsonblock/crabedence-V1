@@ -297,3 +297,12 @@ func (c ProcessExitConfirm) Wait(ctx context.Context, exited <-chan error) (Star
 var _ ProcessStartupConfirm = TimeoutWindowConfirm{}
 var _ ProcessStartupConfirm = FileHandoffConfirm{}
 var _ ProcessStartupConfirm = ProcessExitConfirm{}
+
+// StartupConfirmEvidenceProvider is an optional capability of ProcessHandle
+// implementations that can provide structured startup confirmation evidence.
+// Providers that perform startup confirmation (Tart, Lume) should implement
+// this on their process handle so callers can extract the result without
+// type-asserting to a concrete struct.
+type StartupConfirmEvidenceProvider interface {
+	StartupConfirmResult() StartupConfirmResult
+}

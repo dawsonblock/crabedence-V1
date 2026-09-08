@@ -32,7 +32,78 @@ func ParseRunEvidenceV1(data []byte) (RunEvidenceV1, error) {
 	if err := detectDuplicateKeys(data); err != nil {
 		return ev, fmt.Errorf("malformed evidence: %w", err)
 	}
+	if err := rejectUnpairedSurrogates(data); err != nil {
+		return ev, fmt.Errorf("malformed evidence: %w", err)
+	}
 	return ev, nil
+}
+
+// rejectUnpairedSurrogates scans the raw JSON for \uXXXX escape sequences
+// that represent unpaired UTF-16 surrogates. Go's json.Decoder silently
+// replaces unpaired surrogates with U+FFFD, while JavaScript's JSON.parse
+// preserves them as unpaired surrogates in the string. This divergence
+// produces different canonical bytes and different digests, breaking
+// cross-runtime evidence coherence. Rejecting them at parse time ensures
+// both runtimes see the same bytes.
+//
+// This scan is byte-level and does not parse JSON; it simply looks for
+// the pattern \uXXXX where XXXX is a surrogate code point (D800-DFFF)
+// and checks whether high surrogates (D800-DBFF) are followed by a low
+// surrogate (DC00-DFFF) in the next \uXXXX escape.
+func rejectUnpairedSurrogates(data []byte) error {
+	for i := 0; i < len(data)-5; i++ {
+		if data[i] != '\\' || data[i+1] != 'u' {
+			continue
+		}
+		hex := string(data[i+2 : i+6])
+		code, err := parseHex4(hex)
+		if err != nil {
+			continue // not a valid \uXXXX, let json.Decoder handle it
+		}
+		if code < 0xD800 || code > 0xDFFF {
+			continue // not a surrogate
+		}
+		if code >= 0xDC00 && code <= 0xDFFF {
+			// Low surrogate without a preceding high surrogate.
+			if i < 6 || !isHighSurrogateEscape(data[i-6:]) {
+				return fmt.Errorf("unpaired low surrogate \\u%s", hex)
+			}
+			continue
+		}
+		// High surrogate (D800-DBFF): must be followed by a low surrogate.
+		if i+12 > len(data) || !isLowSurrogateEscape(data[i+6:]) {
+			return fmt.Errorf("unpaired high surrogate \\u%s", hex)
+		}
+	}
+	return nil
+}
+
+func parseHex4(s string) (uint16, error) {
+	var val uint16
+	for _, c := range s {
+		val <<= 4
+		switch {
+		case c >= '0' && c <= '9':
+			val |= uint16(c - '0')
+		case c >= 'a' && c <= 'f':
+			val |= uint16(c - 'a' + 10)
+		case c >= 'A' && c <= 'F':
+			val |= uint16(c - 'A' + 10)
+		default:
+			return 0, fmt.Errorf("invalid hex digit %q", c)
+		}
+	}
+	return val, nil
+}
+
+func isHighSurrogateEscape(data []byte) bool {
+	return len(data) >= 6 && data[0] == '\\' && data[1] == 'u' &&
+		data[2] == 'd' && (data[3] >= '8' && data[3] <= 'b')
+}
+
+func isLowSurrogateEscape(data []byte) bool {
+	return len(data) >= 6 && data[0] == '\\' && data[1] == 'u' &&
+		data[2] == 'd' && (data[3] >= 'c' && data[3] <= 'f')
 }
 
 // detectDuplicateKeys scans a JSON object for duplicate keys at any nesting

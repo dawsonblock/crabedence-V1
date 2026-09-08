@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	core "github.com/openclaw/crabbox/internal/cli"
 	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
@@ -207,7 +208,20 @@ func (p *startupProcess) abort(readinessErr error) error {
 			cause: readinessErr,
 		}
 	}
-	return errors.Join(readinessErr, killErr, p.closeLog())
+	joined := errors.Join(readinessErr, killErr, p.closeLog())
+	// Wrap with StartupConfirmFailure so callers can extract the structured
+	// startup evidence even when the handle is discarded on failure.
+	if p.startupConfirmResult.Stage != "" {
+		return &core.StartupConfirmFailure{
+			Stage:         p.startupConfirmResult.Stage,
+			DurationMs:    p.startupConfirmResult.Duration.Milliseconds(),
+			Ready:         p.startupConfirmResult.Ready,
+			ProcessExited: p.startupConfirmResult.ProcessExited,
+			Retryable:     p.startupConfirmResult.Retryable,
+			Err:           joined,
+		}
+	}
+	return joined
 }
 
 type startupStderrError struct {

@@ -643,11 +643,36 @@ function checkEvidenceLimits(ev: Record<string, unknown>): Error | undefined {
   return checkEvidenceValueLimits(ev, 1);
 }
 
+/**
+ * hasUnpairedSurrogate returns true if the string contains a lone
+ * (unpaired) UTF-16 surrogate code unit. Unpaired surrogates produce
+ * different bytes in Go (escaped as \ud800) vs JavaScript (replaced
+ * with U+FFFD by TextEncoder), breaking the canonical digest coherence.
+ */
+function hasUnpairedSurrogate(value: string): boolean {
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      // High surrogate — must be followed by a low surrogate.
+      const next = value.charCodeAt(i + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return true;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      // Low surrogate without a preceding high surrogate.
+      const prev = value.charCodeAt(i - 1);
+      if (!(prev >= 0xd800 && prev <= 0xdbff)) return true;
+    }
+  }
+  return false;
+}
+
 function checkEvidenceValueLimits(value: unknown, depth: number): Error | undefined {
   if (depth > runEvidenceMaxDepth) {
     return new Error(`evidence exceeds nesting depth ${runEvidenceMaxDepth}`);
   }
   if (typeof value === "string") {
+    if (hasUnpairedSurrogate(value)) {
+      return new Error("evidence string field contains unpaired Unicode surrogate");
+    }
     if (encoder.encode(value).byteLength > runEvidenceMaxFieldBytes) {
       return new Error("evidence string field exceeds byte limit");
     }

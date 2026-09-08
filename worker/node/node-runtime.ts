@@ -304,6 +304,11 @@ export class NodeCoordinatorRuntime implements CoordinatorRuntime {
   private handleCoordinatorAuthorityLost(): void {
     if (this.shuttingDown || this.authorityLost) return;
     this.authorityLost = true;
+    // Mark the storage layer so all subsequent mutations fail closed.
+    // This is the fencing gate: after authority loss, the storage refuses
+    // to begin new transactions, preventing split-brain mutations.
+    // Use optional chaining because test mocks may not implement this.
+    this.storage.markAuthorityLost?.();
     console.error("coordinator advisory-lock session lost; authority lost, shutting down");
     // Stop timers and sockets first so no further coordinator work starts.
     this.beginShutdown();

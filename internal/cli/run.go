@@ -1499,6 +1499,16 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 		acquired = true
 	}
 	if err != nil {
+		// Extract structured startup confirmation evidence from the
+		// acquisition error before recording the failure. This ensures
+		// that startup confirmation failures (timeout, process exit,
+		// file-handoff failure) reach the timing report and RunEvidenceV1
+		// even when the ProcessHandle is discarded on failure.
+		var scf *StartupConfirmFailure
+		if errors.As(err, &scf) && scf.Stage != "" {
+			summary := scf.Summary()
+			leaseStartupConfirm = &summary
+		}
 		return recordFailure(err)
 	}
 	releaseResolvedLease = true
@@ -1664,6 +1674,9 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 			return
 		}
 		report := timingReportFromRunWithActionsURL(cfg.Provider, leaseID, serverSlug(server), timings, time.Since(timings.started), exitCodeForError(err, 7), actionsURL)
+		if leaseStartupConfirm != nil && report.StartupConfirm == nil {
+			report.StartupConfirm = leaseStartupConfirm
+		}
 		if !timings.started.IsZero() {
 			report.StartedAt = timings.started.UTC()
 			report.EndedAt = timings.started.UTC().Add(time.Since(timings.started))
@@ -2402,6 +2415,9 @@ afterSync:
 		if *timingJSON || timingRecordEnabled {
 			total := time.Since(timings.started)
 			report := timingReportFromRunWithActionsURL(cfg.Provider, leaseID, serverSlug(server), timings, total, 0, actionsURL)
+			if leaseStartupConfirm != nil && report.StartupConfirm == nil {
+				report.StartupConfirm = leaseStartupConfirm
+			}
 			if !timings.started.IsZero() {
 				report.StartedAt = timings.started.UTC()
 				report.EndedAt = timings.started.UTC().Add(total)

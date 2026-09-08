@@ -334,11 +334,17 @@ func buildTerminalRunReceipt(keyPath string, in terminalRunReceiptInput) (termin
 func buildTerminalRunReceiptWithKey(key ed25519.PrivateKey, in terminalRunReceiptInput) (terminalRunReceipt, error) {
 	pub := key.Public().(ed25519.PublicKey)
 	commandDigest := commandSHA256(in.Command)
+	// Calculate duration from the millisecond-truncated timestamps so the
+	// receipt's duration_ms exactly matches started_at/ended_at, which the
+	// verifier checks. Go's Milliseconds() truncates toward zero, matching
+	// the Truncate(time.Millisecond) applied to the timestamps above.
+	truncatedStartedAt := in.StartedAt.UTC().Truncate(time.Millisecond)
+	truncatedEndedAt := in.EndedAt.UTC().Truncate(time.Millisecond)
 	receipt := terminalRunReceipt{
 		SchemaVersion:     terminalReceiptSchemaVersion,
 		ReceiptType:       terminalReceiptType,
-		StartedAt:         in.StartedAt.UTC().Format(time.RFC3339Nano),
-		EndedAt:           in.EndedAt.UTC().Format(time.RFC3339Nano),
+		StartedAt:         truncatedStartedAt.Format(time.RFC3339Nano),
+		EndedAt:           truncatedEndedAt.Format(time.RFC3339Nano),
 		Provider:          in.Provider,
 		LeaseID:           in.LeaseID,
 		Slug:              in.Slug,
@@ -348,7 +354,7 @@ func buildTerminalRunReceiptWithKey(key ed25519.PrivateKey, in terminalRunReceip
 		ExitCode:          in.ExitCode,
 		SyncMs:            in.SyncMs,
 		CommandMs:         in.CommandMs,
-		DurationMs:        in.EndedAt.Sub(in.StartedAt).Milliseconds(),
+		DurationMs:        truncatedEndedAt.Sub(truncatedStartedAt).Milliseconds(),
 		LogSHA256:         in.LogSHA256,
 		RetainedLogSHA256: in.RetainedLogSHA256,
 		LogTruncated:      in.LogTruncated,

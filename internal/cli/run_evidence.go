@@ -219,10 +219,13 @@ func NewRunEvidence(input RunEvidenceInput) RunEvidenceV1 {
 		StartupConfirm:     input.StartupConfirm,
 	}
 	if !input.StartedAt.IsZero() {
-		ev.StartedAt = input.StartedAt.UTC().Format(time.RFC3339Nano)
+		// Truncate to millisecond precision so Go and TypeScript produce
+		// identical timestamp strings. Go's RFC3339Nano includes nanosecond
+		// precision, but JavaScript's Date only handles milliseconds.
+		ev.StartedAt = input.StartedAt.UTC().Truncate(time.Millisecond).Format(time.RFC3339Nano)
 	}
 	if !input.EndedAt.IsZero() {
-		ev.EndedAt = input.EndedAt.UTC().Format(time.RFC3339Nano)
+		ev.EndedAt = input.EndedAt.UTC().Truncate(time.Millisecond).Format(time.RFC3339Nano)
 	}
 	ev.Digest = runEvidenceDigest(ev)
 	return ev
@@ -270,8 +273,10 @@ func canonicalEvidenceJSON(ev RunEvidenceV1) ([]byte, error) {
 // marshalNoEscape serializes v as JSON with HTML escaping disabled,
 // byte-for-byte matching JavaScript's JSON.stringify for the value shapes
 // evidence uses (valid UTF-8 strings, booleans, integers within the
-// IEEE-754 safe range, arrays, and objects). With SetEscapeHTML(false),
-// Go also stops escaping U+2028/U+2029, matching JSON.stringify.
+// IEEE-754 safe range, arrays, and objects). Go encoding/json continues
+// escaping U+2028 and U+2029 even when SetEscapeHTML(false) is used.
+// The TypeScript canonicalizer must mirror that behavior to preserve
+// cross-language digest compatibility.
 func marshalNoEscape(v any) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)

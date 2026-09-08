@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"unicode/utf8"
 )
 
 // evidenceVerify verifies a RunEvidenceV1 JSON document: recomputes the digest,
@@ -158,6 +159,27 @@ func validateRunEvidenceStructure(ev RunEvidenceV1) error {
 	}
 	if ev.Digest != "" && !validHexDigest(ev.Digest, 32) {
 		return fmt.Errorf("digest must be a 64-character lowercase hex string")
+	}
+	// Reject strings with invalid UTF-8 (including unpaired surrogates).
+	// Go's json decoder already rejects invalid UTF-8 in string literals,
+	// but strings constructed programmatically could contain invalid bytes.
+	// Unpaired surrogates produce different bytes in Go vs JavaScript
+	// (Go escapes them, JS replaces with U+FFFD), breaking digest coherence.
+	for field, value := range map[string]string{
+		"provider":      ev.Provider,
+		"lease_id":      ev.LeaseID,
+		"run_id":        ev.RunID,
+		"slug":          ev.Slug,
+		"label":         ev.Label,
+		"machine_type":  ev.MachineType,
+		"command_text":  ev.CommandText,
+		"run_status":    string(ev.RunStatus),
+		"error_kind":    string(ev.ErrorKind),
+		"blocked_stage": ev.BlockedStage,
+	} {
+		if !utf8.ValidString(value) {
+			return fmt.Errorf("%s contains invalid UTF-8 (unpaired surrogates or malformed bytes)", field)
+		}
 	}
 	if len(ev.Provider) == 0 {
 		return fmt.Errorf("provider is required")
