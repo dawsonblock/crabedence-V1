@@ -131,7 +131,9 @@ runLive("postgres coordinator parity (live)", () => {
     // the PID of the lock-holding backend by querying pg_stat_activity
     // for the coordinator advisory lock query.
     const storage = f.storage as unknown as {
-      pool: { query: (text: string, params?: unknown[]) => Promise<{ rows: Array<{ pid: number }> }> };
+      pool: {
+        query: (text: string, params?: unknown[]) => Promise<{ rows: Array<{ pid: number }> }>;
+      };
     };
     const result = await storage.pool.query(
       `select pid from pg_stat_activity

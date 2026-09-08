@@ -63,7 +63,9 @@ function terminalReceiptSigningBytes(receipt: TerminalRunReceipt): Uint8Array {
   const prefix = "crabbox-terminal-receipt-v3\0";
   const parts = [encoder.encode(prefix)];
   for (const field of terminalReceiptSigningFields) {
-    const value = encoder.encode(String((receipt as unknown as Record<string, unknown>)[field] ?? ""));
+    const value = encoder.encode(
+      String((receipt as unknown as Record<string, unknown>)[field] ?? ""),
+    );
     const length = new Uint8Array(4);
     new DataView(length.buffer).setUint32(0, value.byteLength);
     parts.push(length, value);
@@ -104,7 +106,10 @@ describe("Go-generated terminal bundle interop", () => {
       exitCode: golden.evidence.exit_code,
       receipt: golden.receipt,
     });
-    expect(err, `expected evidence to be accepted: ${err instanceof Error ? err.message : String(err)}`).toBeUndefined();
+    expect(
+      err,
+      `expected evidence to be accepted: ${err instanceof Error ? err.message : String(err)}`,
+    ).toBeUndefined();
   });
 
   it("evidence digest matches receipt evidence_sha256 binding", () => {
@@ -122,7 +127,9 @@ describe("Go-generated terminal bundle interop", () => {
 
     const signingBytes = terminalReceiptSigningBytes(golden.receipt);
     const valid = await crypto.subtle.verify("Ed25519", key, signature, signingBytes);
-    expect(valid, "Go-generated Ed25519 signature must verify under TypeScript WebCrypto").toBe(true);
+    expect(valid, "Go-generated Ed25519 signature must verify under TypeScript WebCrypto").toBe(
+      true,
+    );
   });
 
   it("rejects a tampered signature", async () => {
