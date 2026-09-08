@@ -52,7 +52,8 @@ func TestGenerateTerminalBundleGolden(t *testing.T) {
 			SyncMs:    2000,
 		},
 		TerminalLog: runLogSnapshot{
-			Log: "all tests passed\n",
+			Log:        "all tests passed\n",
+			FullSHA256: sha256Digest([]byte("all tests passed\n")),
 		},
 	}
 
@@ -152,7 +153,7 @@ func TestTerminalBundleEvidenceBinding(t *testing.T) {
 			TotalMs:   1000,
 			CommandMs: 500,
 		},
-		TerminalLog: runLogSnapshot{Log: "hello\n"},
+		TerminalLog: runLogSnapshot{Log: "hello\n", FullSHA256: sha256Digest([]byte("hello\n"))},
 	}
 
 	bundle, err := BuildTerminalBundle(outcome, key)

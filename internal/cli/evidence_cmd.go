@@ -159,6 +159,9 @@ func validateRunEvidenceStructure(ev RunEvidenceV1) error {
 	if ev.Digest != "" && !validHexDigest(ev.Digest, 32) {
 		return fmt.Errorf("digest must be a 64-character lowercase hex string")
 	}
+	if len(ev.Provider) == 0 {
+		return fmt.Errorf("provider is required")
+	}
 	if len(ev.Provider) > 256 {
 		return fmt.Errorf("provider exceeds 256 characters")
 	}

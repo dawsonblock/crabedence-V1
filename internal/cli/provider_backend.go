@@ -1410,6 +1410,10 @@ type LeaseTarget struct {
 	LeaseID      string
 	Coordinator  *CoordinatorClient
 	runnerTiming *runnerProviderTiming
+	// StartupConfirm carries the structured startup confirmation result
+	// from providers that perform startup confirmation (Tart, Lume).
+	// nil for providers that don't perform startup confirmation.
+	StartupConfirm *StartupConfirmSummary
 	// Recorded by the validated provider lookup, never inferred from absent SSH.
 	providerRelease *leaseReleaseConfirmation
 }

@@ -22,6 +22,31 @@ import {
 import { PostgresCoordinatorStorage } from "./postgres-storage";
 
 const alarmQueue = "coordinator-alarm";
+
+// Race a startup stage against the abort signal. If the abort fires before
+// the stage completes, reject with "startup aborted: authority lost" instead
+// of waiting for the stage to finish. The stage promise is NOT cancelled —
+// many startup APIs (pg-boss, Postgres pool) don't support cancellation —
+// but the coordinator can proceed to cleanup without waiting indefinitely.
+function raceStartupStage<T>(signal: AbortSignal, stage: Promise<T>): Promise<T> {
+  if (signal.aborted) return Promise.reject(new Error("startup aborted: authority lost"));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      reject(new Error("startup aborted: authority lost"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    stage.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
 const alarmTimeStorageKey = "node-runtime:alarm-time";
 const reconcileQueue = "coordinator-reconcile";
 const bridgeDataAttachmentKinds = new Set([
@@ -142,51 +167,62 @@ export class NodeCoordinatorRuntime implements CoordinatorRuntime {
       lock.onLost?.(() => this.handleCoordinatorAuthorityLost());
     }
     try {
-      // Check for startup abort before each major stage.
-      if (this.startupAbort?.signal.aborted) throw new Error("startup aborted: authority lost");
-      await this.scanProvisioning();
-      if (this.startupAbort?.signal.aborted) throw new Error("startup aborted: authority lost");
+      const sig = this.startupAbort!.signal;
+      // Each startup stage is raced against the abort signal so a
+      // permanently-hanging stage (e.g. pg-boss start) does not block
+      // cleanup when authority is lost mid-startup.
+      await raceStartupStage(sig, this.scanProvisioning());
       this.provisioningScanner = setInterval(() => {
         void this.scanProvisioning();
       }, 1_000);
       this.provisioningScanner.unref();
-      if (this.startupAbort?.signal.aborted) throw new Error("startup aborted: authority lost");
-      await this.boss.start();
+      await raceStartupStage(sig, this.boss.start());
       this.bossStarted = true;
-      if (this.startupAbort?.signal.aborted) throw new Error("startup aborted: authority lost");
-      await this.boss.createQueue(alarmQueue, {
-        // "short" permits one queued successor while the current alarm is active.
-        policy: "short",
-        retryLimit: 5,
-        retryDelay: 5,
-        retryBackoff: true,
-      });
-      if (this.startupAbort?.signal.aborted) throw new Error("startup aborted: authority lost");
-      await this.boss.createQueue(reconcileQueue, {
-        policy: "exclusive",
-        retryLimit: 5,
-        retryDelay: 5,
-        retryBackoff: true,
-      });
-      if (this.startupAbort?.signal.aborted) throw new Error("startup aborted: authority lost");
-      await this.boss.work(alarmQueue, { pollingIntervalSeconds: 1 }, async () => {
-        await this.runAlarm();
-      });
-      if (this.startupAbort?.signal.aborted) throw new Error("startup aborted: authority lost");
-      await this.boss.work(reconcileQueue, { pollingIntervalSeconds: 5 }, async () => {
-        await this.runAlarm();
-      });
-      if (this.startupAbort?.signal.aborted) throw new Error("startup aborted: authority lost");
-      await this.boss.schedule(reconcileQueue, "*/15 * * * *", null, {
-        tz: "UTC",
-        singletonKey: "reconcile",
-      });
-      if (this.startupAbort?.signal.aborted) throw new Error("startup aborted: authority lost");
-      await this.boss.send(reconcileQueue, null, {
-        singletonKey: "startup",
-        singletonSeconds: 60,
-      });
-      if (this.startupAbort?.signal.aborted) throw new Error("startup aborted: authority lost");
+      await raceStartupStage(
+        sig,
+        this.boss.createQueue(alarmQueue, {
+          // "short" permits one queued successor while the current alarm is active.
+          policy: "short",
+          retryLimit: 5,
+          retryDelay: 5,
+          retryBackoff: true,
+        }),
+      );
+      await raceStartupStage(
+        sig,
+        this.boss.createQueue(reconcileQueue, {
+          policy: "exclusive",
+          retryLimit: 5,
+          retryDelay: 5,
+          retryBackoff: true,
+        }),
+      );
+      await raceStartupStage(
+        sig,
+        this.boss.work(alarmQueue, { pollingIntervalSeconds: 1 }, async () => {
+          await this.runAlarm();
+        }),
+      );
+      await raceStartupStage(
+        sig,
+        this.boss.work(reconcileQueue, { pollingIntervalSeconds: 5 }, async () => {
+          await this.runAlarm();
+        }),
+      );
+      await raceStartupStage(
+        sig,
+        this.boss.schedule(reconcileQueue, "*/15 * * * *", null, {
+          tz: "UTC",
+          singletonKey: "reconcile",
+        }),
+      );
+      await raceStartupStage(
+        sig,
+        this.boss.send(reconcileQueue, null, {
+          singletonKey: "startup",
+          singletonSeconds: 60,
+        }),
+      );
       // Startup complete: transition to running and remove the startup
       // abort callback. Authority loss from now on is handled by the
       // normal authority-lost callbacks.

@@ -3569,6 +3569,239 @@
         "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
       },
       "expected": "reject"
+    },
+    {
+      "name": "wrong-type-run-id-number",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "run_id": 123,
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "wrong-type-lease-id-number",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "lease_id": 123,
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "wrong-type-slug-number",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "slug": 123,
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "wrong-type-label-number",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "label": 123,
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "wrong-type-machine-type-number",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "machine_type": 123,
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "wrong-type-command-text-number",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "command_text": 123,
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "wrong-type-sync-mode-number",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "sync_mode": 123,
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "wrong-type-sync-fallback-reason-number",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "sync_fallback_reason": 123,
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "wrong-type-blocked-stage-number",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "blocked_stage": 123,
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "wrong-type-resource-exhaustion-number",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "resource_exhaustion": 123,
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "wrong-type-retry-likely-number",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "retry_likely": 123,
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "wrong-type-failure-hint-number",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "failure_hint": 123,
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "wrong-type-started-at-number",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "started_at": 123,
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "wrong-type-ended-at-number",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "ended_at": 123,
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "wrong-type-sync-delegated-string",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "sync_delegated": "true",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "wrong-type-sync-skipped-string",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "sync_skipped": "false",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "wrong-type-error-kind-number",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "error_kind": 123,
+        "exit_code": 1,
+        "run_status": "failed",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "empty-provider",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
     }
   ]
 }

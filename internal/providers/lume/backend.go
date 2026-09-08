@@ -42,6 +42,10 @@ type lumeRunOwner struct {
 	StartIdentity string
 	BootIdentity  string
 	LogPath       string
+	// StartupConfirm captures the final startup confirmation result from
+	// the survival window. It is populated even on success so callers can
+	// record structured startup evidence for provider qualification.
+	StartupConfirm shared.StartupConfirmResult
 }
 
 type bootstrapTrust struct {
@@ -463,6 +467,17 @@ func (b *backend) Acquire(ctx context.Context, req AcquireRequest) (LeaseTarget,
 	}
 	persistedClaim = updatedClaim
 	cleanupKey = false
+	// Propagate the startup confirmation result into the lease target so
+	// it reaches the timing report and RunEvidenceV1.
+	if sc := owner.StartupConfirm; sc.Stage != "" {
+		lease.StartupConfirm = &core.StartupConfirmSummary{
+			Stage:         sc.Stage,
+			DurationMs:    sc.Duration.Milliseconds(),
+			Ready:         sc.Ready,
+			ProcessExited: sc.ProcessExited,
+			Retryable:     sc.Retryable,
+		}
+	}
 	fmt.Fprintf(b.rt.Stderr, "provisioned lease=%s instance=%s state=ready\n", leaseID, name)
 	return lease, nil
 }
@@ -917,7 +932,8 @@ exec "$@"`
 	// begins. Use the shared TimeoutWindowConfirm strategy instead of a local
 	// select — semantically identical but routed through the shared interface.
 	survivalConfirm := shared.TimeoutWindowConfirm{Timeout: b.startupObserveTimeout}
-	if _, err := survivalConfirm.Wait(ctx, exitCh); err != nil {
+	survivalResult, err := survivalConfirm.Wait(ctx, exitCh)
+	if err != nil {
 		_ = detachedStderr.Sync()
 		if _, seekErr := detachedStderr.Seek(0, io.SeekStart); seekErr == nil {
 			_, _ = io.Copy(&stderrBuf, io.LimitReader(detachedStderr, 64<<10))
@@ -925,13 +941,16 @@ exec "$@"`
 		detail := strings.TrimSpace(stderrBuf.String())
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			_ = cmd.Process.Signal(os.Interrupt)
+			owner.StartupConfirm = survivalResult
 			return owner, exit(2, "lume run %s: context cancelled during startup: %v", name, err)
 		}
+		owner.StartupConfirm = survivalResult
 		if detail != "" {
 			return owner, exit(2, "lume run %s failed during startup: %s", name, detail)
 		}
 		return owner, exit(2, "lume run %s failed during startup: %v", name, err)
 	}
+	owner.StartupConfirm = survivalResult
 	return owner, nil
 }
 

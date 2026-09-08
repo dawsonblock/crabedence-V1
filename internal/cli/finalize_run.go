@@ -204,6 +204,12 @@ func BuildTerminalBundle(outcome FinalRunOutcome, key ed25519.PrivateKey) (Termi
 	if receipt.EvidenceSHA256 != evidence.Digest {
 		return TerminalBundleV1{}, fmt.Errorf("self-verify evidence binding: receipt evidence_sha256 %s != evidence digest %s", receipt.EvidenceSHA256, evidence.Digest)
 	}
+	// Self-verify log binding: for non-truncated logs, the full and retained
+	// digests must match. The worker verifier rejects bundles where they
+	// differ, so catch this before the bundle reaches the coordinator.
+	if !bundle.LogTruncated && logSHA256 != retainedLogSHA256 {
+		return TerminalBundleV1{}, fmt.Errorf("self-verify log binding: non-truncated log_sha256 %s != retained_log_sha256 %s", logSHA256, retainedLogSHA256)
+	}
 
 	return bundle, nil
 }

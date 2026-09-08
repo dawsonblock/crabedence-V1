@@ -33,12 +33,12 @@
     "sync_ms": 2000,
     "command_ms": 3000,
     "duration_ms": 5000,
-    "log_sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "log_sha256": "sha256:e0336ec5117948a0d59de5ef8da8324ef52cccc1ce150c2ca56e1208c89bbb8f",
     "retained_log_sha256": "sha256:e0336ec5117948a0d59de5ef8da8324ef52cccc1ce150c2ca56e1208c89bbb8f",
     "log_truncated": false,
     "evidence_sha256": "39b72ad5e1aa978b09533bb27ca660666094f9d1cfc35fd495c382ea3c3ee487",
     "public_key": "ebVWLo/mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ=",
     "signer": "sha256:65b60673d6ed884bf01c2c222d82ada0740f29ac3355d6a925c81f17f47a27b8",
-    "signature": "Dc8AWQp7CF+7Xufbc4XZNL+Wipswe6XMHBCKdwNLfSSIfF+nq0dIbz5ZEVhbfcPf9ft1PittXKHRfggW4N+cBw=="
+    "signature": "oM1J9noFLadJp8mDPXfeg9d/qNum9ffTYHnNGZg6Vg3HwChFGG+0OvXwdbv/8upEOLFbwncCsvEeCNCAMykxCA=="
   }
 }

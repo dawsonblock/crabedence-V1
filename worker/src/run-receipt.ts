@@ -275,6 +275,41 @@ export async function validateRunEvidence(
       return new Error(`evidence contains unknown field ${JSON.stringify(key)}`);
     }
   }
+  // Type-check every optional scalar field. Go's strict JSON decoder
+  // rejects type mismatches automatically; the worker must do the same
+  // so both runtimes accept exactly the same evidence records.
+  const stringFields: Array<string> = [
+    "lease_id",
+    "slug",
+    "run_id",
+    "label",
+    "machine_type",
+    "error_kind",
+    "command_text",
+    "sync_mode",
+    "sync_fallback_reason",
+    "blocked_stage",
+    "resource_exhaustion",
+    "retry_likely",
+    "failure_hint",
+    "started_at",
+    "ended_at",
+  ];
+  for (const field of stringFields) {
+    const value = ev[field];
+    if (value === undefined) continue;
+    if (typeof value !== "string") {
+      return new Error(`evidence ${field} must be a string`);
+    }
+  }
+  const booleanFields: Array<string> = ["sync_delegated", "sync_skipped"];
+  for (const field of booleanFields) {
+    const value = ev[field];
+    if (value === undefined) continue;
+    if (typeof value !== "boolean") {
+      return new Error(`evidence ${field} must be a boolean`);
+    }
+  }
   // Validate timing fields: must be safe integers, non-negative where applicable.
   const timingFields: Array<string> = [
     "total_ms",

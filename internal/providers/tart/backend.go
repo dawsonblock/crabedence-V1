@@ -276,6 +276,21 @@ func (b *backend) Acquire(ctx context.Context, req AcquireRequest) (target Lease
 		return LeaseTarget{}, err
 	}
 	cleanupKey = false
+	// Propagate the startup confirmation result into the lease target so
+	// it reaches the timing report and RunEvidenceV1. Type-assert to
+	// *startupProcess to access StartupConfirmResult(); test fakes that
+	// don't implement this method are skipped.
+	if sp, ok := startup.(*startupProcess); ok {
+		if sc := sp.StartupConfirmResult(); sc.Stage != "" {
+			lease.StartupConfirm = &core.StartupConfirmSummary{
+				Stage:         sc.Stage,
+				DurationMs:    sc.Duration.Milliseconds(),
+				Ready:         sc.Ready,
+				ProcessExited: sc.ProcessExited,
+				Retryable:     sc.Retryable,
+			}
+		}
+	}
 	fmt.Fprintf(b.rt.Stderr, "provisioned lease=%s instance=%s state=ready\n", leaseID, name)
 	return lease, nil
 }

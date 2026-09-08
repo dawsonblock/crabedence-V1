@@ -601,14 +601,12 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 				if prepareErr != nil {
 					auxErr := &AuxiliaryError{Op: "prepare receipt file", Err: prepareErr}
 					err = errors.Join(err, auxErr)
-					runFailure = errors.Join(runFailure, auxErr)
 					fmt.Fprintf(a.Stderr, "warning: receipt file prepare failed (execution outcome unchanged): %v\n", prepareErr)
 				} else {
 					artifact, writeErr := persistPreparedRunReceipt(prepared)
 					if writeErr != nil {
 						auxErr := &AuxiliaryError{Op: "write receipt file", Err: writeErr}
 						err = errors.Join(err, auxErr)
-						runFailure = errors.Join(runFailure, auxErr)
 						fmt.Fprintf(a.Stderr, "warning: receipt file write failed (execution outcome unchanged): %v\n", writeErr)
 					} else {
 						fmt.Fprintf(a.Stderr, "artifact kind=receipt path=%s bytes=%d\n", artifact.Path, artifact.Bytes)
@@ -619,7 +617,6 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 				if finishErr := CommitTerminalBundle(ctx, recorder, *terminalBundleCommitTarget, *bundle); finishErr != nil {
 					auxErr := &AuxiliaryError{Op: "coordinator commit", Err: finishErr}
 					err = errors.Join(err, auxErr)
-					runFailure = errors.Join(runFailure, auxErr)
 					fmt.Fprintf(a.Stderr, "warning: coordinator commit failed (execution outcome unchanged): %v\n", finishErr)
 				} else if a.runOutcome != nil {
 					a.runOutcome.ExitCode = bundle.Receipt.ExitCode
@@ -1334,6 +1331,7 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 	endToEndStartedAt := time.Now()
 	leaseStartedAt := endToEndStartedAt
 	var runnerProviderTiming *runnerProviderTiming
+	var leaseStartupConfirm *StartupConfirmSummary
 	leasePhase := "provider.acquire"
 	claimAdmitted := false
 	releaseResolvedLease := false
@@ -1487,6 +1485,7 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 		if err == nil {
 			server, target, leaseID = lease.Server, lease.SSH, lease.LeaseID
 			runnerProviderTiming = lease.runnerTiming
+			leaseStartupConfirm = lease.StartupConfirm
 		}
 
 	} else {
@@ -1495,6 +1494,7 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 		if err == nil {
 			server, target, leaseID = lease.Server, lease.SSH, lease.LeaseID
 			runnerProviderTiming = lease.runnerTiming
+			leaseStartupConfirm = lease.StartupConfirm
 		}
 		acquired = true
 	}
@@ -2908,6 +2908,9 @@ afterSync:
 		failureClassificationPrinted = true
 	}
 	report := timingReportFromRunWithActionsURL(cfg.Provider, leaseID, serverSlug(server), timings, total, code, actionsURL)
+	if leaseStartupConfirm != nil && report.StartupConfirm == nil {
+		report.StartupConfirm = leaseStartupConfirm
+	}
 	report.CommandText = commandDisplay
 	if !timings.started.IsZero() {
 		report.StartedAt = timings.started.UTC()
