@@ -94,6 +94,9 @@ jobs:
           - name: cli
             packages: ./internal/cli/
             pattern: "TestTerminalReceipt|TestTerminalLog|TestRunEvidence|TestFinalizeRun|TestEvidence|TestReceiptContract"
+          - name: execution
+            packages: ./internal/capability/ ./internal/execution/ ./internal/idempotency/
+            pattern: ""
           - name: providers
             packages: ./internal/providers/tart/ ./internal/providers/lume/ ./internal/providers/shared/
             pattern: ""
@@ -256,6 +259,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: [provenance, go-tests, go-race, worker, postgres, nemo, cross-language]
+    outputs:
+      release_version: ${{ env.RELEASE_VERSION }}
+      tar_sha256: ${{ steps.artifact_hash.outputs.tar_sha256 }}
+      zip_sha256: ${{ steps.artifact_hash.outputs.zip_sha256 }}
     services:
       postgres:
         image: postgres:16
@@ -448,6 +455,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     needs: build-and-attest
+    env:
+      RELEASE_VERSION: ${{ needs.build-and-attest.outputs.release_version }}
     steps:
       - name: Download release artifacts
         uses: actions/download-artifact@v4
@@ -463,8 +472,6 @@ jobs:
             --repo ${{ github.repository }} \
             --pattern "crabedence-${RELEASE_VERSION}.tar.gz" \
             --pattern "crabedence-${RELEASE_VERSION}.tar.gz.sha256"
-        env:
-          RELEASE_VERSION: ${{ needs.build-and-attest.outputs.release_version }}
 
       - name: Verify archive SHA-256
         run: |

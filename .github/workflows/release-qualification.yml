@@ -99,6 +99,9 @@ jobs:
           - name: cli
             packages: ./internal/cli/
             pattern: "TestTerminalReceipt|TestTerminalLog|TestRunEvidence|TestFinalizeRun|TestEvidence|TestReceiptContract"
+          - name: execution
+            packages: ./internal/capability/ ./internal/execution/ ./internal/idempotency/
+            pattern: ""
           - name: providers
             packages: ./internal/providers/tart/ ./internal/providers/lume/ ./internal/providers/shared/
             pattern: ""
