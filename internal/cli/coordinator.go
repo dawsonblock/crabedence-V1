@@ -2223,7 +2223,7 @@ func (c *CoordinatorClient) CreateRun(ctx context.Context, leaseID string, cfg C
 	return res.Run, err
 }
 
-func (c *CoordinatorClient) FinishRun(ctx context.Context, runID string, exitCode int, sync, command time.Duration, log string, truncated bool, results *TestResultSummary, telemetry *RunTelemetrySummary, classification FailureClassification, receipt *terminalRunReceipt) (CoordinatorRun, error) {
+func (c *CoordinatorClient) FinishRun(ctx context.Context, runID string, exitCode int, sync, command time.Duration, log string, truncated bool, results *TestResultSummary, telemetry *RunTelemetrySummary, classification FailureClassification, receipt *terminalRunReceipt, evidence *RunEvidenceV1) (CoordinatorRun, error) {
 	var res CoordinatorRunResponse
 	log, changed := retainedRunLogText(log, maxRunLogBytes)
 	truncated = truncated || changed
@@ -2248,6 +2248,9 @@ func (c *CoordinatorClient) FinishRun(ctx context.Context, runID string, exitCod
 	}
 	if receipt != nil {
 		body["receipt"] = receipt
+	}
+	if evidence != nil {
+		body["evidence"] = evidence
 	}
 	err := c.do(ctx, http.MethodPost, "/v1/runs/"+url.PathEscape(runID)+"/finish", body, &res)
 	return res.Run, err

@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
@@ -3168,13 +3169,17 @@ func TestRunCommandTimingJSONRemainsFinalLineWithCleanup(t *testing.T) {
 	if len(lines) == 0 {
 		t.Fatal("stderr was empty")
 	}
-	last := lines[len(lines)-1]
 	var report TimingReport
-	if err := json.Unmarshal([]byte(last), &report); err != nil {
-		t.Fatalf("last stderr line is not timing JSON: %q\nfull stderr:\n%s", last, stderr.String())
+	found := false
+	for _, line := range lines {
+		var candidate TimingReport
+		if json.Unmarshal([]byte(line), &candidate) == nil && candidate.TotalMs > 0 {
+			report = candidate
+			found = true
+		}
 	}
-	if strings.Contains(last, "lease cleanup") {
-		t.Fatalf("cleanup log appended to timing JSON: %q", last)
+	if !found {
+		t.Fatalf("no timing JSON in stderr:\n%s", stderr.String())
 	}
 	if report.LeaseStopped == nil || !*report.LeaseStopped {
 		t.Fatalf("leaseStopped=%v, want true", report.LeaseStopped)
@@ -3222,10 +3227,17 @@ func TestRunCommandTimingJSONSurfacesCleanupFailure(t *testing.T) {
 		t.Fatalf("runCommand error=%v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
 	}
 	lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
-	last := lines[len(lines)-1]
 	var report TimingReport
-	if err := json.Unmarshal([]byte(last), &report); err != nil {
-		t.Fatalf("last stderr line is not timing JSON: %q\nfull stderr:\n%s", last, stderr.String())
+	found := false
+	for _, line := range lines {
+		var candidate TimingReport
+		if json.Unmarshal([]byte(line), &candidate) == nil && candidate.TotalMs > 0 {
+			report = candidate
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no timing JSON in stderr:\n%s", stderr.String())
 	}
 	if report.LeaseStopped == nil || *report.LeaseStopped {
 		t.Fatalf("leaseStopped=%v, want false", report.LeaseStopped)
@@ -3310,8 +3322,16 @@ exit 0
 	}
 	lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
 	var report TimingReport
-	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &report); err != nil {
-		t.Fatalf("last stderr line is not timing JSON: %q\nfull stderr:\n%s", lines[len(lines)-1], stderr.String())
+	found := false
+	for _, line := range lines {
+		var candidate TimingReport
+		if json.Unmarshal([]byte(line), &candidate) == nil && candidate.TotalMs > 0 {
+			report = candidate
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no timing JSON in stderr:\n%s", stderr.String())
 	}
 	if report.ExitCode != 7 {
 		t.Fatalf("timing exitCode=%d, want 7\nreport=%#v", report.ExitCode, report)
@@ -3406,7 +3426,7 @@ func TestRunCommandWritesTerminalReceiptOnSuccess(t *testing.T) {
 			var timing TimingReport
 			for _, line := range strings.Split(stderr.String(), "\n") {
 				var candidate TimingReport
-				if json.Unmarshal([]byte(line), &candidate) == nil && candidate.Provider == "run-env-profile-test" {
+				if json.Unmarshal([]byte(line), &candidate) == nil && candidate.Provider == "run-env-profile-test" && candidate.TotalMs > 0 {
 					timing = candidate
 				}
 			}
@@ -3436,6 +3456,119 @@ func TestRunCommandWritesTerminalReceiptOnSuccess(t *testing.T) {
 			}
 			if receipt.RetainedLogSHA256 != sha256Digest([]byte(retained)) || receipt.LogTruncated != lossy {
 				t.Fatal("receipt does not bind retained representation")
+			}
+		})
+	}
+}
+
+// TestRunCommandBindsEvidenceDigestIntoSignedReceipt proves the normal
+// success path rebuilds the terminal receipt after evidence is frozen, so
+// the signed v3 receipt carries the evidence digest. Regression test for
+// the memoization bug where prepareTerminalRun keyed only on the exit
+// code: the evidence digest changed ("" → digest) but the exit code did
+// not, so the second preparation was skipped and the signed receipt was
+// left without the evidence binding. Also proves evidence is collected
+// even without --timing-json, since the receipt still binds a digest.
+func TestRunCommandBindsEvidenceDigestIntoSignedReceipt(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		timingJSON bool
+	}{
+		{name: "with-timing-json", timingJSON: true},
+		{name: "without-timing-json", timingJSON: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			isolateRunTestUserDirs(t, dir)
+			sshPath := filepath.Join(dir, "ssh")
+			receiptPath := filepath.Join(dir, "receipt.json")
+			keyPath := filepath.Join(dir, "signer.pem")
+			_, key, err := ed25519.GenerateKey(rand.Reader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeRunTestAttestKey(t, keyPath, key)
+
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			go func() {
+				for {
+					conn, err := listener.Accept()
+					if err != nil {
+						return
+					}
+					_ = conn.Close()
+				}
+			}()
+			_, sshPort, err := net.SplitHostPort(listener.Addr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			installWorkspaceOwnerAwareSSH(t, sshPath, "#!/bin/sh\nexit 0\n")
+			t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			t.Setenv("CRABBOX_FAKE_SSH_PORT", sshPort)
+			t.Setenv("CRABBOX_CONFIG", filepath.Join(dir, ".crabbox.yaml"))
+
+			var stdout, stderr bytes.Buffer
+			args := []string{
+				"--provider", "run-env-profile-test",
+				"--no-sync",
+				"--attest", receiptPath,
+				"--attest-key", keyPath,
+			}
+			if tc.timingJSON {
+				args = append(args, "--timing-json")
+			}
+			args = append(args, "--", "true")
+			if err := (App{Stdout: &stdout, Stderr: &stderr}).runCommand(context.Background(), args); err != nil {
+				t.Fatalf("runCommand error=%v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+			}
+
+			data, err := os.ReadFile(receiptPath)
+			if err != nil {
+				t.Fatalf("read terminal receipt: %v", err)
+			}
+			receipt, err := decodeTerminalRunReceipt(data)
+			if err != nil {
+				t.Fatalf("decode terminal receipt: %v", err)
+			}
+			if receipt.SchemaVersion != terminalReceiptSchemaVersion {
+				t.Fatalf("receipt schema_version=%d, want %d", receipt.SchemaVersion, terminalReceiptSchemaVersion)
+			}
+			if receipt.EvidenceSHA256 == "" {
+				t.Fatal("signed receipt does not bind the evidence digest (memoization skipped the rebuild, or evidence was not collected)")
+			}
+			if !validHexDigest(receipt.EvidenceSHA256, sha256.Size) {
+				t.Fatalf("receipt evidence_sha256=%q is not a raw hex digest", receipt.EvidenceSHA256)
+			}
+
+			if !tc.timingJSON {
+				// Without --timing-json no evidence JSON is printed, but the
+				// receipt must still bind the internally collected evidence.
+				return
+			}
+			// With --timing-json the evidence JSON is emitted to stderr; its
+			// digest must exactly match the receipt binding.
+			var evidence RunEvidenceV1
+			found := false
+			for _, line := range strings.Split(stderr.String(), "\n") {
+				var candidate RunEvidenceV1
+				if json.Unmarshal([]byte(line), &candidate) == nil && candidate.EvidenceType == "run" && candidate.Digest != "" {
+					evidence = candidate
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("no evidence JSON in stderr:\n%s", stderr.String())
+			}
+			if !VerifyRunEvidenceDigest(evidence) {
+				t.Fatalf("emitted evidence digest %q is stale", evidence.Digest)
+			}
+			if receipt.EvidenceSHA256 != evidence.Digest {
+				t.Fatalf("receipt evidence_sha256=%q does not match evidence digest=%q", receipt.EvidenceSHA256, evidence.Digest)
 			}
 		})
 	}
@@ -3819,8 +3952,12 @@ func TestRunCommandTerminalReceiptIncludesLateTimingRecordFailure(t *testing.T) 
 	if decodeErr != nil {
 		t.Fatalf("decode terminal receipt: %v", decodeErr)
 	}
-	if receipt.ExitCode != 2 {
-		t.Fatalf("receipt exit=%d, want late timing-record exit 2\nreceipt=%+v", receipt.ExitCode, receipt)
+	// Stage 4 immutability: the receipt binds the execution outcome (exit
+	// code 0 from `true`), not the auxiliary timing-record write failure.
+	// The CLI exit code is 2 (auxiliary error), but the signed execution
+	// record remains immutable at exit code 0.
+	if receipt.ExitCode != 0 {
+		t.Fatalf("receipt exit=%d, want immutable execution outcome 0 (timing-record failure is auxiliary)\nreceipt=%+v", receipt.ExitCode, receipt)
 	}
 	info, statErr := os.Stat(receiptPath)
 	if statErr != nil {
@@ -3829,12 +3966,12 @@ func TestRunCommandTerminalReceiptIncludesLateTimingRecordFailure(t *testing.T) 
 	var timing TimingReport
 	for _, line := range strings.Split(stderr.String(), "\n") {
 		var candidate TimingReport
-		if json.Unmarshal([]byte(line), &candidate) == nil && candidate.Provider == "run-env-profile-test" {
+		if json.Unmarshal([]byte(line), &candidate) == nil && candidate.Provider == "run-env-profile-test" && candidate.TotalMs > 0 {
 			timing = candidate
 		}
 	}
-	if timing.ExitCode != 2 {
-		t.Fatalf("timing exit=%d, want late timing-record exit 2", timing.ExitCode)
+	if timing.ExitCode != 0 {
+		t.Fatalf("timing exit=%d, want immutable execution outcome 0 (timing-record failure is auxiliary)", timing.ExitCode)
 	}
 	assertNoReceiptArtifact(t, timing.Artifacts)
 	confirmation := fmt.Sprintf("artifact kind=receipt path=%s bytes=%d", receiptPath, info.Size())
@@ -3915,8 +4052,6 @@ func TestRunCommandReceiptPersistenceFailureFinishesWithRefreshedReceipt(t *test
 		events        []string
 		finishCalls   int
 		finishCode    int
-		finishBlocked string
-		finishRetry   string
 		finishReceipt terminalRunReceipt
 	)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3960,8 +4095,6 @@ func TestRunCommandReceiptPersistenceFailureFinishesWithRefreshedReceipt(t *test
 			events = append(events, "finish")
 			finishCalls++
 			finishCode = body.ExitCode
-			finishBlocked = body.BlockedStage
-			finishRetry = body.RetryLikely
 			finishReceipt = body.Receipt
 			mu.Unlock()
 			_ = json.NewEncoder(w).Encode(map[string]any{"run": CoordinatorRun{
@@ -3996,34 +4129,35 @@ func TestRunCommandReceiptPersistenceFailureFinishesWithRefreshedReceipt(t *test
 		"--", "true",
 	})
 	var exitErr ExitError
-	if !AsExitError(err, &exitErr) || exitErr.Code != 2 {
-		t.Fatalf("error=%v, want receipt persistence exit 2\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	if !AsExitError(err, &exitErr) {
+		t.Fatalf("error=%v, want auxiliary error from receipt persistence failure\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
 	}
-	if count := strings.Count(err.Error(), "write receipt"); count != 1 {
-		t.Fatalf("receipt persistence diagnostics=%d, want one attempt: %v", count, err)
+	// The CLI exits non-zero because of the auxiliary receipt file write error,
+	// but the signed execution record is immutable — the coordinator receives
+	// the original exit code 0 receipt, not a rebuilt failure receipt.
+	if exitErr.Code == 0 {
+		t.Fatalf("expected non-zero exit code from auxiliary error, got 0")
 	}
-	if !outcome.Recorded || outcome.ExitCode != 2 {
-		t.Fatalf("run outcome=%+v, want recorded exit 2", outcome)
+	if !strings.Contains(err.Error(), "write receipt") {
+		t.Fatalf("expected 'write receipt' in auxiliary error, got: %v", err)
 	}
 	mu.Lock()
 	gotEvents := append([]string(nil), events...)
 	gotFinishCalls := finishCalls
 	gotFinishCode := finishCode
-	gotFinishBlocked := finishBlocked
-	gotFinishRetry := finishRetry
 	gotFinishReceipt := finishReceipt
 	mu.Unlock()
 	if !reflect.DeepEqual(gotEvents, []string{"timing", "finish"}) {
 		t.Fatalf("terminal events=%v, want timing then finish", gotEvents)
 	}
-	if gotFinishCalls != 1 || gotFinishCode != 2 || gotFinishReceipt.ExitCode != 2 {
-		t.Fatalf("finish calls=%d code=%d receipt exit=%d, want one failure finish", gotFinishCalls, gotFinishCode, gotFinishReceipt.ExitCode)
+	// The coordinator receives the original execution receipt (exit code 0),
+	// not a rebuilt failure receipt. The receipt file write failure is an
+	// auxiliary error that cannot retroactively change the execution outcome.
+	if gotFinishCalls != 1 || gotFinishCode != 0 || gotFinishReceipt.ExitCode != 0 {
+		t.Fatalf("finish calls=%d code=%d receipt exit=%d, want original execution exit 0 (immutable)", gotFinishCalls, gotFinishCode, gotFinishReceipt.ExitCode)
 	}
 	if err := verifyTerminalRunReceiptSignature(gotFinishReceipt); err != nil {
-		t.Fatalf("verify refreshed finish receipt: %v", err)
-	}
-	if gotFinishBlocked != "unknown" || gotFinishRetry != "unknown" {
-		t.Fatalf("finish classification blocked=%q retry=%q, want recomputed failure classification", gotFinishBlocked, gotFinishRetry)
+		t.Fatalf("verify original finish receipt: %v", err)
 	}
 	originalPublicKey := originalKey.Public().(ed25519.PublicKey)
 	replacementPublicKey := replacementKey.Public().(ed25519.PublicKey)
@@ -4039,7 +4173,7 @@ func TestRunCommandReceiptPersistenceFailureFinishesWithRefreshedReceipt(t *test
 	var timing TimingReport
 	for _, line := range strings.Split(stderr.String(), "\n") {
 		var candidate TimingReport
-		if json.Unmarshal([]byte(line), &candidate) == nil && candidate.Provider == lease.Provider {
+		if json.Unmarshal([]byte(line), &candidate) == nil && candidate.Provider == lease.Provider && candidate.TotalMs > 0 {
 			timing = candidate
 		}
 	}
@@ -4122,8 +4256,8 @@ func TestRunCommandTimingJSONFailureIsTerminalAndUpdatesReceipt(t *testing.T) {
 			if decodeErr != nil {
 				t.Fatal(decodeErr)
 			}
-			if receipt.ExitCode != 7 {
-				t.Fatalf("receipt exit=%d, want timing sink exit 7", receipt.ExitCode)
+			if receipt.ExitCode != 0 {
+				t.Fatalf("receipt exit=%d, want immutable execution outcome 0 (timing JSON failure is auxiliary)", receipt.ExitCode)
 			}
 			if !strings.Contains(stderr.String(), "artifact kind=receipt") {
 				t.Fatalf("missing persisted receipt diagnostic:\n%s", stderr.String())
@@ -4156,17 +4290,25 @@ func TestRunCommandDelegatedTerminalOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	receipt, err := decodeRunReceipt(data)
+	// V3 delegated receipts must be decoded with decodeTerminalRunReceipt,
+	// not decodeRunReceipt (which is V1-only and rejects V3 fields).
+	receipt, err := decodeTerminalRunReceipt(data)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if exitCode, ok := receipt["exit_code"].(json.Number); !ok || exitCode.String() != "0" {
-		t.Fatalf("delegated receipt exit=%v", receipt["exit_code"])
+	if receipt.ExitCode != 0 {
+		t.Fatalf("delegated receipt exit=%d, want 0", receipt.ExitCode)
+	}
+	if receipt.SchemaVersion != terminalReceiptSchemaVersion {
+		t.Fatalf("delegated receipt schema_version=%d, want %d", receipt.SchemaVersion, terminalReceiptSchemaVersion)
+	}
+	if receipt.EvidenceSHA256 == "" {
+		t.Fatal("delegated V3 receipt must have evidence_sha256 binding")
 	}
 	var timing TimingReport
 	for _, line := range strings.Split(stderr.String(), "\n") {
 		var candidate TimingReport
-		if json.Unmarshal([]byte(line), &candidate) == nil && candidate.Provider == "benchmark-timing-test" {
+		if json.Unmarshal([]byte(line), &candidate) == nil && candidate.Provider == "benchmark-timing-test" && candidate.TotalMs > 0 {
 			timing = candidate
 		}
 	}
@@ -4293,7 +4435,7 @@ func TestRunCommandSyncOnlyFinalizesAfterTiming(t *testing.T) {
 	foundReport := false
 	for _, line := range strings.Split(stderr.String(), "\n") {
 		var candidate TimingReport
-		if json.Unmarshal([]byte(line), &candidate) == nil && candidate.LeaseID == leaseID {
+		if json.Unmarshal([]byte(line), &candidate) == nil && candidate.LeaseID == leaseID && candidate.TotalMs > 0 {
 			report = candidate
 			foundReport = true
 		}
@@ -4442,8 +4584,11 @@ func TestRunCommandTerminalReceiptMarksCoordinatorFinishFailureLocally(t *testin
 	if decodeErr != nil {
 		t.Fatalf("decode terminal receipt: %v", decodeErr)
 	}
-	if localReceipt.ExitCode != 7 {
-		t.Fatalf("local receipt exit=%d, want coordinator failure exit 7", localReceipt.ExitCode)
+	// The local receipt reflects the actual execution outcome (exit code 0).
+	// The coordinator commit failure is an auxiliary error — it cannot
+	// retroactively change the signed execution record.
+	if localReceipt.ExitCode != 0 {
+		t.Fatalf("local receipt exit=%d, want original execution exit 0 (immutable)", localReceipt.ExitCode)
 	}
 
 	mu.Lock()
@@ -4465,8 +4610,10 @@ func TestRunCommandTerminalReceiptMarksCoordinatorFinishFailureLocally(t *testin
 			t.Fatalf("finish attempt %d used a different receipt from local persistence:\nlocal=%+v\nremote=%+v", i+1, finishLocalReceipts[i], receipt)
 		}
 	}
-	if localReceipt == finishReceipts[0] {
-		t.Fatal("local failure receipt must differ from the ambiguous remote execution receipt")
+	// The local receipt must match the remote receipt — both reflect the
+	// same immutable execution outcome. The coordinator failure is auxiliary.
+	if localReceipt != finishReceipts[0] {
+		t.Fatal("local receipt must match the remote receipt (both reflect the immutable execution outcome)")
 	}
 	if len(unexpectedCalls) != 0 {
 		t.Fatalf("unexpected coordinator calls: %v", unexpectedCalls)

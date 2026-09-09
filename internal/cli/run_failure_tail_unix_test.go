@@ -142,8 +142,16 @@ exit 0
 			}
 			lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
 			var timing TimingReport
-			if err := json.Unmarshal([]byte(lines[len(lines)-1]), &timing); err != nil {
-				t.Fatalf("final timing JSON: %v", err)
+			timingFound := false
+			for _, line := range lines {
+				var candidate TimingReport
+				if json.Unmarshal([]byte(line), &candidate) == nil && candidate.TotalMs > 0 {
+					timing = candidate
+					timingFound = true
+				}
+			}
+			if !timingFound {
+				t.Fatal("timing JSON not found in stderr")
 			}
 			if timing.ExitCode != 23 || timing.LeaseStopped == nil || !*timing.LeaseStopped || releases != 1 {
 				t.Errorf("exit/cleanup changed: timing=%+v releases=%d", timing, releases)

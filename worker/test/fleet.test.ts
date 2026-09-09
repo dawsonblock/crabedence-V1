@@ -41071,6 +41071,140 @@ describe("fleet run history", () => {
     expect(storage.value(`runevent:${run.id}:000000000002`)).toBeUndefined();
   });
 
+  it("rolls back terminal log when transaction fails after event write", async () => {
+    const storage = new MemoryStorage();
+    const fleet = testFleet(storage);
+    const create = await fleet.fetch(
+      request("POST", "/v1/runs", {
+        body: { provider: "aws", command: ["false"] },
+      }),
+    );
+    const { run } = (await create.json()) as { run: RunRecord };
+    const receipt = await testTerminalReceipt({
+      run,
+      exitCode: 1,
+      syncMs: 0,
+      commandMs: 1,
+      log: "failed\n",
+    });
+    // Inject failure on the run event write (inside the transaction,
+    // before the run record write). This tests that the transaction
+    // rolls back both the event and the run record, and the terminal
+    // log is cleaned up.
+    storage.beforePut = async (key) => {
+      if (key.startsWith(`runevent:${run.id}:`)) {
+        throw new Error("injected event write failure");
+      }
+    };
+    const response = await fleet.fetch(
+      request("POST", `/v1/runs/${run.id}/finish`, {
+        body: { exitCode: 1, commandMs: 1, log: "failed\n", receipt },
+      }),
+    );
+    expect(response.status).toBe(500);
+    storage.beforePut = undefined;
+    // Run record remains in running state.
+    expect(storage.value<RunRecord>(`run:${run.id}`)).toMatchObject({
+      state: "running",
+      eventCount: 1,
+    });
+    // Terminal log was cleaned up.
+    expect((await storage.list({ prefix: `runlog:${run.id}:finish:` })).size).toBe(0);
+    // Event was not persisted.
+    expect(storage.value(`runevent:${run.id}:000000000002`)).toBeUndefined();
+  });
+
+  it("rejects duplicate terminal finish with different terminal digest", async () => {
+    const storage = new MemoryStorage();
+    const fleet = testFleet(storage);
+    const ownerHeaders = {
+      "x-crabbox-owner": "alice@example.com",
+      "x-crabbox-org": "example-org",
+    };
+    const create = await fleet.fetch(
+      request("POST", "/v1/runs", {
+        headers: ownerHeaders,
+        body: { provider: "aws", command: ["sh", "-c", "exit 0"] },
+      }),
+    );
+    expect(create.status).toBe(201);
+    const { run } = (await create.json()) as { run: RunRecord };
+
+    const log = "done\n";
+    const receipt = await testTerminalReceipt({
+      run,
+      exitCode: 0,
+      syncMs: 0,
+      commandMs: 1,
+      log,
+    });
+    const finishBody = { exitCode: 0, commandMs: 1, log, receipt };
+    const finish = await fleet.fetch(
+      request("POST", `/v1/runs/${run.id}/finish`, { headers: ownerHeaders, body: finishBody }),
+    );
+    expect(finish.status).toBe(200);
+
+    // Submit with different log content — this produces a different
+    // terminalFinishSHA256, so it must conflict (409).
+    const differentLog = "different output\n";
+    const differentReceipt = await testTerminalReceipt({
+      run,
+      exitCode: 0,
+      syncMs: 0,
+      commandMs: 1,
+      log: differentLog,
+    });
+    const conflict = await fleet.fetch(
+      request("POST", `/v1/runs/${run.id}/finish`, {
+        headers: ownerHeaders,
+        body: { exitCode: 0, commandMs: 1, log: differentLog, receipt: differentReceipt },
+      }),
+    );
+    expect(conflict.status).toBe(409);
+    // Original run record is unchanged.
+    expect(storage.value<RunRecord>(`run:${run.id}`)).toMatchObject({
+      state: "succeeded",
+      exitCode: 0,
+    });
+  });
+
+  it("accepts exact duplicate terminal finish with identical fingerprint", async () => {
+    const storage = new MemoryStorage();
+    const fleet = testFleet(storage);
+    const ownerHeaders = {
+      "x-crabbox-owner": "alice@example.com",
+      "x-crabbox-org": "example-org",
+    };
+    const create = await fleet.fetch(
+      request("POST", "/v1/runs", {
+        headers: ownerHeaders,
+        body: { provider: "aws", command: ["sh", "-c", "exit 0"] },
+      }),
+    );
+    expect(create.status).toBe(201);
+    const { run } = (await create.json()) as { run: RunRecord };
+
+    const log = "done\n";
+    const receipt = await testTerminalReceipt({
+      run,
+      exitCode: 0,
+      syncMs: 0,
+      commandMs: 1,
+      log,
+    });
+    const finishBody = { exitCode: 0, commandMs: 1, log, receipt };
+    const finish = await fleet.fetch(
+      request("POST", `/v1/runs/${run.id}/finish`, { headers: ownerHeaders, body: finishBody }),
+    );
+    expect(finish.status).toBe(200);
+
+    // Exact retry with identical content must be idempotent (200).
+    const duplicate = await fleet.fetch(
+      request("POST", `/v1/runs/${run.id}/finish`, { headers: ownerHeaders, body: finishBody }),
+    );
+    expect(duplicate.status).toBe(200);
+  });
+
   it("keeps missing terminal receipts ambiguous and rejects unverifiable evidence", async () => {
     const fleet = testFleet();
     const create = await fleet.fetch(

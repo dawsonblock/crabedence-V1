@@ -36,6 +36,7 @@ type crabboxKongCLI struct {
 	Results     resultsKongCmd     `cmd:"" passthrough:"" help:"Show recorded test result summaries."`
 	Receipt     receiptKongCmd     `cmd:"" passthrough:"" help:"Retrieve and verify a signed terminal run receipt."`
 	Verify      verifyKongCmd      `cmd:"" passthrough:"" help:"Verify a signed run receipt."`
+	Evidence    evidenceKongCmd    `cmd:"" passthrough:"" help:"Verify a RunEvidenceV1 document (digest, receipt binding, signature)."`
 	Cache       cacheKongCmd       `cmd:"" help:"Inspect, purge, or warm remote caches."`
 	Status      statusKongCmd      `cmd:"" passthrough:"" help:"Show lease state; add --wait to block until ready."`
 	Heartbeat   heartbeatKongCmd   `cmd:"" passthrough:"" help:"Refresh a lease idle deadline and print its state."`
@@ -222,6 +223,9 @@ type receiptKongCmd struct {
 	Args []string `arg:"" optional:""`
 }
 type verifyKongCmd struct {
+	Args []string `arg:"" optional:""`
+}
+type evidenceKongCmd struct {
 	Args []string `arg:"" optional:""`
 }
 type portsKongCmd struct {
@@ -679,6 +683,7 @@ func (c *attachKongCmd) Run(ctx context.Context, app App) error    { return app.
 func (c *resultsKongCmd) Run(ctx context.Context, app App) error   { return app.results(ctx, c.Args) }
 func (c *receiptKongCmd) Run(ctx context.Context, app App) error   { return app.receipt(ctx, c.Args) }
 func (c *verifyKongCmd) Run(ctx context.Context, app App) error    { return app.verify(ctx, c.Args) }
+func (c *evidenceKongCmd) Run(ctx context.Context, app App) error  { return app.evidence(ctx, c.Args) }
 func (c *portsKongCmd) Run(ctx context.Context, app App) error     { return app.ports(ctx, c.Args) }
 func (c *cpKongCmd) Run(ctx context.Context, app App) error        { return app.copyCommand(ctx, c.Args) }
 func (c *tunnelKongCmd) Run(ctx context.Context, app App) error    { return app.tunnel(ctx, c.Args) }

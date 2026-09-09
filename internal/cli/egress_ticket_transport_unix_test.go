@@ -32,7 +32,7 @@ exec /bin/sh -c "$remote"
 		t.Fatal(err)
 	}
 	argsPath := filepath.Join(dir, "argv")
-	t.Setenv("PATH", dir)
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("CRABBOX_TEST_EGRESS_ARGV", argsPath)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -72,6 +72,14 @@ func testEgressStartTicketTransport(t *testing.T, failure string) {
 	python, err := exec.LookPath("python3")
 	if err != nil {
 		t.Fatal("local shell observation fixture requires python3")
+	}
+	// Resolve through pyenv shims or other wrapper scripts to the real
+	// binary. macOS doesn't support nested shebangs, so a shim with its
+	// own shebang can't be used as an interpreter for another script.
+	if resolved, err := exec.Command(python, "-c", "import sys; print(sys.executable)").Output(); err == nil {
+		if real := strings.TrimSpace(string(resolved)); real != "" {
+			python = real
+		}
 	}
 	const ticket = "egress_0123456789abcdef0123456789abcdef"
 	const leaseID = "cbx_0123456789ab"
@@ -129,7 +137,7 @@ while not (p / "helper.json").exists():
 	if err := os.Symlink(git, filepath.Join(dir, "git")); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("PATH", dir)
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("CRABBOX_TEST_EGRESS_OBSERVATIONS", dir)
 	t.Setenv("CRABBOX_TEST_EGRESS_FAILURE", failure)
 	var clientMints, hostMints atomic.Int32

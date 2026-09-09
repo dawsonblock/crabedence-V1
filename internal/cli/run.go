@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"crypto/ed25519"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -477,9 +478,23 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 	var runFailure error
 	returnedRunError := &err
 	recorder := &runRecorder{}
-	var prepareTerminalRun func()
-	var finalizeTerminalRun func()
 	var finalTimingReport *timingReport
+	var runEvidence *RunEvidenceV1
+	// Stage 4: FinalRunOutcome → BuildTerminalBundle replaces the old
+	// prepareTerminalRun/finalizeTerminalRun closure pattern. Each path
+	// (managed SSH and delegated) sets buildFinalOutcome to capture its
+	// path-specific state. The defer calls it once after the timing report
+	// is frozen, then BuildTerminalBundle produces an immutable bundle.
+	// No re-prepare: post-outcome errors are auxiliary and cannot mutate
+	// the signed execution record.
+	var buildFinalOutcome func(report timingReport) FinalRunOutcome
+	var terminalBundleKey ed25519.PrivateKey
+	var terminalBundleAttestPath string
+	var terminalBundleCommitTarget *SSHTarget
+	// coordinatorCommitFallback is called by the defer when no terminal
+	// bundle was built (e.g. --sync-only). It commits a bare coordinator
+	// record without cryptographic receipt/evidence binding.
+	var coordinatorCommitFallback func()
 	var artifactChangeResults []ArtifactChangeResult
 	var timingRecordRepo Repo
 	var timingRecordCommand []string
@@ -517,11 +532,32 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 		if finalizeFailureDigest != nil {
 			finalizeFailureDigest()
 		}
-		if prepareTerminalRun != nil {
-			prepareTerminalRun()
-		}
 		frozenAt := time.Now()
 		report, hasReport := snapshotFinalTimingReport(frozenAt)
+		// Build the terminal bundle BEFORE any auxiliary operations
+		// (timing record write, timing JSON write). This ensures the
+		// bundle captures the execution outcome immutably — auxiliary
+		// failures cannot mutate the signed execution record. The bundle
+		// is self-verified by BuildTerminalBundle before being returned.
+		var bundle *TerminalBundleV1
+		if hasReport && buildFinalOutcome != nil && terminalBundleKey != nil {
+			outcome := buildFinalOutcome(report)
+			b, buildErr := BuildTerminalBundle(outcome, terminalBundleKey)
+			if buildErr != nil {
+				err = errors.Join(err, buildErr)
+				runFailure = errors.Join(runFailure, buildErr)
+			} else {
+				bundle = &b
+				runEvidence = &b.Evidence
+			}
+		} else if hasReport {
+			// No signing key: build evidence only (for --timing-json output).
+			ev := RunEvidenceFromTimingReport(report)
+			runEvidence = &ev
+		}
+		// Auxiliary operations: timing record write and timing JSON write.
+		// Failures here are auxiliary errors — they affect the CLI exit
+		// code but cannot retroactively change the signed execution record.
 		if hasReport && timingRecordEnabled {
 			recordColdRun := timingRecordColdRun
 			if benchmarkCtx.ColdRun != nil {
@@ -534,10 +570,6 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 				}
 				err = errors.Join(err, writeErr)
 				runFailure = errors.Join(runFailure, writeErr)
-				if prepareTerminalRun != nil {
-					prepareTerminalRun()
-				}
-				report, _ = snapshotFinalTimingReport(frozenAt)
 			} else {
 				if benchmarkCtx.OnRecord != nil {
 					benchmarkCtx.OnRecord()
@@ -550,13 +582,51 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 				timingErr := exit(7, "write timing JSON: %v", writeErr)
 				err = errors.Join(err, timingErr)
 				runFailure = errors.Join(runFailure, timingErr)
-				if prepareTerminalRun != nil {
-					prepareTerminalRun()
+			}
+		}
+		if hasReport && runEvidence != nil && *timingJSON {
+			if writeErr := WriteEvidenceJSON(a.Stderr, *runEvidence); writeErr != nil {
+				timingErr := exit(7, "write evidence JSON: %v", writeErr)
+				err = errors.Join(err, timingErr)
+				runFailure = errors.Join(runFailure, timingErr)
+			}
+		}
+		// Persist the terminal bundle. All persistence failures are
+		// auxiliary errors — they cannot retroactively change the execution
+		// outcome. The signed receipt and evidence were already built
+		// immutably by BuildTerminalBundle.
+		if bundle != nil {
+			if terminalBundleAttestPath != "" {
+				prepared, prepareErr := prepareTerminalRunReceipt(terminalBundleAttestPath, bundle.Receipt)
+				if prepareErr != nil {
+					auxErr := &AuxiliaryError{Op: "prepare receipt file", Err: prepareErr}
+					err = errors.Join(err, auxErr)
+					fmt.Fprintf(a.Stderr, "warning: receipt file prepare failed (execution outcome unchanged): %v\n", prepareErr)
+				} else {
+					artifact, writeErr := persistPreparedRunReceipt(prepared)
+					if writeErr != nil {
+						auxErr := &AuxiliaryError{Op: "write receipt file", Err: writeErr}
+						err = errors.Join(err, auxErr)
+						fmt.Fprintf(a.Stderr, "warning: receipt file write failed (execution outcome unchanged): %v\n", writeErr)
+					} else {
+						fmt.Fprintf(a.Stderr, "artifact kind=receipt path=%s bytes=%d\n", artifact.Path, artifact.Bytes)
+					}
+				}
+			}
+			if terminalBundleCommitTarget != nil {
+				if finishErr := CommitTerminalBundle(ctx, recorder, *terminalBundleCommitTarget, *bundle); finishErr != nil {
+					auxErr := &AuxiliaryError{Op: "coordinator commit", Err: finishErr}
+					err = errors.Join(err, auxErr)
+					fmt.Fprintf(a.Stderr, "warning: coordinator commit failed (execution outcome unchanged): %v\n", finishErr)
+				} else if a.runOutcome != nil {
+					a.runOutcome.ExitCode = bundle.Receipt.ExitCode
 				}
 			}
 		}
-		if finalizeTerminalRun != nil {
-			finalizeTerminalRun()
+		// If no terminal bundle was built but a fallback coordinator
+		// commit is registered (e.g. --sync-only), call it now.
+		if bundle == nil && coordinatorCommitFallback != nil {
+			coordinatorCommitFallback()
 		}
 		recorder.Failed(runFailure)
 	}()
@@ -1053,7 +1123,10 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 		runnerObservedStartedAt = time.Now()
 		result, runErr := delegated.Run(ctx, runReq)
 		delegatedProviderEndedAt = time.Now()
-		if *timingJSON || timingRecordEnabled {
+		// Always capture the timing report internally so evidence can be
+		// constructed unconditionally. The --timing-json flag controls
+		// stderr output, not whether provenance exists.
+		{
 			report := timingReportFromDelegatedRunResult(runReq, result, backend.Spec().Name, runErr)
 			if delegatedTimingCapture != nil && delegatedTimingCapture.report != nil {
 				report = *delegatedTimingCapture.report
@@ -1064,46 +1137,73 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 			finalTimingReport = &report
 		}
 		delegatedReceiptEligible := runErr == nil || FinalizeRunResult(result, runErr).ErrorKind == RunErrorCommandExit
-		var preparedDelegatedReceipt *preparedRunReceipt
-		preparedDelegatedExitCode := -1
-		delegatedPreparationAttempted := false
-		prepareTerminalRun = func() {
-			if attestPath == "" || !delegatedReceiptEligible {
-				return
+		// Stage 4: Set buildFinalOutcome so the defer can build an immutable
+		// TerminalBundleV1 via BuildTerminalBundle. This replaces the old
+		// prepareTerminalRun/finalizeTerminalRun closure pattern.
+		if attestPath != "" && delegatedReceiptEligible && delegatedReceiptKey != nil {
+			terminalBundleKey = delegatedReceiptKey
+			terminalBundleAttestPath = attestPath
+			terminalBundleCommitTarget = nil // delegated runs don't commit via recorder
+			delegatedResult := result
+			delegatedReq := runReq
+			delegatedCfg := cfg
+			delegatedRunErr := runErr
+			buildFinalOutcome = func(report timingReport) FinalRunOutcome {
+				finalResult := delegatedResult
+				finalFailure := runFailure
+				if finalFailure == nil {
+					finalFailure = err
+				}
+				if finalFailure == nil {
+					finalFailure = delegatedRunErr
+				}
+				if finalResult.ExitCode == 0 && finalFailure != nil {
+					finalResult.ExitCode = exitCodeForError(finalFailure, 7)
+				}
+				command := strings.TrimSpace(finalResult.CommandText)
+				if command == "" {
+					command = runCommandDisplay(delegatedReq.Command, delegatedReq.ShellMode)
+				}
+				if command == "" {
+					command = strings.Join(delegatedReq.Command, " ")
+				}
+				if command == "" {
+					command = "(delegated)"
+				}
+				provider := finalResult.Provider
+				leaseID := finalResult.LeaseID
+				slug := finalResult.Slug
+				actionsURL := finalResult.ActionsURL
+				if session := finalResult.Session; session != nil {
+					provider = firstNonBlank(provider, session.Provider)
+					leaseID = firstNonBlank(leaseID, session.LeaseID)
+					slug = firstNonBlank(slug, session.Slug)
+					actionsURL = firstNonBlank(actionsURL, session.ActionsURL)
+				}
+				provider = firstNonBlank(provider, delegatedCfg.Provider)
+				runID := delegatedRunID(delegatedReq, finalResult)
+				if runID == "" {
+					digest := sha256Digest([]byte(command + ":" + provider + ":" + leaseID))
+					runID = "run_delegated_" + strings.TrimPrefix(digest, "sha256:")[:16]
+				}
+				finalized := FinalizeRunResult(finalResult, finalFailure)
+				return FinalRunOutcome{
+					ExitCode:    finalResult.ExitCode,
+					RunStatus:   finalized.Status,
+					ErrorKind:   finalized.ErrorKind,
+					Command:     delegatedReq.Command,
+					CommandText: command,
+					Timing:      report,
+					Artifacts:   report.Artifacts,
+					Provider:    provider,
+					LeaseID:     leaseID,
+					Slug:        slug,
+					RunID:       runID,
+					ActionsURL:  actionsURL,
+					StartedAt:   report.StartedAt,
+					EndedAt:     report.EndedAt,
+				}
 			}
-			finalResult := result
-			finalFailure := runFailure
-			if finalFailure == nil {
-				finalFailure = err
-			}
-			if finalResult.ExitCode == 0 && finalFailure != nil {
-				finalResult.ExitCode = exitCodeForError(finalFailure, 7)
-			}
-			if delegatedPreparationAttempted && preparedDelegatedExitCode == finalResult.ExitCode {
-				return
-			}
-			delegatedPreparationAttempted = true
-			preparedDelegatedExitCode = finalResult.ExitCode
-			preparedDelegatedReceipt = nil
-			prepared, receiptErr := prepareDelegatedRunReceipt(attestPath, delegatedReceiptKey, cfg, finalResult, runReq)
-			if receiptErr != nil {
-				err = errors.Join(err, receiptErr)
-				runFailure = errors.Join(runFailure, receiptErr)
-				return
-			}
-			preparedDelegatedReceipt = &prepared
-		}
-		finalizeTerminalRun = func() {
-			if preparedDelegatedReceipt == nil {
-				return
-			}
-			receipt, receiptErr := persistPreparedRunReceipt(*preparedDelegatedReceipt)
-			if receiptErr != nil {
-				err = errors.Join(err, receiptErr)
-				runFailure = errors.Join(runFailure, receiptErr)
-				return
-			}
-			fmt.Fprintf(a.Stderr, "artifact kind=receipt path=%s bytes=%d\n", receipt.Path, receipt.Bytes)
 		}
 		if runErr == nil || result.Command > 0 || result.Total > 0 {
 			a.syncExternalRunnersBestEffort(ctx, cfg, backend)
@@ -1231,6 +1331,7 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 	endToEndStartedAt := time.Now()
 	leaseStartedAt := endToEndStartedAt
 	var runnerProviderTiming *runnerProviderTiming
+	var leaseStartupConfirm *StartupConfirmSummary
 	leasePhase := "provider.acquire"
 	claimAdmitted := false
 	releaseResolvedLease := false
@@ -1384,6 +1485,7 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 		if err == nil {
 			server, target, leaseID = lease.Server, lease.SSH, lease.LeaseID
 			runnerProviderTiming = lease.runnerTiming
+			leaseStartupConfirm = lease.StartupConfirm
 		}
 
 	} else {
@@ -1392,6 +1494,7 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 		if err == nil {
 			server, target, leaseID = lease.Server, lease.SSH, lease.LeaseID
 			runnerProviderTiming = lease.runnerTiming
+			leaseStartupConfirm = lease.StartupConfirm
 		}
 		acquired = true
 	}
@@ -1561,6 +1664,10 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 			return
 		}
 		report := timingReportFromRunWithActionsURL(cfg.Provider, leaseID, serverSlug(server), timings, time.Since(timings.started), exitCodeForError(err, 7), actionsURL)
+		if !timings.started.IsZero() {
+			report.StartedAt = timings.started.UTC()
+			report.EndedAt = timings.started.UTC().Add(time.Since(timings.started))
+		}
 		populateRunTimingMetadata(&report, cfg, repo, server, leaseID, executionRunID, workdir, nil)
 		report.Label = runLabelValue
 		finalTimingReport = &report
@@ -2295,11 +2402,15 @@ afterSync:
 		if *timingJSON || timingRecordEnabled {
 			total := time.Since(timings.started)
 			report := timingReportFromRunWithActionsURL(cfg.Provider, leaseID, serverSlug(server), timings, total, 0, actionsURL)
+			if !timings.started.IsZero() {
+				report.StartedAt = timings.started.UTC()
+				report.EndedAt = timings.started.UTC().Add(total)
+			}
 			populateRunTimingMetadata(&report, cfg, repo, server, leaseID, executionRunID, workdir, nil)
 			report.Label = runLabelValue
 			finalTimingReport = &report
 		}
-		finalizeTerminalRun = func() {
+		finalizeSyncOnlyCoordinator := func() {
 			finalFailure := runFailure
 			if finalFailure == nil {
 				finalFailure = err
@@ -2310,11 +2421,12 @@ afterSync:
 				finalCode = exitCodeForError(finalFailure, 7)
 				classification = ClassifyRunFailure(finalCode, finalFailure.Error(), nil)
 			}
-			if finishErr := recorder.Finish(ctx, target, finalCode, timings.sync, 0, "", false, nil, classification, nil); finishErr != nil {
+			if finishErr := recorder.Finish(ctx, target, finalCode, timings.sync, 0, "", false, nil, classification, nil, nil); finishErr != nil {
 				err = errors.Join(err, finishErr)
 				runFailure = errors.Join(runFailure, finishErr)
 			}
 		}
+		coordinatorCommitFallback = finalizeSyncOnlyCoordinator
 		return nil
 	}
 	recorder.Event("bootstrap.waiting", "bootstrap", "waiting for SSH before command")
@@ -2560,130 +2672,91 @@ afterSync:
 	var results *TestResultSummary
 	classification := FailureClassification{}
 	attestPath := strings.TrimSpace(*attestOut)
-	var preparedTerminalReceipt terminalRunReceipt
-	var preparedTerminalReceiptFile *preparedRunReceipt
-	preparedTerminalExitCode := -1
-	terminalPreparationAttempted := false
 	terminalLog := logBuffer.Snapshot()
-	buildTerminalReceipt := func(finalCode int) (terminalRunReceipt, error) {
-		startedAt := recorder.startedAt
-		endedAt := time.Time{}
-		if !startedAt.IsZero() && !recorder.attachedAt.IsZero() {
-			endedAt = startedAt.Add(time.Since(recorder.attachedAt))
-		}
-		if startedAt.IsZero() {
-			startedAt = commandStart
-		}
-		if endedAt.IsZero() {
-			endedAt = startedAt.Add(time.Since(startedAt))
-		}
-		return buildTerminalRunReceiptWithKey(terminalReceiptKey, terminalRunReceiptInput{
-			Provider:          cfg.Provider,
-			LeaseID:           leaseID,
-			Slug:              serverSlug(server),
-			RunID:             executionRunID,
-			Command:           recordCommand,
-			CommandDisplay:    commandDisplay,
-			ExitCode:          finalCode,
-			SyncMs:            timings.sync.Milliseconds(),
-			CommandMs:         timings.command.Milliseconds(),
-			StartedAt:         startedAt,
-			EndedAt:           endedAt,
-			LogSHA256:         terminalLog.FullSHA256,
-			RetainedLogSHA256: sha256Digest([]byte(terminalLog.Log)),
-			LogTruncated:      terminalLog.Truncated,
-		})
-	}
-	prepareTerminalRun = func() {
-		if timings.command == 0 {
-			timings.command = time.Since(commandStart)
-		}
-		finalCode := code
-		finalFailure := runFailure
-		if finalFailure == nil {
-			finalFailure = err
-		}
-		if finalCode == 0 && finalFailure != nil {
-			finalCode = exitCodeForError(finalFailure, 7)
-		}
-		if recorder.runID == "" && attestPath == "" {
-			return
-		}
-		if finalCode != 0 && classification.BlockedStage == "" {
-			classificationLog := commandFailureLog
-			if finalFailure != nil {
-				classificationLog = strings.TrimSpace(classificationLog + "\n" + finalFailure.Error())
+	// Stage 4: Set buildFinalOutcome so the defer can build an immutable
+	// TerminalBundleV1 via BuildTerminalBundle. This replaces the old
+	// prepareTerminalRun/finalizeTerminalRun closure pattern with a single
+	// atomic build step. The closure captures the SSH path's local state
+	// (code, timings, recordCommand, etc.) and combines it with the frozen
+	// timing report to produce a FinalRunOutcome.
+	sshTarget := target
+	sshCode := code
+	sshRecordCommand := recordCommand
+	sshCommandDisplay := commandDisplay
+	sshExecutionRunID := executionRunID
+	sshCommandStart := commandStart
+	sshCommandFailurePhases := commandFailurePhases
+	sshFailureEvidence := failureEvidence
+	sshCommandFailureLog := commandFailureLog
+	sshTerminalReceiptKey := terminalReceiptKey
+	sshServer := server
+	sshLeaseID := leaseID
+	sshCfg := cfg
+	sshRecorder := recorder
+	sshAttestPath := attestPath
+	sshCoord := coord
+	if sshRecorder.runID != "" || sshAttestPath != "" {
+		if sshTerminalReceiptKey != nil {
+			terminalBundleKey = sshTerminalReceiptKey
+			terminalBundleAttestPath = sshAttestPath
+			if sshCoord != nil && !*syncOnly {
+				terminalBundleCommitTarget = &sshTarget
 			}
-			classification = classifyRunOutcomeFailure(finalCode, classificationLog, commandFailurePhases, failureEvidence, false)
 		}
-		if terminalPreparationAttempted && preparedTerminalExitCode == finalCode {
-			return
-		}
-		terminalPreparationAttempted = true
-		preparedTerminalExitCode = finalCode
-		preparedTerminalReceiptFile = nil
-		receipt, receiptErr := buildTerminalReceipt(finalCode)
-		if receiptErr != nil {
-			err = errors.Join(err, receiptErr)
-			recordRunFailure(&runFailure, receiptErr)
-			return
-		}
-		prepared, receiptErr := prepareTerminalRunReceipt(attestPath, receipt)
-		if receiptErr != nil {
-			err = errors.Join(err, receiptErr)
-			recordRunFailure(&runFailure, receiptErr)
-			return
-		}
-		preparedTerminalReceipt = receipt
-		preparedTerminalReceiptFile = &prepared
-	}
-	finalizeTerminalRun = func() {
-		if preparedTerminalReceiptFile == nil {
-			return
-		}
-		localReceiptPersisted := attestPath == ""
-		if attestPath != "" {
-			artifact, writeErr := persistPreparedRunReceipt(*preparedTerminalReceiptFile)
-			if writeErr != nil {
-				err = errors.Join(err, writeErr)
-				recordRunFailure(&runFailure, writeErr)
-				prepareTerminalRun()
-				if preparedTerminalReceiptFile == nil || preparedTerminalReceipt.ExitCode == 0 {
-					return
+		buildFinalOutcome = func(report timingReport) FinalRunOutcome {
+			finalCode := sshCode
+			finalFailure := runFailure
+			if finalFailure == nil {
+				finalFailure = err
+			}
+			if finalCode == 0 && finalFailure != nil {
+				finalCode = exitCodeForError(finalFailure, 7)
+			}
+			finalClassification := classification
+			if finalCode != 0 && finalClassification.BlockedStage == "" {
+				classificationLog := sshCommandFailureLog
+				if finalFailure != nil {
+					classificationLog = strings.TrimSpace(classificationLog + "\n" + finalFailure.Error())
 				}
-			} else {
-				localReceiptPersisted = true
-				fmt.Fprintf(a.Stderr, "artifact kind=receipt path=%s bytes=%d\n", artifact.Path, artifact.Bytes)
+				finalClassification = classifyRunOutcomeFailure(finalCode, classificationLog, sshCommandFailurePhases, sshFailureEvidence, false)
 			}
-		}
-		if finishErr := recorder.Finish(ctx, target, preparedTerminalReceipt.ExitCode, timings.sync, timings.command, terminalLog.Log, terminalLog.Truncated, results, classification, &preparedTerminalReceipt); finishErr != nil {
-			err = errors.Join(err, finishErr)
-			recordRunFailure(&runFailure, finishErr)
-			if localReceiptPersisted && attestPath != "" && preparedTerminalReceipt.ExitCode == 0 {
-				// The coordinator commit is now ambiguous. Preserve the exact receipt
-				// sent remotely, but make the local CLI failure impossible to miss.
-				failedReceipt, receiptErr := buildTerminalReceipt(exitCodeForError(finishErr, 7))
-				if receiptErr != nil {
-					err = errors.Join(err, receiptErr)
-					recordRunFailure(&runFailure, receiptErr)
+			startedAt := sshRecorder.startedAt
+			endedAt := time.Time{}
+			if !startedAt.IsZero() && !sshRecorder.attachedAt.IsZero() {
+				endedAt = startedAt.Add(time.Since(sshRecorder.attachedAt))
+			}
+			if startedAt.IsZero() {
+				startedAt = sshCommandStart
+			}
+			if endedAt.IsZero() {
+				endedAt = startedAt.Add(time.Since(startedAt))
+			}
+			finalized := report
+			if finalized.RunStatus == "" {
+				if finalCode == 0 {
+					finalized.RunStatus = RunStatusSucceeded
 				} else {
-					failedPrepared, prepareErr := prepareTerminalRunReceipt(attestPath, failedReceipt)
-					if prepareErr != nil {
-						err = errors.Join(err, prepareErr)
-						recordRunFailure(&runFailure, prepareErr)
-					} else if artifact, writeErr := persistPreparedRunReceipt(failedPrepared); writeErr != nil {
-						err = errors.Join(err, writeErr)
-						recordRunFailure(&runFailure, writeErr)
-					} else {
-						fmt.Fprintf(a.Stderr, "artifact kind=receipt path=%s bytes=%d\n", artifact.Path, artifact.Bytes)
-					}
+					finalized.RunStatus = RunStatusFailed
 				}
 			}
-			if a.runOutcome != nil {
-				a.runOutcome.Recorded = false
+			return FinalRunOutcome{
+				ExitCode:       finalCode,
+				RunStatus:      finalized.RunStatus,
+				ErrorKind:      finalized.ErrorKind,
+				Command:        sshRecordCommand,
+				CommandText:    sshCommandDisplay,
+				Timing:         report,
+				Classification: finalClassification,
+				Results:        results,
+				Artifacts:      report.Artifacts,
+				TerminalLog:    terminalLog,
+				StartedAt:      startedAt,
+				EndedAt:        endedAt,
+				Provider:       sshCfg.Provider,
+				LeaseID:        sshLeaseID,
+				Slug:           serverSlug(sshServer),
+				RunID:          sshExecutionRunID,
 			}
-		} else if a.runOutcome != nil {
-			a.runOutcome.ExitCode = preparedTerminalReceipt.ExitCode
 		}
 	}
 	if code != 0 || streamErr != nil {
@@ -2835,6 +2908,14 @@ afterSync:
 		failureClassificationPrinted = true
 	}
 	report := timingReportFromRunWithActionsURL(cfg.Provider, leaseID, serverSlug(server), timings, total, code, actionsURL)
+	if leaseStartupConfirm != nil && report.StartupConfirm == nil {
+		report.StartupConfirm = leaseStartupConfirm
+	}
+	report.CommandText = commandDisplay
+	if !timings.started.IsZero() {
+		report.StartedAt = timings.started.UTC()
+		report.EndedAt = timings.started.UTC().Add(total)
+	}
 	populateRunTimingMetadata(&report, cfg, repo, server, leaseID, executionRunID, workdir, runArtifacts)
 	report.Label = runLabelValue
 	report.SchemaValidations = schemaValidationResults
@@ -2877,9 +2958,10 @@ afterSync:
 		labelField = fmt.Sprintf(" label=%q", runLabelValue)
 	}
 	fmt.Fprintf(a.Stderr, "run details provider=%s lease=%s slug=%s run=%s%s type=%s repo=%s workdir=%s actions=%s stop_command=%q idle_timeout=%s\n", cfg.Provider, leaseID, blank(serverSlug(server), "-"), executionRunID, labelField, blank(server.ServerType.Name, "-"), repo.Root, workdir, blank(actionsURL, "-"), report.StopCommand, cfg.IdleTimeout)
-	if *timingJSON || timingRecordEnabled {
-		finalTimingReport = &report
-	}
+	// Always capture the final timing report internally so evidence can be
+	// constructed unconditionally. The --timing-json flag controls stderr
+	// output, not whether provenance exists.
+	finalTimingReport = &report
 	if code != 0 {
 		digest := runFailureDigestInput{
 			Provider:              cfg.Provider,
@@ -3125,7 +3207,7 @@ func writeDelegatedRunReceipt(path, keyPath string, cfg Config, result RunResult
 	if err != nil {
 		return runArtifact{}, exit(2, "attest key: %v", err)
 	}
-	prepared, err := prepareDelegatedRunReceipt(path, key, cfg, result, req)
+	prepared, _, _, err := prepareDelegatedTerminalReceipt(path, key, cfg, result, req, nil)
 	if err != nil {
 		return runArtifact{}, err
 	}
@@ -3155,6 +3237,173 @@ func prepareDelegatedRunReceipt(path string, key ed25519.PrivateKey, cfg Config,
 	}
 	receipt.Provider = firstNonBlank(receipt.Provider, cfg.Provider)
 	return prepareRunReceipt(path, key, receipt)
+}
+
+// prepareDelegatedTerminalReceipt builds a V3 terminal receipt with evidence
+// binding for a delegated run. This replaces the legacy V1
+// prepareDelegatedRunReceipt path, ensuring delegated providers participate in
+// the same authenticated evidence/receipt relationship as managed SSH.
+//
+// The function:
+//  1. Builds RunEvidenceV1 from the delegated RunResult and timing report.
+//  2. Builds a TerminalRunReceiptV3 with evidence_sha256 binding.
+//  3. Self-verifies the signature and evidence binding.
+//  4. Returns the prepared receipt file for local persistence.
+//
+// The timing report provides the timing fields. If report is nil, the result's
+// own durations are used.
+func prepareDelegatedTerminalReceipt(path string, key ed25519.PrivateKey, cfg Config, result RunResult, req RunRequest, report *TimingReport) (preparedRunReceipt, terminalRunReceipt, RunEvidenceV1, error) {
+	if key == nil {
+		return preparedRunReceipt{}, terminalRunReceipt{}, RunEvidenceV1{}, fmt.Errorf("delegated terminal receipt requires a signing key")
+	}
+
+	command := strings.TrimSpace(result.CommandText)
+	if command == "" {
+		command = runCommandDisplay(req.Command, req.ShellMode)
+	}
+	if command == "" {
+		command = strings.Join(req.Command, " ")
+	}
+	if command == "" {
+		command = "(delegated)"
+	}
+	provider := result.Provider
+	leaseID := result.LeaseID
+	slug := result.Slug
+	if session := result.Session; session != nil {
+		provider = firstNonBlank(provider, session.Provider)
+		leaseID = firstNonBlank(leaseID, session.LeaseID)
+		slug = firstNonBlank(slug, session.Slug)
+	}
+	// Config provider is the last resort fallback.
+	provider = firstNonBlank(provider, cfg.Provider)
+	runID := delegatedRunID(req, result)
+	if runID == "" {
+		// V3 receipts require a non-empty run_id. If no run ID was provided
+		// in the request or session, generate a deterministic one from the
+		// command and provider identity.
+		digest := sha256Digest([]byte(command + ":" + provider + ":" + leaseID))
+		runID = "run_delegated_" + strings.TrimPrefix(digest, "sha256:")[:16]
+	}
+
+	// Build evidence from the delegated result.
+	var totalMs, commandMs, syncMs, runnerTotalMs, endToEndMs int64
+	var bootstrapMs, hydrateMs, probeMs, leaseMs int64
+	var startupConfirm *RunEvidenceStartupConfirm
+	if report != nil {
+		totalMs = report.TotalMs
+		commandMs = report.CommandMs
+		syncMs = report.SyncMs
+		runnerTotalMs = report.RunnerTotalMs
+		endToEndMs = report.EndToEndMs
+		bootstrapMs = report.BootstrapMs
+		hydrateMs = report.HydrateMs
+		probeMs = report.ProbeMs
+		leaseMs = report.LeaseMs
+		startupConfirm = StartupConfirmFromSummary(report.StartupConfirm)
+	} else {
+		totalMs = result.Total.Milliseconds()
+		commandMs = result.Command.Milliseconds()
+	}
+	evidenceInput := RunEvidenceInput{
+		Provider:       provider,
+		LeaseID:        leaseID,
+		Slug:           slug,
+		RunID:          runID,
+		CommandText:    command,
+		ExitCode:       result.ExitCode,
+		RunStatus:      result.Status,
+		ErrorKind:      result.ErrorKind,
+		TotalMs:        totalMs,
+		CommandMs:      commandMs,
+		SyncMs:         syncMs,
+		RunnerTotalMs:  runnerTotalMs,
+		EndToEndMs:     endToEndMs,
+		LeaseMs:        leaseMs,
+		BootstrapMs:    bootstrapMs,
+		HydrateMs:      hydrateMs,
+		ProbeMs:        probeMs,
+		Artifacts:      artifactsFromRunArtifacts(result.Artifacts),
+		StartupConfirm: startupConfirm,
+	}
+	if report != nil {
+		evidenceInput.RunnerPhases = report.RunnerPhases
+		evidenceInput.SyncPhases = report.SyncPhases
+		evidenceInput.CommandPhases = report.CommandPhases
+		evidenceInput.SyncDelegated = report.SyncDelegated
+		evidenceInput.SyncSkipped = report.SyncSkipped
+		evidenceInput.SyncMode = report.SyncMode
+		evidenceInput.SyncTransferFiles = report.SyncTransferFiles
+		evidenceInput.SyncTransferBytes = report.SyncTransferBytes
+		evidenceInput.SyncFallbackReason = report.SyncFallbackReason
+		evidenceInput.BlockedStage = report.BlockedStage
+		evidenceInput.ResourceExhaustion = report.ResourceExhaustion
+		evidenceInput.RetryLikely = report.RetryLikely
+		if report.StartedAt.IsZero() {
+			evidenceInput.StartedAt = time.Now()
+		} else {
+			evidenceInput.StartedAt = report.StartedAt
+		}
+		if report.EndedAt.IsZero() {
+			evidenceInput.EndedAt = time.Now()
+		} else {
+			evidenceInput.EndedAt = report.EndedAt
+		}
+	} else {
+		evidenceInput.StartedAt = time.Now()
+		evidenceInput.EndedAt = time.Now()
+	}
+	evidence := NewRunEvidence(evidenceInput)
+
+	// Build the V3 receipt with evidence binding.
+	// Delegated runs don't have a terminal log, so we use the empty-string
+	// SHA-256 digest for log_sha256 and retained_log_sha256.
+	startedAt := evidenceInput.StartedAt
+	endedAt := evidenceInput.EndedAt
+	emptyLogDigest := sha256Digest([]byte(""))
+	receipt, err := buildTerminalRunReceiptWithKey(key, terminalRunReceiptInput{
+		Provider:          provider,
+		LeaseID:           leaseID,
+		Slug:              slug,
+		RunID:             runID,
+		Command:           req.Command,
+		CommandDisplay:    command,
+		ExitCode:          result.ExitCode,
+		SyncMs:            syncMs,
+		CommandMs:         commandMs,
+		StartedAt:         startedAt,
+		EndedAt:           endedAt,
+		LogSHA256:         emptyLogDigest,
+		RetainedLogSHA256: emptyLogDigest,
+		EvidenceSHA256:    evidence.Digest,
+	})
+	if err != nil {
+		return preparedRunReceipt{}, terminalRunReceipt{}, RunEvidenceV1{}, fmt.Errorf("build delegated terminal receipt: %w", err)
+	}
+
+	// Self-verify: confirm the signature is valid and the evidence binding
+	// is correct before persisting.
+	if verifyErr := verifyTerminalRunReceiptSignature(receipt); verifyErr != nil {
+		return preparedRunReceipt{}, terminalRunReceipt{}, RunEvidenceV1{}, fmt.Errorf("self-verify delegated terminal receipt signature: %w", verifyErr)
+	}
+	if receipt.EvidenceSHA256 != evidence.Digest {
+		return preparedRunReceipt{}, terminalRunReceipt{}, RunEvidenceV1{}, fmt.Errorf("self-verify delegated evidence binding: receipt evidence_sha256 %s != evidence digest %s", receipt.EvidenceSHA256, evidence.Digest)
+	}
+
+	// Prepare the receipt file for persistence.
+	encoded, err := json.MarshalIndent(receipt, "", "  ")
+	if err != nil {
+		return preparedRunReceipt{}, terminalRunReceipt{}, RunEvidenceV1{}, fmt.Errorf("encode delegated terminal receipt: %w", err)
+	}
+	encoded = append(encoded, '\n')
+	if len(encoded) > maxTerminalReceiptBytes {
+		return preparedRunReceipt{}, terminalRunReceipt{}, RunEvidenceV1{}, fmt.Errorf("delegated terminal receipt exceeds %d bytes", maxTerminalReceiptBytes)
+	}
+	prepared := preparedRunReceipt{
+		artifact: runArtifact{Kind: "receipt", Path: path, Bytes: len(encoded)},
+		encoded:  encoded,
+	}
+	return prepared, receipt, evidence, nil
 }
 
 func delegatedRunID(req RunRequest, result RunResult) string {

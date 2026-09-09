@@ -12,35 +12,35 @@
       "exitCode": 0,
       "log": [
         {
-          "text": "o",
-          "count": 1
+          "count": 1,
+          "text": "o"
         },
         {
-          "text": "k",
-          "count": 1
+          "count": 1,
+          "text": "k"
         },
         {
-          "text": "\n",
-          "count": 1
+          "count": 1,
+          "text": "\n"
         }
       ],
       "logChunks": [
         {
+          "count": 1,
           "parts": [
             {
-              "text": "o",
-              "count": 1
+              "count": 1,
+              "text": "o"
             },
             {
-              "text": "k",
-              "count": 1
+              "count": 1,
+              "text": "k"
             },
             {
-              "text": "\n",
-              "count": 1
+              "count": 1,
+              "text": "\n"
             }
-          ],
-          "count": 1
+          ]
         }
       ],
       "logTruncated": false,
@@ -58,8 +58,8 @@
         "receipt_type": "terminal",
         "retained_log_sha256": "sha256:dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22",
         "run_id": "run_unicode",
-        "schema_version": 2,
-        "signature": "931ValZuIckgCS+L/U/khID6zAZqwap9dRMzEoXFog6BkcKGmsYZYtNcTgQos8yWJTNjdklJ9AV74qKv0rdgCw==",
+        "schema_version": 3,
+        "signature": "p7l2MASsBbEKNtcliNMTdQW0h23+TIgozay5fWaeXdpqdynQ3xvIKUfmEufSF4XCTTvlGvUNTkfSNRaXgNcJBQ==",
         "signer": "sha256:139e3940e64b5491722088d9a0d741628fc826e09475d341a780acde3c4b8070",
         "started_at": "2026-08-23T10:00:00Z",
         "sync_ms": 0
@@ -81,83 +81,83 @@
       "exitCode": 0,
       "log": [
         {
-          "text": "c",
-          "count": 1
+          "count": 1,
+          "text": "c"
         },
         {
-          "text": "a",
-          "count": 1
+          "count": 1,
+          "text": "a"
         },
         {
-          "text": "f",
-          "count": 1
+          "count": 1,
+          "text": "f"
         },
         {
-          "text": "é",
-          "count": 1
+          "count": 1,
+          "text": "é"
         },
         {
-          "text": " ",
-          "count": 1
+          "count": 1,
+          "text": " "
         },
         {
-          "text": "€",
-          "count": 1
+          "count": 1,
+          "text": "€"
         },
         {
-          "text": " ",
-          "count": 1
+          "count": 1,
+          "text": " "
         },
         {
-          "text": "😀",
-          "count": 1
+          "count": 1,
+          "text": "😀"
         },
         {
-          "text": "\n",
-          "count": 1
+          "count": 1,
+          "text": "\n"
         }
       ],
       "logChunks": [
         {
+          "count": 1,
           "parts": [
             {
-              "text": "c",
-              "count": 1
+              "count": 1,
+              "text": "c"
             },
             {
-              "text": "a",
-              "count": 1
+              "count": 1,
+              "text": "a"
             },
             {
-              "text": "f",
-              "count": 1
+              "count": 1,
+              "text": "f"
             },
             {
-              "text": "é",
-              "count": 1
+              "count": 1,
+              "text": "é"
             },
             {
-              "text": " ",
-              "count": 1
+              "count": 1,
+              "text": " "
             },
             {
-              "text": "€",
-              "count": 1
+              "count": 1,
+              "text": "€"
             },
             {
-              "text": " ",
-              "count": 1
+              "count": 1,
+              "text": " "
             },
             {
-              "text": "😀",
-              "count": 1
+              "count": 1,
+              "text": "😀"
             },
             {
-              "text": "\n",
-              "count": 1
+              "count": 1,
+              "text": "\n"
             }
-          ],
-          "count": 1
+          ]
         }
       ],
       "logTruncated": false,
@@ -175,8 +175,8 @@
         "receipt_type": "terminal",
         "retained_log_sha256": "sha256:5c213e386bb4db98c54a9230c72964516394e22ec4fb24f2e00d42ffea07bbc0",
         "run_id": "run_unicode",
-        "schema_version": 2,
-        "signature": "pGHn5qi4YxGcy9UKDe+GkEntpfAVC5ljdU2YSF849W/C/QhHfrZijFun4HNc2iG4+VaSxKzbkm1vNCTGNdxjCg==",
+        "schema_version": 3,
+        "signature": "ho4G63Y/i6wmEYWbMY5lrBesBzEd4vLkK1yNzkXu57B0x7uCt/O+wR2k60m1qEX1j6xK2GVxn2pKldiz/aSiBQ==",
         "signer": "sha256:139e3940e64b5491722088d9a0d741628fc826e09475d341a780acde3c4b8070",
         "started_at": "2026-08-23T10:00:00Z",
         "sync_ms": 0
@@ -198,43 +198,43 @@
       "exitCode": 0,
       "log": [
         {
-          "text": "o",
-          "count": 1
+          "count": 1,
+          "text": "o"
         },
         {
-          "text": "k",
-          "count": 1
+          "count": 1,
+          "text": "k"
         },
         {
-          "text": "�",
-          "count": 7
+          "count": 7,
+          "text": "�"
         },
         {
-          "text": "\n",
-          "count": 1
+          "count": 1,
+          "text": "\n"
         }
       ],
       "logChunks": [
         {
+          "count": 1,
           "parts": [
             {
-              "text": "o",
-              "count": 1
+              "count": 1,
+              "text": "o"
             },
             {
-              "text": "k",
-              "count": 1
+              "count": 1,
+              "text": "k"
             },
             {
-              "text": "�",
-              "count": 7
+              "count": 7,
+              "text": "�"
             },
             {
-              "text": "\n",
-              "count": 1
+              "count": 1,
+              "text": "\n"
             }
-          ],
-          "count": 1
+          ]
         }
       ],
       "logTruncated": true,
@@ -252,8 +252,8 @@
         "receipt_type": "terminal",
         "retained_log_sha256": "sha256:c581250c1dbcd1f0d4dadbdd0cb1863b6b39a0d2db5a3a2a971ccec1462ca0a8",
         "run_id": "run_unicode",
-        "schema_version": 2,
-        "signature": "6DePSWOWFSO7hcwXk/5Flps8jFbUsEKM1gcAm48dxJgILzZbrewo+ZdlwIPSYfdefSZJkdjRv8zK5xj9ktTCBA==",
+        "schema_version": 3,
+        "signature": "CxHQgrr6uCPStd3l9iiQariBLOgF69OxkQeX/RMIl/DaMDwGWk3W7eQ4plfQtLcZlsyYmcisRiPxESsCNN7zDw==",
         "signer": "sha256:139e3940e64b5491722088d9a0d741628fc826e09475d341a780acde3c4b8070",
         "started_at": "2026-08-23T10:00:00Z",
         "sync_ms": 0
@@ -279,28 +279,28 @@
       "exitCode": 0,
       "log": [
         {
-          "text": "a",
-          "count": 65536
+          "count": 65536,
+          "text": "a"
         }
       ],
       "logChunks": [
         {
+          "count": 127,
           "parts": [
             {
-              "text": "a",
-              "count": 65536
+              "count": 65536,
+              "text": "a"
             }
-          ],
-          "count": 127
+          ]
         },
         {
+          "count": 1,
           "parts": [
             {
-              "text": "a",
-              "count": 65535
+              "count": 65535,
+              "text": "a"
             }
-          ],
-          "count": 1
+          ]
         }
       ],
       "logTruncated": true,
@@ -318,8 +318,8 @@
         "receipt_type": "terminal",
         "retained_log_sha256": "sha256:79a53244b621a64deaed1f4e3a3a2a2b1d4e076a4815deea451ca3c1ab170e60",
         "run_id": "run_unicode",
-        "schema_version": 2,
-        "signature": "JmlwHz4iGD7MuQDGHkkWm3EQHK2p0rpCI+uSgN8r9Jm6h80S3RCbzlyrJuvRct8TE6QV9hhRCSxO6+EPtpJNCg==",
+        "schema_version": 3,
+        "signature": "J8A0gPBKC7buO29jyZlwoIgMTF5SohMO/wATiXjkdBkUWGkO06b+DZzmSswIDZXhAsTTl8pJq6GiYgG+K6xzBg==",
         "signer": "sha256:139e3940e64b5491722088d9a0d741628fc826e09475d341a780acde3c4b8070",
         "started_at": "2026-08-23T10:00:00Z",
         "sync_ms": 0
@@ -345,28 +345,28 @@
       "exitCode": 0,
       "log": [
         {
-          "text": "a",
-          "count": 65536
+          "count": 65536,
+          "text": "a"
         }
       ],
       "logChunks": [
         {
+          "count": 127,
           "parts": [
             {
-              "text": "a",
-              "count": 65536
+              "count": 65536,
+              "text": "a"
             }
-          ],
-          "count": 127
+          ]
         },
         {
+          "count": 1,
           "parts": [
             {
-              "text": "a",
-              "count": 65535
+              "count": 65535,
+              "text": "a"
             }
-          ],
-          "count": 1
+          ]
         }
       ],
       "logTruncated": true,
@@ -384,8 +384,8 @@
         "receipt_type": "terminal",
         "retained_log_sha256": "sha256:79a53244b621a64deaed1f4e3a3a2a2b1d4e076a4815deea451ca3c1ab170e60",
         "run_id": "run_unicode",
-        "schema_version": 2,
-        "signature": "ije6uLuNjUvwlwCHIHQY4M60/x6ONgk2QidnC2aUmLAZlTNGLkV5MqnLs3+AE0QG3tHEOIjgZRNRCxI/86yXCA==",
+        "schema_version": 3,
+        "signature": "Qu+RXK25XfOwOgkyD5c67xASlIGYQtyxm3nbgjpfWRcLjFbkTNopxpi5VtRwjRf/rAP19/lERidP9NIMrEHyBw==",
         "signer": "sha256:139e3940e64b5491722088d9a0d741628fc826e09475d341a780acde3c4b8070",
         "started_at": "2026-08-23T10:00:00Z",
         "sync_ms": 0
@@ -411,28 +411,28 @@
       "exitCode": 0,
       "log": [
         {
-          "text": "a",
-          "count": 65536
+          "count": 65536,
+          "text": "a"
         }
       ],
       "logChunks": [
         {
+          "count": 127,
           "parts": [
             {
-              "text": "a",
-              "count": 65536
+              "count": 65536,
+              "text": "a"
             }
-          ],
-          "count": 127
+          ]
         },
         {
+          "count": 1,
           "parts": [
             {
-              "text": "a",
-              "count": 65534
+              "count": 65534,
+              "text": "a"
             }
-          ],
-          "count": 1
+          ]
         }
       ],
       "logTruncated": true,
@@ -450,8 +450,8 @@
         "receipt_type": "terminal",
         "retained_log_sha256": "sha256:cbfb413ce4b8083807def53cd07de2f80439ae887cbb5c12dc4a58df18c45b94",
         "run_id": "run_unicode",
-        "schema_version": 2,
-        "signature": "uryvqBoHkocgW6JZYqTv3wA5zEVYydXrDPbHMQCA2g547j8bBKZ8louX/n1VTuFuek90odXAU0mFR+2S/9BxBQ==",
+        "schema_version": 3,
+        "signature": "wLKqA3XDCobm7iBHwdzYLEi3lmYkX8IZXzMyxGquOZp849be2uI/QbDHZt5Kfer3wtsVA9lMenNcKHvtwdYqAw==",
         "signer": "sha256:139e3940e64b5491722088d9a0d741628fc826e09475d341a780acde3c4b8070",
         "started_at": "2026-08-23T10:00:00Z",
         "sync_ms": 0
@@ -473,28 +473,28 @@
       "exitCode": 0,
       "log": [
         {
-          "text": "�",
-          "count": 21845
+          "count": 21845,
+          "text": "�"
         }
       ],
       "logChunks": [
         {
+          "count": 128,
           "parts": [
             {
-              "text": "�",
-              "count": 21845
+              "count": 21845,
+              "text": "�"
             }
-          ],
-          "count": 128
+          ]
         },
         {
+          "count": 1,
           "parts": [
             {
-              "text": "�",
-              "count": 42
+              "count": 42,
+              "text": "�"
             }
-          ],
-          "count": 1
+          ]
         }
       ],
       "logTruncated": true,
@@ -512,8 +512,8 @@
         "receipt_type": "terminal",
         "retained_log_sha256": "sha256:9cd1cce6646757a102bdb74762b422772bdcfd2c234678890a1aa4647d183c5c",
         "run_id": "run_unicode",
-        "schema_version": 2,
-        "signature": "/eMcQRMKTPGvs5G2YAQ2D4vakg+IfzPFJGiqu3Uvb5x0BCFmidhHppTEvCyx7ZuNbRgf/+/oxz2DzQc2kEWBCw==",
+        "schema_version": 3,
+        "signature": "5Hp8UsWc8GYd0KzLVlTk2hYNfioV4sc2TlFkR0Kb7tX4VqfPJKWw/LiOSbsnoUYAIPvvnJZBTV3oCOFhFLP6CQ==",
         "signer": "sha256:139e3940e64b5491722088d9a0d741628fc826e09475d341a780acde3c4b8070",
         "started_at": "2026-08-23T10:00:00Z",
         "sync_ms": 0
@@ -535,19 +535,19 @@
       "exitCode": 0,
       "log": [
         {
-          "text": "a",
-          "count": 65536
+          "count": 65536,
+          "text": "a"
         }
       ],
       "logChunks": [
         {
+          "count": 128,
           "parts": [
             {
-              "text": "a",
-              "count": 65536
+              "count": 65536,
+              "text": "a"
             }
-          ],
-          "count": 128
+          ]
         }
       ],
       "logTruncated": false,
@@ -565,8 +565,8 @@
         "receipt_type": "terminal",
         "retained_log_sha256": "sha256:ad97f87076920684e2ca66fc44e5d322797dc9d64706b174e51b5d0828937043",
         "run_id": "run_unicode",
-        "schema_version": 2,
-        "signature": "L2ivL0asjrxSdK/s+6KXgiD/vEf7yniEFqTTPWAIAdEOG5vF/3ge9UXJYxe84LgxfHDUOKImXipCx48L4RKRDQ==",
+        "schema_version": 3,
+        "signature": "r+PuLPR8PFEPgDfTgQRNkV9nh0I0TxvcedMptDpcfCWeNgL1DKTF4GPdUxRPfJhBauXKUVy5LQ+EC8rIitLdAQ==",
         "signer": "sha256:139e3940e64b5491722088d9a0d741628fc826e09475d341a780acde3c4b8070",
         "started_at": "2026-08-23T10:00:00Z",
         "sync_ms": 0

@@ -2,9 +2,11 @@ package shared
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -13,29 +15,44 @@ import (
 // exiting. This is Tart's default behavior — a VM that doesn't crash within
 // the startup window is presumed booted.
 type TimeoutWindowConfirm struct {
-	// Timeout is the survival window. If zero, the caller's ObserveTimeout
-	// from ProcessStartRequest is used.
+	// Timeout is the survival window. If zero, defaults to 2s.
 	Timeout time.Duration
 }
 
-func (c TimeoutWindowConfirm) Wait(ctx context.Context, _ ProcessHandle, exited <-chan error) error {
+func (c TimeoutWindowConfirm) Wait(ctx context.Context, exited <-chan error) (StartupConfirmResult, error) {
+	start := time.Now()
 	timeout := c.Timeout
 	if timeout <= 0 {
-		// Fall back to a reasonable default if the caller didn't set one.
 		timeout = 2 * time.Second
 	}
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
-		return context.Cause(ctx)
+		return StartupConfirmResult{
+			Stage:     "timeout-window",
+			Duration:  time.Since(start),
+			Retryable: true,
+		}, context.Cause(ctx)
 	case err := <-exited:
 		if err != nil {
-			return fmt.Errorf("process exited during startup: %w", err)
+			return StartupConfirmResult{
+				Stage:         "timeout-window",
+				Duration:      time.Since(start),
+				ProcessExited: true,
+			}, fmt.Errorf("process exited during startup: %w", err)
 		}
-		return fmt.Errorf("process exited unexpectedly during startup")
+		return StartupConfirmResult{
+			Stage:         "timeout-window",
+			Duration:      time.Since(start),
+			ProcessExited: true,
+		}, fmt.Errorf("process exited unexpectedly during startup")
 	case <-timer.C:
-		return nil
+		return StartupConfirmResult{
+			Stage:    "timeout-window",
+			Duration: time.Since(start),
+			Ready:    true,
+		}, nil
 	}
 }
 
@@ -43,6 +60,12 @@ func (c TimeoutWindowConfirm) Wait(ctx context.Context, _ ProcessHandle, exited 
 // is Lume's launch-gate protocol: the wrapper script writes its PID, waits
 // for a gate file, then writes an ack file. If the process exits before the
 // file appears, the wait fails.
+//
+// Event precedence is: context cancellation > process exit > readiness.
+// This means even if the expected file exists, the wait fails if the context
+// is already cancelled or the process has already exited. This prevents
+// false-positive readiness when the process died after writing the file but
+// before the caller observed it.
 type FileHandoffConfirm struct {
 	// Path is the file to poll.
 	Path string
@@ -52,9 +75,15 @@ type FileHandoffConfirm struct {
 	Timeout time.Duration
 	// PollInterval is the file-check interval. If zero, defaults to 10ms.
 	PollInterval time.Duration
+	// FileReader, if non-nil, replaces os.ReadFile for the readiness check.
+	// This allows tests to inject deterministic filesystem errors (EACCES,
+	// ENOTDIR, ELOOP, etc.) without depending on OS privilege semantics.
+	// Production code leaves this nil and uses os.ReadFile.
+	FileReader func(path string) ([]byte, error)
 }
 
-func (c FileHandoffConfirm) Wait(ctx context.Context, _ ProcessHandle, exited <-chan error) error {
+func (c FileHandoffConfirm) Wait(ctx context.Context, exited <-chan error) (StartupConfirmResult, error) {
+	start := time.Now()
 	timeout := c.Timeout
 	if timeout <= 0 {
 		timeout = 2 * time.Second
@@ -68,18 +97,155 @@ func (c FileHandoffConfirm) Wait(ctx context.Context, _ ProcessHandle, exited <-
 	defer deadline.Stop()
 	defer ticker.Stop()
 	for {
-		if data, err := os.ReadFile(c.Path); err == nil && strings.TrimSpace(string(data)) == c.ExpectedContent {
-			return nil
+		// Check cancellation and exit BEFORE readiness, so that a file
+		// left behind by a dead process does not produce false success.
+		select {
+		case <-ctx.Done():
+			return StartupConfirmResult{
+				Stage:     "file-handoff",
+				Duration:  time.Since(start),
+				Retryable: true,
+			}, context.Cause(ctx)
+		case err := <-exited:
+			if err != nil {
+				return StartupConfirmResult{
+					Stage:         "file-handoff",
+					Duration:      time.Since(start),
+					ProcessExited: true,
+				}, fmt.Errorf("process exited before handoff: %w", err)
+			}
+			return StartupConfirmResult{
+				Stage:         "file-handoff",
+				Duration:      time.Since(start),
+				ProcessExited: true,
+			}, fmt.Errorf("process exited before handoff")
+		default:
+		}
+		// Check readiness. Distinguish "file not ready yet" (continue)
+		// from actual I/O errors (fail immediately).
+		if ready, err := c.checkReady(); err != nil {
+			return StartupConfirmResult{
+				Stage:    "file-handoff",
+				Duration: time.Since(start),
+			}, fmt.Errorf("read handoff file %s: %w", c.Path, err)
+		} else if ready {
+			// Re-check exit one more time before committing readiness,
+			// to close the race between file-write and process-death.
+			select {
+			case <-ctx.Done():
+				return StartupConfirmResult{
+					Stage:     "file-handoff",
+					Duration:  time.Since(start),
+					Retryable: true,
+				}, context.Cause(ctx)
+			case err := <-exited:
+				if err != nil {
+					return StartupConfirmResult{
+						Stage:         "file-handoff",
+						Duration:      time.Since(start),
+						ProcessExited: true,
+					}, fmt.Errorf("process exited before handoff: %w", err)
+				}
+				return StartupConfirmResult{
+					Stage:         "file-handoff",
+					Duration:      time.Since(start),
+					ProcessExited: true,
+				}, fmt.Errorf("process exited before handoff")
+			default:
+				return StartupConfirmResult{
+					Stage:    "file-handoff",
+					Duration: time.Since(start),
+					Ready:    true,
+				}, nil
+			}
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return StartupConfirmResult{
+				Stage:     "file-handoff",
+				Duration:  time.Since(start),
+				Retryable: true,
+			}, context.Cause(ctx)
 		case err := <-exited:
-			return fmt.Errorf("process exited before handoff: %v", err)
+			if err != nil {
+				return StartupConfirmResult{
+					Stage:         "file-handoff",
+					Duration:      time.Since(start),
+					ProcessExited: true,
+				}, fmt.Errorf("process exited before handoff: %w", err)
+			}
+			return StartupConfirmResult{
+				Stage:         "file-handoff",
+				Duration:      time.Since(start),
+				ProcessExited: true,
+			}, fmt.Errorf("process exited before handoff")
 		case <-deadline.C:
-			return fmt.Errorf("timed out waiting for %s", c.Path)
+			return StartupConfirmResult{
+				Stage:     "file-handoff",
+				Duration:  time.Since(start),
+				Retryable: true,
+			}, fmt.Errorf("timed out waiting for %s", c.Path)
 		case <-ticker.C:
 		}
+	}
+}
+
+// checkReady returns (true, nil) if the file exists with expected content,
+// (false, nil) if the file is not yet ready (missing or wrong content), or
+// (false, err) for unexpected I/O errors (permission denied, etc.).
+func (c FileHandoffConfirm) checkReady() (bool, error) {
+	var data []byte
+	var err error
+	if c.FileReader != nil {
+		data, err = c.FileReader(c.Path)
+	} else {
+		data, err = os.ReadFile(c.Path)
+	}
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		// Treat "file exists but not ready" as not-ready rather than
+		// an error — the file may be mid-write.
+		if isTransientFileError(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return strings.TrimSpace(string(data)) == c.ExpectedContent, nil
+}
+
+// isTransientFileError returns true for errors that are likely to resolve
+// on retry (file being written, temporary lock, stale handle, etc.). It uses
+// an explicit errno allowlist rather than treating every *os.PathError as
+// transient, since many PathErrors (EACCES due to permissions, ENOTDIR,
+// ELOOP, etc.) represent persistent configuration or filesystem problems
+// that should fail immediately rather than poll until timeout.
+//
+// ENOENT is handled by the caller via errors.Is(err, os.ErrNotExist) before
+// this function is reached, so it is not listed here.
+func isTransientFileError(err error) bool {
+	var pathErr *os.PathError
+	if !errors.As(err, &pathErr) {
+		return false
+	}
+	errno, ok := pathErr.Err.(syscall.Errno)
+	if !ok {
+		return false
+	}
+	switch errno {
+	case syscall.EAGAIN, syscall.EINTR:
+		// Resource temporarily unavailable / interrupted — retryable.
+		return true
+	case syscall.ESTALE:
+		// Stale NFS file handle — typically resolves on retry.
+		return true
+	case syscall.EBUSY, syscall.ETXTBSY:
+		// Device or text file briefly locked (e.g. binary being written) —
+		// can resolve once the writer releases it.
+		return true
+	default:
+		return false
 	}
 }
 
@@ -93,7 +259,8 @@ type ProcessExitConfirm struct {
 	Timeout time.Duration
 }
 
-func (c ProcessExitConfirm) Wait(ctx context.Context, _ ProcessHandle, exited <-chan error) error {
+func (c ProcessExitConfirm) Wait(ctx context.Context, exited <-chan error) (StartupConfirmResult, error) {
+	start := time.Now()
 	var timeoutCh <-chan time.Time
 	if c.Timeout > 0 {
 		timer := time.NewTimer(c.Timeout)
@@ -102,11 +269,27 @@ func (c ProcessExitConfirm) Wait(ctx context.Context, _ ProcessHandle, exited <-
 	}
 	select {
 	case <-ctx.Done():
-		return context.Cause(ctx)
+		return StartupConfirmResult{
+			Stage:     "process-exit",
+			Duration:  time.Since(start),
+			Retryable: true,
+		}, context.Cause(ctx)
 	case <-timeoutCh:
-		return fmt.Errorf("process did not exit within %s", c.Timeout)
+		return StartupConfirmResult{
+			Stage:     "process-exit",
+			Duration:  time.Since(start),
+			Retryable: true,
+		}, fmt.Errorf("process did not exit within %s", c.Timeout)
 	case err := <-exited:
-		return err
+		result := StartupConfirmResult{
+			Stage:         "process-exit",
+			Duration:      time.Since(start),
+			ProcessExited: true,
+		}
+		if err == nil {
+			result.Ready = true
+		}
+		return result, err
 	}
 }
 

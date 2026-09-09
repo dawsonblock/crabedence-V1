@@ -22,6 +22,31 @@ import {
 import { PostgresCoordinatorStorage } from "./postgres-storage";
 
 const alarmQueue = "coordinator-alarm";
+
+// Race a startup stage against the abort signal. If the abort fires before
+// the stage completes, reject with "startup aborted: authority lost" instead
+// of waiting for the stage to finish. The stage promise is NOT cancelled —
+// many startup APIs (pg-boss, Postgres pool) don't support cancellation —
+// but the coordinator can proceed to cleanup without waiting indefinitely.
+function raceStartupStage<T>(signal: AbortSignal, stage: Promise<T>): Promise<T> {
+  if (signal.aborted) return Promise.reject(new Error("startup aborted: authority lost"));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      reject(new Error("startup aborted: authority lost"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    stage.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
 const alarmTimeStorageKey = "node-runtime:alarm-time";
 const reconcileQueue = "coordinator-reconcile";
 const bridgeDataAttachmentKinds = new Set([
@@ -34,6 +59,20 @@ const bridgeDataAttachmentKinds = new Set([
   "workspace-terminal",
   "runtime-adapter-agent",
 ]);
+
+/**
+ * Explicit coordinator lifecycle states. The runtime transitions through
+ * these states in order:
+ *   idle → starting → running → shutting-down → stopped
+ * Authority loss can force a transition from running → shutting-down → stopped
+ * or from starting → shutting-down → stopped (authority lost during startup).
+ */
+export type CoordinatorLifecycleState =
+  | "idle"
+  | "starting"
+  | "running"
+  | "shutting-down"
+  | "stopped";
 
 export interface NodeUpgradeContext {
   request: IncomingMessage;
@@ -66,7 +105,14 @@ export class NodeCoordinatorRuntime implements CoordinatorRuntime {
   private wakeHintPending = false;
   private provisioningScanner?: ReturnType<typeof setInterval>;
   private coordinatorLock: CoordinatorLock | undefined;
+  private bossStarted = false;
+  private authorityLost = false;
+  private stopped = false;
+  private readonly authorityLostCallbacks: Array<() => void> = [];
   private readonly maintenance = new Set<Promise<void>>();
+  // Stage 8: explicit lifecycle state and startup abort controller.
+  private lifecycleState: CoordinatorLifecycleState = "idle";
+  private startupAbort?: AbortController;
 
   constructor(connectionString: string) {
     this.storage = new PostgresCoordinatorStorage(connectionString);
@@ -84,52 +130,149 @@ export class NodeCoordinatorRuntime implements CoordinatorRuntime {
 
   async start(alarmHandler: () => Promise<void>): Promise<void> {
     this.alarmHandler = alarmHandler;
+    this.lifecycleState = "starting";
+    this.startupAbort = new AbortController();
+    // Register the authority-lost handler BEFORE acquiring the lock, so
+    // that authority loss during startup (e.g., the lock session dies
+    // mid-startup) triggers fail-closed cleanup immediately.
+    const onStartupAbort = () => {
+      // Abort startup if authority is lost before startup completes.
+      // The startupAbort controller is cleared once startup succeeds,
+      // so a non-undefined value means we're still starting.
+      if (this.startupAbort) {
+        console.error("coordinator authority lost during startup; aborting");
+        this.startupAbort.abort();
+      }
+    };
+    this.authorityLostCallbacks.push(onStartupAbort);
     await this.storage.initialize();
     if (this.storage.acquireCoordinatorLock) {
       // Multi-replica operation is unsafe until bridge ownership is
       // externalized; a contended lock means a second replica is starting.
       const lock = await this.storage.acquireCoordinatorLock();
       if (!lock) {
+        this.lifecycleState = "stopped";
+        // Remove the startup abort callback before throwing.
+        const idx = this.authorityLostCallbacks.indexOf(onStartupAbort);
+        if (idx >= 0) this.authorityLostCallbacks.splice(idx, 1);
         throw new Error(
           "coordinator advisory lock is held by another instance; refusing to start " +
             "(run exactly one coordinator replica per database)",
         );
       }
       this.coordinatorLock = lock;
+      // Losing the advisory-lock session means losing coordinator authority:
+      // PostgreSQL has already freed the lock, so a replacement replica can
+      // start at any moment. Fail closed immediately.
+      lock.onLost?.(() => this.handleCoordinatorAuthorityLost());
     }
-    await this.scanProvisioning();
-    this.provisioningScanner = setInterval(() => {
-      void this.scanProvisioning();
-    }, 1_000);
-    this.provisioningScanner.unref();
-    await this.boss.start();
-    await this.boss.createQueue(alarmQueue, {
-      // "short" permits one queued successor while the current alarm is active.
-      policy: "short",
-      retryLimit: 5,
-      retryDelay: 5,
-      retryBackoff: true,
-    });
-    await this.boss.createQueue(reconcileQueue, {
-      policy: "exclusive",
-      retryLimit: 5,
-      retryDelay: 5,
-      retryBackoff: true,
-    });
-    await this.boss.work(alarmQueue, { pollingIntervalSeconds: 1 }, async () => {
-      await this.runAlarm();
-    });
-    await this.boss.work(reconcileQueue, { pollingIntervalSeconds: 5 }, async () => {
-      await this.runAlarm();
-    });
-    await this.boss.schedule(reconcileQueue, "*/15 * * * *", null, {
-      tz: "UTC",
-      singletonKey: "reconcile",
-    });
-    await this.boss.send(reconcileQueue, null, {
-      singletonKey: "startup",
-      singletonSeconds: 60,
-    });
+    try {
+      const sig = this.startupAbort!.signal;
+      // Each startup stage is raced against the abort signal so a
+      // permanently-hanging stage (e.g. pg-boss start) does not block
+      // cleanup when authority is lost mid-startup.
+      await raceStartupStage(sig, this.scanProvisioning());
+      this.provisioningScanner = setInterval(() => {
+        void this.scanProvisioning();
+      }, 1_000);
+      this.provisioningScanner.unref();
+      await raceStartupStage(sig, this.boss.start());
+      this.bossStarted = true;
+      await raceStartupStage(
+        sig,
+        this.boss.createQueue(alarmQueue, {
+          // "short" permits one queued successor while the current alarm is active.
+          policy: "short",
+          retryLimit: 5,
+          retryDelay: 5,
+          retryBackoff: true,
+        }),
+      );
+      await raceStartupStage(
+        sig,
+        this.boss.createQueue(reconcileQueue, {
+          policy: "exclusive",
+          retryLimit: 5,
+          retryDelay: 5,
+          retryBackoff: true,
+        }),
+      );
+      await raceStartupStage(
+        sig,
+        this.boss.work(alarmQueue, { pollingIntervalSeconds: 1 }, async () => {
+          await this.runAlarm();
+        }),
+      );
+      await raceStartupStage(
+        sig,
+        this.boss.work(reconcileQueue, { pollingIntervalSeconds: 5 }, async () => {
+          await this.runAlarm();
+        }),
+      );
+      await raceStartupStage(
+        sig,
+        this.boss.schedule(reconcileQueue, "*/15 * * * *", null, {
+          tz: "UTC",
+          singletonKey: "reconcile",
+        }),
+      );
+      await raceStartupStage(
+        sig,
+        this.boss.send(reconcileQueue, null, {
+          singletonKey: "startup",
+          singletonSeconds: 60,
+        }),
+      );
+      // Startup complete: transition to running and remove the startup
+      // abort callback. Authority loss from now on is handled by the
+      // normal authority-lost callbacks.
+      this.lifecycleState = "running";
+      const idx = this.authorityLostCallbacks.indexOf(onStartupAbort);
+      if (idx >= 0) this.authorityLostCallbacks.splice(idx, 1);
+      this.startupAbort = undefined;
+    } catch (error) {
+      this.lifecycleState = "shutting-down";
+      // Reverse-order unwind of any partially initialized resources.
+      // This prevents a failed start from leaving orphaned intervals,
+      // pg-boss workers, or other state that a replacement replica would
+      // conflict with. The coordinator lock is released LAST, only after
+      // all coordinator duties have been torn down.
+      if (this.provisioningScanner) {
+        clearInterval(this.provisioningScanner);
+        this.provisioningScanner = undefined;
+      }
+      if (this.bossStarted) {
+        try {
+          await this.boss.stop({ graceful: false, timeout: 5_000 });
+        } catch {
+          // Best-effort; the original error is more important.
+        }
+        this.bossStarted = false;
+      }
+      if (this.coordinatorLock) {
+        try {
+          await this.coordinatorLock.release();
+        } catch {
+          // Best-effort release; the original error is more important.
+        }
+        this.coordinatorLock = undefined;
+      }
+      // Remove the startup abort callback.
+      const idx = this.authorityLostCallbacks.indexOf(onStartupAbort);
+      if (idx >= 0) this.authorityLostCallbacks.splice(idx, 1);
+      this.startupAbort = undefined;
+      this.lifecycleState = "stopped";
+      throw error;
+    }
+  }
+
+  /**
+   * Returns the current lifecycle state of the coordinator runtime.
+   * This is useful for diagnostics and for tests that need to verify
+   * state transitions.
+   */
+  getLifecycleState(): CoordinatorLifecycleState {
+    return this.lifecycleState;
   }
 
   setOperationRunner(runner: <T>(callback: () => Promise<T>) => Promise<T>): void {
@@ -140,7 +283,49 @@ export class NodeCoordinatorRuntime implements CoordinatorRuntime {
     return this.operationRunner(callback);
   }
 
+  /**
+   * True once the coordinator advisory-lock session died. The process no
+   * longer holds coordinator authority and must stop mutating coordinator
+   * state; callers should fail closed (for example, HTTP 503).
+   */
+  lostAuthority(): boolean {
+    return this.authorityLost;
+  }
+
+  /**
+   * Register a callback invoked when coordinator authority is lost (the
+   * advisory-lock session died). The server uses this to begin an orderly
+   * shutdown; without a registered callback the runtime stops itself.
+   */
+  onAuthorityLost(callback: () => void): void {
+    this.authorityLostCallbacks.push(callback);
+  }
+
+  private handleCoordinatorAuthorityLost(): void {
+    if (this.shuttingDown || this.authorityLost) return;
+    this.authorityLost = true;
+    console.error("coordinator advisory-lock session lost; authority lost, shutting down");
+    // Stop timers and sockets first so no further coordinator work starts.
+    this.beginShutdown();
+    if (this.authorityLostCallbacks.length > 0) {
+      for (const callback of this.authorityLostCallbacks) {
+        try {
+          callback();
+        } catch (error) {
+          console.error("coordinator authority-lost callback failed", error);
+        }
+      }
+    } else {
+      void this.stop().catch((error) =>
+        console.error("coordinator shutdown after authority loss failed", error),
+      );
+    }
+  }
+
   beginShutdown(): void {
+    if (this.lifecycleState !== "stopped") {
+      this.lifecycleState = "shutting-down";
+    }
     this.shuttingDown = true;
     clearInterval(this.pingInterval);
     clearInterval(this.provisioningScanner);
@@ -153,6 +338,10 @@ export class NodeCoordinatorRuntime implements CoordinatorRuntime {
   }
 
   async stop(): Promise<void> {
+    // Idempotent: authority-loss shutdown and an orderly server shutdown can
+    // both race to stop the runtime; the second call must be a no-op.
+    if (this.stopped) return;
+    this.stopped = true;
     this.beginShutdown();
     await Promise.allSettled(this.socketClosures ?? []);
     await this.drainSocketOperations();
@@ -161,11 +350,21 @@ export class NodeCoordinatorRuntime implements CoordinatorRuntime {
     await this.drainMaintenance();
     if (this.wakeHintRun) await boundedWakeHint(this.wakeHintRun);
     await this.boss.stop({ graceful: true, timeout: 10_000 });
+    this.bossStarted = false;
     // Release the replica lock only after every coordinator duty has drained, so
-    // a replacement cannot overlap with a still-finishing instance.
-    await this.coordinatorLock?.release();
+    // a replacement cannot overlap with a still-finishing instance. Wrap the
+    // release: if the advisory-lock session already died (authority loss or a
+    // broken backend), pg_advisory_unlock on the dead connection throws. That
+    // is not a shutdown failure — PostgreSQL has already freed the lock — so
+    // log and continue rather than rejecting the orderly shutdown.
+    try {
+      await this.coordinatorLock?.release();
+    } catch (error) {
+      console.error("coordinator lock release during shutdown failed (continuing)", error);
+    }
     this.coordinatorLock = undefined;
     await this.storage.close();
+    this.lifecycleState = "stopped";
   }
 
   runWithUpgrade<T>(context: NodeUpgradeContext, callback: () => Promise<T>): Promise<T> {

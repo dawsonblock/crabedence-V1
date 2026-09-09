@@ -33,8 +33,17 @@ func (s *tartProcessSupervisor) Start(ctx context.Context, req shared.ProcessSta
 	return s.backend.startVM(ctx, req.Name, req.Keep)
 }
 
-// Compile-time check that *startupProcess satisfies shared.ProcessHandle.
+// Compile-time check that *startupProcess satisfies shared.FullProcessHandle
+// (ProcessHandle + ProcessKiller + ProcessHandoff + ProcessStderr +
+// ExitObservable + LifecycleContextProvider). Tart owns its child's lifecycle
+// and can truthfully implement all capabilities.
+var _ shared.FullProcessHandle = (*startupProcess)(nil)
 var _ shared.ProcessHandle = (*startupProcess)(nil)
+var _ shared.ProcessKiller = (*startupProcess)(nil)
+var _ shared.ProcessHandoff = (*startupProcess)(nil)
+var _ shared.ProcessStderr = (*startupProcess)(nil)
+var _ shared.ExitObservable = (*startupProcess)(nil)
+var _ shared.LifecycleContextProvider = (*startupProcess)(nil)
 
 // Compile-time check that *tartProcessSupervisor satisfies shared.ProcessSupervisor.
 var _ shared.ProcessSupervisor = (*tartProcessSupervisor)(nil)

@@ -405,7 +405,7 @@ func TestVerifyRejectsTamperedReceipts(t *testing.T) {
 		{
 			name: "unsupported schema version",
 			mutate: func(t *testing.T, path string, receipt map[string]any) []byte {
-				receipt["schema_version"] = 2
+				receipt["schema_version"] = 99
 				return marshalReceipt(t, receipt)
 			},
 			wantCode: 2,
@@ -560,10 +560,22 @@ func TestDelegatedRunReceiptOmitsMissingLeaseID(t *testing.T) {
 	if err := json.Unmarshal(data, &receipt); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"lease_id", "slug", "run_id", "actions_url", "log_sha256"} {
+	// V3 receipts: lease_id and slug are omitted when empty (omitempty).
+	// run_id is always present (V3 requires it; a deterministic fallback
+	// is generated if none was provided).
+	// log_sha256 is always present (V3 requires it; the empty-string digest
+	// is used for delegated runs without a terminal log).
+	// actions_url does not exist in V3 receipts.
+	for _, key := range []string{"lease_id", "slug", "actions_url"} {
 		if _, ok := receipt[key]; ok {
-			t.Fatalf("delegated receipt should omit empty %s", key)
+			t.Fatalf("delegated receipt should omit empty/absent %s", key)
 		}
+	}
+	if receipt["schema_version"] != float64(3) {
+		t.Fatalf("schema_version=%v, want 3", receipt["schema_version"])
+	}
+	if receipt["evidence_sha256"] == nil || receipt["evidence_sha256"] == "" {
+		t.Fatal("V3 delegated receipt must have evidence_sha256 binding")
 	}
 	if receipt["command"] != "pnpm test" {
 		t.Fatalf("unexpected command %v", receipt["command"])
@@ -646,9 +658,18 @@ func TestDelegatedAttestUsesNormalizedPrimaryOutcome(t *testing.T) {
 			if err != nil {
 				t.Fatalf("completed command receipt missing: %v", err)
 			}
-			receipt, err := decodeRunReceipt(data)
-			if err != nil || receipt["exit_code"] != json.Number("42") {
+			receipt, err := decodeTerminalRunReceipt(data)
+			if err != nil {
 				t.Fatalf("receipt=%#v err=%v", receipt, err)
+			}
+			if receipt.ExitCode != 42 {
+				t.Fatalf("receipt exit_code=%d, want 42", receipt.ExitCode)
+			}
+			if receipt.SchemaVersion != terminalReceiptSchemaVersion {
+				t.Fatalf("receipt schema_version=%d, want %d", receipt.SchemaVersion, terminalReceiptSchemaVersion)
+			}
+			if receipt.EvidenceSHA256 == "" {
+				t.Fatal("V3 delegated receipt must have evidence_sha256 binding")
 			}
 			if _, err := runVerify(t, receiptPath); err != nil {
 				t.Fatalf("verify receipt: %v", err)
@@ -665,7 +686,7 @@ func TestDelegatedRunReceiptRecordsNonzeroExit(t *testing.T) {
 		CommandText: "pnpm test",
 		ExitCode:    17,
 		Command:     1500 * time.Millisecond,
-	}, RunRequest{Command: []string{"pnpm", "test"}}); err != nil {
+	}, RunRequest{Command: []string{"pnpm", "test"}, RunID: "run_delegated_exit"}); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(path)
@@ -678,6 +699,13 @@ func TestDelegatedRunReceiptRecordsNonzeroExit(t *testing.T) {
 	}
 	if receipt["exit_code"] != float64(17) {
 		t.Fatalf("exit_code=%v, want 17", receipt["exit_code"])
+	}
+	// V3 receipt must have evidence_sha256 binding.
+	if receipt["evidence_sha256"] == nil || receipt["evidence_sha256"] == "" {
+		t.Fatal("V3 delegated receipt must have evidence_sha256 binding")
+	}
+	if receipt["schema_version"] != float64(3) {
+		t.Fatalf("schema_version=%v, want 3", receipt["schema_version"])
 	}
 	if out, err := runVerify(t, path); err != nil || !strings.HasPrefix(out, "PASS ") {
 		t.Fatalf("verify output=%q error=%v", out, err)
@@ -714,17 +742,25 @@ func TestDelegatedRunReceiptUsesSessionIdentityFallbacks(t *testing.T) {
 	if err := json.Unmarshal(data, &receipt); err != nil {
 		t.Fatal(err)
 	}
+	// V3 receipts bind provider, lease_id, slug, and run_id from the session.
+	// V3 receipts do not include actions_url (that was a V1-only field).
 	want := map[string]string{
-		"provider":    "e2b",
-		"lease_id":    "cbx_session",
-		"slug":        "session-slug",
-		"run_id":      "run_session",
-		"actions_url": "https://github.com/example-org/my-app/actions/runs/7",
+		"provider": "e2b",
+		"lease_id": "cbx_session",
+		"slug":     "session-slug",
+		"run_id":   "run_session",
 	}
 	for key, value := range want {
 		if receipt[key] != value {
 			t.Fatalf("receipt[%q]=%v, want %q", key, receipt[key], value)
 		}
+	}
+	// V3 receipt must have evidence_sha256 binding.
+	if receipt["evidence_sha256"] == nil || receipt["evidence_sha256"] == "" {
+		t.Fatal("V3 delegated receipt must have evidence_sha256 binding")
+	}
+	if receipt["schema_version"] != float64(3) {
+		t.Fatalf("schema_version=%v, want 3", receipt["schema_version"])
 	}
 	if out, err := runVerify(t, path); err != nil || !strings.HasPrefix(out, "PASS ") {
 		t.Fatalf("verify output=%q error=%v", out, err)

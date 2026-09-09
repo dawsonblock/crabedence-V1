@@ -101,8 +101,10 @@ func applyDefaults(cfg *Config) {
 // startSupervisedVM routes VM start through the injectable ProcessSupervisor.
 // When the supervisor is the default tartProcessSupervisor, this is equivalent
 // to calling startVM directly. When a test injects a fake, no real process is
-// spawned. The returned *startupProcess satisfies shared.ProcessHandle.
-func (b *backend) startSupervisedVM(ctx context.Context, name string, keep bool) (*startupProcess, error) {
+// spawned. The returned ProcessHandle implements FullProcessHandle (Context,
+// Abort, Handoff, Kill, Stderr, Done) when the default Tart supervisor is
+// used; callers type-assert to the capability interfaces they need.
+func (b *backend) startSupervisedVM(ctx context.Context, name string, keep bool) (shared.ProcessHandle, error) {
 	handle, err := b.supervisor.Start(ctx, shared.ProcessStartRequest{
 		Name:           name,
 		Keep:           keep,
@@ -111,18 +113,7 @@ func (b *backend) startSupervisedVM(ctx context.Context, name string, keep bool)
 	if err != nil {
 		return nil, err
 	}
-	// The default supervisor returns *startupProcess; a fake returns a
-	// fakeProcessHandle. For the fake path, return a minimal stub that
-	// satisfies the Acquire path's abort/handoff/ctx usage.
-	sp, ok := handle.(*startupProcess)
-	if !ok {
-		return &startupProcess{
-			ctx:    ctx,
-			done:   make(chan struct{}),
-			cancel: func(error) {},
-		}, nil
-	}
-	return sp, nil
+	return handle, nil
 }
 
 func (b *backend) Spec() ProviderSpec { return b.spec }
@@ -218,7 +209,7 @@ func (b *backend) Acquire(ctx context.Context, req AcquireRequest) (target Lease
 			return
 		}
 		// Reap our exact child and preserve its failure before name-based cleanup.
-		acquireErr = startup.abort(acquireErr)
+		acquireErr = startup.Abort(acquireErr)
 		cleanup := cleanupUnclaimedVM
 		if publishedClaim.LeaseID != "" {
 			cleanup = func() error {
@@ -233,7 +224,13 @@ func (b *backend) Acquire(ctx context.Context, req AcquireRequest) (target Lease
 		}
 		acquireErr = errors.Join(acquireErr, cleanup())
 	}()
-	ctx = startup.ctx
+	// Tart's startupProcess implements LifecycleContextProvider. Type-assert
+	// to get the process-scoped context for post-startup operations.
+	lcp, ok := startup.(shared.LifecycleContextProvider)
+	if !ok {
+		return LeaseTarget{}, fmt.Errorf("tart supervisor returned handle without lifecycle context capability")
+	}
+	ctx = lcp.Context()
 	ip, err := b.waitForIP(ctx, name)
 	if err != nil {
 		return LeaseTarget{}, err
@@ -270,10 +267,30 @@ func (b *backend) Acquire(ctx context.Context, req AcquireRequest) (target Lease
 	if err != nil {
 		return LeaseTarget{}, err
 	}
-	if err := startup.handoff(); err != nil {
+	// Handoff is the acquisition commit point. Type-assert to ProcessHandoff.
+	handoff, ok := startup.(shared.ProcessHandoff)
+	if !ok {
+		return LeaseTarget{}, fmt.Errorf("tart supervisor returned handle without handoff capability")
+	}
+	if err := handoff.Handoff(); err != nil {
 		return LeaseTarget{}, err
 	}
 	cleanupKey = false
+	// Propagate the startup confirmation result into the lease target so
+	// it reaches the timing report and RunEvidenceV1. Type-assert to
+	// *startupProcess to access StartupConfirmResult(); test fakes that
+	// don't implement this method are skipped.
+	if sp, ok := startup.(*startupProcess); ok {
+		if sc := sp.StartupConfirmResult(); sc.Stage != "" {
+			lease.StartupConfirm = &core.StartupConfirmSummary{
+				Stage:         sc.Stage,
+				DurationMs:    sc.Duration.Milliseconds(),
+				Ready:         sc.Ready,
+				ProcessExited: sc.ProcessExited,
+				Retryable:     sc.Retryable,
+			}
+		}
+	}
 	fmt.Fprintf(b.rt.Stderr, "provisioned lease=%s instance=%s state=ready\n", leaseID, name)
 	return lease, nil
 }

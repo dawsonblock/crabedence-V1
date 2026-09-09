@@ -1,0 +1,3807 @@
+{
+  "description": "Shared Go\u2194TypeScript evidence conformance corpus. Both runtimes must accept or reject each fixture identically.",
+  "fixtures": [
+    {
+      "name": "minimal-success",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "ordinary-failure",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 1,
+        "run_status": "failed",
+        "error_kind": "command-exit",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "timeout-with-error-kind",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 124,
+        "run_status": "timed-out",
+        "error_kind": "timeout",
+        "total_ms": 5000,
+        "command_ms": 4900,
+        "sync_ms": 0,
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "cancellation-with-error-kind",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 130,
+        "run_status": "canceled",
+        "error_kind": "canceled",
+        "total_ms": 200,
+        "command_ms": 100,
+        "sync_ms": 0,
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "startup-confirm-timeout-window",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "tart",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 1000,
+        "command_ms": 500,
+        "sync_ms": 200,
+        "startup_confirm": {
+          "stage": "timeout-window",
+          "duration_ms": 812,
+          "ready": true
+        },
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "startup-confirm-file-handoff-with-exit",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "lume",
+        "exit_code": 1,
+        "run_status": "failed",
+        "error_kind": "provider-error",
+        "total_ms": 500,
+        "command_ms": 300,
+        "sync_ms": 0,
+        "startup_confirm": {
+          "stage": "file-handoff",
+          "duration_ms": 250,
+          "ready": false,
+          "process_exited": true,
+          "retryable": false
+        },
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "skipped-sync-phase-without-ms",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 0,
+        "sync_phases": [
+          {
+            "name": "sync",
+            "skipped": true
+          }
+        ],
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "runner-phases-with-snake-case",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 1000,
+        "command_ms": 500,
+        "sync_ms": 200,
+        "runner_phases": [
+          {
+            "name": "lease",
+            "ms": 100,
+            "provider": "tart",
+            "lease_id": "cbx_abc",
+            "run_id": "run_123",
+            "machine_type": "m1"
+          }
+        ],
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "all-optional-fields",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "lease_id": "cbx_lease",
+        "slug": "test-slug",
+        "run_id": "run_abc",
+        "label": "test-label",
+        "machine_type": "m1",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "command_text": "echo hello",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "runner_total_ms": 80,
+        "end_to_end_ms": 120,
+        "lease_ms": 10,
+        "bootstrap_ms": 5,
+        "hydrate_ms": 3,
+        "probe_ms": 2,
+        "sync_delegated": true,
+        "sync_mode": "rsync",
+        "sync_transfer_files": 10,
+        "sync_transfer_bytes": 1024,
+        "sync_fallback_reason": "permission-denied",
+        "blocked_stage": "hydrate",
+        "resource_exhaustion": "memory",
+        "retry_likely": "transient",
+        "failure_hint": "check logs",
+        "started_at": "2024-01-01T00:00:00Z",
+        "ended_at": "2024-01-01T00:01:00Z",
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "multiple-artifacts",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "artifacts": [
+          {
+            "kind": "log",
+            "path": "/tmp/log.txt",
+            "bytes": 1024,
+            "sha256": "abc123"
+          },
+          {
+            "kind": "junit",
+            "path": "/tmp/results.xml"
+          }
+        ],
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "empty-arrays",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "runner_phases": [],
+        "sync_phases": [],
+        "command_phases": [],
+        "artifacts": [],
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "unicode-command-text",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "command_text": "echo \u00e9\u4e16\u754c\ud55c\uad6d",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "unicode-line-separator",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "command_text": "echo \u2028line2",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "unicode-paragraph-separator",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "command_text": "echo \u2029para2",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "max-safe-integer-timing",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 9007199254740991,
+        "command_ms": 9007199254740991,
+        "sync_ms": 0,
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "unknown-top-level-field",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "evil_field": "malicious",
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "unknown field"
+    },
+    {
+      "name": "unknown-nested-phase-field",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "sync_phases": [
+          {
+            "name": "sync",
+            "ms": 10,
+            "evil": "data"
+          }
+        ],
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "unknown field"
+    },
+    {
+      "name": "unknown-startup-field",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "startup_confirm": {
+          "stage": "timeout-window",
+          "duration_ms": 100,
+          "ready": true,
+          "evil": "data"
+        },
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "unknown field"
+    },
+    {
+      "name": "unsafe-integer-timing",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 9007199254740992,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "safe integer"
+    },
+    {
+      "name": "negative-timing",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": -1,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "non-negative"
+    },
+    {
+      "name": "uppercase-digest",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "digest": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "wrong-schema-version",
+      "evidence": {
+        "schema_version": 2,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "schema_version"
+    },
+    {
+      "name": "wrong-evidence-type",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "batch",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "evidence_type"
+    },
+    {
+      "name": "timeout-without-error-kind",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 124,
+        "run_status": "timed-out",
+        "total_ms": 5000,
+        "command_ms": 4900,
+        "sync_ms": 0,
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "error_kind"
+    },
+    {
+      "name": "canceled-without-error-kind",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 130,
+        "run_status": "canceled",
+        "total_ms": 200,
+        "command_ms": 100,
+        "sync_ms": 0,
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "error_kind"
+    },
+    {
+      "name": "success-with-nonzero-exit",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 1,
+        "run_status": "succeeded",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "exit_code"
+    },
+    {
+      "name": "failure-with-zero-exit",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "failed",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "exit_code"
+    },
+    {
+      "name": "wrong-startup-stage",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "startup_confirm": {
+          "stage": "invalid-stage",
+          "duration_ms": 100,
+          "ready": true
+        },
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "stage"
+    },
+    {
+      "name": "wrong-startup-ready-type",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "startup_confirm": {
+          "stage": "timeout-window",
+          "duration_ms": 100,
+          "ready": "yes"
+        },
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "ready"
+    },
+    {
+      "name": "runner-phase-camel-case",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "runner_phases": [
+          {
+            "name": "lease",
+            "ms": 10,
+            "leaseId": "cbx_abc"
+          }
+        ],
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "unknown field"
+    },
+    {
+      "name": "negative-startup-duration",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test-provider",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "total_ms": 100,
+        "command_ms": 50,
+        "sync_ms": 30,
+        "startup_confirm": {
+          "stage": "timeout-window",
+          "duration_ms": -1,
+          "ready": true
+        },
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "non-negative"
+    },
+    {
+      "name": "golden-basic",
+      "evidence": {
+        "command_ms": 3000,
+        "command_text": "npm test",
+        "digest": "724a033bc9ea65bf46bde14011cf07eb0fcab5c809084a3b4eb89f5dfdb384cb",
+        "ended_at": "2026-01-15T12:30:05Z",
+        "evidence_type": "run",
+        "exit_code": 0,
+        "label": "ci",
+        "lease_id": "cbx_abc123",
+        "machine_type": "cpx21",
+        "provider": "hetzner",
+        "run_id": "run_test001",
+        "run_status": "succeeded",
+        "schema_version": 1,
+        "started_at": "2026-01-15T12:30:00Z",
+        "sync_ms": 2000,
+        "total_ms": 5000
+      },
+      "expected": "accept"
+    },
+    {
+      "name": "golden-html-chars",
+      "evidence": {
+        "command_ms": 1000,
+        "command_text": "grep '<root>' log && echo \"a & b < c\"",
+        "digest": "193c7c60c1f387cdeeae688cfb908f32069eb334d26c1fbce09d881b931c79c2",
+        "ended_at": "2026-01-15T12:30:05Z",
+        "evidence_type": "run",
+        "exit_code": 0,
+        "lease_id": "cbx_html001",
+        "provider": "aws",
+        "run_id": "run_html001",
+        "run_status": "succeeded",
+        "schema_version": 1,
+        "started_at": "2026-01-15T12:30:00Z",
+        "sync_ms": 234,
+        "total_ms": 1234
+      },
+      "expected": "accept"
+    },
+    {
+      "name": "golden-unicode",
+      "evidence": {
+        "command_ms": 700,
+        "command_text": "echo \"h\u00e9llo w\u00f6rld \ud83d\ude80 \u4e2d\u6587 \u0442\u0435\u0441\u0442\"",
+        "digest": "0cce860b171302ee0fa140561ebe262c150fd9e8b9152f1e7639b49b4b7f1056",
+        "ended_at": "2026-01-15T12:30:05Z",
+        "evidence_type": "run",
+        "exit_code": 0,
+        "label": "\u751f\u6001\u7cfb-\u30c6\u30b9\u30c8",
+        "lease_id": "cbx_uni001",
+        "machine_type": "m7i.large",
+        "provider": "daytona",
+        "run_id": "run_uni001",
+        "run_status": "succeeded",
+        "schema_version": 1,
+        "started_at": "2026-01-15T12:30:00Z",
+        "sync_ms": 200,
+        "total_ms": 900
+      },
+      "expected": "accept"
+    },
+    {
+      "name": "golden-nested-phases-artifacts",
+      "evidence": {
+        "artifacts": [
+          {
+            "bytes": 2048,
+            "kind": "junit",
+            "path": "test-results.xml",
+            "sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          {
+            "bytes": 65536,
+            "kind": "log",
+            "path": "out.log"
+          }
+        ],
+        "blocked_stage": "user-command",
+        "command_ms": 6000,
+        "command_phases": [
+          {
+            "ms": 5900,
+            "name": "exec"
+          },
+          {
+            "ms": 100,
+            "name": "teardown"
+          }
+        ],
+        "command_text": "pytest -q",
+        "digest": "a23cc4de351e29237061b997f9db6793e9b1ba140935883b9496f12b8dd88d18",
+        "ended_at": "2026-01-15T12:30:08Z",
+        "error_kind": "command-exit",
+        "evidence_type": "run",
+        "exit_code": 1,
+        "lease_id": "cbx_nest001",
+        "provider": "gcp",
+        "retry_likely": "true",
+        "run_id": "run_nest001",
+        "run_status": "failed",
+        "runner_phases": [
+          {
+            "ms": 6000,
+            "name": "command"
+          },
+          {
+            "ms": 300,
+            "name": "cleanup"
+          }
+        ],
+        "schema_version": 1,
+        "started_at": "2026-01-15T12:30:00Z",
+        "sync_ms": 2000,
+        "sync_phases": [
+          {
+            "ms": 1500,
+            "name": "rsync"
+          },
+          {
+            "ms": 500,
+            "name": "git_hydrate"
+          }
+        ],
+        "total_ms": 8000
+      },
+      "expected": "accept"
+    },
+    {
+      "name": "golden-large-ints",
+      "evidence": {
+        "command_ms": 42000,
+        "command_text": "dd if=/dev/zero of=/tmp/z bs=1M count=8192",
+        "digest": "9b18fa9eb6d174d8c1fc2525cccd0e8fed57f5c9b921e62add21b34466d32238",
+        "ended_at": "2026-01-15T12:30:05Z",
+        "evidence_type": "run",
+        "exit_code": 0,
+        "lease_id": "cbx_big001",
+        "provider": "azure",
+        "run_id": "run_big001",
+        "run_status": "succeeded",
+        "schema_version": 1,
+        "started_at": "2026-01-15T12:30:00Z",
+        "sync_ms": 3000,
+        "sync_transfer_bytes": 9007199254740991,
+        "sync_transfer_files": 9007199254740000,
+        "total_ms": 45000
+      },
+      "expected": "accept"
+    },
+    {
+      "name": "golden-minimal",
+      "evidence": {
+        "command_ms": 10,
+        "digest": "910e0b1191fa68e5fd23d8386abdaf4073f758198f1812bae322d8abb16a2a08",
+        "evidence_type": "run",
+        "exit_code": 0,
+        "provider": "tart",
+        "run_status": "succeeded",
+        "schema_version": 1,
+        "sync_ms": 0,
+        "total_ms": 10
+      },
+      "expected": "accept"
+    },
+    {
+      "name": "golden-line-separator",
+      "evidence": {
+        "command_ms": 100,
+        "command_text": "echo hello\u2028world",
+        "digest": "05294018bdb16079f171c3845ba68d4e6ba2930c3e15924d9b2915bbc671384a",
+        "ended_at": "2026-01-15T12:30:05Z",
+        "evidence_type": "run",
+        "exit_code": 0,
+        "lease_id": "cbx_sep001",
+        "provider": "aws",
+        "run_id": "run_ls001",
+        "run_status": "succeeded",
+        "schema_version": 1,
+        "started_at": "2026-01-15T12:30:00Z",
+        "sync_ms": 50,
+        "total_ms": 150
+      },
+      "expected": "accept"
+    },
+    {
+      "name": "golden-paragraph-separator",
+      "evidence": {
+        "command_ms": 100,
+        "command_text": "echo hello\u2029world",
+        "digest": "427b1bbb5ca6fe20b31c542962375395804ae3500a72028fb9dba1d87b05b6c5",
+        "ended_at": "2026-01-15T12:30:05Z",
+        "evidence_type": "run",
+        "exit_code": 0,
+        "lease_id": "cbx_sep001",
+        "provider": "aws",
+        "run_id": "run_ps001",
+        "run_status": "succeeded",
+        "schema_version": 1,
+        "started_at": "2026-01-15T12:30:00Z",
+        "sync_ms": 50,
+        "total_ms": 150
+      },
+      "expected": "accept"
+    },
+    {
+      "name": "golden-combined-separators",
+      "evidence": {
+        "command_ms": 100,
+        "command_text": "echo \u2028line1\u2029para2\u2028end",
+        "digest": "d6e1a229dfe20ffb159a8a481e54b4dc55a8271618c28e104138de66a2c6b591",
+        "ended_at": "2026-01-15T12:30:05Z",
+        "evidence_type": "run",
+        "exit_code": 0,
+        "lease_id": "cbx_sep001",
+        "provider": "aws",
+        "run_id": "run_cs001",
+        "run_status": "succeeded",
+        "schema_version": 1,
+        "started_at": "2026-01-15T12:30:00Z",
+        "sync_ms": 50,
+        "total_ms": 150
+      },
+      "expected": "accept"
+    },
+    {
+      "name": "golden-unicode-escaping",
+      "evidence": {
+        "command_ms": 100,
+        "command_text": "echo \"\u2028\u2029h\u00e9llo\ud83d\ude80\u2028\"",
+        "digest": "5b82d3a303cd40a56194b57f42f81d7f334ccf849c81c219500ac80d0d09edc3",
+        "ended_at": "2026-01-15T12:30:05Z",
+        "evidence_type": "run",
+        "exit_code": 0,
+        "label": "\u751f\u6001\u7cfb\u2028\u30c6\u30b9\u30c8",
+        "lease_id": "cbx_sep001",
+        "provider": "aws",
+        "run_id": "run_ue001",
+        "run_status": "succeeded",
+        "schema_version": 1,
+        "started_at": "2026-01-15T12:30:00Z",
+        "sync_ms": 50,
+        "total_ms": 150
+      },
+      "expected": "accept"
+    },
+    {
+      "name": "tampered-digest",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": "reject",
+      "error_contains": "digest"
+    },
+    {
+      "name": "too-many-runner-phases",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "runner_phases": [
+          {
+            "name": "p0",
+            "ms": 0,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p1",
+            "ms": 1,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p2",
+            "ms": 2,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p3",
+            "ms": 3,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p4",
+            "ms": 4,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p5",
+            "ms": 5,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p6",
+            "ms": 6,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p7",
+            "ms": 7,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p8",
+            "ms": 8,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p9",
+            "ms": 9,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p10",
+            "ms": 10,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p11",
+            "ms": 11,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p12",
+            "ms": 12,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p13",
+            "ms": 13,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p14",
+            "ms": 14,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p15",
+            "ms": 15,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p16",
+            "ms": 16,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p17",
+            "ms": 17,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p18",
+            "ms": 18,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p19",
+            "ms": 19,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p20",
+            "ms": 20,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p21",
+            "ms": 21,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p22",
+            "ms": 22,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p23",
+            "ms": 23,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p24",
+            "ms": 24,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p25",
+            "ms": 25,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p26",
+            "ms": 26,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p27",
+            "ms": 27,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p28",
+            "ms": 28,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p29",
+            "ms": 29,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p30",
+            "ms": 30,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p31",
+            "ms": 31,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p32",
+            "ms": 32,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p33",
+            "ms": 33,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p34",
+            "ms": 34,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p35",
+            "ms": 35,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p36",
+            "ms": 36,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p37",
+            "ms": 37,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p38",
+            "ms": 38,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p39",
+            "ms": 39,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p40",
+            "ms": 40,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p41",
+            "ms": 41,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p42",
+            "ms": 42,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p43",
+            "ms": 43,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p44",
+            "ms": 44,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p45",
+            "ms": 45,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p46",
+            "ms": 46,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p47",
+            "ms": 47,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p48",
+            "ms": 48,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p49",
+            "ms": 49,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p50",
+            "ms": 50,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p51",
+            "ms": 51,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p52",
+            "ms": 52,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p53",
+            "ms": 53,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p54",
+            "ms": 54,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p55",
+            "ms": 55,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p56",
+            "ms": 56,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p57",
+            "ms": 57,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p58",
+            "ms": 58,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p59",
+            "ms": 59,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p60",
+            "ms": 60,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p61",
+            "ms": 61,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p62",
+            "ms": 62,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p63",
+            "ms": 63,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p64",
+            "ms": 64,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p65",
+            "ms": 65,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p66",
+            "ms": 66,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p67",
+            "ms": 67,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p68",
+            "ms": 68,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p69",
+            "ms": 69,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p70",
+            "ms": 70,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p71",
+            "ms": 71,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p72",
+            "ms": 72,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p73",
+            "ms": 73,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p74",
+            "ms": 74,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p75",
+            "ms": 75,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p76",
+            "ms": 76,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p77",
+            "ms": 77,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p78",
+            "ms": 78,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p79",
+            "ms": 79,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p80",
+            "ms": 80,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p81",
+            "ms": 81,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p82",
+            "ms": 82,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p83",
+            "ms": 83,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p84",
+            "ms": 84,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p85",
+            "ms": 85,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p86",
+            "ms": 86,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p87",
+            "ms": 87,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p88",
+            "ms": 88,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p89",
+            "ms": 89,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p90",
+            "ms": 90,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p91",
+            "ms": 91,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p92",
+            "ms": 92,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p93",
+            "ms": 93,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p94",
+            "ms": 94,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p95",
+            "ms": 95,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p96",
+            "ms": 96,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p97",
+            "ms": 97,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p98",
+            "ms": 98,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p99",
+            "ms": 99,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p100",
+            "ms": 100,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p101",
+            "ms": 101,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p102",
+            "ms": 102,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p103",
+            "ms": 103,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p104",
+            "ms": 104,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p105",
+            "ms": 105,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p106",
+            "ms": 106,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p107",
+            "ms": 107,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p108",
+            "ms": 108,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p109",
+            "ms": 109,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p110",
+            "ms": 110,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p111",
+            "ms": 111,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p112",
+            "ms": 112,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p113",
+            "ms": 113,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p114",
+            "ms": 114,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p115",
+            "ms": 115,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p116",
+            "ms": 116,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p117",
+            "ms": 117,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p118",
+            "ms": 118,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p119",
+            "ms": 119,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p120",
+            "ms": 120,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p121",
+            "ms": 121,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p122",
+            "ms": 122,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p123",
+            "ms": 123,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p124",
+            "ms": 124,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p125",
+            "ms": 125,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p126",
+            "ms": 126,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p127",
+            "ms": 127,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p128",
+            "ms": 128,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p129",
+            "ms": 129,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p130",
+            "ms": 130,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p131",
+            "ms": 131,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p132",
+            "ms": 132,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p133",
+            "ms": 133,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p134",
+            "ms": 134,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p135",
+            "ms": 135,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p136",
+            "ms": 136,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p137",
+            "ms": 137,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p138",
+            "ms": 138,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p139",
+            "ms": 139,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p140",
+            "ms": 140,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p141",
+            "ms": 141,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p142",
+            "ms": 142,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p143",
+            "ms": 143,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p144",
+            "ms": 144,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p145",
+            "ms": 145,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p146",
+            "ms": 146,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p147",
+            "ms": 147,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p148",
+            "ms": 148,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p149",
+            "ms": 149,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p150",
+            "ms": 150,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p151",
+            "ms": 151,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p152",
+            "ms": 152,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p153",
+            "ms": 153,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p154",
+            "ms": 154,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p155",
+            "ms": 155,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p156",
+            "ms": 156,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p157",
+            "ms": 157,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p158",
+            "ms": 158,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p159",
+            "ms": 159,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p160",
+            "ms": 160,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p161",
+            "ms": 161,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p162",
+            "ms": 162,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p163",
+            "ms": 163,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p164",
+            "ms": 164,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p165",
+            "ms": 165,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p166",
+            "ms": 166,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p167",
+            "ms": 167,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p168",
+            "ms": 168,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p169",
+            "ms": 169,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p170",
+            "ms": 170,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p171",
+            "ms": 171,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p172",
+            "ms": 172,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p173",
+            "ms": 173,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p174",
+            "ms": 174,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p175",
+            "ms": 175,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p176",
+            "ms": 176,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p177",
+            "ms": 177,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p178",
+            "ms": 178,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p179",
+            "ms": 179,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p180",
+            "ms": 180,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p181",
+            "ms": 181,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p182",
+            "ms": 182,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p183",
+            "ms": 183,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p184",
+            "ms": 184,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p185",
+            "ms": 185,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p186",
+            "ms": 186,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p187",
+            "ms": 187,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p188",
+            "ms": 188,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p189",
+            "ms": 189,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p190",
+            "ms": 190,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p191",
+            "ms": 191,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p192",
+            "ms": 192,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p193",
+            "ms": 193,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p194",
+            "ms": 194,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p195",
+            "ms": 195,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p196",
+            "ms": 196,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p197",
+            "ms": 197,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p198",
+            "ms": 198,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          },
+          {
+            "name": "p199",
+            "ms": 199,
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          }
+        ]
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "too-many-artifacts",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "artifacts": [
+          {
+            "kind": "log",
+            "path": "f0.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f1.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f2.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f3.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f4.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f5.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f6.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f7.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f8.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f9.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f10.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f11.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f12.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f13.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f14.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f15.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f16.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f17.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f18.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f19.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f20.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f21.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f22.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f23.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f24.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f25.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f26.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f27.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f28.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f29.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f30.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f31.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f32.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f33.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f34.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f35.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f36.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f37.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f38.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f39.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f40.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f41.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f42.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f43.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f44.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f45.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f46.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f47.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f48.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f49.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f50.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f51.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f52.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f53.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f54.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f55.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f56.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f57.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f58.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f59.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f60.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f61.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f62.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f63.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f64.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f65.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f66.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f67.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f68.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f69.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f70.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f71.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f72.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f73.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f74.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f75.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f76.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f77.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f78.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f79.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f80.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f81.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f82.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f83.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f84.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f85.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f86.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f87.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f88.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f89.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f90.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f91.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f92.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f93.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f94.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f95.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f96.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f97.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f98.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f99.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f100.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f101.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f102.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f103.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f104.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f105.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f106.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f107.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f108.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f109.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f110.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f111.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f112.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f113.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f114.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f115.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f116.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f117.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f118.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f119.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f120.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f121.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f122.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f123.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f124.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f125.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f126.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f127.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f128.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f129.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f130.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f131.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f132.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f133.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f134.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f135.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f136.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f137.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f138.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f139.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f140.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f141.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f142.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f143.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f144.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f145.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f146.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f147.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f148.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f149.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f150.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f151.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f152.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f153.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f154.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f155.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f156.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f157.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f158.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f159.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f160.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f161.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f162.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f163.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f164.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f165.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f166.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f167.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f168.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f169.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f170.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f171.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f172.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f173.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f174.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f175.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f176.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f177.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f178.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f179.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f180.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f181.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f182.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f183.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f184.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f185.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f186.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f187.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f188.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f189.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f190.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f191.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f192.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f193.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f194.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f195.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f196.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f197.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f198.log",
+            "bytes": 1
+          },
+          {
+            "kind": "log",
+            "path": "f199.log",
+            "bytes": 1
+          }
+        ]
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "missing-evidence-type",
+      "evidence": {
+        "schema_version": 1,
+        "provider": "test",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "missing-schema-version",
+      "evidence": {
+        "evidence_type": "run",
+        "provider": "test",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "missing-run-status",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "exit_code": 0,
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "missing-digest",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "exit_code": 0,
+        "run_status": "succeeded"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "exit-code-unsafe-integer",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "exit_code": 9007199254740992,
+        "run_status": "failed",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject",
+      "error_contains": "safe"
+    },
+    {
+      "name": "negative-sync-transfer-bytes",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sync_transfer_bytes": -1
+      },
+      "expected": "reject",
+      "error_contains": "non-negative"
+    },
+    {
+      "name": "negative-sync-transfer-files",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sync_transfer_files": -1
+      },
+      "expected": "reject",
+      "error_contains": "non-negative"
+    },
+    {
+      "name": "runner-phase-missing-ms",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "runner_phases": [
+          {
+            "name": "p1",
+            "lease_id": "l",
+            "run_id": "r",
+            "machine_type": "m"
+          }
+        ]
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "sync-phase-unknown-field",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sync_phases": [
+          {
+            "name": "sync",
+            "ms": 1,
+            "evil": true
+          }
+        ]
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "command-phase-unknown-field",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "command_phases": [
+          {
+            "name": "cmd",
+            "ms": 1,
+            "extra": "bad"
+          }
+        ]
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "artifact-missing-kind",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "artifacts": [
+          {
+            "path": "f.log",
+            "bytes": 1
+          }
+        ]
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "artifact-negative-bytes",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "artifacts": [
+          {
+            "kind": "log",
+            "path": "f.log",
+            "bytes": -1
+          }
+        ]
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "artifact-unknown-field",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "artifacts": [
+          {
+            "kind": "log",
+            "path": "f.log",
+            "bytes": 1,
+            "evil": true
+          }
+        ]
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "startup-confirm-missing-stage",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "startup_confirm": {
+          "duration_ms": 100,
+          "ready": true
+        }
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "startup-confirm-missing-ready",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "startup_confirm": {
+          "stage": "timeout-window",
+          "duration_ms": 100
+        }
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "startup-confirm-negative-duration",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "startup_confirm": {
+          "stage": "timeout-window",
+          "duration_ms": -1,
+          "ready": true
+        }
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "invalid-status-unknown",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "exit_code": 0,
+        "run_status": "unknown",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "timed-out-with-zero-exit",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "exit_code": 0,
+        "run_status": "timed-out",
+        "error_kind": "timeout",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "wrong-type-run-id-number",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "run_id": 123,
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "wrong-type-lease-id-number",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "lease_id": 123,
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "wrong-type-slug-number",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "slug": 123,
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "wrong-type-label-number",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "label": 123,
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "wrong-type-machine-type-number",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "machine_type": 123,
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "wrong-type-command-text-number",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "command_text": 123,
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "wrong-type-sync-mode-number",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "sync_mode": 123,
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "wrong-type-sync-fallback-reason-number",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "sync_fallback_reason": 123,
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "wrong-type-blocked-stage-number",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "blocked_stage": 123,
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "wrong-type-resource-exhaustion-number",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "resource_exhaustion": 123,
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "wrong-type-retry-likely-number",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "retry_likely": 123,
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "wrong-type-failure-hint-number",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "failure_hint": 123,
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "wrong-type-started-at-number",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "started_at": 123,
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "wrong-type-ended-at-number",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "ended_at": 123,
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "wrong-type-sync-delegated-string",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "sync_delegated": "true",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "wrong-type-sync-skipped-string",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "sync_skipped": "false",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "wrong-type-error-kind-number",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "test",
+        "error_kind": 123,
+        "exit_code": 1,
+        "run_status": "failed",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    },
+    {
+      "name": "empty-provider",
+      "evidence": {
+        "schema_version": 1,
+        "evidence_type": "run",
+        "provider": "",
+        "exit_code": 0,
+        "run_status": "succeeded",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": "reject"
+    }
+  ]
+}

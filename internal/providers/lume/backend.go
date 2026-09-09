@@ -42,6 +42,10 @@ type lumeRunOwner struct {
 	StartIdentity string
 	BootIdentity  string
 	LogPath       string
+	// StartupConfirm captures the final startup confirmation result from
+	// the survival window. It is populated even on success so callers can
+	// record structured startup evidence for provider qualification.
+	StartupConfirm shared.StartupConfirmResult
 }
 
 type bootstrapTrust struct {
@@ -395,25 +399,45 @@ func (b *backend) Acquire(ctx context.Context, req AcquireRequest) (LeaseTarget,
 		return LeaseTarget{}, cleanupUnclaimedVM(err)
 	}
 	defer removeBootstrapTrust(trust)
-	runOwner, err := b.startVM(ctx, cfg, name, trust, launchToken, func(started lumeRunOwner) error {
-		labels["state"] = "starting"
-		labels["run_owner_pending"] = "false"
-		labels["run_owner_pid"] = strconv.Itoa(started.PID)
-		labels["run_owner_started_at"] = started.StartedAt.UTC().Format(time.RFC3339Nano)
-		labels["run_owner_start_identity"] = started.StartIdentity
-		labels["run_owner_boot_identity"] = started.BootIdentity
-		labels["run_log"] = started.LogPath
-		updated, updateErr := core.UpdateLeaseClaimLabelsIfUnchanged(leaseID, persistedClaim, labels)
-		if updateErr == nil {
-			persistedClaim = updated
-		}
-		return updateErr
+	handle, err := b.supervisor.Start(ctx, shared.ProcessStartRequest{
+		Name: name,
+		Keep: req.Keep,
+		Data: &LumeLaunchContext{
+			Trust:       trust,
+			LaunchToken: launchToken,
+			OnStarted: func(started lumeRunOwner) error {
+				labels["state"] = "starting"
+				labels["run_owner_pending"] = "false"
+				labels["run_owner_pid"] = strconv.Itoa(started.PID)
+				labels["run_owner_started_at"] = started.StartedAt.UTC().Format(time.RFC3339Nano)
+				labels["run_owner_start_identity"] = started.StartIdentity
+				labels["run_owner_boot_identity"] = started.BootIdentity
+				labels["run_log"] = started.LogPath
+				updated, updateErr := core.UpdateLeaseClaimLabelsIfUnchanged(leaseID, persistedClaim, labels)
+				if updateErr == nil {
+					persistedClaim = updated
+				}
+				return updateErr
+			},
+		},
 	})
-	owner = runOwner
 	if err != nil {
 		return LeaseTarget{}, cleanupUnclaimedVM(err)
 	}
-	inst, err := b.waitForRunningVM(ctx, cfg, name, runOwner, releaseCapacity)
+	// The shared ProcessSupervisor returns shared.ProcessHandle, but Lume's
+	// detached-process model means the handle carries provider-specific launch
+	// context (owner callback, boot identity, CAS label) that core does not
+	// understand. The LumeHandle interface extends ProcessHandle with Owner(),
+	// so this assertion is to an interface, not a concrete struct — tests
+	// may substitute any handle implementing both. This is in the Lume
+	// provider adapter, not in core, so it does not violate the architecture
+	// boundary.
+	lumeHandle, ok := handle.(LumeHandle)
+	if !ok {
+		return LeaseTarget{}, cleanupUnclaimedVM(exit(5, "lume supervisor returned unexpected handle type %T", handle))
+	}
+	owner = lumeHandle.Owner()
+	inst, err := b.waitForRunningVM(ctx, cfg, name, owner, releaseCapacity)
 	if err != nil {
 		return LeaseTarget{}, cleanupUnclaimedVM(err)
 	}
@@ -443,6 +467,17 @@ func (b *backend) Acquire(ctx context.Context, req AcquireRequest) (LeaseTarget,
 	}
 	persistedClaim = updatedClaim
 	cleanupKey = false
+	// Propagate the startup confirmation result into the lease target so
+	// it reaches the timing report and RunEvidenceV1.
+	if sc := owner.StartupConfirm; sc.Stage != "" {
+		lease.StartupConfirm = &core.StartupConfirmSummary{
+			Stage:         sc.Stage,
+			DurationMs:    sc.Duration.Milliseconds(),
+			Ready:         sc.Ready,
+			ProcessExited: sc.ProcessExited,
+			Retryable:     sc.Retryable,
+		}
+	}
 	fmt.Fprintf(b.rt.Stderr, "provisioned lease=%s instance=%s state=ready\n", leaseID, name)
 	return lease, nil
 }
@@ -863,7 +898,13 @@ exec "$@"`
 	}
 	exitCh := make(chan error, 1)
 	go func() { exitCh <- cmd.Wait() }()
-	if err := waitForLaunchHandoff(ctx, handoff.OwnerPath, strconv.Itoa(owner.PID), exitCh); err != nil {
+	ownerConfirm := shared.FileHandoffConfirm{
+		Path:            handoff.OwnerPath,
+		ExpectedContent: strconv.Itoa(owner.PID),
+		Timeout:         2 * time.Second,
+		PollInterval:    10 * time.Millisecond,
+	}
+	if _, err := ownerConfirm.Wait(ctx, exitCh); err != nil {
 		_ = cmd.Process.Kill()
 		return owner, exit(2, "lume run %s: establish launch handoff: %v", name, err)
 	}
@@ -877,30 +918,40 @@ exec "$@"`
 		_ = cmd.Process.Kill()
 		return owner, exit(2, "lume run %s: release launch gate: %v", name, err)
 	}
-	if err := waitForLaunchHandoff(ctx, handoff.AckPath, "ready", exitCh); err != nil {
+	ackConfirm := shared.FileHandoffConfirm{
+		Path:            handoff.AckPath,
+		ExpectedContent: "ready",
+		Timeout:         2 * time.Second,
+		PollInterval:    10 * time.Millisecond,
+	}
+	if _, err := ackConfirm.Wait(ctx, exitCh); err != nil {
 		_ = cmd.Process.Kill()
 		return owner, exit(2, "lume run %s: confirm launch gate: %v", name, err)
 	}
-	select {
-	case <-ctx.Done():
-		_ = cmd.Process.Signal(os.Interrupt)
-		return owner, exit(2, "lume run %s: context cancelled during startup", name)
-	case err := <-exitCh:
+	// After the ack, the launcher has exec'd into lume and the survival window
+	// begins. Use the shared TimeoutWindowConfirm strategy instead of a local
+	// select — semantically identical but routed through the shared interface.
+	survivalConfirm := shared.TimeoutWindowConfirm{Timeout: b.startupObserveTimeout}
+	survivalResult, err := survivalConfirm.Wait(ctx, exitCh)
+	if err != nil {
 		_ = detachedStderr.Sync()
 		if _, seekErr := detachedStderr.Seek(0, io.SeekStart); seekErr == nil {
 			_, _ = io.Copy(&stderrBuf, io.LimitReader(detachedStderr, 64<<10))
 		}
 		detail := strings.TrimSpace(stderrBuf.String())
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			_ = cmd.Process.Signal(os.Interrupt)
+			owner.StartupConfirm = survivalResult
+			return owner, exit(2, "lume run %s: context cancelled during startup: %v", name, err)
+		}
+		owner.StartupConfirm = survivalResult
 		if detail != "" {
 			return owner, exit(2, "lume run %s failed during startup: %s", name, detail)
 		}
-		if err != nil {
-			return owner, exit(2, "lume run %s failed during startup: %v", name, err)
-		}
-		return owner, exit(2, "lume run %s exited unexpectedly during startup", name)
-	case <-time.After(b.startupObserveTimeout):
-		return owner, nil
+		return owner, exit(2, "lume run %s failed during startup: %v", name, err)
 	}
+	owner.StartupConfirm = survivalResult
+	return owner, nil
 }
 
 type launchHandoff struct {
@@ -944,25 +995,17 @@ func prepareLaunchHandoff(token string) (launchHandoff, error) {
 	return handoff, nil
 }
 
+// waitForLaunchHandoff is retained for backward compatibility; new code uses
+// shared.FileHandoffConfirm directly. It delegates to the shared strategy.
 func waitForLaunchHandoff(ctx context.Context, path, expected string, exitCh <-chan error) error {
-	deadline := time.NewTimer(2 * time.Second)
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer deadline.Stop()
-	defer ticker.Stop()
-	for {
-		if data, err := os.ReadFile(path); err == nil && strings.TrimSpace(string(data)) == expected {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case err := <-exitCh:
-			return fmt.Errorf("launcher exited before handoff: %v", err)
-		case <-deadline.C:
-			return fmt.Errorf("timed out waiting for %s", filepath.Base(path))
-		case <-ticker.C:
-		}
+	confirm := shared.FileHandoffConfirm{
+		Path:            path,
+		ExpectedContent: expected,
+		Timeout:         2 * time.Second,
+		PollInterval:    10 * time.Millisecond,
 	}
+	_, err := confirm.Wait(ctx, exitCh)
+	return err
 }
 
 func lumeRunLogPath(name string) (string, error) {

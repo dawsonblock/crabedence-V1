@@ -17,55 +17,67 @@ type ProcessSupervisor interface {
 	Start(ctx context.Context, req ProcessStartRequest) (ProcessHandle, error)
 }
 
-// ProcessStartRequest configures a supervised process launch.
+// ProcessStartRequest configures a supervised process launch. Name, Keep,
+// and ObserveTimeout are consumed by all supervisors. Data carries
+// provider-specific launch context (e.g. Lume's bootstrap trust, launch
+// token, and owner callback) that the provider's supervisor type-asserts.
+// This is not aspirational — it is the minimal escape hatch for context
+// that is genuinely provider-specific and cannot be generalized.
 type ProcessStartRequest struct {
 	// Name is the VM/instance name for diagnostics.
 	Name string
-	// Command is the executable and arguments.
-	Command []string
-	// Env is the child environment.
-	Env []string
 	// Keep survives caller context cancellation after a successful handoff.
 	Keep bool
-	// LogPath is the stderr capture path. Empty uses a temporary file.
-	LogPath string
-	// Detached sets a new session (setsid) for the child on POSIX.
-	Detached bool
 	// ObserveTimeout is the startup observation window after the process
-	// starts. If StartupConfirm is nil, the process is considered ready if
-	// it survives this window without exiting.
+	// starts.
 	ObserveTimeout time.Duration
-	// StartupConfirm waits for readiness. nil uses the timeout window.
-	StartupConfirm ProcessStartupConfirm
+	// Data carries provider-specific launch context. Each provider's
+	// supervisor type-asserts this to its own concrete type. nil is
+	// valid and means "use defaults" (used by tests and the generic path).
+	Data any
 }
 
-// ProcessStartupConfirm waits for the process to become ready. It returns nil
-// when the process is ready, or an error if it exits or the context is
-// cancelled before readiness.
+// ProcessStartupConfirm waits for the process to become ready. It returns a
+// StartupConfirmResult and an error: the result is populated even on failure,
+// so callers can record startup evidence (stage, duration, outcome) for
+// provider qualification.
+//
+// The Wait signature no longer takes a ProcessHandle parameter. The
+// strategies only need the caller's context and the process-exit error
+// channel (exited). The exit channel is provided by the supervisor, which
+// derives it from the process's exit observation (if available). This
+// change ensures startup confirmation strategies request only the
+// capabilities they actually require.
 type ProcessStartupConfirm interface {
-	Wait(ctx context.Context, handle ProcessHandle, exited <-chan error) error
+	Wait(ctx context.Context, exited <-chan error) (StartupConfirmResult, error)
 }
 
-// ProcessHandle controls a started process. It is returned by Start and is
-// the sole interface for lifecycle control after spawn.
-type ProcessHandle interface {
-	// PID returns the operating-system process ID.
-	PID() int
-	// Kill sends SIGKILL (or equivalent) to the process. Returns
-	// os.ErrProcessDone if the process has already exited.
-	Kill() error
-	// Abort snapshots diagnostics, cancels readiness, kills the process if
-	// still running, reaps it, and closes the log. Returns the joined error.
-	Abort(readinessErr error) error
-	// Handoff is the acquisition commit point. It closes the log, detaches
-	// the startup context, and (for non-keep) installs a caller-context
-	// watcher that kills the process when the caller is cancelled.
-	Handoff() error
-	// Stderr returns captured startup diagnostics (valid after Abort).
-	Stderr() string
-	// Done is closed when the process has exited and been reaped.
-	Done() <-chan struct{}
+// StartupConfirmResult captures the outcome of a startup confirmation wait.
+// It is populated even when Wait returns an error, so callers can record
+// structured startup evidence for provider qualification.
+type StartupConfirmResult struct {
+	// Stage identifies the confirmation strategy: "timeout-window",
+	// "file-handoff", or "process-exit".
+	Stage string
+	// Duration is the elapsed time from Wait start to outcome.
+	Duration time.Duration
+	// Ready is true if the process was confirmed ready.
+	Ready bool
+	// ProcessExited is true if the process exited during confirmation
+	// (distinguishing exit-based failures from timeout/cancellation).
+	ProcessExited bool
+	// Retryable is true if the failure is likely to succeed on retry
+	// (e.g. timeout, transient file error). False for process exits and
+	// persistent I/O errors.
+	Retryable bool
 }
+
+// ProcessHandle is now defined in process_capabilities.go as a narrow
+// interface with only PID() and Abort(). The previous monolithic interface
+// that included Kill, Handoff, Stderr, Done, and Context has been split
+// into capability interfaces (ProcessKiller, ProcessHandoff, ProcessStderr,
+// ExitObservable, LifecycleContextProvider, DetachedProcess).
+// FullProcessHandle is the backward-compatible superset.
 
 // FakeProcessSupervisor is a test-only ProcessSupervisor that never spawns
 // real processes. It records Start calls and returns configurable handles.
@@ -110,11 +122,12 @@ func (s *FakeProcessSupervisor) Handles() []ProcessHandle {
 
 // Start implements ProcessSupervisor. It records the request and returns a
 // fake handle. The handle's PID increments per call to avoid collisions.
+// If SetNextStartOK(false) has been called, Start returns context.Canceled.
 func (s *FakeProcessSupervisor) Start(_ context.Context, req ProcessStartRequest) (ProcessHandle, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.starts = append(s.starts, FakeProcessStart{Request: req})
-	if !s.nextStartOK && len(s.handles) > 0 {
+	if !s.nextStartOK {
 		return nil, context.Canceled
 	}
 	h := &fakeProcessHandle{
@@ -127,21 +140,30 @@ func (s *FakeProcessSupervisor) Start(_ context.Context, req ProcessStartRequest
 }
 
 type fakeProcessHandle struct {
-	pid     int
-	done    chan struct{}
-	aborted chan struct{}
-	handed  bool
-	killed  bool
+	pid       int
+	done      chan struct{}
+	aborted   chan struct{}
+	handed    bool
+	killed    bool
+	abortOnce sync.Once
+	doneOnce  sync.Once
 }
 
 func (h *fakeProcessHandle) PID() int              { return h.pid }
 func (h *fakeProcessHandle) Kill() error           { h.killed = true; return nil }
 func (h *fakeProcessHandle) Stderr() string        { return "" }
 func (h *fakeProcessHandle) Done() <-chan struct{} { return h.done }
+func (h *fakeProcessHandle) Context() context.Context {
+	return context.Background()
+}
 
 func (h *fakeProcessHandle) Abort(readinessErr error) error {
-	close(h.aborted)
-	close(h.done)
+	h.abortOnce.Do(func() {
+		close(h.aborted)
+	})
+	h.doneOnce.Do(func() {
+		close(h.done)
+	})
 	return readinessErr
 }
 
@@ -162,3 +184,6 @@ func (h *fakeProcessHandle) Aborted() bool {
 
 // HandedOff is a test helper that returns whether Handoff was called.
 func (h *fakeProcessHandle) HandedOff() bool { return h.handed }
+
+// Compile-time check that *fakeProcessHandle satisfies FullProcessHandle.
+var _ FullProcessHandle = (*fakeProcessHandle)(nil)

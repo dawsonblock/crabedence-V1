@@ -30,10 +30,40 @@ func (s *lumeProcessSupervisor) StartupConfirm() shared.ProcessStartupConfirm {
 	}
 }
 
+// LumeLaunchContext carries the provider-specific data that Lume's Acquire
+// passes through the supervisor to startVM. It is carried in
+// ProcessStartRequest.Data and type-asserted by lumeProcessSupervisor.Start.
+type LumeLaunchContext struct {
+	Trust       bootstrapTrust
+	LaunchToken string
+	OnStarted   func(lumeRunOwner) error
+}
+
+// LumeHandle is a ProcessHandle that also exposes Lume's run-owner identity.
+// The Lume supervisor returns handles that satisfy this interface; Acquire
+// uses it to extract provider-specific context (owner PID, boot identity,
+// log path) without reaching into a concrete struct. Tests may substitute
+// any handle implementing both shared.ProcessHandle and Owner().
+type LumeHandle interface {
+	shared.ProcessHandle
+	Owner() lumeRunOwner
+}
+
+// Owner returns the underlying lumeRunOwner. This is used by Acquire after
+// a successful supervisor Start to access the owner identity for label
+// persistence and recovery.
+func (h *lumeProcessHandle) Owner() lumeRunOwner { return h.owner }
+
 func (s *lumeProcessSupervisor) Start(ctx context.Context, req shared.ProcessStartRequest) (shared.ProcessHandle, error) {
-	owner, err := s.backend.startVM(ctx, s.backend.configForRun(), req.Name, bootstrapTrust{}, "", func(started lumeRunOwner) error {
-		return nil
-	})
+	trust := bootstrapTrust{}
+	launchToken := ""
+	var onStarted func(lumeRunOwner) error
+	if lc, ok := req.Data.(*LumeLaunchContext); ok && lc != nil {
+		trust = lc.Trust
+		launchToken = lc.LaunchToken
+		onStarted = lc.OnStarted
+	}
+	owner, err := s.backend.startVM(ctx, s.backend.configForRun(), req.Name, trust, launchToken, onStarted)
 	if err != nil {
 		return nil, err
 	}
@@ -41,23 +71,35 @@ func (s *lumeProcessSupervisor) Start(ctx context.Context, req shared.ProcessSta
 }
 
 // lumeProcessHandle wraps a lumeRunOwner and the backend's stop logic to
-// satisfy shared.ProcessHandle.
+// satisfy shared.ProcessHandle. Because Lume's startVM spawns a detached
+// process that the CLI does not directly wait on, this handle implements
+// shared.ProcessHandle, shared.ProcessKiller, shared.ProcessHandoff,
+// shared.ProcessStderr, and shared.DetachedProcess — but NOT
+// shared.ExitObservable, shared.ReapableProcess, or
+// shared.LifecycleContextProvider.
+//
+// The previous monolithic ProcessHandle forced Lume to implement Done() and
+// Context() with weaker semantics that did not truthfully represent the
+// process's lifecycle. With the capability split, Lume explicitly advertises
+// that it is detached, and callers that need exit observation or
+// process-scoped context must use a provider that truthfully implements
+// those interfaces (e.g. Tart).
+//
+// Abort() is idempotent and signals the process but does not wait for
+// reaping (the process is detached).
 type lumeProcessHandle struct {
-	owner   lumeRunOwner
-	backend *backend
-	mu      sync.Mutex
-	aborted bool
-	done    chan struct{}
+	owner     lumeRunOwner
+	backend   *backend
+	mu        sync.Mutex
+	aborted   bool
+	done      chan struct{}
+	doneOnce  sync.Once
+	abortOnce sync.Once
 }
 
-func (h *lumeProcessHandle) ensureDone() chan struct{} {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.done == nil {
-		h.done = make(chan struct{})
-	}
-	return h.done
-}
+// Detached returns true because Lume's process is detached from the CLI's
+// lifecycle. The CLI does not own the child process after handoff.
+func (h *lumeProcessHandle) Detached() bool { return true }
 
 func (h *lumeProcessHandle) PID() int { return h.owner.PID }
 
@@ -71,13 +113,15 @@ func (h *lumeProcessHandle) Kill() error {
 	return signalProcessInterrupt(h.owner.PID)
 }
 
+// Abort is idempotent. It signals the process and closes Done. It does not
+// wait for the process to actually exit because Lume's process is detached.
 func (h *lumeProcessHandle) Abort(readinessErr error) error {
-	h.mu.Lock()
-	h.aborted = true
-	h.mu.Unlock()
-	_ = h.Kill()
-	done := h.ensureDone()
-	close(done)
+	h.abortOnce.Do(func() {
+		_ = h.Kill()
+	})
+	h.doneOnce.Do(func() {
+		close(h.ensureDone())
+	})
 	return readinessErr
 }
 
@@ -99,10 +143,27 @@ func (h *lumeProcessHandle) Stderr() string {
 	return string(data)
 }
 
-func (h *lumeProcessHandle) Done() <-chan struct{} {
-	return h.ensureDone()
+// ensureDone and the Done method are retained as internal infrastructure
+// for Abort's signaling, but Done() is NOT exported as part of the
+// ExitObservable interface. Lume does not implement ExitObservable because
+// its Done channel is only closed on Abort, not on natural process exit.
+func (h *lumeProcessHandle) ensureDone() chan struct{} {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.done == nil {
+		h.done = make(chan struct{})
+	}
+	return h.done
 }
 
-// Compile-time checks.
+// Compile-time checks. Lume implements ProcessHandle (PID + Abort),
+// ProcessKiller, ProcessHandoff, ProcessStderr, and DetachedProcess.
+// It does NOT implement ExitObservable, ReapableProcess, or
+// LifecycleContextProvider because its process is detached.
 var _ shared.ProcessSupervisor = (*lumeProcessSupervisor)(nil)
 var _ shared.ProcessHandle = (*lumeProcessHandle)(nil)
+var _ shared.ProcessKiller = (*lumeProcessHandle)(nil)
+var _ shared.ProcessHandoff = (*lumeProcessHandle)(nil)
+var _ shared.ProcessStderr = (*lumeProcessHandle)(nil)
+var _ shared.DetachedProcess = (*lumeProcessHandle)(nil)
+var _ LumeHandle = (*lumeProcessHandle)(nil)

@@ -59,7 +59,12 @@ describe("PostgresCoordinatorStorage", () => {
       (text: string, values?: unknown[]) => Promise<QueryResult<QueryResultRow>>
     >(async (text) => queryResult([{ acquired: text.includes("try_advisory_lock") }]));
     const release = vi.fn<() => void>();
-    const client = { query: clientQuery, release } as unknown as PoolClient;
+    const client = {
+      query: clientQuery,
+      release,
+      on: vi.fn(),
+      removeAllListeners: vi.fn(),
+    } as unknown as PoolClient;
     const connect = vi.fn<() => Promise<PoolClient>>(async () => client);
     const pool = {
       query: fakePoolQuery(),
@@ -109,7 +114,12 @@ describe("PostgresCoordinatorStorage", () => {
       queryResult([{ acquired: true }]),
     );
     const release = vi.fn<() => void>();
-    const client = { query: clientQuery, release } as unknown as PoolClient;
+    const client = {
+      query: clientQuery,
+      release,
+      on: vi.fn(),
+      removeAllListeners: vi.fn(),
+    } as unknown as PoolClient;
     const pool = {
       query: fakePoolQuery(),
       connect: vi.fn<() => Promise<PoolClient>>(async () => client),

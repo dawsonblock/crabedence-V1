@@ -998,10 +998,11 @@ export interface RunRecord {
   terminalReceipt?: TerminalRunReceipt;
   terminalFinishSHA256?: string;
   terminalLogPrefix?: string;
+  evidence?: RunEvidenceV1;
 }
 
 export interface TerminalRunReceipt {
-  schema_version: 2;
+  schema_version: 2 | 3;
   receipt_type: "terminal";
   started_at: string;
   ended_at: string;
@@ -1018,20 +1019,24 @@ export interface TerminalRunReceipt {
   log_sha256: string;
   retained_log_sha256: string;
   log_truncated: boolean;
+  /** SHA-256 digest of the RunEvidenceV1, bound into the signed receipt payload (v3+). */
+  evidence_sha256?: string;
   public_key: string;
   signer: string;
   signature: string;
 }
 
 /**
- * RunEvidenceV1 is a provider-neutral, versioned, machine-verifiable record of
- * a single run's outcome. It normalizes RunResult + TimingReport into a
- * portable format that can be stored, compared, and audited across the CLI,
- * the coordinator, and provider qualification pipelines.
+ * RunEvidenceV1 is a provider-neutral, versioned run outcome record. It
+ * normalizes RunResult + TimingReport into a portable format that can be
+ * stored, compared, and audited across the CLI, the coordinator, and
+ * provider qualification pipelines.
  *
  * The digest covers all fields except the digest itself (SHA-256 over the
- * canonical JSON encoding with digest set to ""), so any tampering is
- * detectable. This mirrors the TerminalRunReceipt signing model.
+ * canonical JSON encoding with digest set to ""). The digest is an integrity
+ * checksum, NOT a cryptographic signature. Authenticity is established by
+ * binding the evidence digest into the Ed25519-signed TerminalRunReceipt
+ * (evidence_sha256 field in receipt v3+), which the coordinator verifies.
  */
 export interface RunEvidenceV1 {
   schema_version: 1;
@@ -1082,10 +1087,26 @@ export interface RunEvidenceV1 {
   // Artifacts
   artifacts?: RunEvidenceArtifact[];
 
+  // Startup confirmation result (provider qualification evidence)
+  startup_confirm?: RunEvidenceStartupConfirm;
+
   // Integrity
   started_at?: string;
   ended_at?: string;
   digest: string;
+}
+
+/**
+ * RunEvidenceStartupConfirm is the frozen wire representation of a startup
+ * confirmation result inside RunEvidenceV1. Field names are snake_case
+ * matching the evidence spec.
+ */
+export interface RunEvidenceStartupConfirm {
+  stage: string;
+  duration_ms: number;
+  ready: boolean;
+  process_exited?: boolean;
+  retryable?: boolean;
 }
 
 export interface RunnerPhaseEntry {
@@ -1139,6 +1160,47 @@ export interface RunFinishRequest {
   results?: TestResultSummary;
   telemetry?: RunTelemetrySummary;
   receipt?: TerminalRunReceipt;
+  evidence?: RunEvidenceV1;
+}
+
+/**
+ * TerminalBundleV1 is the atomic terminal record: evidence, receipt, and
+ * terminal log bound together as a single unit. The bundle is self-verified
+ * before being sent to the coordinator. The coordinator atomically persists
+ * all parts in a single transaction.
+ *
+ * The bundle replaces the previous pattern of sending evidence and receipt
+ * as separate fields that could be independently accepted or rejected. With
+ * TerminalBundleV1, either the entire bundle is accepted or it is rejected.
+ *
+ * The coordinator's finishRun endpoint already accepts receipt and evidence
+ * as part of RunFinishRequest and persists them atomically in a single
+ * storage transaction. TerminalBundleV1 documents this contract explicitly.
+ */
+export interface TerminalBundleV1 {
+  /** Schema version for the bundle format itself. */
+  bundle_schema_version: 1;
+  /** RunEvidenceV1 record. */
+  evidence: RunEvidenceV1;
+  /** Signed TerminalRunReceiptV3. */
+  receipt: TerminalRunReceipt;
+  /** Terminal log content (may be truncated). */
+  terminal_log?: string;
+  /** Whether the terminal log was truncated. */
+  log_truncated?: boolean;
+  /** SHA-256 of the full (untruncated) terminal log. */
+  log_sha256?: string;
+  /** SHA-256 of the retained (possibly truncated) log. */
+  retained_log_sha256?: string;
+  /** Test result summary (if any). */
+  results?: TestResultSummary;
+  /** Failure classification (if any). */
+  blocked_stage?: string;
+  retry_likely?: string;
+  /** Sync phase duration in milliseconds. */
+  sync_ms?: number;
+  /** Command phase duration in milliseconds. */
+  command_ms?: number;
 }
 
 export interface RunTelemetryRequest {

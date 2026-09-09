@@ -24,7 +24,8 @@ import (
 
 const attestReceiptSchemaVersion = 1
 const (
-	terminalReceiptSchemaVersion    = 2
+	terminalReceiptSchemaVersion    = 3
+	terminalReceiptV2SchemaVersion  = 2
 	terminalReceiptType             = "terminal"
 	maxTerminalReceiptBytes         = 16 * 1024
 	maxTerminalReceiptFieldBytes    = 4 * 1024
@@ -64,6 +65,7 @@ type terminalRunReceipt struct {
 	LogSHA256         string `json:"log_sha256"`
 	RetainedLogSHA256 string `json:"retained_log_sha256"`
 	LogTruncated      bool   `json:"log_truncated"`
+	EvidenceSHA256    string `json:"evidence_sha256,omitempty"`
 	PublicKey         string `json:"public_key"`
 	Signer            string `json:"signer"`
 	Signature         string `json:"signature"`
@@ -84,6 +86,7 @@ type terminalRunReceiptInput struct {
 	LogSHA256         string
 	RetainedLogSHA256 string
 	LogTruncated      bool
+	EvidenceSHA256    string
 }
 
 type preparedRunReceipt struct {
@@ -279,7 +282,7 @@ func terminalReceiptCommandDisplay(display, digest string) string {
 }
 
 func terminalReceiptSigningBytes(receipt terminalRunReceipt) []byte {
-	return lengthPrefixedBytes("crabbox-terminal-receipt-v2\x00", []string{
+	values := []string{
 		strconv.Itoa(receipt.SchemaVersion),
 		receipt.ReceiptType,
 		receipt.StartedAt,
@@ -297,9 +300,15 @@ func terminalReceiptSigningBytes(receipt terminalRunReceipt) []byte {
 		receipt.LogSHA256,
 		receipt.RetainedLogSHA256,
 		strconv.FormatBool(receipt.LogTruncated),
-		receipt.PublicKey,
-		receipt.Signer,
-	})
+	}
+	prefix := "crabbox-terminal-receipt-v2\x00"
+	if receipt.SchemaVersion >= terminalReceiptSchemaVersion {
+		// v3+ includes evidence_sha256 in the signed payload.
+		prefix = "crabbox-terminal-receipt-v3\x00"
+		values = append(values, receipt.EvidenceSHA256)
+	}
+	values = append(values, receipt.PublicKey, receipt.Signer)
+	return lengthPrefixedBytes(prefix, values)
 }
 
 func lengthPrefixedBytes(prefix string, values []string) []byte {
@@ -343,6 +352,7 @@ func buildTerminalRunReceiptWithKey(key ed25519.PrivateKey, in terminalRunReceip
 		LogSHA256:         in.LogSHA256,
 		RetainedLogSHA256: in.RetainedLogSHA256,
 		LogTruncated:      in.LogTruncated,
+		EvidenceSHA256:    in.EvidenceSHA256,
 		PublicKey:         base64.StdEncoding.EncodeToString(pub),
 		Signer:            attestFingerprint(pub),
 	}
@@ -359,8 +369,11 @@ func buildTerminalRunReceiptWithKey(key ed25519.PrivateKey, in terminalRunReceip
 }
 
 func validateTerminalRunReceipt(receipt terminalRunReceipt) error {
-	if receipt.SchemaVersion != terminalReceiptSchemaVersion || receipt.ReceiptType != terminalReceiptType {
-		return fmt.Errorf("unsupported terminal receipt")
+	if receipt.ReceiptType != terminalReceiptType {
+		return fmt.Errorf("unsupported terminal receipt type")
+	}
+	if receipt.SchemaVersion != terminalReceiptSchemaVersion && receipt.SchemaVersion != terminalReceiptV2SchemaVersion {
+		return fmt.Errorf("unsupported terminal receipt schema_version %d", receipt.SchemaVersion)
 	}
 	for name, value := range map[string]string{
 		"started_at":          receipt.StartedAt,
@@ -413,6 +426,9 @@ func validateTerminalRunReceipt(receipt terminalRunReceipt) error {
 			return fmt.Errorf("invalid %s", name)
 		}
 	}
+	if receipt.EvidenceSHA256 != "" && !validHexDigest(receipt.EvidenceSHA256, sha256.Size) {
+		return fmt.Errorf("invalid evidence_sha256")
+	}
 	pub, err := base64.StdEncoding.DecodeString(receipt.PublicKey)
 	if err != nil || len(pub) != ed25519.PublicKeySize {
 		return fmt.Errorf("invalid public_key")
@@ -463,7 +479,8 @@ func verifyTerminalRunReceipt(receipt terminalRunReceipt, binding terminalRunRec
 		receipt.DurationMs < binding.SyncMs+binding.CommandMs ||
 		binding.LogSHA256 != "" && receipt.LogSHA256 != binding.LogSHA256 ||
 		binding.RetainedLogSHA256 != "" && receipt.RetainedLogSHA256 != binding.RetainedLogSHA256 ||
-		receipt.LogTruncated != binding.LogTruncated {
+		receipt.LogTruncated != binding.LogTruncated ||
+		binding.EvidenceSHA256 != "" && receipt.EvidenceSHA256 != binding.EvidenceSHA256 {
 		return fmt.Errorf("terminal receipt binding mismatch")
 	}
 	return nil
@@ -715,6 +732,17 @@ func validSHA256Digest(value string) bool {
 	}
 	decoded, err := hex.DecodeString(strings.TrimPrefix(value, "sha256:"))
 	return err == nil && len(decoded) == sha256.Size
+}
+
+// validHexDigest checks that value is a lowercase hex string encoding
+// exactly nBytes bytes. Used for evidence_sha256, which stores the raw
+// hex digest matching the evidence record's digest field (no "sha256:" prefix).
+func validHexDigest(value string, nBytes int) bool {
+	if len(value) != nBytes*2 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
 }
 
 func writeRunReceipt(path, keyPath string, in runReceiptInput) (runArtifact, error) {

@@ -313,7 +313,12 @@ import {
   type ProviderReconciliationObservation,
   type ProviderReconciliationQuarantine,
 } from "./provider-reconciliation";
-import { sameTerminalRunBinding, terminalFinishSHA256, verifyTerminalReceipt } from "./run-receipt";
+import {
+  sameTerminalRunBinding,
+  terminalFinishSHA256,
+  validateRunEvidence,
+  verifyTerminalReceipt,
+} from "./run-receipt";
 import {
   readRuntimeAdapterRelayBody,
   runtimeAdapterProxyPath,
@@ -14748,6 +14753,7 @@ export class FleetCoordinator {
       results: input.results,
       telemetry: input.telemetry,
       receipt: input.receipt,
+      evidence: input.evidence,
     });
     if (run.state !== "running") {
       return run.terminalFinishSHA256 === requestedFingerprint
@@ -14775,6 +14781,23 @@ export class FleetCoordinator {
           { status: 400 },
         );
       }
+    }
+    // Verify evidence before persisting it. Invalid evidence fails closed.
+    const evidenceError = await validateRunEvidence(input.evidence, {
+      runID,
+      leaseID: run.leaseID,
+      provider: run.provider,
+      exitCode,
+      receipt,
+    });
+    if (evidenceError) {
+      return json(
+        {
+          error: "invalid_evidence",
+          message: evidenceError.message,
+        },
+        { status: 400 },
+      );
     }
     const terminalLogPrefix = runTerminalLogPrefix(
       runID,
@@ -14819,6 +14842,7 @@ export class FleetCoordinator {
         if (input.results) next.results = boundedTestResults(input.results);
         if (telemetry) next.telemetry = mergeRunTelemetry(next.telemetry, telemetry);
         if (receipt) next.terminalReceipt = receipt;
+        if (input.evidence) next.evidence = input.evidence;
         next.terminalFinishSHA256 = requestedFingerprint;
         next.terminalLogPrefix = terminalLogPrefix;
         const seq = (next.eventCount ?? 0) + 1;
@@ -24701,12 +24725,30 @@ function canonicalJSONStringify(value: unknown): string {
   if (value && typeof value === "object") {
     const entries = Object.entries(value as Record<string, unknown>)
       .filter(([, item]) => item !== undefined)
-      .toSorted(([left], [right]) => left.localeCompare(right));
+      // Code-point comparison, NOT locale-aware ordering. localeCompare is
+      // locale/environment-dependent and produces different bytes (and thus
+      // different SHA-256 digests) for the same input across runtimes. This
+      // must match stableJSONValue (run-receipt.ts) and canonicalize
+      // (coordinator-migration.ts) so fixedRequestFingerprint,
+      // fixedLeaseCreateIntentHash, and cleanupRunEvidence are deterministic
+      // across platforms.
+      .toSorted(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
     return `{${entries
-      .map(([key, item]) => `${JSON.stringify(key)}:${canonicalJSONStringify(item)}`)
+      .map(
+        ([key, item]) =>
+          `${escapeJSONSeparators(JSON.stringify(key))}:${canonicalJSONStringify(item)}`,
+      )
       .join(",")}}`;
   }
-  return JSON.stringify(value) ?? "null";
+  return escapeJSONSeparators(JSON.stringify(value) ?? "null");
+}
+
+// escapeJSONSeparators replaces raw U+2028/U+2029 with \u2028/\u2029 to match
+// Go's json.Encoder behavior (which escapes them even with SetEscapeHTML(false)).
+// JavaScript's JSON.stringify emits them raw, producing different canonical
+// bytes and therefore different SHA-256 digests.
+function escapeJSONSeparators(s: string): string {
+  return s.replaceAll("\u2028", "\\u2028").replaceAll("\u2029", "\\u2029");
 }
 
 function sanitizeTelemetryTimestamp(value: string | undefined, now: Date): string {
