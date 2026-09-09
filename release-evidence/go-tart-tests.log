@@ -1,7 +1,0 @@
-command=go test -count=1 -timeout=120s ./internal/providers/tart/
-started_at=2026-09-08T23:26:08Z
----
-ok  	github.com/openclaw/crabbox/internal/providers/tart	78.999s
----
-finished_at=2026-09-08T23:27:28Z
-exit=0

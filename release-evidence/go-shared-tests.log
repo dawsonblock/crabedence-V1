@@ -1,7 +1,0 @@
-command=go test -count=1 -timeout=60s ./internal/providers/shared/
-started_at=2026-09-08T23:27:33Z
----
-ok  	github.com/openclaw/crabbox/internal/providers/shared	0.777s
----
-finished_at=2026-09-08T23:27:36Z
-exit=0

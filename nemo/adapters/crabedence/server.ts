@@ -222,15 +222,25 @@ class InMemoryIdempotencyStore implements IdempotencyStore {
 
 /**
  * Compute a canonical digest of the request for idempotency binding.
- * Binds: principal, capability, canonical arguments.
- * The same key with different arguments is a conflict.
+ * Binds the full admitted operation identity:
+ *   - principal
+ *   - grant_id
+ *   - capability
+ *   - execution_class
+ *   - canonical arguments (sorted keys)
+ *
+ * The same key with different arguments, authority, or class is a conflict.
+ * Uses canonical JSON (sorted keys at all levels) so property insertion
+ * order does not affect the digest.
  */
 async function computeRequestDigest(
   request: ExecutionApiRequest,
 ): Promise<string> {
-  const canonical = JSON.stringify({
+  const canonical = canonicalJSONStringify({
     principal: request.authority.principal,
+    grant_id: request.authority.grant_id,
     capability: request.capability,
+    execution_class: request.execution_class,
     arguments: request.arguments,
   });
   const encoder = new TextEncoder();
@@ -239,6 +249,25 @@ async function computeRequestDigest(
   return Array.from(new Uint8Array(hash))
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
+}
+
+/**
+ * Canonical JSON: sorted keys at every nesting level, no whitespace.
+ * This ensures the same object produces the same string regardless of
+ * property insertion order.
+ */
+function canonicalJSONStringify(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return "[" + value.map(canonicalJSONStringify).join(",") + "]";
+  }
+  const keys = Object.keys(value as object).sort();
+  const pairs = keys.map(
+    (k) => JSON.stringify(k) + ":" + canonicalJSONStringify((value as Record<string, unknown>)[k]),
+  );
+  return "{" + pairs.join(",") + "}";
 }
 
 // ─── Server ──────────────────────────────────────────────────────────
@@ -408,27 +437,67 @@ export class ExecutionApiServer {
           return;
         }
 
-        if (reservation.state === "EXISTING" && reservation.response) {
+        if (reservation.state === "EXISTING") {
           // Return the existing terminal response (including UNKNOWN).
           // This is the critical fix: UNKNOWN is persisted and returned
           // for the same key, NOT re-invoked.
-          this.sendResponse(socket, reservation.response);
+          if (reservation.response) {
+            this.sendResponse(socket, reservation.response);
+          } else {
+            // EXISTING but no response — inconsistent state. Fail closed
+            // into UNKNOWN/reconciliation, never re-execute.
+            this.sendResponse(socket, {
+              status: "UNKNOWN",
+              error: "execution record exists but has no terminal response (reconciliation required)",
+            });
+          }
           return;
         }
 
         // state === "NEW" — proceed to execute
-        const response = await this.handler(request);
+        let response: ExecutionApiResponse;
+        try {
+          response = await this.handler(request);
+        } catch (handlerErr) {
+          // Handler crashed after dispatch. The side effect may have
+          // occurred. Return UNKNOWN, not FAILED, and persist it.
+          response = {
+            status: "UNKNOWN",
+            error: `handler error after dispatch: ${(handlerErr as Error).message}`,
+          };
+        }
 
         // Persist the outcome (including UNKNOWN) so retries retrieve
         // it instead of re-invoking the provider.
-        await this.idempotency.settle(request.idempotency_key, response);
+        try {
+          await this.idempotency.settle(request.idempotency_key, response);
+        } catch (settleErr) {
+          // Persistence failed. The side effect may have occurred.
+          // Return UNKNOWN, not FAILED.
+          this.sendResponse(socket, {
+            status: "UNKNOWN",
+            error: `execution completed but persistence failed: ${(settleErr as Error).message}`,
+          });
+          return;
+        }
 
         this.sendResponse(socket, response);
         return;
       }
 
       // No idempotency key — execute directly
-      const response = await this.handler(request);
+      let response: ExecutionApiResponse;
+      try {
+        response = await this.handler(request);
+      } catch (handlerErr) {
+        // Handler crash without idempotency key — still return the
+        // typed error. For mutations this is a problem, but without
+        // a key there's no reservation to protect.
+        response = {
+          status: "FAILED",
+          error: `handler error: ${(handlerErr as Error).message}`,
+        };
+      }
       this.sendResponse(socket, response);
     } catch (err) {
       this.sendResponse(socket, {

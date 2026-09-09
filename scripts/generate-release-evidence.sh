@@ -244,12 +244,14 @@ echo "=== Live PostgreSQL gates ==="
 
 # Live PostgreSQL gates fail closed. Without CRABBOX_TEST_DATABASE_URL the
 # tests skip themselves and exit 0, which must NOT be recorded as PASS.
-# The wrapper checks the env var, runs Vitest with JSON output, and parses
-# the result to require a nonzero number of executed tests.
+# The wrapper checks the env var, runs Vitest with JSON output to a
+# SEPARATE pure JSON file (not the decorated log), and parses that file
+# to require a nonzero number of executed tests.
 run_live_postgres_gate() {
   local name="$1"
   local test_file="$2"
   local log="$EVIDENCE_DIR/${name}.log"
+  local json_out="$EVIDENCE_DIR/${name}.vitest.json"
 
   if [ -z "${CRABBOX_TEST_DATABASE_URL:-}" ]; then
     {
@@ -265,19 +267,50 @@ run_live_postgres_gate() {
     return
   fi
 
-  run_and_log "$name" npx vitest run --no-file-parallelism --reporter=json "$test_file"
+  # Run Vitest with JSON reporter, writing pure JSON to a separate file.
+  # Use the Worker package's locked Vitest, not root npx (reproducibility).
+  {
+    echo "command=run_live_postgres_gate $name $test_file"
+    echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "---"
+  } > "$log"
+
+  set +e
+  # Use the locked worker Vitest executable for reproducibility
+  (cd worker && npx vitest run --no-file-parallelism --reporter=json \
+    "../$test_file" > "$json_out" 2>> "$log")
   local rc=$?
+  set -e
+
+  {
+    echo "---"
+    echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "exit=$rc"
+  } >> "$log"
+
   if [ "$rc" -ne 0 ]; then
     record_gate "$name" "FAIL" "$rc" "$log"
     echo "  FAIL  $name (exit=$rc)"
     return
   fi
 
-  # Parse Vitest JSON output to verify tests actually executed (not skipped).
-  local total_tests skipped_tests
-  total_tests="$(jq -r '.testResults[].assertionResults | length' "$log" 2>/dev/null | paste -sd+ | bc 2>/dev/null || echo 0)"
-  skipped_tests="$(grep -c '"status":"skip"' "$log" 2>/dev/null || echo 0)"
-  local executed_tests=$((total_tests - skipped_tests))
+  # Parse the pure JSON file (not the decorated log) to verify tests
+  # actually executed (not skipped).
+  local total_tests skipped_tests executed_tests
+  if [ ! -f "$json_out" ] || ! jq empty "$json_out" 2>/dev/null; then
+    {
+      echo ""
+      echo "FAIL: vitest JSON output missing or invalid"
+      echo "exit=1"
+    } >> "$log"
+    record_gate "$name" "FAIL" 1 "$log"
+    echo "  FAIL  $name (no valid JSON output)"
+    return
+  fi
+
+  total_tests="$(jq '[.testResults[].assertionResults | length] | add // 0' "$json_out" 2>/dev/null || echo 0)"
+  skipped_tests="$(jq '[.testResults[].assertionResults[] | select(.status == "skip")] | length' "$json_out" 2>/dev/null || echo 0)"
+  executed_tests=$((total_tests - skipped_tests))
 
   if [ "$executed_tests" -le 0 ]; then
     {
@@ -308,6 +341,8 @@ run_gate cross-language-conformance \
 # ─── Phase 15: Worker gates ────────────────────────────────────────────────
 echo ""
 echo "=== Worker gates ==="
+# Ensure Worker dependencies are installed.
+npm ci --prefix worker 2>/dev/null || true
 run_gate worker-typecheck npm run check --prefix worker
 run_gate worker-tests npm test --prefix worker
 run_gate worker-format npm run format:check --prefix worker
@@ -317,8 +352,10 @@ run_gate worker-build npm run build --prefix worker
 # ─── Phase NEMO: NeMo kernel/adapter gates ────────────────────────────────
 echo ""
 echo "=== NeMo gates ==="
-run_gate nemo-typecheck npx --prefix nemo tsc --noEmit --project nemo/tsconfig.json
-run_gate nemo-tests npx --prefix nemo vitest run --root nemo
+# Ensure NeMo dependencies are installed.
+npm ci --prefix nemo 2>/dev/null || npm install --prefix nemo 2>/dev/null || true
+run_gate nemo-typecheck sh -c 'cd nemo && npx tsc --noEmit'
+run_gate nemo-tests sh -c 'cd nemo && npx vitest run'
 
 # ─── Phase 15: Worker structured summaries ─────────────────────────────────
 # Extract test counts from the worker test log.

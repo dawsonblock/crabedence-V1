@@ -39,3 +39,4 @@ internal/applevmhelper/embedded/
 **/.DS_Store
 .claude/
 nemo/node_modules/
+release-evidence/

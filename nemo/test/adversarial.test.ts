@@ -423,7 +423,8 @@ describe("Adversarial: Kernel admission", () => {
     const remote = new MockPort({
       status: "SUCCEEDED",
       result: { ok: true },
-      evidence: { digest: "abc123", receiptVersion: 3 },
+      evidence: { digest: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", receiptVersion: 3 },
+      execution: { provider: "test", runId: "run_critical_001" },
     });
     const catalog = new CapabilityCatalog();
     catalog.register({
@@ -443,7 +444,7 @@ describe("Adversarial: Kernel admission", () => {
     });
 
     expect(outcome.status).toBe("SUCCEEDED");
-    expect(outcome.evidence?.digest).toBe("abc123");
+    expect(outcome.evidence?.digest).toBe("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2");
   });
 
   it("validates schema (missing required property)", async () => {
@@ -472,5 +473,301 @@ describe("Adversarial: Kernel admission", () => {
     expect(outcome.status).toBe("DENIED");
     expect(outcome.error).toContain("schema");
     expect(outcome.error).toContain("body");
+  });
+
+  // ─── New tests for hardening 6 audit items ─────────────────────────────
+
+  it("handler crash after dispatch returns UNKNOWN, not FAILED", async () => {
+    const socketPath = makeTempSocket();
+    cleanupSocket(socketPath);
+
+    const crashHandler = async (_req: ExecutionApiRequest): Promise<ExecutionApiResponse> => {
+      throw new Error("provider crashed after side effect");
+    };
+
+    const server = new ExecutionApiServer(crashHandler, socketPath);
+    await server.start();
+
+    try {
+      const client = new CrabedenceClient(socketPath, 1000);
+      const adapter = new CrabedenceExecutionAdapter(client);
+      const outcome = await adapter.execute({
+        capabilityId: "email.send",
+        arguments: { to: "bob@example.com" },
+        authority: auth,
+        executionClass: "MUTATION",
+        idempotencyKey: "crash_dispatch",
+      });
+
+      // Handler crash after dispatch must return UNKNOWN, not FAILED.
+      // The side effect may have occurred.
+      expect(outcome.status).toBe("UNKNOWN");
+    } finally {
+      await server.stop();
+      cleanupSocket(socketPath);
+    }
+  });
+
+  it("persistence failure after success returns UNKNOWN", async () => {
+    const socketPath = makeTempSocket();
+    cleanupSocket(socketPath);
+
+    const successHandler = async (_req: ExecutionApiRequest): Promise<ExecutionApiResponse> => {
+      return { status: "SUCCEEDED" };
+    };
+
+    // A store that fails on settle()
+    const failingStore: IdempotencyStore = {
+      async reserve() {
+        return { state: "NEW" as const };
+      },
+      async settle() {
+        throw new Error("database write failed");
+      },
+    };
+
+    const server = new ExecutionApiServer(successHandler, socketPath, failingStore);
+    await server.start();
+
+    try {
+      const client = new CrabedenceClient(socketPath, 1000);
+      const adapter = new CrabedenceExecutionAdapter(client);
+      const outcome = await adapter.execute({
+        capabilityId: "email.send",
+        arguments: { to: "bob@example.com" },
+        authority: auth,
+        executionClass: "MUTATION",
+        idempotencyKey: "persist_fail",
+      });
+
+      // Persistence failed after success — must return UNKNOWN, not FAILED.
+      expect(outcome.status).toBe("UNKNOWN");
+    } finally {
+      await server.stop();
+      cleanupSocket(socketPath);
+    }
+  });
+
+  it("EXISTING record with no response fails closed to UNKNOWN", async () => {
+    const socketPath = makeTempSocket();
+    cleanupSocket(socketPath);
+
+    const successHandler = async (_req: ExecutionApiRequest): Promise<ExecutionApiResponse> => {
+      return { status: "SUCCEEDED" };
+    };
+
+    // A store that returns EXISTING with no response (inconsistent state)
+    const brokenStore: IdempotencyStore = {
+      async reserve() {
+        return { state: "EXISTING" as const, response: undefined };
+      },
+      async settle() {
+        // no-op
+      },
+    };
+
+    const server = new ExecutionApiServer(successHandler, socketPath, brokenStore);
+    await server.start();
+
+    try {
+      const client = new CrabedenceClient(socketPath, 1000);
+      const adapter = new CrabedenceExecutionAdapter(client);
+      const outcome = await adapter.execute({
+        capabilityId: "email.send",
+        arguments: { to: "bob@example.com" },
+        authority: auth,
+        executionClass: "MUTATION",
+        idempotencyKey: "broken_existing",
+      });
+
+      // EXISTING with no response must fail closed to UNKNOWN, not re-execute.
+      expect(outcome.status).toBe("UNKNOWN");
+      expect(outcome.error).toContain("reconciliation");
+    } finally {
+      await server.stop();
+      cleanupSocket(socketPath);
+    }
+  });
+
+  it("same key with different grant_id is a conflict", async () => {
+    const socketPath = makeTempSocket();
+    cleanupSocket(socketPath);
+
+    let callCount = 0;
+    const handler = async (req: ExecutionApiRequest): Promise<ExecutionApiResponse> => {
+      callCount++;
+      return { status: "SUCCEEDED" };
+    };
+
+    const server = new ExecutionApiServer(handler, socketPath);
+    await server.start();
+
+    try {
+      const client = new CrabedenceClient(socketPath, 1000);
+      const adapter = new CrabedenceExecutionAdapter(client);
+
+      // First request with grant_123
+      await adapter.execute({
+        capabilityId: "email.send",
+        arguments: { to: "bob@example.com" },
+        authority: { principal: "alice@example.com", grantId: "grant_123" },
+        executionClass: "MUTATION",
+        idempotencyKey: "same_key_diff_grant",
+      });
+
+      // Second request with grant_456 — same key, different grant
+      const outcome2 = await adapter.execute({
+        capabilityId: "email.send",
+        arguments: { to: "bob@example.com" },
+        authority: { principal: "alice@example.com", grantId: "grant_456" },
+        executionClass: "MUTATION",
+        idempotencyKey: "same_key_diff_grant",
+      });
+
+      // Different grant_id means different request digest → CONFLICT
+      expect(outcome2.status).toBe("DENIED");
+      expect(outcome2.error).toContain("different request");
+    } finally {
+      await server.stop();
+      cleanupSocket(socketPath);
+    }
+  });
+
+  it("malformed wire response status is rejected", async () => {
+    const socketPath = makeTempSocket();
+    cleanupSocket(socketPath);
+
+    // Handler returns an invalid status
+    const badHandler = async (_req: ExecutionApiRequest): Promise<ExecutionApiResponse> => {
+      return { status: "BANANA" } as unknown as ExecutionApiResponse;
+    };
+
+    const server = new ExecutionApiServer(badHandler, socketPath);
+    await server.start();
+
+    try {
+      const client = new CrabedenceClient(socketPath, 1000);
+      const adapter = new CrabedenceExecutionAdapter(client);
+
+      await expect(
+        adapter.execute({
+          capabilityId: "test.read",
+          arguments: {},
+          authority: auth,
+          executionClass: "READ",
+        }),
+      ).rejects.toThrow(TransportError);
+    } finally {
+      await server.stop();
+      cleanupSocket(socketPath);
+    }
+  });
+
+  it("CRITICAL with invalid receipt version is rejected by kernel", async () => {
+    const local = new MockPort({ status: "SUCCEEDED" });
+    const remote = new MockPort({
+      status: "SUCCEEDED",
+      evidence: {
+        digest: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+        receiptVersion: 2, // Wrong — must be 3
+      },
+      execution: { provider: "test", runId: "run_bad_v" },
+    });
+    const catalog = new CapabilityCatalog();
+    catalog.register({
+      id: "email.send",
+      schema: { type: "object" },
+      executionClass: "CRITICAL",
+      adapter: "crabedence",
+      authorityPolicy: "email.send",
+    });
+    const kernel = new NemoKernel(catalog, { local, remote });
+
+    const outcome = await kernel.execute({
+      capabilityId: "email.send",
+      arguments: { to: "bob@example.com" },
+      authority: auth,
+      idempotencyKey: "bad_receipt_v",
+    });
+
+    expect(outcome.status).toBe("FAILED");
+    expect(outcome.error).toContain("receiptVersion");
+    expect(outcome.error).toContain("3");
+  });
+
+  it("CRITICAL with short digest is rejected by kernel", async () => {
+    const local = new MockPort({ status: "SUCCEEDED" });
+    const remote = new MockPort({
+      status: "SUCCEEDED",
+      evidence: {
+        digest: "abc123", // Too short — not a valid SHA-256
+        receiptVersion: 3,
+      },
+      execution: { provider: "test", runId: "run_bad_d" },
+    });
+    const catalog = new CapabilityCatalog();
+    catalog.register({
+      id: "email.send",
+      schema: { type: "object" },
+      executionClass: "CRITICAL",
+      adapter: "crabedence",
+      authorityPolicy: "email.send",
+    });
+    const kernel = new NemoKernel(catalog, { local, remote });
+
+    const outcome = await kernel.execute({
+      capabilityId: "email.send",
+      arguments: { to: "bob@example.com" },
+      authority: auth,
+      idempotencyKey: "bad_digest",
+    });
+
+    expect(outcome.status).toBe("FAILED");
+    expect(outcome.error).toContain("digest");
+  });
+
+  it("canonical JSON: reordered arguments produce same digest", async () => {
+    const socketPath = makeTempSocket();
+    cleanupSocket(socketPath);
+
+    let callCount = 0;
+    const handler = async (_req: ExecutionApiRequest): Promise<ExecutionApiResponse> => {
+      callCount++;
+      return { status: "SUCCEEDED" };
+    };
+
+    const server = new ExecutionApiServer(handler, socketPath);
+    await server.start();
+
+    try {
+      const client = new CrabedenceClient(socketPath, 1000);
+      const adapter = new CrabedenceExecutionAdapter(client);
+
+      // First request with arguments in one order
+      await adapter.execute({
+        capabilityId: "email.send",
+        arguments: { to: "bob@example.com", body: "hello" },
+        authority: auth,
+        executionClass: "MUTATION",
+        idempotencyKey: "reorder_test",
+      });
+
+      // Second request with arguments in different order — same key
+      const outcome2 = await adapter.execute({
+        capabilityId: "email.send",
+        arguments: { body: "hello", to: "bob@example.com" },
+        authority: auth,
+        executionClass: "MUTATION",
+        idempotencyKey: "reorder_test",
+      });
+
+      // Canonical JSON means reordered keys produce the same digest.
+      // So this should return the existing SUCCEEDED, not CONFLICT.
+      expect(outcome2.status).toBe("SUCCEEDED");
+      expect(callCount).toBe(1); // Handler called once, not twice
+    } finally {
+      await server.stop();
+      cleanupSocket(socketPath);
+    }
   });
 });

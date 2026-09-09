@@ -165,7 +165,7 @@ describe("NemoKernel", () => {
     const remote = new MockPort({
       status: "SUCCEEDED",
       result: { messageId: "msg_123" },
-      evidence: { digest: "abc123", receiptVersion: 3 },
+      evidence: { digest: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", receiptVersion: 3 },
       execution: { provider: "gmail", runId: "run_002" },
     });
     const kernel = makeKernel(local, remote, [criticalCap]);
@@ -178,7 +178,7 @@ describe("NemoKernel", () => {
     });
 
     expect(outcome.status).toBe("SUCCEEDED");
-    expect(outcome.evidence).toEqual({ digest: "abc123", receiptVersion: 3 });
+    expect(outcome.evidence).toEqual({ digest: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", receiptVersion: 3 });
   });
 
   // Step 17: Test UNKNOWN
@@ -323,7 +323,7 @@ describe("NemoKernel", () => {
     const local = new MockPort({ status: "SUCCEEDED" });
     const remote = new MockPort({
       status: "SUCCEEDED",
-      evidence: { digest: "def456", receiptVersion: 3 },
+      evidence: { digest: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", receiptVersion: 3 },
       execution: { provider: "gmail", runId: "run_persisted" },
     });
     const kernel1 = makeKernel(local, remote, [criticalCap]);

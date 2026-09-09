@@ -120,17 +120,57 @@ function validateSchema(value: unknown, schema: unknown): string | null {
  * Validate and check a deadline string. Returns:
  *   - null if no deadline or deadline is valid and not expired
  *   - error message if deadline is malformed or expired
+ *
+ * Uses RFC3339 parsing to match Go's time.Parse(time.RFC3339, ...).
+ * Date.parse accepts formats that Go's RFC3339 parser will reject,
+ * so we validate the format more strictly here.
  */
 function checkDeadline(deadline: string | undefined): string | null {
   if (!deadline) {
     return null;
   }
+  // RFC3339: YYYY-MM-DDTHH:MM:SS[.ssssss](Z|+HH:MM|-HH:MM)
+  // This is a strict check that rejects what Go would reject.
+  const rfc3339Pattern = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
+  if (!rfc3339Pattern.test(deadline)) {
+    return `invalid deadline format (expected RFC3339): ${deadline}`;
+  }
   const parsed = Date.parse(deadline);
   if (isNaN(parsed)) {
-    return `invalid deadline format: ${deadline}`;
+    return `invalid deadline: ${deadline}`;
   }
   if (parsed < Date.now()) {
     return `deadline expired: ${deadline}`;
+  }
+  return null;
+}
+
+// ─── Evidence validation ──────────────────────────────────────────────
+
+/** Pattern for a 64-character lowercase hex SHA-256 digest. */
+const HEX_DIGEST_PATTERN = /^[0-9a-f]{64}$/;
+
+/**
+ * Validate evidence for CRITICAL operations.
+ * CRITICAL success requires:
+ *   - evidence.digest matching ^[0-9a-f]{64}$
+ *   - evidence.receiptVersion === 3
+ *   - execution.runId present
+ */
+function validateCriticalEvidence(
+  outcome: KernelExecutionOutcome,
+): string | null {
+  if (!outcome.evidence?.digest) {
+    return "CRITICAL capability returned SUCCEEDED without evidence digest";
+  }
+  if (!HEX_DIGEST_PATTERN.test(outcome.evidence.digest)) {
+    return `CRITICAL evidence digest is not a valid 64-char lowercase hex SHA-256: ${outcome.evidence.digest}`;
+  }
+  if (outcome.evidence.receiptVersion !== 3) {
+    return `CRITICAL evidence receiptVersion must be 3, got ${outcome.evidence.receiptVersion ?? "missing"}`;
+  }
+  if (!outcome.execution?.runId) {
+    return "CRITICAL capability returned SUCCEEDED without execution.runId";
   }
   return null;
 }
@@ -228,18 +268,22 @@ export class NemoKernel {
     });
 
     // For CRITICAL operations, verify the evidence contract.
-    // A SUCCEEDED CRITICAL must include evidence with a digest.
-    // A UNKNOWN CRITICAL may or may not include evidence.
+    // A SUCCEEDED CRITICAL must include:
+    //   - evidence.digest matching ^[0-9a-f]{64}$
+    //   - evidence.receiptVersion === 3
+    //   - execution.runId
     if (
       descriptor.executionClass === "CRITICAL" &&
-      outcome.status === "SUCCEEDED" &&
-      !outcome.evidence?.digest
+      outcome.status === "SUCCEEDED"
     ) {
-      return {
-        status: "FAILED",
-        error: "CRITICAL capability returned SUCCEEDED without evidence digest",
-        execution: outcome.execution,
-      };
+      const evidenceError = validateCriticalEvidence(outcome);
+      if (evidenceError) {
+        return {
+          status: "FAILED",
+          error: evidenceError,
+          execution: outcome.execution,
+        };
+      }
     }
 
     return outcome;

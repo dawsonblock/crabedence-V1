@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"regexp"
 	"time"
 )
 
@@ -46,15 +47,49 @@ type ExecutionMeta struct {
 	RunID    string `json:"run_id"`
 }
 
+// GoCapabilityDescriptor is the server-side authoritative capability
+// registration. The execution class is pinned here — callers cannot
+// self-classify. This is the Go equivalent of NeMo's
+// CapabilityDescriptor, but owned by the execution layer, not the
+// reasoning layer.
+type GoCapabilityDescriptor struct {
+	ID              string `json:"id"`
+	ExecutionClass  string `json:"execution_class"`
+	AuthorityPolicy string `json:"authority_policy"`
+	// Schema is the JSON schema for argument validation (future).
+	Schema json.RawMessage `json:"schema,omitempty"`
+}
+
+// capabilityRegistry is the server-controlled capability catalog.
+// Callers (including NeMo) cannot override execution classes here.
+// This is the authoritative source — the caller's execution_class
+// field is treated as an assertion at most, never as the source of truth.
+var capabilityRegistry = map[string]GoCapabilityDescriptor{
+	// Capabilities will be registered here as the bridge is wired.
+	// Until then, all capabilities are UNIMPLEMENTED.
+}
+
+// validExecutionClass returns true if the class is a known value.
+func validExecutionClass(class string) bool {
+	switch class {
+	case "PURE", "READ", "MUTATION", "CRITICAL":
+		return true
+	}
+	return false
+}
+
+// hexDigestPattern matches a 64-character lowercase hexadecimal string.
+var hexDigestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
 // execCommand implements `crabbox exec`: a narrow JSON-in/JSON-out
 // execution bridge for NeMo. It reads an ExecutionRequest from stdin,
-// validates authority, dispatches to the configured provider, generates
-// RunEvidenceV1, signs a V3 receipt, and returns an ExecutionResponse.
+// validates authority, looks up the capability in the server-controlled
+// registry, and dispatches to the configured provider.
 //
-// This command does NOT rebuild the execution machinery. It uses the
-// existing Crabedence provider, evidence, and receipt systems. The
-// command is the production bridge between NeMo's Unix socket server
-// and the Go execution core.
+// Until provider dispatch is fully wired, ALL capabilities return
+// FAILED with "execution bridge not implemented". This command never
+// returns SUCCEEDED or UNKNOWN for an operation that was not actually
+// executed — that would be dishonest about side effects.
 //
 // Usage:
 //
@@ -64,9 +99,10 @@ func (a App) execCommand(ctx context.Context, args []string) error {
 		fmt.Fprintln(a.Stderr, "Usage: crabbox exec")
 		fmt.Fprintln(a.Stderr, "")
 		fmt.Fprintln(a.Stderr, "Reads an ExecutionRequest JSON object from stdin,")
-		fmt.Fprintln(a.Stderr, "dispatches to the configured provider, generates")
-		fmt.Fprintln(a.Stderr, "RunEvidenceV1, signs a V3 receipt, and writes an")
-		fmt.Fprintln(a.Stderr, "ExecutionResponse JSON object to stdout.")
+		fmt.Fprintln(a.Stderr, "validates authority and capability, dispatches to the")
+		fmt.Fprintln(a.Stderr, "configured provider, generates RunEvidenceV1, signs a")
+		fmt.Fprintln(a.Stderr, "V3 receipt, and writes an ExecutionResponse JSON object")
+		fmt.Fprintln(a.Stderr, "to stdout.")
 		return nil
 	}
 
@@ -101,13 +137,45 @@ func (a App) execCommand(ctx context.Context, args []string) error {
 		})
 	}
 
-	// Check deadline if present
+	// Look up capability in the server-controlled registry.
+	// The caller's execution_class is an assertion, not the source of truth.
+	desc, known := capabilityRegistry[req.Capability]
+	if !known {
+		// Unknown capability — check if caller provided a class at least
+		if !validExecutionClass(req.ExecutionClass) {
+			return writeExecResponse(a.Stdout, ExecutionResponse{
+				Status: "FAILED",
+				Error:  fmt.Sprintf("unknown capability: %s (no execution class provided)", req.Capability),
+			})
+		}
+		// Capability not registered in server registry.
+		// Until the registry is populated, return UNIMPLEMENTED.
+		return writeExecResponse(a.Stdout, ExecutionResponse{
+			Status: "FAILED",
+			Error:  fmt.Sprintf("capability not registered in server registry: %s", req.Capability),
+		})
+	}
+
+	// The server registry's execution class is authoritative.
+	// If the caller supplied a different class, that's a mismatch.
+	if req.ExecutionClass != "" && req.ExecutionClass != desc.ExecutionClass {
+		return writeExecResponse(a.Stdout, ExecutionResponse{
+			Status: "DENIED",
+			Error: fmt.Sprintf("execution class mismatch: caller asserted %s but capability %s is pinned as %s",
+				req.ExecutionClass, req.Capability, desc.ExecutionClass),
+		})
+	}
+
+	// Use the server-pinned class for all subsequent checks.
+	effectiveClass := desc.ExecutionClass
+
+	// Check deadline if present (RFC3339, matching TypeScript Date.parse for ISO strings)
 	if req.Deadline != "" {
 		deadline, err := time.Parse(time.RFC3339, req.Deadline)
 		if err != nil {
 			return writeExecResponse(a.Stdout, ExecutionResponse{
 				Status: "DENIED",
-				Error:  fmt.Sprintf("invalid deadline: %v", err),
+				Error:  fmt.Sprintf("invalid deadline (expected RFC3339): %v", err),
 			})
 		}
 		if time.Now().After(deadline) {
@@ -119,7 +187,7 @@ func (a App) execCommand(ctx context.Context, args []string) error {
 	}
 
 	// Require idempotency key for mutations
-	if (req.ExecutionClass == "MUTATION" || req.ExecutionClass == "CRITICAL") && req.IdempotencyKey == "" {
+	if (effectiveClass == "MUTATION" || effectiveClass == "CRITICAL") && req.IdempotencyKey == "" {
 		return writeExecResponse(a.Stdout, ExecutionResponse{
 			Status: "DENIED",
 			Error:  "idempotency key required for MUTATION/CRITICAL capabilities",
@@ -127,10 +195,8 @@ func (a App) execCommand(ctx context.Context, args []string) error {
 	}
 
 	// TODO: Dispatch to the configured provider based on the capability.
-	// For now, this returns a structured response indicating that the
-	// provider dispatch bridge is not yet wired. The existing `run`
-	// command's provider acquisition, evidence generation, and receipt
-	// signing machinery should be called here.
+	// The existing `run` command's provider acquisition, evidence
+	// generation, and receipt signing machinery should be called here.
 	//
 	// The capability ID maps to a registered provider adapter. The
 	// arguments are validated against the capability's schema. Authority
@@ -138,29 +204,14 @@ func (a App) execCommand(ctx context.Context, args []string) error {
 	// RunEvidenceV1 is generated and canonicalized. A V3 receipt is
 	// signed binding the evidence digest. The terminal bundle is
 	// committed to the coordinator.
-
-	// For READ operations, return a structured response.
-	if req.ExecutionClass == "READ" {
-		return writeExecResponse(a.Stdout, ExecutionResponse{
-			Status: "SUCCEEDED",
-			Result: json.RawMessage(`{"note":"read bridge not yet wired to provider"}`),
-			Execution: &ExecutionMeta{
-				Provider: "bridge-pending",
-				RunID:    generateExecRunID(),
-			},
-		})
-	}
-
-	// For MUTATION/CRITICAL, return UNKNOWN until the provider bridge
-	// is fully wired. This is safer than claiming SUCCEEDED without
-	// actual evidence generation.
+	//
+	// Until provider dispatch is implemented, return FAILED for ALL
+	// execution classes. Never return SUCCEEDED (no operation ran) or
+	// UNKNOWN (no provider was invoked — UNKNOWN means the operation
+	// may have executed, which is not the case here).
 	return writeExecResponse(a.Stdout, ExecutionResponse{
-		Status: "UNKNOWN",
-		Error:  "execution bridge pending provider dispatch wiring",
-		Execution: &ExecutionMeta{
-			Provider: "bridge-pending",
-			RunID:    generateExecRunID(),
-		},
+		Status: "FAILED",
+		Error:  "execution bridge not implemented: provider dispatch not yet wired",
 	})
 }
 
@@ -172,9 +223,4 @@ func writeExecResponse(w io.Writer, resp ExecutionResponse) error {
 	}
 	_, err = w.Write(data)
 	return err
-}
-
-// generateExecRunID generates a unique run identifier.
-func generateExecRunID() string {
-	return fmt.Sprintf("exec-%d", time.Now().UnixNano())
 }

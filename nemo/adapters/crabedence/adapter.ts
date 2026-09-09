@@ -255,11 +255,26 @@ export class CrabedenceClient {
 
 // ─── Adapter ─────────────────────────────────────────────────────────
 
+/** Valid status values from the wire protocol. */
+const VALID_WIRE_STATUSES = new Set([
+  "SUCCEEDED",
+  "FAILED",
+  "DENIED",
+  "UNKNOWN",
+]);
+
 /**
- * Maps Crabedence wire status to NeMo execution status.
- * Identity mapping — the wire protocol uses the same status names.
+ * Validate and map Crabedence wire status to NeMo execution status.
+ * Rejects unknown status values at runtime — a malformed peer cannot
+ * inject arbitrary status strings.
  */
-function mapStatus(status: CrabedenceExecutionResponse["status"]): string {
+function mapStatus(status: unknown): string {
+  if (typeof status !== "string" || !VALID_WIRE_STATUSES.has(status)) {
+    throw new TransportError(
+      `invalid wire status: ${JSON.stringify(status)}`,
+      "PROTOCOL",
+    );
+  }
   return status;
 }
 

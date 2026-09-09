@@ -1,9 +1,0 @@
-command=verify source-tree-sha256.txt
-started_at=2026-09-08T23:25:10Z
----
----
-files_checked=2270
-missing=0
-mismatched=0
-status=PASS
-finished_at=2026-09-08T23:25:49Z

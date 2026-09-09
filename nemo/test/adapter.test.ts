@@ -60,7 +60,7 @@ describe("CrabedenceExecutionAdapter (Unix socket)", () => {
       status: "SUCCEEDED",
       result: { message_id: "msg_001" },
       evidence: {
-        digest: "abc123def456",
+        digest: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
         receipt_version: 3,
       },
       execution: {
@@ -84,7 +84,7 @@ describe("CrabedenceExecutionAdapter (Unix socket)", () => {
     expect(outcome.status).toBe("SUCCEEDED");
     expect(outcome.result).toEqual({ message_id: "msg_001" });
     expect(outcome.evidence).toEqual({
-      digest: "abc123def456",
+      digest: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
       receiptVersion: 3,
     });
     expect(outcome.execution).toEqual({

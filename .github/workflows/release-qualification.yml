@@ -206,6 +206,34 @@ jobs:
       - name: Live PostgreSQL test (${{ matrix.test }})
         run: npx vitest run --no-file-parallelism test/${{ matrix.test }}
 
+  # ─── NeMo tests ──────────────────────────────────────────────────────
+  nemo:
+    name: NeMo
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: provenance
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.provenance.outputs.commit }}
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: worker/package.json
+          cache: npm
+          cache-dependency-path: nemo/package-lock.json
+
+      - name: Install NeMo dependencies
+        run: npm ci --prefix nemo
+
+      - name: NeMo typecheck
+        run: npx --prefix nemo tsc --noEmit
+
+      - name: NeMo tests
+        run: npx --prefix nemo vitest run
+
   # ─── Cross-language conformance ──────────────────────────────────────
   cross-language:
     name: Cross-language conformance
@@ -232,7 +260,23 @@ jobs:
     name: Release evidence + admission
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: [provenance, go-tests, go-race, worker, postgres, cross-language]
+    needs: [provenance, go-tests, go-race, worker, postgres, nemo, cross-language]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: crabbox
+          POSTGRES_PASSWORD: crabbox
+          POSTGRES_DB: crabbox_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U crabbox"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CRABBOX_TEST_DATABASE_URL: postgres://crabbox:crabbox@localhost:5432/crabbox_test
     steps:
       - name: Check out
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -254,6 +298,9 @@ jobs:
 
       - name: Install Worker dependencies
         run: npm ci --prefix worker
+
+      - name: Install NeMo dependencies
+        run: npm ci --prefix nemo
 
       - name: Generate release evidence
         run: bash scripts/generate-release-evidence.sh

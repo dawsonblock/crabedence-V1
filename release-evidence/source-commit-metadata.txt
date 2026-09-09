@@ -1,4 +1,0 @@
-commit a8d2cda3348a1744bf9e40e0ab5411721770005d
-Author: dawsonblock <dawsonblock@users.noreply.github.com>
-Date: Tue Sep 8 17:23:56 2026 -0600
-Subject: fix: shared V2/V3 contract fixture, GitHub attestation pipeline, RC2 release machinery
