@@ -1,28 +1,34 @@
 /**
- * Crabedence execution API server (Unix socket).
+ * Crabedence execution API server (Unix socket) — test/local bridge.
  *
- * This is the protocol endpoint between NeMo and Crabedence. It:
+ * @deprecated This server is for testing only. Production execution
+ * uses the Go `crabbox serve-execution` service, which owns authority,
+ * idempotency, dispatch, evidence, and receipts.
+ *
+ * This bridge does:
  *   1. Accepts framed requests over a Unix domain socket
- *   2. Validates required request fields
+ *   2. Validates required request field presence (not authority truth)
  *   3. Reserves idempotency keys atomically (prevents concurrent duplicates)
- *   4. Delegates to an injected handler (the bridge to Crabedence Go core)
- *   5. Persists execution state durably (including UNKNOWN)
+ *   4. Delegates to an injected handler
+ *   5. Persists execution state (including UNKNOWN)
  *   6. Returns typed outcomes
  *
- * What this server does NOT do itself:
- *   - JSON-schema argument validation (lives in Crabedence core)
- *   - Authority grant verification (lives in Crabedence core)
- *   - Authority-policy matching (lives in Crabedence core)
- *   - Provider dispatch (lives in Crabedence core)
- *   - V3 receipt signing (lives in Crabedence core)
- *   - Evidence generation (lives in Crabedence core)
- *   - PostgreSQL fencing (lives in Crabedence core)
+ * What this bridge does NOT do:
+ *   - Authority grant verification (only presence check; Crabedence verifies)
+ *   - JSON-schema argument validation (Crabedence core)
+ *   - Authority-policy matching (Crabedence core)
+ *   - Provider dispatch (Crabedence core)
+ *   - V3 receipt signing (Crabedence core)
+ *   - Evidence generation (Crabedence core)
+ *   - PostgreSQL fencing (Crabedence core)
  *
  * The injected ExecutionHandler is the bridge to that machinery.
  */
 
 import { createServer, type Server, type Socket } from "node:net";
-import { unlinkSync, existsSync } from "node:fs";
+import { unlinkSync, existsSync, mkdirSync, chmodSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { homedir, tmpdir } from "node:os";
 
 // ─── Wire types (shared with adapter) ─────────────────────────────────
 
@@ -34,7 +40,7 @@ export interface ExecutionApiRequest {
     readonly authority_ref?: string;
     readonly grant_id?: string;
   };
-  readonly execution_class: string;
+  readonly execution_class?: string;
   readonly idempotency_key?: string;
   readonly deadline?: string;
 }
@@ -286,6 +292,14 @@ export class ExecutionApiServer {
   }
 
   async start(): Promise<void> {
+    // Ensure the socket directory exists with 0700 permissions.
+    // Don't bind in a shared /tmp location without a private subdirectory.
+    const dir = dirname(this.socketPath);
+    if (!existsSync(dir)) {
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+    }
+    chmodSync(dir, 0o700);
+
     if (existsSync(this.socketPath)) {
       unlinkSync(this.socketPath);
     }
@@ -296,6 +310,12 @@ export class ExecutionApiServer {
 
     return new Promise((resolve) => {
       this.server!.listen(this.socketPath, () => {
+        // Restrict socket access to owner only
+        try {
+          chmodSync(this.socketPath, 0o600);
+        } catch {
+          // Best effort — some platforms may not support this
+        }
         resolve();
       });
     });
