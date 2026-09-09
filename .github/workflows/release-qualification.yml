@@ -3,7 +3,7 @@ name: Release Qualification
 on:
   push:
     branches:
-      - release/crabedence-v1-hardening
+      - release/crabedence-v1-rc6-qualified-execution
   workflow_dispatch:
     inputs:
       ref:

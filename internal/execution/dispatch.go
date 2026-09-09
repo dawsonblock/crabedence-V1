@@ -29,6 +29,7 @@ const (
 //   - Post-dispatch failures return UNKNOWN (may have executed)
 //   - Idempotent requests return the stored result
 //   - Same key + different request returns CONFLICT
+//   - MUTATION/CRITICAL fail closed when durable store is unavailable
 type DispatchExecutor struct {
 	handler  Handler
 	store    *idempotency.Store
@@ -52,10 +53,14 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		return e.dispatch(ctx, req, desc)
 	}
 
-	// For MUTATION and CRITICAL, use durable idempotency
+	// For MUTATION and CRITICAL, durable idempotency is REQUIRED.
+	// Fail closed — never execute unguarded mutations.
 	if e.store == nil {
-		// No store — fall back to in-memory dispatch
-		return e.dispatch(ctx, req, desc)
+		return Response{
+			Status:      StatusFailed,
+			FailureCode: string(capability.FailureInternalError),
+			Error:       "durable idempotency unavailable: MUTATION/CRITICAL operations require a database connection",
+		}
 	}
 
 	// Compute request digest
@@ -123,16 +128,18 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	// We have a new reservation — dispatch
 	executionID := reserve.Record.ExecutionID
 
-	// Mark as DISPATCHING
+	// Mark as DISPATCHING — this is PRE_DISPATCH.
+	// If this fails, return FAILED (not UNKNOWN) — no side effect has occurred.
 	if err := e.store.SetState(ctx, executionID, idempotency.StateDispatching, nil, ""); err != nil {
 		return Response{
-			Status:      StatusUnknown,
-			FailureCode: string(capability.FailureExecutionUnknown),
-			Error:       "failed to persist DISPATCHING state",
+			Status:      StatusFailed,
+			FailureCode: string(capability.FailureInternalError),
+			Error:       "failed to persist DISPATCHING state before dispatch",
 		}
 	}
 
-	// Dispatch
+	// Dispatch — from this point, we are POST_DISPATCH.
+	// Any failure after this point is UNKNOWN (may have executed).
 	resp := e.dispatch(ctx, req, desc)
 
 	// Persist terminal result
@@ -154,7 +161,8 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	}
 
 	if err := e.store.SetState(ctx, executionID, state, resp.Result, evidenceDigest); err != nil {
-		// Persistence failed after dispatch — return UNKNOWN
+		// Persistence failed AFTER dispatch — return UNKNOWN.
+		// The side effect may have occurred; we cannot claim FAILED.
 		return Response{
 			Status:      StatusUnknown,
 			FailureCode: string(capability.FailureExecutionUnknown),
@@ -177,15 +185,10 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	return resp
 }
 
-// dispatch sends the request to the handler and tracks dispatch state.
-// Pre-dispatch failures return FAILED. Post-dispatch failures return UNKNOWN.
+// dispatch sends the request to the handler.
+// This crosses the dispatch boundary — any failure after this call
+// begins is POST_DISPATCH (may have executed).
 func (e *DispatchExecutor) dispatch(ctx context.Context, req Request, desc capability.Descriptor) Response {
-	// PRE_DISPATCH: any failure here is safe FAILED
-	// We use a panic recovery to catch pre-dispatch errors
-	defer func() {
-		// panics are caught by the caller
-	}()
-
 	// Set a timeout if deadline is provided
 	dispatchCtx := ctx
 	if req.Deadline != "" {
@@ -200,13 +203,8 @@ func (e *DispatchExecutor) dispatch(ctx context.Context, req Request, desc capab
 		}
 	}
 
-	// POST_DISPATCH: from this point, any failure is UNKNOWN
 	// The handler.Execute call crosses the dispatch boundary.
 	resp := e.handler.Execute(dispatchCtx, req, desc)
-
-	// If the handler panicked or returned an error status due to
-	// a transport failure, we need to determine if dispatch occurred.
-	// For now, we trust the handler to set the correct status.
 	return resp
 }
 

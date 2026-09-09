@@ -307,9 +307,6 @@ jobs:
       - name: Check release admission
         run: bash scripts/check-release-admission.sh
 
-      - name: Verify release artifact
-        run: bash scripts/verify-release-artifact.sh
-
       # ─── Build artifact from the same clean checkout ──────────────────
       - name: Build source archive
         shell: bash
@@ -333,7 +330,7 @@ jobs:
       - name: Generate artifact.json
         shell: bash
         run: |
-          cat > dist/dist/release-evidence/artifact.json << EOF
+          cat > dist/release-evidence/artifact.json << EOF
           {
             "name": "crabedence-${RELEASE_VERSION}.tar.gz",
             "sha256": "${{ steps.artifact_hash.outputs.tar_sha256 }}",
@@ -351,6 +348,10 @@ jobs:
         run: |
           cd dist/release-evidence
           find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 shasum -a 256 > SHA256SUMS
+
+      # ─── Verify release artifact (after archive + artifact.json exist) ──
+      - name: Verify release artifact
+        run: bash scripts/verify-release-artifact.sh
 
       # ─── Generate SBOM ────────────────────────────────────────────────
       - name: Generate SBOM
@@ -435,5 +436,57 @@ jobs:
             dist/release-evidence/qualification-matrix.md
             dist/release-evidence/source-tree-sha256.txt
             dist/release-evidence/provenance.json
-            dist/dist/release-evidence/artifact.json
+            dist/release-evidence/artifact.json
             dist/release-evidence/SHA256SUMS
+
+  # ─── Clean-room verification ─────────────────────────────────────────
+  # Extract the published archive into a fresh directory and verify
+  # it without any Git checkout. This proves the artifact survives
+  # outside the original build environment.
+  clean-room-verify:
+    name: Clean-room verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: build-and-attest
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-evidence
+          path: evidence
+
+      - name: Download source archive
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download "$RELEASE_VERSION" \
+            --repo ${{ github.repository }} \
+            --pattern "crabedence-${RELEASE_VERSION}.tar.gz" \
+            --pattern "crabedence-${RELEASE_VERSION}.tar.gz.sha256"
+        env:
+          RELEASE_VERSION: ${{ needs.build-and-attest.outputs.release_version }}
+
+      - name: Verify archive SHA-256
+        run: |
+          expected="$(cut -d ' ' -f1 < crabedence-${RELEASE_VERSION}.tar.gz.sha256)"
+          actual="$(sha256sum crabedence-${RELEASE_VERSION}.tar.gz | cut -d ' ' -f1)"
+          if [ "$expected" != "$actual" ]; then
+            echo "SHA-256 mismatch: expected=$expected actual=$actual"
+            exit 1
+          fi
+          echo "Archive SHA-256 verified: $actual"
+
+      - name: Extract archive into clean directory
+        run: |
+          mkdir -p clean-room
+          tar xzf "crabedence-${RELEASE_VERSION}.tar.gz" -C clean-room
+
+      - name: Verify release artifact (standalone, no .git)
+        run: |
+          # Copy evidence bundle alongside extracted source
+          cp -r evidence clean-room/qualification
+          # Run the verifier against the extracted source
+          # The verifier uses find (not git) so it works without .git
+          bash clean-room/crabedence-${RELEASE_VERSION}/scripts/verify-release-artifact.sh \
+            clean-room/qualification \
+            clean-room/crabedence-${RELEASE_VERSION}

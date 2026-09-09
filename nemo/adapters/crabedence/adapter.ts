@@ -46,7 +46,7 @@ export interface CrabedenceExecutionRequest {
  * Crabedence execution API response.
  */
 export interface CrabedenceExecutionResponse {
-  readonly status: "SUCCEEDED" | "FAILED" | "DENIED" | "UNKNOWN";
+  readonly status: "SUCCEEDED" | "FAILED" | "DENIED" | "UNKNOWN" | "IN_FLIGHT";
   readonly result?: unknown;
   readonly error?: string;
   readonly evidence?: {
@@ -378,8 +378,14 @@ export class CrabedenceExecutionAdapter implements ExecutionPort {
     try {
       const response = await this.client.execute(wireRequest);
 
+      // IN_FLIGHT is a valid wire status but not a terminal NEMO status.
+      // The operation is in progress — the outcome is unknown to the caller.
+      // Convert to UNKNOWN at the NEMO boundary.
+      const nemoStatus: KernelExecutionOutcome["status"] =
+        response.status === "IN_FLIGHT" ? "UNKNOWN" : (response.status as KernelExecutionOutcome["status"]);
+
       return {
-        status: mapStatus(response.status) as KernelExecutionOutcome["status"],
+        status: nemoStatus,
         ...(response.result !== undefined && { result: response.result }),
         ...(response.error !== undefined && { error: response.error }),
         ...(response.evidence && {

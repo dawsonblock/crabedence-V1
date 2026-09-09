@@ -82,21 +82,28 @@ type Handler interface {
 
 // Service is the persistent Crabedence execution service.
 type Service struct {
-	registry   *capability.Registry
-	handler    Handler
-	socketPath string
-	listener   net.Listener
-	mu         sync.Mutex
-	running    bool
+	registry      *capability.Registry
+	handler       Handler
+	socketPath    string
+	listener      net.Listener
+	mu            sync.Mutex
+	running       bool
+	grantResolver capability.GrantResolver
 }
 
 // NewService creates a new execution service.
 func NewService(registry *capability.Registry, handler Handler, socketPath string) *Service {
 	return &Service{
-		registry:   registry,
-		handler:    handler,
-		socketPath: socketPath,
+		registry:      registry,
+		handler:       handler,
+		socketPath:    socketPath,
+		grantResolver: capability.NoopGrantResolver{},
 	}
+}
+
+// SetGrantResolver sets the grant resolver for authority verification.
+func (s *Service) SetGrantResolver(resolver capability.GrantResolver) {
+	s.grantResolver = resolver
 }
 
 // Start begins listening on the Unix socket.
@@ -221,6 +228,23 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 		return
 	}
 
+	// Verify authority (grant resolution)
+	if decision.Descriptor.AuthorityPolicy.GrantRequired {
+		fc, reason := s.registry.VerifyAuthority(ctx, capability.AdmissionRequest{
+			Capability: req.Capability,
+			Principal:  req.Authority.Principal,
+			GrantID:    req.Authority.GrantID,
+		}, s.grantResolver)
+		if fc != "" {
+			s.writeResponse(conn, Response{
+				Status:      StatusDenied,
+				FailureCode: string(fc),
+				Error:       reason,
+			})
+			return
+		}
+	}
+
 	// Check deadline
 	if req.Deadline != "" {
 		deadline, err := time.Parse(time.RFC3339, req.Deadline)
@@ -254,6 +278,26 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 				Error:       "CRITICAL capability returned SUCCEEDED without evidence digest",
 				Execution:   response.Execution,
 			}
+		} else if !isValidEvidenceDigest(response.Evidence.Digest) {
+			response = Response{
+				Status:      StatusFailed,
+				FailureCode: string(capability.FailureExecutionFailed),
+				Error:       "CRITICAL capability returned invalid evidence digest (must be 64-char lowercase hex)",
+				Execution:   response.Execution,
+			}
+		} else if response.Evidence.ReceiptVersion != 3 {
+			response = Response{
+				Status:      StatusFailed,
+				FailureCode: string(capability.FailureExecutionFailed),
+				Error:       fmt.Sprintf("CRITICAL capability returned receipt_version %d (must be 3)", response.Evidence.ReceiptVersion),
+				Execution:   response.Execution,
+			}
+		} else if response.Execution == nil || response.Execution.RunID == "" {
+			response = Response{
+				Status:      StatusFailed,
+				FailureCode: string(capability.FailureExecutionFailed),
+				Error:       "CRITICAL capability returned SUCCEEDED without run_id",
+			}
 		}
 	}
 
@@ -275,4 +319,18 @@ func (s *Service) writeResponse(conn net.Conn, resp Response) {
 
 	conn.Write(lenBuf)
 	conn.Write(payload)
+}
+
+// isValidEvidenceDigest checks that a digest is a 64-character lowercase
+// hexadecimal SHA-256 digest.
+func isValidEvidenceDigest(digest string) bool {
+	if len(digest) != 64 {
+		return false
+	}
+	for _, c := range digest {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
 }

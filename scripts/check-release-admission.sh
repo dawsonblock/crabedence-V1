@@ -41,8 +41,9 @@ DERIVED_FAIL_NAMES=""
 for i in $(seq 0 $((GATE_COUNT - 1))); do
   name="$(jq -r ".gates[$i].name" "$QUAL_FILE")"
   status="$(jq -r ".gates[$i].status" "$QUAL_FILE")"
-  exit_code="$(jq -r ".gates[$i].exit" "$QUAL_FILE")"
-  log="$(jq -r ".gates[$i].log" "$QUAL_FILE")"
+  exit_code="$(jq -r ".gates[$i].exit_code" "$QUAL_FILE")"
+  evidence_file="$(jq -r ".gates[$i].evidence_file" "$QUAL_FILE")"
+  mandatory="$(jq -r ".gates[$i].mandatory" "$QUAL_FILE")"
 
   # Derive status from exit code if status field is missing
   if [ "$status" = "null" ] || [ -z "$status" ]; then
@@ -56,18 +57,18 @@ for i in $(seq 0 $((GATE_COUNT - 1))); do
   # Cross-check: PASS status must have exit code 0
   if [ "$status" = "PASS" ] && [ "$exit_code" != "0" ]; then
     status="FAIL"
-    echo "  INCONSISTENCY: $name claims PASS but exit=$exit_code" >&2
+    echo "  INCONSISTENCY: $name claims PASS but exit_code=$exit_code" >&2
   fi
 
   # Cross-check: FAIL status must have non-zero exit code
   if [ "$status" = "FAIL" ] && [ "$exit_code" = "0" ]; then
-    echo "  WARNING: $name claims FAIL but exit=0" >&2
+    echo "  WARNING: $name claims FAIL but exit_code=0" >&2
   fi
 
-  # Cross-check: log file must exist (if evidence dir is alongside)
+  # Cross-check: evidence file must exist (if evidence dir is alongside)
   EVIDENCE_DIR="$(dirname "$QUAL_FILE")"
-  if [ -n "$log" ] && [ "$log" != "null" ] && [ ! -f "$EVIDENCE_DIR/$log" ]; then
-    echo "  WARNING: $name references missing log: $log" >&2
+  if [ -n "$evidence_file" ] && [ "$evidence_file" != "null" ] && [ ! -f "$EVIDENCE_DIR/$evidence_file" ]; then
+    echo "  WARNING: $name references missing evidence: $evidence_file" >&2
   fi
 
   if [ "$status" = "PASS" ]; then
@@ -114,7 +115,7 @@ if [ "$DERIVED_FAIL" -eq 0 ]; then
   DERIVED_STATUS="PASS"
   DERIVED_PROMOTABLE="true"
 else
-  DERIVED_STATUS="FAILED"
+  DERIVED_STATUS="FAIL"
   DERIVED_PROMOTABLE="false"
 fi
 

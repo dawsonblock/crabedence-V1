@@ -143,8 +143,10 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 
 // Reserve atomically reserves an execution request.
 //
-// If the key is new, a RESERVED record is inserted and the caller
-// may proceed to dispatch.
+// Uses INSERT ... ON CONFLICT DO NOTHING to atomically reserve.
+// If the insert succeeds, the caller may proceed to dispatch.
+// If the insert conflicts (key exists), we read the existing record
+// and compare digests.
 //
 // If the key exists with the same request digest:
 //   - Terminal state: return the stored result
@@ -153,16 +155,47 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 // If the key exists with a different request digest:
 //   - Return CONFLICT (never re-execute)
 func (s *Store) Reserve(ctx context.Context, key, principal, capability, digest, grantID, class string) (*ReserveResult, error) {
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
-	if err != nil {
+	// First, try to atomically INSERT a new RESERVED record.
+	// ON CONFLICT DO NOTHING means if the key already exists, no rows are inserted.
+	var executionID string
+	var createdAt time.Time
+	err := s.db.QueryRowContext(ctx, `
+		INSERT INTO execution_requests
+			(idempotency_key, principal_id, capability_id, request_digest,
+			 grant_id, execution_class, state)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (principal_id, capability_id, idempotency_key) DO NOTHING
+		RETURNING execution_id, created_at
+	`, key, principal, capability, digest, nullableString(grantID), class, string(StateReserved)).Scan(&executionID, &createdAt)
+
+	if err == nil {
+		// Insert succeeded — we have a new reservation
+		return &ReserveResult{
+			State: StateReserved,
+			Record: &Record{
+				ExecutionID:    executionID,
+				IdempotencyKey: key,
+				PrincipalID:    principal,
+				CapabilityID:   capability,
+				RequestDigest:  digest,
+				GrantID:        grantID,
+				ExecutionClass: class,
+				State:          StateReserved,
+				CreatedAt:      createdAt,
+				UpdatedAt:      createdAt,
+			},
+		}, nil
+	}
+
+	if !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
 	}
-	defer tx.Rollback()
 
-	// Try to find existing record
+	// ON CONFLICT DO NOTHING returned no rows — the key already exists.
+	// Read the existing record to check the digest.
 	var rec Record
 	var resultJSON []byte
-	err = tx.QueryRowContext(ctx, `
+	err = s.db.QueryRowContext(ctx, `
 		SELECT execution_id, idempotency_key, principal_id, capability_id,
 		       request_digest, COALESCE(grant_id, ''), execution_class, state,
 		       result, COALESCE(evidence_digest, ''), created_at, updated_at
@@ -174,56 +207,24 @@ func (s *Store) Reserve(ctx context.Context, key, principal, capability, digest,
 		&rec.ExecutionClass, &rec.State, &resultJSON,
 		&rec.EvidenceDigest, &rec.CreatedAt, &rec.UpdatedAt,
 	)
-
-	if err == nil {
-		// Record exists — check digest
-		rec.Result = json.RawMessage(resultJSON)
-		if rec.RequestDigest != digest {
-			return &ReserveResult{
-				State:    rec.State,
-				Record:   &rec,
-				Conflict: true,
-			}, tx.Commit()
-		}
-		// Same digest — return existing state
-		return &ReserveResult{
-			State:  rec.State,
-			Record: &rec,
-		}, tx.Commit()
-	}
-
-	if !errors.Is(err, sql.ErrNoRows) {
-		return nil, err
-	}
-
-	// No existing record — insert new RESERVED record
-	var executionID string
-	err = tx.QueryRowContext(ctx, `
-		INSERT INTO execution_requests
-			(idempotency_key, principal_id, capability_id, request_digest,
-			 grant_id, execution_class, state)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
-		RETURNING execution_id, created_at
-	`, key, principal, capability, digest, nullableString(grantID), class, string(StateReserved)).Scan(&executionID, &rec.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
-	rec.ExecutionID = executionID
-	rec.IdempotencyKey = key
-	rec.PrincipalID = principal
-	rec.CapabilityID = capability
-	rec.RequestDigest = digest
-	rec.GrantID = grantID
-	rec.ExecutionClass = class
-	rec.State = StateReserved
-	rec.UpdatedAt = rec.CreatedAt
 
-	if err := tx.Commit(); err != nil {
-		return nil, err
+	rec.Result = json.RawMessage(resultJSON)
+
+	// Check if the digest matches
+	if rec.RequestDigest != digest {
+		return &ReserveResult{
+			State:    rec.State,
+			Record:   &rec,
+			Conflict: true,
+		}, nil
 	}
 
+	// Same digest — return existing state
 	return &ReserveResult{
-		State:  StateReserved,
+		State:  rec.State,
 		Record: &rec,
 	}, nil
 }

@@ -29,39 +29,54 @@ mkdir -p "$(dirname "$OUTPUT")"
 # ─── Exclusions ────────────────────────────────────────────────────────
 # These are NOT source files and must not appear in the manifest.
 # Everything else in the source tree is qualified source.
+#
+# We use shell case matching (not regex) to avoid pattern-matching bugs.
+# Paths are relative (e.g. ".git/objects/..." not "/.git/objects/...").
 
-# Directories to exclude (match anywhere in path)
-EXCLUDE_DIRS="node_modules\|/\.git/\|/dist/\|/coverage/\|/tmp/\|/\.build/\|/bin/\|__pycache__"
-
-# Files to exclude by basename
-EXCLUDE_FILES=".DS_Store"
-
-# File patterns to exclude
-EXCLUDE_PATTERNS="\.pyc$\|\.pyo$\|\.swp$\|\.swo$\|~$\|^\.#"
-
-# ─── Generate manifest ────────────────────────────────────────────────
 cd "$SOURCE_DIR"
 
 # Enumerate all files, filter exclusions, compute SHA-256.
-# Use find + grep for exclusions, then shasum each file.
 # Sort with LC_ALL=C for determinism.
 find . -type f | while IFS= read -r filepath; do
   relpath="${filepath#./}"
 
-  # Skip excluded directories (anywhere in path)
-  echo "$relpath" | grep -q "$EXCLUDE_DIRS" && continue
+  # Skip excluded top-level and nested directories using case matching.
+  # This correctly handles both top-level (.git/...) and nested (foo/.git/...).
+  case "$relpath" in
+    .git/*|*/.git/*) continue ;;
+    node_modules/*|*/node_modules/*) continue ;;
+    dist/*|*/dist/*) continue ;;
+    coverage/*|*/coverage/*) continue ;;
+    tmp/*|*/tmp/*) continue ;;
+    .build/*|*/.build/*) continue ;;
+    bin/*|*/bin/*) continue ;;
+    __pycache__/*|*/__pycache__/*) continue ;;
+  esac
 
-  # Skip release-evidence/ (only schemas/README.md are tracked)
+  # Skip release-evidence/ (only schemas/README.md are tracked, not generated evidence)
   case "$relpath" in
     release-evidence/schemas/*|release-evidence/README.md) ;;
     release-evidence/*) continue ;;
   esac
 
   # Skip excluded files by basename
-  [ "$(basename "$filepath")" = "$EXCLUDE_FILES" ] && continue
+  case "$(basename "$filepath")" in
+    .DS_Store) continue ;;
+  esac
 
-  # Skip excluded patterns
-  echo "$relpath" | grep -q "\($EXCLUDE_PATTERNS\)" && continue
+  # Skip excluded file patterns
+  case "$relpath" in
+    *.pyc|*.pyo|*.swp|*.swo|*~|.#*) continue ;;
+  esac
+
+  # Skip the output file itself (if it's inside the source tree)
+  OUTPUT_RELPATH=""
+  if [ "$(cd "$(dirname "$OUTPUT")" && pwd)" = "$(pwd)" ]; then
+    OUTPUT_RELPATH="$(basename "$OUTPUT")"
+  fi
+  if [ -n "$OUTPUT_RELPATH" ] && [ "$relpath" = "$OUTPUT_RELPATH" ]; then
+    continue
+  fi
 
   # Compute SHA-256
   sha="$(shasum -a 256 "$filepath" | cut -d ' ' -f 1)"

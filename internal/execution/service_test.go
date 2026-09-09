@@ -23,7 +23,7 @@ func TestExecutionServiceEcho(t *testing.T) {
 		"system": NewEchoHandler(),
 	})
 
-	service := NewService(registry, handler, socketPath)
+	service := setupServiceWithGrants(registry, handler, socketPath)
 	ctx := context.Background()
 	if err := service.Start(ctx); err != nil {
 		t.Fatal(err)
@@ -76,7 +76,7 @@ func TestExecutionServiceCounterIncrement(t *testing.T) {
 		"test-counter": counter,
 	})
 
-	service := NewService(registry, handler, socketPath)
+	service := setupServiceWithGrants(registry, handler, socketPath)
 	ctx := context.Background()
 	if err := service.Start(ctx); err != nil {
 		t.Fatal(err)
@@ -111,7 +111,7 @@ func TestExecutionServiceUnknownCapability(t *testing.T) {
 	registry := capability.NewRegistry()
 	handler := NewMultiHandler(map[string]Handler{})
 
-	service := NewService(registry, handler, socketPath)
+	service := setupServiceWithGrants(registry, handler, socketPath)
 	ctx := context.Background()
 	if err := service.Start(ctx); err != nil {
 		t.Fatal(err)
@@ -150,7 +150,7 @@ func TestExecutionServiceMissingIdempotencyKey(t *testing.T) {
 		"test-counter": NewCounterHandler(),
 	})
 
-	service := NewService(registry, handler, socketPath)
+	service := setupServiceWithGrants(registry, handler, socketPath)
 	ctx := context.Background()
 	if err := service.Start(ctx); err != nil {
 		t.Fatal(err)
@@ -190,7 +190,7 @@ func TestExecutionServiceExecutionClassMismatch(t *testing.T) {
 		"test-counter": NewCounterHandler(),
 	})
 
-	service := NewService(registry, handler, socketPath)
+	service := setupServiceWithGrants(registry, handler, socketPath)
 	ctx := context.Background()
 	if err := service.Start(ctx); err != nil {
 		t.Fatal(err)
@@ -226,7 +226,7 @@ func TestExecutionServiceOversizedMessage(t *testing.T) {
 	registry := capability.NewRegistry()
 	handler := NewMultiHandler(map[string]Handler{})
 
-	service := NewService(registry, handler, socketPath)
+	service := setupServiceWithGrants(registry, handler, socketPath)
 	ctx := context.Background()
 	if err := service.Start(ctx); err != nil {
 		t.Fatal(err)
@@ -261,7 +261,7 @@ func TestExecutionServiceMissingAuthority(t *testing.T) {
 		"test-counter": NewCounterHandler(),
 	})
 
-	service := NewService(registry, handler, socketPath)
+	service := setupServiceWithGrants(registry, handler, socketPath)
 	ctx := context.Background()
 	if err := service.Start(ctx); err != nil {
 		t.Fatal(err)

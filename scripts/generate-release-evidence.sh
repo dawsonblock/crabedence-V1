@@ -276,7 +276,7 @@ run_live_postgres_gate() {
   set +e
   # Use the locked worker Vitest executable for reproducibility
   (cd worker && npx vitest run --no-file-parallelism --reporter=json \
-    "../$test_file" > "$json_out" 2>> "$log")
+    "$test_file" > "$json_out" 2>> "$log")
   local rc=$?
   set -e
 
@@ -420,7 +420,7 @@ if [ "$ALL_PASS" = true ]; then
   RELEASE_STATUS="PASS"
   ARTIFACT_PROMOTABLE=true
 else
-  RELEASE_STATUS="FAILED"
+  RELEASE_STATUS="FAIL"
   ARTIFACT_PROMOTABLE=false
 fi
 

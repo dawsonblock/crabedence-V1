@@ -28,7 +28,7 @@ func TestConcurrentIdenticalMutations(t *testing.T) {
 		"test-counter": counter,
 	})
 
-	service := NewService(registry, handler, socketPath)
+	service := setupServiceWithGrants(registry, handler, socketPath)
 	ctx := context.Background()
 	if err := service.Start(ctx); err != nil {
 		t.Fatal(err)
@@ -92,7 +92,7 @@ func TestUnicodePayload(t *testing.T) {
 		"system": NewEchoHandler(),
 	})
 
-	service := NewService(registry, handler, socketPath)
+	service := setupServiceWithGrants(registry, handler, socketPath)
 	ctx := context.Background()
 	if err := service.Start(ctx); err != nil {
 		t.Fatal(err)
@@ -144,7 +144,7 @@ func TestMaxFrameSize(t *testing.T) {
 		"system": NewEchoHandler(),
 	})
 
-	service := NewService(registry, handler, socketPath)
+	service := setupServiceWithGrants(registry, handler, socketPath)
 	ctx := context.Background()
 	if err := service.Start(ctx); err != nil {
 		t.Fatal(err)
@@ -184,7 +184,7 @@ func TestSocketCloseBeforeResponse(t *testing.T) {
 	registry := capability.NewRegistry()
 	handler := NewMultiHandler(map[string]Handler{})
 
-	service := NewService(registry, handler, socketPath)
+	service := setupServiceWithGrants(registry, handler, socketPath)
 	ctx := context.Background()
 	if err := service.Start(ctx); err != nil {
 		t.Fatal(err)
@@ -232,7 +232,7 @@ func TestExpiredDeadline(t *testing.T) {
 		"system": NewEchoHandler(),
 	})
 
-	service := NewService(registry, handler, socketPath)
+	service := setupServiceWithGrants(registry, handler, socketPath)
 	ctx := context.Background()
 	if err := service.Start(ctx); err != nil {
 		t.Fatal(err)
@@ -275,7 +275,7 @@ func TestInvalidDeadline(t *testing.T) {
 		"system": NewEchoHandler(),
 	})
 
-	service := NewService(registry, handler, socketPath)
+	service := setupServiceWithGrants(registry, handler, socketPath)
 	ctx := context.Background()
 	if err := service.Start(ctx); err != nil {
 		t.Fatal(err)
@@ -309,7 +309,7 @@ func TestMalformedJSON(t *testing.T) {
 	registry := capability.NewRegistry()
 	handler := NewMultiHandler(map[string]Handler{})
 
-	service := NewService(registry, handler, socketPath)
+	service := setupServiceWithGrants(registry, handler, socketPath)
 	ctx := context.Background()
 	if err := service.Start(ctx); err != nil {
 		t.Fatal(err)

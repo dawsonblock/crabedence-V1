@@ -154,23 +154,29 @@ fi
 
 # 4. qualification.json — independently recompute gate summary.
 if [ -f "$EVIDENCE_DIR/qualification.json" ]; then
-  # 4a. Validate against schema if present.
-  if [ -f "$REPO_ROOT/release-evidence/schemas/qualification.schema.json" ]; then
-    # Use npx ajv if available, otherwise skip with warning
-    if command -v npx >/dev/null 2>&1 && npx --yes ajv-cli validate \
-      -s "$REPO_ROOT/release-evidence/schemas/qualification.schema.json" \
-      -d "$EVIDENCE_DIR/qualification.json" >/dev/null 2>&1; then
-      check "Qualification schema valid" "PASS"
-    else
-      # Fallback: basic jq structure check
-      if jq empty "$EVIDENCE_DIR/qualification.json" 2>/dev/null; then
-        check "Qualification schema (jq fallback)" "PASS"
-      else
-        check "Qualification schema valid" "FAIL"
-      fi
-    fi
-  else
+  # 4a. Validate against schema — no fallback. A missing validator is a
+  # qualification failure, not a warning.
+  SCHEMA_FILE="$EVIDENCE_DIR/schemas/qualification.schema.json"
+  if [ ! -f "$SCHEMA_FILE" ]; then
+    SCHEMA_FILE="$REPO_ROOT/release-evidence/schemas/qualification.schema.json"
+  fi
+  if [ ! -f "$SCHEMA_FILE" ]; then
     check "Qualification schema (missing)" "FAIL"
+    echo "  ERROR: qualification.schema.json not found" >&2
+    exit 1
+  fi
+  if ! command -v ajv >/dev/null 2>&1; then
+    check "Qualification schema (ajv not installed)" "FAIL"
+    echo "  ERROR: ajv is required for schema validation. Install with: npm install -g ajv-cli" >&2
+    exit 1
+  fi
+  if ajv validate -s "$SCHEMA_FILE" -d "$EVIDENCE_DIR/qualification.json" >/dev/null 2>&1; then
+    check "Qualification schema valid" "PASS"
+  else
+    check "Qualification schema valid" "FAIL"
+    echo "  ERROR: qualification.json does not validate against schema" >&2
+    ajv validate -s "$SCHEMA_FILE" -d "$EVIDENCE_DIR/qualification.json" >&2 || true
+    exit 1
   fi
 
   # 4b. Independently recompute gate summary from individual gates.

@@ -1,8 +1,10 @@
 package capability
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 )
 
 // FailureCode is a typed error vocabulary for execution failures.
@@ -73,6 +75,50 @@ type AdmissionRequest struct {
 	Deadline       string          `json:"deadline"`
 }
 
+// VerifyAuthority resolves the grant and checks that it permits the
+// capability for the given principal. This is the real authority
+// verification — not just presence checks.
+//
+// Returns nil if authorized, or a FailureCode + reason if not.
+func (r *Registry) VerifyAuthority(ctx context.Context, req AdmissionRequest, resolver GrantResolver) (FailureCode, string) {
+	if req.Principal == "" {
+		return FailureUnauthorized, "missing principal"
+	}
+
+	desc, ok := r.Lookup(req.Capability)
+	if !ok {
+		return FailureCapabilityNotFound, fmt.Sprintf("capability not registered: %s", req.Capability)
+	}
+
+	if !desc.AuthorityPolicy.GrantRequired {
+		return "", ""
+	}
+
+	if req.GrantID == "" {
+		return FailureUnauthorized, "missing grant_id"
+	}
+
+	if resolver == nil {
+		// No resolver configured — fail closed for grant-required capabilities
+		return FailureUnauthorized, "no grant resolver configured"
+	}
+
+	grant, err := resolver.Resolve(ctx, req.GrantID, req.Principal)
+	if err != nil {
+		return FailureUnauthorized, fmt.Sprintf("grant resolution failed: %v", err)
+	}
+
+	if grant == nil {
+		return FailureUnauthorized, fmt.Sprintf("grant not found or not issued to principal: %s", req.GrantID)
+	}
+
+	if !grant.IsValid(req.Capability, time.Now()) {
+		return FailureUnauthorized, fmt.Sprintf("grant %s does not permit capability %s (expired, revoked, or not authorized)", req.GrantID, req.Capability)
+	}
+
+	return "", ""
+}
+
 // Admit performs admission checks for an execution request.
 // It validates:
 //   - Capability exists in the registry
@@ -81,8 +127,8 @@ type AdmissionRequest struct {
 //   - Idempotency key is present for mutations
 //   - Deadline is valid and not expired
 //
-// It does NOT perform schema validation or authority policy resolution
-// — those are separate steps.
+// It does NOT perform schema validation or authority grant resolution
+// — those are separate steps (see VerifyAuthority).
 func (r *Registry) Admit(req AdmissionRequest) AdmissionDecision {
 	desc, ok := r.Lookup(req.Capability)
 	if !ok {
@@ -112,7 +158,7 @@ func (r *Registry) Admit(req AdmissionRequest) AdmissionDecision {
 		}
 	}
 
-	// Check authority
+	// Check authority presence (grant resolution is a separate step)
 	if req.Principal == "" {
 		return AdmissionDecision{
 			Allowed:     false,
