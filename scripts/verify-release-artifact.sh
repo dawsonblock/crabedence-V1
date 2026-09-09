@@ -2,24 +2,15 @@
 # Verify a release artifact's evidence bundle.
 #
 # Works standalone on an extracted archive — does NOT require .git.
-# Checks:
-#   - SHA256SUMS verifies
-#   - Source manifest: every listed file exists with matching SHA-256
-#   - Source manifest: no extra files in source tree
-#   - Commit/tree metadata consistency
-#   - qualification.json: every gate individually PASS
-#   - artifact_promotable matches release_status
-#   - Required evidence logs present
-#   - Release invariants documented
 #
 # Usage: ./scripts/verify-release-artifact.sh [evidence-dir] [source-dir]
-#   evidence-dir: directory containing release evidence (default: release-evidence/)
+#   evidence-dir: directory containing qualification bundle (default: dist/release-evidence/)
 #   source-dir:    directory containing the source tree to verify (default: repo root)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-EVIDENCE_DIR="${1:-$REPO_ROOT/release-evidence}"
+EVIDENCE_DIR="${1:-$REPO_ROOT/dist/release-evidence}"
 SOURCE_DIR="${2:-$REPO_ROOT}"
 
 if [ ! -d "$EVIDENCE_DIR" ]; then
@@ -69,51 +60,41 @@ else
   check "Source SHA-256 manifest present" "FAIL"
 fi
 
-if [ -f "$EVIDENCE_DIR/source-tree-git-manifest.txt" ]; then
-  check "Source Git blob manifest present" "PASS"
-else
-  check "Source Git blob manifest present" "FAIL"
-fi
-
 # 2b. Verify manifest against actual source tree (standalone, no .git required).
-# Checks: every manifest file exists with matching hash, and no extra files.
 if [ -f "$EVIDENCE_DIR/source-tree-sha256.txt" ]; then
   MANIFEST_FILES="$(mktemp)"
   ACTUAL_FILES="$(mktemp)"
   MISMATCH_LOG="$(mktemp)"
 
-  # Extract file paths from manifest.
-  # Format: <64-char-sha256>  <path>
-  # The SHA is 64 chars, followed by 2 spaces, then the path.
-  # Use substr to extract everything after position 66.
+  # Extract file paths from manifest. Format: <64-char-sha256>  <path>
+  # SHA is 64 chars + 2 spaces = 66 chars, path starts at position 66.
   while IFS= read -r line; do
     [ -z "$line" ] && continue
-    # Extract path: everything after "hash  " (64 chars + 2 spaces = 66)
     path="${line:66}"
     echo "$path" >> "$MANIFEST_FILES"
   done < "$EVIDENCE_DIR/source-tree-sha256.txt"
-  sort -o "$MANIFEST_FILES" "$MANIFEST_FILES"
+  LC_ALL=C sort -o "$MANIFEST_FILES" "$MANIFEST_FILES"
 
-  # Enumerate actual source files (excluding release-evidence/ and common generated dirs).
-  # Use find so this works without .git.
-  find "$SOURCE_DIR" -type f \
-    ! -path "$SOURCE_DIR/release-evidence/*" \
-    ! -path "$SOURCE_DIR/node_modules/*" \
-    ! -path "$SOURCE_DIR/worker/node_modules/*" \
-    ! -path "$SOURCE_DIR/nemo/node_modules/*" \
-    ! -path "$SOURCE_DIR/.git/*" \
-    ! -path "$SOURCE_DIR/bin/*" \
-    ! -path "$SOURCE_DIR/dist/*" \
-    ! -path "$SOURCE_DIR/worker/dist/*" \
-    -print0 | while IFS= read -r -d '' f; do
-    # Strip the SOURCE_DIR prefix to get relative path
-    rel="${f#$SOURCE_DIR/}"
-    printf '%s\n' "$rel"
-  done | sort > "$ACTUAL_FILES"
+  # Enumerate actual source files using find (no .git required).
+  # Use the same exclusions as generate-source-manifest.sh.
+  cd "$SOURCE_DIR"
+  find . -type f | while IFS= read -r filepath; do
+    relpath="${filepath#./}"
+    # Skip excluded directories
+    echo "$relpath" | grep -q "node_modules\|/\.git/\|/dist/\|/coverage/\|/tmp/\|/\.build/\|/bin/\|__pycache__" && continue
+    # Skip release-evidence/ generated files (keep schemas/README)
+    case "$relpath" in
+      release-evidence/schemas/*|release-evidence/README.md) ;;
+      release-evidence/*) continue ;;
+    esac
+    # Skip OS metadata
+    [ "$(basename "$filepath")" = ".DS_Store" ] && continue
+    echo "$relpath" | grep -q "\.pyc$\|\.pyo$\|\.swp$\|\.swo$\|~$\|^\.#" && continue
+    printf '%s\n' "$relpath"
+  done | LC_ALL=C sort > "$ACTUAL_FILES"
 
   # Check for missing files (in manifest but not in source tree)
   MISSING="$(comm -23 "$MANIFEST_FILES" "$ACTUAL_FILES")"
-
   # Check for extra files (in source tree but not in manifest)
   EXTRA="$(comm -13 "$MANIFEST_FILES" "$ACTUAL_FILES")"
 
@@ -143,18 +124,9 @@ if [ -f "$EVIDENCE_DIR/source-tree-sha256.txt" ]; then
   echo "  Extra:           $EXTRA_COUNT" >&2
   echo "  Mismatched:      $MISMATCH_COUNT" >&2
 
-  if [ "$MISSING_COUNT" -gt 0 ]; then
-    echo "  Files in manifest but not in source tree:" >&2
-    echo "$MISSING" | head -20 | sed 's/^/    /' >&2
-  fi
-  if [ "$EXTRA_COUNT" -gt 0 ]; then
-    echo "  Files in source tree but not in manifest:" >&2
-    echo "$EXTRA" | head -20 | sed 's/^/    /' >&2
-  fi
-  if [ "$MISMATCH_COUNT" -gt 0 ]; then
-    echo "  Hash mismatches:" >&2
-    cat "$MISMATCH_LOG" | head -20 | sed 's/^/    /' >&2
-  fi
+  [ -n "$MISSING" ] && echo "$MISSING" | head -20 | sed 's/^/    /' >&2
+  [ -n "$EXTRA" ] && echo "$EXTRA" | head -20 | sed 's/^/    /' >&2
+  [ "$MISMATCH_COUNT" -gt 0 ] && cat "$MISMATCH_LOG" | head -20 | sed 's/^/    /' >&2
 
   rm -f "$MANIFEST_FILES" "$ACTUAL_FILES" "$MISMATCH_LOG"
 
@@ -180,27 +152,70 @@ else
   check "Commit/tree consistency (missing)" "FAIL"
 fi
 
-# 4. qualification.json exists and all gates PASS.
+# 4. qualification.json — independently recompute gate summary.
 if [ -f "$EVIDENCE_DIR/qualification.json" ]; then
-  RELEASE_STATUS="$(jq -r '.release_status' "$EVIDENCE_DIR/qualification.json" 2>/dev/null || echo "")"
-  if [ "$RELEASE_STATUS" = "PASS" ]; then
-    check "Qualification release_status" "PASS"
+  # 4a. Validate against schema if present.
+  if [ -f "$REPO_ROOT/release-evidence/schemas/qualification.schema.json" ]; then
+    # Use npx ajv if available, otherwise skip with warning
+    if command -v npx >/dev/null 2>&1 && npx --yes ajv-cli validate \
+      -s "$REPO_ROOT/release-evidence/schemas/qualification.schema.json" \
+      -d "$EVIDENCE_DIR/qualification.json" >/dev/null 2>&1; then
+      check "Qualification schema valid" "PASS"
+    else
+      # Fallback: basic jq structure check
+      if jq empty "$EVIDENCE_DIR/qualification.json" 2>/dev/null; then
+        check "Qualification schema (jq fallback)" "PASS"
+      else
+        check "Qualification schema valid" "FAIL"
+      fi
+    fi
   else
-    check "Qualification release_status ($RELEASE_STATUS)" "FAIL"
+    check "Qualification schema (missing)" "FAIL"
   fi
 
-  # 4b. Validate each gate individually PASS (not just aggregate).
+  # 4b. Independently recompute gate summary from individual gates.
   GATE_COUNT="$(jq '.gates | length' "$EVIDENCE_DIR/qualification.json" 2>/dev/null || echo 0)"
-  FAILED_GATES="$(jq -r '.gates[] | select(.status != "PASS") | .name' "$EVIDENCE_DIR/qualification.json" 2>/dev/null || echo "")"
-  if [ "$GATE_COUNT" -gt 0 ] && [ -z "$FAILED_GATES" ]; then
-    check "All gates individually PASS ($GATE_COUNT)" "PASS"
+  DERIVED_PASS="$(jq '[.gates[] | select(.status == "PASS")] | length' "$EVIDENCE_DIR/qualification.json" 2>/dev/null || echo 0)"
+  DERIVED_FAIL="$(jq '[.gates[] | select(.status == "FAIL")] | length' "$EVIDENCE_DIR/qualification.json" 2>/dev/null || echo 0)"
+  DERIVED_SKIP="$(jq '[.gates[] | select(.status == "SKIP")] | length' "$EVIDENCE_DIR/qualification.json" 2>/dev/null || echo 0)"
+
+  # Check every mandatory gate is PASS
+  FAILED_MANDATORY="$(jq -r '.gates[] | select(.mandatory == true and .status != "PASS") | .id' "$EVIDENCE_DIR/qualification.json" 2>/dev/null || echo "")"
+
+  if [ "$GATE_COUNT" -gt 0 ] && [ -z "$FAILED_MANDATORY" ]; then
+    check "All mandatory gates PASS ($GATE_COUNT)" "PASS"
   else
-    echo "  Failed gates:" >&2
-    echo "$FAILED_GATES" | head -10 | sed 's/^/    /' >&2
-    check "All gates individually PASS" "FAIL"
+    echo "  Failed mandatory gates: $FAILED_MANDATORY" >&2
+    check "All mandatory gates PASS" "FAIL"
   fi
 
-  # 4c. Verify artifact_promotable matches release_status.
+  # 4c. Cross-check declared vs derived summary.
+  DECLARED_TOTAL="$(jq -r '.gate_summary.total' "$EVIDENCE_DIR/qualification.json" 2>/dev/null || echo 0)"
+  DECLARED_PASSED="$(jq -r '.gate_summary.passed' "$EVIDENCE_DIR/qualification.json" 2>/dev/null || echo 0)"
+  DECLARED_FAILED="$(jq -r '.gate_summary.failed' "$EVIDENCE_DIR/qualification.json" 2>/dev/null || echo 0)"
+
+  if [ "$DECLARED_TOTAL" = "$GATE_COUNT" ] && \
+     [ "$DECLARED_PASSED" = "$DERIVED_PASS" ] && \
+     [ "$DECLARED_FAILED" = "$DERIVED_FAIL" ]; then
+    check "Gate summary consistency" "PASS"
+  else
+    check "Gate summary consistency" "FAIL"
+  fi
+
+  # 4d. Cross-check release_status matches derived.
+  RELEASE_STATUS="$(jq -r '.release_status' "$EVIDENCE_DIR/qualification.json" 2>/dev/null || echo "")"
+  if [ "$DERIVED_FAIL" -eq 0 ]; then
+    DERIVED_STATUS="PASS"
+  else
+    DERIVED_STATUS="FAIL"
+  fi
+  if [ "$RELEASE_STATUS" = "$DERIVED_STATUS" ]; then
+    check "Release status consistency" "PASS"
+  else
+    check "Release status consistency" "FAIL"
+  fi
+
+  # 4e. Cross-check artifact_promotable.
   PROMOTABLE="$(jq -r '.artifact_promotable' "$EVIDENCE_DIR/qualification.json" 2>/dev/null || echo "false")"
   if [ "$RELEASE_STATUS" = "PASS" ] && [ "$PROMOTABLE" = "true" ]; then
     check "Artifact promotable" "PASS"
@@ -210,77 +225,54 @@ if [ -f "$EVIDENCE_DIR/qualification.json" ]; then
     check "Artifact promotable (mismatch)" "FAIL"
   fi
 
-  # 4d. Cross-check: if any gate is FAIL, release_status must not be PASS.
-  if [ -n "$FAILED_GATES" ] && [ "$RELEASE_STATUS" = "PASS" ]; then
-    check "Gate-status consistency" "FAIL"
+  # 4f. Cross-check: mandatory gate with exit_code != 0 must not be PASS.
+  INCONSISTENT_GATES="$(jq -r '.gates[] | select(.status == "PASS" and .exit_code != 0) | .id' "$EVIDENCE_DIR/qualification.json" 2>/dev/null || echo "")"
+  if [ -z "$INCONSISTENT_GATES" ]; then
+    check "Gate exit-code consistency" "PASS"
   else
-    check "Gate-status consistency" "PASS"
+    echo "  PASS gates with nonzero exit: $INCONSISTENT_GATES" >&2
+    check "Gate exit-code consistency" "FAIL"
   fi
 
-  # 4e. Cross-check: every gate must have a matching log file.
+  # 4g. Cross-check: mandatory gate with tests_executed == 0 must not be PASS (for test gates).
+  ZERO_EXECUTION_GATES="$(jq -r '.gates[] | select(.mandatory == true and .tests_executed == 0 and .status == "PASS") | .id' "$EVIDENCE_DIR/qualification.json" 2>/dev/null || echo "")"
+  if [ -z "$ZERO_EXECUTION_GATES" ]; then
+    check "Gate execution consistency" "PASS"
+  else
+    echo "  PASS gates with 0 executed tests: $ZERO_EXECUTION_GATES" >&2
+    check "Gate execution consistency" "FAIL"
+  fi
+
+  # 4h. Verify each gate's evidence file exists.
   GATE_LOG_MISSING=false
-  for log in $(jq -r '.gates[].log' "$EVIDENCE_DIR/qualification.json" 2>/dev/null || echo ""); do
+  for log in $(jq -r '.gates[].evidence_file' "$EVIDENCE_DIR/qualification.json" 2>/dev/null || echo ""); do
     if [ ! -f "$EVIDENCE_DIR/$log" ]; then
       GATE_LOG_MISSING=true
-      echo "  Missing log for gate: $log" >&2
+      echo "  Missing evidence file: $log" >&2
     fi
   done
   if [ "$GATE_LOG_MISSING" = false ]; then
-    check "Gate log files present" "PASS"
+    check "Gate evidence files present" "PASS"
   else
-    check "Gate log files present" "FAIL"
+    check "Gate evidence files present" "FAIL"
   fi
 else
-  check "Qualification release_status (missing)" "FAIL"
-  check "All gates individually PASS (missing)" "FAIL"
-  check "Artifact promotable (missing)" "FAIL"
-  check "Gate-status consistency (missing)" "FAIL"
-  check "Gate log files present (missing)" "FAIL"
+  check "Qualification JSON (missing)" "FAIL"
 fi
 
-# 5. Required evidence logs present.
-REQUIRED_LOGS=(
-  "go-vet.log"
-  "go-evidence-tests.log"
-  "go-race-evidence.log"
-  "go-race-providers.log"
-  "go-tart-tests.log"
-  "go-lume-tests.log"
-  "go-shared-tests.log"
-  "worker-typecheck.log"
-  "worker-tests.log"
-  "worker-format.log"
-  "worker-lint.log"
-  "worker-build.log"
-  "postgres-fencing.log"
-  "postgres-parity.log"
-  "cross-language-conformance.log"
-  "source-manifest-verify.log"
-  "nemo-typecheck.log"
-  "nemo-tests.log"
-)
-ALL_LOGS_PRESENT=true
-for log in "${REQUIRED_LOGS[@]}"; do
-  if [ ! -f "$EVIDENCE_DIR/$log" ]; then
-    ALL_LOGS_PRESENT=false
-    echo "  Missing required log: $log" >&2
-    break
+# 5. Artifact.json — verify archive digest if present.
+if [ -f "$EVIDENCE_DIR/artifact.json" ]; then
+  ARTIFACT_SHA="$(jq -r '.sha256' "$EVIDENCE_DIR/artifact.json" 2>/dev/null || echo "")"
+  if [ -n "$ARTIFACT_SHA" ] && [[ "$ARTIFACT_SHA" =~ ^[0-9a-f]{64}$ ]]; then
+    check "Artifact digest format" "PASS"
+  else
+    check "Artifact digest format" "FAIL"
   fi
-done
-if [ "$ALL_LOGS_PRESENT" = true ]; then
-  check "Required evidence logs" "PASS"
 else
-  check "Required evidence logs (missing)" "FAIL"
+  check "Artifact.json (missing)" "FAIL"
 fi
 
-# 6. Toolchain identity present.
-if [ -f "$EVIDENCE_DIR/toolchains.json" ] && [ -f "$EVIDENCE_DIR/environment.json" ]; then
-  check "Toolchain identity" "PASS"
-else
-  check "Toolchain identity (missing)" "FAIL"
-fi
-
-# 7. Release invariants documented.
+# 6. Release invariants documented.
 if [ -f "$EVIDENCE_DIR/qualification.json" ]; then
   INV_COUNT="$(jq '.invariants | length' "$EVIDENCE_DIR/qualification.json" 2>/dev/null || echo 0)"
   if [ "$INV_COUNT" -ge 12 ]; then

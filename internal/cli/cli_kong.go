@@ -21,6 +21,7 @@ type crabboxKongCLI struct {
 	Prewarm     prewarmKongCmd     `cmd:"" passthrough:"" help:"Lease and hydrate a reusable test-ready box."`
 	Run         runKongCmd         `cmd:"" passthrough:"" help:"Sync the repo, run a remote command, stream output."`
 	Exec        execKongCmd        `cmd:"" passthrough:"" help:"Execute a capability via JSON stdin/stdout (NeMo bridge)."`
+	ServeExec   serveExecKongCmd   `cmd:"" help:"Start the persistent execution service (Unix socket)."`
 	Watch       watchKongCmd       `cmd:"" passthrough:"" help:"Re-run a command on a warm lease when local files change."`
 	Shard       shardKongCmd       `cmd:"" passthrough:"" help:"Fork a checkpoint into parallel shards and merge their test results."`
 	Bench       benchKongCmd       `cmd:"" help:"Record and report local benchmark timings."`
@@ -171,6 +172,9 @@ type runKongCmd struct {
 }
 type execKongCmd struct {
 	Args []string `arg:"" optional:""`
+}
+type serveExecKongCmd struct {
+	Socket string `help:"Unix socket path" default:"/tmp/crabedence-exec.sock"`
 }
 type watchKongCmd struct {
 	Args []string `arg:"" optional:""`
@@ -666,8 +670,11 @@ func (c *warmupKongCmd) Run(ctx context.Context, app App) error  { return app.wa
 func (c *prewarmKongCmd) Run(ctx context.Context, app App) error { return app.prewarm(ctx, c.Args) }
 func (c *runKongCmd) Run(ctx context.Context, app App) error     { return app.runCommand(ctx, c.Args) }
 func (c *execKongCmd) Run(ctx context.Context, app App) error    { return app.execCommand(ctx, c.Args) }
-func (c *watchKongCmd) Run(ctx context.Context, app App) error   { return app.watch(ctx, c.Args) }
-func (c *shardKongCmd) Run(ctx context.Context, app App) error   { return app.shard(ctx, c.Args) }
+func (c *serveExecKongCmd) Run(ctx context.Context, app App) error {
+	return app.serveExecCommand(ctx, c.Socket)
+}
+func (c *watchKongCmd) Run(ctx context.Context, app App) error { return app.watch(ctx, c.Args) }
+func (c *shardKongCmd) Run(ctx context.Context, app App) error { return app.shard(ctx, c.Args) }
 func (c *benchRunKongCmd) Run(ctx context.Context, app App) error {
 	return app.benchRun(ctx, c.Args)
 }
