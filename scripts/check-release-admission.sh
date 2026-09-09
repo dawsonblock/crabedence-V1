@@ -8,7 +8,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-QUAL_FILE="${1:-$REPO_ROOT/release-evidence/qualification.json}"
+QUAL_FILE="${1:-$REPO_ROOT/dist/release-evidence/qualification.json}"
 
 if [ ! -f "$QUAL_FILE" ]; then
   echo "ERROR: qualification.json not found at $QUAL_FILE" >&2

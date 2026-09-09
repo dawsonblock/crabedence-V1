@@ -1,27 +1,28 @@
 #!/usr/bin/env bash
-# Generate machine-verifiable release evidence into release-evidence/.
+# Generate machine-verifiable release evidence into dist/release-evidence/.
 #
 # This script is the canonical release qualification pipeline. It:
-#   1. Requires a clean Git working tree (Phase 4).
-#   2. Captures source provenance from Git (Phase 5).
-#   3. Generates source-tree manifests with both Git blob IDs and raw SHA-256 (Phase 6).
-#   4. Verifies the source manifest (Phase 7).
-#   5. Runs all qualification gates with uncached Go tests (Phase 8).
-#   6. Captures raw logs for every gate (Phase 9-13).
-#   7. Fails closed if any mandatory gate fails (Phase 3).
-#   8. Generates qualification.json as the canonical admission record (Phase 16).
-#   9. Generates SHA256SUMS for the evidence bundle (Phase 20).
+#   1. Requires a clean Git working tree.
+#   2. Captures source provenance from Git.
+#   3. Generates source-tree manifest using scripts/generate-source-manifest.sh.
+#   4. Runs all qualification gates with uncached Go tests.
+#   5. Captures raw logs and machine-readable JSON for every gate.
+#   6. Fails closed if any mandatory gate fails.
+#   7. Generates qualification.json as the canonical admission record.
+#   8. Generates SHA256SUMS for the evidence bundle.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-EVIDENCE_DIR="$REPO_ROOT/release-evidence"
-mkdir -p "$EVIDENCE_DIR"
+EVIDENCE_DIR="$REPO_ROOT/dist/release-evidence"
+mkdir -p "$EVIDENCE_DIR/gate-results"
 
 # Clean previous generated artifacts.
-rm -f "$EVIDENCE_DIR"/*.log "$EVIDENCE_DIR"/*.json "$EVIDENCE_DIR"/SHA256SUMS \
-  "$EVIDENCE_DIR"/source-commit.txt "$EVIDENCE_DIR"/source-commit-metadata.txt \
-  "$EVIDENCE_DIR"/source-tree-manifest.txt "$EVIDENCE_DIR"/source-tree-git-manifest.txt \
-  "$EVIDENCE_DIR"/source-tree-sha256.txt "$EVIDENCE_DIR"/provenance.json
+rm -f "$EVIDENCE_DIR"/*.json "$EVIDENCE_DIR"/SHA256SUMS \
+  "$EVIDENCE_DIR"/source-tree-sha256.txt "$EVIDENCE_DIR"/source-tree-git-blobs.txt \
+  "$EVIDENCE_DIR"/provenance.json "$EVIDENCE_DIR"/artifact.json \
+  "$EVIDENCE_DIR"/toolchains.json "$EVIDENCE_DIR"/environment.json
+rm -rf "$EVIDENCE_DIR/gate-results"
+mkdir -p "$EVIDENCE_DIR/gate-results"
 
 # ─── Gate tracking ─────────────────────────────────────────────────────────
 # Each gate records: name, status (PASS/FAIL/NOT_RUN), exit code, log file.
@@ -44,7 +45,7 @@ record_gate() {
 run_and_log() {
   local name="$1"
   shift
-  local log="$EVIDENCE_DIR/${name}.log"
+  local log="$EVIDENCE_DIR/gate-results/${name}.log"
   {
     echo "command=$*"
     echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -68,7 +69,7 @@ run_and_log() {
 run_gate() {
   local name="$1"
   shift
-  local log="$EVIDENCE_DIR/${name}.log"
+  local log="$EVIDENCE_DIR/gate-results/${name}.log"
   if run_and_log "$name" "$@"; then
     record_gate "$name" "PASS" 0 "$log"
     echo "  PASS  $name"
@@ -134,24 +135,21 @@ cat > "$EVIDENCE_DIR/build-reproducibility.json" << EOF
 }
 EOF
 
-# ─── Phase 6: Source-tree manifests ─────────────────────────────────────────
-# Exclude release-evidence/ from source manifests — those are generated
-# outputs, not source inputs. The manifest binds the source tree, not the
-# evidence bundle.
-# Git blob manifest: path → git_blob_id
-git -C "$REPO_ROOT" ls-files -z -- . ':(exclude)release-evidence/' | sort -z | while IFS= read -r -d '' file; do
+# ─── Phase 6: Source-tree manifest ──────────────────────────────────────────
+# Use the canonical source manifest generator (scripts/generate-source-manifest.sh)
+# which uses find (not git ls-files) and explicit exclusions.
+bash "$REPO_ROOT/scripts/generate-source-manifest.sh" \
+  "$EVIDENCE_DIR/source-tree-sha256.txt" "$REPO_ROOT" 2>&1 | \
+  tee "$EVIDENCE_DIR/gate-results/source-manifest-generate.log"
+
+# Git blob manifest: path → git_blob_id (for Git-native verification)
+git -C "$REPO_ROOT" ls-files -z -- . ':(exclude)release-evidence/' ':(exclude)dist/' | sort -z | while IFS= read -r -d '' file; do
   blob="$(git -C "$REPO_ROOT" rev-parse "HEAD:$file")"
   echo "$blob  $file"
-done > "$EVIDENCE_DIR/source-tree-git-manifest.txt"
-
-# Raw SHA-256 manifest: path → sha256 of file content
-git -C "$REPO_ROOT" ls-files -z -- . ':(exclude)release-evidence/' | sort -z | while IFS= read -r -d '' file; do
-  sha="$(shasum -a 256 "$REPO_ROOT/$file" | cut -d ' ' -f 1)"
-  echo "$sha  $file"
-done > "$EVIDENCE_DIR/source-tree-sha256.txt"
+done > "$EVIDENCE_DIR/source-tree-git-blobs.txt"
 
 # ─── Phase 7: Verify source manifest ────────────────────────────────────────
-MANIFEST_VERIFY="$EVIDENCE_DIR/source-manifest-verify.log"
+MANIFEST_VERIFY="$EVIDENCE_DIR/gate-results/source-manifest-verify.log"
 {
   echo "command=verify source-tree-sha256.txt"
   echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -250,7 +248,7 @@ echo "=== Live PostgreSQL gates ==="
 run_live_postgres_gate() {
   local name="$1"
   local test_file="$2"
-  local log="$EVIDENCE_DIR/${name}.log"
+  local log="$EVIDENCE_DIR/gate-results/${name}.log"
   local json_out="$EVIDENCE_DIR/${name}.vitest.json"
 
   if [ -z "${CRABBOX_TEST_DATABASE_URL:-}" ]; then
@@ -359,7 +357,7 @@ run_gate nemo-tests sh -c 'cd nemo && npx vitest run'
 
 # ─── Phase 15: Worker structured summaries ─────────────────────────────────
 # Extract test counts from the worker test log.
-WORKER_TEST_LOG="$EVIDENCE_DIR/worker-tests.log"
+WORKER_TEST_LOG="$EVIDENCE_DIR/gate-results/worker-tests.log"
 if [ -f "$WORKER_TEST_LOG" ]; then
   TESTS_PASSED="$(grep -oE 'Tests.*[0-9]+ passed' "$WORKER_TEST_LOG" | grep -oE '[0-9]+ passed' | head -1 | grep -oE '^[0-9]+' || echo 0)"
   TESTS_FAILED="$(grep -oE 'Tests.*[0-9]+ failed' "$WORKER_TEST_LOG" | grep -oE '[0-9]+ failed' | head -1 | grep -oE '^[0-9]+' || echo 0)"
@@ -381,7 +379,7 @@ EOF
 fi
 
 # Extract lint counts from the worker lint log.
-WORKER_LINT_LOG="$EVIDENCE_DIR/worker-lint.log"
+WORKER_LINT_LOG="$EVIDENCE_DIR/gate-results/worker-lint.log"
 if [ -f "$WORKER_LINT_LOG" ]; then
   LINT_ERRORS="$(grep -oE 'Found [0-9]+ warnings? and [0-9]+ errors?' "$WORKER_LINT_LOG" | grep -oE '[0-9]+ errors?' | grep -oE '^[0-9]+' || echo 0)"
   LINT_WARNINGS="$(grep -oE 'Found [0-9]+ warnings? and [0-9]+ errors?' "$WORKER_LINT_LOG" | grep -oE '[0-9]+ warnings?' | grep -oE '^[0-9]+' || echo 0)"
@@ -405,7 +403,7 @@ echo "=== Generating qualification.json ==="
 GATES_JSON="["
 for i in "${!GATE_NAMES[@]}"; do
   [ "$i" -gt 0 ] && GATES_JSON+=","
-  GATES_JSON+="{\"name\":\"${GATE_NAMES[$i]}\",\"status\":\"${GATE_STATUS[$i]}\",\"exit\":${GATE_EXIT[$i]},\"log\":\"$(basename "${GATE_LOG[$i]}")\"}"
+  GATES_JSON+="{\"id\":\"${GATE_NAMES[$i]}\",\"name\":\"${GATE_NAMES[$i]}\",\"mandatory\":true,\"status\":\"${GATE_STATUS[$i]}\",\"exit_code\":${GATE_EXIT[$i]},\"evidence_file\":\"gate-results/$(basename "${GATE_LOG[$i]}")\"}"
 done
 GATES_JSON+="]"
 
@@ -440,12 +438,39 @@ done
 
 cat > "$EVIDENCE_DIR/qualification.json" << EOF
 {
-  "schema_version": 1,
-  "source": {
+  "qualification_version": 1,
+  "release_status": "$RELEASE_STATUS",
+  "artifact_promotable": $ARTIFACT_PROMOTABLE,
+  "gate_summary": {
+    "total": $TOTAL_GATES,
+    "passed": $PASSED_GATES,
+    "failed": $FAILED_GATES,
+    "skipped": 0
+  },
+  "gates": $GATES_JSON,
+  "invariants": [
+    {"id": "CRAB-V1-001", "description": "V3 receipt always binds evidence_sha256"},
+    {"id": "CRAB-V1-002", "description": "V2 receipt can never contain evidence_sha256"},
+    {"id": "CRAB-V1-003", "description": "receipt evidence digest equals canonical RunEvidenceV1 SHA-256"},
+    {"id": "CRAB-V1-004", "description": "Go and TypeScript produce identical canonical evidence"},
+    {"id": "CRAB-V1-005", "description": "Go and TypeScript accept/reject identical receipt/evidence domains"},
+    {"id": "CRAB-V1-006", "description": "startup confirmation failure evidence survives to RunEvidenceV1"},
+    {"id": "CRAB-V1-007", "description": "detached providers never advertise exit observability"},
+    {"id": "CRAB-V1-008", "description": "persistence failure cannot alter FinalRunOutcome"},
+    {"id": "CRAB-V1-009", "description": "new mutations fail after coordinator authority loss"},
+    {"id": "CRAB-V1-010", "description": "replacement mutations cannot overlap pre-admitted old-coordinator mutations"},
+    {"id": "CRAB-V1-011", "description": "qualified source tree equals packaged source tree"},
+    {"id": "CRAB-V1-012", "description": "every mandatory qualification gate was executed and passed"},
+    {"id": "CRAB-V1-013", "description": "Go capability registry is authoritative for execution class"},
+    {"id": "CRAB-V1-014", "description": "durable idempotency prevents duplicate side effects"},
+    {"id": "CRAB-V1-015", "description": "UNKNOWN is a first-class terminal state for post-dispatch ambiguity"},
+    {"id": "CRAB-V1-016", "description": "crabbox exec never returns fake success for undispatched operations"}
+  ],
+  "provenance": {
     "commit": "$COMMIT",
     "tree": "$TREE",
     "branch": "$BRANCH",
-    "dirty": false
+    "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   },
   "toolchains": {
     "go": "$GO_VERSION",
@@ -460,29 +485,7 @@ cat > "$EVIDENCE_DIR/qualification.json" << EOF
     "os_version": "$(uname -r)",
     "arch": "$(uname -m)",
     "date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  },
-  "gates": $GATES_JSON,
-  "gate_summary": {
-    "total": $TOTAL_GATES,
-    "passed": $PASSED_GATES,
-    "failed": $FAILED_GATES
-  },
-  "release_status": "$RELEASE_STATUS",
-  "artifact_promotable": $ARTIFACT_PROMOTABLE,
-  "invariants": [
-    {"id": "CRAB-V1-001", "description": "V3 receipt always binds evidence_sha256"},
-    {"id": "CRAB-V1-002", "description": "V2 receipt can never contain evidence_sha256"},
-    {"id": "CRAB-V1-003", "description": "receipt evidence digest equals canonical RunEvidenceV1 SHA-256"},
-    {"id": "CRAB-V1-004", "description": "Go and TypeScript produce identical canonical evidence"},
-    {"id": "CRAB-V1-005", "description": "Go and TypeScript accept/reject identical receipt/evidence domains"},
-    {"id": "CRAB-V1-006", "description": "startup confirmation failure evidence survives to RunEvidenceV1"},
-    {"id": "CRAB-V1-007", "description": "detached providers never advertise exit observability"},
-    {"id": "CRAB-V1-008", "description": "persistence failure cannot alter FinalRunOutcome"},
-    {"id": "CRAB-V1-009", "description": "new mutations fail after coordinator authority loss"},
-    {"id": "CRAB-V1-010", "description": "replacement mutations cannot overlap pre-admitted old-coordinator mutations"},
-    {"id": "CRAB-V1-011", "description": "qualified source tree equals packaged source tree"},
-    {"id": "CRAB-V1-012", "description": "every mandatory qualification gate was executed and passed"}
-  ]
+  }
 }
 EOF
 

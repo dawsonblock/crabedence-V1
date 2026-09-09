@@ -33,7 +33,7 @@ jobs:
       - name: Verify clean working tree
         shell: bash
         run: |
-          if [ -n "$(git status --porcelain --untracked-files=all -- . ':(exclude)release-evidence/')" ]; then
+          if [ -n "$(git status --porcelain --untracked-files=all -- . ':(exclude)dist/')" ]; then
             echo "ERROR: working tree is not clean"
             git status --porcelain
             exit 1
@@ -333,7 +333,7 @@ jobs:
       - name: Generate artifact.json
         shell: bash
         run: |
-          cat > release-evidence/artifact.json << EOF
+          cat > dist/dist/release-evidence/artifact.json << EOF
           {
             "name": "crabedence-${RELEASE_VERSION}.tar.gz",
             "sha256": "${{ steps.artifact_hash.outputs.tar_sha256 }}",
@@ -349,7 +349,7 @@ jobs:
       - name: Regenerate SHA256SUMS
         shell: bash
         run: |
-          cd release-evidence
+          cd dist/release-evidence
           find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 shasum -a 256 > SHA256SUMS
 
       # ─── Generate SBOM ────────────────────────────────────────────────
@@ -431,9 +431,9 @@ jobs:
             dist/crabedence-${{ env.RELEASE_VERSION }}.zip
             dist/crabedence-${{ env.RELEASE_VERSION }}.zip.sha256
             dist/crabedence-${{ env.RELEASE_VERSION }}.bom.json
-            release-evidence/qualification.json
-            release-evidence/qualification-matrix.md
-            release-evidence/source-tree-sha256.txt
-            release-evidence/provenance.json
-            release-evidence/artifact.json
-            release-evidence/SHA256SUMS
+            dist/release-evidence/qualification.json
+            dist/release-evidence/qualification-matrix.md
+            dist/release-evidence/source-tree-sha256.txt
+            dist/release-evidence/provenance.json
+            dist/dist/release-evidence/artifact.json
+            dist/release-evidence/SHA256SUMS
