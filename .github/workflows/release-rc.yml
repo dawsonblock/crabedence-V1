@@ -330,6 +330,12 @@ jobs:
           subject-path: dist/crabedence-${{ env.RELEASE_VERSION }}.bom.json
 
       # ─── Tag the release candidate ────────────────────────────────────
+      - name: Configure Git identity
+        shell: bash
+        run: |
+          git config user.name "Crabedence Release Bot"
+          git config user.email "release@crabedence.dev"
+
       - name: Tag release candidate
         shell: bash
         run: |
