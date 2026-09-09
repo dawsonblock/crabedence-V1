@@ -1,8 +1,12 @@
 /**
- * NeMo kernel — capability catalog and execution routing.
+ * NEMO kernel — capability catalog and execution routing.
+ *
+ * NEMO is an optional specialized reasoning/research component, not the
+ * parent runtime. Any planner can invoke Crabedence capabilities through
+ * the stable capability invocation ABI (docs/spec/capability-invocation-abi.md).
  *
  * The kernel owns:
- *   - capability registration (with pinned execution classes)
+ *   - capability registration (with pinned execution classes for NEMO-local routing)
  *   - execution class routing (PURE → local, READ/MUTATION/CRITICAL → adapter)
  *   - request admission (schema validation, authority policy binding,
  *     deadline enforcement, CRITICAL evidence verification)
@@ -13,6 +17,8 @@
  *   - receipt signing
  *   - PostgreSQL fencing
  *   - idempotency storage
+ *   - authority truth (grant resolution)
+ *   - execution-class truth (Crabedence's registry is authoritative)
  *
  * Those are Crabedence's responsibilities below the port.
  */

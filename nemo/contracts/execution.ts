@@ -1,17 +1,23 @@
 /**
- * NeMo execution contracts.
+ * NEMO execution contracts.
  *
- * These types define the boundary between NeMo (reasoning/kernel) and
- * Crabedence (execution-control). NeMo owns these interfaces. Crabedence
- * implements them through an adapter.
+ * NEMO is an optional specialized reasoning/research component, not the
+ * parent runtime. Any planner (Hermes, OpenAI SDK, custom) can invoke
+ * Crabedence capabilities through the stable capability invocation ABI.
+ *
+ * These types define NEMO's internal execution port interface. The
+ * stable boundary between any planner and Crabedence is defined in:
+ *   docs/spec/capability-invocation-abi.md
  *
  * Dependency direction:
  *
- *   NeMo contract
+ *   NEMO contract (internal to NEMO)
  *       ↑
- *   Crabedence adapter
+ *   Crabedence adapter (implements the contract)
  *
- * Never the reverse.
+ * The adapter is a thin transport layer. It does not own provider
+ * semantics, authority truth, execution-class truth, durable
+ * idempotency, receipts, or reconciliation.
  */
 
 // ─── Execution classes ────────────────────────────────────────────────

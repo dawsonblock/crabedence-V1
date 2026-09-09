@@ -143,35 +143,40 @@ For the full mental model, see [How Crabbox Works](docs/how-it-works.md). For
 product scope and non-goals, see the [Crabbox Vision](VISION.md). For the
 doc-to-code map, see [Source Map](docs/source-map.md).
 
-### NeMo execution boundary
+### Execution kernel
 
-Crabbox includes a NeMo execution kernel (`nemo/`) that provides a typed
-execution port for reasoning/agent systems. NeMo owns capability registration
-with pinned execution classes; Crabbox owns provider lifecycle, evidence
-generation, receipt signing, and durable coordination.
+Crabedence is a planner-agnostic trusted execution kernel. Any
+planning/reasoning runtime (Hermes, OpenAI Agents SDK, LangGraph,
+custom) can invoke capabilities through a stable ABI. Crabedence
+independently resolves execution class, authority, schema, and
+provider binding from its registry — the planner does not supply
+security-relevant properties.
+
+See [Architecture: Planner-Agnostic Execution Kernel](docs/architecture/execution-kernel.md)
+and [Capability Invocation ABI](docs/spec/capability-invocation-abi.md).
 
 ```text
-MODEL / AGENT
+ANY PLANNER (Hermes, OpenAI SDK, custom)
       │
       ▼
-   NEMO KERNEL
-   capability catalog (immutable execution classes)
-   ExecutionPort interface
+   capability invocation ABI
+   (capability, arguments, principal, grant_id, idempotency_key)
       │
-      ├─ PURE → local execution
-      └─ READ / MUTATION / CRITICAL → Crabedence adapter
+      ├─ PURE → local execution (no socket hop)
+      └─ READ / MUTATION / CRITICAL → Crabedence
             │
             ▼ (Unix socket, length-prefixed JSON)
-         ExecutionApiServer
+         CRABEDENCE EXECUTION KERNEL
             │
-            ├─ authority validation
-            ├─ idempotency (atomic reservation, UNKNOWN persisted)
-            └─ handler → Crabedence Go core
+            ├─ capability registry (authoritative execution classes)
+            ├─ authority verification (grant resolution)
+            ├─ durable idempotency (PostgreSQL)
+            ├─ provider dispatch
+            ├─ RunEvidenceV1 generation
+            ├─ V3 receipt signing
+            └─ reconciliation
                   │
-                  ├─ provider dispatch
-                  ├─ RunEvidenceV1 generation
-                  ├─ V3 receipt signing
-                  └─ coordinator commitment
+                  ├─ MCP / APIs / Crabbox workers
 ```
 
 Execution classes are immutable once registered — a CRITICAL capability
@@ -189,10 +194,11 @@ spawn.
 
 ```sh
 # Start the persistent execution service
-crabbox serve-execution --socket /tmp/crabedence-exec.sock
+crabbox serve-execution
 
-# NeMo connects to the socket and sends execution requests
-# The service admits, dispatches, and returns typed responses
+# The service listens on a Unix socket (XDG_RUNTIME_DIR/crabedence/execution.sock)
+# Any planner can connect and send capability invocations
+# Set CRABEDENCE_DATABASE_URL for durable idempotency (required for MUTATION/CRITICAL)
 ```
 
 The `crabbox exec` command is a stdin/stdout bridge for testing and
@@ -207,10 +213,19 @@ echo '{"capability":"system.echo","arguments":{},"authority":{"principal":"alice
 
 Built-in capabilities:
 - `system.echo` (PURE) — returns arguments as echo result
+- `system.info` (READ) — returns system information (goes through remote port)
 - `test.counter.increment` (MUTATION) — harmless mutation with idempotency
 
-See [NeMo contracts](nemo/contracts/execution.ts),
-[NeMo kernel](nemo/kernel/kernel.ts),
+### NEMO
+
+NEMO (`nemo/`) is an optional specialized reasoning/research component,
+not the parent runtime. It provides a thin adapter to Crabedence's
+Unix socket and a test client for the execution service. Any planner
+can replace NEMO — the capability invocation ABI is the stable boundary.
+
+See [Capability Invocation ABI](docs/spec/capability-invocation-abi.md),
+[NEMO contracts](nemo/contracts/execution.ts),
+[NEMO kernel](nemo/kernel/kernel.ts),
 [Crabedence adapter](nemo/adapters/crabedence/adapter.ts),
 [Go capability registry](internal/capability/registry.go),
 [Go execution service](internal/execution/service.go), and

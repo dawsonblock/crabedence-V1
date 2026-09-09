@@ -148,7 +148,10 @@ func (r *Registry) Admit(req AdmissionRequest) AdmissionDecision {
 		}
 	}
 
-	// Verify caller's execution class assertion matches registry
+	// Verify caller's execution class assertion (optional, advisory).
+	// If present, it must match the registry's pinned class.
+	// If absent, the registry's pinned class is used (planner-agnostic).
+	// This is a defense-in-depth check — the registry is authoritative.
 	if req.ExecutionClass != "" && req.ExecutionClass != string(desc.ExecutionClass) {
 		return AdmissionDecision{
 			Allowed:     false,

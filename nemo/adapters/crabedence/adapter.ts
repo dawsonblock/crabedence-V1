@@ -1,19 +1,29 @@
 /**
  * Crabedence execution adapter.
  *
- * Implements NeMo's ExecutionPort by calling the Crabedence execution
- * API over a Unix domain socket. This adapter is intentionally thin —
- * it maps NeMo request types to Crabedence wire format and maps the
- * response back. If this file grows beyond a few hundred lines, the
- * boundary is wrong.
+ * Implements NEMO's ExecutionPort by calling the Crabedence execution
+ * kernel over a Unix domain socket. This adapter is intentionally thin —
+ * it maps NEMO request types to the Crabedence wire format (defined in
+ * docs/spec/capability-invocation-abi.md) and maps the response back.
+ *
+ * The adapter is a transport layer. It does not own:
+ *   - provider semantics
+ *   - authority truth (grant resolution is Crabedence's job)
+ *   - execution-class truth (Crabedence's registry is authoritative)
+ *   - durable idempotency
+ *   - receipts or evidence
+ *   - reconciliation
+ *
+ * Any planner (Hermes, OpenAI SDK, custom) can target the same ABI
+ * directly without going through NEMO. NEMO is optional.
  *
  * Dependency direction:
  *
- *   NeMo contracts (ExecutionPort)
+ *   NEMO contracts (ExecutionPort)
  *       ↑ implements
  *   CrabedenceExecutionAdapter
  *       ↓ calls
- *   Crabedence execution API (Unix socket)
+ *   Crabedence execution kernel (Unix socket)
  */
 
 import { connect, type Socket } from "node:net";
@@ -27,8 +37,12 @@ import type {
 // ─── Wire protocol ────────────────────────────────────────────────────
 
 /**
- * Crabedence execution API request (POST /v1/executions).
- * This is the wire format. NeMo's types map to this.
+ * Crabedence wire request (capability invocation ABI).
+ * See docs/spec/capability-invocation-abi.md for the frozen specification.
+ *
+ * execution_class is optional/advisory — Crabedence's registry is
+ * authoritative. If present, it is checked against the registry.
+ * If absent, the registry's pinned class is used.
  */
 export interface CrabedenceExecutionRequest {
   readonly capability: string;
@@ -37,7 +51,7 @@ export interface CrabedenceExecutionRequest {
     readonly principal: string;
     readonly grant_id: string;
   };
-  readonly execution_class: string;
+  readonly execution_class?: string;
   readonly idempotency_key?: string;
   readonly deadline?: string;
 }
@@ -370,7 +384,9 @@ export class CrabedenceExecutionAdapter implements ExecutionPort {
         principal: request.authority.principal,
         grant_id: request.authority.grantId,
       },
-      execution_class: request.executionClass ?? "CRITICAL",
+      // execution_class is optional/advisory — only send if the caller
+      // explicitly asserts it. Crabedence's registry is authoritative.
+      ...(request.executionClass && { execution_class: request.executionClass }),
       ...(request.idempotencyKey && { idempotency_key: request.idempotencyKey }),
       ...(request.deadline && { deadline: request.deadline }),
     };
