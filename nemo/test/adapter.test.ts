@@ -183,21 +183,19 @@ describe("CrabedenceExecutionAdapter (Unix socket)", () => {
     expect(callCount).toBe(1);
   });
 
-  // ─── UNKNOWN is not cached ──────────────────────────────────────
+  // ─── UNKNOWN IS persisted and returned for same key ──────────────
+  // This is the critical fix: UNKNOWN is a durable terminal state for
+  // idempotency. A retry with the same key must return the existing
+  // UNKNOWN record, NOT re-invoke the provider (which could duplicate
+  // the side effect).
 
-  it("does not cache UNKNOWN responses for idempotency", async () => {
+  it("persists UNKNOWN and returns it for same idempotency key", async () => {
     let callCount = 0;
     await startServer(async (req) => {
       callCount++;
-      if (callCount === 1) {
-        return {
-          status: "UNKNOWN" as const,
-          error: "first attempt lost connectivity",
-        };
-      }
       return {
-        status: "SUCCEEDED" as const,
-        result: { message_id: "msg_retry" },
+        status: "UNKNOWN" as const,
+        error: "lost connectivity after provider call",
       };
     });
 
@@ -220,8 +218,9 @@ describe("CrabedenceExecutionAdapter (Unix socket)", () => {
     });
 
     expect(resp1.status).toBe("UNKNOWN");
-    expect(resp2.status).toBe("SUCCEEDED");
-    expect(callCount).toBe(2);
+    expect(resp2.status).toBe("UNKNOWN");
+    // Handler called only once — UNKNOWN is persisted, not re-invoked.
+    expect(callCount).toBe(1);
   });
 
   // ─── Missing authority → DENIED ─────────────────────────────────

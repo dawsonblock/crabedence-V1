@@ -84,6 +84,8 @@ func (a App) directCommandHelp(ctx context.Context, args []string) (error, bool)
 		return a.prewarm(ctx, helpArgs), true
 	case "run":
 		return a.runCommand(ctx, helpArgs), true
+	case "exec":
+		return a.execCommand(ctx, helpArgs), true
 	case "watch":
 		return a.watch(ctx, helpArgs), true
 	case "shard":

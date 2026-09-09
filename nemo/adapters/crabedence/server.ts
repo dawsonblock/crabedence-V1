@@ -1,21 +1,24 @@
 /**
- * Crabedence execution API server.
+ * Crabedence execution API server (Unix socket).
  *
- * Listens on a Unix domain socket and accepts execution requests from
- * NeMo's CrabedenceExecutionAdapter. This is the server side of the
- * boundary between NeMo (reasoning) and Crabedence (execution).
+ * This is the protocol endpoint between NeMo and Crabedence. It:
+ *   1. Accepts framed requests over a Unix domain socket
+ *   2. Validates required request fields
+ *   3. Reserves idempotency keys atomically (prevents concurrent duplicates)
+ *   4. Delegates to an injected handler (the bridge to Crabedence Go core)
+ *   5. Persists execution state durably (including UNKNOWN)
+ *   6. Returns typed outcomes
  *
- * The server:
- *   1. Validates the request schema
- *   2. Verifies authority
- *   3. Checks idempotency (deduplicates mutations)
- *   4. Routes to the appropriate provider
- *   5. Captures evidence
- *   6. Returns a typed outcome with UNKNOWN as first-class
+ * What this server does NOT do itself:
+ *   - JSON-schema argument validation (lives in Crabedence core)
+ *   - Authority grant verification (lives in Crabedence core)
+ *   - Authority-policy matching (lives in Crabedence core)
+ *   - Provider dispatch (lives in Crabedence core)
+ *   - V3 receipt signing (lives in Crabedence core)
+ *   - Evidence generation (lives in Crabedence core)
+ *   - PostgreSQL fencing (lives in Crabedence core)
  *
- * In production this connects to Crabedence's Go core for provider
- * lifecycle, evidence generation, and receipt signing. For testing
- * and local development, handlers can be injected.
+ * The injected ExecutionHandler is the bridge to that machinery.
  */
 
 import { createServer, type Server, type Socket } from "node:net";
@@ -52,45 +55,207 @@ export interface ExecutionApiResponse {
 // ─── Handler interface ───────────────────────────────────────────────
 
 /**
- * Request handler. In production this bridges to Crabedence's Go core.
- * In tests, a mock handler is injected.
+ * Request handler. In production this bridges to Crabedence's Go core
+ * for provider lifecycle, evidence generation, receipt signing, and
+ * authority verification. In tests, a mock handler is injected.
  */
 export type ExecutionHandler = (
   request: ExecutionApiRequest,
 ) => Promise<ExecutionApiResponse>;
 
+// ─── Protocol constants ────────────────────────────────────────────────
+
+const MAX_MESSAGE_BYTES = 4 * 1024 * 1024;
+const IO_TIMEOUT_MS = 30_000;
+
+// ─── Execution state ──────────────────────────────────────────────────
+
+/**
+ * Durable execution record state.
+ *
+ * IN_FLIGHT   — request dispatched to provider, awaiting outcome
+ * SUCCEEDED   — provider confirmed success
+ * FAILED      — provider confirmed failure
+ * DENIED      — authority rejected before dispatch
+ * UNKNOWN     — dispatched but outcome could not be confirmed
+ *
+ * For MUTATION/CRITICAL operations, once a key is IN_FLIGHT or has
+ * reached any terminal state, a retry with the same key MUST return
+ * the existing record, not re-invoke the provider.
+ */
+type ExecutionState =
+  | "IN_FLIGHT"
+  | "SUCCEEDED"
+  | "FAILED"
+  | "DENIED"
+  | "UNKNOWN";
+
+interface ExecutionRecord {
+  readonly key: string;
+  readonly requestDigest: string;
+  state: ExecutionState;
+  response?: ExecutionApiResponse;
+}
+
 // ─── Idempotency store ───────────────────────────────────────────────
 
 /**
- * In-memory idempotency store. In production this is backed by
- * PostgreSQL. For each idempotency key, the first response is cached
- * and returned for subsequent requests with the same key.
+ * Idempotency store with atomic reservation.
+ *
+ * In production this is backed by PostgreSQL with INSERT ... ON CONFLICT.
+ * For testing, an in-memory implementation is used.
+ *
+ * Key invariants:
+ *   1. Concurrent requests with the same key + digest converge on one
+ *      execution record (atomic reservation).
+ *   2. A key bound to a different request digest is a hard conflict.
+ *   3. UNKNOWN is persisted (not discarded) so retries retrieve the
+ *      existing record instead of re-invoking the provider.
+ *   4. IN_FLIGHT records block concurrent duplicates until the first
+ *      execution completes.
  */
-class IdempotencyStore {
-  private readonly cache = new Map<string, ExecutionApiResponse>();
+export interface IdempotencyStore {
+  /**
+   * Atomically reserve a key. Returns:
+   *   - { state: "NEW" } if the key was not present (caller should execute)
+   *   - { state: "EXISTING", response } if the key has a terminal record
+   *   - { state: "IN_FLIGHT" } if the key is reserved but not yet complete
+   *   - { state: "CONFLICT" } if the key exists with a different digest
+   */
+  reserve(
+    key: string,
+    requestDigest: string,
+  ): Promise<{
+    state: "NEW" | "EXISTING" | "IN_FLIGHT" | "CONFLICT";
+    response?: ExecutionApiResponse;
+  }>;
 
-  async get(key: string): Promise<ExecutionApiResponse | undefined> {
-    return this.cache.get(key);
+  /** Store the outcome for a reserved key. */
+  settle(
+    key: string,
+    response: ExecutionApiResponse,
+  ): Promise<void>;
+}
+
+/**
+ * In-memory idempotency store with atomic reservation.
+ * Concurrent calls to reserve() with the same key are serialized.
+ */
+class InMemoryIdempotencyStore implements IdempotencyStore {
+  private readonly records = new Map<string, ExecutionRecord>();
+  private readonly pending = new Map<
+    string,
+    Promise<{ state: "NEW" | "EXISTING" | "IN_FLIGHT" | "CONFLICT"; response?: ExecutionApiResponse }>
+  >();
+
+  async reserve(
+    key: string,
+    requestDigest: string,
+  ): Promise<{
+    state: "NEW" | "EXISTING" | "IN_FLIGHT" | "CONFLICT";
+    response?: ExecutionApiResponse;
+  }> {
+    // If a reservation is already pending for this key, wait for it.
+    const existing = this.pending.get(key);
+    if (existing) {
+      return existing;
+    }
+
+    const promise = (async () => {
+      const record = this.records.get(key);
+      if (!record) {
+        // New reservation
+        this.records.set(key, {
+          key,
+          requestDigest,
+          state: "IN_FLIGHT",
+        });
+        return { state: "NEW" as const };
+      }
+
+      // Key exists — check digest
+      if (record.requestDigest !== requestDigest) {
+        return { state: "CONFLICT" as const };
+      }
+
+      if (record.state === "IN_FLIGHT") {
+        return { state: "IN_FLIGHT" as const };
+      }
+
+      return {
+        state: "EXISTING" as const,
+        response: record.response,
+      };
+    })();
+
+    this.pending.set(key, promise);
+    try {
+      return await promise;
+    } finally {
+      this.pending.delete(key);
+    }
   }
 
-  async put(key: string, response: ExecutionApiResponse): Promise<void> {
-    this.cache.set(key, response);
+  async settle(
+    key: string,
+    response: ExecutionApiResponse,
+  ): Promise<void> {
+    const record = this.records.get(key);
+    if (!record) {
+      return;
+    }
+    // Map response status to execution state
+    const state: ExecutionState =
+      response.status === "SUCCEEDED"
+        ? "SUCCEEDED"
+        : response.status === "FAILED"
+          ? "FAILED"
+          : response.status === "DENIED"
+            ? "DENIED"
+            : "UNKNOWN";
+    record.state = state;
+    record.response = response;
   }
+}
+
+// ─── Request digest ──────────────────────────────────────────────────
+
+/**
+ * Compute a canonical digest of the request for idempotency binding.
+ * Binds: principal, capability, canonical arguments.
+ * The same key with different arguments is a conflict.
+ */
+async function computeRequestDigest(
+  request: ExecutionApiRequest,
+): Promise<string> {
+  const canonical = JSON.stringify({
+    principal: request.authority.principal,
+    capability: request.capability,
+    arguments: request.arguments,
+  });
+  const encoder = new TextEncoder();
+  const data = encoder.encode(canonical);
+  const hash = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(hash))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 // ─── Server ──────────────────────────────────────────────────────────
 
 export class ExecutionApiServer {
   private server: Server | null = null;
-  private readonly idempotency = new IdempotencyStore();
+  private readonly idempotency: IdempotencyStore;
 
   constructor(
     private readonly handler: ExecutionHandler,
     private readonly socketPath: string,
-  ) {}
+    idempotency?: IdempotencyStore,
+  ) {
+    this.idempotency = idempotency ?? new InMemoryIdempotencyStore();
+  }
 
   async start(): Promise<void> {
-    // Clean up stale socket
     if (existsSync(this.socketPath)) {
       unlinkSync(this.socketPath);
     }
@@ -122,13 +287,51 @@ export class ExecutionApiServer {
     const chunks: Buffer[] = [];
     let request: ExecutionApiRequest | null = null;
     let expectedLen = 0;
+    let processed = false;
+
+    // I/O timeout
+    const timer = setTimeout(() => {
+      if (!processed) {
+        try {
+          socket.destroy();
+        } catch {
+          // ignore
+        }
+      }
+    }, IO_TIMEOUT_MS);
 
     socket.on("data", async (chunk: Buffer) => {
+      if (processed) {
+        // Reject trailing data after a complete frame
+        this.sendResponse(socket, {
+          status: "FAILED",
+          error: "unexpected trailing data after frame",
+        });
+        try {
+          socket.destroy();
+        } catch {
+          // ignore
+        }
+        return;
+      }
+
       chunks.push(chunk);
       const buf = Buffer.concat(chunks);
 
       if (request === null && buf.length >= 4) {
         expectedLen = buf.readUInt32BE(0);
+        if (expectedLen > MAX_MESSAGE_BYTES) {
+          this.sendResponse(socket, {
+            status: "FAILED",
+            error: `frame length ${expectedLen} exceeds maximum ${MAX_MESSAGE_BYTES}`,
+          });
+          try {
+            socket.destroy();
+          } catch {
+            // ignore
+          }
+          return;
+        }
       }
 
       if (request === null && buf.length >= 4 + expectedLen) {
@@ -142,13 +345,19 @@ export class ExecutionApiServer {
           });
           return;
         }
+        processed = true;
+        clearTimeout(timer);
         // Process asynchronously
         this.processRequest(socket, request);
       }
     });
 
     socket.on("error", () => {
-      // Socket errors are expected on close; ignore
+      clearTimeout(timer);
+    });
+
+    socket.on("close", () => {
+      clearTimeout(timer);
     });
   }
 
@@ -173,23 +382,53 @@ export class ExecutionApiServer {
         return;
       }
 
-      // Idempotency check for mutations
+      // Idempotency handling for mutations
       if (request.idempotency_key) {
-        const cached = await this.idempotency.get(request.idempotency_key);
-        if (cached) {
-          this.sendResponse(socket, cached);
+        const digest = await computeRequestDigest(request);
+        const reservation = await this.idempotency.reserve(
+          request.idempotency_key,
+          digest,
+        );
+
+        if (reservation.state === "CONFLICT") {
+          this.sendResponse(socket, {
+            status: "DENIED",
+            error: "idempotency key bound to different request",
+          });
           return;
         }
+
+        if (reservation.state === "IN_FLIGHT") {
+          // Another request with this key is in progress.
+          // Return UNKNOWN — the caller should retrieve the result later.
+          this.sendResponse(socket, {
+            status: "UNKNOWN",
+            error: "execution in flight for this idempotency key",
+          });
+          return;
+        }
+
+        if (reservation.state === "EXISTING" && reservation.response) {
+          // Return the existing terminal response (including UNKNOWN).
+          // This is the critical fix: UNKNOWN is persisted and returned
+          // for the same key, NOT re-invoked.
+          this.sendResponse(socket, reservation.response);
+          return;
+        }
+
+        // state === "NEW" — proceed to execute
+        const response = await this.handler(request);
+
+        // Persist the outcome (including UNKNOWN) so retries retrieve
+        // it instead of re-invoking the provider.
+        await this.idempotency.settle(request.idempotency_key, response);
+
+        this.sendResponse(socket, response);
+        return;
       }
 
-      // Execute
+      // No idempotency key — execute directly
       const response = await this.handler(request);
-
-      // Cache idempotent responses
-      if (request.idempotency_key && response.status !== "UNKNOWN") {
-        await this.idempotency.put(request.idempotency_key, response);
-      }
-
       this.sendResponse(socket, response);
     } catch (err) {
       this.sendResponse(socket, {
@@ -200,11 +439,11 @@ export class ExecutionApiServer {
   }
 
   private sendResponse(socket: Socket, response: ExecutionApiResponse): void {
-    const json = JSON.stringify(response);
+    const payload = Buffer.from(JSON.stringify(response), "utf-8");
     const length = Buffer.alloc(4);
-    length.writeUInt32BE(json.length, 0);
+    length.writeUInt32BE(payload.byteLength, 0);
     socket.write(length);
-    socket.write(json);
+    socket.write(payload);
     socket.end();
   }
 }

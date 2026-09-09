@@ -241,12 +241,61 @@ run_gate go-race-providers go test -race -count=1 -timeout=120s \
 # ─── Phase 10-12: Live PostgreSQL gates ────────────────────────────────────
 echo ""
 echo "=== Live PostgreSQL gates ==="
-run_gate postgres-fencing \
-  npx vitest run --no-file-parallelism \
-  test/postgres-authority-fencing.live.test.ts
-run_gate postgres-parity \
-  npx vitest run --no-file-parallelism \
-  test/coordinator-parity.live.test.ts
+
+# Live PostgreSQL gates fail closed. Without CRABBOX_TEST_DATABASE_URL the
+# tests skip themselves and exit 0, which must NOT be recorded as PASS.
+# The wrapper checks the env var, runs Vitest with JSON output, and parses
+# the result to require a nonzero number of executed tests.
+run_live_postgres_gate() {
+  local name="$1"
+  local test_file="$2"
+  local log="$EVIDENCE_DIR/${name}.log"
+
+  if [ -z "${CRABBOX_TEST_DATABASE_URL:-}" ]; then
+    {
+      echo "command=run_live_postgres_gate $name $test_file"
+      echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      echo "---"
+      echo "SKIP: CRABBOX_TEST_DATABASE_URL not set"
+      echo "exit=1"
+      echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "$log"
+    record_gate "$name" "FAIL" 1 "$log"
+    echo "  FAIL  $name (CRABBOX_TEST_DATABASE_URL not set)"
+    return
+  fi
+
+  run_and_log "$name" npx vitest run --no-file-parallelism --reporter=json "$test_file"
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    record_gate "$name" "FAIL" "$rc" "$log"
+    echo "  FAIL  $name (exit=$rc)"
+    return
+  fi
+
+  # Parse Vitest JSON output to verify tests actually executed (not skipped).
+  local total_tests skipped_tests
+  total_tests="$(jq -r '.testResults[].assertionResults | length' "$log" 2>/dev/null | paste -sd+ | bc 2>/dev/null || echo 0)"
+  skipped_tests="$(grep -c '"status":"skip"' "$log" 2>/dev/null || echo 0)"
+  local executed_tests=$((total_tests - skipped_tests))
+
+  if [ "$executed_tests" -le 0 ]; then
+    {
+      echo ""
+      echo "FAIL: 0 tests executed ($total_tests total, $skipped_tests skipped)"
+      echo "exit=1"
+    } >> "$log"
+    record_gate "$name" "FAIL" 1 "$log"
+    echo "  FAIL  $name (0 tests executed, all skipped)"
+    return
+  fi
+
+  record_gate "$name" "PASS" 0 "$log"
+  echo "  PASS  $name ($executed_tests tests executed)"
+}
+
+run_live_postgres_gate postgres-fencing test/postgres-authority-fencing.live.test.ts
+run_live_postgres_gate postgres-parity test/coordinator-parity.live.test.ts
 
 # ─── Phase 13: Cross-language conformance ───────────────────────────────────
 echo ""
@@ -265,6 +314,12 @@ run_gate worker-format npm run format:check --prefix worker
 run_gate worker-lint npm run lint --prefix worker
 run_gate worker-build npm run build --prefix worker
 
+# ─── Phase NEMO: NeMo kernel/adapter gates ────────────────────────────────
+echo ""
+echo "=== NeMo gates ==="
+run_gate nemo-typecheck npx --prefix nemo tsc --noEmit --project nemo/tsconfig.json
+run_gate nemo-tests npx --prefix nemo vitest run --root nemo
+
 # ─── Phase 15: Worker structured summaries ─────────────────────────────────
 # Extract test counts from the worker test log.
 WORKER_TEST_LOG="$EVIDENCE_DIR/worker-tests.log"
@@ -274,6 +329,8 @@ if [ -f "$WORKER_TEST_LOG" ]; then
   TESTS_SKIPPED="$(grep -oE 'Tests.*[0-9]+ skipped' "$WORKER_TEST_LOG" | grep -oE '[0-9]+ skipped' | head -1 | grep -oE '^[0-9]+' || echo 0)"
   FILES_PASSED="$(grep -oE 'Test Files.*[0-9]+ passed' "$WORKER_TEST_LOG" | grep -oE '[0-9]+ passed' | head -1 | grep -oE '^[0-9]+' || echo 0)"
   FILES_SKIPPED="$(grep -oE 'Test Files.*[0-9]+ skipped' "$WORKER_TEST_LOG" | grep -oE '[0-9]+ skipped' | head -1 | grep -oE '^[0-9]+' || echo 0)"
+  # Derive exit code from the actual gate log, not hardcoded.
+  WORKER_TESTS_EXIT="$(grep '^exit=' "$WORKER_TEST_LOG" | tail -1 | cut -d= -f2 || echo 1)"
   cat > "$EVIDENCE_DIR/worker-tests.json" << EOF
 {
   "files_passed": $FILES_PASSED,
@@ -281,7 +338,7 @@ if [ -f "$WORKER_TEST_LOG" ]; then
   "tests_passed": $TESTS_PASSED,
   "tests_skipped": $TESTS_SKIPPED,
   "tests_failed": $TESTS_FAILED,
-  "exit": 0
+  "exit": $WORKER_TESTS_EXIT
 }
 EOF
 fi
@@ -291,11 +348,13 @@ WORKER_LINT_LOG="$EVIDENCE_DIR/worker-lint.log"
 if [ -f "$WORKER_LINT_LOG" ]; then
   LINT_ERRORS="$(grep -oE 'Found [0-9]+ warnings? and [0-9]+ errors?' "$WORKER_LINT_LOG" | grep -oE '[0-9]+ errors?' | grep -oE '^[0-9]+' || echo 0)"
   LINT_WARNINGS="$(grep -oE 'Found [0-9]+ warnings? and [0-9]+ errors?' "$WORKER_LINT_LOG" | grep -oE '[0-9]+ warnings?' | grep -oE '^[0-9]+' || echo 0)"
+  # Derive exit code from the actual gate log, not hardcoded.
+  WORKER_LINT_EXIT="$(grep '^exit=' "$WORKER_LINT_LOG" | tail -1 | cut -d= -f2 || echo 1)"
   cat > "$EVIDENCE_DIR/worker-lint.json" << EOF
 {
   "errors": $LINT_ERRORS,
   "warnings": $LINT_WARNINGS,
-  "exit": 0
+  "exit": $WORKER_LINT_EXIT
 }
 EOF
 fi

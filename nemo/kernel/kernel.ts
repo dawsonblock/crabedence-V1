@@ -4,7 +4,8 @@
  * The kernel owns:
  *   - capability registration (with pinned execution classes)
  *   - execution class routing (PURE → local, READ/MUTATION/CRITICAL → adapter)
- *   - authority reference forwarding (does not verify authority itself)
+ *   - request admission (schema validation, authority policy binding,
+ *     deadline enforcement, CRITICAL evidence verification)
  *
  * The kernel does NOT own:
  *   - provider lifecycle
@@ -38,7 +39,8 @@ export class CapabilityCatalog {
     if (this.capabilities.has(descriptor.id)) {
       throw new Error(`capability already registered: ${descriptor.id}`);
     }
-    this.capabilities.set(descriptor.id, Object.freeze({ ...descriptor }));
+    // Deep freeze the descriptor and its schema to prevent mutation
+    this.capabilities.set(descriptor.id, deepFreeze(structuredClone(descriptor)));
   }
 
   lookup(capabilityId: string): CapabilityDescriptor {
@@ -58,6 +60,81 @@ export class CapabilityCatalog {
   }
 }
 
+/** Deep freeze an object and all nested properties. */
+function deepFreeze<T>(value: T): T {
+  if (value && typeof value === "object") {
+    Object.freeze(value);
+    for (const key of Object.keys(value as object)) {
+      deepFreeze((value as Record<string, unknown>)[key]);
+    }
+  }
+  return value;
+}
+
+// ─── Schema validation ────────────────────────────────────────────────
+
+/**
+ * Minimal JSON schema validation for the subset of JSON schema used in
+ * capability descriptors. This is NOT a full JSON schema implementation —
+ * it validates type, required properties, and basic constraints. For
+ * full schema validation, Crabedence's core should validate at execution
+ * time. The kernel validates enough to reject obviously malformed
+ * requests before they reach the execution port.
+ */
+function validateSchema(value: unknown, schema: unknown): string | null {
+  if (!schema || typeof schema !== "object") {
+    return null; // No schema = no validation
+  }
+  const s = schema as Record<string, unknown>;
+
+  if (s.type === "object" && typeof value !== "object") {
+    return `expected object, got ${typeof value}`;
+  }
+  if (s.type === "string" && typeof value !== "string") {
+    return `expected string, got ${typeof value}`;
+  }
+  if (s.type === "number" && typeof value !== "number") {
+    return `expected number, got ${typeof value}`;
+  }
+  if (s.type === "boolean" && typeof value !== "boolean") {
+    return `expected boolean, got ${typeof value}`;
+  }
+  if (s.type === "array" && !Array.isArray(value)) {
+    return `expected array, got ${typeof value}`;
+  }
+
+  if (s.required && Array.isArray(s.required) && typeof value === "object" && value) {
+    for (const prop of s.required as string[]) {
+      if (!(prop in value)) {
+        return `missing required property: ${prop}`;
+      }
+    }
+  }
+
+  return null;
+}
+
+// ─── Deadline validation ──────────────────────────────────────────────
+
+/**
+ * Validate and check a deadline string. Returns:
+ *   - null if no deadline or deadline is valid and not expired
+ *   - error message if deadline is malformed or expired
+ */
+function checkDeadline(deadline: string | undefined): string | null {
+  if (!deadline) {
+    return null;
+  }
+  const parsed = Date.parse(deadline);
+  if (isNaN(parsed)) {
+    return `invalid deadline format: ${deadline}`;
+  }
+  if (parsed < Date.now()) {
+    return `deadline expired: ${deadline}`;
+  }
+  return null;
+}
+
 // ─── Kernel ───────────────────────────────────────────────────────────
 
 /**
@@ -73,7 +150,8 @@ export interface KernelPorts {
 
 /**
  * The NeMo kernel. Routes execution requests based on pinned capability
- * execution classes.
+ * execution classes. Validates schemas, authority references, deadlines,
+ * and CRITICAL evidence contracts before accepting outcomes.
  */
 export class NemoKernel {
   constructor(
@@ -109,15 +187,61 @@ export class NemoKernel {
       };
     }
 
+    // Validate authority is present and non-empty.
+    if (
+      !request.authority?.principal ||
+      !request.authority?.grantId
+    ) {
+      return {
+        status: "DENIED",
+        error: "missing authority principal or grantId",
+      };
+    }
+
+    // Validate deadline if present.
+    const deadlineError = checkDeadline(request.deadline);
+    if (deadlineError) {
+      return {
+        status: "DENIED",
+        error: deadlineError,
+      };
+    }
+
+    // Validate arguments against capability schema.
+    const schemaError = validateSchema(request.arguments, descriptor.schema);
+    if (schemaError) {
+      return {
+        status: "DENIED",
+        error: `schema validation failed: ${schemaError}`,
+      };
+    }
+
     // Route based on execution class.
     const port =
       descriptor.executionClass === "PURE"
         ? this.ports.local
         : this.ports.remote;
 
-    return port.execute({
+    const outcome = await port.execute({
       ...request,
       executionClass: descriptor.executionClass,
     });
+
+    // For CRITICAL operations, verify the evidence contract.
+    // A SUCCEEDED CRITICAL must include evidence with a digest.
+    // A UNKNOWN CRITICAL may or may not include evidence.
+    if (
+      descriptor.executionClass === "CRITICAL" &&
+      outcome.status === "SUCCEEDED" &&
+      !outcome.evidence?.digest
+    ) {
+      return {
+        status: "FAILED",
+        error: "CRITICAL capability returned SUCCEEDED without evidence digest",
+        execution: outcome.execution,
+      };
+    }
+
+    return outcome;
   }
 }
