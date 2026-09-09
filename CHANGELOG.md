@@ -4,28 +4,25 @@
 
 ### RC6.1 — Planner-Agnostic Execution Kernel
 
+- Architecture: three orthogonal dimensions pinned per capability — effect class (PURE/READ/MUTATION/CRITICAL), assurance profile (NONE/STANDARD/DURABLE/HIGH_ASSURANCE), execution route (LOCAL/DIRECT/CRABEDENCE). The dispatch layer reads the route from the descriptor; the planner does not decide what is "safe."
 - Architecture: Crabedence repositioned as a planner-agnostic trusted execution kernel. Any planning/reasoning runtime (Hermes, OpenAI Agents SDK, LangGraph, custom) can invoke capabilities through a stable ABI. See `docs/architecture/execution-kernel.md`.
-- Architecture: capability invocation ABI frozen (`docs/spec/capability-invocation-abi.md`). Minimal request: capability, arguments, principal, grant_id, idempotency_key. Security-relevant properties (execution class, authority policy, provider) pinned inside Crabedence's registry, not sent by the planner.
-- Architecture: NEMO repositioned from parent runtime to optional specialized reasoning/research component. Any planner can replace NEMO — the ABI is the stable boundary.
-- Execution: `execution_class` is now optional in the wire request. If absent, Crabedence's registry resolves it. If present, it is checked against the registry (mismatch = DENIED).
-- Execution: `system.info` READ capability added (goes through remote port, proving NEMO → Go end-to-end).
-- Execution: DispatchExecutor wired into `serve-execution` with PostgreSQL connection. MUTATION/CRITICAL fail closed when durable store unavailable.
-- Execution: FailClosedHandler rejects MUTATION/CRITICAL when no database connection — prevents unguarded mutations from configuration errors.
-- Execution: MultiHandler and DispatchExecutor.Handler interface implemented (tests previously could not compile).
-- Authority: GrantResolver interface with Resolve(ctx, grantID, principal). Grant.IsValid checks expiry, revocation, capability scope. InMemoryGrantResolver for testing, NoopGrantResolver for default (fail closed).
-- Authority: Service.VerifyAuthority called after admission for grant-required capabilities. Tests verify valid grant, missing grant, expired grant, wrong principal.
-- Protocol: IN_FLIGHT added to CrabedenceExecutionResponse status type. Converted to UNKNOWN at NEMO boundary (not a terminal NEMO status).
-- Protocol: Go CRITICAL evidence enforcement strengthened — digest must be 64-char lowercase hex, receipt_version must be 3, run_id required.
-- Release: one canonical qualification.schema.json (old release/ schema removed). Generator, checker, and verifier all consume the same schema.
-- Release: source manifest fixed — shell case matching (not regex) for exclusions, excludes own output file.
-- Release: admission checker fixed — uses exit_code/evidence_file (matches generator), FAIL not FAILED.
-- Release: PostgreSQL test paths fixed (test/ not ../test/ from worker/).
-- Release: RC workflow ordering fixed — verify after artifact.json exists, dist/dist typo fixed.
-- Release: clean-room verification job added — extracts archive, verifies without .git.
-- Release: ajv required for schema validation (no jq fallback). ajv-cli pinned as dev dependency.
-- Release: qualification workflow triggers on RC6 branch.
-- Security: socket path uses XDG_RUNTIME_DIR/crabedence/ (0700 dir), not /tmp.
-- NEMO: legacy exports (createCrabedenceBridge, ExecutionApiServer) marked @deprecated. Production path: CrabedenceExecutionAdapter → Go Unix socket.
+- Architecture: capability invocation ABI frozen (`docs/spec/capability-invocation-abi.md`). Semantic contract is stable; transport is replaceable (Unix socket is first binding, not only binding). Minimal request: capability, arguments, principal, authority_ref, idempotency_key.
+- Architecture: Function Hooks is the optional fast-dispatch layer. It reads `execution_route` from the descriptor to route LOCAL/DIRECT capabilities without Crabedence, and CRABEDENCE operations to the trusted kernel. Not a mandatory hop.
+- Architecture: NEMO repositioned to optional specialized component, not between every request and every planner.
+- Execution: `execution_class` is optional/advisory in the wire request. If absent, Crabedence's registry resolves it. If present, checked against registry (mismatch = DENIED).
+- Execution: `authority_ref` replaces `grant_id` as the stable ABI field. `grant_id` accepted for backward compatibility. `authority_ref` is opaque — today a grant, tomorrow a capability token or workload identity.
+- Execution: `system.info` READ capability (goes through remote port, proving end-to-end).
+- Execution: DispatchExecutor wired into `serve-execution` with PostgreSQL. MUTATION/CRITICAL fail closed when durable store unavailable.
+- Execution: FailClosedHandler rejects MUTATION/CRITICAL when no database — prevents unguarded mutations.
+- Execution: MultiHandler and DispatchExecutor.Handler interface implemented.
+- Authority: GrantResolver with Resolve(ctx, grantID, principal). Grant.IsValid checks expiry, revocation, capability scope. Service.VerifyAuthority called after admission.
+- Protocol: IN_FLIGHT added to wire response type, converted to UNKNOWN at NEMO boundary.
+- Protocol: Go CRITICAL evidence enforcement — 64-char hex digest, receipt_version 3, run_id required.
+- Client: `crabbox invoke` — planner-agnostic CLI client using the same ABI as NEMO. Proves planner independence.
+- Release: one canonical qualification.schema.json. Generator/checker/verifier aligned.
+- Release: source manifest, PostgreSQL test paths, RC workflow ordering, clean-room verification, ajv required, qualification branch trigger — all fixed.
+- Security: socket path uses XDG_RUNTIME_DIR/crabedence/ (0700 dir).
+- NEMO: legacy exports marked @deprecated. Production path: CrabedenceExecutionAdapter → Go Unix socket.
 
 ### RC6 — Qualified Execution Boundary
 

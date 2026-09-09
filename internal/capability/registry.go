@@ -1,15 +1,22 @@
 // Package capability defines the authoritative capability registry for
 // the Crabedence execution service.
 //
-// The registry is the single source of truth for:
-//   - Execution class (PURE, READ, MUTATION, CRITICAL)
+// The registry is the single source of truth for three orthogonal
+// dimensions pinned per capability:
+//   - Execution class: side-effect semantics (PURE, READ, MUTATION, CRITICAL)
+//   - Assurance profile: admission/durability/evidence (NONE, STANDARD, DURABLE, HIGH_ASSURANCE)
+//   - Execution route: dispatch mechanism (LOCAL, DIRECT, CRABEDENCE)
+//
+// Plus:
 //   - Argument schema (JSON Schema)
 //   - Authority policy
-//   - Adapter/provider binding
+//   - Adapter/provider binding (fixed or server-controlled policy)
 //
-// Callers (including NeMo) cannot override these values. The caller's
-// execution_class field is treated as an assertion at most — the
-// registry's pinned class is authoritative.
+// Callers (including any planner — Hermes, NEMO, OpenAI SDK, custom)
+// cannot override these values. The caller's execution_class field is
+// treated as an assertion at most — the registry's pinned values are
+// authoritative. The dispatch layer (Function Hooks or equivalent)
+// reads the execution_route from the descriptor to decide routing.
 package capability
 
 import (
@@ -106,6 +113,55 @@ func DefaultAssuranceProfile(c ExecutionClass) AssuranceProfile {
 	return AssuranceStandard
 }
 
+// ExecutionRoute determines which execution mechanism handles a
+// capability. This is the third orthogonal dimension, independent
+// of effect class and assurance profile.
+//
+// The route is pinned in the capability descriptor — the planner
+// does not decide what is "safe." Function Hooks (or any dispatch
+// layer) looks up the route and dispatches accordingly.
+type ExecutionRoute string
+
+const (
+	// RouteLocal: execute in the calling process. No socket hop,
+	// no durability, no admission. Used for PURE capabilities.
+	RouteLocal ExecutionRoute = "LOCAL"
+
+	// RouteDirect: execute via a direct adapter with admission but
+	// without the full durable execution kernel. Used for low-risk
+	// READs where the descriptor explicitly permits it.
+	RouteDirect ExecutionRoute = "DIRECT"
+
+	// RouteCrabedence: execute through the Crabedence trusted
+	// execution kernel with authority, idempotency, dispatch,
+	// evidence, and reconciliation. Used for sensitive READs,
+	// MUTATIONs, and CRITICALs.
+	RouteCrabedence ExecutionRoute = "CRABEDENCE"
+)
+
+// Valid returns true if the execution route is a known value.
+func (r ExecutionRoute) Valid() bool {
+	switch r {
+	case RouteLocal, RouteDirect, RouteCrabedence:
+		return true
+	}
+	return false
+}
+
+// DefaultExecutionRoute returns the default route for an assurance
+// profile. The registry may override this per capability.
+func DefaultExecutionRoute(p AssuranceProfile) ExecutionRoute {
+	switch p {
+	case AssuranceNone:
+		return RouteLocal
+	case AssuranceStandard:
+		return RouteDirect
+	case AssuranceDurable, AssuranceHighAssurance:
+		return RouteCrabedence
+	}
+	return RouteCrabedence
+}
+
 // AuthorityPolicy defines how authority is verified for a capability.
 type AuthorityPolicy struct {
 	// ID is the policy identifier (e.g. "gmail.send").
@@ -117,6 +173,14 @@ type AuthorityPolicy struct {
 
 // Descriptor describes a registered capability. This is the server-side
 // authoritative definition — callers cannot override these values.
+//
+// Three orthogonal dimensions are pinned here:
+//   - ExecutionClass: side-effect semantics (PURE, READ, MUTATION, CRITICAL)
+//   - AssuranceProfile: admission/durability/evidence requirements
+//   - ExecutionRoute: which mechanism handles it (LOCAL, DIRECT, CRABEDENCE)
+//
+// The planner does not decide what is "safe." The dispatch layer
+// (Function Hooks or equivalent) looks up the route from this descriptor.
 type Descriptor struct {
 	// ID is the unique capability identifier (e.g. "email.send").
 	ID string `json:"id"`
@@ -127,6 +191,12 @@ type Descriptor struct {
 	// AssuranceProfile is the pinned admission/durability/evidence profile.
 	// If empty, defaults to DefaultAssuranceProfile(ExecutionClass).
 	AssuranceProfile AssuranceProfile `json:"assurance_profile,omitempty"`
+
+	// ExecutionRoute is the pinned dispatch route.
+	// If empty, defaults to DefaultExecutionRoute(EffectiveAssuranceProfile()).
+	// The planner cannot override this — the dispatch layer reads it
+	// from the descriptor to decide LOCAL vs DIRECT vs CRABEDENCE.
+	ExecutionRoute ExecutionRoute `json:"execution_route,omitempty"`
 
 	// Schema is the JSON Schema for argument validation.
 	Schema json.RawMessage `json:"schema,omitempty"`
@@ -146,6 +216,15 @@ func (d Descriptor) EffectiveAssuranceProfile() AssuranceProfile {
 		return d.AssuranceProfile
 	}
 	return DefaultAssuranceProfile(d.ExecutionClass)
+}
+
+// EffectiveExecutionRoute returns the execution route, defaulting
+// to the standard mapping for the assurance profile if not set.
+func (d Descriptor) EffectiveExecutionRoute() ExecutionRoute {
+	if d.ExecutionRoute != "" && d.ExecutionRoute.Valid() {
+		return d.ExecutionRoute
+	}
+	return DefaultExecutionRoute(d.EffectiveAssuranceProfile())
 }
 
 // Registry is the server-controlled capability catalog.

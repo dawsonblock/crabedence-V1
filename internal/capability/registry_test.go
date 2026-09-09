@@ -282,3 +282,110 @@ func TestAdmitValid(t *testing.T) {
 		t.Errorf("expected descriptor ID=test.valid, got %s", decision.Descriptor.ID)
 	}
 }
+
+func TestThreeDimensionalRouting(t *testing.T) {
+	tests := []struct {
+		name          string
+		class         ExecutionClass
+		assurance     AssuranceProfile
+		route         ExecutionRoute
+		wantAssurance AssuranceProfile
+		wantRoute     ExecutionRoute
+	}{
+		{
+			name:          "PURE defaults to NONE/LOCAL",
+			class:         ClassPure,
+			wantAssurance: AssuranceNone,
+			wantRoute:     RouteLocal,
+		},
+		{
+			name:          "READ defaults to STANDARD/DIRECT",
+			class:         ClassRead,
+			wantAssurance: AssuranceStandard,
+			wantRoute:     RouteDirect,
+		},
+		{
+			name:          "MUTATION defaults to DURABLE/CRABEDENCE",
+			class:         ClassMutation,
+			wantAssurance: AssuranceDurable,
+			wantRoute:     RouteCrabedence,
+		},
+		{
+			name:          "CRITICAL defaults to HIGH_ASSURANCE/CRABEDENCE",
+			class:         ClassCritical,
+			wantAssurance: AssuranceHighAssurance,
+			wantRoute:     RouteCrabedence,
+		},
+		{
+			name:          "READ with HIGH_ASSURANCE overrides to CRABEDENCE",
+			class:         ClassRead,
+			assurance:     AssuranceHighAssurance,
+			wantAssurance: AssuranceHighAssurance,
+			wantRoute:     RouteCrabedence,
+		},
+		{
+			name:          "READ with explicit DIRECT route",
+			class:         ClassRead,
+			route:         RouteDirect,
+			wantAssurance: AssuranceStandard,
+			wantRoute:     RouteDirect,
+		},
+		{
+			name:          "PURE with explicit CRABEDENCE route (unusual but allowed)",
+			class:         ClassPure,
+			route:         RouteCrabedence,
+			wantAssurance: AssuranceNone,
+			wantRoute:     RouteCrabedence,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := Descriptor{
+				ID:               "test.cap",
+				ExecutionClass:   tt.class,
+				AssuranceProfile: tt.assurance,
+				ExecutionRoute:   tt.route,
+				AdapterID:        "test",
+			}
+			if got := d.EffectiveAssuranceProfile(); got != tt.wantAssurance {
+				t.Errorf("assurance: got %s, want %s", got, tt.wantAssurance)
+			}
+			if got := d.EffectiveExecutionRoute(); got != tt.wantRoute {
+				t.Errorf("route: got %s, want %s", got, tt.wantRoute)
+			}
+		})
+	}
+}
+
+func TestExecutionRouteValid(t *testing.T) {
+	valid := []ExecutionRoute{RouteLocal, RouteDirect, RouteCrabedence}
+	for _, r := range valid {
+		if !r.Valid() {
+			t.Errorf("expected %s to be valid", r)
+		}
+	}
+	invalid := []ExecutionRoute{"", "FAST", "SLOW", "remote"}
+	for _, r := range invalid {
+		if r.Valid() {
+			t.Errorf("expected %q to be invalid", r)
+		}
+	}
+}
+
+func TestDefaultExecutionRoute(t *testing.T) {
+	tests := []struct {
+		profile AssuranceProfile
+		want    ExecutionRoute
+	}{
+		{AssuranceNone, RouteLocal},
+		{AssuranceStandard, RouteDirect},
+		{AssuranceDurable, RouteCrabedence},
+		{AssuranceHighAssurance, RouteCrabedence},
+	}
+	for _, tt := range tests {
+		if got := DefaultExecutionRoute(tt.profile); got != tt.want {
+			t.Errorf("DefaultExecutionRoute(%s) = %s, want %s", tt.profile, got, tt.want)
+		}
+	}
+}
