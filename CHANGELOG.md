@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### RC6 — Qualified Execution Boundary
+
+- Execution: persistent Go execution service (`crabbox serve-execution`) — long-lived Unix socket server replacing per-call subprocess spawn. Length-prefixed JSON protocol (4-byte BE, 4 MiB max). Admission → dispatch → CRITICAL evidence validation.
+- Execution: authoritative capability registry in Go (`internal/capability/`) — server-controlled execution class, schema, authority policy, and adapter binding. Caller's `execution_class` is an assertion only; mismatch with registry's pinned class is DENIED.
+- Execution: typed error vocabulary — `INVALID_REQUEST`, `UNAUTHORIZED`, `CAPABILITY_NOT_FOUND`, `CAPABILITY_UNIMPLEMENTED`, `ADMISSION_DENIED`, `EXECUTION_FAILED`, `EXECUTION_UNKNOWN`, `IN_FLIGHT`, `INTERNAL_ERROR`, `IDEMPOTENCY_CONFLICT`. `crabbox exec` returns `FAILED` + `CAPABILITY_UNIMPLEMENTED` (not fake success). Never returns `UNKNOWN` for undispatched operations.
+- Execution: `system.echo` capability (PURE, first real end-to-end). `test.counter.increment` capability (MUTATION, harmless mutation with idempotency).
+- Idempotency: durable PostgreSQL-backed idempotency store (`internal/idempotency/`) — `execution_requests` table with states RESERVED, DISPATCHING, IN_FLIGHT, SUCCEEDED, FAILED, DENIED, UNKNOWN, RECONCILIATION_REQUIRED. Atomic reservation via `INSERT ON CONFLICT`. Same key + different digest = CONFLICT (never re-execute).
+- Idempotency: canonical JSON digest binding protocol version, principal, capability, canonical arguments (sorted keys), grant identity, and authoritative execution class. Property insertion order does not affect digest.
+- Execution: dispatch-point state machine — PRE_DISPATCH failures return FAILED (safe), POST_DISPATCH failures return UNKNOWN (may have executed). Persistence failure after dispatch returns UNKNOWN, not FAILED.
+- Reconciliation: `internal/reconcile/` worker for UNKNOWN records. Queries provider to resolve to CONFIRMED_SUCCEEDED, CONFIRMED_FAILED, or still UNKNOWN.
+- Release: stale committed `release-evidence/` removed. Evidence generated to `dist/release-evidence/` (not committed). Schema files in `release-evidence/schemas/`.
+- Release: standalone source manifest generator (`scripts/generate-source-manifest.sh`) — explicit exclusions, LC_ALL=C sort, no .git dependency.
+- Release: standalone artifact verifier rewritten — no .git required, detects missing/extra/mismatched files, independently recomputes gate summary, cross-checks declared vs derived status.
+- Release: JSON Schema validation (Draft 2020-12) for qualification.json and artifact.json.
+- Release CI: PostgreSQL 16 service in evidence-generating jobs, `npm ci --prefix nemo`, dedicated NeMo job, separate JSON/log evidence files, dynamic gate count.
+
 ### Changes
 
 - Evidence: V3 terminal receipts now require `evidence_sha256` — schema version 3 has a clean semantic meaning: V3 == authenticated evidence binding. Both Go and TypeScript reject V3 receipts with missing or empty `evidence_sha256`. V2 receipts remain legacy and cannot bind evidence. Go now also rejects V2 receipts that carry `evidence_sha256` (previously only TypeScript enforced this). Full V2/V3 contract matrix tests added to both languages covering: V2 no evidence (PASS), V2 evidence present (FAIL), V2 malformed evidence (FAIL), V3 no evidence (FAIL), V3 malformed evidence (FAIL), V3 valid evidence (PASS). Signed V2 receipts with injected unsigned evidence_sha256 are rejected before authentication.
