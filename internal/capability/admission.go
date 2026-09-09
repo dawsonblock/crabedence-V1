@@ -61,7 +61,7 @@ type AdmissionDecision struct {
 	Reason string `json:"reason,omitempty"`
 
 	// Descriptor is the resolved capability descriptor.
-	Descriptor Descriptor `json:"descriptor"`
+	Descriptor ResolvedDescriptor `json:"descriptor"`
 }
 
 // AdmissionRequest is the input to admission checking.

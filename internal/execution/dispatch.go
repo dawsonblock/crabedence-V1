@@ -47,7 +47,7 @@ func NewDispatchExecutor(handler Handler, store *idempotency.Store) *DispatchExe
 }
 
 // ExecuteWithIdempotency executes a request with durable idempotency.
-func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Request, desc capability.Descriptor) Response {
+func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Request, desc capability.ResolvedDescriptor) Response {
 	// For PURE and READ, skip idempotency (no side effects)
 	if desc.ExecutionClass == capability.ClassPure || desc.ExecutionClass == capability.ClassRead {
 		return e.dispatch(ctx, req, desc)
@@ -188,7 +188,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 // dispatch sends the request to the handler.
 // This crosses the dispatch boundary — any failure after this call
 // begins is POST_DISPATCH (may have executed).
-func (e *DispatchExecutor) dispatch(ctx context.Context, req Request, desc capability.Descriptor) Response {
+func (e *DispatchExecutor) dispatch(ctx context.Context, req Request, desc capability.ResolvedDescriptor) Response {
 	// Set a timeout if deadline is provided
 	dispatchCtx := ctx
 	if req.Deadline != "" {

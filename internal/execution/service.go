@@ -92,7 +92,7 @@ const (
 
 // Handler dispatches an admitted execution request to the provider.
 type Handler interface {
-	Execute(ctx context.Context, req Request, desc capability.Descriptor) Response
+	Execute(ctx context.Context, req Request, desc capability.ResolvedDescriptor) Response
 }
 
 // Service is the persistent Crabedence execution service.

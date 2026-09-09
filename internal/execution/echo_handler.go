@@ -22,7 +22,7 @@ func NewEchoHandler() *EchoHandler {
 }
 
 // Execute handles a system.echo request by returning the arguments.
-func (h *EchoHandler) Execute(ctx context.Context, req Request, desc capability.Descriptor) Response {
+func (h *EchoHandler) Execute(ctx context.Context, req Request, desc capability.ResolvedDescriptor) Response {
 	runID := fmt.Sprintf("echo-%d", time.Now().UnixNano())
 
 	result, err := json.Marshal(map[string]any{
@@ -54,7 +54,7 @@ func (h *EchoHandler) Execute(ctx context.Context, req Request, desc capability.
 
 // RegisterEchoCapability registers system.echo in the capability registry.
 func RegisterEchoCapability(reg *capability.Registry) error {
-	return reg.Register(capability.Descriptor{
+	return reg.Register(capability.CapabilityDescriptor{
 		ID:             "system.echo",
 		ExecutionClass: capability.ClassPure,
 		AdapterID:      "system",

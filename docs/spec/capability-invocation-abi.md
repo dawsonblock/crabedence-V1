@@ -150,7 +150,32 @@ MUTATION + DURABLE → CRABEDENCE
 PURE + NONE        → LOCAL
 ```
 
-But the registry may override the default mapping per capability.
+The capability definition explicitly pins each resolved dimension;
+defaults are only a registration-time convenience. Security-relevant
+execution semantics are frozen at registration and do not change
+during execution.
+
+### Invalid combinations are rejected at registration
+
+Not every combination of dimensions is valid. The route must be able
+to satisfy the stated assurance contract:
+
+| Combination | Valid? | Reason |
+|-------------|--------|--------|
+| PURE/NONE/LOCAL | Yes | Local can satisfy NONE for PURE |
+| READ/STANDARD/DIRECT | Yes | Direct can satisfy STANDARD for READ |
+| READ/HIGH_ASSURANCE/CRABEDENCE | Yes | Crabedence satisfies HIGH_ASSURANCE |
+| MUTATION/DURABLE/CRABEDENCE | Yes | Crabedence satisfies DURABLE |
+| CRITICAL/HIGH_ASSURANCE/CRABEDENCE | Yes | Crabedence satisfies HIGH_ASSURANCE |
+| CRITICAL/HIGH_ASSURANCE/LOCAL | No | LOCAL cannot satisfy HIGH_ASSURANCE |
+| MUTATION/DURABLE/DIRECT | No | DIRECT cannot handle MUTATION effects |
+| READ/HIGH_ASSURANCE/DIRECT | No | DIRECT cannot satisfy HIGH_ASSURANCE |
+| PURE/HIGH_ASSURANCE/LOCAL | No | LOCAL cannot satisfy HIGH_ASSURANCE |
+
+Invalid combinations are rejected at registration time. They cannot
+enter the active registry. This prevents the bypass problem at
+descriptor configuration time — e.g. registering
+CRITICAL/HIGH_ASSURANCE/DIRECT is impossible.
 
 ### Typical mapping
 

@@ -22,7 +22,7 @@ func NewSystemInfoHandler() *SystemInfoHandler {
 }
 
 // Execute returns system information.
-func (h *SystemInfoHandler) Execute(ctx context.Context, req Request, desc capability.Descriptor) Response {
+func (h *SystemInfoHandler) Execute(ctx context.Context, req Request, desc capability.ResolvedDescriptor) Response {
 	runID := fmt.Sprintf("sysinfo-%d", time.Now().UnixNano())
 
 	result, _ := json.Marshal(map[string]any{
@@ -49,7 +49,7 @@ func (h *SystemInfoHandler) Execute(ctx context.Context, req Request, desc capab
 // READ capabilities go through the remote execution port, proving
 // NEMO → Go service connectivity end-to-end.
 func RegisterSystemInfoCapability(reg *capability.Registry) error {
-	return reg.Register(capability.Descriptor{
+	return reg.Register(capability.CapabilityDescriptor{
 		ID:             "system.info",
 		ExecutionClass: capability.ClassRead,
 		AdapterID:      "system-info",

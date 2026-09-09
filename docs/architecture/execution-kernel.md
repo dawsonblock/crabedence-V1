@@ -163,7 +163,7 @@ CRABEDENCE-routed operations require the durable path.
 
 ## What Crabedence Owns
 
-- Capability registry (authoritative execution classes, assurance profiles, execution routes)
+- Capability registry (authoritative execution classes, assurance profiles, execution routes — frozen at registration)
 - Argument schema validation
 - Authority verification (grant resolution via `authority_ref`)
 - Durable idempotency (PostgreSQL)
@@ -172,6 +172,25 @@ CRABEDENCE-routed operations require the durable path.
 - Evidence generation (RunEvidenceV1)
 - V3 receipt signing (Ed25519)
 - Reconciliation (UNKNOWN → definitive state)
+
+### Two catalog types
+
+The capability catalog is split into two views:
+
+**Planner-visible catalog** (read-only):
+- Capability ID, argument schema, description
+- The planner discovers what it can invoke, not how it executes
+
+**Trusted admitted catalog** (authoritative):
+- Effect class, assurance profile, execution route
+- Authority policy, adapter policy
+- Frozen at registration via `ResolvedDescriptor`
+- Invalid combinations rejected before entering the registry
+
+The planner may discover `email.send(to, subject, body)` but cannot
+redefine its effect, assurance, route, authority, or adapter. Function
+Hooks routes from the trusted admitted catalog, not from the
+planner's view.
 
 ## What Crabedence Does NOT Own
 

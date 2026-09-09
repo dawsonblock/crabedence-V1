@@ -34,7 +34,7 @@ func (h *CounterHandler) GetCount(name string) int64 {
 }
 
 // Execute handles a test.counter.increment request.
-func (h *CounterHandler) Execute(ctx context.Context, req Request, desc capability.Descriptor) Response {
+func (h *CounterHandler) Execute(ctx context.Context, req Request, desc capability.ResolvedDescriptor) Response {
 	runID := fmt.Sprintf("counter-%d", time.Now().UnixNano())
 
 	// Parse arguments
@@ -84,7 +84,7 @@ func (h *CounterHandler) Execute(ctx context.Context, req Request, desc capabili
 
 // RegisterCounterCapability registers test.counter.increment in the registry.
 func RegisterCounterCapability(reg *capability.Registry) error {
-	return reg.Register(capability.Descriptor{
+	return reg.Register(capability.CapabilityDescriptor{
 		ID:             "test.counter.increment",
 		ExecutionClass: capability.ClassMutation,
 		AdapterID:      "test-counter",

@@ -18,7 +18,7 @@ func NewMultiHandler(handlers map[string]Handler) *MultiHandler {
 }
 
 // Execute dispatches to the handler registered for the descriptor's adapter ID.
-func (h *MultiHandler) Execute(ctx context.Context, req Request, desc capability.Descriptor) Response {
+func (h *MultiHandler) Execute(ctx context.Context, req Request, desc capability.ResolvedDescriptor) Response {
 	handler, ok := h.handlers[desc.AdapterID]
 	if !ok {
 		return Response{
@@ -33,12 +33,12 @@ func (h *MultiHandler) Execute(ctx context.Context, req Request, desc capability
 // Execute implements Handler for DispatchExecutor.
 // It delegates to ExecuteWithIdempotency which handles durable idempotency
 // and dispatch-point semantics.
-func (e *DispatchExecutor) Execute(ctx context.Context, req Request, desc capability.Descriptor) Response {
+func (e *DispatchExecutor) Execute(ctx context.Context, req Request, desc capability.ResolvedDescriptor) Response {
 	return e.ExecuteWithIdempotency(ctx, req, desc)
 }
 
 // Execute implements Handler for FailClosedHandler.
-func (h *FailClosedHandler) Execute(ctx context.Context, req Request, desc capability.Descriptor) Response {
+func (h *FailClosedHandler) Execute(ctx context.Context, req Request, desc capability.ResolvedDescriptor) Response {
 	if desc.ExecutionClass == capability.ClassMutation || desc.ExecutionClass == capability.ClassCritical {
 		return Response{
 			Status:      StatusFailed,

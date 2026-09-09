@@ -12,6 +12,11 @@
 //   - Authority policy
 //   - Adapter/provider binding (fixed or server-controlled policy)
 //
+// Dimensions are resolved and frozen at registration time. The active
+// registry contains only ResolvedDescriptors — no runtime inference.
+// Invalid combinations (e.g. CRITICAL/HIGH_ASSURANCE/LOCAL) are rejected
+// at registration, not discovered at execution.
+//
 // Callers (including any planner — Hermes, NEMO, OpenAI SDK, custom)
 // cannot override these values. The caller's execution_class field is
 // treated as an assertion at most — the registry's pinned values are
@@ -98,7 +103,8 @@ func (a AssuranceProfile) RequiresEvidence() bool {
 }
 
 // DefaultAssuranceProfile returns the default assurance profile for
-// an execution class. The registry may override this per capability.
+// an execution class. This is a registration-time convenience; the
+// capability definition explicitly pins the resolved value.
 func DefaultAssuranceProfile(c ExecutionClass) AssuranceProfile {
 	switch c {
 	case ClassPure:
@@ -149,7 +155,8 @@ func (r ExecutionRoute) Valid() bool {
 }
 
 // DefaultExecutionRoute returns the default route for an assurance
-// profile. The registry may override this per capability.
+// profile. This is a registration-time convenience; the capability
+// definition explicitly pins the resolved value.
 func DefaultExecutionRoute(p AssuranceProfile) ExecutionRoute {
 	switch p {
 	case AssuranceNone:
@@ -171,31 +178,23 @@ type AuthorityPolicy struct {
 	GrantRequired bool `json:"grant_required"`
 }
 
-// Descriptor describes a registered capability. This is the server-side
-// authoritative definition — callers cannot override these values.
-//
-// Three orthogonal dimensions are pinned here:
-//   - ExecutionClass: side-effect semantics (PURE, READ, MUTATION, CRITICAL)
-//   - AssuranceProfile: admission/durability/evidence requirements
-//   - ExecutionRoute: which mechanism handles it (LOCAL, DIRECT, CRABEDENCE)
-//
-// The planner does not decide what is "safe." The dispatch layer
-// (Function Hooks or equivalent) looks up the route from this descriptor.
-type Descriptor struct {
+// CapabilityDescriptor is the raw, pre-resolution capability definition.
+// AssuranceProfile and ExecutionRoute may be unspecified — they are
+// resolved from defaults during registration. This type is used by
+// the registry's trusted catalog builder, never by the execution path.
+type CapabilityDescriptor struct {
 	// ID is the unique capability identifier (e.g. "email.send").
 	ID string `json:"id"`
 
-	// ExecutionClass is the pinned effect classification.
+	// ExecutionClass is the effect classification.
 	ExecutionClass ExecutionClass `json:"execution_class"`
 
-	// AssuranceProfile is the pinned admission/durability/evidence profile.
+	// AssuranceProfile is the admission/durability/evidence profile.
 	// If empty, defaults to DefaultAssuranceProfile(ExecutionClass).
 	AssuranceProfile AssuranceProfile `json:"assurance_profile,omitempty"`
 
-	// ExecutionRoute is the pinned dispatch route.
-	// If empty, defaults to DefaultExecutionRoute(EffectiveAssuranceProfile()).
-	// The planner cannot override this — the dispatch layer reads it
-	// from the descriptor to decide LOCAL vs DIRECT vs CRABEDENCE.
+	// ExecutionRoute is the dispatch route.
+	// If empty, defaults to DefaultExecutionRoute(resolved AssuranceProfile).
 	ExecutionRoute ExecutionRoute `json:"execution_route,omitempty"`
 
 	// Schema is the JSON Schema for argument validation.
@@ -209,9 +208,130 @@ type Descriptor struct {
 	AdapterID string `json:"adapter_id"`
 }
 
+// ResolvedDescriptor is the frozen, fully-resolved capability definition.
+// All three dimensions are concrete. This is the only descriptor type
+// that exists in the active registry or reaches the execution path.
+//
+// If a capability exists in the active registry, its execution
+// semantics have already been completely resolved and validated.
+type ResolvedDescriptor struct {
+	// ID is the unique capability identifier (e.g. "email.send").
+	ID string `json:"id"`
+
+	// ExecutionClass is the pinned effect classification.
+	ExecutionClass ExecutionClass `json:"execution_class"`
+
+	// AssuranceProfile is the pinned, concrete assurance profile.
+	AssuranceProfile AssuranceProfile `json:"assurance_profile"`
+
+	// ExecutionRoute is the pinned, concrete dispatch route.
+	ExecutionRoute ExecutionRoute `json:"execution_route"`
+
+	// Schema is the JSON Schema for argument validation.
+	Schema json.RawMessage `json:"schema,omitempty"`
+
+	// AuthorityPolicy defines how authority is verified.
+	AuthorityPolicy AuthorityPolicy `json:"authority_policy"`
+
+	// AdapterID identifies the provider adapter that handles this capability.
+	AdapterID string `json:"adapter_id"`
+}
+
+// Descriptor is an alias for backward compatibility with existing code.
+// New code should use CapabilityDescriptor for raw definitions and
+// ResolvedDescriptor for the active registry.
+//
+// Deprecated: Use CapabilityDescriptor for registration input and
+// ResolvedDescriptor for registry lookups.
+type Descriptor = CapabilityDescriptor
+
+// ValidateDescriptorCompatibility checks that the execution route can
+// satisfy the stated assurance contract. This prevents the bypass
+// problem at descriptor configuration time — e.g. registering
+// CRITICAL/HIGH_ASSURANCE/DIRECT is rejected because a DIRECT adapter
+// cannot provide HIGH_ASSURANCE guarantees.
+func ValidateDescriptorCompatibility(effect ExecutionClass, assurance AssuranceProfile, route ExecutionRoute) error {
+	switch route {
+	case RouteLocal:
+		// LOCAL can only satisfy NONE assurance and only for PURE effects.
+		if effect != ClassPure {
+			return fmt.Errorf("route LOCAL requires effect PURE, got %s", effect)
+		}
+		if assurance != AssuranceNone {
+			return fmt.Errorf("route LOCAL cannot satisfy assurance %s (requires NONE)", assurance)
+		}
+
+	case RouteDirect:
+		// DIRECT can satisfy STANDARD for READ effects.
+		// It cannot handle MUTATION/CRITICAL effects or DURABLE/HIGH_ASSURANCE.
+		if effect == ClassMutation || effect == ClassCritical {
+			return fmt.Errorf("route DIRECT cannot handle effect %s (requires CRABEDENCE)", effect)
+		}
+		if assurance == AssuranceDurable || assurance == AssuranceHighAssurance {
+			return fmt.Errorf("route DIRECT cannot satisfy assurance %s (requires CRABEDENCE)", assurance)
+		}
+
+	case RouteCrabedence:
+		// CRABEDENCE can satisfy STANDARD, DURABLE, and HIGH_ASSURANCE.
+		// It can handle all effect classes.
+
+	default:
+		return fmt.Errorf("unknown execution route: %s", route)
+	}
+	return nil
+}
+
+// Resolve takes a raw CapabilityDescriptor, applies defaults to
+// unspecified dimensions, validates compatibility, and returns a
+// frozen ResolvedDescriptor. Returns an error if the combination
+// is invalid.
+func Resolve(d CapabilityDescriptor) (ResolvedDescriptor, error) {
+	if d.ID == "" {
+		return ResolvedDescriptor{}, fmt.Errorf("capability ID is required")
+	}
+	if !d.ExecutionClass.Valid() {
+		return ResolvedDescriptor{}, fmt.Errorf("invalid execution class: %s", d.ExecutionClass)
+	}
+
+	// Resolve assurance profile from default if unspecified.
+	assurance := d.AssuranceProfile
+	if assurance == "" {
+		assurance = DefaultAssuranceProfile(d.ExecutionClass)
+	}
+	if !assurance.Valid() {
+		return ResolvedDescriptor{}, fmt.Errorf("invalid assurance profile: %s", assurance)
+	}
+
+	// Resolve execution route from default if unspecified.
+	route := d.ExecutionRoute
+	if route == "" {
+		route = DefaultExecutionRoute(assurance)
+	}
+	if !route.Valid() {
+		return ResolvedDescriptor{}, fmt.Errorf("invalid execution route: %s", route)
+	}
+
+	// Validate that the route can satisfy the assurance contract.
+	if err := ValidateDescriptorCompatibility(d.ExecutionClass, assurance, route); err != nil {
+		return ResolvedDescriptor{}, fmt.Errorf("capability %s: %w", d.ID, err)
+	}
+
+	return ResolvedDescriptor{
+		ID:               d.ID,
+		ExecutionClass:   d.ExecutionClass,
+		AssuranceProfile: assurance,
+		ExecutionRoute:   route,
+		Schema:           d.Schema,
+		AuthorityPolicy:  d.AuthorityPolicy,
+		AdapterID:        d.AdapterID,
+	}, nil
+}
+
 // EffectiveAssuranceProfile returns the assurance profile, defaulting
 // to the standard mapping for the execution class if not set.
-func (d Descriptor) EffectiveAssuranceProfile() AssuranceProfile {
+//
+// Deprecated: Use Resolve() to get a ResolvedDescriptor with concrete values.
+func (d CapabilityDescriptor) EffectiveAssuranceProfile() AssuranceProfile {
 	if d.AssuranceProfile != "" && d.AssuranceProfile.Valid() {
 		return d.AssuranceProfile
 	}
@@ -220,36 +340,58 @@ func (d Descriptor) EffectiveAssuranceProfile() AssuranceProfile {
 
 // EffectiveExecutionRoute returns the execution route, defaulting
 // to the standard mapping for the assurance profile if not set.
-func (d Descriptor) EffectiveExecutionRoute() ExecutionRoute {
+//
+// Deprecated: Use Resolve() to get a ResolvedDescriptor with concrete values.
+func (d CapabilityDescriptor) EffectiveExecutionRoute() ExecutionRoute {
 	if d.ExecutionRoute != "" && d.ExecutionRoute.Valid() {
 		return d.ExecutionRoute
 	}
 	return DefaultExecutionRoute(d.EffectiveAssuranceProfile())
 }
 
-// Registry is the server-controlled capability catalog.
-// It is thread-safe and immutable after registration.
+// Registry is the server-controlled, trusted admitted capability catalog.
+// It stores only ResolvedDescriptors — all dimensions are concrete and
+// validated at registration time. The planner cannot register or modify
+// capabilities; it can only discover them via the planner-visible catalog.
+//
+// Thread-safe and immutable after registration.
 type Registry struct {
 	mu      sync.RWMutex
-	entries map[string]Descriptor
+	entries map[string]ResolvedDescriptor
 }
 
 // NewRegistry creates an empty capability registry.
 func NewRegistry() *Registry {
 	return &Registry{
-		entries: make(map[string]Descriptor),
+		entries: make(map[string]ResolvedDescriptor),
 	}
 }
 
-// Register adds a capability to the registry.
-// Returns an error if the capability is already registered or if the
-// descriptor is invalid.
-func (r *Registry) Register(d Descriptor) error {
+// Register resolves and validates a capability descriptor, then adds
+// it to the registry. Returns an error if the capability is already
+// registered or if the descriptor is invalid or incompatible.
+func (r *Registry) Register(d CapabilityDescriptor) error {
+	resolved, err := Resolve(d)
+	if err != nil {
+		return err
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if _, exists := r.entries[resolved.ID]; exists {
+		return fmt.Errorf("capability already registered: %s", resolved.ID)
+	}
+
+	r.entries[resolved.ID] = resolved
+	return nil
+}
+
+// RegisterResolved adds an already-resolved descriptor to the registry.
+// This is for trusted catalog builders that have already validated.
+func (r *Registry) RegisterResolved(d ResolvedDescriptor) error {
 	if d.ID == "" {
 		return fmt.Errorf("capability ID is required")
-	}
-	if !d.ExecutionClass.Valid() {
-		return fmt.Errorf("invalid execution class: %s", d.ExecutionClass)
 	}
 
 	r.mu.Lock()
@@ -263,9 +405,9 @@ func (r *Registry) Register(d Descriptor) error {
 	return nil
 }
 
-// Lookup retrieves a capability descriptor by ID.
+// Lookup retrieves a resolved capability descriptor by ID.
 // Returns the descriptor and true if found, or zero value and false.
-func (r *Registry) Lookup(id string) (Descriptor, bool) {
+func (r *Registry) Lookup(id string) (ResolvedDescriptor, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
