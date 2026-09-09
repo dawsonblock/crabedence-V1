@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -105,7 +106,8 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	service := NewService(registry, handler, opts.SocketPath)
 
 	// Ensure socket directory has restrictive permissions
-	if dir := filepathDir(opts.SocketPath); dir != "" {
+	if dir := filepath.Dir(opts.SocketPath); dir != "" && dir != "." {
+		os.MkdirAll(dir, 0o700)
 		os.Chmod(dir, 0o700)
 	}
 
@@ -155,19 +157,6 @@ type FailClosedHandler struct {
 // MUTATION/CRITICAL when no durable store is available.
 func NewFailClosedHandler(inner Handler) *FailClosedHandler {
 	return &FailClosedHandler{inner: inner}
-}
-
-// filepathDir returns the directory portion of a path.
-func filepathDir(path string) string {
-	for i := len(path) - 1; i >= 0; i-- {
-		if path[i] == '/' {
-			if i == 0 {
-				return "/"
-			}
-			return path[:i]
-		}
-	}
-	return "."
 }
 
 // durationSeconds converts an int64 to a time.Duration.

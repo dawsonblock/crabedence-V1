@@ -21,6 +21,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -135,10 +136,19 @@ func (s *Service) Start(ctx context.Context) error {
 		os.Remove(s.socketPath)
 	}
 
+	// Ensure socket directory exists with restrictive permissions
+	if dir := filepath.Dir(s.socketPath); dir != "" && dir != "." {
+		os.MkdirAll(dir, 0o700)
+		os.Chmod(dir, 0o700)
+	}
+
 	listener, err := net.Listen("unix", s.socketPath)
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %w", s.socketPath, err)
 	}
+
+	// Restrict socket access to owner only
+	os.Chmod(s.socketPath, 0o600)
 
 	s.listener = listener
 	s.running = true
@@ -325,6 +335,9 @@ func (s *Service) writeResponse(conn net.Conn, resp Response) {
 		log.Printf("execution service: marshal error: %v", err)
 		return
 	}
+
+	// Set write deadline to prevent blocking on hung clients
+	conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 
 	lenBuf := make([]byte, 4)
 	lenBuf[0] = byte(len(payload) >> 24)

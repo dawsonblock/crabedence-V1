@@ -247,7 +247,7 @@ async function computeRequestDigest(
     principal: request.authority.principal,
     authority_ref: request.authority.authority_ref ?? request.authority.grant_id,
     capability: request.capability,
-    execution_class: request.execution_class,
+    execution_class: request.execution_class ?? "",
     arguments: request.arguments,
   });
   const encoder = new TextEncoder();
@@ -282,6 +282,7 @@ function canonicalJSONStringify(value: unknown): string {
 export class ExecutionApiServer {
   private server: Server | null = null;
   private readonly idempotency: IdempotencyStore;
+  private readonly activeConnections = new Set<Socket>();
 
   constructor(
     private readonly handler: ExecutionHandler,
@@ -305,6 +306,10 @@ export class ExecutionApiServer {
     }
 
     this.server = createServer((socket: Socket) => {
+      this.activeConnections.add(socket);
+      socket.on("close", () => {
+        this.activeConnections.delete(socket);
+      });
       this.handleConnection(socket);
     });
 
@@ -323,6 +328,16 @@ export class ExecutionApiServer {
 
   async stop(): Promise<void> {
     if (this.server) {
+      // Destroy all active connections before closing
+      for (const socket of this.activeConnections) {
+        try {
+          socket.destroy();
+        } catch {
+          // ignore
+        }
+      }
+      this.activeConnections.clear();
+
       await new Promise<void>((resolve) => {
         this.server!.close(() => resolve());
       });

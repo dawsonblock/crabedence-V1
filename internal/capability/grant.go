@@ -2,16 +2,17 @@ package capability
 
 import (
 	"context"
+	"sync"
 	"time"
 )
 
 // Grant represents an authorization grant issued to a principal.
 type Grant struct {
-	ID            string
-	Principal     string
-	Capabilities   []string // capabilities this grant permits
-	ExpiresAt     time.Time
-	Revoked       bool
+	ID           string
+	Principal    string
+	Capabilities []string // capabilities this grant permits
+	ExpiresAt    time.Time
+	Revoked      bool
 }
 
 // IsValid checks whether the grant is valid for the given capability at the given time.
@@ -57,6 +58,7 @@ func (NoopGrantResolver) Resolve(ctx context.Context, grantID string, principal 
 
 // InMemoryGrantResolver is a simple in-memory grant resolver for testing.
 type InMemoryGrantResolver struct {
+	mu     sync.RWMutex
 	grants map[string]*Grant
 }
 
@@ -67,11 +69,15 @@ func NewInMemoryGrantResolver() *InMemoryGrantResolver {
 
 // AddGrant adds a grant to the resolver.
 func (r *InMemoryGrantResolver) AddGrant(g *Grant) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.grants[g.ID] = g
 }
 
 // Resolve looks up a grant by ID.
 func (r *InMemoryGrantResolver) Resolve(ctx context.Context, grantID string, principal string) (*Grant, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	g, ok := r.grants[grantID]
 	if !ok {
 		return nil, nil
