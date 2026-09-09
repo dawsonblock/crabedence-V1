@@ -31,7 +31,8 @@ export interface ExecutionApiRequest {
   readonly arguments: unknown;
   readonly authority: {
     readonly principal: string;
-    readonly grant_id: string;
+    readonly authority_ref?: string;
+    readonly grant_id?: string;
   };
   readonly execution_class: string;
   readonly idempotency_key?: string;
@@ -238,7 +239,7 @@ async function computeRequestDigest(
 ): Promise<string> {
   const canonical = canonicalJSONStringify({
     principal: request.authority.principal,
-    grant_id: request.authority.grant_id,
+    authority_ref: request.authority.authority_ref ?? request.authority.grant_id,
     capability: request.capability,
     execution_class: request.execution_class,
     arguments: request.arguments,
@@ -403,7 +404,8 @@ export class ExecutionApiServer {
         });
         return;
       }
-      if (!request.authority?.principal || !request.authority?.grant_id) {
+      const authRef = request.authority?.authority_ref ?? request.authority?.grant_id;
+      if (!request.authority?.principal || !authRef) {
         this.sendResponse(socket, {
           status: "DENIED",
           error: "missing authority",

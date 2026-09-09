@@ -167,7 +167,7 @@ func TestEndToEndAuthorityRejection(t *testing.T) {
 	req := Request{
 		Capability:     "test.counter.increment",
 		Arguments:      json.RawMessage(`{"counter":"test","by":1}`),
-		Authority:      RequestAuthority{Principal: "alice@example.com", GrantID: "grant_123"},
+		Authority:      RequestAuthority{Principal: "alice@example.com", AuthorityRef: "grant_123"},
 		IdempotencyKey: "key_001",
 	}
 
@@ -218,7 +218,7 @@ func TestEndToEndExpiredGrant(t *testing.T) {
 	req := Request{
 		Capability:     "test.counter.increment",
 		Arguments:      json.RawMessage(`{"counter":"test","by":1}`),
-		Authority:      RequestAuthority{Principal: "alice@example.com", GrantID: "expired_grant"},
+		Authority:      RequestAuthority{Principal: "alice@example.com", AuthorityRef: "expired_grant"},
 		IdempotencyKey: "key_001",
 	}
 
@@ -271,7 +271,7 @@ func TestEndToEndWrongPrincipal(t *testing.T) {
 	req := Request{
 		Capability:     "test.counter.increment",
 		Arguments:      json.RawMessage(`{"counter":"test","by":1}`),
-		Authority:      RequestAuthority{Principal: "bob@example.com", GrantID: "grant_alice"},
+		Authority:      RequestAuthority{Principal: "bob@example.com", AuthorityRef: "grant_alice"},
 		IdempotencyKey: "key_001",
 	}
 

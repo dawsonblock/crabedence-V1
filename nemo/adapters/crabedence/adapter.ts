@@ -37,24 +37,32 @@ import type {
 // ─── Wire protocol ────────────────────────────────────────────────────
 
 /**
- * Crabedence wire request (capability invocation ABI).
+ * Capability invocation request (Capability Invocation ABI).
  * See docs/spec/capability-invocation-abi.md for the frozen specification.
  *
  * execution_class is optional/advisory — Crabedence's registry is
  * authoritative. If present, it is checked against the registry.
  * If absent, the registry's pinned class is used.
+ *
+ * authority_ref is an opaque reference to authority material — today
+ * a grant ID, tomorrow a capability token or workload identity.
+ * grant_id is accepted for backward compatibility.
  */
-export interface CrabedenceExecutionRequest {
+export interface CapabilityInvocationRequest {
   readonly capability: string;
   readonly arguments: unknown;
   readonly authority: {
     readonly principal: string;
-    readonly grant_id: string;
+    readonly authority_ref?: string;
+    readonly grant_id?: string;
   };
   readonly execution_class?: string;
   readonly idempotency_key?: string;
   readonly deadline?: string;
 }
+
+/** @deprecated Use CapabilityInvocationRequest */
+export type CrabedenceExecutionRequest = CapabilityInvocationRequest;
 
 /**
  * Crabedence execution API response.
@@ -377,12 +385,12 @@ export class CrabedenceExecutionAdapter implements ExecutionPort {
   async execute(
     request: KernelExecutionRequest,
   ): Promise<KernelExecutionOutcome> {
-    const wireRequest: CrabedenceExecutionRequest = {
+    const wireRequest: CapabilityInvocationRequest = {
       capability: request.capabilityId,
       arguments: request.arguments,
       authority: {
         principal: request.authority.principal,
-        grant_id: request.authority.grantId,
+        authority_ref: request.authority.grantId,
       },
       // execution_class is optional/advisory — only send if the caller
       // explicitly asserts it. Crabedence's registry is authoritative.

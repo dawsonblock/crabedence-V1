@@ -47,6 +47,65 @@ func (c ExecutionClass) RequiresEvidence() bool {
 	return c == ClassCritical
 }
 
+// AssuranceProfile determines admission, durability, and evidence
+// requirements. This is orthogonal to effect class — a public READ
+// and a medical-records READ are both READ, but may have different
+// assurance profiles.
+type AssuranceProfile string
+
+const (
+	// AssuranceNone: no durability, no evidence, no idempotency.
+	// Used for PURE capabilities that never cross the execution boundary.
+	AssuranceNone AssuranceProfile = "NONE"
+
+	// AssuranceStandard: admission and authority verified, but no
+	// durable idempotency or evidence. Used for typical READ operations.
+	AssuranceStandard AssuranceProfile = "STANDARD"
+
+	// AssuranceDurable: PostgreSQL-backed idempotency, exactly-once
+	// semantics. Used for MUTATION operations.
+	AssuranceDurable AssuranceProfile = "DURABLE"
+
+	// AssuranceHighAssurance: durable idempotency plus V3 evidence,
+	// receipt signing, and reconciliation. Used for CRITICAL operations.
+	AssuranceHighAssurance AssuranceProfile = "HIGH_ASSURANCE"
+)
+
+// Valid returns true if the assurance profile is a known value.
+func (a AssuranceProfile) Valid() bool {
+	switch a {
+	case AssuranceNone, AssuranceStandard, AssuranceDurable, AssuranceHighAssurance:
+		return true
+	}
+	return false
+}
+
+// RequiresDurableStore returns true if the profile requires PostgreSQL.
+func (a AssuranceProfile) RequiresDurableStore() bool {
+	return a == AssuranceDurable || a == AssuranceHighAssurance
+}
+
+// RequiresEvidence returns true if the profile requires V3 evidence.
+func (a AssuranceProfile) RequiresEvidence() bool {
+	return a == AssuranceHighAssurance
+}
+
+// DefaultAssuranceProfile returns the default assurance profile for
+// an execution class. The registry may override this per capability.
+func DefaultAssuranceProfile(c ExecutionClass) AssuranceProfile {
+	switch c {
+	case ClassPure:
+		return AssuranceNone
+	case ClassRead:
+		return AssuranceStandard
+	case ClassMutation:
+		return AssuranceDurable
+	case ClassCritical:
+		return AssuranceHighAssurance
+	}
+	return AssuranceStandard
+}
+
 // AuthorityPolicy defines how authority is verified for a capability.
 type AuthorityPolicy struct {
 	// ID is the policy identifier (e.g. "gmail.send").
@@ -62,8 +121,12 @@ type Descriptor struct {
 	// ID is the unique capability identifier (e.g. "email.send").
 	ID string `json:"id"`
 
-	// ExecutionClass is the pinned risk classification.
+	// ExecutionClass is the pinned effect classification.
 	ExecutionClass ExecutionClass `json:"execution_class"`
+
+	// AssuranceProfile is the pinned admission/durability/evidence profile.
+	// If empty, defaults to DefaultAssuranceProfile(ExecutionClass).
+	AssuranceProfile AssuranceProfile `json:"assurance_profile,omitempty"`
 
 	// Schema is the JSON Schema for argument validation.
 	Schema json.RawMessage `json:"schema,omitempty"`
@@ -72,7 +135,17 @@ type Descriptor struct {
 	AuthorityPolicy AuthorityPolicy `json:"authority_policy"`
 
 	// AdapterID identifies the provider adapter that handles this capability.
+	// May be a fixed adapter ID or a server-controlled adapter policy.
 	AdapterID string `json:"adapter_id"`
+}
+
+// EffectiveAssuranceProfile returns the assurance profile, defaulting
+// to the standard mapping for the execution class if not set.
+func (d Descriptor) EffectiveAssuranceProfile() AssuranceProfile {
+	if d.AssuranceProfile != "" && d.AssuranceProfile.Valid() {
+		return d.AssuranceProfile
+	}
+	return DefaultAssuranceProfile(d.ExecutionClass)
 }
 
 // Registry is the server-controlled capability catalog.

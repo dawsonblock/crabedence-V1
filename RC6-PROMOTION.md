@@ -134,3 +134,18 @@ mandatory_not_run == 0
 source_mismatch == 0
 artifact_mismatch == 0
 ```
+
+## Planner Independence
+
+- [ ] Crabedence core has no dependency on NEMO
+- [ ] Crabedence core has no dependency on Hermes
+- [ ] Capability ABI has a generic conformance suite
+- [ ] Two independent clients pass the same conformance suite
+- [ ] `crabbox invoke` (generic CLI client) executes capabilities successfully
+- [ ] NEMO adapter executes the same capabilities successfully
+- [ ] Caller cannot control execution class (advisory only; registry is authoritative)
+- [ ] Caller cannot control authority policy (resolved by Crabedence)
+- [ ] Caller cannot bypass durable mutation semantics (fail closed without store)
+- [ ] Provider selection remains server-controlled (adapter policy in registry)
+- [ ] `authority_ref` is accepted (not just `grant_id`)
+- [ ] `execution_class` is optional in the wire request

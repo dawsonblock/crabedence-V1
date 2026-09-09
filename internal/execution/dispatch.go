@@ -69,7 +69,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		req.Authority.Principal,
 		req.Capability,
 		req.Arguments,
-		req.Authority.GrantID,
+		req.Authority.EffectiveAuthorityRef(),
 		string(desc.ExecutionClass),
 	)
 	if err != nil {
@@ -81,7 +81,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	}
 
 	// Reserve the request atomically
-	reserve, err := e.store.Reserve(ctx, req.IdempotencyKey, req.Authority.Principal, req.Capability, digest, req.Authority.GrantID, string(desc.ExecutionClass))
+	reserve, err := e.store.Reserve(ctx, req.IdempotencyKey, req.Authority.Principal, req.Capability, digest, req.Authority.EffectiveAuthorityRef(), string(desc.ExecutionClass))
 	if err != nil {
 		return Response{
 			Status:      StatusFailed,

@@ -64,7 +64,7 @@ func TestConcurrentIdenticalMutations(t *testing.T) {
 			req := Request{
 				Capability:     "test.counter.increment",
 				Arguments:      json.RawMessage(`{"counter":"concurrent","by":1}`),
-				Authority:      RequestAuthority{Principal: "alice@example.com", GrantID: "grant_123"},
+				Authority:      RequestAuthority{Principal: "alice@example.com", AuthorityRef: "grant_123"},
 				IdempotencyKey: "concurrent_key_001",
 			}
 			resp := sendRequest(t, conn, req)

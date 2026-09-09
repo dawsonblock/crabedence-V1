@@ -22,6 +22,7 @@ type crabboxKongCLI struct {
 	Run         runKongCmd         `cmd:"" passthrough:"" help:"Sync the repo, run a remote command, stream output."`
 	Exec        execKongCmd        `cmd:"" passthrough:"" help:"Execute a capability via JSON stdin/stdout (NeMo bridge)."`
 	ServeExec   serveExecKongCmd   `cmd:"" help:"Start the persistent execution service (Unix socket)."`
+	Invoke      invokeKongCmd      `cmd:"" help:"Invoke a capability via the execution service (planner-agnostic client)."`
 	Watch       watchKongCmd       `cmd:"" passthrough:"" help:"Re-run a command on a warm lease when local files change."`
 	Shard       shardKongCmd       `cmd:"" passthrough:"" help:"Fork a checkpoint into parallel shards and merge their test results."`
 	Bench       benchKongCmd       `cmd:"" help:"Record and report local benchmark timings."`
@@ -175,6 +176,16 @@ type execKongCmd struct {
 }
 type serveExecKongCmd struct {
 	Socket string `help:"Unix socket path" default:"/tmp/crabedence-exec.sock"`
+}
+type invokeKongCmd struct {
+	Socket         string `help:"Unix socket path" default:"/tmp/crabedence-exec.sock"`
+	Capability     string `help:"Capability to invoke" required:""`
+	Principal      string `help:"Requesting principal" required:""`
+	AuthorityRef   string `help:"Authority reference (e.g. grant ID)"`
+	IdempotencyKey string `help:"Idempotency key (required for MUTATION/CRITICAL)"`
+	Arguments      string `help:"Arguments as JSON" default:"{}"`
+	ExecutionClass string `help:"Execution class assertion (advisory; registry is authoritative)"`
+	Deadline       string `help:"RFC3339 deadline"`
 }
 type watchKongCmd struct {
 	Args []string `arg:"" optional:""`
@@ -672,6 +683,9 @@ func (c *runKongCmd) Run(ctx context.Context, app App) error     { return app.ru
 func (c *execKongCmd) Run(ctx context.Context, app App) error    { return app.execCommand(ctx, c.Args) }
 func (c *serveExecKongCmd) Run(ctx context.Context, app App) error {
 	return app.serveExecCommand(ctx, c.Socket)
+}
+func (c *invokeKongCmd) Run(ctx context.Context, app App) error {
+	return app.invokeCommand(ctx, c.Socket, c.Capability, c.Principal, c.AuthorityRef, c.IdempotencyKey, c.Arguments, c.ExecutionClass, c.Deadline)
 }
 func (c *watchKongCmd) Run(ctx context.Context, app App) error { return app.watch(ctx, c.Args) }
 func (c *shardKongCmd) Run(ctx context.Context, app App) error { return app.shard(ctx, c.Args) }

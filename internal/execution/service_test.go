@@ -91,7 +91,7 @@ func TestExecutionServiceCounterIncrement(t *testing.T) {
 	req := Request{
 		Capability:     "test.counter.increment",
 		Arguments:      json.RawMessage(`{"counter":"test","by":1}`),
-		Authority:      RequestAuthority{Principal: "alice@example.com", GrantID: "grant_123"},
+		Authority:      RequestAuthority{Principal: "alice@example.com", AuthorityRef: "grant_123"},
 		IdempotencyKey: "key_001",
 	}
 	resp := sendRequest(t, conn, req)
@@ -166,7 +166,7 @@ func TestExecutionServiceMissingIdempotencyKey(t *testing.T) {
 	req := Request{
 		Capability: "test.counter.increment",
 		Arguments:  json.RawMessage(`{"counter":"test"}`),
-		Authority:  RequestAuthority{Principal: "alice@example.com", GrantID: "grant_123"},
+		Authority:  RequestAuthority{Principal: "alice@example.com", AuthorityRef: "grant_123"},
 	}
 	resp := sendRequest(t, conn, req)
 
@@ -206,7 +206,7 @@ func TestExecutionServiceExecutionClassMismatch(t *testing.T) {
 	req := Request{
 		Capability:     "test.counter.increment",
 		Arguments:      json.RawMessage(`{}`),
-		Authority:      RequestAuthority{Principal: "alice@example.com", GrantID: "grant_123"},
+		Authority:      RequestAuthority{Principal: "alice@example.com", AuthorityRef: "grant_123"},
 		IdempotencyKey: "key_001",
 		ExecutionClass: "READ",
 	}

@@ -27,21 +27,27 @@ import (
 	"github.com/openclaw/crabbox/internal/capability"
 )
 
-// Request is the wire-format execution request.
-// This matches the NEMO adapter's wire protocol exactly.
+// Request is the wire-format capability invocation.
+// This is the Capability Invocation ABI (see docs/spec/capability-invocation-abi.md).
+// The semantic contract is stable; the transport is replaceable.
 type Request struct {
 	Capability     string           `json:"capability"`
 	Arguments      json.RawMessage  `json:"arguments"`
 	Authority      RequestAuthority `json:"authority"`
-	ExecutionClass string           `json:"execution_class,omitempty"`
+	ExecutionClass string           `json:"execution_class,omitempty"` // advisory; registry is authoritative
 	IdempotencyKey string           `json:"idempotency_key,omitempty"`
 	Deadline       string           `json:"deadline,omitempty"`
 }
 
-// RequestAuthority is the authority reference in the wire request.
+// RequestAuthority carries the principal and authority reference.
+// AuthorityRef is an opaque reference to authority material — today
+// a grant ID, tomorrow a capability token, workload identity, or
+// signed assertion. The ABI does not prescribe the authority mechanism.
 type RequestAuthority struct {
-	Principal string `json:"principal"`
-	GrantID   string `json:"grant_id"`
+	Principal    string `json:"principal"`
+	AuthorityRef string `json:"authority_ref"`
+	// GrantID is accepted for backward compatibility and mapped to AuthorityRef.
+	GrantID string `json:"grant_id,omitempty"`
 }
 
 // Response is the wire-format execution response.
@@ -64,6 +70,15 @@ type EvidenceRef struct {
 type ExecutionMeta struct {
 	Provider string `json:"provider"`
 	RunID    string `json:"run_id"`
+}
+
+// EffectiveAuthorityRef returns the authority reference, preferring
+// authority_ref and falling back to grant_id for backward compatibility.
+func (a RequestAuthority) EffectiveAuthorityRef() string {
+	if a.AuthorityRef != "" {
+		return a.AuthorityRef
+	}
+	return a.GrantID
 }
 
 // Status values.
@@ -213,7 +228,7 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 		Capability:     req.Capability,
 		Arguments:      req.Arguments,
 		Principal:      req.Authority.Principal,
-		GrantID:        req.Authority.GrantID,
+		GrantID:        req.Authority.EffectiveAuthorityRef(),
 		ExecutionClass: req.ExecutionClass,
 		IdempotencyKey: req.IdempotencyKey,
 		Deadline:       req.Deadline,
@@ -233,7 +248,7 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 		fc, reason := s.registry.VerifyAuthority(ctx, capability.AdmissionRequest{
 			Capability: req.Capability,
 			Principal:  req.Authority.Principal,
-			GrantID:    req.Authority.GrantID,
+			GrantID:    req.Authority.EffectiveAuthorityRef(),
 		}, s.grantResolver)
 		if fc != "" {
 			s.writeResponse(conn, Response{

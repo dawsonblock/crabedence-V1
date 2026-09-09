@@ -1,7 +1,7 @@
 // Production exports: the thin NEMO → Crabedence Go execution adapter.
 // This is the only execution path that should be used in production.
 export { CrabedenceClient, CrabedenceExecutionAdapter, TransportError } from "./adapter";
-export type { CrabedenceExecutionRequest, CrabedenceExecutionResponse } from "./adapter";
+export type { CapabilityInvocationRequest, CrabedenceExecutionResponse } from "./adapter";
 
 // ─── Legacy/test-only exports ──────────────────────────────────────────
 // These are exported for testing and backward compatibility only.
