@@ -13,8 +13,13 @@ import (
 )
 
 // TestConcurrentIdenticalMutations verifies that 100 concurrent
-// identical mutation requests result in exactly one increment.
-// This is the core idempotency qualification.
+// mutation requests without durable idempotency ALL fail closed.
+// This is the fail-closed guarantee: no unguarded mutations.
+//
+// When a PostgreSQL store is wired in (via DispatchExecutor), a
+// separate test should verify that 100 concurrent identical mutations
+// result in exactly ONE mutation (count == 1). That test requires
+// a live PostgreSQL connection and belongs in the integration test suite.
 func TestConcurrentIdenticalMutations(t *testing.T) {
 	socketPath := testSocketPath(t)
 
@@ -28,7 +33,11 @@ func TestConcurrentIdenticalMutations(t *testing.T) {
 		"test-counter": counter,
 	})
 
-	service := setupServiceWithGrants(registry, handler, socketPath)
+	// No store → FailClosedHandler → MUTATION/CRITICAL fail closed
+	failClosed := NewFailClosedHandler(handler)
+	service := NewService(registry, failClosed, socketPath)
+	service.SetGrantResolver(testGrantResolver())
+
 	ctx := context.Background()
 	if err := service.Start(ctx); err != nil {
 		t.Fatal(err)
@@ -39,12 +48,9 @@ func TestConcurrentIdenticalMutations(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(N)
 
-	// All 100 requests use the same idempotency key
-	// Without idempotency, the counter would be 100.
-	// With idempotency, the counter should be 1.
-	// (Note: the in-memory counter handler doesn't implement idempotency
-	// itself — that's the job of the DispatchExecutor with a Store.
-	// This test verifies that the service handles concurrent connections.)
+	var failCount, successCount int64
+	var mu sync.Mutex
+
 	for i := 0; i < N; i++ {
 		go func() {
 			defer wg.Done()
@@ -62,21 +68,31 @@ func TestConcurrentIdenticalMutations(t *testing.T) {
 				IdempotencyKey: "concurrent_key_001",
 			}
 			resp := sendRequest(t, conn, req)
-			if resp.Status != StatusSucceeded {
-				t.Errorf("expected SUCCEEDED, got %s: %s", resp.Status, resp.Error)
+			mu.Lock()
+			if resp.Status == StatusFailed {
+				failCount++
+			} else if resp.Status == StatusSucceeded {
+				successCount++
 			}
+			mu.Unlock()
 		}()
 	}
 
 	wg.Wait()
 
-	// Without durable idempotency, all 100 will increment.
-	// This test documents the current behavior: the service itself
-	// doesn't implement idempotency — that requires the DispatchExecutor
-	// with a Store. When the DispatchExecutor is wired in, this test
-	// should verify count == 1.
+	// ALL 100 must fail closed — no unguarded mutations
+	if failCount != N {
+		t.Errorf("expected %d failures (fail closed), got %d failures, %d successes", N, failCount, successCount)
+	}
+	if successCount != 0 {
+		t.Errorf("expected 0 successes (no durable idempotency), got %d", successCount)
+	}
+
+	// Counter must be 0 — no mutations executed
 	count := counter.GetCount("concurrent")
-	t.Logf("concurrent count = %d (expected %d without durable idempotency)", count, N)
+	if count != 0 {
+		t.Errorf("expected count=0 (fail closed), got %d", count)
+	}
 }
 
 // TestUnicodePayload verifies that Unicode arguments are handled correctly.
