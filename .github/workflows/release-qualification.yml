@@ -19,29 +19,15 @@ env:
   GOTOOLCHAIN: local
 
 jobs:
-  qualify:
-    name: Release Qualification
+  # ─── Provenance gate ──────────────────────────────────────────────────
+  provenance:
+    name: Provenance
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: crabbox
-          POSTGRES_PASSWORD: crabbox
-          POSTGRES_DB: crabbox_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U crabbox"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-
-    env:
-      CRABBOX_TEST_DATABASE_URL: postgres://crabbox:crabbox@localhost:5432/crabbox_test
-
+    timeout-minutes: 5
+    outputs:
+      commit: ${{ steps.record.outputs.commit }}
+      tree: ${{ steps.record.outputs.tree }}
+      branch: ${{ steps.record.outputs.branch }}
     steps:
       - name: Check out
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -58,27 +44,30 @@ jobs:
           fi
 
       - name: Record source provenance
+        id: record
         shell: bash
         run: |
-          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
-          echo "tree=$(git rev-parse HEAD^{tree})" >> "$GITHUB_ENV"
-          echo "branch=$(git rev-parse --abbrev-ref HEAD)" >> "$GITHUB_ENV"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "tree=$(git rev-parse HEAD^{tree})" >> "$GITHUB_OUTPUT"
+          echo "branch=$(git rev-parse --abbrev-ref HEAD)" >> "$GITHUB_OUTPUT"
+
+  # ─── Go tests (no race) ───────────────────────────────────────────────
+  go-tests:
+    name: Go tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: provenance
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.provenance.outputs.commit }}
 
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
           cache: false
-
-      - name: Set up Node
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
-        with:
-          node-version-file: worker/package.json
-          cache: npm
-          cache-dependency-path: worker/package-lock.json
-
-      - name: Install Worker dependencies
-        run: npm ci --prefix worker
 
       - name: Go formatting check
         run: |
@@ -95,13 +84,65 @@ jobs:
         run: go vet ./...
 
       - name: Go tests (uncached)
-        run: go test -count=1 -timeout=20m ./internal/cli/ ./internal/providers/shared/ ./internal/providers/tart/ ./internal/providers/lume/
+        run: go test -count=1 -timeout=15m ./internal/cli/ ./internal/providers/shared/ ./internal/providers/tart/ ./internal/providers/lume/
 
-      - name: Go race tests (uncached)
-        run: go test -race -count=1 -timeout=20m -run "TestTerminalReceipt|TestTerminalLog|TestRunEvidence|TestFinalizeRun|TestEvidence|TestReceiptContract" ./internal/cli/
+  # ─── Go race tests ────────────────────────────────────────────────────
+  go-race:
+    name: Go race tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: provenance
+    strategy:
+      fail-fast: false
+      matrix:
+        group:
+          - name: cli
+            packages: ./internal/cli/
+            pattern: "TestTerminalReceipt|TestTerminalLog|TestRunEvidence|TestFinalizeRun|TestEvidence|TestReceiptContract"
+          - name: providers
+            packages: ./internal/providers/tart/ ./internal/providers/lume/ ./internal/providers/shared/
+            pattern: ""
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.provenance.outputs.commit }}
 
-      - name: Go race tests (providers)
-        run: go test -race -count=1 -timeout=20m ./internal/providers/tart/ ./internal/providers/lume/ ./internal/providers/shared/
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Go race tests (${{ matrix.group.name }})
+        run: |
+          if [ -n "${{ matrix.group.pattern }}" ]; then
+            go test -race -count=1 -timeout=20m -run "${{ matrix.group.pattern }}" ${{ matrix.group.packages }}
+          else
+            go test -race -count=1 -timeout=20m ${{ matrix.group.packages }}
+          fi
+
+  # ─── Worker tests ────────────────────────────────────────────────────
+  worker:
+    name: Worker
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: provenance
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.provenance.outputs.commit }}
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: worker/package.json
+          cache: npm
+          cache-dependency-path: worker/package-lock.json
+
+      - name: Install Worker dependencies
+        run: npm ci --prefix worker
 
       - name: Worker typecheck
         run: npm run check --prefix worker
@@ -118,14 +159,101 @@ jobs:
       - name: Worker build
         run: npm run build --prefix worker
 
-      - name: Live PostgreSQL authority fencing
-        run: npx vitest run --no-file-parallelism test/postgres-authority-fencing.live.test.ts
+  # ─── Live PostgreSQL ────────────────────────────────────────────────
+  postgres:
+    name: PostgreSQL fencing + parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: provenance
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          - postgres-authority-fencing.live.test.ts
+          - coordinator-parity.live.test.ts
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: crabbox
+          POSTGRES_PASSWORD: crabbox
+          POSTGRES_DB: crabbox_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U crabbox"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CRABBOX_TEST_DATABASE_URL: postgres://crabbox:crabbox@localhost:5432/crabbox_test
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.provenance.outputs.commit }}
 
-      - name: Live PostgreSQL coordinator parity
-        run: npx vitest run --no-file-parallelism test/coordinator-parity.live.test.ts
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: worker/package.json
+          cache: npm
+          cache-dependency-path: worker/package-lock.json
+
+      - name: Install Worker dependencies
+        run: npm ci --prefix worker
+
+      - name: Live PostgreSQL test (${{ matrix.test }})
+        run: npx vitest run --no-file-parallelism test/${{ matrix.test }}
+
+  # ─── Cross-language conformance ──────────────────────────────────────
+  cross-language:
+    name: Cross-language conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: provenance
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.provenance.outputs.commit }}
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: false
 
       - name: Cross-language conformance
         run: go test -count=1 -timeout=60s -run "TestRunEvidenceConformanceCorpus|TestReceiptContractConformance" ./internal/cli/
+
+  # ─── Evidence aggregation ────────────────────────────────────────────
+  evidence:
+    name: Release evidence + admission
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [provenance, go-tests, go-race, worker, postgres, cross-language]
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.provenance.outputs.commit }}
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: worker/package.json
+          cache: npm
+          cache-dependency-path: worker/package-lock.json
+
+      - name: Install Worker dependencies
+        run: npm ci --prefix worker
 
       - name: Generate release evidence
         run: bash scripts/generate-release-evidence.sh
