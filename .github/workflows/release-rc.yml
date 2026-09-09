@@ -79,7 +79,7 @@ jobs:
         run: go vet ./...
 
       - name: Go tests (uncached)
-        run: go test -count=1 -timeout=15m ./internal/cli/ ./internal/providers/shared/ ./internal/providers/tart/ ./internal/providers/lume/
+        run: go test -count=1 -timeout=15m ./internal/cli/ ./internal/capability/ ./internal/execution/ ./internal/idempotency/ ./internal/providers/shared/ ./internal/providers/tart/ ./internal/providers/lume/
 
   # ─── Go race tests (parallel matrix) ─────────────────────────────────
   go-race:

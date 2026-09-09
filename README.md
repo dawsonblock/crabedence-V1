@@ -180,19 +180,41 @@ require idempotency keys. UNKNOWN is a first-class terminal state: a lost
 response after dispatch returns UNKNOWN (not FAILED), preventing duplicate
 side effects on retry.
 
-The `crabbox exec` command is the Go-side bridge: it reads a JSON execution
-request from stdin, validates authority, dispatches to the provider, generates
-evidence, signs a V3 receipt, and returns a JSON response on stdout.
+The `crabbox serve-execution` command starts the persistent Go execution
+service on a Unix socket. This is the production architecture: a long-lived
+Go process owns the capability registry, authority verification, durable
+idempotency, provider dispatch, evidence generation, and V3 receipt signing.
+NeMo connects to this service over the Unix socket — no per-call subprocess
+spawn.
 
 ```sh
-# NeMo calls Crabedence through the Unix socket server
-# The server delegates to crabbox exec as a subprocess
-echo '{"capability":"test.run","arguments":{},"authority":{"principal":"alice","grant_id":"g1"},"execution_class":"CRITICAL","idempotency_key":"k1"}' | crabbox exec
+# Start the persistent execution service
+crabbox serve-execution --socket /tmp/crabedence-exec.sock
+
+# NeMo connects to the socket and sends execution requests
+# The service admits, dispatches, and returns typed responses
 ```
 
+The `crabbox exec` command is a stdin/stdout bridge for testing and
+ad-hoc execution. It validates requests through the same capability
+registry but cannot dispatch to providers — use `crabbox serve-execution`
+for real execution.
+
+```sh
+# Validate a request (returns CAPABILITY_UNIMPLEMENTED for dispatch)
+echo '{"capability":"system.echo","arguments":{},"authority":{"principal":"alice","grant_id":"g1"}}' | crabbox exec
+```
+
+Built-in capabilities:
+- `system.echo` (PURE) — returns arguments as echo result
+- `test.counter.increment` (MUTATION) — harmless mutation with idempotency
+
 See [NeMo contracts](nemo/contracts/execution.ts),
-[NeMo kernel](nemo/kernel/kernel.ts), and
-[Crabedence adapter](nemo/adapters/crabedence/adapter.ts).
+[NeMo kernel](nemo/kernel/kernel.ts),
+[Crabedence adapter](nemo/adapters/crabedence/adapter.ts),
+[Go capability registry](internal/capability/registry.go),
+[Go execution service](internal/execution/service.go), and
+[Go idempotency store](internal/idempotency/store.go).
 
 ## Install
 

@@ -216,14 +216,17 @@ export class CrabedenceClient {
               return;
             }
             try {
-              const response = JSON.parse(
-                frame.toString("utf-8"),
-              ) as CrabedenceExecutionResponse;
+              const raw = JSON.parse(frame.toString("utf-8"));
+              const response = validateWireResponse(raw);
               succeed(response);
-            } catch {
-              fail(
-                new TransportError("invalid JSON in response", "PROTOCOL"),
-              );
+            } catch (err) {
+              if (err instanceof TransportError) {
+                fail(err);
+              } else {
+                fail(
+                  new TransportError("invalid JSON in response", "PROTOCOL"),
+                );
+              }
             }
           }
         } catch (err) {
@@ -261,6 +264,7 @@ const VALID_WIRE_STATUSES = new Set([
   "FAILED",
   "DENIED",
   "UNKNOWN",
+  "IN_FLIGHT",
 ]);
 
 /**
@@ -276,6 +280,70 @@ function mapStatus(status: unknown): string {
     );
   }
   return status;
+}
+
+/**
+ * Runtime validation of a Crabedence wire response.
+ * Rejects malformed responses at the protocol boundary.
+ */
+function validateWireResponse(raw: unknown): CrabedenceExecutionResponse {
+  if (typeof raw !== "object" || raw === null) {
+    throw new TransportError("response is not an object", "PROTOCOL");
+  }
+  const obj = raw as Record<string, unknown>;
+
+  // status is required and must be a valid enum
+  const status = mapStatus(obj.status);
+
+  // error must be a string if present
+  if (obj.error !== undefined && typeof obj.error !== "string") {
+    throw new TransportError("response.error must be a string", "PROTOCOL");
+  }
+
+  // evidence must have a valid digest if present
+  let evidence: CrabedenceExecutionResponse["evidence"];
+  if (obj.evidence !== undefined) {
+    if (typeof obj.evidence !== "object" || obj.evidence === null) {
+      throw new TransportError("response.evidence must be an object", "PROTOCOL");
+    }
+    const ev = obj.evidence as Record<string, unknown>;
+    if (typeof ev.digest !== "string" || !/^[0-9a-f]{64}$/.test(ev.digest)) {
+      throw new TransportError(
+        "response.evidence.digest must be a 64-character hex string",
+        "PROTOCOL",
+      );
+    }
+    evidence = {
+      digest: ev.digest,
+      ...(typeof ev.receipt_version === "number" && {
+        receipt_version: ev.receipt_version,
+      }),
+    };
+  }
+
+  // execution must have provider and run_id if present
+  let execution: CrabedenceExecutionResponse["execution"];
+  if (obj.execution !== undefined) {
+    if (typeof obj.execution !== "object" || obj.execution === null) {
+      throw new TransportError("response.execution must be an object", "PROTOCOL");
+    }
+    const ex = obj.execution as Record<string, unknown>;
+    if (typeof ex.provider !== "string" || typeof ex.run_id !== "string") {
+      throw new TransportError(
+        "response.execution must have provider and run_id strings",
+        "PROTOCOL",
+      );
+    }
+    execution = { provider: ex.provider, run_id: ex.run_id };
+  }
+
+  return {
+    status: status as CrabedenceExecutionResponse["status"],
+    ...(obj.result !== undefined && { result: obj.result }),
+    ...(obj.error !== undefined && { error: obj.error as string }),
+    ...(evidence && { evidence }),
+    ...(execution && { execution }),
+  };
 }
 
 /**
