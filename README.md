@@ -3,10 +3,11 @@
 ![Crabbox banner](docs/assets/readme-banner.jpg)
 
 [![CI](https://github.com/openclaw/crabbox/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/openclaw/crabbox/actions/workflows/ci.yml)
+[![Release qualification](https://github.com/openclaw/crabbox/actions/workflows/release-qualification.yml/badge.svg)](https://github.com/openclaw/crabbox/actions/workflows/release-qualification.yml)
 [![Release verification](https://github.com/openclaw/crabbox/actions/workflows/release-assets.yml/badge.svg)](https://github.com/openclaw/crabbox/actions/workflows/release-assets.yml)
 [![Latest release](https://badgen.net/github/release/openclaw/crabbox/stable)](https://github.com/openclaw/crabbox/releases/latest)
 
-**Warm a box, sync the diff, run the suite.**
+**Warm a box, sync the diff, run the suite — with cryptographically attributable execution evidence.**
 
 Crabbox is a generic remote software testing and execution control plane. It is
 for maintainers, contributors, and automation that need to run repository
@@ -20,11 +21,17 @@ crabbox run -- pnpm test
 ```
 
 Behind that one command, Crabbox leases or selects a runner, syncs the current
-working tree, runs the command remotely, streams output back, records evidence,
-and releases or unclaims the target. The system is a Go CLI on your machine, an
+working tree, runs the command remotely, streams output back, records
+evidence, and releases or unclaims the target. The system is a Go CLI on your machine, an
 optional coordinator that owns provider credentials and lease state, and a
 managed or delegated runner. Run the coordinator on Cloudflare Workers with a
 Durable Object, or as a Node.js service backed by PostgreSQL.
+
+Every run produces a `RunEvidenceV1` record — a portable, versioned, SHA-256
+digested execution outcome. The evidence digest is bound into an Ed25519-signed
+`TerminalRunReceiptV3`, so terminal execution results are independently
+verifiable in both Go and TypeScript. See
+[Run evidence spec](docs/spec/run-evidence.md).
 
 ## Who Crabbox is for
 
@@ -36,7 +43,8 @@ turning every test run into a bespoke CI job:
 - contributors who want a disposable environment that matches a repository's
   setup scripts and can be released when the run finishes;
 - AI agents and other automation that need command output, logs, artifacts, and
-  run history from an auditable remote box;
+  run history from an auditable remote box — with cryptographically signed
+  execution evidence and a typed execution boundary for reasoning systems;
 - teams that want coordinator-owned cloud credentials, spend caps, cleanup, and
   shared usage history instead of local long-lived provider keys.
 
@@ -134,6 +142,57 @@ labels do not select that service's AWS placement; its URL and server policy do.
 For the full mental model, see [How Crabbox Works](docs/how-it-works.md). For
 product scope and non-goals, see the [Crabbox Vision](VISION.md). For the
 doc-to-code map, see [Source Map](docs/source-map.md).
+
+### NeMo execution boundary
+
+Crabbox includes a NeMo execution kernel (`nemo/`) that provides a typed
+execution port for reasoning/agent systems. NeMo owns capability registration
+with pinned execution classes; Crabbox owns provider lifecycle, evidence
+generation, receipt signing, and durable coordination.
+
+```text
+MODEL / AGENT
+      │
+      ▼
+   NEMO KERNEL
+   capability catalog (immutable execution classes)
+   ExecutionPort interface
+      │
+      ├─ PURE → local execution
+      └─ READ / MUTATION / CRITICAL → Crabedence adapter
+            │
+            ▼ (Unix socket, length-prefixed JSON)
+         ExecutionApiServer
+            │
+            ├─ authority validation
+            ├─ idempotency (atomic reservation, UNKNOWN persisted)
+            └─ handler → Crabedence Go core
+                  │
+                  ├─ provider dispatch
+                  ├─ RunEvidenceV1 generation
+                  ├─ V3 receipt signing
+                  └─ coordinator commitment
+```
+
+Execution classes are immutable once registered — a CRITICAL capability
+cannot be downgraded to READ at runtime. MUTATION and CRITICAL operations
+require idempotency keys. UNKNOWN is a first-class terminal state: a lost
+response after dispatch returns UNKNOWN (not FAILED), preventing duplicate
+side effects on retry.
+
+The `crabbox exec` command is the Go-side bridge: it reads a JSON execution
+request from stdin, validates authority, dispatches to the provider, generates
+evidence, signs a V3 receipt, and returns a JSON response on stdout.
+
+```sh
+# NeMo calls Crabedence through the Unix socket server
+# The server delegates to crabbox exec as a subprocess
+echo '{"capability":"test.run","arguments":{},"authority":{"principal":"alice","grant_id":"g1"},"execution_class":"CRITICAL","idempotency_key":"k1"}' | crabbox exec
+```
+
+See [NeMo contracts](nemo/contracts/execution.ts),
+[NeMo kernel](nemo/kernel/kernel.ts), and
+[Crabedence adapter](nemo/adapters/crabedence/adapter.ts).
 
 ## Install
 
@@ -405,6 +464,37 @@ and authoring guide.
   verification, and service-token support keep normal use and operator
   automation separate. See [Auth and admin](docs/features/auth-admin.md) and
   the [Security Policy](SECURITY.md).
+- **Cryptographically attributable execution evidence.** Every terminal run
+  produces a `RunEvidenceV1` record with a SHA-256 digest, bound into an
+  Ed25519-signed `TerminalRunReceiptV3`. Both Go and TypeScript implement the
+  same canonicalization, digest, and verification path. V3 receipts require
+  `evidence_sha256`; V2 receipts are legacy and cannot bind evidence. See
+  [Run evidence spec](docs/spec/run-evidence.md),
+  [Hermetic agent evidence](docs/features/hermetic-agent-evidence.md), and
+  [Receipts](docs/features/receipts.md).
+- **Provider startup confirmation evidence.** Providers advertise only the
+  lifecycle capabilities they actually possess (exit observation, reaping,
+  file handoff, detached execution). Startup confirmation strategies
+  (`TimeoutWindowConfirm`, `FileHandoffConfirm`, `ProcessExitConfirm`) are
+  recorded in `RunEvidenceV1.startup_confirm`, so evidence answers not just
+  "did it start?" but "what observation strategy was used?"
+- **Release qualification pipeline.** Machine-verifiable qualification
+  gates require a clean Git tree, record commit/tree provenance, generate
+  Git blob and raw SHA-256 source manifests, run uncached Go tests + race
+  tests + Worker typecheck/lint/tests/build + cross-language conformance +
+  PostgreSQL fencing + NeMo tests, and fail closed if any gate skips or
+  fails. The artifact verifier detects extra files, validates each gate
+  individually, and cross-checks `artifact_promotable` against
+  `release_status`. See
+  [Release qualification](.github/workflows/release-qualification.yml),
+  [Release RC](.github/workflows/release-rc.yml), and
+  [VERIFY-RELEASE.md](VERIFY-RELEASE.md).
+- **NeMo execution kernel.** A typed execution boundary for reasoning/agent
+  systems. Capabilities are registered with immutable execution classes
+  (PURE/READ/MUTATION/CRITICAL). Idempotency keys required for mutations.
+  UNKNOWN preserved as first-class terminal state. See
+  [NeMo contracts](nemo/contracts/execution.ts) and
+  [NeMo kernel](nemo/kernel/kernel.ts).
 
 ## Machine classes
 
@@ -632,13 +722,23 @@ npm run build --prefix worker
 npm run check:node --prefix worker
 npm run build:node --prefix worker
 
+# NeMo execution kernel
+npm ci --prefix nemo
+npm run check --prefix nemo
+npm test --prefix nemo
+
 # Repository scripts
-node scripts/generate-linux-readiness.mjs --check
+node scripts/generate-linux-readness.mjs --check
 node scripts/generate-bootstrap.mjs --check
 node --test scripts/*.test.js scripts/*.test.mjs
 
 # Docs
 scripts/check-docs.sh
+
+# Release qualification (requires clean Git tree)
+scripts/generate-release-evidence.sh
+scripts/check-release-admission.sh
+scripts/verify-release-artifact.sh
 
 # Optional live smoke, when broker/provider credentials are available
 CRABBOX_LIVE=1 CRABBOX_LIVE_REPO=/path/to/my-app scripts/live-smoke.sh
@@ -648,8 +748,8 @@ CRABBOX_BIN=./bin/crabbox scripts/live-firecracker-smoke.sh
 ```
 
 CI runs the full gate (gofmt, vet, race tests, all Go modules, coverage
-threshold, repository script tests, docs link/build check, GoReleaser snapshot, and Worker
-lint/typecheck/tests/build) on every push and PR. The required `Go` check aggregates
+threshold, repository script tests, docs link/build check, GoReleaser snapshot, Worker
+lint/typecheck/tests/build, and NeMo typecheck/tests) on every push and PR. The required `Go` check aggregates
 three independent 30-minute jobs: `Go test` (formatting, vet, deadcode, full race
 suite, Linux supervision proof, and build), `Go modules` (normal tests in every
 module, including the root), and `Go coverage` (90% core coverage threshold).
@@ -671,6 +771,20 @@ Narrow requests stay narrow. The original request supplies authorization;
 GitHub events alone do not. Sequential technical gates, separate trust domains,
 and cancellation boundaries remain mandatory. See
 [Release engineering](docs/RELEASING.md).
+
+Release candidates use a machine-verifiable qualification pipeline:
+`scripts/generate-release-evidence.sh` requires a clean Git working tree,
+records commit/tree SHA, generates Git blob and raw SHA-256 source manifests,
+runs all gates with uncached Go tests, captures race evidence, live PostgreSQL
+fencing/parity, Worker typecheck/lint/tests/build, cross-language conformance,
+and NeMo typecheck/tests, then produces `qualification.json` with per-gate
+status. `scripts/check-release-admission.sh` fails closed if any gate is not
+PASS. `scripts/verify-release-artifact.sh` verifies SHA256SUMS, source manifest
+equality (no extra files), per-gate PASS, commit/tree consistency, and required
+evidence logs. The RC workflow builds the artifact from the exact qualified
+commit, generates provenance via GitHub SLSA attestation, and publishes as a
+GitHub prerelease. See [VERIFY-RELEASE.md](VERIFY-RELEASE.md) for consumer
+verification instructions.
 
 Git-overlay integration tests use real Git with task-owned local and loopback
 origins. Their local SSH stand-ins isolate Git authentication settings and
@@ -696,12 +810,15 @@ path is documented in
 
 - **Get the model:** [How Crabbox Works](docs/how-it-works.md), [Architecture](docs/architecture.md), [Concepts](docs/concepts.md), [Orchestrator](docs/orchestrator.md)
 - **Use the CLI:** [CLI](docs/cli.md), [Commands](docs/commands/README.md), [Features](docs/features/README.md), [Configuration](docs/features/configuration.md)
+- **Execution evidence:** [Run evidence spec](docs/spec/run-evidence.md), [Receipts](docs/features/receipts.md), [Hermetic agent evidence](docs/features/hermetic-agent-evidence.md), [Portable coordinator](docs/features/portable-coordinator.md)
+- **NeMo execution kernel:** [Contracts](nemo/contracts/execution.ts), [Kernel](nemo/kernel/kernel.ts), [Crabedence adapter](nemo/adapters/crabedence/adapter.ts), [Bridge](nemo/adapters/crabedence/bridge.ts)
 - **Integrate editors and agents:** [Integrations](docs/integrations/README.md), [Editors](docs/integrations/editors.md), [AI agents and harnesses](docs/integrations/agents.md)
 - **Choose a provider:** [Providers](docs/providers/README.md), [AWS](docs/providers/aws.md), [Azure](docs/providers/azure.md), [GCP](docs/providers/gcp.md), [Hetzner](docs/providers/hetzner.md), [DigitalOcean](docs/providers/digitalocean.md), [Linode](docs/providers/linode.md), [Hostinger](docs/providers/hostinger.md)
 - **Advanced features:** [Actions hydration](docs/features/actions-hydration.md), [Capsules](docs/features/capsules.md), [Checkpoints](docs/features/checkpoints.md), [Jobs](docs/features/jobs.md), [Pond](docs/features/pond.md)
 - **Interactive QA:** [Interactive Desktop and VNC](docs/features/interactive-desktop-vnc.md), [Artifacts](docs/features/artifacts.md), [Portal](docs/features/portal.md)
 - **Integrate infrastructure:** [Bring Your Own Infrastructure](docs/features/bring-your-own-infrastructure.md), [Portable Coordinator](docs/features/portable-coordinator.md), [Private AWS Workspaces](docs/features/aws-private-workspaces.md), [External Provider](docs/providers/external.md)
-- **Operate it:** [Operations](docs/operations.md), [Release engineering](docs/RELEASING.md), [Observability](docs/observability.md), [Troubleshooting](docs/troubleshooting.md), [Performance](docs/performance.md)
+- **Release engineering:** [Release qualification](.github/workflows/release-qualification.yml), [Release RC](.github/workflows/release-rc.yml), [VERIFY-RELEASE.md](VERIFY-RELEASE.md), [Release engineering](docs/RELEASING.md)
+- **Operate it:** [Operations](docs/operations.md), [Observability](docs/observability.md), [Troubleshooting](docs/troubleshooting.md), [Performance](docs/performance.md)
 - **Set it up or audit it:** [Infrastructure](docs/infrastructure.md), [Security Policy](SECURITY.md), [Operational Security](docs/security.md), [Getting Started](docs/getting-started.md), [Source Map](docs/source-map.md)
 - **Changes:** [CHANGELOG.md](CHANGELOG.md)
 
