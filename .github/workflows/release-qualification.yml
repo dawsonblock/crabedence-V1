@@ -232,10 +232,10 @@ jobs:
         run: npm ci --prefix nemo
 
       - name: NeMo typecheck
-        run: npx --prefix nemo tsc --noEmit
+        run: cd nemo && npx tsc --noEmit
 
       - name: NeMo tests
-        run: npx --prefix nemo vitest run
+        run: cd nemo && npx vitest run
 
   # ─── Cross-language conformance ──────────────────────────────────────
   cross-language:
