@@ -495,6 +495,12 @@ EOF
 # ─── Phase 23: Generate qualification matrix from JSON ──────────────────────
 "$REPO_ROOT/scripts/generate-qualification-matrix.sh"
 
+# ─── Phase 24: Copy qualification schema into evidence bundle ───────────────
+# The artifact must be self-contained: the verifier should not need to reach
+# outside the evidence directory to find the schema.
+mkdir -p "$EVIDENCE_DIR/schemas"
+cp "$REPO_ROOT/schemas/qualification.schema.json" "$EVIDENCE_DIR/schemas/qualification.schema.json"
+
 # ─── Phase 20: SHA256SUMS for evidence bundle ──────────────────────────────
 # Must be generated AFTER all other files (including qualification-matrix.md)
 # so that every file in the evidence directory is covered.

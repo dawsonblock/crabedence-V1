@@ -104,7 +104,7 @@ if [ -f "$EVIDENCE_DIR/qualification.json" ]; then
   # qualification failure, not a warning.
   SCHEMA_FILE="$EVIDENCE_DIR/schemas/qualification.schema.json"
   if [ ! -f "$SCHEMA_FILE" ]; then
-    SCHEMA_FILE="$REPO_ROOT/release-evidence/schemas/qualification.schema.json"
+    SCHEMA_FILE="$REPO_ROOT/schemas/qualification.schema.json"
   fi
   if [ ! -f "$SCHEMA_FILE" ]; then
     check "Qualification schema (missing)" "FAIL"

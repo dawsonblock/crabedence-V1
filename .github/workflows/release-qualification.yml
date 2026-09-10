@@ -305,6 +305,9 @@ jobs:
       - name: Install NeMo dependencies
         run: npm ci --prefix nemo
 
+      - name: Install artifact verification tools
+        run: npm install -g ajv-cli
+
       - name: Generate release evidence
         run: bash scripts/generate-release-evidence.sh
 

@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://crabedence.dev/schemas/qualification.schema.json",
+  "title": "Crabedence Release Qualification",
+  "description": "Canonical machine-readable qualification record. All release admission decisions derive from this file.",
+  "type": "object",
+  "required": [
+    "qualification_version",
+    "release_status",
+    "artifact_promotable",
+    "gate_summary",
+    "gates",
+    "invariants",
+    "provenance",
+    "toolchains",
+    "environment"
+  ],
+  "properties": {
+    "qualification_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "release_status": {
+      "type": "string",
+      "enum": ["PASS", "FAIL"]
+    },
+    "artifact_promotable": {
+      "type": "boolean"
+    },
+    "gate_summary": {
+      "type": "object",
+      "required": ["total", "passed", "failed", "skipped"],
+      "properties": {
+        "total": { "type": "integer", "minimum": 0 },
+        "passed": { "type": "integer", "minimum": 0 },
+        "failed": { "type": "integer", "minimum": 0 },
+        "skipped": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "gates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "name", "mandatory", "status", "exit_code", "evidence_file"],
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "mandatory": { "type": "boolean" },
+          "status": { "type": "string", "enum": ["PASS", "FAIL", "SKIP"] },
+          "exit_code": { "type": "integer" },
+          "tests_discovered": { "type": "integer", "minimum": 0 },
+          "tests_executed": { "type": "integer", "minimum": 0 },
+          "tests_passed": { "type": "integer", "minimum": 0 },
+          "tests_failed": { "type": "integer", "minimum": 0 },
+          "tests_skipped": { "type": "integer", "minimum": 0 },
+          "evidence_file": { "type": "string" }
+        }
+      }
+    },
+    "invariants": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "description"],
+        "properties": {
+          "id": { "type": "string" },
+          "description": { "type": "string" }
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "required": ["commit", "tree", "branch"],
+      "properties": {
+        "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "tree": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "branch": { "type": "string" },
+        "timestamp": { "type": "string" }
+      }
+    },
+    "toolchains": {
+      "type": "object",
+      "required": ["go", "node", "npm", "git"],
+      "properties": {
+        "go": { "type": "string" },
+        "node": { "type": "string" },
+        "npm": { "type": "string" },
+        "git": { "type": "string" },
+        "postgres_client": { "type": "string" },
+        "worker_package_version": { "type": "string" }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "required": ["os", "os_version", "arch", "date"],
+      "properties": {
+        "os": { "type": "string" },
+        "os_version": { "type": "string" },
+        "arch": { "type": "string" },
+        "date": { "type": "string" }
+      }
+    }
+  }
+}
