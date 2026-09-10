@@ -60,80 +60,26 @@ else
   check "Source SHA-256 manifest present" "FAIL"
 fi
 
-# 2b. Verify manifest against actual source tree (standalone, no .git required).
+# 2b. Verify manifest against actual source tree by delegating to
+# verify-source-manifest.sh. This guarantees a single source of truth
+# for exclusion logic — the artifact verifier no longer reimplements
+# the bidirectional manifest check (which previously diverged from the
+# generator's exclusions on nested bin/dist/node_modules paths).
 if [ -f "$EVIDENCE_DIR/source-tree-sha256.txt" ]; then
-  MANIFEST_FILES="$(mktemp)"
-  ACTUAL_FILES="$(mktemp)"
-  MISMATCH_LOG="$(mktemp)"
-
-  # Extract file paths from manifest. Format: <64-char-sha256>  <path>
-  # SHA is 64 chars + 2 spaces = 66 chars, path starts at position 66.
-  while IFS= read -r line; do
-    [ -z "$line" ] && continue
-    path="${line:66}"
-    echo "$path" >> "$MANIFEST_FILES"
-  done < "$EVIDENCE_DIR/source-tree-sha256.txt"
-  LC_ALL=C sort -o "$MANIFEST_FILES" "$MANIFEST_FILES"
-
-  # Enumerate actual source files using find (no .git required).
-  # Use the same exclusions as generate-source-manifest.sh.
-  cd "$SOURCE_DIR"
-  find . -type f | while IFS= read -r filepath; do
-    relpath="${filepath#./}"
-    # Skip excluded directories
-    echo "$relpath" | grep -q "node_modules\|/\.git/\|/dist/\|/coverage/\|/tmp/\|/\.build/\|/bin/\|__pycache__" && continue
-    # Skip release-evidence/ generated files (keep schemas/README)
-    case "$relpath" in
-      release-evidence/schemas/*|release-evidence/README.md) ;;
-      release-evidence/*) continue ;;
-    esac
-    # Skip OS metadata
-    [ "$(basename "$filepath")" = ".DS_Store" ] && continue
-    echo "$relpath" | grep -q "\.pyc$\|\.pyo$\|\.swp$\|\.swo$\|~$\|^\.#" && continue
-    printf '%s\n' "$relpath"
-  done | LC_ALL=C sort > "$ACTUAL_FILES"
-
-  # Check for missing files (in manifest but not in source tree)
-  MISSING="$(comm -23 "$MANIFEST_FILES" "$ACTUAL_FILES")"
-  # Check for extra files (in source tree but not in manifest)
-  EXTRA="$(comm -13 "$MANIFEST_FILES" "$ACTUAL_FILES")"
-
-  # Check for hash mismatches
-  MISMATCH_COUNT=0
-  while IFS= read -r line; do
-    [ -z "$line" ] && continue
-    expected_sha="${line:0:64}"
-    file_path="${line:66}"
-    if [ -f "$SOURCE_DIR/$file_path" ]; then
-      actual_sha="$(shasum -a 256 "$SOURCE_DIR/$file_path" | cut -d ' ' -f 1)"
-      if [ "$actual_sha" != "$expected_sha" ]; then
-        echo "MISMATCH: $file_path (expected=$expected_sha actual=$actual_sha)" >> "$MISMATCH_LOG"
-        MISMATCH_COUNT=$((MISMATCH_COUNT + 1))
-      fi
-    fi
-  done < "$EVIDENCE_DIR/source-tree-sha256.txt"
-
-  MANIFEST_COUNT="$(wc -l < "$MANIFEST_FILES" | tr -d ' ')"
-  ACTUAL_COUNT="$(wc -l < "$ACTUAL_FILES" | tr -d ' ')"
-  MISSING_COUNT="$(echo "$MISSING" | grep -c . 2>/dev/null || echo 0)"
-  EXTRA_COUNT="$(echo "$EXTRA" | grep -c . 2>/dev/null || echo 0)"
-
-  echo "  Manifest files: $MANIFEST_COUNT" >&2
-  echo "  Actual files:   $ACTUAL_COUNT" >&2
-  echo "  Missing:         $MISSING_COUNT" >&2
-  echo "  Extra:           $EXTRA_COUNT" >&2
-  echo "  Mismatched:      $MISMATCH_COUNT" >&2
-
-  [ -n "$MISSING" ] && echo "$MISSING" | head -20 | sed 's/^/    /' >&2
-  [ -n "$EXTRA" ] && echo "$EXTRA" | head -20 | sed 's/^/    /' >&2
-  [ "$MISMATCH_COUNT" -gt 0 ] && cat "$MISMATCH_LOG" | head -20 | sed 's/^/    /' >&2
-
-  rm -f "$MANIFEST_FILES" "$ACTUAL_FILES" "$MISMATCH_LOG"
-
-  if [ "$MISSING_COUNT" -eq 0 ] && [ "$EXTRA_COUNT" -eq 0 ] && [ "$MISMATCH_COUNT" -eq 0 ]; then
-    check "Source manifest equality" "PASS"
+  SOURCE_VERIFIER="$SCRIPT_DIR/verify-source-manifest.sh"
+  if [ ! -x "$SOURCE_VERIFIER" ]; then
+    check "Source manifest equality (verifier missing)" "FAIL"
+    echo "  ERROR: verify-source-manifest.sh not found or not executable" >&2
   else
-    check "Source manifest equality" "FAIL"
+    # verify-source-manifest.sh prints a summary; capture and surface it.
+    if "$SOURCE_VERIFIER" "$EVIDENCE_DIR/source-tree-sha256.txt" "$SOURCE_DIR" >"$EVIDENCE_DIR/.source-verify.tmp" 2>&1; then
+      check "Source manifest equality" "PASS"
+    else
+      check "Source manifest equality" "FAIL"
+    fi
+    # Surface the verifier's detail (missing/mismatched/unexpected) to stderr.
+    sed 's/^/    /' "$EVIDENCE_DIR/.source-verify.tmp" >&2
+    rm -f "$EVIDENCE_DIR/.source-verify.tmp"
   fi
 else
   check "Source manifest equality (missing)" "FAIL"

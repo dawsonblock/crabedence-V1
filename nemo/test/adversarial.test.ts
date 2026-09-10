@@ -771,3 +771,241 @@ describe("Adversarial: Kernel admission", () => {
     }
   });
 });
+
+// ─── Additional regression tests from build 4 audit ───────────────────
+
+describe("Adversarial: oversized response rejected", () => {
+  let socketPath: string;
+  let server: ExecutionApiServer;
+
+  beforeEach(() => {
+    socketPath = makeTempSocket();
+  });
+
+  afterEach(async () => {
+    if (server) await server.stop();
+    cleanupSocket(socketPath);
+  });
+
+  it("rejects response exceeding MAX_MESSAGE_BYTES", async () => {
+    // Create a server that returns a response larger than 4 MiB.
+    // The client should reject it as a PROTOCOL error.
+    const hugePayload = "x".repeat(5 * 1024 * 1024); // 5 MiB
+    const handler = async (): Promise<ExecutionApiResponse> => ({
+      status: "SUCCEEDED",
+      result: { data: hugePayload },
+    });
+
+    server = new ExecutionApiServer(handler, socketPath);
+    await server.start();
+
+    const client = new CrabedenceClient(socketPath, 5000);
+    await expect(
+      client.execute({
+        capability: "test.huge",
+        arguments: {},
+        authority: wireAuth,
+      }),
+    ).rejects.toThrow();
+  });
+});
+
+describe("Adversarial: socket permission check", () => {
+  it("server creates socket with 0600 permissions", async () => {
+    const { statSync } = await import("node:fs");
+    const socketPath = makeTempSocket();
+    cleanupSocket(socketPath);
+
+    const handler = async (): Promise<ExecutionApiResponse> => ({
+      status: "SUCCEEDED",
+    });
+    const srv = new ExecutionApiServer(handler, socketPath);
+    await srv.start();
+
+    try {
+      const stat = statSync(socketPath);
+      const mode = stat.mode & 0o777;
+      expect(mode).toBe(0o600);
+    } finally {
+      await srv.stop();
+      cleanupSocket(socketPath);
+    }
+  });
+
+  it("server creates directory with 0700 permissions", async () => {
+    const { statSync } = await import("node:fs");
+    const dir = mkdtempSync(join(tmpdir(), "nemo-perm-"));
+    const socketPath = join(dir, "subdir", "crabedence.sock");
+
+    const handler = async (): Promise<ExecutionApiResponse> => ({
+      status: "SUCCEEDED",
+    });
+    const srv = new ExecutionApiServer(handler, socketPath);
+    await srv.start();
+
+    try {
+      const stat = statSync(join(dir, "subdir"));
+      const mode = stat.mode & 0o777;
+      expect(mode).toBe(0o700);
+    } finally {
+      await srv.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("Adversarial: execution class absent at adapter", () => {
+  let socketPath: string;
+  let server: ExecutionApiServer;
+
+  beforeEach(() => {
+    socketPath = makeTempSocket();
+  });
+
+  afterEach(async () => {
+    if (server) await server.stop();
+    cleanupSocket(socketPath);
+  });
+
+  it("adapter does not invent execution class when absent", async () => {
+    // The adapter should only send execution_class if the caller provides it.
+    // When absent, the wire request should NOT contain execution_class.
+    let receivedClass: string | undefined;
+    const handler = async (req: ExecutionApiRequest): Promise<ExecutionApiResponse> => {
+      receivedClass = req.execution_class;
+      return { status: "SUCCEEDED" };
+    };
+
+    server = new ExecutionApiServer(handler, socketPath);
+    await server.start();
+
+    const client = new CrabedenceClient(socketPath, 5000);
+    const adapter = new CrabedenceExecutionAdapter(client);
+
+    // Execute without executionClass — adapter should not invent one
+    await adapter.execute({
+      capabilityId: "test.read",
+      arguments: {},
+      authority: auth,
+      // executionClass intentionally omitted
+    });
+
+    // The server should NOT have received an execution_class
+    expect(receivedClass).toBeUndefined();
+  });
+});
+
+describe("Adversarial: authority reference malformed", () => {
+  let socketPath: string;
+  let server: ExecutionApiServer;
+
+  beforeEach(() => {
+    socketPath = makeTempSocket();
+  });
+
+  afterEach(async () => {
+    if (server) await server.stop();
+    cleanupSocket(socketPath);
+  });
+
+  it("rejects empty authority_ref", async () => {
+    const handler = async (): Promise<ExecutionApiResponse> => ({
+      status: "SUCCEEDED",
+    });
+
+    server = new ExecutionApiServer(handler, socketPath);
+    await server.start();
+
+    const client = new CrabedenceClient(socketPath, 5000);
+
+    // authority_ref is empty string — server must DENY (not execute, not throw).
+    // DENIED is a terminal status returned as a resolved response.
+    const response = await client.execute({
+      capability: "test.read",
+      arguments: {},
+      authority: { principal: "alice", authority_ref: "" },
+    });
+    expect(response.status).toBe("DENIED");
+  });
+
+  it("rejects whitespace-only authority_ref", async () => {
+    const handler = async (): Promise<ExecutionApiResponse> => ({
+      status: "SUCCEEDED",
+    });
+
+    server = new ExecutionApiServer(handler, socketPath);
+    await server.start();
+
+    const client = new CrabedenceClient(socketPath, 5000);
+
+    const response = await client.execute({
+      capability: "test.read",
+      arguments: {},
+      authority: { principal: "alice", authority_ref: "   " },
+    });
+    expect(response.status).toBe("DENIED");
+  });
+});
+
+describe("Adversarial: non-ASCII evidence and provider fields", () => {
+  let socketPath: string;
+  let server: ExecutionApiServer;
+
+  beforeEach(() => {
+    socketPath = makeTempSocket();
+  });
+
+  afterEach(async () => {
+    if (server) await server.stop();
+    cleanupSocket(socketPath);
+  });
+
+  it("round-trips Unicode in provider and run_id fields", async () => {
+    const unicodeProvider = "提供者-🙂";
+    const unicodeRunId = "run-你好-1234";
+
+    const handler = async (): Promise<ExecutionApiResponse> => ({
+      status: "SUCCEEDED",
+      execution: {
+        provider: unicodeProvider,
+        run_id: unicodeRunId,
+      },
+    });
+
+    server = new ExecutionApiServer(handler, socketPath);
+    await server.start();
+
+    const client = new CrabedenceClient(socketPath, 5000);
+    const response = await client.execute({
+      capability: "test.read",
+      arguments: {},
+      authority: wireAuth,
+    });
+
+    expect(response.status).toBe("SUCCEEDED");
+    expect(response.execution?.provider).toBe(unicodeProvider);
+    expect(response.execution?.run_id).toBe(unicodeRunId);
+  });
+
+  it("round-trips Unicode in error field", async () => {
+    const unicodeError = "失败原因：连接超时 🚫";
+
+    const handler = async (): Promise<ExecutionApiResponse> => ({
+      status: "FAILED",
+      error: unicodeError,
+    });
+
+    server = new ExecutionApiServer(handler, socketPath);
+    await server.start();
+
+    const client = new CrabedenceClient(socketPath, 5000);
+    const response = await client.execute({
+      capability: "test.read",
+      arguments: {},
+      authority: wireAuth,
+    });
+
+    expect(response.status).toBe("FAILED");
+    expect(response.error).toBe(unicodeError);
+  });
+});

@@ -46,26 +46,45 @@ done < "$MANIFEST"
 
 # 2. Source → manifest: detect unexpected files not in the manifest
 # Walk the actual source tree and compare against manifest paths.
-# Excludes match generate-source-manifest.sh exclusions.
+# Exclusions MUST match generate-source-manifest.sh exactly — use the
+# same shell case-matching (not find -path, which only matches top-level
+# paths and would diverge on nested dirs like plugins/herdr/bin/).
 source_paths_file="$(mktemp)"
 trap 'rm -f "$manifest_paths_file" "$source_paths_file"' EXIT
 
 (
   cd "$ROOT"
-  find . -type f \
-    ! -path './.git/*' \
-    ! -path './dist/*' \
-    ! -path './bin/*' \
-    ! -path './node_modules/*' \
-    ! -path './worker/node_modules/*' \
-    ! -path './worker/dist/*' \
-    ! -path './nemo/node_modules/*' \
-    ! -path './release-evidence/*' \
-    ! -path './.github/release-allowed-signers' \
-    ! -path './source-tree-sha256.txt' \
-    ! -path './source-tree-git-blobs.txt' \
-    | sed 's|^\./||' \
-    | sort \
+  find . -type f | while IFS= read -r filepath; do
+    relpath="${filepath#./}"
+
+    # Skip excluded directories (top-level AND nested). Mirror generator.
+    case "$relpath" in
+      .git/*|*/.git/*) continue ;;
+      node_modules/*|*/node_modules/*) continue ;;
+      dist/*|*/dist/*) continue ;;
+      coverage/*|*/coverage/*) continue ;;
+      tmp/*|*/tmp/*) continue ;;
+      .build/*|*/.build/*) continue ;;
+      bin/*|*/bin/*) continue ;;
+      __pycache__/*|*/__pycache__/*) continue ;;
+    esac
+
+    # release-evidence/: keep schemas/ and README, skip generated evidence.
+    case "$relpath" in
+      release-evidence/schemas/*|release-evidence/README.md) ;;
+      release-evidence/*) continue ;;
+    esac
+
+    # Skip excluded basenames / patterns.
+    case "$(basename "$filepath")" in
+      .DS_Store) continue ;;
+    esac
+    case "$relpath" in
+      *.pyc|*.pyo|*.swp|*.swo|*~|.#*) continue ;;
+    esac
+
+    printf '%s\n' "$relpath"
+  done | LC_ALL=C sort
 ) > "$source_paths_file"
 
 # Find files in source but not in manifest
