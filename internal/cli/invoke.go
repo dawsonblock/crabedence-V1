@@ -19,11 +19,12 @@ import (
 // Hermes, a test client, or any future planner.
 //
 // Usage:
-//   crabbox invoke --capability system.info --principal alice@example.com
-//   crabbox invoke --capability test.counter.increment \
-//     --principal alice@example.com --authority-ref grant_123 \
-//     --idempotency-key key_001 \
-//     --arguments '{"counter":"test","by":1}'
+//
+//	crabbox invoke --capability system.info --principal alice@example.com
+//	crabbox invoke --capability test.counter.increment \
+//	  --principal alice@example.com --authority-ref grant_123 \
+//	  --idempotency-key key_001 \
+//	  --arguments '{"counter":"test","by":1}'
 func (a App) invokeCommand(ctx context.Context, socketPath, capability, principal, authorityRef, idempotencyKey, argumentsJSON, executionClass, deadline string) error {
 	if capability == "" {
 		return fmt.Errorf("--capability is required")

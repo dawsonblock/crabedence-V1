@@ -26,13 +26,13 @@ func (h *SystemInfoHandler) Execute(ctx context.Context, req Request, desc capab
 	runID := fmt.Sprintf("sysinfo-%d", time.Now().UnixNano())
 
 	result, _ := json.Marshal(map[string]any{
-		"go_version":  runtime.Version(),
-		"os":          runtime.GOOS,
-		"arch":        runtime.GOARCH,
-		"cpus":        runtime.NumCPU(),
-		"timestamp":   time.Now().UTC().Format(time.RFC3339Nano),
-		"principal":   req.Authority.Principal,
-		"capability":  req.Capability,
+		"go_version": runtime.Version(),
+		"os":         runtime.GOOS,
+		"arch":       runtime.GOARCH,
+		"cpus":       runtime.NumCPU(),
+		"timestamp":  time.Now().UTC().Format(time.RFC3339Nano),
+		"principal":  req.Authority.Principal,
+		"capability": req.Capability,
 	})
 
 	return Response{
