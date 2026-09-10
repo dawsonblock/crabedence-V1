@@ -1,5 +1,5 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://crabedence.dev/schemas/qualification.schema.json",
   "title": "Crabedence Release Qualification",
   "description": "Canonical machine-readable qualification record. All release admission decisions derive from this file.",
@@ -18,7 +18,7 @@
   "properties": {
     "qualification_version": {
       "type": "integer",
-      "const": 1
+      "enum": [1]
     },
     "release_status": {
       "type": "string",
