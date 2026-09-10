@@ -5,8 +5,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-QUAL_FILE="$REPO_ROOT/release-evidence/qualification.json"
-OUTPUT="$REPO_ROOT/release-evidence/qualification-matrix.md"
+QUAL_FILE="$REPO_ROOT/dist/release-evidence/qualification.json"
+OUTPUT="$REPO_ROOT/dist/release-evidence/qualification-matrix.md"
 
 if [ ! -f "$QUAL_FILE" ]; then
   echo "ERROR: qualification.json not found at $QUAL_FILE" >&2
@@ -19,9 +19,9 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
-COMMIT="$(jq -r '.source.commit' "$QUAL_FILE")"
-TREE="$(jq -r '.source.tree' "$QUAL_FILE")"
-BRANCH="$(jq -r '.source.branch' "$QUAL_FILE")"
+COMMIT="$(jq -r '.provenance.commit' "$QUAL_FILE")"
+TREE="$(jq -r '.provenance.tree' "$QUAL_FILE")"
+BRANCH="$(jq -r '.provenance.branch' "$QUAL_FILE")"
 DATE="$(jq -r '.environment.date' "$QUAL_FILE")"
 GO_VER="$(jq -r '.toolchains.go' "$QUAL_FILE")"
 NODE_VER="$(jq -r '.toolchains.node' "$QUAL_FILE")"
@@ -55,7 +55,7 @@ FAILED="$(jq -r '.gate_summary.failed' "$QUAL_FILE")"
   for i in $(seq 0 $((GATE_COUNT - 1))); do
     name="$(jq -r ".gates[$i].name" "$QUAL_FILE")"
     status="$(jq -r ".gates[$i].status" "$QUAL_FILE")"
-    log="$(jq -r ".gates[$i].log" "$QUAL_FILE")"
+    log="$(jq -r ".gates[$i].evidence_file" "$QUAL_FILE")"
     echo "| \`$name\` | $status | \`$log\` |"
   done
 
