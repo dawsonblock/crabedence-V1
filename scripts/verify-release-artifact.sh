@@ -186,8 +186,10 @@ if [ -f "$EVIDENCE_DIR/qualification.json" ]; then
     check "Gate exit-code consistency" "FAIL"
   fi
 
-  # 4g. Cross-check: mandatory gate with tests_executed == 0 must not be PASS (for test gates).
-  ZERO_EXECUTION_GATES="$(jq -r '.gates[] | select(.mandatory == true and .tests_executed == 0 and .status == "PASS") | .id' "$EVIDENCE_DIR/qualification.json" 2>/dev/null || echo "")"
+  # 4g. Cross-check: mandatory test gate with tests_executed == 0 must not be PASS.
+  # Only applies to gates whose names contain "tests" or start with "postgres-".
+  # Non-test gates (vet, typecheck, format, lint, build) legitimately have tests_executed == 0.
+  ZERO_EXECUTION_GATES="$(jq -r '.gates[] | select(.mandatory == true and .status == "PASS" and ((.name | test("tests")) or (.name | startswith("postgres-")))) | select(.tests_executed == 0 or .tests_executed == null) | .id' "$EVIDENCE_DIR/qualification.json" 2>/dev/null || echo "")"
   if [ -z "$ZERO_EXECUTION_GATES" ]; then
     check "Gate execution consistency" "PASS"
   else

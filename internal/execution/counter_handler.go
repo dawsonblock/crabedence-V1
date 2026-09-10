@@ -92,5 +92,23 @@ func RegisterCounterCapability(reg *capability.Registry) error {
 			ID:            "test.counter",
 			GrantRequired: true,
 		},
+		Schema: json.RawMessage(`{
+			"type": "object",
+			"properties": {
+				"counter": {
+					"type": "string",
+					"minLength": 1,
+					"maxLength": 256,
+					"description": "Counter name (defaults to 'default')"
+				},
+				"by": {
+					"type": "integer",
+					"minimum": -1000000,
+					"maximum": 1000000,
+					"description": "Increment amount (defaults to 1)"
+				}
+			},
+			"additionalProperties": false
+		}`),
 	})
 }

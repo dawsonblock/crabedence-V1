@@ -57,5 +57,10 @@ func RegisterSystemInfoCapability(reg *capability.Registry) error {
 			ID:            "system.info",
 			GrantRequired: false,
 		},
+		Schema: json.RawMessage(`{
+			"type": "object",
+			"properties": {},
+			"additionalProperties": false
+		}`),
 	})
 }

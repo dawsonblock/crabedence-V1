@@ -25,18 +25,21 @@ rm -rf "$EVIDENCE_DIR/gate-results"
 mkdir -p "$EVIDENCE_DIR/gate-results"
 
 # ─── Gate tracking ─────────────────────────────────────────────────────────
-# Each gate records: name, status (PASS/FAIL/NOT_RUN), exit code, log file.
+# Each gate records: name, status (PASS/FAIL/NOT_RUN), exit code, log file,
+# and tests_executed (for test-suite gates; empty for non-test gates).
 declare -a GATE_NAMES=()
 declare -a GATE_STATUS=()
 declare -a GATE_EXIT=()
 declare -a GATE_LOG=()
+declare -a GATE_TESTS=()
 
 record_gate() {
-  local name="$1" status="$2" exit_code="$3" log="$4"
+  local name="$1" status="$2" exit_code="$3" log="$4" tests="${5:-}"
   GATE_NAMES+=("$name")
   GATE_STATUS+=("$status")
   GATE_EXIT+=("$exit_code")
   GATE_LOG+=("$log")
+  GATE_TESTS+=("$tests")
 }
 
 # ─── run_and_log (Phase 2) ──────────────────────────────────────────────────
@@ -402,11 +405,70 @@ fi
 echo ""
 echo "=== Generating qualification.json ==="
 
-# Build gates JSON array from tracked results.
+# Extract tests_executed from a gate log. Returns 0 for non-test gates or
+# when the count cannot be determined. For Go test gates, parses the
+# "--- PASS"/"--- FAIL" summary lines. For Vitest gates, the live Postgres
+# wrapper already wrote structured JSON; for plain npm vitest gates we
+# parse the JSON summary if present.
+extract_tests_executed() {
+  local gate_name="$1"
+  local log="$2"
+  local count=0
+
+  case "$gate_name" in
+    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers)
+      # Go test summary lines look like: "--- PASS: TestFoo (0.01s)"
+      # or "--- FAIL: TestFoo (0.01s)". Count unique test entries.
+      count=$(grep -cE '^(--- PASS|--- FAIL|=== RUN  )' "$log" 2>/dev/null || echo 0)
+      # Fallback: count "ok" or "FAIL" package summary lines.
+      if [ "$count" -eq 0 ]; then
+        count=$(grep -cE '^(ok|FAIL|---)\s' "$log" 2>/dev/null || echo 0)
+      fi
+      ;;
+    worker-tests|nemo-tests)
+      # Vitest prints "Test Files  X passed (Y)" and "Tests  Z passed (W)"
+      # Try to extract the "Tests" count from the summary line.
+      local tests_line
+      tests_line=$(grep -E 'Tests\s+[0-9]+' "$log" 2>/dev/null | tail -1 || echo "")
+      if [ -n "$tests_line" ]; then
+        local parsed
+        parsed=$(echo "$tests_line" | grep -oE '[0-9]+ (passed|failed|skipped)' | grep -oE '^[0-9]+' | paste -sd+ - | bc 2>/dev/null || echo 0)
+        count="${parsed:-0}"
+      fi
+      ;;
+    postgres-*)
+      # Live Postgres gates write a structured JSON summary alongside the log.
+      local json_summary="${log%.log}.summary.json"
+      if [ ! -f "$json_summary" ]; then
+        json_summary="$EVIDENCE_DIR/${gate_name}.summary.json"
+      fi
+      if [ -f "$json_summary" ]; then
+        count=$(grep -oE '"tests_executed"\s*:\s*[0-9]+' "$json_summary" 2>/dev/null | grep -oE '[0-9]+$' || echo 0)
+      fi
+      ;;
+    cross-language-conformance)
+      # Conformance runner prints a count of cases.
+      count=$(grep -cE '^(PASS|FAIL|ok|not ok)\s' "$log" 2>/dev/null || echo 0)
+      ;;
+    *)
+      # Non-test gates (vet, typecheck, format, lint, build) have no test count.
+      count=0
+      ;;
+  esac
+
+  # Ensure numeric and non-negative.
+  if ! [[ "$count" =~ ^[0-9]+$ ]]; then
+    count=0
+  fi
+  echo "$count"
+}
+
+# Build gates JSON array from tracked results, including tests_executed.
 GATES_JSON="["
 for i in "${!GATE_NAMES[@]}"; do
   [ "$i" -gt 0 ] && GATES_JSON+=","
-  GATES_JSON+="{\"id\":\"${GATE_NAMES[$i]}\",\"name\":\"${GATE_NAMES[$i]}\",\"mandatory\":true,\"status\":\"${GATE_STATUS[$i]}\",\"exit_code\":${GATE_EXIT[$i]},\"evidence_file\":\"gate-results/$(basename "${GATE_LOG[$i]}")\"}"
+  tests_executed="$(extract_tests_executed "${GATE_NAMES[$i]}" "${GATE_LOG[$i]}")"
+  GATES_JSON+="{\"id\":\"${GATE_NAMES[$i]}\",\"name\":\"${GATE_NAMES[$i]}\",\"mandatory\":true,\"status\":\"${GATE_STATUS[$i]}\",\"exit_code\":${GATE_EXIT[$i]},\"tests_executed\":${tests_executed},\"evidence_file\":\"gate-results/$(basename "${GATE_LOG[$i]}")\"}"
 done
 GATES_JSON+="]"
 

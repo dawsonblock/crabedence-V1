@@ -5,83 +5,32 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"sort"
 	"strings"
 )
 
-// CanonicalJSON produces deterministic JSON with sorted keys at all levels.
-// This ensures that property insertion order does not affect the digest.
+// CanonicalJSON produces deterministic JSON for idempotency digests.
+//
+// It delegates to Go's standard encoding/json, which provides the
+// required guarantees:
+//   - map[string]any keys are sorted (byte order = UTF-8 code-point order)
+//   - json.Number values preserve their lexical representation
+//   - output is deterministic for the same input value
+//
+// RELATIONSHIP TO THE EVIDENCE CANONICALIZATION:
+// The RunEvidenceV1 canonicalization (internal/cli/run_evidence.go)
+// is a cross-language Go↔TypeScript format that disables HTML escaping
+// and mirrors JavaScript's JSON.stringify byte-for-byte. This
+// canonicalization is Go-only and uses the standard encoder defaults.
+// They are intentionally separate: the evidence protocol has a
+// cross-language conformance corpus; this one has its own (see
+// digest_conformance_test.go). Do not merge them without a shared
+// conformance corpus covering both.
 func CanonicalJSON(v any) (string, error) {
-	return canonicalValue(v)
-}
-
-func canonicalValue(v any) (string, error) {
-	switch val := v.(type) {
-	case nil:
-		return "null", nil
-	case bool:
-		if val {
-			return "true", nil
-		}
-		return "false", nil
-	case json.Number:
-		return string(val), nil
-	case float64:
-		return formatFloat(val), nil
-	case int:
-		return fmt.Sprintf("%d", val), nil
-	case int64:
-		return fmt.Sprintf("%d", val), nil
-	case string:
-		b, err := json.Marshal(val)
-		if err != nil {
-			return "", err
-		}
-		return string(b), nil
-	case []any:
-		parts := make([]string, len(val))
-		for i, item := range val {
-			s, err := canonicalValue(item)
-			if err != nil {
-				return "", err
-			}
-			parts[i] = s
-		}
-		return "[" + strings.Join(parts, ",") + "]", nil
-	case map[string]any:
-		keys := make([]string, 0, len(val))
-		for k := range val {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		parts := make([]string, 0, len(keys))
-		for _, k := range keys {
-			ks, err := json.Marshal(k)
-			if err != nil {
-				return "", err
-			}
-			vs, err := canonicalValue(val[k])
-			if err != nil {
-				return "", err
-			}
-			parts = append(parts, string(ks)+":"+vs)
-		}
-		return "{" + strings.Join(parts, ",") + "}", nil
-	default:
-		b, err := json.Marshal(val)
-		if err != nil {
-			return "", err
-		}
-		return string(b), nil
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "", err
 	}
-}
-
-// formatFloat formats a float64 in a canonical way.
-func formatFloat(f float64) string {
-	if f == float64(int64(f)) {
-		return fmt.Sprintf("%d", int64(f))
-	}
-	return fmt.Sprintf("%g", f)
+	return string(b), nil
 }
 
 // DigestInput is the input to the idempotency digest.

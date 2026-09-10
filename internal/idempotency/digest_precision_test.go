@@ -84,13 +84,19 @@ func TestComputeDigestFromRawFloatPreserved(t *testing.T) {
 		t.Error("distinct float values must produce distinct digests")
 	}
 
-	// Same value in different lexical form should produce the same digest
+	// Different lexical forms of the same numeric value produce
+	// different digests. This is intentional: UseNumber() preserves
+	// the exact lexical representation, so 1.5 and 1.50 are distinct.
+	// This is the conservative behavior for idempotency — the exact
+	// bytes the client sent determine the digest, not a normalized
+	// numeric value. This prevents accidental collisions from
+	// ambiguous normalization rules.
 	args3 := json.RawMessage(`{"amount":1.50}`)
 	d3, err := ComputeDigestFromRaw(1, "test@example.com", "test.cap", args3, "", "MUTATION")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d1 != d3 {
-		t.Errorf("1.5 and 1.50 should produce the same digest: %s != %s", d1, d3)
+	if d1 == d3 {
+		t.Error("1.5 and 1.50 are different lexical forms and should produce different digests (UseNumber preserves lexical representation)")
 	}
 }

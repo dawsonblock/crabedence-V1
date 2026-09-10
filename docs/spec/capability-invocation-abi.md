@@ -9,18 +9,21 @@ The semantic contract is stable. The transport is replaceable.
 
 ## The Semantic Contract
 
-A capability invocation is a single JSON object:
+A capability invocation is a single JSON object. The canonical
+Unix-socket transport binding (see below) uses this exact structure:
 
 ```json
 {
-  "abi_version": "1",
   "capability": "gmail.message.send",
   "arguments": {
     "to": "bob@example.com",
     "body": "Hello"
   },
-  "principal": "user-123",
-  "authority_ref": "grant-456",
+  "authority": {
+    "principal": "user-123",
+    "authority_ref": "grant-456"
+  },
+  "execution_class": "MUTATION",
   "idempotency_key": "send-001",
   "deadline": "2025-01-01T00:00:00Z"
 }
@@ -30,17 +33,16 @@ A capability invocation is a single JSON object:
 
 | Field              | Type   | Description                                      |
 |--------------------|--------|--------------------------------------------------|
-| `abi_version`      | string | ABI version, currently `"1"`                     |
 | `capability`       | string | Registered capability identifier                 |
 | `arguments`        | object | Arguments for the capability (validated by schema) |
-| `principal`        | string | Identity of the requesting principal             |
+| `authority.principal` | string | Identity of the requesting principal          |
 
 ### Conditionally required fields
 
-| Field              | Type   | Required when                          |
-|--------------------|--------|----------------------------------------|
-| `authority_ref`    | string | Capability's authority policy requires authorization |
-| `idempotency_key`  | string | Effect class is MUTATION or CRITICAL   |
+| Field                     | Type   | Required when                          |
+|---------------------------|--------|----------------------------------------|
+| `authority.authority_ref` | string | Capability's authority policy requires authorization |
+| `idempotency_key`         | string | Effect class is MUTATION or CRITICAL   |
 
 ### Optional fields
 
@@ -48,6 +50,24 @@ A capability invocation is a single JSON object:
 |--------------------|--------|--------------------------------------------------|
 | `execution_class`  | string | Caller assertion; checked against registry. If absent, registry's pinned class is used. Mismatch = DENIED. |
 | `deadline`         | string | RFC3339 timestamp; request is DENIED after this time |
+
+### Authority object
+
+The `authority` field groups identity and authorization material:
+
+```json
+{
+  "principal": "user-123",
+  "authority_ref": "grant-456",
+  "grant_id": "grant-456"
+}
+```
+
+- `principal` (required): the requesting principal's identity.
+- `authority_ref` (conditionally required): opaque reference to
+  authority material. Crabedence resolves it internally.
+- `grant_id` (deprecated alias): accepted for backward compatibility
+  and mapped to `authority_ref` when `authority_ref` is absent.
 
 ### Fields the planner must NOT send
 
@@ -69,6 +89,22 @@ If a planner sends these, they are ignored:
 - `evidence`
 - `assurance_profile`
 - `execution_route`
+
+## Unix Socket Transport Binding
+
+The persistent execution service uses a length-prefixed JSON protocol
+over a Unix domain socket:
+
+1. The client connects to the socket (0600 permissions, 0700 directory).
+2. The client sends a 4-byte big-endian length prefix followed by
+   the UTF-8 JSON request body.
+3. Maximum message size is 4 MiB.
+4. The service responds with a 4-byte big-endian length prefix
+   followed by the UTF-8 JSON response body.
+
+The request body is the JSON object described above. There is no
+envelope, no `abi_version` field — the semantic contract is enforced
+by the capability registry, not a version tag on the wire.
 
 ## Why `authority_ref` instead of `grant_id`
 

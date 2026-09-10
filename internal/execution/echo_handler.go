@@ -62,5 +62,19 @@ func RegisterEchoCapability(reg *capability.Registry) error {
 			ID:            "system.echo",
 			GrantRequired: false,
 		},
+		Schema: json.RawMessage(`{
+			"type": "object",
+			"properties": {
+				"message": {
+					"type": "string",
+					"description": "Message to echo back"
+				},
+				"data": {
+					"type": "string",
+					"description": "Raw data to echo back (for frame-size tests)"
+				}
+			},
+			"additionalProperties": true
+		}`),
 	})
 }

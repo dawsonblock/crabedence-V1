@@ -253,24 +253,9 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 		return
 	}
 
-	// Verify authority (grant resolution)
-	if decision.Descriptor.AuthorityPolicy.GrantRequired {
-		fc, reason := s.registry.VerifyAuthority(ctx, capability.AdmissionRequest{
-			Capability: req.Capability,
-			Principal:  req.Authority.Principal,
-			GrantID:    req.Authority.EffectiveAuthorityRef(),
-		}, s.grantResolver)
-		if fc != "" {
-			s.writeResponse(conn, Response{
-				Status:      StatusDenied,
-				FailureCode: string(fc),
-				Error:       reason,
-			})
-			return
-		}
-	}
-
-	// Check deadline
+	// Check deadline before any further validation. An expired deadline
+	// means the request is stale — there is no point validating schema or
+	// authority for a request the caller already abandoned.
 	if req.Deadline != "" {
 		deadline, err := time.Parse(time.RFC3339, req.Deadline)
 		if err != nil {
@@ -286,6 +271,39 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 				Status:      StatusDenied,
 				FailureCode: string(capability.FailureAdmissionDenied),
 				Error:       "deadline expired",
+			})
+			return
+		}
+	}
+
+	// ─── Argument schema validation ──────────────────────────────────────
+	// The capability descriptor may declare a JSON Schema for arguments.
+	// If declared, arguments must validate against it before dispatch.
+	// An empty schema means no validation. A malformed schema is a
+	// registration error and fails closed.
+	if len(decision.Descriptor.Schema) > 0 {
+		if err := capability.ValidateArguments(decision.Descriptor.Schema, req.Arguments); err != nil {
+			s.writeResponse(conn, Response{
+				Status:      StatusDenied,
+				FailureCode: string(capability.FailureInvalidRequest),
+				Error:       fmt.Sprintf("argument schema validation failed: %v", err),
+			})
+			return
+		}
+	}
+
+	// Verify authority (grant resolution)
+	if decision.Descriptor.AuthorityPolicy.GrantRequired {
+		fc, reason := s.registry.VerifyAuthority(ctx, capability.AdmissionRequest{
+			Capability: req.Capability,
+			Principal:  req.Authority.Principal,
+			GrantID:    req.Authority.EffectiveAuthorityRef(),
+		}, s.grantResolver)
+		if fc != "" {
+			s.writeResponse(conn, Response{
+				Status:      StatusDenied,
+				FailureCode: string(fc),
+				Error:       reason,
 			})
 			return
 		}

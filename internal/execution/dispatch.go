@@ -146,6 +146,20 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		}
 	}
 
+	// ─── IN_FLIGHT: the dispatch boundary ───────────────────────────────────
+	// Transition to IN_FLIGHT immediately before handler.Execute.
+	// IN_FLIGHT has precise semantics: the dispatch boundary has been
+	// crossed — the request is with the provider. A crash in DISPATCHING
+	// is pre-dispatch (safe to reclaim); a crash in IN_FLIGHT is
+	// post-dispatch (mark UNKNOWN for reconciliation, never blind-retry).
+	if err := e.store.TransitionState(ctx, executionID, leaseToken, idempotency.StateDispatching, idempotency.StateInFlight); err != nil {
+		return Response{
+			Status:      StatusFailed,
+			FailureCode: string(capability.FailureInternalError),
+			Error:       fmt.Sprintf("failed to transition to IN_FLIGHT (lease lost or state changed): %v", err),
+		}
+	}
+
 	// Dispatch — from this point, we are POST_DISPATCH.
 	// Any failure after this point is UNKNOWN (may have executed).
 	resp := e.dispatch(ctx, req, desc)
@@ -210,7 +224,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	// the expected state must match, and terminal states are immutable.
 	// A second identical finalize is idempotent; a conflicting receipt
 	// is rejected as FINALIZATION_CONFLICT.
-	if err := e.store.Finalize(ctx, executionID, leaseToken, idempotency.StateDispatching, state, resp.Result, evidenceDigest, receiptVersion); err != nil {
+	if err := e.store.Finalize(ctx, executionID, leaseToken, idempotency.StateInFlight, state, resp.Result, evidenceDigest, receiptVersion); err != nil {
 		// Finalization failed AFTER dispatch — return UNKNOWN.
 		// The side effect may have occurred; we cannot claim FAILED.
 		// This could be because:

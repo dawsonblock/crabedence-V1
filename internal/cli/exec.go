@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
+	"os"
+	"time"
 
 	"github.com/openclaw/crabbox/internal/capability"
 	"github.com/openclaw/crabbox/internal/execution"
@@ -50,22 +53,21 @@ type ExecutionMeta struct {
 
 // execCommand implements `crabbox exec`: a narrow JSON-in/JSON-out
 // execution bridge for NeMo. It reads an ExecutionRequest from stdin,
-// validates it through the capability registry, and returns a typed
-// response.
+// forwards it to the persistent execution service over the Unix
+// socket (the same ABI that `crabbox invoke` uses), and writes the
+// ExecutionResponse to stdout.
 //
-// Until provider dispatch is fully wired, capabilities without an
-// adapter return FAILED with CAPABILITY_UNIMPLEMENTED. This command
-// never returns SUCCEEDED for an operation that was not actually
-// executed, and never returns UNKNOWN for an operation that was never
-// dispatched.
+// This is the stdin/stdout bridge for subprocess-based planners
+// (like the legacy TypeScript bridge.ts). It delegates entirely to
+// the persistent execution service — it never dispatches on its own.
 func (a App) execCommand(ctx context.Context, args []string) error {
 	if len(args) > 0 && (args[0] == "-h" || args[0] == "--help") {
 		fmt.Fprintln(a.Stderr, "Usage: crabbox exec")
 		fmt.Fprintln(a.Stderr, "")
 		fmt.Fprintln(a.Stderr, "Reads an ExecutionRequest JSON object from stdin,")
-		fmt.Fprintln(a.Stderr, "validates it through the capability registry,")
-		fmt.Fprintln(a.Stderr, "dispatches to the configured provider, and writes")
-		fmt.Fprintln(a.Stderr, "an ExecutionResponse JSON object to stdout.")
+		fmt.Fprintln(a.Stderr, "forwards it to the persistent execution service")
+		fmt.Fprintln(a.Stderr, "(crabbox serve-execution) over the Unix socket,")
+		fmt.Fprintln(a.Stderr, "and writes an ExecutionResponse JSON object to stdout.")
 		return nil
 	}
 
@@ -88,59 +90,114 @@ func (a App) execCommand(ctx context.Context, args []string) error {
 		})
 	}
 
-	// Build a registry with built-in capabilities
-	registry := capability.NewRegistry()
-	if err := execution.RegisterEchoCapability(registry); err != nil {
-		return writeExecResponse(a.Stdout, ExecutionResponse{
-			Status:      "FAILED",
-			FailureCode: string(capability.FailureInternalError),
-			Error:       fmt.Sprintf("registry error: %v", err),
-		})
-	}
-	if err := execution.RegisterCounterCapability(registry); err != nil {
-		return writeExecResponse(a.Stdout, ExecutionResponse{
-			Status:      "FAILED",
-			FailureCode: string(capability.FailureInternalError),
-			Error:       fmt.Sprintf("registry error: %v", err),
-		})
-	}
-
-	// Admit the request through the registry
-	decision := registry.Admit(capability.AdmissionRequest{
-		Capability:     req.Capability,
-		Arguments:      req.Arguments,
-		Principal:      req.Authority.Principal,
-		GrantID:        req.Authority.GrantID,
+	// Build the execution service request (same wire format as invoke).
+	execReq := execution.Request{
+		Capability: req.Capability,
+		Arguments:  req.Arguments,
+		Authority: execution.RequestAuthority{
+			Principal:    req.Authority.Principal,
+			AuthorityRef: req.Authority.GrantID,
+		},
 		ExecutionClass: req.ExecutionClass,
 		IdempotencyKey: req.IdempotencyKey,
 		Deadline:       req.Deadline,
-	})
+	}
 
-	if !decision.Allowed {
-		status := "DENIED"
-		if decision.FailureCode == capability.FailureCapabilityNotFound ||
-			decision.FailureCode == capability.FailureCapabilityUnimplemented {
-			status = "FAILED"
-		}
+	// Connect to the persistent execution service.
+	socketPath := a.defaultExecutionSocketPath()
+	conn, err := net.DialTimeout("unix", socketPath, 10*time.Second)
+	if err != nil {
 		return writeExecResponse(a.Stdout, ExecutionResponse{
-			Status:      status,
-			FailureCode: string(decision.FailureCode),
-			Error:       decision.Reason,
+			Status:      "FAILED",
+			FailureCode: string(capability.FailureInternalError),
+			Error:       fmt.Sprintf("failed to connect to execution service at %s: %v (is 'crabbox serve-execution' running?)", socketPath, err),
+		})
+	}
+	defer conn.Close()
+
+	// Send request (length-prefixed JSON, same ABI as invoke).
+	payload, err := json.Marshal(execReq)
+	if err != nil {
+		return writeExecResponse(a.Stdout, ExecutionResponse{
+			Status:      "FAILED",
+			FailureCode: string(capability.FailureInternalError),
+			Error:       fmt.Sprintf("failed to marshal request: %v", err),
 		})
 	}
 
-	// TODO: For the subprocess bridge, we can't dispatch to the persistent
-	// service. The `crabbox serve-execution` command owns the persistent
-	// service. The `crabbox exec` command is a simple stdin/stdout bridge
-	// that should connect to the persistent service over the Unix socket.
-	//
-	// For now, return CAPABILITY_UNIMPLEMENTED for all capabilities.
-	// The persistent service (crabbox serve-execution) handles real dispatch.
-	return writeExecResponse(a.Stdout, ExecutionResponse{
-		Status:      "FAILED",
-		FailureCode: string(capability.FailureCapabilityUnimplemented),
-		Error:       "crabbox exec cannot dispatch; use 'crabbox serve-execution' for the persistent service",
-	})
+	lenBuf := make([]byte, 4)
+	lenBuf[0] = byte(len(payload) >> 24)
+	lenBuf[1] = byte(len(payload) >> 16)
+	lenBuf[2] = byte(len(payload) >> 8)
+	lenBuf[3] = byte(len(payload))
+
+	conn.SetDeadline(time.Now().Add(30 * time.Second))
+	if _, err := conn.Write(lenBuf); err != nil {
+		return writeExecResponse(a.Stdout, ExecutionResponse{
+			Status:      "FAILED",
+			FailureCode: string(capability.FailureInternalError),
+			Error:       fmt.Sprintf("failed to send length: %v", err),
+		})
+	}
+	if _, err := conn.Write(payload); err != nil {
+		return writeExecResponse(a.Stdout, ExecutionResponse{
+			Status:      "FAILED",
+			FailureCode: string(capability.FailureInternalError),
+			Error:       fmt.Sprintf("failed to send request: %v", err),
+		})
+	}
+
+	// Read response (length-prefixed JSON).
+	respLenBuf := make([]byte, 4)
+	if _, err := readFull(conn, respLenBuf); err != nil {
+		return writeExecResponse(a.Stdout, ExecutionResponse{
+			Status:      "FAILED",
+			FailureCode: string(capability.FailureInternalError),
+			Error:       fmt.Sprintf("failed to read response length: %v", err),
+		})
+	}
+	respLen := uint32(respLenBuf[0])<<24 | uint32(respLenBuf[1])<<16 | uint32(respLenBuf[2])<<8 | uint32(respLenBuf[3])
+	if respLen > 4*1024*1024 {
+		return writeExecResponse(a.Stdout, ExecutionResponse{
+			Status:      "FAILED",
+			FailureCode: string(capability.FailureInternalError),
+			Error:       fmt.Sprintf("response too large: %d bytes", respLen),
+		})
+	}
+
+	respBuf := make([]byte, respLen)
+	if _, err := readFull(conn, respBuf); err != nil {
+		return writeExecResponse(a.Stdout, ExecutionResponse{
+			Status:      "FAILED",
+			FailureCode: string(capability.FailureInternalError),
+			Error:       fmt.Sprintf("failed to read response: %v", err),
+		})
+	}
+
+	// Parse the response and write it to stdout.
+	var execResp ExecutionResponse
+	if err := json.Unmarshal(respBuf, &execResp); err != nil {
+		return writeExecResponse(a.Stdout, ExecutionResponse{
+			Status:      "FAILED",
+			FailureCode: string(capability.FailureInternalError),
+			Error:       fmt.Sprintf("failed to parse response: %v", err),
+		})
+	}
+
+	return writeExecResponse(a.Stdout, execResp)
+}
+
+// defaultExecutionSocketPath returns the default execution service
+// socket path (same logic as serve.go's defaultSocketPath).
+func (a App) defaultExecutionSocketPath() string {
+	if xdg := os.Getenv("XDG_RUNTIME_DIR"); xdg != "" {
+		return xdg + "/crabedence/execution.sock"
+	}
+	user := os.Getenv("USER")
+	if user == "" {
+		user = "unknown"
+	}
+	return "/tmp/crabedence-" + user + "/execution.sock"
 }
 
 // writeExecResponse writes an ExecutionResponse as JSON to the writer.

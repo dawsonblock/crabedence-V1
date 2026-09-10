@@ -12,6 +12,7 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
+	"github.com/openclaw/crabbox/internal/authority"
 	"github.com/openclaw/crabbox/internal/capability"
 	"github.com/openclaw/crabbox/internal/idempotency"
 	"github.com/openclaw/crabbox/internal/reconcile"
@@ -69,8 +70,9 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	counterHandler := NewCounterHandler()
 	infoHandler := NewSystemInfoHandler()
 
-	// Connect to PostgreSQL for durable idempotency
+	// Connect to PostgreSQL for durable idempotency and authority
 	var store *idempotency.Store
+	var authorityStore *authority.Store
 	if opts.DatabaseURL != "" {
 		db, err := sql.Open("pgx", opts.DatabaseURL)
 		if err != nil {
@@ -85,6 +87,11 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 		store, err = idempotency.NewStore(db)
 		if err != nil {
 			return fmt.Errorf("failed to create idempotency store: %w", err)
+		}
+
+		authorityStore, err = authority.NewStore(db)
+		if err != nil {
+			return fmt.Errorf("failed to create authority store: %w", err)
 		}
 	}
 
@@ -106,6 +113,13 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	}
 
 	service := NewService(registry, handler, opts.SocketPath)
+
+	// Wire production authority: PostgreSQL-backed grant resolution.
+	// Without this, the service defaults to NoopGrantResolver which
+	// denies all grant-required capabilities in production.
+	if authorityStore != nil {
+		service.SetGrantResolver(authorityStore)
+	}
 
 	// Ensure socket directory has restrictive permissions
 	if dir := filepath.Dir(opts.SocketPath); dir != "" && dir != "." {
