@@ -440,7 +440,7 @@ export class ExecutionApiServer {
         return;
       }
       const authRef = request.authority?.authority_ref ?? request.authority?.grant_id;
-      if (!request.authority?.principal || !authRef) {
+      if (!request.authority?.principal || !authRef || !authRef.trim()) {
         this.sendResponse(socket, {
           status: "DENIED",
           error: "missing authority",
