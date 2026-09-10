@@ -429,9 +429,9 @@ extract_tests_executed() {
     worker-tests|nemo-tests)
       # Vitest prints a summary like:
       #   Tests  5 passed (5)
-      # Extract the total from parentheses, or sum passed+failed+skipped.
+      # The output may contain ANSI color codes in CI, so strip them.
       local tests_line
-      tests_line=$(grep -E 'Tests[[:space:]]+[0-9]+' "$log" 2>/dev/null | tail -1 || true)
+      tests_line=$(sed 's/\x1b\[[0-9;]*m//g' "$log" 2>/dev/null | grep -E 'Tests[[:space:]]+[0-9]+' | tail -1 || true)
       if [ -n "$tests_line" ]; then
         # Try to extract the number in parentheses first: "5 passed (5)"
         local in_parens
@@ -452,8 +452,8 @@ extract_tests_executed() {
       fi
       ;;
     postgres-*)
-      # Live Postgres gates write a structured JSON summary alongside the log.
-      # Try several possible locations.
+      # Live Postgres gates write a vitest JSON file alongside the log.
+      # Use jq (already available in CI) to count assertion results.
       local json_summary
       for candidate in "${log%.log}.summary.json" "$EVIDENCE_DIR/${gate_name}.summary.json" "$EVIDENCE_DIR/${gate_name}.vitest.json"; do
         if [ -f "$candidate" ]; then
@@ -461,12 +461,9 @@ extract_tests_executed() {
           break
         fi
       done
-      if [ -n "${json_summary:-}" ] && [ -f "$json_summary" ]; then
-        count=$(grep -oE '"tests_executed"[[:space:]]*:[[:space:]]*[0-9]+' "$json_summary" 2>/dev/null | grep -oE '[0-9]+$' || true)
-        if [ "$count" -eq 0 ] 2>/dev/null; then
-          # Try "numTotalTests" from vitest JSON output
-          count=$(grep -oE '"numTotalTests"[[:space:]]*:[[:space:]]*[0-9]+' "$json_summary" 2>/dev/null | grep -oE '[0-9]+$' || true)
-        fi
+      if [ -n "${json_summary:-}" ] && [ -f "$json_summary" ] && command -v jq >/dev/null 2>&1; then
+        # Count total assertion results across all test files.
+        count=$(jq '[.testResults[].assertionResults | length] | add // 0' "$json_summary" 2>/dev/null || true)
       fi
       ;;
     cross-language-conformance)
