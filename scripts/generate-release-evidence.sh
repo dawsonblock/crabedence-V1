@@ -505,6 +505,25 @@ cp "$REPO_ROOT/schemas/qualification.schema.json" "$EVIDENCE_DIR/schemas/qualifi
 # Must be generated AFTER all other files (including qualification-matrix.md)
 # so that every file in the evidence directory is covered.
 cd "$EVIDENCE_DIR"
+find . -type f ! -name SHA256SUMS ! -name artifact.json -print0 | sort -z | xargs -0 shasum -a 256 > SHA256SUMS
+
+# ─── Phase 25: Generate artifact.json ───────────────────────────────────────
+# The artifact digest is the SHA-256 of the SHA256SUMS manifest, binding all
+# evidence files into a single verifiable digest.
+ARTIFACT_SHA="$(shasum -a 256 SHA256SUMS | awk '{print $1}')"
+cat > "$EVIDENCE_DIR/artifact.json" << EOF
+{
+  "name": "crabedence-v1.0.0-rc.2",
+  "sha256": "$ARTIFACT_SHA",
+  "digest_of": "SHA256SUMS",
+  "commit": "$COMMIT",
+  "tree": "$TREE",
+  "branch": "$BRANCH",
+  "generated_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOF
+
+# Regenerate SHA256SUMS to include artifact.json itself.
 find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 shasum -a 256 > SHA256SUMS
 
 # ─── Phase 3: Fail closed ──────────────────────────────────────────────────
