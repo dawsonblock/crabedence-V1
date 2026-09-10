@@ -348,17 +348,3 @@ func (s *Service) writeResponse(conn net.Conn, resp Response) {
 	conn.Write(lenBuf)
 	conn.Write(payload)
 }
-
-// isValidEvidenceDigest checks that a digest is a 64-character lowercase
-// hexadecimal SHA-256 digest.
-func isValidEvidenceDigest(digest string) bool {
-	if len(digest) != 64 {
-		return false
-	}
-	for _, c := range digest {
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
-			return false
-		}
-	}
-	return true
-}

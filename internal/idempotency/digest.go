@@ -125,9 +125,18 @@ func ComputeDigest(input DigestInput) (string, error) {
 
 // ComputeDigestFromRaw computes the digest from raw JSON arguments.
 // The arguments are parsed and re-canonicalized to ensure determinism.
+//
+// Uses json.Decoder with UseNumber() to preserve numeric precision.
+// Go's default json.Unmarshal into map[string]any decodes all numbers
+// as float64, which collapses distinct large integers beyond IEEE-754
+// exact range (e.g., 9007199254740992 and 9007199254740993 both map
+// to the same float64). UseNumber() preserves them as json.Number,
+// keeping the original lexical representation intact.
 func ComputeDigestFromRaw(protocolVersion int, principal, capability string, args json.RawMessage, grantID, class string) (string, error) {
+	dec := json.NewDecoder(strings.NewReader(string(args)))
+	dec.UseNumber()
 	var argsMap map[string]any
-	if err := json.Unmarshal(args, &argsMap); err != nil {
+	if err := dec.Decode(&argsMap); err != nil {
 		return "", fmt.Errorf("failed to parse arguments: %w", err)
 	}
 	return ComputeDigest(DigestInput{

@@ -30,6 +30,8 @@ const (
 //   - Idempotent requests return the stored result
 //   - Same key + different request returns CONFLICT
 //   - MUTATION/CRITICAL fail closed when durable store is unavailable
+//   - CRITICAL evidence is validated BEFORE terminal state is persisted
+//   - Only the reservation owner (lease holder) may dispatch
 type DispatchExecutor struct {
 	handler  Handler
 	store    *idempotency.Store
@@ -80,7 +82,9 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		}
 	}
 
-	// Reserve the request atomically
+	// Reserve the request atomically.
+	// Acquired=true means THIS caller owns the reservation and may dispatch.
+	// Acquired=false means another caller owns it or the record is terminal.
 	reserve, err := e.store.Reserve(ctx, req.IdempotencyKey, req.Authority.Principal, req.Capability, digest, req.Authority.EffectiveAuthorityRef(), string(desc.ExecutionClass))
 	if err != nil {
 		return Response{
@@ -90,7 +94,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		}
 	}
 
-	// Check for conflict
+	// Check for conflict — same key, different request
 	if reserve.Conflict {
 		return Response{
 			Status:      StatusDenied,
@@ -99,13 +103,13 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		}
 	}
 
-	// Check for existing terminal result
-	if reserve.Record != nil && reserve.State.IsTerminal() {
-		result := reserve.Record.Result
+	// Check for existing terminal result — replay the stored result.
+	// Acquired=false means we did NOT create this reservation.
+	if !reserve.Acquired && reserve.Record != nil && reserve.State.IsTerminal() {
 		return Response{
 			Status:   string(reserve.State),
-			Result:   result,
-			Evidence: parseEvidence(reserve.Record.EvidenceDigest),
+			Result:   reserve.Record.Result,
+			Evidence: parseEvidence(reserve.Record.EvidenceDigest, reserve.Record.ReceiptVersion),
 			Execution: &ExecutionMeta{
 				Provider: desc.AdapterID,
 				RunID:    reserve.Record.ExecutionID,
@@ -113,8 +117,10 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		}
 	}
 
-	// Check for existing in-flight
-	if reserve.Record != nil && !reserve.State.IsTerminal() && reserve.State != idempotency.StateReserved {
+	// Check for existing in-flight — another caller owns the reservation
+	// or the record is in a non-terminal state.
+	// Acquired=false means we do NOT own this execution.
+	if !reserve.Acquired {
 		return Response{
 			Status:      StatusInFlight,
 			FailureCode: string(capability.FailureInFlight),
@@ -125,16 +131,18 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		}
 	}
 
-	// We have a new reservation — dispatch
+	// Acquired=true — THIS caller owns the reservation and holds the lease.
+	// Only now may we dispatch.
 	executionID := reserve.Record.ExecutionID
+	leaseToken := reserve.LeaseToken
 
-	// Mark as DISPATCHING — this is PRE_DISPATCH.
-	// If this fails, return FAILED (not UNKNOWN) — no side effect has occurred.
-	if err := e.store.SetState(ctx, executionID, idempotency.StateDispatching, nil, ""); err != nil {
+	// Mark as DISPATCHING using CAS (only lease holder may transition).
+	// This is PRE_DISPATCH — if this fails, return FAILED (safe).
+	if err := e.store.TransitionState(ctx, executionID, leaseToken, idempotency.StateReserved, idempotency.StateDispatching); err != nil {
 		return Response{
 			Status:      StatusFailed,
 			FailureCode: string(capability.FailureInternalError),
-			Error:       "failed to persist DISPATCHING state before dispatch",
+			Error:       fmt.Sprintf("failed to transition to DISPATCHING (lease lost or state changed): %v", err),
 		}
 	}
 
@@ -142,7 +150,42 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	// Any failure after this point is UNKNOWN (may have executed).
 	resp := e.dispatch(ctx, req, desc)
 
-	// Persist terminal result
+	// ─── CRITICAL EVIDENCE VALIDATION BEFORE PERSISTENCE ──────────────────
+	// The evidence contract MUST be validated BEFORE the terminal state
+	// is persisted. Persisting SUCCEEDED with invalid evidence would
+	// create a poisoned record that replays invalid evidence on retry.
+	if desc.ExecutionClass.RequiresEvidence() && resp.Status == StatusSucceeded {
+		if resp.Evidence == nil || resp.Evidence.Digest == "" {
+			resp = Response{
+				Status:      StatusFailed,
+				FailureCode: string(capability.FailureExecutionFailed),
+				Error:       "CRITICAL capability returned SUCCEEDED without evidence digest",
+				Execution:   resp.Execution,
+			}
+		} else if !isValidEvidenceDigest(resp.Evidence.Digest) {
+			resp = Response{
+				Status:      StatusFailed,
+				FailureCode: string(capability.FailureExecutionFailed),
+				Error:       "CRITICAL capability returned invalid evidence digest (must be 64-char lowercase hex)",
+				Execution:   resp.Execution,
+			}
+		} else if resp.Evidence.ReceiptVersion != 3 {
+			resp = Response{
+				Status:      StatusFailed,
+				FailureCode: string(capability.FailureExecutionFailed),
+				Error:       fmt.Sprintf("CRITICAL capability returned receipt_version %d (must be 3)", resp.Evidence.ReceiptVersion),
+				Execution:   resp.Execution,
+			}
+		} else if resp.Execution == nil || resp.Execution.RunID == "" {
+			resp = Response{
+				Status:      StatusFailed,
+				FailureCode: string(capability.FailureExecutionFailed),
+				Error:       "CRITICAL capability returned SUCCEEDED without run_id",
+			}
+		}
+	}
+
+	// ─── DETERMINE TERMINAL STATE ──────────────────────────────────────────
 	var state idempotency.State
 	switch resp.Status {
 	case StatusSucceeded:
@@ -156,17 +199,28 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	}
 
 	evidenceDigest := ""
+	receiptVersion := 0
 	if resp.Evidence != nil {
 		evidenceDigest = resp.Evidence.Digest
+		receiptVersion = resp.Evidence.ReceiptVersion
 	}
 
-	if err := e.store.SetState(ctx, executionID, state, resp.Result, evidenceDigest); err != nil {
-		// Persistence failed AFTER dispatch — return UNKNOWN.
+	// ─── IMMUTABLE FINALIZATION ────────────────────────────────────────────
+	// Finalize uses CAS semantics: only the lease holder may finalize,
+	// the expected state must match, and terminal states are immutable.
+	// A second identical finalize is idempotent; a conflicting receipt
+	// is rejected as FINALIZATION_CONFLICT.
+	if err := e.store.Finalize(ctx, executionID, leaseToken, idempotency.StateDispatching, state, resp.Result, evidenceDigest, receiptVersion); err != nil {
+		// Finalization failed AFTER dispatch — return UNKNOWN.
 		// The side effect may have occurred; we cannot claim FAILED.
+		// This could be because:
+		//   - we lost the lease (another worker took over)
+		//   - the state changed unexpectedly
+		//   - a conflicting finalization already occurred
 		return Response{
 			Status:      StatusUnknown,
 			FailureCode: string(capability.FailureExecutionUnknown),
-			Error:       "failed to persist terminal result after dispatch",
+			Error:       fmt.Sprintf("failed to finalize execution after dispatch: %v", err),
 			Execution: &ExecutionMeta{
 				Provider: desc.AdapterID,
 				RunID:    executionID,
@@ -208,12 +262,35 @@ func (e *DispatchExecutor) dispatch(ctx context.Context, req Request, desc capab
 	return resp
 }
 
-func parseEvidence(digest string) *EvidenceRef {
+// parseEvidence reconstructs an EvidenceRef from stored evidence data.
+// It uses the STORED receipt version — it does NOT invent V3 metadata.
+// If the stored receipt version is 0 (legacy records), it returns
+// the digest without a receipt version claim, rather than fabricating one.
+func parseEvidence(digest string, receiptVersion int) *EvidenceRef {
 	if digest == "" {
 		return nil
 	}
-	return &EvidenceRef{
-		Digest:         digest,
-		ReceiptVersion: 3,
+	ref := &EvidenceRef{
+		Digest: digest,
 	}
+	// Only set ReceiptVersion if it was actually stored.
+	// Never fabricate a version the original execution did not produce.
+	if receiptVersion > 0 {
+		ref.ReceiptVersion = receiptVersion
+	}
+	return ref
+}
+
+// isValidEvidenceDigest checks that a digest is a 64-character lowercase
+// hexadecimal SHA-256 digest.
+func isValidEvidenceDigest(digest string) bool {
+	if len(digest) != 64 {
+		return false
+	}
+	for _, c := range digest {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
 }

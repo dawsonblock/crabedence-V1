@@ -10,6 +10,8 @@ import (
 	"syscall"
 	"time"
 
+	_ "github.com/jackc/pgx/v5/stdlib"
+
 	"github.com/openclaw/crabbox/internal/capability"
 	"github.com/openclaw/crabbox/internal/idempotency"
 	"github.com/openclaw/crabbox/internal/reconcile"
