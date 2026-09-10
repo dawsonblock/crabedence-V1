@@ -207,7 +207,7 @@ jobs:
         run: npm ci --prefix worker
 
       - name: Live PostgreSQL test (${{ matrix.test }})
-        run: npx vitest run --no-file-parallelism test/${{ matrix.test }}
+        run: cd worker && npx vitest run --no-file-parallelism --config vitest.live.config.ts test/${{ matrix.test }}
 
   # ─── NeMo tests ──────────────────────────────────────────────────────
   nemo:

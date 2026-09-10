@@ -274,8 +274,11 @@ run_live_postgres_gate() {
   } > "$log"
 
   set +e
-  # Use the locked worker Vitest executable for reproducibility
-  (cd worker && npx vitest run --no-file-parallelism --reporter=json \
+  # Use the locked worker Vitest executable for reproducibility.
+  # The live config does NOT exclude *.live.test.ts (the default
+  # vitest.config.ts excludes them so they don't run in `npm test`).
+  (cd worker && npx vitest run --no-file-parallelism \
+    --config vitest.live.config.ts --reporter=json \
     "$test_file" > "$json_out" 2>> "$log")
   local rc=$?
   set -e
