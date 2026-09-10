@@ -224,6 +224,44 @@ else
   check "Artifact.json (missing)" "FAIL"
 fi
 
+# 5b. Release manifest — verify release metadata is present and consistent.
+if [ -f "$EVIDENCE_DIR/release-manifest.json" ]; then
+  RM_STATUS="$(jq -r '.status' "$EVIDENCE_DIR/release-manifest.json" 2>/dev/null || echo "")"
+  RM_COMMIT="$(jq -r '.provenance.commit' "$EVIDENCE_DIR/release-manifest.json" 2>/dev/null || echo "")"
+  if [ "$RM_STATUS" = "PASS" ] && [ -n "$RM_COMMIT" ] && [[ "$RM_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+    check "Release manifest" "PASS"
+  else
+    check "Release manifest" "FAIL"
+  fi
+else
+  check "Release manifest (missing)" "FAIL"
+fi
+
+# 5c. SBOM — verify Software Bill of Materials is present and valid JSON.
+if [ -f "$EVIDENCE_DIR/sbom.spdx.json" ]; then
+  SBOM_VER="$(jq -r '.spdxVersion' "$EVIDENCE_DIR/sbom.spdx.json" 2>/dev/null || echo "")"
+  SBOM_PKG_COUNT="$(jq '.packages | length' "$EVIDENCE_DIR/sbom.spdx.json" 2>/dev/null || echo 0)"
+  if [ "$SBOM_VER" = "SPDX-2.3" ] && [ "$SBOM_PKG_COUNT" -ge 1 ]; then
+    check "SBOM (SPDX-2.3, $SBOM_PKG_COUNT packages)" "PASS"
+  else
+    check "SBOM (invalid)" "FAIL"
+  fi
+else
+  check "SBOM (missing)" "FAIL"
+fi
+
+# 5d. Attestation — verify attestation reference is present.
+if [ -f "$EVIDENCE_DIR/attestation/attestation.json" ]; then
+  ATT_URL="$(jq -r '.attestation_url // empty' "$EVIDENCE_DIR/attestation/attestation.json" 2>/dev/null)"
+  if [ -n "$ATT_URL" ]; then
+    check "GitHub attestation" "PASS"
+  else
+    check "GitHub attestation (no URL)" "FAIL"
+  fi
+else
+  check "GitHub attestation (missing)" "FAIL"
+fi
+
 # 6. Release invariants documented.
 if [ -f "$EVIDENCE_DIR/qualification.json" ]; then
   INV_COUNT="$(jq '.invariants | length' "$EVIDENCE_DIR/qualification.json" 2>/dev/null || echo 0)"

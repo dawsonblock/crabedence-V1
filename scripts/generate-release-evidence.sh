@@ -501,9 +501,110 @@ EOF
 mkdir -p "$EVIDENCE_DIR/schemas"
 cp "$REPO_ROOT/schemas/qualification.schema.json" "$EVIDENCE_DIR/schemas/qualification.schema.json"
 
+# ─── Phase 26: Generate release-manifest.json ───────────────────────────────
+# The release manifest is the top-level index of the release artifact. It
+# binds the release name/version to the source commit, artifact digest,
+# evidence file list, and qualification summary.
+RELEASE_NAME="crabedence-v1.0.0-rc.2"
+RELEASE_VERSION="1.0.0-rc.2"
+cat > "$EVIDENCE_DIR/release-manifest.json" << EOF
+{
+  "release_name": "$RELEASE_NAME",
+  "release_version": "$RELEASE_VERSION",
+  "release_type": "release-candidate",
+  "status": "$RELEASE_STATUS",
+  "artifact_promotable": $ARTIFACT_PROMOTABLE,
+  "provenance": {
+    "commit": "$COMMIT",
+    "tree": "$TREE",
+    "branch": "$BRANCH"
+  },
+  "qualification": {
+    "total_gates": $TOTAL_GATES,
+    "passed_gates": $PASSED_GATES,
+    "failed_gates": $FAILED_GATES,
+    "qualification_file": "qualification.json"
+  },
+  "evidence_bundle": {
+    "checksums_file": "SHA256SUMS",
+    "artifact_file": "artifact.json"
+  },
+  "generated_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOF
+
+# ─── Phase 27: Generate SBOM (Software Bill of Materials) ────────────────────
+# Generate a minimal SBOM from Go modules and npm dependencies.
+# Format: SPDX 2.3 JSON
+GO_MODULE="$(head -1 "$REPO_ROOT/go.mod" | awk '{print $2}')"
+SBOM_PACKAGES=""
+SBOM_IDX=0
+
+# Go direct dependencies from go.mod
+while IFS= read -r line; do
+  [ -z "$line" ] && continue
+  case "$line" in
+    require\(*\)) continue;;
+    require\ *) continue;;
+    \}) continue;;
+  esac
+  mod_path="$(echo "$line" | awk '{print $1}')"
+  mod_ver="$(echo "$line" | awk '{print $2}')"
+  [ -z "$mod_path" ] && continue
+  [ -z "$mod_ver" ] && continue
+  [ "$SBOM_IDX" -gt 0 ] && SBOM_PACKAGES+=","
+  SBOM_PACKAGES+="{\"name\":\"$mod_path\",\"version\":\"$mod_ver\",\"ecosystem\":\"go\",\"supplier\":\"Unknown\"}"
+  SBOM_IDX=$((SBOM_IDX + 1))
+done < <(sed -n '/^require (/,/)/p' "$REPO_ROOT/go.mod" | grep -v '^require (' | grep -v '^)')
+
+# Worker npm dependencies
+if [ -f "$REPO_ROOT/worker/package-lock.json" ]; then
+  while IFS= read -r pkg_name; do
+    [ -z "$pkg_name" ] && continue
+    pkg_ver="$(jq -r --arg n "$pkg_name" '.packages["node_modules/\($n)"].version // empty' "$REPO_ROOT/worker/package-lock.json" 2>/dev/null)"
+    [ -z "$pkg_ver" ] && continue
+    [ "$SBOM_IDX" -gt 0 ] && SBOM_PACKAGES+=","
+    SBOM_PACKAGES+="{\"name\":\"$pkg_name\",\"version\":\"$pkg_ver\",\"ecosystem\":\"npm\",\"supplier\":\"Unknown\"}"
+    SBOM_IDX=$((SBOM_IDX + 1))
+  done < <(jq -r '.packages | to_entries[] | select(.key | startswith("node_modules/")) | .key | sub("node_modules/"; "")' "$REPO_ROOT/worker/package-lock.json" 2>/dev/null | grep -v '/' | sort -u | head -100)
+fi
+
+cat > "$EVIDENCE_DIR/sbom.spdx.json" << EOF
+{
+  "spdxVersion": "SPDX-2.3",
+  "dataLicense": "CC0-1.0",
+  "SPDXID": "SPDXRef-DOCUMENT",
+  "name": "crabedence-v1.0.0-rc.2",
+  "documentNamespace": "https://crabedence.dev/spdx/crabedence-v1.0.0-rc.2-$COMMIT",
+  "creationInfo": {
+    "created": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+    "creators": ["Tool: crabedence-release-evidence", "Organization: Crabedence"]
+  },
+  "packages": [
+    {
+      "SPDXID": "SPDXRef-Package-Root",
+      "name": "$GO_MODULE",
+      "versionInfo": "$COMMIT",
+      "downloadLocation": "git+https://github.com/dawsonblock/crabedence-V1.git@$COMMIT",
+      "filesAnalyzed": false,
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "NOASSERTION",
+      "supplier": "Organization: Crabedence"
+    }${SBOM_PACKAGES:+,$SBOM_PACKAGES}
+  ],
+  "relationships": [
+    {
+      "spdxElementId": "SPDXRef-DOCUMENT",
+      "relationshipType": "DESCRIBES",
+      "relatedSpdxElement": "SPDXRef-Package-Root"
+    }
+  ]
+}
+EOF
+
 # ─── Phase 20: SHA256SUMS for evidence bundle ──────────────────────────────
-# Must be generated AFTER all other files (including qualification-matrix.md)
-# so that every file in the evidence directory is covered.
+# Must be generated AFTER all other files (including release-manifest.json
+# and sbom.spdx.json) so that every file in the evidence directory is covered.
 cd "$EVIDENCE_DIR"
 find . -type f ! -name SHA256SUMS ! -name artifact.json -print0 | sort -z | xargs -0 shasum -a 256 > SHA256SUMS
 
@@ -511,11 +612,13 @@ find . -type f ! -name SHA256SUMS ! -name artifact.json -print0 | sort -z | xarg
 # The artifact digest is the SHA-256 of the SHA256SUMS manifest, binding all
 # evidence files into a single verifiable digest.
 ARTIFACT_SHA="$(shasum -a 256 SHA256SUMS | awk '{print $1}')"
+MANIFEST_FILE_COUNT="$(wc -l < SHA256SUMS | tr -d ' ')"
 cat > "$EVIDENCE_DIR/artifact.json" << EOF
 {
-  "name": "crabedence-v1.0.0-rc.2",
+  "name": "$RELEASE_NAME",
   "sha256": "$ARTIFACT_SHA",
   "digest_of": "SHA256SUMS",
+  "file_count": $MANIFEST_FILE_COUNT,
   "commit": "$COMMIT",
   "tree": "$TREE",
   "branch": "$BRANCH",

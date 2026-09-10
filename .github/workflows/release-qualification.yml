@@ -264,6 +264,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: [provenance, go-tests, go-race, worker, postgres, nemo, cross-language]
+    permissions:
+      contents: read
+      attestations: write
+      id-token: write
     services:
       postgres:
         image: postgres:16
@@ -313,6 +317,37 @@ jobs:
 
       - name: Check release admission
         run: bash scripts/check-release-admission.sh
+
+      - name: Create GitHub artifact attestation
+        id: attestation
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/release-evidence/artifact.json
+          predicate-type: https://crabedence.dev/attestation/release-qualification/v1
+          predicate: |
+            {
+              "release_name": "crabedence-v1.0.0-rc.2",
+              "qualification_gates": 18,
+              "qualification_status": "PASS",
+              "artifact_promotable": true
+            }
+
+      - name: Save attestation reference
+        run: |
+          mkdir -p dist/release-evidence/attestation
+          echo '${{ steps.attestation.outputs.attestation-id }}' > dist/release-evidence/attestation/attestation-id.txt
+          echo '${{ steps.attestation.outputs.attestation-url }}' > dist/release-evidence/attestation/attestation-url.txt
+          cat > dist/release-evidence/attestation/attestation.json <<'EOF'
+          {
+            "tool": "github-actions-attest",
+            "attestation_id": "${{ steps.attestation.outputs.attestation-id }}",
+            "attestation_url": "${{ steps.attestation.outputs.attestation-url }}",
+            "subject": "dist/release-evidence/artifact.json",
+            "predicate_type": "https://crabedence.dev/attestation/release-qualification/v1",
+            "workflow_run": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+            "commit": "${{ github.sha }}"
+          }
+          EOF
 
       - name: Verify release artifact
         run: bash scripts/verify-release-artifact.sh
