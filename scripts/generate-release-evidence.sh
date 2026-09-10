@@ -407,48 +407,71 @@ echo "=== Generating qualification.json ==="
 
 # Extract tests_executed from a gate log. Returns 0 for non-test gates or
 # when the count cannot be determined. For Go test gates, parses the
-# "--- PASS"/"--- FAIL" summary lines. For Vitest gates, the live Postgres
-# wrapper already wrote structured JSON; for plain npm vitest gates we
-# parse the JSON summary if present.
+# "ok"/"FAIL" package summary lines (Go test without -v does not print
+# per-test PASS/FAIL lines). For Vitest gates, parses the summary line.
+# For live PostgreSQL gates, reads the structured JSON summary.
 extract_tests_executed() {
   local gate_name="$1"
   local log="$2"
   local count=0
 
   case "$gate_name" in
-    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers)
-      # Go test summary lines look like: "--- PASS: TestFoo (0.01s)"
-      # or "--- FAIL: TestFoo (0.01s)". Count unique test entries.
-      count=$(grep -cE '^(--- PASS|--- FAIL|=== RUN  )' "$log" 2>/dev/null || echo 0)
-      # Fallback: count "ok" or "FAIL" package summary lines.
-      if [ "$count" -eq 0 ]; then
-        count=$(grep -cE '^(ok|FAIL|---)\s' "$log" 2>/dev/null || echo 0)
-      fi
+    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-cli)
+      # Go test without -v prints one line per package:
+      #   ok  \t<package>\t<duration>
+      #   FAIL\t<package>\t<duration>
+      # Count those lines as evidence tests ran.
+      # Also check for -v output (--- PASS/--- FAIL) in case verbose is used.
+      # NOTE: grep -c outputs "0" and exits 1 when no matches. Using
+      # `|| true` (not `|| echo 0`) avoids appending a second "0".
+      count=$(grep -cE '^(ok|FAIL|--- PASS|--- FAIL)' "$log" 2>/dev/null || true)
       ;;
     worker-tests|nemo-tests)
-      # Vitest prints "Test Files  X passed (Y)" and "Tests  Z passed (W)"
-      # Try to extract the "Tests" count from the summary line.
+      # Vitest prints a summary like:
+      #   Tests  5 passed (5)
+      # Extract the total from parentheses, or sum passed+failed+skipped.
       local tests_line
-      tests_line=$(grep -E 'Tests\s+[0-9]+' "$log" 2>/dev/null | tail -1 || echo "")
+      tests_line=$(grep -E 'Tests[[:space:]]+[0-9]+' "$log" 2>/dev/null | tail -1 || true)
       if [ -n "$tests_line" ]; then
-        local parsed
-        parsed=$(echo "$tests_line" | grep -oE '[0-9]+ (passed|failed|skipped)' | grep -oE '^[0-9]+' | paste -sd+ - | bc 2>/dev/null || echo 0)
-        count="${parsed:-0}"
+        # Try to extract the number in parentheses first: "5 passed (5)"
+        local in_parens
+        in_parens=$(echo "$tests_line" | grep -oE '\([0-9]+\)' | grep -oE '[0-9]+' || true)
+        if [ -n "$in_parens" ]; then
+          count="$in_parens"
+        else
+          # Sum the individual counts: "5 passed | 2 failed | 1 skipped"
+          local passed failed skipped
+          passed=$(echo "$tests_line" | grep -oE '[0-9]+ passed' | grep -oE '^[0-9]+' || true)
+          failed=$(echo "$tests_line" | grep -oE '[0-9]+ failed' | grep -oE '^[0-9]+' || true)
+          skipped=$(echo "$tests_line" | grep -oE '[0-9]+ skipped' | grep -oE '^[0-9]+' || true)
+          passed="${passed:-0}"
+          failed="${failed:-0}"
+          skipped="${skipped:-0}"
+          count=$((passed + failed + skipped))
+        fi
       fi
       ;;
     postgres-*)
       # Live Postgres gates write a structured JSON summary alongside the log.
-      local json_summary="${log%.log}.summary.json"
-      if [ ! -f "$json_summary" ]; then
-        json_summary="$EVIDENCE_DIR/${gate_name}.summary.json"
-      fi
-      if [ -f "$json_summary" ]; then
-        count=$(grep -oE '"tests_executed"\s*:\s*[0-9]+' "$json_summary" 2>/dev/null | grep -oE '[0-9]+$' || echo 0)
+      # Try several possible locations.
+      local json_summary
+      for candidate in "${log%.log}.summary.json" "$EVIDENCE_DIR/${gate_name}.summary.json" "$EVIDENCE_DIR/${gate_name}.vitest.json"; do
+        if [ -f "$candidate" ]; then
+          json_summary="$candidate"
+          break
+        fi
+      done
+      if [ -n "${json_summary:-}" ] && [ -f "$json_summary" ]; then
+        count=$(grep -oE '"tests_executed"[[:space:]]*:[[:space:]]*[0-9]+' "$json_summary" 2>/dev/null | grep -oE '[0-9]+$' || true)
+        if [ "$count" -eq 0 ] 2>/dev/null; then
+          # Try "numTotalTests" from vitest JSON output
+          count=$(grep -oE '"numTotalTests"[[:space:]]*:[[:space:]]*[0-9]+' "$json_summary" 2>/dev/null | grep -oE '[0-9]+$' || true)
+        fi
       fi
       ;;
     cross-language-conformance)
-      # Conformance runner prints a count of cases.
-      count=$(grep -cE '^(PASS|FAIL|ok|not ok)\s' "$log" 2>/dev/null || echo 0)
+      # Conformance runner prints PASS/FAIL lines per case.
+      count=$(grep -cE '^(PASS|FAIL|ok|not ok)' "$log" 2>/dev/null || true)
       ;;
     *)
       # Non-test gates (vet, typecheck, format, lint, build) have no test count.
