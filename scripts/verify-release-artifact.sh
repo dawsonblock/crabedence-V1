@@ -212,16 +212,28 @@ else
   check "Qualification JSON (missing)" "FAIL"
 fi
 
-# 5. Artifact.json — verify archive digest if present.
-if [ -f "$EVIDENCE_DIR/artifact.json" ]; then
-  ARTIFACT_SHA="$(jq -r '.sha256' "$EVIDENCE_DIR/artifact.json" 2>/dev/null || echo "")"
-  if [ -n "$ARTIFACT_SHA" ] && [[ "$ARTIFACT_SHA" =~ ^[0-9a-f]{64}$ ]]; then
-    check "Artifact digest format" "PASS"
+# 5. evidence-manifest.json — verify evidence bundle digest.
+# The digest claim (digest_of: "SHA256SUMS") is independently verified:
+# recompute SHA256(SHA256SUMS) and compare with the stored sha256.
+if [ -f "$EVIDENCE_DIR/evidence-manifest.json" ]; then
+  EVIDENCE_SHA="$(jq -r '.sha256' "$EVIDENCE_DIR/evidence-manifest.json" 2>/dev/null || echo "")"
+  if [ -n "$EVIDENCE_SHA" ] && [[ "$EVIDENCE_SHA" =~ ^[0-9a-f]{64}$ ]]; then
+    check "Evidence manifest digest format" "PASS"
+    # Independently verify the digest claim: SHA256(SHA256SUMS) must match.
+    if [ -f "$EVIDENCE_DIR/SHA256SUMS" ]; then
+      ACTUAL_SHA="$(shasum -a 256 "$EVIDENCE_DIR/SHA256SUMS" | awk '{print $1}')"
+      if [ "$EVIDENCE_SHA" = "$ACTUAL_SHA" ]; then
+        check "Evidence manifest digest verified" "PASS"
+      else
+        check "Evidence manifest digest verified" "FAIL"
+        echo "  ERROR: evidence-manifest.json claims sha256=$EVIDENCE_SHA but actual SHA256(SHA256SUMS)=$ACTUAL_SHA" >&2
+      fi
+    fi
   else
-    check "Artifact digest format" "FAIL"
+    check "Evidence manifest digest format" "FAIL"
   fi
 else
-  check "Artifact.json (missing)" "FAIL"
+  check "Evidence manifest (missing)" "FAIL"
 fi
 
 # 5b. Release manifest — verify release metadata is present and consistent.

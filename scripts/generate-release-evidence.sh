@@ -505,8 +505,11 @@ cp "$REPO_ROOT/schemas/qualification.schema.json" "$EVIDENCE_DIR/schemas/qualifi
 # The release manifest is the top-level index of the release artifact. It
 # binds the release name/version to the source commit, artifact digest,
 # evidence file list, and qualification summary.
-RELEASE_NAME="crabedence-v1.0.0-rc.2"
-RELEASE_VERSION="1.0.0-rc.2"
+#
+# RELEASE_NAME / RELEASE_VERSION come from the environment (set by CI)
+# so that the same script works for any RC version without code changes.
+RELEASE_NAME="${RELEASE_NAME:-crabedence-v1.0.0-rc.2}"
+RELEASE_VERSION="${RELEASE_VERSION:-1.0.0-rc.2}"
 cat > "$EVIDENCE_DIR/release-manifest.json" << EOF
 {
   "release_name": "$RELEASE_NAME",
@@ -574,8 +577,8 @@ cat > "$EVIDENCE_DIR/sbom.spdx.json" << EOF
   "spdxVersion": "SPDX-2.3",
   "dataLicense": "CC0-1.0",
   "SPDXID": "SPDXRef-DOCUMENT",
-  "name": "crabedence-v1.0.0-rc.2",
-  "documentNamespace": "https://crabedence.dev/spdx/crabedence-v1.0.0-rc.2-$COMMIT",
+  "name": "$RELEASE_NAME",
+  "documentNamespace": "https://crabedence.dev/spdx/$RELEASE_NAME-$COMMIT",
   "creationInfo": {
     "created": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
     "creators": ["Tool: crabedence-release-evidence", "Organization: Crabedence"]
@@ -605,18 +608,29 @@ EOF
 # ─── Phase 20: SHA256SUMS for evidence bundle ──────────────────────────────
 # Must be generated AFTER all other files (including release-manifest.json
 # and sbom.spdx.json) so that every file in the evidence directory is covered.
+# evidence-manifest.json is EXCLUDED because its digest is computed FROM
+# this SHA256SUMS — including it would create a self-invalidating cycle.
 cd "$EVIDENCE_DIR"
-find . -type f ! -name SHA256SUMS ! -name artifact.json -print0 | sort -z | xargs -0 shasum -a 256 > SHA256SUMS
+find . -type f ! -name SHA256SUMS ! -name evidence-manifest.json ! -name artifact.json -print0 | sort -z | xargs -0 shasum -a 256 > SHA256SUMS
 
-# ─── Phase 25: Generate artifact.json ───────────────────────────────────────
-# The artifact digest is the SHA-256 of the SHA256SUMS manifest, binding all
-# evidence files into a single verifiable digest.
-ARTIFACT_SHA="$(shasum -a 256 SHA256SUMS | awk '{print $1}')"
+# ─── Phase 25: Generate evidence-manifest.json ──────────────────────────────
+# The evidence bundle digest is the SHA-256 of the SHA256SUMS manifest,
+# binding all evidence files into a single verifiable digest.
+#
+# SHA256SUMS is NOT regenerated after this file is written. The digest
+# claim (digest_of: "SHA256SUMS") remains verifiable because SHA256SUMS
+# is immutable at this point.
+#
+# Note: `artifact.json` is reserved for the release workflow's source
+# archive metadata (tar.gz/zip hashes). This file (evidence-manifest.json)
+# is the evidence bundle identity. Do not conflate the two.
+EVIDENCE_SHA="$(shasum -a 256 SHA256SUMS | awk '{print $1}')"
 MANIFEST_FILE_COUNT="$(wc -l < SHA256SUMS | tr -d ' ')"
-cat > "$EVIDENCE_DIR/artifact.json" << EOF
+cat > "$EVIDENCE_DIR/evidence-manifest.json" << EOF
 {
   "name": "$RELEASE_NAME",
-  "sha256": "$ARTIFACT_SHA",
+  "manifest_type": "evidence-bundle",
+  "sha256": "$EVIDENCE_SHA",
   "digest_of": "SHA256SUMS",
   "file_count": $MANIFEST_FILE_COUNT,
   "commit": "$COMMIT",
@@ -625,9 +639,6 @@ cat > "$EVIDENCE_DIR/artifact.json" << EOF
   "generated_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 EOF
-
-# Regenerate SHA256SUMS to include artifact.json itself.
-find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 shasum -a 256 > SHA256SUMS
 
 # ─── Phase 3: Fail closed ──────────────────────────────────────────────────
 echo ""

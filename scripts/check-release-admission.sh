@@ -65,10 +65,16 @@ for i in $(seq 0 $((GATE_COUNT - 1))); do
     echo "  WARNING: $name claims FAIL but exit_code=0" >&2
   fi
 
-  # Cross-check: evidence file must exist (if evidence dir is alongside)
+  # Cross-check: evidence file must exist (if evidence dir is alongside).
+  # A mandatory gate claiming PASS without proof is a FAIL — not a warning.
   EVIDENCE_DIR="$(dirname "$QUAL_FILE")"
   if [ -n "$evidence_file" ] && [ "$evidence_file" != "null" ] && [ ! -f "$EVIDENCE_DIR/$evidence_file" ]; then
-    echo "  WARNING: $name references missing evidence: $evidence_file" >&2
+    if [ "$status" = "PASS" ]; then
+      status="FAIL"
+      echo "  INCONSISTENCY: $name claims PASS but evidence file missing: $evidence_file" >&2
+    else
+      echo "  WARNING: $name references missing evidence: $evidence_file" >&2
+    fi
   fi
 
   if [ "$status" = "PASS" ]; then
