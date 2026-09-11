@@ -107,7 +107,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	// Acquired=false means we did NOT create this reservation.
 	if !reserve.Acquired && reserve.Record != nil && reserve.State.IsTerminal() {
 		return Response{
-			Status:   string(reserve.State),
+			Status:   stateToStatus(reserve.State),
 			Result:   reserve.Record.Result,
 			Evidence: parseEvidence(reserve.Record.EvidenceDigest, reserve.Record.ReceiptVersion),
 			Execution: &ExecutionMeta{
@@ -136,23 +136,23 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	executionID := reserve.Record.ExecutionID
 	leaseToken := reserve.LeaseToken
 
-	// Mark as DISPATCHING using CAS (only lease holder may transition).
+	// Mark as EXECUTING using CAS (only lease holder may transition).
 	// This is PRE_DISPATCH — if this fails, return FAILED (safe).
-	if err := e.store.TransitionState(ctx, executionID, leaseToken, idempotency.StateReserved, idempotency.StateDispatching); err != nil {
+	if err := e.store.TransitionState(ctx, executionID, leaseToken, idempotency.StatePrepared, idempotency.StateExecuting); err != nil {
 		return Response{
 			Status:      StatusFailed,
 			FailureCode: string(capability.FailureInternalError),
-			Error:       fmt.Sprintf("failed to transition to DISPATCHING (lease lost or state changed): %v", err),
+			Error:       fmt.Sprintf("failed to transition to EXECUTING (lease lost or state changed): %v", err),
 		}
 	}
 
 	// ─── IN_FLIGHT: the dispatch boundary ───────────────────────────────────
 	// Transition to IN_FLIGHT immediately before handler.Execute.
 	// IN_FLIGHT has precise semantics: the dispatch boundary has been
-	// crossed — the request is with the provider. A crash in DISPATCHING
+	// crossed — the request is with the provider. A crash in EXECUTING
 	// is pre-dispatch (safe to reclaim); a crash in IN_FLIGHT is
 	// post-dispatch (mark UNKNOWN for reconciliation, never blind-retry).
-	if err := e.store.TransitionState(ctx, executionID, leaseToken, idempotency.StateDispatching, idempotency.StateInFlight); err != nil {
+	if err := e.store.TransitionState(ctx, executionID, leaseToken, idempotency.StateExecuting, idempotency.StateInFlight); err != nil {
 		return Response{
 			Status:      StatusFailed,
 			FailureCode: string(capability.FailureInternalError),
@@ -203,7 +203,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	var state idempotency.State
 	switch resp.Status {
 	case StatusSucceeded:
-		state = idempotency.StateSucceeded
+		state = idempotency.StateCommitted
 	case StatusFailed:
 		state = idempotency.StateFailed
 	case StatusDenied:
@@ -224,13 +224,64 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	// the expected state must match, and terminal states are immutable.
 	// A second identical finalize is idempotent; a conflicting receipt
 	// is rejected as FINALIZATION_CONFLICT.
-	if err := e.store.Finalize(ctx, executionID, leaseToken, idempotency.StateInFlight, state, resp.Result, evidenceDigest, receiptVersion); err != nil {
+	//
+	// If the handler returned an ambiguous result after IN_FLIGHT
+	// (post-dispatch uncertainty), the state is UNKNOWN — we do NOT
+	// finalize as FAILED. The side effect may have occurred.
+	if state == idempotency.StateUnknown {
+		// Post-dispatch uncertainty — enter recovery, do not finalize.
+		rec, lookupErr := e.store.Lookup(ctx, executionID)
+		if lookupErr == nil {
+			_ = e.store.EnterRecovery(ctx, executionID, idempotency.StateInFlight, rec.Version)
+		}
+		return Response{
+			Status:      StatusUnknown,
+			FailureCode: string(capability.FailureExecutionUnknown),
+			Error:       "post-dispatch ambiguity: entered recovery (side effect may have occurred)",
+			Execution: &ExecutionMeta{
+				Provider: desc.AdapterID,
+				RunID:    executionID,
+			},
+		}
+	}
+
+	providerID := ""
+	providerRunID := ""
+	if resp.Execution != nil {
+		providerID = resp.Execution.Provider
+		providerRunID = resp.Execution.RunID
+	}
+
+	receipt := idempotency.TerminalReceipt{
+		ExecutionID:     executionID,
+		Capability:      req.Capability,
+		Principal:       req.Authority.Principal,
+		RequestDigest:   digest,
+		TerminalStatus:  state,
+		CanonicalResult: resp.Result,
+		ProviderID:      providerID,
+		ProviderRunID:   providerRunID,
+		EvidenceDigest:  evidenceDigest,
+		ReceiptVersion:  receiptVersion,
+	}
+
+	// Look up the lease generation for the fenced finalize.
+	rec, err := e.store.Lookup(ctx, executionID)
+	if err != nil {
+		return Response{
+			Status:      StatusUnknown,
+			FailureCode: string(capability.FailureExecutionUnknown),
+			Error:       fmt.Sprintf("failed to lookup execution for finalize: %v", err),
+			Execution: &ExecutionMeta{
+				Provider: desc.AdapterID,
+				RunID:    executionID,
+			},
+		}
+	}
+
+	if err := e.store.Finalize(ctx, executionID, leaseToken, rec.LeaseGeneration, idempotency.StateInFlight, receipt); err != nil {
 		// Finalization failed AFTER dispatch — return UNKNOWN.
 		// The side effect may have occurred; we cannot claim FAILED.
-		// This could be because:
-		//   - we lost the lease (another worker took over)
-		//   - the state changed unexpectedly
-		//   - a conflicting finalization already occurred
 		return Response{
 			Status:      StatusUnknown,
 			FailureCode: string(capability.FailureExecutionUnknown),
@@ -307,4 +358,21 @@ func isValidEvidenceDigest(digest string) bool {
 		}
 	}
 	return true
+}
+
+// stateToStatus maps a durable store state to a wire protocol status.
+// The store uses COMMITTED; the wire protocol uses SUCCEEDED.
+func stateToStatus(state idempotency.State) string {
+	switch state {
+	case idempotency.StateCommitted:
+		return StatusSucceeded
+	case idempotency.StateFailed:
+		return StatusFailed
+	case idempotency.StateDenied:
+		return StatusDenied
+	case idempotency.StateUnknown:
+		return StatusUnknown
+	default:
+		return string(state)
+	}
 }

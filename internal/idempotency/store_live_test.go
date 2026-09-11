@@ -91,7 +91,7 @@ func TestLiveStoreConcurrentReserveSingleExecution(t *testing.T) {
 
 				// Finalize with SUCCEEDED
 				result := []byte(`{"value":42}`)
-				if err := store.Finalize(ctx, reserve.Record.ExecutionID, reserve.LeaseToken, StateInFlight, StateSucceeded, result, "evidencedigest000000000000000000000000000000000000000000000000000000123456", 3); err != nil {
+				if err := store.FinalizeLegacy(ctx, reserve.Record.ExecutionID, reserve.LeaseToken, StateInFlight, StateSucceeded, result, "evidencedigest000000000000000000000000000000000000000000000000000000123456", 3); err != nil {
 					t.Errorf("lease holder failed to finalize: %v", err)
 				}
 			} else {
@@ -234,7 +234,7 @@ func TestLiveStoreLeaseExpiryReclaim(t *testing.T) {
 	}
 
 	// Caller A's old lease token should NOT be able to finalize.
-	err = store.Finalize(ctx, reserveA.Record.ExecutionID, reserveA.LeaseToken, StateInFlight, StateSucceeded, nil, "", 3)
+	err = store.FinalizeLegacy(ctx, reserveA.Record.ExecutionID, reserveA.LeaseToken, StateInFlight, StateSucceeded, nil, "", 3)
 	if err == nil {
 		t.Error("old lease holder (A) should NOT be able to finalize after lease takeover")
 	}
@@ -246,7 +246,7 @@ func TestLiveStoreLeaseExpiryReclaim(t *testing.T) {
 	if err := store.TransitionState(ctx, reserveC.Record.ExecutionID, reserveC.LeaseToken, StateDispatching, StateInFlight); err != nil {
 		t.Errorf("new lease holder (C) failed to transition to IN_FLIGHT: %v", err)
 	}
-	err = store.Finalize(ctx, reserveC.Record.ExecutionID, reserveC.LeaseToken, StateInFlight, StateSucceeded, []byte(`{"ok":true}`), "", 0)
+	err = store.FinalizeLegacy(ctx, reserveC.Record.ExecutionID, reserveC.LeaseToken, StateInFlight, StateSucceeded, []byte(`{"ok":true}`), "", 0)
 	if err != nil {
 		t.Errorf("new lease holder (C) failed to finalize: %v", err)
 	}
@@ -301,23 +301,23 @@ func TestLiveStoreFinalizeConflict(t *testing.T) {
 	}
 
 	// Finalize with SUCCEEDED and evidence digest X.
-	if err := store.Finalize(ctx, executionID, leaseToken, StateInFlight, StateSucceeded, []byte(`{"result":"A"}`), "digest_X", 3); err != nil {
+	if err := store.FinalizeLegacy(ctx, executionID, leaseToken, StateInFlight, StateSucceeded, []byte(`{"result":"A"}`), "digest_X", 3); err != nil {
 		t.Fatalf("first finalize failed: %v", err)
 	}
 
 	// Identical re-finalize — should be idempotent (no error).
-	if err := store.Finalize(ctx, executionID, leaseToken, StateInFlight, StateSucceeded, []byte(`{"result":"A"}`), "digest_X", 3); err != nil {
+	if err := store.FinalizeLegacy(ctx, executionID, leaseToken, StateInFlight, StateSucceeded, []byte(`{"result":"A"}`), "digest_X", 3); err != nil {
 		t.Errorf("identical re-finalize should be idempotent, got: %v", err)
 	}
 
 	// Conflicting finalize — different terminal state.
-	err = store.Finalize(ctx, executionID, leaseToken, StateInFlight, StateFailed, []byte(`{"result":"B"}`), "", 0)
+	err = store.FinalizeLegacy(ctx, executionID, leaseToken, StateInFlight, StateFailed, []byte(`{"result":"B"}`), "", 0)
 	if err == nil {
 		t.Error("conflicting finalize (SUCCEEDED → FAILED) must be rejected")
 	}
 
 	// Conflicting finalize — same state but different evidence.
-	err = store.Finalize(ctx, executionID, leaseToken, StateInFlight, StateSucceeded, []byte(`{"result":"B"}`), "digest_Y", 3)
+	err = store.FinalizeLegacy(ctx, executionID, leaseToken, StateInFlight, StateSucceeded, []byte(`{"result":"B"}`), "digest_Y", 3)
 	if err == nil {
 		t.Error("conflicting finalize (different evidence) must be rejected")
 	}
@@ -540,7 +540,7 @@ func TestLiveStoreCrashInDispatchingRecovery(t *testing.T) {
 	if err := store.TransitionState(ctx, reserveA.Record.ExecutionID, reserveA.LeaseToken, StateDispatching, StateInFlight); err == nil {
 		t.Error("old lease holder (A) should NOT be able to transition after takeover")
 	}
-	if err := store.Finalize(ctx, reserveA.Record.ExecutionID, reserveA.LeaseToken, StateInFlight, StateSucceeded, nil, "", 0); err == nil {
+	if err := store.FinalizeLegacy(ctx, reserveA.Record.ExecutionID, reserveA.LeaseToken, StateInFlight, StateSucceeded, nil, "", 0); err == nil {
 		t.Error("old lease holder (A) should NOT be able to finalize after takeover")
 	}
 
@@ -551,7 +551,7 @@ func TestLiveStoreCrashInDispatchingRecovery(t *testing.T) {
 	if err := store.TransitionState(ctx, reserveB.Record.ExecutionID, reserveB.LeaseToken, StateDispatching, StateInFlight); err != nil {
 		t.Errorf("B failed to transition to IN_FLIGHT: %v", err)
 	}
-	if err := store.Finalize(ctx, reserveB.Record.ExecutionID, reserveB.LeaseToken, StateInFlight, StateSucceeded, []byte(`{"ok":true}`), "", 0); err != nil {
+	if err := store.FinalizeLegacy(ctx, reserveB.Record.ExecutionID, reserveB.LeaseToken, StateInFlight, StateSucceeded, []byte(`{"ok":true}`), "", 0); err != nil {
 		t.Errorf("B failed to finalize: %v", err)
 	}
 
@@ -699,13 +699,13 @@ func TestLiveStoreLeaseRenewalByOldTokenRejected(t *testing.T) {
 	}
 
 	// Caller A tries to renew with the old token — must be rejected.
-	err = store.RenewLease(ctx, reserveA.Record.ExecutionID, oldToken, time.Minute)
+	err = store.RenewLeaseLegacy(ctx, reserveA.Record.ExecutionID, oldToken, time.Minute)
 	if err == nil {
 		t.Error("old lease holder (A) should NOT be able to renew after takeover")
 	}
 
 	// Caller B (current holder) CAN renew.
-	err = store.RenewLease(ctx, reserveB.Record.ExecutionID, reserveB.LeaseToken, time.Minute)
+	err = store.RenewLeaseLegacy(ctx, reserveB.Record.ExecutionID, reserveB.LeaseToken, time.Minute)
 	if err != nil {
 		t.Errorf("current lease holder (B) should be able to renew: %v", err)
 	}
@@ -764,13 +764,13 @@ func TestLiveStoreRetryAfterInvalidEvidenceNoMagicV3(t *testing.T) {
 
 	// Finalize with FAILED (simulating: CRITICAL returned invalid V2
 	// evidence, kernel rejected it as FAILED).
-	if err := store.Finalize(ctx, execID, leaseToken, StateInFlight, StateFailed, []byte(`{"error":"invalid evidence"}`), "", 0); err != nil {
+	if err := store.FinalizeLegacy(ctx, execID, leaseToken, StateInFlight, StateFailed, []byte(`{"error":"invalid evidence"}`), "", 0); err != nil {
 		t.Fatalf("first finalize failed: %v", err)
 	}
 
 	// Retry: attempt to finalize as SUCCEEDED with valid V3 evidence.
 	// This must be rejected — FAILED is terminal and immutable.
-	err = store.Finalize(ctx, execID, leaseToken, StateInFlight, StateSucceeded, []byte(`{"ok":true}`), "valid_digest_000000000000000000000000000000000000000000000000000000123456", 3)
+	err = store.FinalizeLegacy(ctx, execID, leaseToken, StateInFlight, StateSucceeded, []byte(`{"ok":true}`), "valid_digest_000000000000000000000000000000000000000000000000000000123456", 3)
 	if err == nil {
 		t.Error("retry with V3 evidence must NOT overwrite terminal FAILED state")
 	}

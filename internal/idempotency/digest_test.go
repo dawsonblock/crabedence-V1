@@ -150,18 +150,57 @@ func TestStateIsTerminal(t *testing.T) {
 		state    State
 		terminal bool
 	}{
-		{StateReserved, false},
-		{StateDispatching, false},
+		{StatePrepared, false},
+		{StateExecuting, false},
 		{StateInFlight, false},
-		{StateSucceeded, true},
+		{StateCommitted, true},
 		{StateFailed, true},
 		{StateDenied, true},
 		{StateUnknown, true},
-		{StateReconciliationRequired, false},
 	}
 	for _, tt := range tests {
 		if tt.state.IsTerminal() != tt.terminal {
 			t.Errorf("%s: IsTerminal() = %v, want %v", tt.state, tt.state.IsTerminal(), tt.terminal)
+		}
+	}
+}
+
+func TestStateCallerTerminal(t *testing.T) {
+	tests := []struct {
+		state    State
+		terminal bool
+	}{
+		{StatePrepared, false},
+		{StateExecuting, false},
+		{StateInFlight, false},
+		{StateCommitted, true},
+		{StateFailed, true},
+		{StateDenied, true},
+		{StateUnknown, true},
+	}
+	for _, tt := range tests {
+		if got := tt.state.IsCallerTerminal(); got != tt.terminal {
+			t.Errorf("%s: IsCallerTerminal() = %v, want %v", tt.state, got, tt.terminal)
+		}
+	}
+}
+
+func TestStateDurablyFinal(t *testing.T) {
+	tests := []struct {
+		state State
+		final bool
+	}{
+		{StatePrepared, false},
+		{StateExecuting, false},
+		{StateInFlight, false},
+		{StateCommitted, true},
+		{StateFailed, true},
+		{StateDenied, true},
+		{StateUnknown, false},
+	}
+	for _, tt := range tests {
+		if got := tt.state.IsDurablyFinal(); got != tt.final {
+			t.Errorf("%s: IsDurablyFinal() = %v, want %v", tt.state, got, tt.final)
 		}
 	}
 }

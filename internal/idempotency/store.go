@@ -1,26 +1,9 @@
-// Package idempotency provides durable idempotency storage for the
-// Crabedence execution service.
+// Package idempotency provides the durable execution contract store
+// backed by PostgreSQL.
 //
-// Idempotency lives below the NEMO process — in Crabedence itself.
-// This ensures that a process crash does not cause re-invocation,
-// and that concurrent identical requests converge on one execution.
-//
-// The store implements a lease-based lifecycle contract:
-//
-//		reserve (atomic INSERT)
-//		    │
-//		    ▼
-//		 PREPARED + lease acquired
-//		    │
-//		    ▼
-//		 EXECUTING (lease held)
-//		    │
-//		┌───┼───┐
-//		▼   ▼   ▼
-//	 COMMITTED / FAILED / UNKNOWN
-//
-// Only the lease owner may transition state. Lease expiry allows
-// recovery of crashed executions without duplicate dispatch.
+// The store owns lease time (via clock_timestamp()), enforces lease
+// fencing inside SQL, and makes blind duplicate side effects impossible.
+// See docs/spec/durable-execution-contract.md for the frozen invariants.
 package idempotency
 
 import (
@@ -34,106 +17,59 @@ import (
 	"time"
 )
 
-// State represents the lifecycle state of an execution request.
-type State string
+// ─── Record ───────────────────────────────────────────────────────────
 
-const (
-	// StateReserved means the request has been reserved but not yet dispatched.
-	// The caller that performed the INSERT owns the reservation.
-	StateReserved State = "RESERVED"
-
-	// StateDispatching means the request is being dispatched to the provider.
-	// The lease holder is actively executing.
-	StateDispatching State = "DISPATCHING"
-
-	// StateInFlight means the provider has accepted the request.
-	StateInFlight State = "IN_FLIGHT"
-
-	// StateSucceeded means the provider returned a definitive success.
-	StateSucceeded State = "SUCCEEDED"
-
-	// StateFailed means the provider returned a definitive failure.
-	StateFailed State = "FAILED"
-
-	// StateDenied means admission denied the request before dispatch.
-	StateDenied State = "DENIED"
-
-	// StateUnknown means the provider may have executed but the terminal
-	// outcome cannot be established.
-	StateUnknown State = "UNKNOWN"
-
-	// StateReconciliationRequired means the request needs reconciliation.
-	StateReconciliationRequired State = "RECONCILIATION_REQUIRED"
-)
-
-// IsTerminal returns true if the state is terminal (no further transitions).
-func (s State) IsTerminal() bool {
-	switch s {
-	case StateSucceeded, StateFailed, StateDenied, StateUnknown:
-		return true
-	}
-	return false
-}
-
-// Record is a stored idempotency record.
+// Record is a stored execution record.
 type Record struct {
-	ExecutionID    string          `json:"execution_id"`
-	IdempotencyKey string          `json:"idempotency_key"`
-	PrincipalID    string          `json:"principal_id"`
-	CapabilityID   string          `json:"capability_id"`
-	RequestDigest  string          `json:"request_digest"`
-	GrantID        string          `json:"grant_id"`
-	ExecutionClass string          `json:"execution_class"`
-	State          State           `json:"state"`
-	Result         json.RawMessage `json:"result,omitempty"`
-	EvidenceDigest string          `json:"evidence_digest,omitempty"`
-	ReceiptVersion int             `json:"receipt_version,omitempty"`
-	LeaseOwner     string          `json:"lease_owner,omitempty"`
-	LeaseToken     string          `json:"lease_token,omitempty"`
-	LeaseExpiresAt *time.Time      `json:"lease_expires_at,omitempty"`
-	Attempt        int             `json:"attempt,omitempty"`
-	Version        int             `json:"version"`
-	CreatedAt      time.Time       `json:"created_at"`
-	UpdatedAt      time.Time       `json:"updated_at"`
+	ExecutionID           string          `json:"execution_id"`
+	IdempotencyKey        string          `json:"idempotency_key"`
+	PrincipalID           string          `json:"principal_id"`
+	CapabilityID          string          `json:"capability_id"`
+	RequestDigest         string          `json:"request_digest"`
+	GrantID               string          `json:"grant_id"`
+	ExecutionClass        string          `json:"execution_class"`
+	State                 State           `json:"state"`
+	Result                json.RawMessage `json:"result,omitempty"`
+	EvidenceDigest        string          `json:"evidence_digest,omitempty"`
+	ReceiptVersion        int             `json:"receipt_version,omitempty"`
+	LeaseOwner            string          `json:"lease_owner,omitempty"`
+	LeaseToken            string          `json:"lease_token,omitempty"`
+	LeaseStartedAt        *time.Time      `json:"lease_started_at,omitempty"`
+	LeaseExpiresAt        *time.Time      `json:"lease_expires_at,omitempty"`
+	LeaseGeneration       int             `json:"lease_generation,omitempty"`
+	ProviderID            string          `json:"provider_id,omitempty"`
+	ProviderRunID         string          `json:"provider_run_id,omitempty"`
+	TerminalReceiptDigest string          `json:"terminal_receipt_digest,omitempty"`
+	Attempt               int             `json:"attempt,omitempty"`
+	Version               int             `json:"version"`
+	CreatedAt             time.Time       `json:"created_at"`
+	UpdatedAt             time.Time       `json:"updated_at"`
 }
 
-// ReserveResult is the outcome of a reservation attempt.
-type ReserveResult struct {
-	// State is the current state of the record.
-	State State `json:"state"`
+// ─── Store ───────────────────────────────────────────────────────────
 
-	// Record is the existing record if found, or nil if newly reserved.
-	Record *Record `json:"record,omitempty"`
-
-	// Acquired is true if THIS caller created the reservation and may dispatch.
-	// Only Acquired == true callers may proceed to dispatch.
-	// Acquired == false means another caller owns the reservation
-	// or the record already exists in some state.
-	Acquired bool `json:"acquired"`
-
-	// Conflict is true if the same key was used with a different request.
-	Conflict bool `json:"conflict"`
-
-	// LeaseToken is the ownership token for the new reservation.
-	// Only valid when Acquired is true.
-	LeaseToken string `json:"lease_token,omitempty"`
-}
-
-// Store is the durable idempotency store backed by PostgreSQL.
+// Store is the durable execution contract store backed by PostgreSQL.
 type Store struct {
-	db *sql.DB
+	db       *sql.DB
+	leaseCfg LeaseConfig
 }
 
-// NewStore creates a new durable idempotency store.
+// NewStore creates a new durable execution store with default lease config.
 func NewStore(db *sql.DB) (*Store, error) {
-	store := &Store{db: db}
-	if err := store.ensureSchema(context.Background()); err != nil {
+	return NewStoreWithConfig(db, DefaultLeaseConfig)
+}
+
+// NewStoreWithConfig creates a store with a custom lease configuration.
+func NewStoreWithConfig(db *sql.DB, cfg LeaseConfig) (*Store, error) {
+	s := &Store{db: db, leaseCfg: cfg}
+	if err := s.ensureSchema(context.Background()); err != nil {
 		return nil, fmt.Errorf("failed to ensure schema: %w", err)
 	}
-	return store, nil
+	return s, nil
 }
 
-// ensureSchema creates the execution_requests table if it doesn't exist.
+// ─── Schema ──────────────────────────────────────────────────────────
+
 func (s *Store) ensureSchema(ctx context.Context) error {
 	_, err := s.db.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS execution_requests (
@@ -150,7 +86,12 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 			receipt_version INTEGER NOT NULL DEFAULT 0,
 			lease_owner TEXT,
 			lease_token TEXT,
+			lease_started_at TIMESTAMPTZ,
 			lease_expires_at TIMESTAMPTZ,
+			lease_generation INTEGER NOT NULL DEFAULT 1,
+			provider_id TEXT,
+			provider_run_id TEXT,
+			terminal_receipt_digest TEXT,
 			attempt INTEGER NOT NULL DEFAULT 0,
 			version INTEGER NOT NULL DEFAULT 1,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -175,7 +116,12 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 				receipt_version INTEGER NOT NULL DEFAULT 0,
 				lease_owner TEXT,
 				lease_token TEXT,
+				lease_started_at TIMESTAMPTZ,
 				lease_expires_at TIMESTAMPTZ,
+				lease_generation INTEGER NOT NULL DEFAULT 1,
+				provider_id TEXT,
+				provider_run_id TEXT,
+				terminal_receipt_digest TEXT,
 				attempt INTEGER NOT NULL DEFAULT 0,
 				version INTEGER NOT NULL DEFAULT 1,
 				created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -188,7 +134,13 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 		}
 	}
 
-	// Migration: add lease columns if they don't exist (for existing tables).
+	// Migrations: add new columns if they don't exist.
+	s.addColumnIfMissing(ctx, "lease_started_at", "TIMESTAMPTZ")
+	s.addColumnIfMissing(ctx, "lease_generation", "INTEGER NOT NULL DEFAULT 1")
+	s.addColumnIfMissing(ctx, "provider_id", "TEXT")
+	s.addColumnIfMissing(ctx, "provider_run_id", "TEXT")
+	s.addColumnIfMissing(ctx, "terminal_receipt_digest", "TEXT")
+	// Legacy columns from earlier versions.
 	s.addColumnIfMissing(ctx, "receipt_version", "INTEGER NOT NULL DEFAULT 0")
 	s.addColumnIfMissing(ctx, "lease_owner", "TEXT")
 	s.addColumnIfMissing(ctx, "lease_token", "TEXT")
@@ -196,92 +148,107 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 	s.addColumnIfMissing(ctx, "attempt", "INTEGER NOT NULL DEFAULT 0")
 	s.addColumnIfMissing(ctx, "version", "INTEGER NOT NULL DEFAULT 1")
 
+	// Migrate old state names to new vocabulary.
+	s.migrateStateNames(ctx)
+
 	return nil
 }
 
+func (s *Store) migrateStateNames(ctx context.Context) {
+	// Map old state names to new ones.
+	migrations := map[string]string{
+		"RESERVED":                "PREPARED",
+		"DISPATCHING":             "EXECUTING",
+		"SUCCEEDED":               "COMMITTED",
+		"RECONCILIATION_REQUIRED": "UNKNOWN",
+	}
+	for old, new := range migrations {
+		s.db.ExecContext(ctx, `UPDATE execution_requests SET state = $1 WHERE state = $2`, new, old)
+	}
+}
+
 func (s *Store) addColumnIfMissing(ctx context.Context, column, ddl string) {
-	// Best-effort migration; errors are ignored (column already exists).
 	s.db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE execution_requests ADD COLUMN IF NOT EXISTS %s %s", column, ddl))
 }
 
-// generateLeaseToken generates a cryptographically random lease token.
+// ─── Lease token generation ──────────────────────────────────────────
+
+// generateLeaseToken generates a cryptographically unguessable lease token.
 func generateLeaseToken() (string, error) {
-	b := make([]byte, 16)
+	b := make([]byte, 32) // 256 bits
 	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
 }
 
-// DefaultLeaseDuration is the default lease duration for new reservations.
-const DefaultLeaseDuration = 5 * time.Minute
+// ─── Acquire (reservation) ───────────────────────────────────────────
 
-// Reserve atomically reserves an execution request.
+// Acquire attempts to acquire a lease for an execution.
 //
-// Uses INSERT ... ON CONFLICT DO NOTHING to atomically reserve.
-// If the insert succeeds, the caller acquires the reservation
-// and a lease token, and may proceed to dispatch.
-// If the insert conflicts (key exists), we read the existing record
-// and compare digests.
+// This replaces the old Reserve/ReserveWithLease methods. It returns
+// a typed AcquireResult that prevents callers from inferring semantics
+// from state names.
 //
-// If the key exists with the same request digest:
-//   - Terminal state: return the stored result (Acquired=false)
-//   - Non-terminal state: return IN_FLIGHT (Acquired=false)
-//   - Non-terminal + expired lease: reclaim and return Acquired=true
-//
-// If the key exists with a different request digest:
-//   - Return CONFLICT (never re-execute)
-func (s *Store) Reserve(ctx context.Context, key, principal, capability, digest, grantID, class string) (*ReserveResult, error) {
-	return s.ReserveWithLease(ctx, key, principal, capability, digest, grantID, class, DefaultLeaseDuration)
-}
+// The reclaim matrix is encoded in the SQL:
+//   - PREPARED + expired → reclaim allowed
+//   - EXECUTING + expired → reclaim allowed (dispatch boundary not crossed)
+//   - IN_FLIGHT + expired → reclaim forbidden → transition to UNKNOWN
+//   - UNKNOWN → no dispatch (RECOVERY_REQUIRED)
+//   - COMMITTED/FAILED/DENIED → immutable replay
+func (s *Store) Acquire(ctx context.Context, key, principal, capability, digest, grantID, class string, leaseDuration time.Duration) (*AcquireResult, error) {
+	if err := s.leaseCfg.Validate(leaseDuration); err != nil {
+		return nil, err
+	}
 
-// ReserveWithLease is Reserve with a configurable lease duration.
-func (s *Store) ReserveWithLease(ctx context.Context, key, principal, capability, digest, grantID, class string, leaseDuration time.Duration) (*ReserveResult, error) {
 	leaseToken, err := generateLeaseToken()
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate lease token: %w", err)
 	}
 	leaseOwner := fmt.Sprintf("pid-%d", currentPID())
-	leaseExpires := time.Now().Add(leaseDuration)
 
-	// First, try to atomically INSERT a new RESERVED record with a lease.
-	// ON CONFLICT DO NOTHING means if the key already exists, no rows are inserted.
+	// First, try to atomically INSERT a new PREPARED record with a lease.
+	// PostgreSQL owns the timestamps via clock_timestamp().
 	var executionID string
 	var createdAt time.Time
 	err = s.db.QueryRowContext(ctx, `
 		INSERT INTO execution_requests
 			(idempotency_key, principal_id, capability_id, request_digest,
 			 grant_id, execution_class, state,
-			 lease_owner, lease_token, lease_expires_at, attempt, version)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, 1)
+			 lease_owner, lease_token, lease_started_at, lease_expires_at,
+			 lease_generation, attempt, version)
+		VALUES ($1, $2, $3, $4, $5, $6, 'PREPARED',
+				$7, $8, clock_timestamp(), clock_timestamp() + $9::interval,
+				1, 0, 1)
 		ON CONFLICT (principal_id, capability_id, idempotency_key) DO NOTHING
 		RETURNING execution_id, created_at
 	`, key, principal, capability, digest, nullableString(grantID), class,
-		string(StateReserved), leaseOwner, leaseToken, leaseExpires,
+		leaseOwner, leaseToken, fmt.Sprintf("%d microseconds", leaseDuration.Microseconds()),
 	).Scan(&executionID, &createdAt)
 
 	if err == nil {
-		// Insert succeeded — THIS caller acquired the reservation and the lease.
-		return &ReserveResult{
-			State:      StateReserved,
-			Acquired:   true,
+		// Insert succeeded — THIS caller acquired the lease.
+		return &AcquireResult{
+			Kind:       LeaseAcquired,
+			State:      StatePrepared,
 			LeaseToken: leaseToken,
+			Generation: 1,
 			Record: &Record{
-				ExecutionID:    executionID,
-				IdempotencyKey: key,
-				PrincipalID:    principal,
-				CapabilityID:   capability,
-				RequestDigest:  digest,
-				GrantID:        grantID,
-				ExecutionClass: class,
-				State:          StateReserved,
-				LeaseOwner:     leaseOwner,
-				LeaseToken:     leaseToken,
-				LeaseExpiresAt: &leaseExpires,
-				Attempt:        0,
-				Version:        1,
-				CreatedAt:      createdAt,
-				UpdatedAt:      createdAt,
+				ExecutionID:     executionID,
+				IdempotencyKey:  key,
+				PrincipalID:     principal,
+				CapabilityID:    capability,
+				RequestDigest:   digest,
+				GrantID:         grantID,
+				ExecutionClass:  class,
+				State:           StatePrepared,
+				LeaseOwner:      leaseOwner,
+				LeaseToken:      leaseToken,
+				LeaseGeneration: 1,
+				Attempt:         0,
+				Version:         1,
+				CreatedAt:       createdAt,
+				UpdatedAt:       createdAt,
 			},
 		}, nil
 	}
@@ -290,70 +257,117 @@ func (s *Store) ReserveWithLease(ctx context.Context, key, principal, capability
 		return nil, err
 	}
 
-	// ON CONFLICT DO NOTHING returned no rows — the key already exists.
-	// Read the existing record to check the digest and lease status.
+	// ON CONFLICT DO NOTHING — the key already exists. Read it.
 	rec, err := s.lookupByKey(ctx, principal, capability, key)
 	if err != nil {
 		return nil, err
 	}
 
-	// Check if the digest matches
+	// Different digest → idempotency conflict.
 	if rec.RequestDigest != digest {
-		return &ReserveResult{
-			State:    rec.State,
-			Record:   rec,
-			Conflict: true,
+		return &AcquireResult{
+			Kind:   IdempotencyConflict,
+			State:  rec.State,
+			Record: rec,
 		}, nil
 	}
 
-	// Same digest — check if the record is terminal.
-	if rec.State.IsTerminal() {
-		return &ReserveResult{
-			State:    rec.State,
-			Record:   rec,
-			Acquired: false,
+	// Durably final → immutable replay.
+	if rec.State.IsDurablyFinal() {
+		return &AcquireResult{
+			Kind:   TerminalReplay,
+			State:  rec.State,
+			Record: rec,
 		}, nil
 	}
 
-	// Same digest, non-terminal — check if the lease has expired.
-	// If expired, attempt to reclaim atomically.
-	if rec.LeaseExpiresAt != nil && time.Now().After(*rec.LeaseExpiresAt) {
-		reclaimed, err := s.reclaimLease(ctx, rec, leaseToken, leaseOwner, leaseExpires)
+	// UNKNOWN → recovery required, no dispatch.
+	if rec.State == StateUnknown {
+		return &AcquireResult{
+			Kind:   RecoveryRequired,
+			State:  rec.State,
+			Record: rec,
+		}, nil
+	}
+
+	// PREPARED or EXECUTING with expired lease → reclaim.
+	if (rec.State == StatePrepared || rec.State == StateExecuting) && rec.LeaseExpiresAt != nil {
+		reclaimed, err := s.reclaimExpiredLease(ctx, rec, leaseToken, leaseOwner, leaseDuration)
 		if err != nil {
 			return nil, err
 		}
 		if reclaimed {
-			return &ReserveResult{
-				State:      StateReserved,
-				Acquired:   true,
+			return &AcquireResult{
+				Kind:       LeaseReclaimed,
+				State:      StatePrepared,
 				LeaseToken: leaseToken,
+				Generation: rec.LeaseGeneration + 1,
 				Record:     rec,
 			}, nil
 		}
-		// Another caller reclaimed between our read and CAS — fall through.
+		// Another caller reclaimed between our read and CAS — re-read.
+		rec, err = s.lookupByKey(ctx, principal, capability, key)
+		if err != nil {
+			return nil, err
+		}
+		// Re-check after race.
+		if rec.State.IsDurablyFinal() {
+			return &AcquireResult{Kind: TerminalReplay, State: rec.State, Record: rec}, nil
+		}
+		if rec.State == StateUnknown {
+			return &AcquireResult{Kind: RecoveryRequired, State: rec.State, Record: rec}, nil
+		}
 	}
 
-	// Same digest, non-terminal, lease still valid — another caller owns it.
-	return &ReserveResult{
-		State:    rec.State,
-		Record:   rec,
-		Acquired: false,
+	// IN_FLIGHT with expired lease → transition to UNKNOWN, return recovery required.
+	if rec.State == StateInFlight && rec.LeaseExpiresAt != nil {
+		marked, err := s.markInFlightExpiredAsUnknown(ctx, rec)
+		if err != nil {
+			return nil, err
+		}
+		if marked {
+			return &AcquireResult{
+				Kind:   RecoveryRequired,
+				State:  StateUnknown,
+				Record: rec,
+			}, nil
+		}
+		// Another caller marked it — re-read.
+		rec, err = s.lookupByKey(ctx, principal, capability, key)
+		if err != nil {
+			return nil, err
+		}
+		if rec.State == StateUnknown {
+			return &AcquireResult{Kind: RecoveryRequired, State: rec.State, Record: rec}, nil
+		}
+	}
+
+	// Same digest, non-terminal, lease still valid → held by other.
+	return &AcquireResult{
+		Kind:   LeaseHeldByOther,
+		State:  rec.State,
+		Record: rec,
 	}, nil
 }
 
-// reclaimLease atomically takes over an expired lease using CAS.
-// Returns true if this caller now owns the lease.
-func (s *Store) reclaimLease(ctx context.Context, rec *Record, newToken, newOwner string, newExpiry time.Time) (bool, error) {
+// reclaimExpiredLease atomically takes over an expired lease for
+// PREPARED or EXECUTING states. The dispatch boundary was NOT crossed.
+// Generation increments to function as a fencing epoch.
+func (s *Store) reclaimExpiredLease(ctx context.Context, rec *Record, newToken, newOwner string, duration time.Duration) (bool, error) {
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE execution_requests
-		SET lease_owner = $1, lease_token = $2, lease_expires_at = $3,
+		SET lease_owner = $1, lease_token = $2,
+		    lease_started_at = clock_timestamp(),
+		    lease_expires_at = clock_timestamp() + $3::interval,
+		    lease_generation = lease_generation + 1,
 		    attempt = attempt + 1, version = version + 1,
-		    state = $4, updated_at = NOW()
-		WHERE execution_id = $5
-		  AND version = $6
-		  AND lease_token = $7
-		  AND lease_expires_at < NOW()
-	`, newOwner, newToken, newExpiry, string(StateReserved), rec.ExecutionID, rec.Version, rec.LeaseToken)
+		    state = 'PREPARED', updated_at = clock_timestamp()
+		WHERE execution_id = $4
+		  AND version = $5
+		  AND state IN ('PREPARED', 'EXECUTING')
+		  AND lease_expires_at < clock_timestamp()
+	`, newOwner, newToken, fmt.Sprintf("%d microseconds", duration.Microseconds()),
+		rec.ExecutionID, rec.Version)
 	if err != nil {
 		return false, err
 	}
@@ -364,58 +378,376 @@ func (s *Store) reclaimLease(ctx context.Context, rec *Record, newToken, newOwne
 	if rows == 0 {
 		return false, nil
 	}
-
-	// Update the in-memory record.
+	// Update in-memory record.
 	rec.LeaseOwner = newOwner
 	rec.LeaseToken = newToken
-	rec.LeaseExpiresAt = &newExpiry
+	rec.LeaseGeneration++
 	rec.Attempt++
 	rec.Version++
-	rec.State = StateReserved
+	rec.State = StatePrepared
 	return true, nil
 }
 
-// Finalize atomically finalizes an execution with CAS semantics.
+// markInFlightExpiredAsUnknown transitions an expired IN_FLIGHT record
+// to UNKNOWN. The side effect may have occurred — never blind-retry.
+func (s *Store) markInFlightExpiredAsUnknown(ctx context.Context, rec *Record) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE execution_requests
+		SET state = 'UNKNOWN', version = version + 1,
+		    lease_owner = NULL, lease_token = NULL,
+		    lease_started_at = NULL, lease_expires_at = NULL,
+		    updated_at = clock_timestamp()
+		WHERE execution_id = $1
+		  AND version = $2
+		  AND state = 'IN_FLIGHT'
+		  AND lease_expires_at < clock_timestamp()
+	`, rec.ExecutionID, rec.Version)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if rows == 0 {
+		return false, nil
+	}
+	rec.State = StateUnknown
+	rec.Version++
+	return true, nil
+}
+
+// ─── Lease-fenced transitions ────────────────────────────────────────
+
+// BeginExecution transitions from PREPARED to EXECUTING.
+// Only the active lease holder may transition. The lease must be
+// unexpired (checked inside SQL).
+func (s *Store) BeginExecution(ctx context.Context, executionID, leaseToken string, leaseGeneration int) error {
+	return s.leaseFencedTransition(ctx, executionID, leaseToken, leaseGeneration, StatePrepared, StateExecuting)
+}
+
+// MarkInFlight transitions from EXECUTING to IN_FLIGHT.
+// This crosses the dispatch boundary — persist BEFORE the provider call.
+// After this point, a crash means the side effect may have occurred.
+func (s *Store) MarkInFlight(ctx context.Context, executionID, leaseToken string, leaseGeneration int) error {
+	return s.leaseFencedTransition(ctx, executionID, leaseToken, leaseGeneration, StateExecuting, StateInFlight)
+}
+
+// leaseFencedTransition performs a state transition with full lease
+// fencing enforced inside the SQL statement.
+func (s *Store) leaseFencedTransition(ctx context.Context, executionID, leaseToken string, leaseGeneration int, expectedState, newState State) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE execution_requests
+		SET state = $1, version = version + 1, updated_at = clock_timestamp()
+		WHERE execution_id = $2
+		  AND state = $3
+		  AND lease_token = $4
+		  AND lease_generation = $5
+		  AND lease_expires_at > clock_timestamp()
+	`, string(newState), executionID, string(expectedState), leaseToken, leaseGeneration)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return s.classifyTransitionFailure(ctx, executionID, leaseToken, leaseGeneration, expectedState)
+	}
+	return nil
+}
+
+// classifyTransitionFailure determines the specific lease error for a
+// failed transition by inspecting the current record state.
+func (s *Store) classifyTransitionFailure(ctx context.Context, executionID, leaseToken string, leaseGeneration int, expectedState State) error {
+	rec, err := s.Lookup(ctx, executionID)
+	if err != nil {
+		return fmt.Errorf("%w: execution %s transition failed (lookup error: %v)", LeaseLost, executionID, err)
+	}
+	if rec.State != expectedState {
+		if rec.State.IsDurablyFinal() {
+			return fmt.Errorf("%w: execution %s is durably final (%s)", LeaseStateConflict, executionID, rec.State)
+		}
+		return fmt.Errorf("%w: execution %s expected %s but is %s", LeaseStateConflict, executionID, expectedState, rec.State)
+	}
+	if rec.LeaseToken != leaseToken {
+		return fmt.Errorf("%w: execution %s token mismatch", LeaseTokenMismatch, executionID)
+	}
+	if rec.LeaseGeneration != leaseGeneration {
+		return fmt.Errorf("%w: execution %s generation %d != %d", LeaseGenerationMismatch, executionID, rec.LeaseGeneration, leaseGeneration)
+	}
+	// Token and generation match but rows affected was 0 → expired.
+	return fmt.Errorf("%w: execution %s lease expired", LeaseExpired, executionID)
+}
+
+// ─── Lease renewal ──────────────────────────────────────────────────
+
+// RenewLease extends the lease for the current holder. Only the
+// active lease token and generation may renew. The lease must be
+// unexpired (checked inside SQL). PostgreSQL computes the new expiry.
+func (s *Store) RenewLease(ctx context.Context, executionID, leaseToken string, leaseGeneration int, duration time.Duration) error {
+	if err := s.leaseCfg.Validate(duration); err != nil {
+		return err
+	}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE execution_requests
+		SET lease_expires_at = clock_timestamp() + $1::interval,
+		    updated_at = clock_timestamp()
+		WHERE execution_id = $2
+		  AND lease_token = $3
+		  AND lease_generation = $4
+		  AND lease_expires_at > clock_timestamp()
+		  AND state NOT IN ('COMMITTED', 'FAILED', 'DENIED', 'UNKNOWN')
+	`, fmt.Sprintf("%d microseconds", duration.Microseconds()),
+		executionID, leaseToken, leaseGeneration)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return s.classifyRenewalFailure(ctx, executionID, leaseToken, leaseGeneration)
+	}
+	return nil
+}
+
+func (s *Store) classifyRenewalFailure(ctx context.Context, executionID, leaseToken string, leaseGeneration int) error {
+	rec, err := s.Lookup(ctx, executionID)
+	if err != nil {
+		return fmt.Errorf("%w: execution %s renewal failed (lookup error: %v)", LeaseLost, executionID, err)
+	}
+	if rec.State.IsDurablyFinal() || rec.State == StateUnknown {
+		return fmt.Errorf("%w: execution %s is terminal (%s)", LeaseStateConflict, executionID, rec.State)
+	}
+	if rec.LeaseToken != leaseToken {
+		return fmt.Errorf("%w: execution %s token mismatch", LeaseTokenMismatch, executionID)
+	}
+	if rec.LeaseGeneration != leaseGeneration {
+		return fmt.Errorf("%w: execution %s generation %d != %d", LeaseGenerationMismatch, executionID, rec.LeaseGeneration, leaseGeneration)
+	}
+	return fmt.Errorf("%w: execution %s lease expired", LeaseExpired, executionID)
+}
+
+// ─── Abandon pre-dispatch ────────────────────────────────────────────
+
+// AbandonPreDispatch transitions from PREPARED or EXECUTING back to
+// PREPARED and releases the lease. This allows the next caller to
+// reclaim immediately without waiting for expiry. Safe because the
+// dispatch boundary was not crossed.
+func (s *Store) AbandonPreDispatch(ctx context.Context, executionID, leaseToken string, leaseGeneration int) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE execution_requests
+		SET state = 'PREPARED', version = version + 1,
+		    lease_owner = NULL, lease_token = NULL,
+		    lease_started_at = NULL, lease_expires_at = NULL,
+		    updated_at = clock_timestamp()
+		WHERE execution_id = $1
+		  AND state IN ('PREPARED', 'EXECUTING')
+		  AND lease_token = $2
+		  AND lease_generation = $3
+		  AND lease_expires_at > clock_timestamp()
+	`, executionID, leaseToken, leaseGeneration)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return s.classifyTransitionFailure(ctx, executionID, leaseToken, leaseGeneration, StatePrepared)
+	}
+	return nil
+}
+
+// ─── Immutable finalization ─────────────────────────────────────────
+
+// Finalize atomically finalizes an execution with an immutable terminal
+// receipt. Only the active lease holder may finalize. The lease must
+// be unexpired (checked inside SQL).
 //
-// Only the current lease holder may finalize. The expected state
-// must match. This prevents:
-//   - Duplicate dispatch (non-lease-holders cannot finalize)
-//   - State races (expected state must match)
-//   - Blind overwrites (version check)
+// Behavior:
+//   - First valid finalization → durably final (COMMITTED/FAILED/DENIED)
+//   - Same canonical receipt again → ALREADY_FINALIZED (idempotent)
+//   - Different receipt for same execution → FINALIZATION_CONFLICT
 //
-// For terminal finalization, this is immutable: a second identical
-// finalize is idempotent, but a conflicting receipt is rejected.
-func (s *Store) Finalize(ctx context.Context, executionID, leaseToken string, expectedState State, newState State, result json.RawMessage, evidenceDigest string, receiptVersion int) error {
-	// First check if already finalized (idempotent replay).
+// The entire terminal receipt is compared, not just state + evidence.
+func (s *Store) Finalize(ctx context.Context, executionID, leaseToken string, leaseGeneration int, expectedState State, receipt TerminalReceipt) error {
+	// Compute the terminal receipt digest for equality comparison.
+	receiptDigest, err := receipt.Digest()
+	if err != nil {
+		return fmt.Errorf("failed to compute terminal receipt digest: %w", err)
+	}
+
+	// First check if already finalized (idempotent replay or conflict).
 	existing, err := s.Lookup(ctx, executionID)
 	if err != nil {
 		return fmt.Errorf("finalize lookup failed: %w", err)
 	}
 
-	if existing.State.IsTerminal() {
-		// Already finalized — check for conflict.
-		if existing.State != newState {
-			return fmt.Errorf("FINALIZATION_CONFLICT: execution %s already finalized as %s, cannot finalize as %s", executionID, existing.State, newState)
+	if existing.State.IsDurablyFinal() {
+		// Already finalized — compare the full receipt.
+		if existing.TerminalReceiptDigest == receiptDigest {
+			return nil // ALREADY_FINALIZED — idempotent replay.
 		}
-		// Same terminal state — idempotent replay. Check evidence consistency.
-		if evidenceDigest != "" && existing.EvidenceDigest != "" && evidenceDigest != existing.EvidenceDigest {
-			return fmt.Errorf("FINALIZATION_CONFLICT: execution %s has evidence %s, new finalize claims %s", executionID, existing.EvidenceDigest, evidenceDigest)
-		}
-		return nil
+		return fmt.Errorf("FINALIZATION_CONFLICT: execution %s already finalized with different receipt (existing digest %s, new digest %s)",
+			executionID, existing.TerminalReceiptDigest, receiptDigest)
 	}
 
-	// Not yet terminal — perform CAS transition.
+	// Not yet durably final — perform CAS transition.
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE execution_requests
+		SET state = $1, result = $2, evidence_digest = $3, receipt_version = $4,
+		    provider_id = $5, provider_run_id = $6,
+		    terminal_receipt_digest = $7,
+		    lease_owner = NULL, lease_token = NULL,
+		    lease_started_at = NULL, lease_expires_at = NULL,
+		    version = version + 1, updated_at = clock_timestamp()
+		WHERE execution_id = $8
+		  AND state = $9
+		  AND lease_token = $10
+		  AND lease_generation = $11
+		  AND lease_expires_at > clock_timestamp()
+		  AND version = $12
+	`, string(receipt.TerminalStatus),
+		nullableBytes(receipt.CanonicalResult),
+		nullableString(receipt.EvidenceDigest),
+		receipt.ReceiptVersion,
+		nullableString(receipt.ProviderID),
+		nullableString(receipt.ProviderRunID),
+		receiptDigest,
+		executionID, string(expectedState), leaseToken, leaseGeneration, existing.Version)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return s.classifyTransitionFailure(ctx, executionID, leaseToken, leaseGeneration, expectedState)
+	}
+	return nil
+}
+
+// ─── Recovery ────────────────────────────────────────────────────────
+
+// EnterRecovery transitions a record to UNKNOWN for reconciliation.
+// This is used for IN_FLIGHT records where the lease has expired
+// (the side effect may have occurred) or for records where the
+// handler returned an ambiguous result.
+//
+// Uses CAS with expected state to prevent overwriting a state that
+// changed after it was read.
+func (s *Store) EnterRecovery(ctx context.Context, executionID string, expectedState State, expectedVersion int) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE execution_requests
+		SET state = 'UNKNOWN', version = version + 1,
+		    lease_owner = NULL, lease_token = NULL,
+		    lease_started_at = NULL, lease_expires_at = NULL,
+		    updated_at = clock_timestamp()
+		WHERE execution_id = $1
+		  AND state = $2
+		  AND version = $3
+	`, executionID, string(expectedState), expectedVersion)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return fmt.Errorf("%w: execution %s enter recovery CAS failed (state/version mismatch)", LeaseStateConflict, executionID)
+	}
+	return nil
+}
+
+// ResolveRecovery resolves an UNKNOWN record to a durably final state
+// using a recovery result. Uses CAS with expected state=UNKNOWN to
+// prevent overwriting a state that changed after it was read.
+//
+// The recovery result must include evidence for any definitive
+// conclusion (COMMITTED or FAILED).
+func (s *Store) ResolveRecovery(ctx context.Context, executionID string, expectedVersion int, decision RecoveryDecision, result RecoveryResult) error {
+	var newState State
+	switch decision {
+	case RecoveryCommitted:
+		newState = StateCommitted
+	case RecoveryFailed:
+		newState = StateFailed
+	case RecoveryUnknown:
+		// Still unknown — no state change, just touch updated_at.
+		_, err := s.db.ExecContext(ctx, `
+			UPDATE execution_requests
+			SET updated_at = clock_timestamp()
+			WHERE execution_id = $1 AND state = 'UNKNOWN' AND version = $2
+		`, executionID, expectedVersion)
+		if err != nil {
+			return err
+		}
+		return nil
+	case RecoveryRetryable:
+		// Retryable — transition back to PREPARED for re-dispatch.
+		// Only allowed for records proven safe to retry.
+		result2, err := s.db.ExecContext(ctx, `
+			UPDATE execution_requests
+			SET state = 'PREPARED', version = version + 1,
+			    lease_owner = NULL, lease_token = NULL,
+			    lease_started_at = NULL, lease_expires_at = NULL,
+			    updated_at = clock_timestamp()
+			WHERE execution_id = $1 AND state = 'UNKNOWN' AND version = $2
+		`, executionID, expectedVersion)
+		if err != nil {
+			return err
+		}
+		rows, err := result2.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rows == 0 {
+			return fmt.Errorf("%w: execution %s recovery retry CAS failed", LeaseStateConflict, executionID)
+		}
+		return nil
+	case RecoveryConflict:
+		return fmt.Errorf("%w: execution %s recovery conflict", LeaseStateConflict, executionID)
+	default:
+		return fmt.Errorf("unknown recovery decision: %s", decision)
+	}
+
+	// Definitive resolution — compute terminal receipt digest.
+	receipt := TerminalReceipt{
+		ExecutionID:     executionID,
+		CanonicalResult: result.Result,
+		EvidenceDigest:  result.EvidenceDigest,
+		ReceiptVersion:  result.ReceiptVersion,
+		ProviderID:      result.ProviderID,
+		ProviderRunID:   result.ProviderRunID,
+		TerminalStatus:  newState,
+	}
+	receiptDigest, err := receipt.Digest()
+	if err != nil {
+		return fmt.Errorf("failed to compute recovery receipt digest: %w", err)
+	}
+
 	result2, err := s.db.ExecContext(ctx, `
 		UPDATE execution_requests
 		SET state = $1, result = $2, evidence_digest = $3, receipt_version = $4,
-		    lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
-		    version = version + 1, updated_at = NOW()
-		WHERE execution_id = $5
-		  AND state = $6
-		  AND lease_token = $7
-		  AND version = $8
-	`, string(newState), nullableBytes(result), nullableString(evidenceDigest), receiptVersion,
-		executionID, string(expectedState), leaseToken, existing.Version)
+		    provider_id = $5, provider_run_id = $6,
+		    terminal_receipt_digest = $7,
+		    version = version + 1, updated_at = clock_timestamp()
+		WHERE execution_id = $8 AND state = 'UNKNOWN' AND version = $9
+	`, string(newState),
+		nullableBytes(result.Result),
+		nullableString(result.EvidenceDigest),
+		result.ReceiptVersion,
+		nullableString(result.ProviderID),
+		nullableString(result.ProviderRunID),
+		receiptDigest,
+		executionID, expectedVersion)
 	if err != nil {
 		return err
 	}
@@ -424,102 +756,26 @@ func (s *Store) Finalize(ctx context.Context, executionID, leaseToken string, ex
 		return err
 	}
 	if rows == 0 {
-		// CAS failed — either state changed, lease lost, or version mismatch.
-		return fmt.Errorf("FINALIZE_CAS_FAILED: execution %s state transition %s→%s rejected (lost lease or state changed)", executionID, expectedState, newState)
+		return fmt.Errorf("%w: execution %s recovery resolution CAS failed (state/version mismatch)", LeaseStateConflict, executionID)
 	}
 	return nil
 }
 
-// TransitionState performs a non-terminal state transition with CAS.
-// Only the lease holder may transition.
-func (s *Store) TransitionState(ctx context.Context, executionID, leaseToken string, expectedState, newState State) error {
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE execution_requests
-		SET state = $1, version = version + 1, updated_at = NOW()
-		WHERE execution_id = $2
-		  AND state = $3
-		  AND lease_token = $4
-	`, string(newState), executionID, string(expectedState), leaseToken)
-	if err != nil {
-		return err
-	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if rows == 0 {
-		return fmt.Errorf("TRANSITION_CAS_FAILED: execution %s %s→%s rejected (not lease holder or state mismatch)", executionID, expectedState, newState)
-	}
-	return nil
-}
-
-// RenewLease extends the lease for the current holder.
-// Only the current lease token may renew.
-func (s *Store) RenewLease(ctx context.Context, executionID, leaseToken string, duration time.Duration) error {
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE execution_requests
-		SET lease_expires_at = NOW() + $1, updated_at = NOW()
-		WHERE execution_id = $2
-		  AND lease_token = $3
-		  AND state NOT IN ('SUCCEEDED', 'FAILED', 'DENIED', 'UNKNOWN')
-	`, duration, executionID, leaseToken)
-	if err != nil {
-		return err
-	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if rows == 0 {
-		return fmt.Errorf("LEASE_RENEWAL_REJECTED: execution %s lease renewal rejected (not holder or already terminal)", executionID)
-	}
-	return nil
-}
-
-// SetState updates the state of an execution request.
-// DEPRECATED: Use Finalize or TransitionState instead.
-// This method is retained for backward compatibility with the
-// reconciliation worker but should be migrated.
-func (s *Store) SetState(ctx context.Context, executionID string, state State, result json.RawMessage, evidenceDigest string) error {
-	_, err := s.db.ExecContext(ctx, `
-		UPDATE execution_requests
-		SET state = $1, result = $2, evidence_digest = $3, updated_at = NOW()
-		WHERE execution_id = $4
-	`, string(state), nullableBytes(result), nullableString(evidenceDigest), executionID)
-	return err
-}
-
-// SetStateWithVersion updates state with CAS (expected version).
-func (s *Store) SetStateWithVersion(ctx context.Context, executionID string, expectedVersion int, state State, result json.RawMessage, evidenceDigest string) error {
-	result2, err := s.db.ExecContext(ctx, `
-		UPDATE execution_requests
-		SET state = $1, result = $2, evidence_digest = $3, version = version + 1, updated_at = NOW()
-		WHERE execution_id = $4 AND version = $5
-	`, string(state), nullableBytes(result), nullableString(evidenceDigest), executionID, expectedVersion)
-	if err != nil {
-		return err
-	}
-	rows, err := result2.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if rows == 0 {
-		return fmt.Errorf("SET_STATE_CAS_FAILED: execution %s version %d transition to %s rejected", executionID, expectedVersion, state)
-	}
-	return nil
-}
+// ─── Lookup ─────────────────────────────────────────────────────────
 
 // Lookup retrieves a record by execution ID.
 func (s *Store) Lookup(ctx context.Context, executionID string) (*Record, error) {
 	var rec Record
 	var resultJSON []byte
-	var leaseOwner, leaseToken sql.NullString
-	var leaseExpiresAt sql.NullTime
+	var leaseOwner, leaseToken, providerID, providerRunID, terminalDigest sql.NullString
+	var leaseStartedAt, leaseExpiresAt sql.NullTime
 	err := s.db.QueryRowContext(ctx, `
 		SELECT execution_id, idempotency_key, principal_id, capability_id,
 		       request_digest, COALESCE(grant_id, ''), execution_class, state,
 		       result, COALESCE(evidence_digest, ''), COALESCE(receipt_version, 0),
-		       lease_owner, lease_token, lease_expires_at,
+		       lease_owner, lease_token, lease_started_at, lease_expires_at,
+		       COALESCE(lease_generation, 1),
+		       provider_id, provider_run_id, terminal_receipt_digest,
 		       COALESCE(attempt, 0), COALESCE(version, 1), created_at, updated_at
 		FROM execution_requests
 		WHERE execution_id = $1
@@ -528,7 +784,9 @@ func (s *Store) Lookup(ctx context.Context, executionID string) (*Record, error)
 		&rec.CapabilityID, &rec.RequestDigest, &rec.GrantID,
 		&rec.ExecutionClass, &rec.State, &resultJSON,
 		&rec.EvidenceDigest, &rec.ReceiptVersion,
-		&leaseOwner, &leaseToken, &leaseExpiresAt,
+		&leaseOwner, &leaseToken, &leaseStartedAt, &leaseExpiresAt,
+		&rec.LeaseGeneration,
+		&providerID, &providerRunID, &terminalDigest,
 		&rec.Attempt, &rec.Version, &rec.CreatedAt, &rec.UpdatedAt,
 	)
 	if err != nil {
@@ -541,9 +799,22 @@ func (s *Store) Lookup(ctx context.Context, executionID string) (*Record, error)
 	if leaseToken.Valid {
 		rec.LeaseToken = leaseToken.String
 	}
+	if leaseStartedAt.Valid {
+		t := leaseStartedAt.Time
+		rec.LeaseStartedAt = &t
+	}
 	if leaseExpiresAt.Valid {
 		t := leaseExpiresAt.Time
 		rec.LeaseExpiresAt = &t
+	}
+	if providerID.Valid {
+		rec.ProviderID = providerID.String
+	}
+	if providerRunID.Valid {
+		rec.ProviderRunID = providerRunID.String
+	}
+	if terminalDigest.Valid {
+		rec.TerminalReceiptDigest = terminalDigest.String
 	}
 	return &rec, nil
 }
@@ -556,13 +827,15 @@ func (s *Store) LookupByKey(ctx context.Context, principal, capability, key stri
 func (s *Store) lookupByKey(ctx context.Context, principal, capability, key string) (*Record, error) {
 	var rec Record
 	var resultJSON []byte
-	var leaseOwner, leaseToken sql.NullString
-	var leaseExpiresAt sql.NullTime
+	var leaseOwner, leaseToken, providerID, providerRunID, terminalDigest sql.NullString
+	var leaseStartedAt, leaseExpiresAt sql.NullTime
 	err := s.db.QueryRowContext(ctx, `
 		SELECT execution_id, idempotency_key, principal_id, capability_id,
 		       request_digest, COALESCE(grant_id, ''), execution_class, state,
 		       result, COALESCE(evidence_digest, ''), COALESCE(receipt_version, 0),
-		       lease_owner, lease_token, lease_expires_at,
+		       lease_owner, lease_token, lease_started_at, lease_expires_at,
+		       COALESCE(lease_generation, 1),
+		       provider_id, provider_run_id, terminal_receipt_digest,
 		       COALESCE(attempt, 0), COALESCE(version, 1), created_at, updated_at
 		FROM execution_requests
 		WHERE principal_id = $1 AND capability_id = $2 AND idempotency_key = $3
@@ -571,7 +844,9 @@ func (s *Store) lookupByKey(ctx context.Context, principal, capability, key stri
 		&rec.CapabilityID, &rec.RequestDigest, &rec.GrantID,
 		&rec.ExecutionClass, &rec.State, &resultJSON,
 		&rec.EvidenceDigest, &rec.ReceiptVersion,
-		&leaseOwner, &leaseToken, &leaseExpiresAt,
+		&leaseOwner, &leaseToken, &leaseStartedAt, &leaseExpiresAt,
+		&rec.LeaseGeneration,
+		&providerID, &providerRunID, &terminalDigest,
 		&rec.Attempt, &rec.Version, &rec.CreatedAt, &rec.UpdatedAt,
 	)
 	if err != nil {
@@ -584,32 +859,48 @@ func (s *Store) lookupByKey(ctx context.Context, principal, capability, key stri
 	if leaseToken.Valid {
 		rec.LeaseToken = leaseToken.String
 	}
+	if leaseStartedAt.Valid {
+		t := leaseStartedAt.Time
+		rec.LeaseStartedAt = &t
+	}
 	if leaseExpiresAt.Valid {
 		t := leaseExpiresAt.Time
 		rec.LeaseExpiresAt = &t
 	}
+	if providerID.Valid {
+		rec.ProviderID = providerID.String
+	}
+	if providerRunID.Valid {
+		rec.ProviderRunID = providerRunID.String
+	}
+	if terminalDigest.Valid {
+		rec.TerminalReceiptDigest = terminalDigest.String
+	}
 	return &rec, nil
 }
 
-// ListUnknown returns all records in UNKNOWN or RECONCILIATION_REQUIRED state.
+// ─── Listing ─────────────────────────────────────────────────────────
+
+// ListUnknown returns all records in UNKNOWN state.
 func (s *Store) ListUnknown(ctx context.Context) ([]*Record, error) {
-	return s.listByStates(ctx, []State{StateUnknown, StateReconciliationRequired})
+	return s.listByStates(ctx, []State{StateUnknown})
 }
 
-// ListExpiredLeases returns all non-terminal records whose lease has expired.
-// These are executions where the previous holder crashed and the
-// execution needs recovery.
+// ListExpiredLeases returns all PREPARED/EXECUTING/IN_FLIGHT records
+// whose lease has expired. These need recovery.
 func (s *Store) ListExpiredLeases(ctx context.Context) ([]*Record, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT execution_id, idempotency_key, principal_id, capability_id,
 		       request_digest, COALESCE(grant_id, ''), execution_class, state,
 		       result, COALESCE(evidence_digest, ''), COALESCE(receipt_version, 0),
-		       lease_owner, lease_token, lease_expires_at,
+		       lease_owner, lease_token, lease_started_at, lease_expires_at,
+		       COALESCE(lease_generation, 1),
+		       provider_id, provider_run_id, terminal_receipt_digest,
 		       COALESCE(attempt, 0), COALESCE(version, 1), created_at, updated_at
 		FROM execution_requests
-		WHERE state IN ('RESERVED', 'DISPATCHING', 'IN_FLIGHT')
+		WHERE state IN ('PREPARED', 'EXECUTING', 'IN_FLIGHT')
 		  AND lease_expires_at IS NOT NULL
-		  AND lease_expires_at < NOW()
+		  AND lease_expires_at < clock_timestamp()
 		ORDER BY updated_at
 	`)
 	if err != nil {
@@ -618,9 +909,8 @@ func (s *Store) ListExpiredLeases(ctx context.Context) ([]*Record, error) {
 	return scanRecords(rows)
 }
 
-// ListStuck returns all non-terminal records that need attention:
-// either UNKNOWN, RECONCILIATION_REQUIRED, or expired-lease stuck
-// in RESERVED/DISPATCHING/IN_FLIGHT.
+// ListStuck returns all records needing attention: UNKNOWN or
+// expired-lease stuck in PREPARED/EXECUTING/IN_FLIGHT.
 func (s *Store) ListStuck(ctx context.Context) ([]*Record, error) {
 	stuck, err := s.ListExpiredLeases(ctx)
 	if err != nil {
@@ -648,7 +938,9 @@ func (s *Store) listByStates(ctx context.Context, states []State) ([]*Record, er
 		SELECT execution_id, idempotency_key, principal_id, capability_id,
 		       request_digest, COALESCE(grant_id, ''), execution_class, state,
 		       result, COALESCE(evidence_digest, ''), COALESCE(receipt_version, 0),
-		       lease_owner, lease_token, lease_expires_at,
+		       lease_owner, lease_token, lease_started_at, lease_expires_at,
+		       COALESCE(lease_generation, 1),
+		       provider_id, provider_run_id, terminal_receipt_digest,
 		       COALESCE(attempt, 0), COALESCE(version, 1), created_at, updated_at
 		FROM execution_requests
 		WHERE state IN (`+placeholders+`)
@@ -667,14 +959,16 @@ func scanRecords(rows *sql.Rows) ([]*Record, error) {
 	for rows.Next() {
 		var rec Record
 		var resultJSON []byte
-		var leaseOwner, leaseToken sql.NullString
-		var leaseExpiresAt sql.NullTime
+		var leaseOwner, leaseToken, providerID, providerRunID, terminalDigest sql.NullString
+		var leaseStartedAt, leaseExpiresAt sql.NullTime
 		if err := rows.Scan(
 			&rec.ExecutionID, &rec.IdempotencyKey, &rec.PrincipalID,
 			&rec.CapabilityID, &rec.RequestDigest, &rec.GrantID,
 			&rec.ExecutionClass, &rec.State, &resultJSON,
 			&rec.EvidenceDigest, &rec.ReceiptVersion,
-			&leaseOwner, &leaseToken, &leaseExpiresAt,
+			&leaseOwner, &leaseToken, &leaseStartedAt, &leaseExpiresAt,
+			&rec.LeaseGeneration,
+			&providerID, &providerRunID, &terminalDigest,
 			&rec.Attempt, &rec.Version, &rec.CreatedAt, &rec.UpdatedAt,
 		); err != nil {
 			return nil, err
@@ -686,16 +980,165 @@ func scanRecords(rows *sql.Rows) ([]*Record, error) {
 		if leaseToken.Valid {
 			rec.LeaseToken = leaseToken.String
 		}
+		if leaseStartedAt.Valid {
+			t := leaseStartedAt.Time
+			rec.LeaseStartedAt = &t
+		}
 		if leaseExpiresAt.Valid {
 			t := leaseExpiresAt.Time
 			rec.LeaseExpiresAt = &t
+		}
+		if providerID.Valid {
+			rec.ProviderID = providerID.String
+		}
+		if providerRunID.Valid {
+			rec.ProviderRunID = providerRunID.String
+		}
+		if terminalDigest.Valid {
+			rec.TerminalReceiptDigest = terminalDigest.String
 		}
 		records = append(records, &rec)
 	}
 	return records, rows.Err()
 }
 
-// currentPID returns the current process ID (for lease owner identity).
+// ─── Backward-compatible wrappers ────────────────────────────────────
+//
+// These wrap the new contract methods with the old API to minimize
+// caller changes during migration. New code should use the typed API.
+
+// ReserveResult is the legacy outcome of a reservation attempt.
+type ReserveResult struct {
+	State      State   `json:"state"`
+	Record     *Record `json:"record,omitempty"`
+	Acquired   bool    `json:"acquired"`
+	Conflict   bool    `json:"conflict"`
+	LeaseToken string  `json:"lease_token,omitempty"`
+}
+
+// DefaultLeaseDuration is the default lease duration for new reservations.
+const DefaultLeaseDuration = 5 * time.Minute
+
+// Reserve atomically reserves an execution request (legacy wrapper).
+func (s *Store) Reserve(ctx context.Context, key, principal, capability, digest, grantID, class string) (*ReserveResult, error) {
+	return s.ReserveWithLease(ctx, key, principal, capability, digest, grantID, class, DefaultLeaseDuration)
+}
+
+// ReserveWithLease is Reserve with a configurable lease duration (legacy wrapper).
+func (s *Store) ReserveWithLease(ctx context.Context, key, principal, capability, digest, grantID, class string, leaseDuration time.Duration) (*ReserveResult, error) {
+	result, err := s.Acquire(ctx, key, principal, capability, digest, grantID, class, leaseDuration)
+	if err != nil {
+		return nil, err
+	}
+	return &ReserveResult{
+		State:      result.State,
+		Record:     result.Record,
+		Acquired:   result.Acquired(),
+		Conflict:   result.Kind == IdempotencyConflict,
+		LeaseToken: result.LeaseToken,
+	}, nil
+}
+
+// TransitionState performs a non-terminal state transition (legacy wrapper).
+// Maps old state names to new ones.
+func (s *Store) TransitionState(ctx context.Context, executionID, leaseToken string, expectedState, newState State) error {
+	// Map legacy state names.
+	expectedState = migrateState(expectedState)
+	newState = migrateState(newState)
+	// Look up the generation from the record.
+	rec, err := s.Lookup(ctx, executionID)
+	if err != nil {
+		return err
+	}
+	return s.leaseFencedTransition(ctx, executionID, leaseToken, rec.LeaseGeneration, expectedState, newState)
+}
+
+// FinalizeLegacy atomically finalizes an execution (legacy wrapper).
+// Maps old state names and constructs a TerminalReceipt from loose fields.
+// New code should use Finalize with a TerminalReceipt directly.
+func (s *Store) FinalizeLegacy(ctx context.Context, executionID, leaseToken string, expectedState, newState State, result json.RawMessage, evidenceDigest string, receiptVersion int) error {
+	expectedState = migrateState(expectedState)
+	newState = migrateState(newState)
+	rec, err := s.Lookup(ctx, executionID)
+	if err != nil {
+		return fmt.Errorf("finalize lookup failed: %w", err)
+	}
+	receipt := TerminalReceipt{
+		ExecutionID:     executionID,
+		Capability:      rec.CapabilityID,
+		Principal:       rec.PrincipalID,
+		RequestDigest:   rec.RequestDigest,
+		TerminalStatus:  newState,
+		CanonicalResult: result,
+		EvidenceDigest:  evidenceDigest,
+		ReceiptVersion:  receiptVersion,
+	}
+	return s.Finalize(ctx, executionID, leaseToken, rec.LeaseGeneration, expectedState, receipt)
+}
+
+// RenewLeaseLegacy extends the lease for the current holder (legacy wrapper).
+// Looks up the generation from the record. New code should pass generation explicitly.
+func (s *Store) RenewLeaseLegacy(ctx context.Context, executionID, leaseToken string, duration time.Duration) error {
+	rec, err := s.Lookup(ctx, executionID)
+	if err != nil {
+		return err
+	}
+	return s.RenewLease(ctx, executionID, leaseToken, rec.LeaseGeneration, duration)
+}
+
+// SetState updates the state of an execution request.
+// DEPRECATED: Use Finalize, EnterRecovery, or ResolveRecovery instead.
+// This method is retained for backward compatibility with the
+// reconciliation worker but should be migrated.
+func (s *Store) SetState(ctx context.Context, executionID string, state State, result json.RawMessage, evidenceDigest string) error {
+	state = migrateState(state)
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE execution_requests
+		SET state = $1, result = $2, evidence_digest = $3, updated_at = clock_timestamp()
+		WHERE execution_id = $4
+	`, string(state), nullableBytes(result), nullableString(evidenceDigest), executionID)
+	return err
+}
+
+// SetStateWithVersion updates state with CAS (expected version).
+func (s *Store) SetStateWithVersion(ctx context.Context, executionID string, expectedVersion int, state State, result json.RawMessage, evidenceDigest string) error {
+	state = migrateState(state)
+	result2, err := s.db.ExecContext(ctx, `
+		UPDATE execution_requests
+		SET state = $1, result = $2, evidence_digest = $3, version = version + 1, updated_at = clock_timestamp()
+		WHERE execution_id = $4 AND version = $5
+	`, string(state), nullableBytes(result), nullableString(evidenceDigest), executionID, expectedVersion)
+	if err != nil {
+		return err
+	}
+	rows, err := result2.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return fmt.Errorf("SET_STATE_CAS_FAILED: execution %s version %d transition to %s rejected", executionID, expectedVersion, state)
+	}
+	return nil
+}
+
+// migrateState maps legacy state names to the new vocabulary.
+func migrateState(s State) State {
+	switch s {
+	case "RESERVED":
+		return StatePrepared
+	case "DISPATCHING":
+		return StateExecuting
+	case "SUCCEEDED":
+		return StateCommitted
+	case "RECONCILIATION_REQUIRED":
+		return StateUnknown
+	default:
+		return s
+	}
+}
+
+// ─── Helpers ────────────────────────────────────────────────────────
+
 func currentPID() int {
 	return osGetpid()
 }
