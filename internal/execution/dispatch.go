@@ -105,25 +105,14 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 
 	// Check for existing terminal result — replay the stored result.
 	// Acquired=false means we did NOT create this reservation.
-	// P1 #8: Replay the stored provider_id and provider_run_id, not
-	// the adapter ID and execution ID. The caller should see the same
-	// execution metadata as the original provider result.
 	if !reserve.Acquired && reserve.Record != nil && reserve.State.IsTerminal() {
-		replayProvider := reserve.Record.ProviderID
-		if replayProvider == "" {
-			replayProvider = desc.AdapterID
-		}
-		replayRunID := reserve.Record.ProviderRunID
-		if replayRunID == "" {
-			replayRunID = reserve.Record.ExecutionID
-		}
 		return Response{
 			Status:   stateToStatus(reserve.State),
 			Result:   reserve.Record.Result,
 			Evidence: parseEvidence(reserve.Record.EvidenceDigest, reserve.Record.ReceiptVersion),
 			Execution: &ExecutionMeta{
-				Provider: replayProvider,
-				RunID:    replayRunID,
+				Provider: desc.AdapterID,
+				RunID:    reserve.Record.ExecutionID,
 			},
 		}
 	}
@@ -171,9 +160,24 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		}
 	}
 
+	// P1 #2: Lease heartbeat — renew the lease while the provider is
+	// executing. Without this, a long-running provider call can exceed
+	// the lease duration, causing the record to become UNKNOWN even
+	// though the provider eventually succeeds. The heartbeat renews
+	// the lease at the configured RenewalWindow interval until the
+	// provider call completes or the context is cancelled.
+	leaseGen := reserve.Generation
+	heartbeatCtx, heartbeatCancel := context.WithCancel(ctx)
+	defer heartbeatCancel()
+	go e.leaseHeartbeat(heartbeatCtx, executionID, leaseToken, leaseGen)
+
 	// Dispatch — from this point, we are POST_DISPATCH.
 	// Any failure after this point is UNKNOWN (may have executed).
 	resp := e.dispatch(ctx, req, desc)
+
+	// Stop the heartbeat as soon as the provider call returns.
+	// Finalization does not require an active lease renewal.
+	heartbeatCancel()
 
 	// ─── CRITICAL EVIDENCE VALIDATION BEFORE PERSISTENCE ──────────────────
 	// The evidence contract MUST be validated BEFORE the terminal state
@@ -219,10 +223,10 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	}
 
 	// ─── DETERMINE TERMINAL STATE ──────────────────────────────────────────
-	// P1 #3: After the dispatch boundary (IN_FLIGHT), a generic FAILED
-	// is treated as UNKNOWN unless the handler explicitly marks it as
-	// a DefinitiveFailure (proven no side effect). This prevents a
-	// provider that lost connection from causing a blind retry.
+	// P1 #5: DENIED is a pre-dispatch admission concept. After the
+	// dispatch boundary (IN_FLIGHT has been persisted), a handler
+	// returning StatusDenied cannot prove no side effect occurred.
+	// Map it to UNKNOWN for reconciliation, not DENIED.
 	var state idempotency.State
 	switch resp.Status {
 	case StatusSucceeded:
@@ -237,7 +241,10 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 			state = idempotency.StateUnknown
 		}
 	case StatusDenied:
-		state = idempotency.StateDenied
+		// DENIED after dispatch is semantically incorrect — the
+		// dispatch boundary was already crossed. Treat as UNKNOWN
+		// since we cannot prove the provider didn't act.
+		state = idempotency.StateUnknown
 	default:
 		state = idempotency.StateUnknown
 	}
@@ -406,50 +413,3 @@ func stateToStatus(state idempotency.State) string {
 		return string(state)
 	}
 }
-
-// leaseHeartbeat periodically renews the lease while a provider call is
-// active. This prevents long-running provider calls from exceeding the
-// lease duration and falling into UNKNOWN despite successful execution.
-//
-// The heartbeat runs in a goroutine started after IN_FLIGHT is persisted.
-// It renews the lease at the store's configured RenewalWindow interval.
-// Renewal stops when:
-//   - The dispatch context is cancelled (caller gave up or timed out)
-//   - heartbeatCancel() is called (provider call returned)
-//   - RenewLease fails (lease was taken over or record advanced)
-//
-// Renewal failures are logged but do not cancel the provider call —
-// the provider may still succeed, and finalization will fail-closed
-// if the lease was actually lost.
-func (e *DispatchExecutor) leaseHeartbeat(ctx context.Context, executionID, leaseToken string, leaseGeneration int) {
-	// Renew at 80% of the default lease duration to stay well ahead of
-	// expiry. The store's RenewLease checks that the lease is still
-	// valid before extending.
-	renewalInterval := defaultLeaseRenewalInterval
-	ticker := time.NewTicker(renewalInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if err := e.store.RenewLease(ctx, executionID, leaseToken, leaseGeneration, defaultLeaseRenewalDuration); err != nil {
-				// Lease renewal failed — the lease may have expired,
-				// been taken over, or the record advanced. Log and
-				// stop renewing. The provider call continues; if it
-				// succeeds, Finalize will fail-closed on the stale lease.
-				return
-			}
-		}
-	}
-}
-
-// defaultLeaseRenewalInterval is the interval at which the lease heartbeat
-// attempts renewal. It is set to 4 minutes, which is 80% of the default
-// 5-minute lease duration, providing a comfortable margin before expiry.
-const defaultLeaseRenewalInterval = 4 * time.Minute
-
-// defaultLeaseRenewalDuration is the duration for which each renewal
-// extends the lease. It matches the default lease duration of 5 minutes.
-const defaultLeaseRenewalDuration = 5 * time.Minute
