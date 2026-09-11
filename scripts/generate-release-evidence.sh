@@ -256,7 +256,11 @@ run_gate effect-fabric-contract go test -count=1 -timeout=60s \
 # effect-fabric-race: race-detector run over the execution + idempotency
 # + capability packages. Closes concurrent-acquisition races and
 # stale-worker fencing violations.
-run_gate effect-fabric-race go test -race -count=1 -timeout=120s \
+# Unset CRABBOX_TEST_DATABASE_URL so live tests skip — the race gate
+# should not run live PostgreSQL tests (they're too slow with -race
+# and are covered by effect-fabric-postgres separately).
+run_gate effect-fabric-race env -u CRABBOX_TEST_DATABASE_URL \
+  go test -race -count=1 -timeout=120s \
   ./internal/capability/ ./internal/execution/ ./internal/idempotency/
 
 # ─── Phase 10-12: Live PostgreSQL gates ────────────────────────────────────
@@ -403,6 +407,8 @@ run_effect_fabric_postgres_gate() {
   if [ "$rc" -ne 0 ]; then
     record_gate "$name" "FAIL" "$rc" "$log"
     echo "  FAIL  $name (exit=$rc)"
+    # Print the test output to stdout so failures are visible in CI.
+    cat "$log"
     return
   fi
 
