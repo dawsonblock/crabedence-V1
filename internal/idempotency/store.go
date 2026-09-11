@@ -301,7 +301,7 @@ func (s *Store) Acquire(ctx context.Context, key, principal, capability, digest,
 				Kind:       LeaseReclaimed,
 				State:      StatePrepared,
 				LeaseToken: leaseToken,
-				Generation: rec.LeaseGeneration + 1,
+				Generation: rec.LeaseGeneration,
 				Record:     rec,
 			}, nil
 		}
