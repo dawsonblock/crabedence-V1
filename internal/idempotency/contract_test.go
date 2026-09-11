@@ -139,19 +139,19 @@ func TestTerminalReceiptDigestExcludesFinalizedAt(t *testing.T) {
 
 func TestTerminalReceiptDigestDifferentResults(t *testing.T) {
 	r1 := TerminalReceipt{
-		ExecutionID:    "exec-1",
-		Capability:     "cap",
-		Principal:      "alice",
-		RequestDigest:  "d",
-		TerminalStatus: StateCommitted,
+		ExecutionID:     "exec-1",
+		Capability:      "cap",
+		Principal:       "alice",
+		RequestDigest:   "d",
+		TerminalStatus:  StateCommitted,
 		CanonicalResult: json.RawMessage(`{"value":1}`),
 	}
 	r2 := TerminalReceipt{
-		ExecutionID:    "exec-1",
-		Capability:     "cap",
-		Principal:      "alice",
-		RequestDigest:  "d",
-		TerminalStatus: StateCommitted,
+		ExecutionID:     "exec-1",
+		Capability:      "cap",
+		Principal:       "alice",
+		RequestDigest:   "d",
+		TerminalStatus:  StateCommitted,
 		CanonicalResult: json.RawMessage(`{"value":2}`),
 	}
 	d1, _ := r1.Digest()
