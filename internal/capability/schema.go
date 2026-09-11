@@ -84,6 +84,23 @@ func validateObject(schema map[string]any, obj map[string]any, path string) erro
 		}
 	}
 
+	// additionalProperties: false rejects unknown properties.
+	// JSON Schema default is to allow additional properties, but
+	// capability schemas should declare additionalProperties: false
+	// to prevent unexpected arguments from silently passing.
+	if ap, ok := schema["additionalProperties"]; ok {
+		if allow, ok := ap.(bool); ok && !allow {
+			for name := range obj {
+				if _, declared := props[name]; !declared {
+					if path == "" {
+						return fmt.Errorf("unknown field: %s (additionalProperties is false)", name)
+					}
+					return fmt.Errorf("%s: unknown field: %s (additionalProperties is false)", path, name)
+				}
+			}
+		}
+	}
+
 	return nil
 }
 

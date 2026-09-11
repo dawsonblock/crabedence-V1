@@ -146,6 +146,16 @@ required evidence invalid/missing
 → reconciliation required
 ```
 
+This applies to ALL evidence validation failures after the dispatch
+boundary has been crossed (IN_FLIGHT persisted), including:
+- Missing evidence digest
+- Invalid evidence digest format
+- Wrong receipt version
+- Missing provider run ID
+
+Returning FAILED in any of these cases would allow a blind retry of
+an operation that may have already executed.
+
 ## 7. Terminal finalization
 
 ### Immutability

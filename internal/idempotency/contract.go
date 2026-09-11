@@ -114,6 +114,29 @@ const (
 
 func (e LeaseError) Error() string { return string(e) }
 
+// ─── Clock ────────────────────────────────────────────────────────────
+
+// Clock provides the current time. The store uses clock_timestamp()
+// in PostgreSQL for live deployments, but tests can inject a
+// deterministic clock to control lease expiry without sleeping.
+type Clock interface {
+	Now() time.Time
+}
+
+// SystemClock returns the real wall-clock time.
+type SystemClock struct{}
+
+// Now returns time.Now().
+func (SystemClock) Now() time.Time { return time.Now() }
+
+// FixedClock returns a fixed time. Useful for deterministic tests.
+type FixedClock struct {
+	T time.Time
+}
+
+// Now returns the fixed time.
+func (c FixedClock) Now() time.Time { return c.T }
+
 // ─── Acquire result ──────────────────────────────────────────────────
 
 // AcquireResultKind is the typed outcome of a lease acquisition attempt.

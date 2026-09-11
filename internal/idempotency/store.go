@@ -1086,20 +1086,6 @@ func (s *Store) RenewLeaseLegacy(ctx context.Context, executionID, leaseToken st
 	return s.RenewLease(ctx, executionID, leaseToken, rec.LeaseGeneration, duration)
 }
 
-// SetState updates the state of an execution request.
-// DEPRECATED: Use Finalize, EnterRecovery, or ResolveRecovery instead.
-// This method is retained for backward compatibility with the
-// reconciliation worker but should be migrated.
-func (s *Store) SetState(ctx context.Context, executionID string, state State, result json.RawMessage, evidenceDigest string) error {
-	state = migrateState(state)
-	_, err := s.db.ExecContext(ctx, `
-		UPDATE execution_requests
-		SET state = $1, result = $2, evidence_digest = $3, updated_at = clock_timestamp()
-		WHERE execution_id = $4
-	`, string(state), nullableBytes(result), nullableString(evidenceDigest), executionID)
-	return err
-}
-
 // SetStateWithVersion updates state with CAS (expected version).
 func (s *Store) SetStateWithVersion(ctx context.Context, executionID string, expectedVersion int, state State, result json.RawMessage, evidenceDigest string) error {
 	state = migrateState(state)

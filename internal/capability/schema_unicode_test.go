@@ -47,3 +47,77 @@ func TestSchemaMinLengthUnicode(t *testing.T) {
 		t.Error("expected 2-rune string to fail minLength=3")
 	}
 }
+
+// TestSchemaAdditionalPropertiesFalse verifies that when
+// additionalProperties is false, unknown properties are rejected.
+func TestSchemaAdditionalPropertiesFalse(t *testing.T) {
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"name": map[string]any{"type": "string"},
+			"age":  map[string]any{"type": "integer"},
+		},
+		"additionalProperties": false,
+	}
+
+	// Valid: only declared properties.
+	if err := validateObject(schema, map[string]any{
+		"name": "alice",
+		"age":  float64(30),
+	}, ""); err != nil {
+		t.Errorf("expected valid object to pass, got: %v", err)
+	}
+
+	// Invalid: unknown property "email".
+	err := validateObject(schema, map[string]any{
+		"name":  "alice",
+		"email": "alice@example.com",
+	}, "")
+	if err == nil {
+		t.Error("expected unknown property 'email' to be rejected")
+	}
+
+	// Invalid: unknown property at nested path.
+	nestedSchema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"user": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"name": map[string]any{"type": "string"},
+				},
+				"additionalProperties": false,
+			},
+		},
+		"additionalProperties": false,
+	}
+	err = validateObject(nestedSchema, map[string]any{
+		"user": map[string]any{
+			"name":  "alice",
+			"email": "alice@example.com",
+		},
+	}, "")
+	if err == nil {
+		t.Error("expected nested unknown property to be rejected")
+	}
+}
+
+// TestSchemaAdditionalPropertiesDefault verifies that when
+// additionalProperties is not set (default), unknown properties
+// are allowed (JSON Schema default behavior).
+func TestSchemaAdditionalPropertiesDefault(t *testing.T) {
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"name": map[string]any{"type": "string"},
+		},
+	}
+
+	// No additionalProperties set — unknown properties allowed.
+	if err := validateObject(schema, map[string]any{
+		"name":  "alice",
+		"email": "alice@example.com",
+	}, ""); err != nil {
+		t.Errorf("expected unknown property to be allowed by default, got: %v", err)
+	}
+}

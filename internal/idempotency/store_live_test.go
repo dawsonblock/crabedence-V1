@@ -620,8 +620,9 @@ func TestLiveStoreCrashInFlightUnknown(t *testing.T) {
 		t.Errorf("record should still be IN_FLIGHT after crash, got %s", rec.State)
 	}
 
-	// The reconcile worker would mark this as UNKNOWN. Simulate that.
-	if err := store.SetState(ctx, execID, StateUnknown, nil, ""); err != nil {
+	// The reconcile worker would mark this as UNKNOWN. Simulate that
+	// using the contract's EnterRecovery (CAS, not blind SetState).
+	if err := store.EnterRecovery(ctx, execID, StateInFlight, rec.Version); err != nil {
 		t.Fatalf("failed to mark crashed IN_FLIGHT as UNKNOWN: %v", err)
 	}
 
@@ -824,23 +825,37 @@ func TestLiveStoreRecoveryWithProofOfCompletion(t *testing.T) {
 	}
 	execID := reserve.Record.ExecutionID
 
-	if err := store.SetState(ctx, execID, StateUnknown, nil, ""); err != nil {
+	// Transition to UNKNOWN via the contract's EnterRecovery (CAS).
+	rec, err := store.Lookup(ctx, execID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnterRecovery(ctx, execID, StatePrepared, rec.Version); err != nil {
 		t.Fatal(err)
 	}
 
 	// Simulate the reconcile worker: resolver confirms completion.
 	proofResult := []byte(`{"confirmed":true,"provider_run_id":"run_123"}`)
-	if err := store.SetState(ctx, execID, StateSucceeded, proofResult, "proof_digest_000000000000000000000000000000000000000000000000000000123456"); err != nil {
-		t.Fatalf("recovery to SUCCEEDED failed: %v", err)
-	}
-
-	// Verify.
-	rec, err := store.Lookup(ctx, execID)
+	rec, err = store.Lookup(ctx, execID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rec.State != StateSucceeded {
-		t.Errorf("recovery with proof should result in SUCCEEDED, got %s", rec.State)
+	if err := store.ResolveRecovery(ctx, execID, rec.Version, RecoveryCommitted, RecoveryResult{
+		Decision:       RecoveryCommitted,
+		Result:         proofResult,
+		EvidenceDigest: "proof_digest_000000000000000000000000000000000000000000000000000000123456",
+		ProviderRunID:  "run_123",
+	}); err != nil {
+		t.Fatalf("recovery to COMMITTED failed: %v", err)
+	}
+
+	// Verify.
+	rec, err = store.Lookup(ctx, execID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.State != StateCommitted {
+		t.Errorf("recovery with proof should result in COMMITTED, got %s", rec.State)
 	}
 
 	db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key = $1`, key)
@@ -883,18 +898,30 @@ func TestLiveStoreRecoveryWithProofOfFailure(t *testing.T) {
 	}
 	execID := reserve.Record.ExecutionID
 
-	if err := store.SetState(ctx, execID, StateUnknown, nil, ""); err != nil {
+	// Transition to UNKNOWN via the contract's EnterRecovery (CAS).
+	rec, err := store.Lookup(ctx, execID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnterRecovery(ctx, execID, StatePrepared, rec.Version); err != nil {
 		t.Fatal(err)
 	}
 
 	// Simulate the reconcile worker: resolver confirms failure.
 	proofResult := []byte(`{"confirmed":false,"error":"provider returned error"}`)
-	if err := store.SetState(ctx, execID, StateFailed, proofResult, ""); err != nil {
+	rec, err = store.Lookup(ctx, execID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ResolveRecovery(ctx, execID, rec.Version, RecoveryFailed, RecoveryResult{
+		Decision: RecoveryFailed,
+		Result:   proofResult,
+	}); err != nil {
 		t.Fatalf("recovery to FAILED failed: %v", err)
 	}
 
 	// Verify.
-	rec, err := store.Lookup(ctx, execID)
+	rec, err = store.Lookup(ctx, execID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -942,14 +969,18 @@ func TestLiveStoreRecoveryWithoutProofStaysUnknown(t *testing.T) {
 	}
 	execID := reserve.Record.ExecutionID
 
-	if err := store.SetState(ctx, execID, StateUnknown, nil, ""); err != nil {
+	rec, err := store.Lookup(ctx, execID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnterRecovery(ctx, execID, StatePrepared, rec.Version); err != nil {
 		t.Fatal(err)
 	}
 
 	// Simulate the reconcile worker: NoopResolver returns UNKNOWN.
-	// The worker should NOT call SetState (state stays UNKNOWN).
+	// The worker should NOT change state (stays UNKNOWN).
 	// Verify the record is still UNKNOWN after "reconciliation".
-	rec, err := store.Lookup(ctx, execID)
+	rec, err = store.Lookup(ctx, execID)
 	if err != nil {
 		t.Fatal(err)
 	}

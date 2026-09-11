@@ -313,33 +313,39 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 	response := s.handler.Execute(ctx, req, decision.Descriptor)
 
 	// Validate CRITICAL evidence
+	// CRITICAL: if evidence validation fails AFTER the provider has been
+	// called (dispatch boundary crossed), the result is UNKNOWN — not
+	// FAILED. The provider may have executed the side effect. Returning
+	// FAILED would allow a blind retry. Per the durable execution
+	// contract §6: evidence validation failure after provider success is
+	// uncertainty, not failure.
 	if decision.Descriptor.ExecutionClass.RequiresEvidence() && response.Status == StatusSucceeded {
 		if response.Evidence == nil || response.Evidence.Digest == "" {
 			response = Response{
-				Status:      StatusFailed,
-				FailureCode: string(capability.FailureExecutionFailed),
-				Error:       "CRITICAL capability returned SUCCEEDED without evidence digest",
+				Status:      StatusUnknown,
+				FailureCode: string(capability.FailureExecutionUnknown),
+				Error:       "CRITICAL capability returned SUCCEEDED without evidence digest (post-dispatch uncertainty)",
 				Execution:   response.Execution,
 			}
 		} else if !isValidEvidenceDigest(response.Evidence.Digest) {
 			response = Response{
-				Status:      StatusFailed,
-				FailureCode: string(capability.FailureExecutionFailed),
-				Error:       "CRITICAL capability returned invalid evidence digest (must be 64-char lowercase hex)",
+				Status:      StatusUnknown,
+				FailureCode: string(capability.FailureExecutionUnknown),
+				Error:       "CRITICAL capability returned invalid evidence digest (post-dispatch uncertainty)",
 				Execution:   response.Execution,
 			}
 		} else if response.Evidence.ReceiptVersion != 3 {
 			response = Response{
-				Status:      StatusFailed,
-				FailureCode: string(capability.FailureExecutionFailed),
-				Error:       fmt.Sprintf("CRITICAL capability returned receipt_version %d (must be 3)", response.Evidence.ReceiptVersion),
+				Status:      StatusUnknown,
+				FailureCode: string(capability.FailureExecutionUnknown),
+				Error:       fmt.Sprintf("CRITICAL capability returned receipt_version %d (must be 3, post-dispatch uncertainty)", response.Evidence.ReceiptVersion),
 				Execution:   response.Execution,
 			}
 		} else if response.Execution == nil || response.Execution.RunID == "" {
 			response = Response{
-				Status:      StatusFailed,
-				FailureCode: string(capability.FailureExecutionFailed),
-				Error:       "CRITICAL capability returned SUCCEEDED without run_id",
+				Status:      StatusUnknown,
+				FailureCode: string(capability.FailureExecutionUnknown),
+				Error:       "CRITICAL capability returned SUCCEEDED without run_id (post-dispatch uncertainty)",
 			}
 		}
 	}
