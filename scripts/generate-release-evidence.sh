@@ -239,6 +239,26 @@ run_gate go-race-evidence go test -race -count=1 -timeout=120s \
 run_gate go-race-providers go test -race -count=1 -timeout=120s \
   ./internal/providers/tart/ ./internal/providers/lume/ ./internal/providers/shared/
 
+# ─── Effect Fabric contract gates ────────────────────────────────────────────
+# Dedicated gates for the durable execution contract. These are NOT
+# hidden inside the general Go test gates — they are first-class
+# release gates so that contract regressions are immediately visible.
+echo ""
+echo "=== Effect Fabric contract gates ==="
+
+# effect-fabric-contract: typed contract unit tests (no DB required).
+# Verifies state predicates, lease config validation, acquire result
+# kinds, terminal receipt digest, and recovery decision types.
+run_gate effect-fabric-contract go test -count=1 -timeout=60s \
+  -run "TestStateIsTerminal|TestStateCallerTerminal|TestStateDurablyFinal" \
+  ./internal/idempotency/
+
+# effect-fabric-race: race-detector run over the execution + idempotency
+# + capability packages. Closes concurrent-acquisition races and
+# stale-worker fencing violations.
+run_gate effect-fabric-race go test -race -count=1 -timeout=120s \
+  ./internal/capability/ ./internal/execution/ ./internal/idempotency/
+
 # ─── Phase 10-12: Live PostgreSQL gates ────────────────────────────────────
 echo ""
 echo "=== Live PostgreSQL gates ==="
@@ -334,6 +354,79 @@ run_live_postgres_gate() {
 run_live_postgres_gate postgres-fencing test/postgres-authority-fencing.live.test.ts
 run_live_postgres_gate postgres-parity test/coordinator-parity.live.test.ts
 
+# effect-fabric-postgres: live PostgreSQL contract tests for the
+# durable execution store. Runs the expired-lease matrix, stale-worker
+# fencing, finalization conflicts, and evidence recovery tests.
+# These require a real PostgreSQL instance (CRABBOX_TEST_DATABASE_URL).
+echo ""
+echo "=== Effect Fabric live PostgreSQL gates ==="
+
+# Live Go PostgreSQL gate for the effect fabric contract.
+# Uses the same fail-closed wrapper pattern as the Vitest live gates.
+run_effect_fabric_postgres_gate() {
+  local name="effect-fabric-postgres"
+  local log="$EVIDENCE_DIR/gate-results/${name}.log"
+
+  if [ -z "${CRABBOX_TEST_DATABASE_URL:-}" ]; then
+    {
+      echo "command=run_effect_fabric_postgres_gate"
+      echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      echo "---"
+      echo "SKIP: CRABBOX_TEST_DATABASE_URL not set"
+      echo "exit=1"
+      echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "$log"
+    record_gate "$name" "FAIL" 1 "$log"
+    echo "  FAIL  $name (CRABBOX_TEST_DATABASE_URL not set)"
+    return
+  fi
+
+  {
+    echo "command=go test -count=1 -timeout=300s -run TestLiveEffectFabric ./internal/idempotency/"
+    echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "---"
+  } > "$log"
+
+  set +e
+  go test -count=1 -timeout=300s \
+    -run "TestLiveEffectFabric|TestLiveStore" \
+    ./internal/idempotency/ >> "$log" 2>&1
+  local rc=$?
+  set -e
+
+  {
+    echo "---"
+    echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "exit=$rc"
+  } >> "$log"
+
+  if [ "$rc" -ne 0 ]; then
+    record_gate "$name" "FAIL" "$rc" "$log"
+    echo "  FAIL  $name (exit=$rc)"
+    return
+  fi
+
+  # Verify tests actually executed (not skipped). Go test prints "ok"
+  # lines for packages that ran tests.
+  local executed
+  executed=$(grep -cE '^(ok|FAIL|--- PASS|--- FAIL)' "$log" 2>/dev/null || true)
+  if [ "$executed" -le 0 ]; then
+    {
+      echo ""
+      echo "FAIL: 0 tests executed (all skipped or no match)"
+      echo "exit=1"
+    } >> "$log"
+    record_gate "$name" "FAIL" 1 "$log"
+    echo "  FAIL  $name (0 tests executed)"
+    return
+  fi
+
+  record_gate "$name" "PASS" 0 "$log"
+  echo "  PASS  $name ($executed test lines)"
+}
+
+run_effect_fabric_postgres_gate
+
 # ─── Phase 13: Cross-language conformance ───────────────────────────────────
 echo ""
 echo "=== Cross-language conformance ==="
@@ -416,7 +509,7 @@ extract_tests_executed() {
   local count=0
 
   case "$gate_name" in
-    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-cli)
+    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-cli|effect-fabric-contract|effect-fabric-race|effect-fabric-postgres)
       # Go test without -v prints one line per package:
       #   ok  \t<package>\t<duration>
       #   FAIL\t<package>\t<duration>
@@ -549,7 +642,12 @@ cat > "$EVIDENCE_DIR/qualification.json" << EOF
     {"id": "CRAB-V1-013", "description": "Go capability registry is authoritative for execution class"},
     {"id": "CRAB-V1-014", "description": "durable idempotency prevents duplicate side effects"},
     {"id": "CRAB-V1-015", "description": "UNKNOWN is a first-class terminal state for post-dispatch ambiguity"},
-    {"id": "CRAB-V1-016", "description": "crabbox exec never returns fake success for undispatched operations"}
+    {"id": "CRAB-V1-016", "description": "crabbox exec never returns fake success for undispatched operations"},
+    {"id": "CRAB-V1-017", "description": "expired IN_FLIGHT work is never blindly redispatched"},
+    {"id": "CRAB-V1-018", "description": "only an unexpired active lease generation may mutate execution state"},
+    {"id": "CRAB-V1-019", "description": "terminal finalization is immutable and conflict-aware"},
+    {"id": "CRAB-V1-020", "description": "post-dispatch uncertainty cannot become retryable without evidence"},
+    {"id": "CRAB-V1-021", "description": "concurrent identical mutations cause at most one provider dispatch"}
   ],
   "provenance": {
     "commit": "$COMMIT",
@@ -590,8 +688,27 @@ cp "$REPO_ROOT/schemas/qualification.schema.json" "$EVIDENCE_DIR/schemas/qualifi
 #
 # RELEASE_NAME / RELEASE_VERSION come from the environment (set by CI)
 # so that the same script works for any RC version without code changes.
-RELEASE_NAME="${RELEASE_NAME:-crabedence-v1.0.0-rc.2}"
-RELEASE_VERSION="${RELEASE_VERSION:-1.0.0-rc.2}"
+# Require explicit RELEASE_VERSION — fail closed if not set.
+if [ -z "${RELEASE_VERSION:-}" ]; then
+  echo "ERROR: RELEASE_VERSION must be set (e.g., 1.0.0-rc.7)" >&2
+  echo "       Refusing to use a hardcoded default." >&2
+  exit 1
+fi
+RELEASE_NAME="${RELEASE_NAME:-crabedence-v${RELEASE_VERSION}}"
+
+# Aggregate tests_executed across all test gates for the release manifest.
+TOTAL_TESTS_EXECUTED=0
+TOTAL_TESTS_SKIPPED=0
+for i in "${!GATE_NAMES[@]}"; do
+  gate_name="${GATE_NAMES[$i]}"
+  case "$gate_name" in
+    *tests|postgres-*|effect-fabric-*|cross-language-conformance)
+      te="$(extract_tests_executed "$gate_name" "${GATE_LOG[$i]}")"
+      TOTAL_TESTS_EXECUTED=$((TOTAL_TESTS_EXECUTED + te))
+      ;;
+  esac
+done
+
 cat > "$EVIDENCE_DIR/release-manifest.json" << EOF
 {
   "release_name": "$RELEASE_NAME",
@@ -608,6 +725,8 @@ cat > "$EVIDENCE_DIR/release-manifest.json" << EOF
     "total_gates": $TOTAL_GATES,
     "passed_gates": $PASSED_GATES,
     "failed_gates": $FAILED_GATES,
+    "tests_executed": $TOTAL_TESTS_EXECUTED,
+    "tests_skipped": $TOTAL_TESTS_SKIPPED,
     "qualification_file": "qualification.json"
   },
   "evidence_bundle": {

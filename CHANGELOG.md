@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### RC7 — Effect Fabric Durable Store Contracts
+
+- Execution: durable store contract replaced with lease-fenced, conflict-aware lifecycle. New state vocabulary: PREPARED, EXECUTING, IN_FLIGHT, UNKNOWN, COMMITTED, FAILED, DENIED. PostgreSQL owns lease time via `clock_timestamp()`. Lease generation acts as a fencing epoch — stale workers cannot mutate state after takeover.
+- Execution: typed `AcquireResult` replaces boolean acquisition. Kinds: ACQUIRED, HELD_BY_OTHER, RECLAIMED, TERMINAL_REPLAY, RECOVERY_REQUIRED, IDEMPOTENCY_CONFLICT. State-aware reclaim matrix: PREPARED/EXECUTING + expired → reclaim; IN_FLIGHT + expired → UNKNOWN (never blind-retry).
+- Execution: immutable terminal receipts with `terminal_receipt_sha256`. Same receipt twice → idempotent; different result/provider/version → FINALIZATION_CONFLICT. Post-dispatch uncertainty enters recovery (UNKNOWN), not FAILED.
+- Execution: `RecoveryDecision` typed contract (COMMITTED/FAILED/UNKNOWN/RETRYABLE/CONFLICT). `NoopResolver` honestly returns UNKNOWN rather than pretending success or safe retry.
+- Release: dedicated gates `effect-fabric-contract`, `effect-fabric-postgres`, `effect-fabric-race`. New invariants CRAB-V1-017 through CRAB-V1-021. `RELEASE_VERSION` required explicitly (no hardcoded default). Attestation subject matches actual attested object (`evidence-manifest.json`).
+- See `docs/spec/durable-execution-contract.md` for the frozen invariants.
+
 ### RC6.1 — Planner-Agnostic Execution Kernel
 
 - Architecture: three orthogonal dimensions pinned per capability — effect class (PURE/READ/MUTATION/CRITICAL), assurance profile (NONE/STANDARD/DURABLE/HIGH_ASSURANCE), execution route (LOCAL/DIRECT/CRABEDENCE). The dispatch layer reads the route from the descriptor; the planner does not decide what is "safe."
