@@ -962,7 +962,7 @@ func TestLiveStoreRecoveryWithoutProofStaysUnknown(t *testing.T) {
 	grantID := "grant_test"
 	class := "MUTATION"
 
-	// Create a record in UNKNOWN state.
+	// Create a record in UNKNOWN state via EnterRecovery (CAS).
 	reserve, err := store.Reserve(ctx, key, principal, capability, digest, grantID, class)
 	if err != nil {
 		t.Fatal(err)
