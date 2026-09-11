@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 )
 
 // ValidateArguments validates request arguments against a capability's
@@ -120,12 +121,16 @@ func validateValue(schema map[string]any, val any, path string) error {
 	}
 
 	// String checks
+	// JSON Schema minLength/maxLength count Unicode code points
+	// (runes), not UTF-8 bytes. A 3-character Japanese string like
+	// "日本語" has 9 UTF-8 bytes but 3 code points.
 	if s, ok := val.(string); ok {
-		if minLength, ok := schema["minLength"].(float64); ok && int(minLength) > 0 && len(s) < int(minLength) {
-			return fmt.Errorf("%s: string length %d is less than minLength %d", path, len(s), int(minLength))
+		runeCount := utf8.RuneCountInString(s)
+		if minLength, ok := schema["minLength"].(float64); ok && int(minLength) > 0 && runeCount < int(minLength) {
+			return fmt.Errorf("%s: string length %d is less than minLength %d", path, runeCount, int(minLength))
 		}
-		if maxLength, ok := schema["maxLength"].(float64); ok && int(maxLength) > 0 && len(s) > int(maxLength) {
-			return fmt.Errorf("%s: string length %d is greater than maxLength %d", path, len(s), int(maxLength))
+		if maxLength, ok := schema["maxLength"].(float64); ok && int(maxLength) > 0 && runeCount > int(maxLength) {
+			return fmt.Errorf("%s: string length %d is greater than maxLength %d", path, runeCount, int(maxLength))
 		}
 	}
 

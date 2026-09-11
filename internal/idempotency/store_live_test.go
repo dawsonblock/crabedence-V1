@@ -1539,3 +1539,160 @@ func TestLiveEffectFabricEvidenceRecovery(t *testing.T) {
 		db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key = $1`, k)
 	}
 }
+
+// TestLiveEffectFabricCrashAfterPrepared verifies that a crash after
+// PREPARED (before EXECUTING) is safely reclaimable: the lease expires
+// and a new caller can reclaim and complete the execution.
+func TestLiveEffectFabricCrashAfterPrepared(t *testing.T) {
+	dbURL := os.Getenv("CRABBOX_TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live PostgreSQL test")
+	}
+
+	db, err := openTestDB(dbURL)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	store, err := NewStore(db)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+
+	ctx := context.Background()
+	key := fmt.Sprintf("test-crash-prepared-%d", time.Now().UnixNano())
+	db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key LIKE 'test-crash-prepared-%'`)
+	defer db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key = $1`, key)
+
+	// Caller A acquires and reaches PREPARED, then crashes.
+	acqA, err := store.Acquire(ctx, key, "alice@example.com", "test.counter.increment",
+		"digest-crash-prepared", "grant_test", "MUTATION", 100*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acqA.Kind != LeaseAcquired {
+		t.Fatalf("expected ACQUIRED, got %s", acqA.Kind)
+	}
+	// Crash: no BeginExecution, no further action.
+
+	time.Sleep(200 * time.Millisecond)
+
+	// Caller B reclaims after lease expiry.
+	acqB, err := store.Acquire(ctx, key, "alice@example.com", "test.counter.increment",
+		"digest-crash-prepared", "grant_test", "MUTATION", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acqB.Kind != LeaseReclaimed {
+		t.Fatalf("expected RECLAIMED, got %s", acqB.Kind)
+	}
+
+	// Caller A's old token cannot begin execution.
+	if err := store.BeginExecution(ctx, acqA.Record.ExecutionID, acqA.LeaseToken, acqA.Generation); err == nil {
+		t.Error("old lease holder should NOT be able to BeginExecution after takeover")
+	}
+
+	// Caller B completes the lifecycle.
+	if err := store.BeginExecution(ctx, acqB.Record.ExecutionID, acqB.LeaseToken, acqB.Generation); err != nil {
+		t.Fatalf("B failed to BeginExecution: %v", err)
+	}
+	if err := store.MarkInFlight(ctx, acqB.Record.ExecutionID, acqB.LeaseToken, acqB.Generation); err != nil {
+		t.Fatalf("B failed to MarkInFlight: %v", err)
+	}
+	receipt := TerminalReceipt{
+		ExecutionID:     acqB.Record.ExecutionID,
+		Capability:      "test.counter.increment",
+		Principal:       "alice@example.com",
+		RequestDigest:   "digest-crash-prepared",
+		TerminalStatus:  StateCommitted,
+		CanonicalResult: json.RawMessage(`{"ok":true}`),
+		ReceiptVersion:  3,
+	}
+	if err := store.Finalize(ctx, acqB.Record.ExecutionID, acqB.LeaseToken, acqB.Generation, StateInFlight, receipt); err != nil {
+		t.Fatalf("B failed to finalize: %v", err)
+	}
+}
+
+// TestLiveEffectFabricCrashAfterFinalization verifies that a crash
+// after finalization (before the response reaches the caller) results
+// in terminal replay: the caller retries and gets the same terminal
+// result, not a new execution.
+func TestLiveEffectFabricCrashAfterFinalization(t *testing.T) {
+	dbURL := os.Getenv("CRABBOX_TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live PostgreSQL test")
+	}
+
+	db, err := openTestDB(dbURL)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	store, err := NewStore(db)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+
+	ctx := context.Background()
+	key := fmt.Sprintf("test-crash-final-%d", time.Now().UnixNano())
+	db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key LIKE 'test-crash-final-%'`)
+	defer db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key = $1`, key)
+
+	// Caller A acquires and completes the full lifecycle.
+	acqA, err := store.Acquire(ctx, key, "alice@example.com", "test.counter.increment",
+		"digest-crash-final", "grant_test", "MUTATION", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acqA.Kind != LeaseAcquired {
+		t.Fatalf("expected ACQUIRED, got %s", acqA.Kind)
+	}
+
+	if err := store.BeginExecution(ctx, acqA.Record.ExecutionID, acqA.LeaseToken, acqA.Generation); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkInFlight(ctx, acqA.Record.ExecutionID, acqA.LeaseToken, acqA.Generation); err != nil {
+		t.Fatal(err)
+	}
+	originalResult := json.RawMessage(`{"value":42}`)
+	receipt := TerminalReceipt{
+		ExecutionID:     acqA.Record.ExecutionID,
+		Capability:      "test.counter.increment",
+		Principal:       "alice@example.com",
+		RequestDigest:   "digest-crash-final",
+		TerminalStatus:  StateCommitted,
+		CanonicalResult: originalResult,
+		ReceiptVersion:  3,
+	}
+	if err := store.Finalize(ctx, acqA.Record.ExecutionID, acqA.LeaseToken, acqA.Generation, StateInFlight, receipt); err != nil {
+		t.Fatalf("A failed to finalize: %v", err)
+	}
+
+	// Crash: A's response is lost. A retries with the same idempotency key.
+	acqB, err := store.Acquire(ctx, key, "alice@example.com", "test.counter.increment",
+		"digest-crash-final", "grant_test", "MUTATION", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The retry should get TERMINAL_REPLAY, not a new acquisition.
+	if acqB.Kind != TerminalReplay {
+		t.Fatalf("expected TERMINAL_REPLAY after finalization crash, got %s", acqB.Kind)
+	}
+	if acqB.Record == nil {
+		t.Fatal("expected non-nil record for terminal replay")
+	}
+	if acqB.Record.State != StateCommitted {
+		t.Errorf("expected COMMITTED replay, got %s", acqB.Record.State)
+	}
+
+	// The replayed result must match the original.
+	var resultStr string
+	if err := json.Unmarshal(acqB.Record.Result, &resultStr); err == nil {
+		if resultStr != "42" {
+			t.Errorf("expected replay result {\"value\":42}, got %s", acqB.Record.Result)
+		}
+	}
+}
