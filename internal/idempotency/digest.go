@@ -97,3 +97,18 @@ func ComputeDigestFromRaw(protocolVersion int, principal, capability string, arg
 		ExecutionClass:  class,
 	})
 }
+
+// isValidEvidenceDigest checks that a digest is a 64-character lowercase
+// hexadecimal SHA-256 digest. This is used by the store to validate
+// CRITICAL recovery evidence with the same strength as normal finalization.
+func isValidEvidenceDigest(digest string) bool {
+	if len(digest) != 64 {
+		return false
+	}
+	for _, c := range digest {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}

@@ -19,29 +19,49 @@ import (
 	"github.com/openclaw/crabbox/internal/idempotency"
 )
 
-// Resolver queries a provider to determine if an operation actually happened.
-// This is the legacy interface. New code should use RecoveryResolver.
-type Resolver interface {
-	// Resolve queries the provider for the terminal state of an execution.
-	// Returns CONFIRMED_SUCCEEDED, CONFIRMED_FAILED, or still UNKNOWN.
-	Resolve(ctx context.Context, rec *idempotency.Record) (idempotency.State, error)
-}
-
 // Worker runs reconciliation for UNKNOWN execution records and recovery
 // of crashed executions with expired leases.
+//
+// The worker uses idempotency.RecoveryResolver, which returns a full
+// RecoveryResult (decision, result, evidence, provider identity). This
+// is propagated directly to ResolveRecovery, which requires evidence
+// for definitive conclusions.
 type Worker struct {
-	store    *idempotency.Store
-	resolver Resolver
-	interval time.Duration
+	store     *idempotency.Store
+	resolvers map[string]idempotency.RecoveryResolver // keyed by capability_id
+	default_  idempotency.RecoveryResolver
+	interval  time.Duration
 }
 
-// NewWorker creates a reconciliation worker.
-func NewWorker(store *idempotency.Store, resolver Resolver, interval time.Duration) *Worker {
+// NewWorker creates a reconciliation worker with a default resolver.
+// The default resolver is used when no capability-specific resolver
+// is registered.
+func NewWorker(store *idempotency.Store, defaultResolver idempotency.RecoveryResolver, interval time.Duration) *Worker {
 	return &Worker{
-		store:    store,
-		resolver: resolver,
-		interval: interval,
+		store:     store,
+		resolvers: make(map[string]idempotency.RecoveryResolver),
+		default_:  defaultResolver,
+		interval:  interval,
 	}
+}
+
+// RegisterResolver registers a capability-specific recovery resolver.
+// When a UNKNOWN record's capability_id matches, this resolver is used
+// instead of the default.
+func (w *Worker) RegisterResolver(capabilityID string, resolver idempotency.RecoveryResolver) {
+	w.resolvers[capabilityID] = resolver
+}
+
+// resolve selects the appropriate resolver for a record.
+func (w *Worker) resolve(ctx context.Context, rec *idempotency.Record) (idempotency.RecoveryResult, error) {
+	if r, ok := w.resolvers[rec.CapabilityID]; ok {
+		return r.Resolve(ctx, rec)
+	}
+	if w.default_ != nil {
+		return w.default_.Resolve(ctx, rec)
+	}
+	// No resolver registered — return UNKNOWN (fail-closed).
+	return idempotency.RecoveryResult{Decision: idempotency.RecoveryUnknown}, nil
 }
 
 // Run starts the reconciliation loop. It runs until the context is cancelled.
@@ -128,44 +148,40 @@ func (w *Worker) recoverCrashed(ctx context.Context, rec *idempotency.Record) er
 // reconcileOne attempts to reconcile a single UNKNOWN record.
 // Uses CAS with expected state=UNKNOWN to prevent overwriting a
 // state that changed after it was read.
+//
+// The full RecoveryResult (including evidence, provider identity,
+// and result) is propagated to ResolveRecovery. This is critical:
+// ResolveRecovery rejects definitive recovery without proof, so
+// the resolver MUST supply evidence for COMMITTED/FAILED decisions.
 func (w *Worker) reconcileOne(ctx context.Context, rec *idempotency.Record) error {
 	// Query the resolver for the actual outcome.
-	state, err := w.resolver.Resolve(ctx, rec)
+	result, err := w.resolve(ctx, rec)
 	if err != nil {
 		return fmt.Errorf("resolver error: %w", err)
 	}
 
-	// Map the resolved state to a recovery decision.
-	var decision idempotency.RecoveryDecision
-	switch state {
-	case idempotency.StateCommitted:
-		decision = idempotency.RecoveryCommitted
-	case idempotency.StateFailed:
-		decision = idempotency.RecoveryFailed
-	case idempotency.StateUnknown:
-		// Still unknown — no state change.
+	// If still UNKNOWN, no state change needed.
+	if result.Decision == idempotency.RecoveryUnknown {
 		return nil
-	default:
-		return fmt.Errorf("resolver returned unexpected state: %s", state)
 	}
 
-	// Resolve with CAS — expected state is UNKNOWN, expected version is rec.Version.
-	result := idempotency.RecoveryResult{
-		Decision: decision,
-	}
-	if err := w.store.ResolveRecovery(ctx, rec.ExecutionID, rec.Version, decision, result); err != nil {
+	// Resolve with CAS — expected state is UNKNOWN, expected version
+	// is rec.Version. The full RecoveryResult is propagated so
+	// ResolveRecovery can validate evidence and build a canonical
+	// terminal receipt.
+	if err := w.store.ResolveRecovery(ctx, rec.ExecutionID, rec.Version, result.Decision, result); err != nil {
 		return fmt.Errorf("failed to resolve recovery: %w", err)
 	}
 
 	return nil
 }
 
-// NoopResolver is a resolver that always returns UNKNOWN.
+// NoopResolver is a RecoveryResolver that always returns UNKNOWN.
 // It is used when no provider-specific resolver is available.
 // It must not cause retries or terminal rewrites.
 type NoopResolver struct{}
 
 // Resolve always returns UNKNOWN (no reconciliation possible).
-func (NoopResolver) Resolve(_ context.Context, _ *idempotency.Record) (idempotency.State, error) {
-	return idempotency.StateUnknown, nil
+func (NoopResolver) Resolve(_ context.Context, _ *idempotency.Record) (idempotency.RecoveryResult, error) {
+	return idempotency.RecoveryResult{Decision: idempotency.RecoveryUnknown}, nil
 }

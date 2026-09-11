@@ -246,15 +246,20 @@ run_gate effect-fabric-contract go test -count=1 -timeout=60s \
   -run "TestState|TestLeaseConfig|TestAcquireResult|TestTerminalReceipt|TestRecovery|TestLeaseError|TestMigrateState|TestDefaultLeaseConfig|TestFixedClock|TestSystemClock" \
   ./internal/idempotency/
 
+# effect-fabric-reconciliation: reconciliation worker unit tests.
+# Verifies NoopResolver, resolver registration, and fail-closed behavior.
+run_gate effect-fabric-reconciliation go test -count=1 -timeout=60s \
+  ./internal/reconcile/
+
 # effect-fabric-race: race-detector run over the execution + idempotency
-# + capability packages. Closes concurrent-acquisition races and
-# stale-worker fencing violations.
+# + capability + reconcile packages. Closes concurrent-acquisition races
+# and stale-worker fencing violations.
 # Unset CRABBOX_TEST_DATABASE_URL so live tests skip — the race gate
 # should not run live PostgreSQL tests (they're too slow with -race
 # and are covered by effect-fabric-postgres separately).
 run_gate effect-fabric-race env -u CRABBOX_TEST_DATABASE_URL \
   go test -race -count=1 -timeout=120s \
-  ./internal/capability/ ./internal/execution/ ./internal/idempotency/
+  ./internal/capability/ ./internal/execution/ ./internal/idempotency/ ./internal/reconcile/
 
 # ─── Phase 10-12: Live PostgreSQL gates ────────────────────────────────────
 echo ""
@@ -583,7 +588,7 @@ extract_tests_executed() {
   local count=0
 
   case "$gate_name" in
-    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-cli|effect-fabric-contract|effect-fabric-race|effect-fabric-postgres|authority-postgres)
+    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-cli|effect-fabric-contract|effect-fabric-reconciliation|effect-fabric-race|effect-fabric-postgres|authority-postgres)
       # Go test without -v prints one line per package:
       #   ok  \t<package>\t<duration>
       #   FAIL\t<package>\t<duration>

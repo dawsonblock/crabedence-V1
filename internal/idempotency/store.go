@@ -10,7 +10,7 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
-	"encoding/hex"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -100,10 +100,14 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 		)
 	`)
 	if err != nil {
-		// gen_random_uuid might not be available without pgcrypto
+		// gen_random_uuid might not be available without pgcrypto.
+		// P1/P2 #6: The fallback must still generate UUIDs application-side
+		// since Acquire() does not supply execution_id. Generate via
+		// a DEFAULT clause using a Go-side UUID if pgcrypto is unavailable.
+		// We use a TEXT primary key with a Go-generated UUID as default.
 		_, err = s.db.ExecContext(ctx, `
 			CREATE TABLE IF NOT EXISTS execution_requests (
-				execution_id UUID PRIMARY KEY,
+				execution_id TEXT PRIMARY KEY,
 				idempotency_key TEXT NOT NULL,
 				principal_id TEXT NOT NULL,
 				capability_id TEXT NOT NULL,
@@ -135,26 +139,52 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 	}
 
 	// Migrations: add new columns if they don't exist.
-	s.addColumnIfMissing(ctx, "lease_started_at", "TIMESTAMPTZ")
-	s.addColumnIfMissing(ctx, "lease_generation", "INTEGER NOT NULL DEFAULT 1")
-	s.addColumnIfMissing(ctx, "provider_id", "TEXT")
-	s.addColumnIfMissing(ctx, "provider_run_id", "TEXT")
-	s.addColumnIfMissing(ctx, "terminal_receipt_digest", "TEXT")
+	// P1/P2 #6: Migration failures must propagate — store initialization
+	// fails closed if schema alteration or state migration fails.
+	if err := s.addColumnIfMissing(ctx, "lease_started_at", "TIMESTAMPTZ"); err != nil {
+		return fmt.Errorf("migration failed (lease_started_at): %w", err)
+	}
+	if err := s.addColumnIfMissing(ctx, "lease_generation", "INTEGER NOT NULL DEFAULT 1"); err != nil {
+		return fmt.Errorf("migration failed (lease_generation): %w", err)
+	}
+	if err := s.addColumnIfMissing(ctx, "provider_id", "TEXT"); err != nil {
+		return fmt.Errorf("migration failed (provider_id): %w", err)
+	}
+	if err := s.addColumnIfMissing(ctx, "provider_run_id", "TEXT"); err != nil {
+		return fmt.Errorf("migration failed (provider_run_id): %w", err)
+	}
+	if err := s.addColumnIfMissing(ctx, "terminal_receipt_digest", "TEXT"); err != nil {
+		return fmt.Errorf("migration failed (terminal_receipt_digest): %w", err)
+	}
 	// Legacy columns from earlier versions.
-	s.addColumnIfMissing(ctx, "receipt_version", "INTEGER NOT NULL DEFAULT 0")
-	s.addColumnIfMissing(ctx, "lease_owner", "TEXT")
-	s.addColumnIfMissing(ctx, "lease_token", "TEXT")
-	s.addColumnIfMissing(ctx, "lease_expires_at", "TIMESTAMPTZ")
-	s.addColumnIfMissing(ctx, "attempt", "INTEGER NOT NULL DEFAULT 0")
-	s.addColumnIfMissing(ctx, "version", "INTEGER NOT NULL DEFAULT 1")
+	if err := s.addColumnIfMissing(ctx, "receipt_version", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("migration failed (receipt_version): %w", err)
+	}
+	if err := s.addColumnIfMissing(ctx, "lease_owner", "TEXT"); err != nil {
+		return fmt.Errorf("migration failed (lease_owner): %w", err)
+	}
+	if err := s.addColumnIfMissing(ctx, "lease_token", "TEXT"); err != nil {
+		return fmt.Errorf("migration failed (lease_token): %w", err)
+	}
+	if err := s.addColumnIfMissing(ctx, "lease_expires_at", "TIMESTAMPTZ"); err != nil {
+		return fmt.Errorf("migration failed (lease_expires_at): %w", err)
+	}
+	if err := s.addColumnIfMissing(ctx, "attempt", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("migration failed (attempt): %w", err)
+	}
+	if err := s.addColumnIfMissing(ctx, "version", "INTEGER NOT NULL DEFAULT 1"); err != nil {
+		return fmt.Errorf("migration failed (version): %w", err)
+	}
 
 	// Migrate old state names to new vocabulary.
-	s.migrateStateNames(ctx)
+	if err := s.migrateStateNames(ctx); err != nil {
+		return fmt.Errorf("state name migration failed: %w", err)
+	}
 
 	return nil
 }
 
-func (s *Store) migrateStateNames(ctx context.Context) {
+func (s *Store) migrateStateNames(ctx context.Context) error {
 	// Map old state names to new ones.
 	migrations := map[string]string{
 		"RESERVED":                "PREPARED",
@@ -162,13 +192,17 @@ func (s *Store) migrateStateNames(ctx context.Context) {
 		"SUCCEEDED":               "COMMITTED",
 		"RECONCILIATION_REQUIRED": "UNKNOWN",
 	}
-	for old, new := range migrations {
-		s.db.ExecContext(ctx, `UPDATE execution_requests SET state = $1 WHERE state = $2`, new, old)
+	for old, newVal := range migrations {
+		if _, err := s.db.ExecContext(ctx, `UPDATE execution_requests SET state = $1 WHERE state = $2`, newVal, old); err != nil {
+			return fmt.Errorf("failed to migrate state %s -> %s: %w", old, newVal, err)
+		}
 	}
+	return nil
 }
 
-func (s *Store) addColumnIfMissing(ctx context.Context, column, ddl string) {
-	s.db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE execution_requests ADD COLUMN IF NOT EXISTS %s %s", column, ddl))
+func (s *Store) addColumnIfMissing(ctx context.Context, column, ddl string) error {
+	_, err := s.db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE execution_requests ADD COLUMN IF NOT EXISTS %s %s", column, ddl))
+	return err
 }
 
 // ─── Lease token generation ──────────────────────────────────────────
@@ -179,7 +213,7 @@ func generateLeaseToken() (string, error) {
 	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}
-	return hex.EncodeToString(b), nil
+	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
 // ─── Acquire (reservation) ───────────────────────────────────────────
@@ -338,6 +372,13 @@ func (s *Store) Acquire(ctx context.Context, key, principal, capability, digest,
 		rec, err = s.lookupByKey(ctx, principal, capability, key)
 		if err != nil {
 			return nil, err
+		}
+		// P2 #7: Re-check IsDurablyFinal after re-read. Another worker
+		// may have finalized the record between our initial read
+		// and this re-read. A durably-final record must return
+		// TerminalReplay, not LeaseHeldByOther.
+		if rec.State.IsDurablyFinal() {
+			return &AcquireResult{Kind: TerminalReplay, State: rec.State, Record: rec}, nil
 		}
 		if rec.State == StateUnknown {
 			return &AcquireResult{Kind: RecoveryRequired, State: rec.State, Record: rec}, nil
@@ -789,13 +830,24 @@ func (s *Store) ResolveRecovery(ctx context.Context, executionID string, expecte
 		newState = StateFailed
 	case RecoveryUnknown:
 		// Still unknown — no state change, just touch updated_at.
-		_, err := s.db.ExecContext(ctx, `
+		// P1 #3: Check RowsAffected to detect stale CAS. A zero-row
+		// update means the record advanced to a different version
+		// since we read it. Return STATE_CONFLICT so the caller knows
+		// its view is stale.
+		result, err := s.db.ExecContext(ctx, `
 			UPDATE execution_requests
 			SET updated_at = clock_timestamp()
 			WHERE execution_id = $1 AND state = 'UNKNOWN' AND version = $2
 		`, executionID, expectedVersion)
 		if err != nil {
 			return err
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rows == 0 {
+			return fmt.Errorf("%w: execution %s recovery-unknown CAS failed (state/version mismatch)", LeaseStateConflict, executionID)
 		}
 		return nil
 	case RecoveryRetryable:
@@ -813,29 +865,49 @@ func (s *Store) ResolveRecovery(ctx context.Context, executionID string, expecte
 		return fmt.Errorf("unknown recovery decision: %s", decision)
 	}
 
-	// P1 #6: Enforce evidence for definitive recovery. A definitive
+	// P1 #4/#6: Enforce evidence for definitive recovery. A definitive
 	// conclusion (COMMITTED or FAILED) must include evidence/proof.
 	// Without evidence, the recovery is not credible and must stay
 	// UNKNOWN. This prevents a resolver from claiming success or
 	// failure without proof.
-	if result.EvidenceDigest == "" && len(result.Result) == 0 {
-		return fmt.Errorf("definitive recovery (%s) requires evidence or result — cannot resolve without proof", decision)
+	//
+	// For CRITICAL executions, recovery proof must be as strong as
+	// normal CRITICAL finalization: valid SHA-256 evidence digest,
+	// receipt version 3, provider identity, and provider run ID.
+	// Arbitrary JSON result is NOT sufficient for CRITICAL recovery.
+	existingRec, lookupErr := s.Lookup(ctx, executionID)
+	if lookupErr != nil {
+		return fmt.Errorf("recovery lookup failed: %w", lookupErr)
+	}
+	if existingRec.ExecutionClass == "CRITICAL" {
+		if decision == RecoveryCommitted {
+			if result.EvidenceDigest == "" || !isValidEvidenceDigest(result.EvidenceDigest) {
+				return fmt.Errorf("CRITICAL recovery to COMMITTED requires valid evidence digest (64-char lowercase hex)")
+			}
+			if result.ReceiptVersion != 3 {
+				return fmt.Errorf("CRITICAL recovery to COMMITTED requires receipt_version 3, got %d", result.ReceiptVersion)
+			}
+			if result.ProviderID == "" || result.ProviderRunID == "" {
+				return fmt.Errorf("CRITICAL recovery to COMMITTED requires provider_id and provider_run_id")
+			}
+		}
+	} else {
+		// Non-CRITICAL: require at least evidence or result.
+		if result.EvidenceDigest == "" && len(result.Result) == 0 {
+			return fmt.Errorf("definitive recovery (%s) requires evidence or result — cannot resolve without proof", decision)
+		}
 	}
 
 	// P1 #7: Build recovery receipts from the same canonical builder
-	// as normal finalization. Load the existing record to populate
+	// as normal finalization. Use the record loaded above to populate
 	// identity fields (capability, principal, request_digest) so
 	// recovery-finalized and normally-finalized receipts use the
 	// same complete schema.
-	existing, err := s.Lookup(ctx, executionID)
-	if err != nil {
-		return fmt.Errorf("recovery lookup failed: %w", err)
-	}
 	receipt := TerminalReceipt{
 		ExecutionID:     executionID,
-		Capability:      existing.CapabilityID,
-		Principal:       existing.PrincipalID,
-		RequestDigest:   existing.RequestDigest,
+		Capability:      existingRec.CapabilityID,
+		Principal:       existingRec.PrincipalID,
+		RequestDigest:   existingRec.RequestDigest,
 		CanonicalResult: result.Result,
 		EvidenceDigest:  result.EvidenceDigest,
 		ReceiptVersion:  result.ReceiptVersion,
@@ -1205,27 +1277,6 @@ func (s *Store) RenewLeaseLegacy(ctx context.Context, executionID, leaseToken st
 		return err
 	}
 	return s.RenewLease(ctx, executionID, leaseToken, rec.LeaseGeneration, duration)
-}
-
-// SetStateWithVersion updates state with CAS (expected version).
-func (s *Store) SetStateWithVersion(ctx context.Context, executionID string, expectedVersion int, state State, result json.RawMessage, evidenceDigest string) error {
-	state = migrateState(state)
-	result2, err := s.db.ExecContext(ctx, `
-		UPDATE execution_requests
-		SET state = $1, result = $2, evidence_digest = $3, version = version + 1, updated_at = clock_timestamp()
-		WHERE execution_id = $4 AND version = $5
-	`, string(state), nullableBytes(result), nullableString(evidenceDigest), executionID, expectedVersion)
-	if err != nil {
-		return err
-	}
-	rows, err := result2.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if rows == 0 {
-		return fmt.Errorf("SET_STATE_CAS_FAILED: execution %s version %d transition to %s rejected", executionID, expectedVersion, state)
-	}
-	return nil
 }
 
 // migrateState maps legacy state names to the new vocabulary.

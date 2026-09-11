@@ -6,9 +6,12 @@
 package idempotency
 
 import (
+	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"time"
 )
 
@@ -208,6 +211,16 @@ type TerminalReceipt struct {
 // receipt content (identity, result, provider, evidence, version) but
 // not the transient finalization timestamp.
 func (r TerminalReceipt) Digest() (string, error) {
+	// P2 #8: Canonicalize the result JSON before hashing. A json.RawMessage
+	// preserves the original byte ordering of object keys, which means
+	// {"a":1,"b":2} and {"b":2,"a":1} produce different digests despite
+	// being semantically identical. Parse and re-marshal with sorted keys
+	// so the digest is canonical.
+	canonicalResult, err := canonicalizeJSON(r.CanonicalResult)
+	if err != nil {
+		return "", fmt.Errorf("failed to canonicalize result: %w", err)
+	}
+
 	// Marshal with FinalizedAt excluded.
 	canonical, err := json.Marshal(struct {
 		ExecutionID     string          `json:"execution_id"`
@@ -226,7 +239,7 @@ func (r TerminalReceipt) Digest() (string, error) {
 		Principal:       r.Principal,
 		RequestDigest:   r.RequestDigest,
 		TerminalStatus:  r.TerminalStatus,
-		CanonicalResult: r.CanonicalResult,
+		CanonicalResult: canonicalResult,
 		ProviderID:      r.ProviderID,
 		ProviderRunID:   r.ProviderRunID,
 		EvidenceDigest:  r.EvidenceDigest,
@@ -237,6 +250,23 @@ func (r TerminalReceipt) Digest() (string, error) {
 	}
 	hash := sha256.Sum256(canonical)
 	return hex.EncodeToString(hash[:]), nil
+}
+
+// canonicalizeJSON parses a json.RawMessage and re-marshals it with
+// sorted object keys. This ensures that semantically identical JSON
+// produces identical byte sequences for digest computation.
+// nil or empty input returns nil (which omits the field).
+func canonicalizeJSON(raw json.RawMessage) (json.RawMessage, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var v any
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(&v); err != nil {
+		return nil, err
+	}
+	return json.Marshal(v)
 }
 
 // ─── Recovery ────────────────────────────────────────────────────────
@@ -265,7 +295,7 @@ type RecoveryResult struct {
 // RecoveryResolver queries a provider to determine if an operation
 // actually happened. Resolvers are registered per provider/capability.
 type RecoveryResolver interface {
-	Resolve(ctx Ctx, record *Record) (RecoveryResult, error)
+	Resolve(ctx context.Context, record *Record) (RecoveryResult, error)
 }
 
 // Ctx is an alias for context.Context to avoid importing context in

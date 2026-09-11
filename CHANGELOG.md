@@ -26,7 +26,19 @@
 - Execution: 100-way concurrent mutation dispatch test added (CRAB-V1-021 end-to-end proof).
 - Release: source-manifest gate uses canonical `verify-source-manifest.sh` (bidirectional, no duplicate logic).
 - Release: `npm install` fallbacks removed from release qualification — locked dependencies required.
-- Release: dedicated gates `effect-fabric-contract`, `effect-fabric-postgres`, `effect-fabric-race`, `authority-postgres`. New invariants CRAB-V1-017 through CRAB-V1-021. `RELEASE_VERSION` required explicitly (no hardcoded default). Attestation subject matches actual attested object (`evidence-manifest.json`).
+- Reconciliation: `reconcile.Worker` migrated from legacy `Resolver` to `idempotency.RecoveryResolver` — full `RecoveryResult` (evidence, provider identity, result) propagated to `ResolveRecovery`. Provider/capability resolver registration via `RegisterResolver`.
+- Reconciliation: `NoopResolver` implements `RecoveryResolver` (fail-closed UNKNOWN).
+- Reconciliation: dedicated `effect-fabric-reconciliation` release gate added; `internal/reconcile` included in `effect-fabric-race`.
+- Execution: `RecoveryUnknown` CAS now checks `RowsAffected` — stale CAS returns `LeaseStateConflict` instead of silent success.
+- Execution: CRITICAL recovery proof is class-aware — `RecoveryCommitted` for CRITICAL executions requires valid SHA-256 evidence digest, receipt v3, provider_id, and provider_run_id (equal to normal CRITICAL finalization).
+- Execution: `SetStateWithVersion` removed — no unfenced state mutations remain.
+- Execution: DENIED after dispatch boundary (IN_FLIGHT) mapped to UNKNOWN — DENIED is pre-dispatch admission only.
+- Execution: schema migration errors now propagate — `NewStore` fails closed if `ALTER TABLE` or state-name migration fails.
+- Execution: UUID fallback schema uses TEXT primary key (application-side UUID) instead of UUID with no default.
+- Execution: `Acquire()` IN_FLIGHT race fixed — re-read after CAS failure now checks `IsDurablyFinal()` and returns `TerminalReplay` instead of `LeaseHeldByOther`.
+- Execution: terminal receipt `CanonicalResult` canonicalized before hashing — sorted JSON keys ensure semantically identical results produce identical digests.
+- Execution: lease token encoding changed from hex to base64url (matches frozen contract spec).
+- Release: dedicated gates `effect-fabric-contract`, `effect-fabric-postgres`, `effect-fabric-race`, `effect-fabric-reconciliation`, `authority-postgres`. New invariants CRAB-V1-017 through CRAB-V1-021. `RELEASE_VERSION` required explicitly (no hardcoded default). Attestation subject matches actual attested object (`evidence-manifest.json`).
 - See `docs/spec/durable-execution-contract.md` for the frozen invariants.
 
 ### RC6.1 — Planner-Agnostic Execution Kernel
