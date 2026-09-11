@@ -165,7 +165,7 @@ MANIFEST_VERIFY="$EVIDENCE_DIR/gate-results/source-manifest-verify.log"
 
 set +e
 bash "$REPO_ROOT/scripts/verify-source-manifest.sh"   "$EVIDENCE_DIR/source-tree-sha256.txt" "$REPO_ROOT" >> "$MANIFEST_VERIFY" 2>&1
-local manifest_rc=$?
+manifest_rc=$?
 set -e
 
 {
