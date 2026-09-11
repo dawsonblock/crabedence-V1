@@ -132,15 +132,18 @@ func TestLiveConcurrentIdenticalMutationSingleDispatch(t *testing.T) {
 
 	// CRAB-V1-021: exactly one provider dispatch.
 	// The counter should be exactly 1 (one increment by one handler call).
+	// Multiple callers may receive SUCCEEDED via terminal replay — that
+	// is correct idempotent behavior. The invariant is that the side
+	// effect occurred exactly once, not that only one caller sees success.
 	finalCount := counter.GetCount(counterName)
 	if finalCount != 1 {
 		t.Errorf("CRAB-V1-021 violation: expected counter=1 (exactly one dispatch), got counter=%d", finalCount)
 	}
 
-	// Exactly one caller should succeed.
-	if successCount != 1 {
-		t.Errorf("expected exactly 1 success, got %d (fail=%d, in-flight/unknown=%d)",
-			successCount, failCount, inFlightCount)
+	// At least one caller should succeed.
+	if successCount < 1 {
+		t.Errorf("expected at least 1 success, got 0 (fail=%d, in-flight/unknown=%d)",
+			failCount, inFlightCount)
 	}
 
 	// The successful result should contain value=1.
