@@ -152,35 +152,26 @@ git -C "$REPO_ROOT" ls-files -z -- . ':(exclude)release-evidence/' ':(exclude)di
 done > "$EVIDENCE_DIR/source-tree-git-blobs.txt"
 
 # ─── Phase 7: Verify source manifest ────────────────────────────────────────
+# Use the canonical bidirectional verifier (scripts/verify-source-manifest.sh)
+# instead of inline logic. The canonical script checks both:
+#   1. manifest → source (every manifest entry exists and matches)
+#   2. source → manifest (no unexpected files added after generation)
 MANIFEST_VERIFY="$EVIDENCE_DIR/gate-results/source-manifest-verify.log"
 {
-  echo "command=verify source-tree-sha256.txt"
+  echo "command=bash $REPO_ROOT/scripts/verify-source-manifest.sh $EVIDENCE_DIR/source-tree-sha256.txt $REPO_ROOT"
   echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "---"
-  missing=0
-  mismatched=0
-  checked=0
-  while IFS= read -r line; do
-    [ -z "$line" ] && continue
-    expected_sha="$(echo "$line" | cut -d ' ' -f 1)"
-    file="$(echo "$line" | cut -d ' ' -f 3-)"
-    checked=$((checked + 1))
-    if [ ! -f "$REPO_ROOT/$file" ]; then
-      echo "MISSING: $file"
-      missing=$((missing + 1))
-      continue
-    fi
-    actual_sha="$(shasum -a 256 "$REPO_ROOT/$file" | cut -d ' ' -f 1)"
-    if [ "$actual_sha" != "$expected_sha" ]; then
-      echo "MISMATCH: $file (expected=$expected_sha actual=$actual_sha)"
-      mismatched=$((mismatched + 1))
-    fi
-  done < "$EVIDENCE_DIR/source-tree-sha256.txt"
+} > "$MANIFEST_VERIFY"
+
+set +e
+bash "$REPO_ROOT/scripts/verify-source-manifest.sh"   "$EVIDENCE_DIR/source-tree-sha256.txt" "$REPO_ROOT" >> "$MANIFEST_VERIFY" 2>&1
+local manifest_rc=$?
+set -e
+
+{
   echo "---"
-  echo "files_checked=$checked"
-  echo "missing=$missing"
-  echo "mismatched=$mismatched"
-  if [ "$missing" -eq 0 ] && [ "$mismatched" -eq 0 ]; then
+  echo "exit=$manifest_rc"
+  if [ "$manifest_rc" -eq 0 ]; then
     echo "status=PASS"
     record_gate "source_manifest" "PASS" 0 "$MANIFEST_VERIFY"
   else
@@ -188,7 +179,7 @@ MANIFEST_VERIFY="$EVIDENCE_DIR/gate-results/source-manifest-verify.log"
     record_gate "source_manifest" "FAIL" 1 "$MANIFEST_VERIFY"
   fi
   echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-} > "$MANIFEST_VERIFY"
+} >> "$MANIFEST_VERIFY"
 echo "  $(grep 'status=' "$MANIFEST_VERIFY" | tail -1 | cut -d= -f2)  source_manifest"
 
 # ─── Phase 21: Toolchain identity ───────────────────────────────────────────
@@ -248,9 +239,11 @@ echo "=== Effect Fabric contract gates ==="
 
 # effect-fabric-contract: typed contract unit tests (no DB required).
 # Verifies state predicates, lease config validation, acquire result
-# kinds, terminal receipt digest, and recovery decision types.
+# kinds, terminal receipt digest, recovery decision types, receipt
+# identity fields, digest determinism, FinalizedAt exclusion, clock
+# interface, state aliases, and RecoveryRetryable rejection.
 run_gate effect-fabric-contract go test -count=1 -timeout=60s \
-  -run "TestStateIsTerminal|TestStateCallerTerminal|TestStateDurablyFinal" \
+  -run "TestState|TestLeaseConfig|TestAcquireResult|TestTerminalReceipt|TestRecovery|TestLeaseError|TestMigrateState|TestDefaultLeaseConfig|TestFixedClock|TestSystemClock" \
   ./internal/idempotency/
 
 # effect-fabric-race: race-detector run over the execution + idempotency
@@ -386,7 +379,7 @@ run_effect_fabric_postgres_gate() {
   fi
 
   {
-    echo "command=go test -count=1 -timeout=300s -run TestLiveEffectFabric ./internal/idempotency/"
+    echo "command=go test -count=1 -timeout=300s -run TestLiveEffectFabric ./internal/idempotency/ && go test -count=1 -timeout=300s -run TestLiveConcurrent ./internal/execution/"
     echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "---"
   } > "$log"
@@ -395,8 +388,14 @@ run_effect_fabric_postgres_gate() {
   go test -count=1 -timeout=300s \
     -run "TestLiveEffectFabric|TestLiveStore" \
     ./internal/idempotency/ >> "$log" 2>&1
-  local rc=$?
+  local rc1=$?
+  # Also run the 100-way concurrent mutation dispatch test (CRAB-V1-021).
+  go test -count=1 -timeout=300s \
+    -run "TestLiveConcurrentIdenticalMutationSingleDispatch" \
+    ./internal/execution/ >> "$log" 2>&1
+  local rc2=$?
   set -e
+  local rc=$((rc1 + rc2))
 
   {
     echo "---"
@@ -514,7 +513,7 @@ run_gate cross-language-conformance \
 echo ""
 echo "=== Worker gates ==="
 # Ensure Worker dependencies are installed.
-npm ci --prefix worker 2>/dev/null || true
+npm ci --prefix worker
 run_gate worker-typecheck npm run check --prefix worker
 run_gate worker-tests npm test --prefix worker
 run_gate worker-format npm run format:check --prefix worker
@@ -525,7 +524,7 @@ run_gate worker-build npm run build --prefix worker
 echo ""
 echo "=== NeMo gates ==="
 # Ensure NeMo dependencies are installed.
-npm ci --prefix nemo 2>/dev/null || npm install --prefix nemo 2>/dev/null || true
+npm ci --prefix nemo
 run_gate nemo-typecheck sh -c 'cd nemo && npx tsc --noEmit'
 run_gate nemo-tests sh -c 'cd nemo && npx vitest run'
 

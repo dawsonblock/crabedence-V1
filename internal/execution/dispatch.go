@@ -105,14 +105,25 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 
 	// Check for existing terminal result — replay the stored result.
 	// Acquired=false means we did NOT create this reservation.
+	// P1 #8: Replay the stored provider_id and provider_run_id, not
+	// the adapter ID and execution ID. The caller should see the same
+	// execution metadata as the original provider result.
 	if !reserve.Acquired && reserve.Record != nil && reserve.State.IsTerminal() {
+		replayProvider := reserve.Record.ProviderID
+		if replayProvider == "" {
+			replayProvider = desc.AdapterID
+		}
+		replayRunID := reserve.Record.ProviderRunID
+		if replayRunID == "" {
+			replayRunID = reserve.Record.ExecutionID
+		}
 		return Response{
 			Status:   stateToStatus(reserve.State),
 			Result:   reserve.Record.Result,
 			Evidence: parseEvidence(reserve.Record.EvidenceDigest, reserve.Record.ReceiptVersion),
 			Execution: &ExecutionMeta{
-				Provider: desc.AdapterID,
-				RunID:    reserve.Record.ExecutionID,
+				Provider: replayProvider,
+				RunID:    replayRunID,
 			},
 		}
 	}
@@ -208,12 +219,23 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	}
 
 	// ─── DETERMINE TERMINAL STATE ──────────────────────────────────────────
+	// P1 #3: After the dispatch boundary (IN_FLIGHT), a generic FAILED
+	// is treated as UNKNOWN unless the handler explicitly marks it as
+	// a DefinitiveFailure (proven no side effect). This prevents a
+	// provider that lost connection from causing a blind retry.
 	var state idempotency.State
 	switch resp.Status {
 	case StatusSucceeded:
 		state = idempotency.StateCommitted
 	case StatusFailed:
-		state = idempotency.StateFailed
+		if resp.DefinitiveFailure {
+			state = idempotency.StateFailed
+		} else {
+			// Post-dispatch uncertainty: the handler returned FAILED
+			// but cannot prove no side effect occurred. Per the
+			// durable execution contract §6, this is UNKNOWN.
+			state = idempotency.StateUnknown
+		}
 	case StatusDenied:
 		state = idempotency.StateDenied
 	default:

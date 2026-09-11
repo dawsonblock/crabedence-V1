@@ -12,6 +12,20 @@
 - Execution: `additionalProperties: false` enforced in JSON Schema validator — unknown arguments are rejected, not silently accepted.
 - Execution: `SetState` blind update removed from tests — all recovery transitions use `EnterRecovery`/`ResolveRecovery` with CAS.
 - Execution: `Clock` interface added for deterministic test injection (`SystemClock`, `FixedClock`).
+- Execution: `RecoveryRetryable` rejected at store level — post-dispatch uncertainty cannot become retryable without proven safety (CRAB-V1-020).
+- Execution: lease-less PREPARED reacquisition after `AbandonPreDispatch` — stranded records now acquire immediately via `acquireUnleased`.
+- Execution: `DefinitiveFailure` field on `Response` — generic FAILED after dispatch defaults to UNKNOWN unless the handler proves no side effect occurred.
+- Execution: `Finalize` validates receipt identity (execution_id, capability, principal, request_digest) against the database row.
+- Execution: `Finalize` rejects non-durably-final terminal statuses (UNKNOWN, PREPARED, EXECUTING, IN_FLIGHT).
+- Execution: `ResolveRecovery` requires evidence/result for definitive recovery (COMMITTED/FAILED).
+- Execution: recovery receipts built from the same canonical builder as normal finalization (identity fields populated from the row).
+- Execution: replay returns stored `provider_id`/`provider_run_id` instead of `adapter_id`/`execution_id`.
+- Execution: `FinalizedAt` excluded from terminal receipt digest (store assigns it; caller cannot know DB timestamp).
+- Execution: `DefaultDuration` wired into legacy `Reserve()`; `RenewalWindow` documented as advisory.
+- Execution: `contract_test.go` added with comprehensive non-live contract coverage (24 tests).
+- Execution: 100-way concurrent mutation dispatch test added (CRAB-V1-021 end-to-end proof).
+- Release: source-manifest gate uses canonical `verify-source-manifest.sh` (bidirectional, no duplicate logic).
+- Release: `npm install` fallbacks removed from release qualification — locked dependencies required.
 - Release: dedicated gates `effect-fabric-contract`, `effect-fabric-postgres`, `effect-fabric-race`, `authority-postgres`. New invariants CRAB-V1-017 through CRAB-V1-021. `RELEASE_VERSION` required explicitly (no hardcoded default). Attestation subject matches actual attested object (`evidence-manifest.json`).
 - See `docs/spec/durable-execution-contract.md` for the frozen invariants.
 

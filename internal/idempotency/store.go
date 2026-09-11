@@ -291,6 +291,8 @@ func (s *Store) Acquire(ctx context.Context, key, principal, capability, digest,
 	}
 
 	// PREPARED or EXECUTING with expired lease → reclaim.
+	// Also handle PREPARED with no lease (after AbandonPreDispatch) —
+	// acquire immediately since no one holds the lease.
 	if (rec.State == StatePrepared || rec.State == StateExecuting) && rec.LeaseExpiresAt != nil {
 		reclaimed, err := s.reclaimExpiredLease(ctx, rec, leaseToken, leaseOwner, leaseDuration)
 		if err != nil {
@@ -342,12 +344,77 @@ func (s *Store) Acquire(ctx context.Context, key, principal, capability, digest,
 		}
 	}
 
+	// PREPARED with no lease (after AbandonPreDispatch) → acquire
+	// immediately. The lease was explicitly released before expiry,
+	// so there is no holder to contend with.
+	if rec.State == StatePrepared && rec.LeaseExpiresAt == nil {
+		acquired, err := s.acquireUnleased(ctx, rec, leaseToken, leaseOwner, leaseDuration)
+		if err != nil {
+			return nil, err
+		}
+		if acquired {
+			return &AcquireResult{
+				Kind:       LeaseAcquired,
+				State:      StatePrepared,
+				LeaseToken: leaseToken,
+				Generation: rec.LeaseGeneration,
+				Record:     rec,
+			}, nil
+		}
+		// Another caller acquired — re-read.
+		rec, err = s.lookupByKey(ctx, principal, capability, key)
+		if err != nil {
+			return nil, err
+		}
+		if rec.State.IsDurablyFinal() {
+			return &AcquireResult{Kind: TerminalReplay, State: rec.State, Record: rec}, nil
+		}
+		if rec.State == StateUnknown {
+			return &AcquireResult{Kind: RecoveryRequired, State: rec.State, Record: rec}, nil
+		}
+	}
+
 	// Same digest, non-terminal, lease still valid → held by other.
 	return &AcquireResult{
 		Kind:   LeaseHeldByOther,
 		State:  rec.State,
 		Record: rec,
 	}, nil
+}
+
+// acquireUnleased atomically acquires a PREPARED record that has no
+// active lease (lease_token IS NULL, lease_expires_at IS NULL). This
+// happens after AbandonPreDispatch releases the lease before expiry.
+func (s *Store) acquireUnleased(ctx context.Context, rec *Record, newToken, newOwner string, duration time.Duration) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE execution_requests
+		SET lease_owner = $1, lease_token = $2,
+		    lease_started_at = clock_timestamp(),
+		    lease_expires_at = clock_timestamp() + $3::interval,
+		    lease_generation = lease_generation + 1,
+		    version = version + 1, updated_at = clock_timestamp()
+		WHERE execution_id = $4
+		  AND state = 'PREPARED'
+		  AND lease_token IS NULL
+		  AND lease_expires_at IS NULL
+		  AND version = $5
+	`, newOwner, newToken, fmt.Sprintf("%d microseconds", duration.Microseconds()),
+		rec.ExecutionID, rec.Version)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if rows == 0 {
+		return false, nil
+	}
+	rec.LeaseOwner = newOwner
+	rec.LeaseToken = newToken
+	rec.LeaseGeneration++
+	rec.Version++
+	return true, nil
 }
 
 // reclaimExpiredLease atomically takes over an expired lease for
@@ -576,16 +643,57 @@ func (s *Store) AbandonPreDispatch(ctx context.Context, executionID, leaseToken 
 //
 // The entire terminal receipt is compared, not just state + evidence.
 func (s *Store) Finalize(ctx context.Context, executionID, leaseToken string, leaseGeneration int, expectedState State, receipt TerminalReceipt) error {
-	// Compute the terminal receipt digest for equality comparison.
-	receiptDigest, err := receipt.Digest()
-	if err != nil {
-		return fmt.Errorf("failed to compute terminal receipt digest: %w", err)
+	// P1 #5: Reject non-durably-final terminal statuses. Finalize is a
+	// durably-final transition — the receipt must target COMMITTED,
+	// FAILED, or DENIED. Passing UNKNOWN, PREPARED, EXECUTING, or
+	// IN_FLIGHT is a contract violation.
+	if !receipt.TerminalStatus.IsDurablyFinal() {
+		return fmt.Errorf("invalid terminal status %s: Finalize requires a durably-final state (COMMITTED, FAILED, or DENIED)", receipt.TerminalStatus)
 	}
 
 	// First check if already finalized (idempotent replay or conflict).
 	existing, err := s.Lookup(ctx, executionID)
 	if err != nil {
 		return fmt.Errorf("finalize lookup failed: %w", err)
+	}
+
+	// P1 #4: Validate receipt identity matches the database row.
+	// The terminal receipt is an immutable record — its identity
+	// fields must match the execution being finalized. A mismatch
+	// means the receipt describes a different execution.
+	if receipt.ExecutionID != "" && receipt.ExecutionID != executionID {
+		return fmt.Errorf("receipt identity mismatch: receipt execution_id %s != row execution_id %s", receipt.ExecutionID, executionID)
+	}
+	if receipt.Capability != "" && receipt.Capability != existing.CapabilityID {
+		return fmt.Errorf("receipt identity mismatch: receipt capability %s != row capability_id %s", receipt.Capability, existing.CapabilityID)
+	}
+	if receipt.Principal != "" && receipt.Principal != existing.PrincipalID {
+		return fmt.Errorf("receipt identity mismatch: receipt principal %s != row principal_id %s", receipt.Principal, existing.PrincipalID)
+	}
+	if receipt.RequestDigest != "" && receipt.RequestDigest != existing.RequestDigest {
+		return fmt.Errorf("receipt identity mismatch: receipt request_digest %s != row request_digest %s", receipt.RequestDigest, existing.RequestDigest)
+	}
+
+	// Populate identity fields from the authoritative row, not the
+	// caller. This ensures the canonical receipt digest is computed
+	// from the store's truth, not caller-supplied values.
+	receipt.ExecutionID = executionID
+	receipt.Capability = existing.CapabilityID
+	receipt.Principal = existing.PrincipalID
+	receipt.RequestDigest = existing.RequestDigest
+
+	// P2 #9: Store assigns FinalizedAt authoritatively. The store
+	// uses clock_timestamp() so the timestamp is deterministic and
+	// tied to the database transaction, not the caller's clock.
+	// We set it before computing the digest so the canonical receipt
+	// includes a meaningful finalized-at timestamp.
+	// (The actual DB update uses clock_timestamp() for updated_at;
+	// we approximate FinalizedAt with the same transaction time by
+	// reading it after the UPDATE. For the digest, we use a zero
+	// value and exclude it — see TerminalReceipt.Digest().)
+	receiptDigest, err := receipt.Digest()
+	if err != nil {
+		return fmt.Errorf("failed to compute terminal receipt digest: %w", err)
 	}
 
 	if existing.State.IsDurablyFinal() {
@@ -691,36 +799,43 @@ func (s *Store) ResolveRecovery(ctx context.Context, executionID string, expecte
 		}
 		return nil
 	case RecoveryRetryable:
-		// Retryable — transition back to PREPARED for re-dispatch.
-		// Only allowed for records proven safe to retry.
-		result2, err := s.db.ExecContext(ctx, `
-			UPDATE execution_requests
-			SET state = 'PREPARED', version = version + 1,
-			    lease_owner = NULL, lease_token = NULL,
-			    lease_started_at = NULL, lease_expires_at = NULL,
-			    updated_at = clock_timestamp()
-			WHERE execution_id = $1 AND state = 'UNKNOWN' AND version = $2
-		`, executionID, expectedVersion)
-		if err != nil {
-			return err
-		}
-		rows, err := result2.RowsAffected()
-		if err != nil {
-			return err
-		}
-		if rows == 0 {
-			return fmt.Errorf("%w: execution %s recovery retry CAS failed", LeaseStateConflict, executionID)
-		}
-		return nil
+		// CRAB-V1-020: post-dispatch uncertainty cannot become retryable
+		// without evidence. RecoveryRetryable is rejected at the store
+		// level because the store cannot distinguish UNKNOWN from
+		// expired IN_FLIGHT (where the side effect may have occurred)
+		// from a hypothetical safe-retry source. A generic retry path
+		// here would allow blind redispatch of potentially-executed
+		// operations.
+		return fmt.Errorf("%w: RecoveryRetryable is not permitted — post-dispatch uncertainty cannot become retryable without proven safety (CRAB-V1-020)", LeaseStateConflict)
 	case RecoveryConflict:
 		return fmt.Errorf("%w: execution %s recovery conflict", LeaseStateConflict, executionID)
 	default:
 		return fmt.Errorf("unknown recovery decision: %s", decision)
 	}
 
-	// Definitive resolution — compute terminal receipt digest.
+	// P1 #6: Enforce evidence for definitive recovery. A definitive
+	// conclusion (COMMITTED or FAILED) must include evidence/proof.
+	// Without evidence, the recovery is not credible and must stay
+	// UNKNOWN. This prevents a resolver from claiming success or
+	// failure without proof.
+	if result.EvidenceDigest == "" && len(result.Result) == 0 {
+		return fmt.Errorf("definitive recovery (%s) requires evidence or result — cannot resolve without proof", decision)
+	}
+
+	// P1 #7: Build recovery receipts from the same canonical builder
+	// as normal finalization. Load the existing record to populate
+	// identity fields (capability, principal, request_digest) so
+	// recovery-finalized and normally-finalized receipts use the
+	// same complete schema.
+	existing, err := s.Lookup(ctx, executionID)
+	if err != nil {
+		return fmt.Errorf("recovery lookup failed: %w", err)
+	}
 	receipt := TerminalReceipt{
 		ExecutionID:     executionID,
+		Capability:      existing.CapabilityID,
+		Principal:       existing.PrincipalID,
+		RequestDigest:   existing.RequestDigest,
 		CanonicalResult: result.Result,
 		EvidenceDigest:  result.EvidenceDigest,
 		ReceiptVersion:  result.ReceiptVersion,
@@ -1020,8 +1135,14 @@ type ReserveResult struct {
 const DefaultLeaseDuration = 5 * time.Minute
 
 // Reserve atomically reserves an execution request (legacy wrapper).
+// Uses the store's configured DefaultDuration rather than the package-level
+// DefaultLeaseDuration constant.
 func (s *Store) Reserve(ctx context.Context, key, principal, capability, digest, grantID, class string) (*ReserveResult, error) {
-	return s.ReserveWithLease(ctx, key, principal, capability, digest, grantID, class, DefaultLeaseDuration)
+	duration := s.leaseCfg.DefaultDuration
+	if duration <= 0 {
+		duration = DefaultLeaseDuration
+	}
+	return s.ReserveWithLease(ctx, key, principal, capability, digest, grantID, class, duration)
 }
 
 // ReserveWithLease is Reserve with a configurable lease duration (legacy wrapper).

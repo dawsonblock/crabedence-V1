@@ -72,6 +72,18 @@ func (s State) IsTerminal() bool {
 // ─── Lease configuration ──────────────────────────────────────────────
 
 // LeaseConfig defines the lease policy enforced by the store.
+//
+// DefaultDuration is used by the legacy Reserve() wrapper when no
+// explicit duration is provided. New code should use Acquire() with
+// an explicit duration.
+//
+// MaxDuration is the maximum allowed lease duration. Requests for
+// longer durations are rejected by Validate().
+//
+// RenewalWindow is the window before lease expiry during which a
+// lease holder should attempt renewal. It is advisory — the store
+// does not enforce it. It is reserved for future use by lease
+// auto-renewal helpers. Currently no code reads this field.
 type LeaseConfig struct {
 	DefaultDuration time.Duration
 	MaxDuration     time.Duration
@@ -188,8 +200,38 @@ type TerminalReceipt struct {
 // Digest computes the SHA-256 digest of the canonical terminal receipt.
 // This provides a simple equality test for duplicate finalization and
 // makes conflict detection precise.
+//
+// FinalizedAt is excluded from the digest because the store assigns it
+// from clock_timestamp() inside the database transaction — the caller
+// cannot know it before computing the digest. Including a zero value
+// would make the digest meaningless. The digest binds the immutable
+// receipt content (identity, result, provider, evidence, version) but
+// not the transient finalization timestamp.
 func (r TerminalReceipt) Digest() (string, error) {
-	canonical, err := json.Marshal(r)
+	// Marshal with FinalizedAt excluded.
+	canonical, err := json.Marshal(struct {
+		ExecutionID     string          `json:"execution_id"`
+		Capability      string          `json:"capability"`
+		Principal       string          `json:"principal"`
+		RequestDigest   string          `json:"request_digest"`
+		TerminalStatus  State           `json:"terminal_status"`
+		CanonicalResult json.RawMessage `json:"canonical_result,omitempty"`
+		ProviderID      string          `json:"provider_id"`
+		ProviderRunID   string          `json:"provider_run_id"`
+		EvidenceDigest  string          `json:"evidence_digest,omitempty"`
+		ReceiptVersion  int             `json:"receipt_version,omitempty"`
+	}{
+		ExecutionID:     r.ExecutionID,
+		Capability:      r.Capability,
+		Principal:       r.Principal,
+		RequestDigest:   r.RequestDigest,
+		TerminalStatus:  r.TerminalStatus,
+		CanonicalResult: r.CanonicalResult,
+		ProviderID:      r.ProviderID,
+		ProviderRunID:   r.ProviderRunID,
+		EvidenceDigest:  r.EvidenceDigest,
+		ReceiptVersion:  r.ReceiptVersion,
+	})
 	if err != nil {
 		return "", err
 	}
