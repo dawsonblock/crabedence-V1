@@ -433,6 +433,75 @@ run_effect_fabric_postgres_gate() {
 
 run_effect_fabric_postgres_gate
 
+# ─── Authority store live PostgreSQL gate ─────────────────────────────────────
+# Tests grant lookup, principal mismatch, capability mismatch, expiry,
+# revocation, and database error handling.
+echo ""
+echo "=== Authority store live PostgreSQL gate ==="
+
+run_authority_postgres_gate() {
+  local name="authority-postgres"
+  local log="$EVIDENCE_DIR/gate-results/${name}.log"
+
+  if [ -z "${CRABBOX_TEST_DATABASE_URL:-}" ]; then
+    {
+      echo "command=run_authority_postgres_gate"
+      echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      echo "---"
+      echo "SKIP: CRABBOX_TEST_DATABASE_URL not set"
+      echo "exit=1"
+      echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "$log"
+    record_gate "$name" "FAIL" 1 "$log"
+    echo "  FAIL  $name (CRABBOX_TEST_DATABASE_URL not set)"
+    return
+  fi
+
+  {
+    echo "command=go test -count=1 -timeout=120s -run TestLiveAuthority ./internal/authority/"
+    echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "---"
+  } > "$log"
+
+  set +e
+  go test -count=1 -timeout=120s \
+    -run "TestLiveAuthority" \
+    ./internal/authority/ >> "$log" 2>&1
+  local rc=$?
+  set -e
+
+  {
+    echo "---"
+    echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "exit=$rc"
+  } >> "$log"
+
+  if [ "$rc" -ne 0 ]; then
+    record_gate "$name" "FAIL" "$rc" "$log"
+    echo "  FAIL  $name (exit=$rc)"
+    cat "$log"
+    return
+  fi
+
+  local executed
+  executed=$(grep -cE '^(ok|FAIL|--- PASS|--- FAIL)' "$log" 2>/dev/null || true)
+  if [ "$executed" -le 0 ]; then
+    {
+      echo ""
+      echo "FAIL: 0 tests executed (all skipped or no match)"
+      echo "exit=1"
+    } >> "$log"
+    record_gate "$name" "FAIL" 1 "$log"
+    echo "  FAIL  $name (0 tests executed)"
+    return
+  fi
+
+  record_gate "$name" "PASS" 0 "$log"
+  echo "  PASS  $name ($executed test lines)"
+}
+
+run_authority_postgres_gate
+
 # ─── Phase 13: Cross-language conformance ───────────────────────────────────
 echo ""
 echo "=== Cross-language conformance ==="
@@ -515,7 +584,7 @@ extract_tests_executed() {
   local count=0
 
   case "$gate_name" in
-    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-cli|effect-fabric-contract|effect-fabric-race|effect-fabric-postgres)
+    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-cli|effect-fabric-contract|effect-fabric-race|effect-fabric-postgres|authority-postgres)
       # Go test without -v prints one line per package:
       #   ok  \t<package>\t<duration>
       #   FAIL\t<package>\t<duration>
@@ -708,7 +777,7 @@ TOTAL_TESTS_SKIPPED=0
 for i in "${!GATE_NAMES[@]}"; do
   gate_name="${GATE_NAMES[$i]}"
   case "$gate_name" in
-    *tests|postgres-*|effect-fabric-*|cross-language-conformance)
+    *tests|postgres-*|effect-fabric-*|cross-language-conformance|authority-*)
       te="$(extract_tests_executed "$gate_name" "${GATE_LOG[$i]}")"
       TOTAL_TESTS_EXECUTED=$((TOTAL_TESTS_EXECUTED + te))
       ;;

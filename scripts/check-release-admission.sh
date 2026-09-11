@@ -84,7 +84,7 @@ for i in $(seq 0 $((GATE_COUNT - 1))); do
   tests_executed="$(jq -r ".gates[$i].tests_executed // \"\"" "$QUAL_FILE")"
   is_test_gate=false
   case "$name" in
-    *tests|postgres-*|effect-fabric-*) is_test_gate=true ;;
+    *tests|postgres-*|effect-fabric-*|authority-*) is_test_gate=true ;;
   esac
   if [ "$is_test_gate" = true ] && [ "$status" = "PASS" ]; then
     if [ "$tests_executed" = "" ] || [ "$tests_executed" = "null" ] || [ "$tests_executed" = "0" ]; then
