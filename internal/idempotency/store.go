@@ -40,6 +40,7 @@ type Record struct {
 	ProviderID            string          `json:"provider_id,omitempty"`
 	ProviderRunID         string          `json:"provider_run_id,omitempty"`
 	TerminalReceiptDigest string          `json:"terminal_receipt_digest,omitempty"`
+	RecoveryLocator       json.RawMessage `json:"recovery_locator,omitempty"`
 	Attempt               int             `json:"attempt,omitempty"`
 	Version               int             `json:"version"`
 	CreatedAt             time.Time       `json:"created_at"`
@@ -92,6 +93,7 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 			provider_id TEXT,
 			provider_run_id TEXT,
 			terminal_receipt_digest TEXT,
+			recovery_locator JSONB,
 			attempt INTEGER NOT NULL DEFAULT 0,
 			version INTEGER NOT NULL DEFAULT 1,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -126,6 +128,7 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 				provider_id TEXT,
 				provider_run_id TEXT,
 				terminal_receipt_digest TEXT,
+				recovery_locator JSONB,
 				attempt INTEGER NOT NULL DEFAULT 0,
 				version INTEGER NOT NULL DEFAULT 1,
 				created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -155,6 +158,9 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 	}
 	if err := s.addColumnIfMissing(ctx, "terminal_receipt_digest", "TEXT"); err != nil {
 		return fmt.Errorf("migration failed (terminal_receipt_digest): %w", err)
+	}
+	if err := s.addColumnIfMissing(ctx, "recovery_locator", "JSONB"); err != nil {
+		return fmt.Errorf("migration failed (recovery_locator): %w", err)
 	}
 	// Legacy columns from earlier versions.
 	if err := s.addColumnIfMissing(ctx, "receipt_version", "INTEGER NOT NULL DEFAULT 0"); err != nil {
@@ -216,6 +222,21 @@ func generateLeaseToken() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
+// generateExecutionID generates a UUID v4 application-side.
+// This replaces the gen_random_uuid() database default, making
+// the insert path independent of the pgcrypto extension.
+func generateExecutionID() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	// Set version 4 (random) and variant bits.
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
+}
+
 // ─── Acquire (reservation) ───────────────────────────────────────────
 
 // Acquire attempts to acquire a lease for an execution.
@@ -243,21 +264,28 @@ func (s *Store) Acquire(ctx context.Context, key, principal, capability, digest,
 
 	// First, try to atomically INSERT a new PREPARED record with a lease.
 	// PostgreSQL owns the timestamps via clock_timestamp().
+	// execution_id is generated application-side (UUID v4) so the insert
+	// works whether or not the pgcrypto extension is available.
+	genID, err := generateExecutionID()
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate execution ID: %w", err)
+	}
 	var executionID string
 	var createdAt time.Time
 	err = s.db.QueryRowContext(ctx, `
 		INSERT INTO execution_requests
-			(idempotency_key, principal_id, capability_id, request_digest,
+			(execution_id, idempotency_key, principal_id, capability_id, request_digest,
 			 grant_id, execution_class, state,
 			 lease_owner, lease_token, lease_started_at, lease_expires_at,
 			 lease_generation, attempt, version)
-		VALUES ($1, $2, $3, $4, $5, $6, 'PREPARED',
+		VALUES ($10, $1, $2, $3, $4, $5, $6, 'PREPARED',
 				$7, $8, clock_timestamp(), clock_timestamp() + $9::interval,
 				1, 0, 1)
 		ON CONFLICT (principal_id, capability_id, idempotency_key) DO NOTHING
 		RETURNING execution_id, created_at
 	`, key, principal, capability, digest, nullableString(grantID), class,
 		leaseOwner, leaseToken, fmt.Sprintf("%d microseconds", leaseDuration.Microseconds()),
+		genID,
 	).Scan(&executionID, &createdAt)
 
 	if err == nil {
@@ -537,13 +565,73 @@ func (s *Store) BeginExecution(ctx context.Context, executionID, leaseToken stri
 // MarkInFlight transitions from EXECUTING to IN_FLIGHT.
 // This crosses the dispatch boundary — persist BEFORE the provider call.
 // After this point, a crash means the side effect may have occurred.
-func (s *Store) MarkInFlight(ctx context.Context, executionID, leaseToken string, leaseGeneration int) error {
-	return s.leaseFencedTransition(ctx, executionID, leaseToken, leaseGeneration, StateExecuting, StateInFlight)
+//
+// providerID and recoveryLocator are persisted atomically with the
+// state transition so that a crashed execution carries the information
+// needed for provider-specific reconciliation.
+func (s *Store) MarkInFlight(ctx context.Context, executionID, leaseToken string, leaseGeneration int, providerID string, recoveryLocator json.RawMessage) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE execution_requests
+		SET state = 'IN_FLIGHT', version = version + 1,
+		    provider_id = $4, recovery_locator = $5,
+		    updated_at = clock_timestamp()
+		WHERE execution_id = $1
+		  AND state = 'EXECUTING'
+		  AND lease_token = $2
+		  AND lease_generation = $3
+		  AND lease_expires_at > clock_timestamp()
+	`, executionID, leaseToken, leaseGeneration,
+		nullableString(providerID), nullableBytes(recoveryLocator))
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return s.classifyTransitionFailure(ctx, executionID, leaseToken, leaseGeneration, StateExecuting)
+	}
+	return nil
+}
+
+// legalTransitions defines the allowed state transitions.
+// This enforces the lifecycle graph inside the Store rather than
+// relying on caller convention.
+var legalTransitions = map[State][]State{
+	StatePrepared:  {StateExecuting, StateDenied},
+	StateExecuting: {StateInFlight, StateDenied, StatePrepared},
+	StateInFlight:  {StateCommitted, StateFailed, StateUnknown},
+	StateUnknown:   {StateCommitted, StateFailed},
+}
+
+// isLegalTransition checks whether a state transition is allowed by
+// the lifecycle graph. Terminal states have no outgoing transitions.
+func isLegalTransition(from, to State) bool {
+	if from.IsDurablyFinal() {
+		return false // Terminal states are immutable.
+	}
+	allowed, ok := legalTransitions[from]
+	if !ok {
+		return false
+	}
+	for _, s := range allowed {
+		if s == to {
+			return true
+		}
+	}
+	return false
 }
 
 // leaseFencedTransition performs a state transition with full lease
 // fencing enforced inside the SQL statement.
+//
+// In addition to lease fencing, this enforces the legal transition
+// matrix — only transitions defined in legalTransitions are permitted.
 func (s *Store) leaseFencedTransition(ctx context.Context, executionID, leaseToken string, leaseGeneration int, expectedState, newState State) error {
+	if !isLegalTransition(expectedState, newState) {
+		return fmt.Errorf("%w: illegal transition %s → %s", LeaseStateConflict, expectedState, newState)
+	}
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE execution_requests
 		SET state = $1, version = version + 1, updated_at = clock_timestamp()
@@ -600,7 +688,7 @@ func (s *Store) RenewLease(ctx context.Context, executionID, leaseToken string, 
 	}
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE execution_requests
-		SET lease_expires_at = clock_timestamp() + $1::interval,
+		SET lease_expires_at = GREATEST(lease_expires_at, clock_timestamp() + $1::interval),
 		    updated_at = clock_timestamp()
 		WHERE execution_id = $2
 		  AND lease_token = $3
@@ -684,12 +772,20 @@ func (s *Store) AbandonPreDispatch(ctx context.Context, executionID, leaseToken 
 //
 // The entire terminal receipt is compared, not just state + evidence.
 func (s *Store) Finalize(ctx context.Context, executionID, leaseToken string, leaseGeneration int, expectedState State, receipt TerminalReceipt) error {
-	// P1 #5: Reject non-durably-final terminal statuses. Finalize is a
+	// Reject non-durably-final terminal statuses. Finalize is a
 	// durably-final transition — the receipt must target COMMITTED,
 	// FAILED, or DENIED. Passing UNKNOWN, PREPARED, EXECUTING, or
 	// IN_FLIGHT is a contract violation.
 	if !receipt.TerminalStatus.IsDurablyFinal() {
 		return fmt.Errorf("invalid terminal status %s: Finalize requires a durably-final state (COMMITTED, FAILED, or DENIED)", receipt.TerminalStatus)
+	}
+
+	// Enforce the legal transition matrix for finalization:
+	//   COMMITTED, FAILED → only from IN_FLIGHT (post-dispatch)
+	//   DENIED            → only from PREPARED or EXECUTING (pre-dispatch)
+	// This prevents illegal transitions like PREPARED → COMMITTED.
+	if !isLegalTransition(expectedState, receipt.TerminalStatus) {
+		return fmt.Errorf("%w: illegal finalization transition %s → %s", LeaseStateConflict, expectedState, receipt.TerminalStatus)
 	}
 
 	// First check if already finalized (idempotent replay or conflict).
@@ -821,7 +917,8 @@ func (s *Store) EnterRecovery(ctx context.Context, executionID string, expectedS
 //
 // The recovery result must include evidence for any definitive
 // conclusion (COMMITTED or FAILED).
-func (s *Store) ResolveRecovery(ctx context.Context, executionID string, expectedVersion int, decision RecoveryDecision, result RecoveryResult) error {
+func (s *Store) ResolveRecovery(ctx context.Context, executionID string, expectedVersion int, result RecoveryResult) error {
+	decision := result.Decision
 	var newState State
 	switch decision {
 	case RecoveryCommitted:
@@ -880,15 +977,19 @@ func (s *Store) ResolveRecovery(ctx context.Context, executionID string, expecte
 		return fmt.Errorf("recovery lookup failed: %w", lookupErr)
 	}
 	if existingRec.ExecutionClass == "CRITICAL" {
-		if decision == RecoveryCommitted {
+		// CRITICAL: both COMMITTED and FAILED require full proof.
+		// RecoveryFailed is equally dangerous — claiming a CRITICAL
+		// execution definitively failed without proof could allow
+		// a retry of an already-executed side effect.
+		if decision == RecoveryCommitted || decision == RecoveryFailed {
 			if result.EvidenceDigest == "" || !isValidEvidenceDigest(result.EvidenceDigest) {
-				return fmt.Errorf("CRITICAL recovery to COMMITTED requires valid evidence digest (64-char lowercase hex)")
+				return fmt.Errorf("CRITICAL recovery to %s requires valid evidence digest (64-char lowercase hex)", decision)
 			}
 			if result.ReceiptVersion != 3 {
-				return fmt.Errorf("CRITICAL recovery to COMMITTED requires receipt_version 3, got %d", result.ReceiptVersion)
+				return fmt.Errorf("CRITICAL recovery to %s requires receipt_version 3, got %d", decision, result.ReceiptVersion)
 			}
 			if result.ProviderID == "" || result.ProviderRunID == "" {
-				return fmt.Errorf("CRITICAL recovery to COMMITTED requires provider_id and provider_run_id")
+				return fmt.Errorf("CRITICAL recovery to %s requires provider_id and provider_run_id", decision)
 			}
 		}
 	} else {
@@ -955,6 +1056,7 @@ func (s *Store) Lookup(ctx context.Context, executionID string) (*Record, error)
 	var rec Record
 	var resultJSON []byte
 	var leaseOwner, leaseToken, providerID, providerRunID, terminalDigest sql.NullString
+	var recoveryLocator []byte
 	var leaseStartedAt, leaseExpiresAt sql.NullTime
 	err := s.db.QueryRowContext(ctx, `
 		SELECT execution_id, idempotency_key, principal_id, capability_id,
@@ -962,7 +1064,7 @@ func (s *Store) Lookup(ctx context.Context, executionID string) (*Record, error)
 		       result, COALESCE(evidence_digest, ''), COALESCE(receipt_version, 0),
 		       lease_owner, lease_token, lease_started_at, lease_expires_at,
 		       COALESCE(lease_generation, 1),
-		       provider_id, provider_run_id, terminal_receipt_digest,
+		       provider_id, provider_run_id, terminal_receipt_digest, recovery_locator,
 		       COALESCE(attempt, 0), COALESCE(version, 1), created_at, updated_at
 		FROM execution_requests
 		WHERE execution_id = $1
@@ -973,7 +1075,7 @@ func (s *Store) Lookup(ctx context.Context, executionID string) (*Record, error)
 		&rec.EvidenceDigest, &rec.ReceiptVersion,
 		&leaseOwner, &leaseToken, &leaseStartedAt, &leaseExpiresAt,
 		&rec.LeaseGeneration,
-		&providerID, &providerRunID, &terminalDigest,
+		&providerID, &providerRunID, &terminalDigest, &recoveryLocator,
 		&rec.Attempt, &rec.Version, &rec.CreatedAt, &rec.UpdatedAt,
 	)
 	if err != nil {
@@ -1002,6 +1104,9 @@ func (s *Store) Lookup(ctx context.Context, executionID string) (*Record, error)
 	}
 	if terminalDigest.Valid {
 		rec.TerminalReceiptDigest = terminalDigest.String
+	}
+	if len(recoveryLocator) > 0 {
+		rec.RecoveryLocator = json.RawMessage(recoveryLocator)
 	}
 	return &rec, nil
 }
@@ -1015,6 +1120,7 @@ func (s *Store) lookupByKey(ctx context.Context, principal, capability, key stri
 	var rec Record
 	var resultJSON []byte
 	var leaseOwner, leaseToken, providerID, providerRunID, terminalDigest sql.NullString
+	var recoveryLocator []byte
 	var leaseStartedAt, leaseExpiresAt sql.NullTime
 	err := s.db.QueryRowContext(ctx, `
 		SELECT execution_id, idempotency_key, principal_id, capability_id,
@@ -1022,7 +1128,7 @@ func (s *Store) lookupByKey(ctx context.Context, principal, capability, key stri
 		       result, COALESCE(evidence_digest, ''), COALESCE(receipt_version, 0),
 		       lease_owner, lease_token, lease_started_at, lease_expires_at,
 		       COALESCE(lease_generation, 1),
-		       provider_id, provider_run_id, terminal_receipt_digest,
+		       provider_id, provider_run_id, terminal_receipt_digest, recovery_locator,
 		       COALESCE(attempt, 0), COALESCE(version, 1), created_at, updated_at
 		FROM execution_requests
 		WHERE principal_id = $1 AND capability_id = $2 AND idempotency_key = $3
@@ -1033,7 +1139,7 @@ func (s *Store) lookupByKey(ctx context.Context, principal, capability, key stri
 		&rec.EvidenceDigest, &rec.ReceiptVersion,
 		&leaseOwner, &leaseToken, &leaseStartedAt, &leaseExpiresAt,
 		&rec.LeaseGeneration,
-		&providerID, &providerRunID, &terminalDigest,
+		&providerID, &providerRunID, &terminalDigest, &recoveryLocator,
 		&rec.Attempt, &rec.Version, &rec.CreatedAt, &rec.UpdatedAt,
 	)
 	if err != nil {
@@ -1062,6 +1168,9 @@ func (s *Store) lookupByKey(ctx context.Context, principal, capability, key stri
 	}
 	if terminalDigest.Valid {
 		rec.TerminalReceiptDigest = terminalDigest.String
+	}
+	if len(recoveryLocator) > 0 {
+		rec.RecoveryLocator = json.RawMessage(recoveryLocator)
 	}
 	return &rec, nil
 }
@@ -1082,7 +1191,7 @@ func (s *Store) ListExpiredLeases(ctx context.Context) ([]*Record, error) {
 		       result, COALESCE(evidence_digest, ''), COALESCE(receipt_version, 0),
 		       lease_owner, lease_token, lease_started_at, lease_expires_at,
 		       COALESCE(lease_generation, 1),
-		       provider_id, provider_run_id, terminal_receipt_digest,
+		       provider_id, provider_run_id, terminal_receipt_digest, recovery_locator,
 		       COALESCE(attempt, 0), COALESCE(version, 1), created_at, updated_at
 		FROM execution_requests
 		WHERE state IN ('PREPARED', 'EXECUTING', 'IN_FLIGHT')
@@ -1127,7 +1236,7 @@ func (s *Store) listByStates(ctx context.Context, states []State) ([]*Record, er
 		       result, COALESCE(evidence_digest, ''), COALESCE(receipt_version, 0),
 		       lease_owner, lease_token, lease_started_at, lease_expires_at,
 		       COALESCE(lease_generation, 1),
-		       provider_id, provider_run_id, terminal_receipt_digest,
+		       provider_id, provider_run_id, terminal_receipt_digest, recovery_locator,
 		       COALESCE(attempt, 0), COALESCE(version, 1), created_at, updated_at
 		FROM execution_requests
 		WHERE state IN (`+placeholders+`)
@@ -1147,6 +1256,7 @@ func scanRecords(rows *sql.Rows) ([]*Record, error) {
 		var rec Record
 		var resultJSON []byte
 		var leaseOwner, leaseToken, providerID, providerRunID, terminalDigest sql.NullString
+		var recoveryLocator []byte
 		var leaseStartedAt, leaseExpiresAt sql.NullTime
 		if err := rows.Scan(
 			&rec.ExecutionID, &rec.IdempotencyKey, &rec.PrincipalID,
@@ -1155,7 +1265,7 @@ func scanRecords(rows *sql.Rows) ([]*Record, error) {
 			&rec.EvidenceDigest, &rec.ReceiptVersion,
 			&leaseOwner, &leaseToken, &leaseStartedAt, &leaseExpiresAt,
 			&rec.LeaseGeneration,
-			&providerID, &providerRunID, &terminalDigest,
+			&providerID, &providerRunID, &terminalDigest, &recoveryLocator,
 			&rec.Attempt, &rec.Version, &rec.CreatedAt, &rec.UpdatedAt,
 		); err != nil {
 			return nil, err
@@ -1183,6 +1293,9 @@ func scanRecords(rows *sql.Rows) ([]*Record, error) {
 		}
 		if terminalDigest.Valid {
 			rec.TerminalReceiptDigest = terminalDigest.String
+		}
+		if len(recoveryLocator) > 0 {
+			rec.RecoveryLocator = json.RawMessage(recoveryLocator)
 		}
 		records = append(records, &rec)
 	}
@@ -1295,6 +1408,12 @@ func migrateState(s State) State {
 	default:
 		return s
 	}
+}
+
+// LeaseConfig returns the store's lease configuration.
+// Used by DispatchExecutor to derive heartbeat parameters.
+func (s *Store) LeaseConfig() LeaseConfig {
+	return s.leaseCfg
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────

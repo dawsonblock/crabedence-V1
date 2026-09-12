@@ -28,6 +28,19 @@
 - Release: `npm install` fallbacks removed from release qualification — locked dependencies required.
 - Reconciliation: `reconcile.Worker` migrated from legacy `Resolver` to `idempotency.RecoveryResolver` — full `RecoveryResult` (evidence, provider identity, result) propagated to `ResolveRecovery`. Provider/capability resolver registration via `RegisterResolver`.
 - Reconciliation: `NoopResolver` implements `RecoveryResolver` (fail-closed UNKNOWN).
+- Reconciliation: production `serve.go` registers `CounterHandler.Resolve` as `RecoveryResolver` for `test.counter.increment` — the worker now has a real resolver instead of shipping only `NoopResolver`.
+- Execution: `DispatchExecutor` migrated from legacy `Reserve`/`TransitionState` to typed `Acquire`/`BeginExecution`/`MarkInFlight` — lease generation and fencing are explicit throughout the execution path.
+- Execution: `MarkInFlight` persists `provider_id` and `recovery_locator` atomically with the IN_FLIGHT transition — a crashed execution carries enough information for provider-specific reconciliation.
+- Execution: recovery locator contains `capability_id`, `idempotency_key`, `principal`, `request_digest`, `provider_id`, `execution_class`, `arguments`, and `dispatched_at` — sufficient for resolvers to query the provider.
+- Execution: lease heartbeat uses `Store.LeaseConfig()` for renewal interval and duration — no hardcoded constants. Renewal interval = `DefaultDuration - RenewalWindow`; renewal duration = `DefaultDuration` clamped to `MaxDuration`.
+- Execution: `RenewLease` uses PostgreSQL `GREATEST` — renewal cannot shorten an existing valid lease.
+- Execution: `execution_id` generated application-side (UUID v4) — the insert no longer depends on `gen_random_uuid()` or the `pgcrypto` extension.
+- Execution: CRITICAL `RecoveryFailed` requires the same proof as `RecoveryCommitted` — evidence digest, receipt version 3, provider ID, provider run ID. A CRITICAL execution cannot be claimed FAILED without proof.
+- Execution: `ResolveRecovery` signature simplified — `result.Decision` is the single source of truth for recovery decisions.
+- Execution: store enforces legal transition matrix (`legalTransitions`) — `COMMITTED`/`FAILED` may only finalize from `IN_FLIGHT`; `DENIED` is pre-dispatch only; terminal states are immutable.
+- Execution: `Record.RecoveryLocator` added — persisted JSONB locator for provider-specific recovery.
+- Execution: `CounterHandler.Resolve` implements `RecoveryResolver` — checks the counter state to determine if the increment occurred.
+- Tests: transition matrix coverage, UUID generation validity/uniqueness, `RenewLease` monotonicity, recovery locator persistence, CRITICAL `RecoveryFailed` proof requirements, stored provider metadata replay, and live worker+PG reconciliation.
 - Reconciliation: dedicated `effect-fabric-reconciliation` release gate added; `internal/reconcile` included in `effect-fabric-race`.
 - Execution: `RecoveryUnknown` CAS now checks `RowsAffected` — stale CAS returns `LeaseStateConflict` instead of silent success.
 - Execution: CRITICAL recovery proof is class-aware — `RecoveryCommitted` for CRITICAL executions requires valid SHA-256 evidence digest, receipt v3, provider_id, and provider_run_id (equal to normal CRITICAL finalization).

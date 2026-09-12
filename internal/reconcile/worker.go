@@ -169,7 +169,7 @@ func (w *Worker) reconcileOne(ctx context.Context, rec *idempotency.Record) erro
 	// is rec.Version. The full RecoveryResult is propagated so
 	// ResolveRecovery can validate evidence and build a canonical
 	// terminal receipt.
-	if err := w.store.ResolveRecovery(ctx, rec.ExecutionID, rec.Version, result.Decision, result); err != nil {
+	if err := w.store.ResolveRecovery(ctx, rec.ExecutionID, rec.Version, result); err != nil {
 		return fmt.Errorf("failed to resolve recovery: %w", err)
 	}
 

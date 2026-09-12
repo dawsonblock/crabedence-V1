@@ -84,9 +84,10 @@ func (s State) IsTerminal() bool {
 // longer durations are rejected by Validate().
 //
 // RenewalWindow is the window before lease expiry during which a
-// lease holder should attempt renewal. It is advisory — the store
-// does not enforce it. It is reserved for future use by lease
-// auto-renewal helpers. Currently no code reads this field.
+// lease holder should attempt renewal. It is consumed by the
+// DispatchExecutor lease heartbeat: the heartbeat computes its
+// renewal interval as (DefaultDuration - RenewalWindow), so the
+// first renewal fires RenewalWindow before the lease would expire.
 type LeaseConfig struct {
 	DefaultDuration time.Duration
 	MaxDuration     time.Duration

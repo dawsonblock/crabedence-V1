@@ -33,7 +33,9 @@ BeginExecution (acquire lease)
 EXECUTING
    │
 MarkInFlight (dispatch boundary crossed)
-   │
+   │  — persists provider_id + recovery_locator atomically
+   │    so a crashed execution carries the information needed
+   │    for provider-specific reconciliation
    ▼
 IN_FLIGHT
    │

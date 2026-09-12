@@ -423,3 +423,108 @@ func TestRecoveryResultJSON(t *testing.T) {
 		t.Error("JSON should contain evidence digest")
 	}
 }
+
+// TestLegalTransitionMatrix verifies that the Store's transition matrix
+// rejects illegal state transitions. This ensures the lifecycle graph
+// is enforced inside the Store, not just in callers.
+func TestLegalTransitionMatrix(t *testing.T) {
+	tests := []struct {
+		name  string
+		from  State
+		to    State
+		legal bool
+	}{
+		// Legal transitions
+		{"PREPARED→EXECUTING", StatePrepared, StateExecuting, true},
+		{"PREPARED→DENIED", StatePrepared, StateDenied, true},
+		{"EXECUTING→IN_FLIGHT", StateExecuting, StateInFlight, true},
+		{"EXECUTING→DENIED", StateExecuting, StateDenied, true},
+		{"EXECUTING→PREPARED", StateExecuting, StatePrepared, true},
+		{"IN_FLIGHT→COMMITTED", StateInFlight, StateCommitted, true},
+		{"IN_FLIGHT→FAILED", StateInFlight, StateFailed, true},
+		{"IN_FLIGHT→UNKNOWN", StateInFlight, StateUnknown, true},
+		{"UNKNOWN→COMMITTED", StateUnknown, StateCommitted, true},
+		{"UNKNOWN→FAILED", StateUnknown, StateFailed, true},
+
+		// Illegal transitions
+		{"PREPARED→COMMITTED", StatePrepared, StateCommitted, false},
+		{"PREPARED→IN_FLIGHT", StatePrepared, StateInFlight, false},
+		{"PREPARED→UNKNOWN", StatePrepared, StateUnknown, false},
+		{"EXECUTING→COMMITTED", StateExecuting, StateCommitted, false},
+		{"EXECUTING→UNKNOWN", StateExecuting, StateUnknown, false},
+		{"EXECUTING→FAILED", StateExecuting, StateFailed, false},
+		{"IN_FLIGHT→PREPARED", StateInFlight, StatePrepared, false},
+		{"IN_FLIGHT→EXECUTING", StateInFlight, StateExecuting, false},
+		{"IN_FLIGHT→DENIED", StateInFlight, StateDenied, false},
+		{"UNKNOWN→IN_FLIGHT", StateUnknown, StateInFlight, false},
+		{"UNKNOWN→PREPARED", StateUnknown, StatePrepared, false},
+		{"UNKNOWN→EXECUTING", StateUnknown, StateExecuting, false},
+		{"UNKNOWN→DENIED", StateUnknown, StateDenied, false},
+
+		// Terminal states are immutable
+		{"COMMITTED→EXECUTING", StateCommitted, StateExecuting, false},
+		{"COMMITTED→FAILED", StateCommitted, StateFailed, false},
+		{"COMMITTED→UNKNOWN", StateCommitted, StateUnknown, false},
+		{"FAILED→COMMITTED", StateFailed, StateCommitted, false},
+		{"FAILED→UNKNOWN", StateFailed, StateUnknown, false},
+		{"DENIED→COMMITTED", StateDenied, StateCommitted, false},
+		{"DENIED→IN_FLIGHT", StateDenied, StateInFlight, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isLegalTransition(tt.from, tt.to)
+			if got != tt.legal {
+				t.Errorf("isLegalTransition(%s, %s) = %v, want %v",
+					tt.from, tt.to, got, tt.legal)
+			}
+		})
+	}
+}
+
+// TestGenerateExecutionID verifies that application-side UUID generation
+// produces valid UUID v4 format strings.
+func TestGenerateExecutionID(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		id, err := generateExecutionID()
+		if err != nil {
+			t.Fatalf("generateExecutionID failed: %v", err)
+		}
+		// UUID v4 format: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx
+		if len(id) != 36 {
+			t.Fatalf("execution ID length %d, want 36: %q", len(id), id)
+		}
+		if id[8] != '-' || id[13] != '-' || id[18] != '-' || id[23] != '-' {
+			t.Errorf("execution ID missing hyphens: %q", id)
+		}
+		if id[14] != '4' {
+			t.Errorf("execution ID version nibble: got %c, want '4'", id[14])
+		}
+		variant := id[19]
+		if variant != '8' && variant != '9' && variant != 'a' && variant != 'b' {
+			t.Errorf("execution ID variant nibble: got %c, want 8/9/a/b", variant)
+		}
+	}
+}
+
+// TestGenerateExecutionIDUniqueness verifies UUIDs are unique.
+func TestGenerateExecutionIDUniqueness(t *testing.T) {
+	seen := make(map[string]bool)
+	for i := 0; i < 10000; i++ {
+		id, err := generateExecutionID()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if seen[id] {
+			t.Fatalf("duplicate execution ID generated: %s", id)
+		}
+		seen[id] = true
+	}
+}
+
+// TestIsLegalTransitionNilFrom verifies that zero-value State is rejected.
+func TestIsLegalTransitionNilFrom(t *testing.T) {
+	if isLegalTransition("", StateCommitted) {
+		t.Error("empty state should not transition to COMMITTED")
+	}
+}

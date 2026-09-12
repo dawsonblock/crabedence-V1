@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/openclaw/crabbox/internal/capability"
+	"github.com/openclaw/crabbox/internal/idempotency"
 )
 
 // CounterHandler implements the test.counter.increment capability.
@@ -80,6 +81,65 @@ func (h *CounterHandler) Execute(ctx context.Context, req Request, desc capabili
 			RunID:    runID,
 		},
 	}
+}
+
+// Resolve implements idempotency.RecoveryResolver for the counter
+// capability. It checks whether the counter described in the recovery
+// locator was actually incremented.
+//
+// For an in-memory counter, a process crash loses all state — so this
+// resolver can only prove COMMITTED (the counter exists and was
+// incremented), not FAILED (the counter may have existed before the
+// crash). RecoveryFailed is not possible for in-memory providers.
+func (h *CounterHandler) Resolve(ctx context.Context, rec *idempotency.Record) (idempotency.RecoveryResult, error) {
+	// Parse the recovery locator to find which counter was incremented.
+	var locator struct {
+		Arguments struct {
+			Counter string `json:"counter"`
+			By      int64  `json:"by"`
+		} `json:"arguments"`
+	}
+	if len(rec.RecoveryLocator) > 0 {
+		var loc struct {
+			Arguments json.RawMessage `json:"arguments"`
+		}
+		if err := json.Unmarshal(rec.RecoveryLocator, &loc); err == nil {
+			json.Unmarshal(loc.Arguments, &locator.Arguments)
+		}
+	}
+
+	counterName := locator.Arguments.Counter
+	if counterName == "" {
+		counterName = "default"
+	}
+
+	h.mu.Lock()
+	value, exists := h.counters[counterName]
+	h.mu.Unlock()
+
+	if !exists {
+		// The counter does not exist — either the handler never ran,
+		// or the process crashed and in-memory state was lost.
+		// We cannot distinguish these cases, so return UNKNOWN.
+		return idempotency.RecoveryResult{
+			Decision: idempotency.RecoveryUnknown,
+		}, nil
+	}
+
+	// The counter exists — the increment happened (or the counter
+	// was incremented by a different execution). For the test counter,
+	// this is sufficient proof of COMMITTED.
+	result, _ := json.Marshal(map[string]any{
+		"counter": counterName,
+		"value":   value,
+		"by":      locator.Arguments.By,
+	})
+	return idempotency.RecoveryResult{
+		Decision:      idempotency.RecoveryCommitted,
+		Result:        result,
+		ProviderID:    "test-counter",
+		ProviderRunID: fmt.Sprintf("counter-recovered-%s", counterName),
+	}, nil
 }
 
 // RegisterCounterCapability registers test.counter.increment in the registry.

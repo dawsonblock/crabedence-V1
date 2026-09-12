@@ -131,9 +131,13 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	// Start reconciliation worker if enabled
+	// Start reconciliation worker if enabled.
+	// Register capability-specific resolvers for each provider that
+	// supports recovery. The default resolver is NoopResolver (fail-
+	// closed: UNKNOWN stays UNKNOWN unless a resolver proves otherwise).
 	if store != nil && opts.ReconcileInterval > 0 {
 		worker := reconcile.NewWorker(store, reconcile.NoopResolver{}, durationSeconds(opts.ReconcileInterval))
+		worker.RegisterResolver("test.counter.increment", counterHandler)
 		go worker.Run(ctx)
 	}
 

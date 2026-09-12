@@ -2,6 +2,7 @@ package execution
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
@@ -82,20 +83,24 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		}
 	}
 
-	// Reserve the request atomically.
-	// Acquired=true means THIS caller owns the reservation and may dispatch.
-	// Acquired=false means another caller owns it or the record is terminal.
-	reserve, err := e.store.Reserve(ctx, req.IdempotencyKey, req.Authority.Principal, req.Capability, digest, req.Authority.EffectiveAuthorityRef(), string(desc.ExecutionClass))
+	// Acquire the execution atomically using the typed API.
+	// The lease duration comes from the store's LeaseConfig.
+	leaseCfg := e.store.LeaseConfig()
+	leaseDuration := leaseCfg.DefaultDuration
+	if leaseDuration <= 0 {
+		leaseDuration = idempotency.DefaultLeaseDuration
+	}
+	acq, err := e.store.Acquire(ctx, req.IdempotencyKey, req.Authority.Principal, req.Capability, digest, req.Authority.EffectiveAuthorityRef(), string(desc.ExecutionClass), leaseDuration)
 	if err != nil {
 		return Response{
 			Status:      StatusFailed,
 			FailureCode: string(capability.FailureInternalError),
-			Error:       fmt.Sprintf("idempotency reserve failed: %v", err),
+			Error:       fmt.Sprintf("idempotency acquire failed: %v", err),
 		}
 	}
 
 	// Check for conflict — same key, different request
-	if reserve.Conflict {
+	if acq.Kind == idempotency.IdempotencyConflict {
 		return Response{
 			Status:      StatusDenied,
 			FailureCode: string(capability.FailureIdempotencyConflict),
@@ -104,55 +109,72 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	}
 
 	// Check for existing terminal result — replay the stored result.
-	// Acquired=false means we did NOT create this reservation.
-	if !reserve.Acquired && reserve.Record != nil && reserve.State.IsTerminal() {
+	// Terminal replay must use the STORED provider identity, not the
+	// current adapter. The stored provider_id/provider_run_id are part
+	// of the audit trail for CRITICAL operations.
+	if acq.Kind == idempotency.TerminalReplay && acq.Record != nil {
+		replayProvider := acq.Record.ProviderID
+		replayRunID := acq.Record.ProviderRunID
+		if replayProvider == "" {
+			replayProvider = desc.AdapterID
+		}
+		if replayRunID == "" {
+			replayRunID = acq.Record.ExecutionID
+		}
 		return Response{
-			Status:   stateToStatus(reserve.State),
-			Result:   reserve.Record.Result,
-			Evidence: parseEvidence(reserve.Record.EvidenceDigest, reserve.Record.ReceiptVersion),
+			Status:   stateToStatus(acq.State),
+			Result:   acq.Record.Result,
+			Evidence: parseEvidence(acq.Record.EvidenceDigest, acq.Record.ReceiptVersion),
 			Execution: &ExecutionMeta{
-				Provider: desc.AdapterID,
-				RunID:    reserve.Record.ExecutionID,
+				Provider: replayProvider,
+				RunID:    replayRunID,
 			},
 		}
 	}
 
 	// Check for existing in-flight — another caller owns the reservation
 	// or the record is in a non-terminal state.
-	// Acquired=false means we do NOT own this execution.
-	if !reserve.Acquired {
+	if !acq.Acquired() {
+		replayProvider := desc.AdapterID
+		replayRunID := ""
+		if acq.Record != nil {
+			replayRunID = acq.Record.ExecutionID
+			if acq.Record.ProviderID != "" {
+				replayProvider = acq.Record.ProviderID
+			}
+		}
 		return Response{
 			Status:      StatusInFlight,
 			FailureCode: string(capability.FailureInFlight),
 			Execution: &ExecutionMeta{
-				Provider: desc.AdapterID,
-				RunID:    reserve.Record.ExecutionID,
+				Provider: replayProvider,
+				RunID:    replayRunID,
 			},
 		}
 	}
 
-	// Acquired=true — THIS caller owns the reservation and holds the lease.
+	// Acquired — THIS caller owns the reservation and holds the lease.
 	// Only now may we dispatch.
-	executionID := reserve.Record.ExecutionID
-	leaseToken := reserve.LeaseToken
+	executionID := acq.Record.ExecutionID
+	leaseToken := acq.LeaseToken
+	leaseGen := acq.Generation
 
-	// Mark as EXECUTING using CAS (only lease holder may transition).
+	// Mark as EXECUTING using the typed API (fenced by token + generation).
 	// This is PRE_DISPATCH — if this fails, return FAILED (safe).
-	if err := e.store.TransitionState(ctx, executionID, leaseToken, idempotency.StatePrepared, idempotency.StateExecuting); err != nil {
+	if err := e.store.BeginExecution(ctx, executionID, leaseToken, leaseGen); err != nil {
 		return Response{
 			Status:      StatusFailed,
 			FailureCode: string(capability.FailureInternalError),
-			Error:       fmt.Sprintf("failed to transition to EXECUTING (lease lost or state changed): %v", err),
+			Error:       fmt.Sprintf("failed to begin execution (lease lost or state changed): %v", err),
 		}
 	}
 
 	// ─── IN_FLIGHT: the dispatch boundary ───────────────────────────────────
-	// Transition to IN_FLIGHT immediately before handler.Execute.
-	// IN_FLIGHT has precise semantics: the dispatch boundary has been
-	// crossed — the request is with the provider. A crash in EXECUTING
-	// is pre-dispatch (safe to reclaim); a crash in IN_FLIGHT is
-	// post-dispatch (mark UNKNOWN for reconciliation, never blind-retry).
-	if err := e.store.TransitionState(ctx, executionID, leaseToken, idempotency.StateExecuting, idempotency.StateInFlight); err != nil {
+	// Persist the recovery locator BEFORE crossing IN_FLIGHT.
+	// The locator carries enough information for a RecoveryResolver to
+	// query the provider and determine whether the side effect occurred.
+	recoveryLocator := buildRecoveryLocator(req, desc, digest)
+	if err := e.store.MarkInFlight(ctx, executionID, leaseToken, leaseGen, desc.AdapterID, recoveryLocator); err != nil {
 		return Response{
 			Status:      StatusFailed,
 			FailureCode: string(capability.FailureInternalError),
@@ -160,13 +182,11 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		}
 	}
 
-	// P1 #2: Lease heartbeat — renew the lease while the provider is
+	// Lease heartbeat — renew the lease while the provider is
 	// executing. Without this, a long-running provider call can exceed
 	// the lease duration, causing the record to become UNKNOWN even
-	// though the provider eventually succeeds. The heartbeat renews
-	// the lease at the configured RenewalWindow interval until the
-	// provider call completes or the context is cancelled.
-	leaseGen := reserve.Generation
+	// though the provider eventually succeeds. The heartbeat uses the
+	// store's LeaseConfig for renewal interval and duration.
 	heartbeatCtx, heartbeatCancel := context.WithCancel(ctx)
 	defer heartbeatCancel()
 	go e.leaseHeartbeat(heartbeatCtx, executionID, leaseToken, leaseGen)
@@ -364,6 +384,34 @@ func (e *DispatchExecutor) dispatch(ctx context.Context, req Request, desc capab
 	return resp
 }
 
+// buildRecoveryLocator constructs the recovery locator persisted before
+// crossing IN_FLIGHT. It carries the information a RecoveryResolver
+// needs to query the provider and determine whether the side effect
+// occurred:
+//   - capability_id, arguments, principal — to reconstruct the request
+//   - idempotency_key — for providers that accept a caller-supplied
+//     idempotency token
+//   - request_digest — for providers that support content-based lookup
+//   - provider_id — which adapter handled the operation
+//   - timestamp — when the dispatch was initiated
+func buildRecoveryLocator(req Request, desc capability.ResolvedDescriptor, digest string) json.RawMessage {
+	locator := map[string]any{
+		"capability_id":   req.Capability,
+		"idempotency_key": req.IdempotencyKey,
+		"principal":       req.Authority.Principal,
+		"request_digest":  digest,
+		"provider_id":     desc.AdapterID,
+		"execution_class": string(desc.ExecutionClass),
+		"arguments":       json.RawMessage(req.Arguments),
+		"dispatched_at":   time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	data, err := json.Marshal(locator)
+	if err != nil {
+		return nil
+	}
+	return data
+}
+
 // parseEvidence reconstructs an EvidenceRef from stored evidence data.
 // It uses the STORED receipt version — it does NOT invent V3 metadata.
 // If the stored receipt version is 0 (legacy records), it returns
@@ -418,18 +466,41 @@ func stateToStatus(state idempotency.State) string {
 // active. This prevents long-running provider calls from exceeding the
 // lease duration and falling into UNKNOWN despite successful execution.
 //
-// The heartbeat runs in a goroutine started after IN_FLIGHT is persisted.
-// It renews the lease at the configured interval until the provider call
-// completes or the context is cancelled.
+// The heartbeat derives its interval and renewal duration from the
+// store's LeaseConfig:
+//   - renewal duration = DefaultDuration (clamped to MaxDuration)
+//   - renewal interval = DefaultDuration - RenewalWindow
+//     (i.e., renew RenewalWindow before expiry)
+//
+// If RenewalWindow is zero or exceeds DefaultDuration, the interval
+// falls back to 80% of DefaultDuration.
 //
 // Renewal failures are logged but do not cancel the provider call —
 // the provider may still succeed, and finalization will fail-closed
 // if the lease was actually lost.
 func (e *DispatchExecutor) leaseHeartbeat(ctx context.Context, executionID, leaseToken string, leaseGeneration int) {
-	// Renew at 80% of the default lease duration to stay well ahead of
-	// expiry. The store's RenewLease checks that the lease is still
-	// valid before extending.
-	renewalInterval := defaultLeaseRenewalInterval
+	cfg := e.store.LeaseConfig()
+
+	// Renewal duration: use the configured default, clamped to max.
+	renewDuration := cfg.DefaultDuration
+	if renewDuration <= 0 {
+		renewDuration = 5 * time.Minute
+	}
+	if cfg.MaxDuration > 0 && renewDuration > cfg.MaxDuration {
+		renewDuration = cfg.MaxDuration
+	}
+
+	// Renewal interval: renew RenewalWindow before expiry.
+	renewalInterval := renewDuration - cfg.RenewalWindow
+	if cfg.RenewalWindow <= 0 || renewalInterval <= 0 {
+		// Fallback: renew at 80% of the lease duration.
+		renewalInterval = renewDuration * 4 / 5
+	}
+	// Floor at 1 second to prevent a degenerate tight loop.
+	if renewalInterval < time.Second {
+		renewalInterval = time.Second
+	}
+
 	ticker := time.NewTicker(renewalInterval)
 	defer ticker.Stop()
 
@@ -438,22 +509,13 @@ func (e *DispatchExecutor) leaseHeartbeat(ctx context.Context, executionID, leas
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := e.store.RenewLease(ctx, executionID, leaseToken, leaseGeneration, defaultLeaseRenewalDuration); err != nil {
+			if err := e.store.RenewLease(ctx, executionID, leaseToken, leaseGeneration, renewDuration); err != nil {
 				// Lease renewal failed — the lease may have expired,
-				// been taken over, or the record advanced. Log and
-				// stop renewing. The provider call continues; if it
-				// succeeds, Finalize will fail-closed on the stale lease.
+				// been taken over, or the record advanced. Stop renewing.
+				// The provider call continues; if it succeeds, Finalize
+				// will fail-closed on the stale lease.
 				return
 			}
 		}
 	}
 }
-
-// defaultLeaseRenewalInterval is the interval at which the lease heartbeat
-// attempts renewal. It is set to 4 minutes, which is 80% of the default
-// 5-minute lease duration, providing a comfortable margin before expiry.
-const defaultLeaseRenewalInterval = 4 * time.Minute
-
-// defaultLeaseRenewalDuration is the duration for which each renewal
-// extends the lease. It matches the default lease duration of 5 minutes.
-const defaultLeaseRenewalDuration = 5 * time.Minute
