@@ -16,18 +16,24 @@ UNKNOWN     The durable store cannot currently determine the
             real-world result.
 COMMITTED   Durably final — the operation succeeded.
 FAILED      Durably final — the operation definitively failed.
-DENIED      Durably final — admission denied before dispatch.
 ```
+
+DENIED is a wire-level admission status, not a durable store state.
+Admission denial happens in the service layer before the idempotency
+envelope, so no code path persists StateDenied. The constant is
+retained in `IsDurablyFinal`/`IsCallerTerminal` for backward
+compatibility with any pre-existing DENIED records, but
+`legalTransitions` does not include it as a reachable target.
 
 Lifecycle:
 
 ```
-reserve
+Acquire (insert or reclaim)
    │
    ▼
 PREPARED
    │
-BeginExecution (acquire lease)
+BeginExecution (lease holder only)
    │
    ▼
 EXECUTING
@@ -46,11 +52,13 @@ IN_FLIGHT
           ▼
       UNKNOWN
           │
+      ClaimUnknownBatch (FOR UPDATE SKIP LOCKED)
+          │
           ▼
       ResolveRecovery
-          ├── COMMITTED
-          ├── FAILED
-          └── UNKNOWN (still unknown)
+          ├── COMMITTED (claim fields cleared)
+          ├── FAILED (claim fields cleared)
+          └── UNKNOWN → ReleaseReconcileClaim (backoff)
 ```
 
 ## 2. Terminal predicates
@@ -66,7 +74,7 @@ func IsCallerTerminal(state State) bool {
 
 func IsDurablyFinal(state State) bool {
     switch state {
-    case COMMITTED, FAILED, DENIED:
+    case COMMITTED, FAILED, DENIED:  // DENIED kept for backward compat
         return true
     }
     return false
@@ -109,7 +117,6 @@ durably-final (reconciliation may still resolve it).
 | UNKNOWN | no normal dispatch | Reconciliation only |
 | COMMITTED | immutable replay | Return existing terminal receipt |
 | FAILED | immutable replay | Return existing terminal receipt |
-| DENIED | immutable replay | Return existing terminal receipt |
 
 **IN_FLIGHT expired → reclaim is forbidden.** The side effect may
 have occurred. The record transitions to UNKNOWN for reconciliation.
@@ -226,6 +233,27 @@ Never: cannot determine → PREPARED → retry.
 
 Reconciliation must use CAS transitions with expected state/version.
 It must never overwrite a state that changed after it was read.
+
+### Work distribution
+
+Multiple service replicas may run reconciliation workers concurrently.
+`ClaimUnknownBatch` claims a batch of UNKNOWN records using
+`FOR UPDATE SKIP LOCKED`, setting `reconcile_owner` and
+`reconcile_lease_expires_at`. Each record is processed by exactly one
+worker per claim window.
+
+Claimable records must satisfy:
+
+- `state = 'UNKNOWN'`
+- No active reconcile claim (`reconcile_owner IS NULL` or
+  `reconcile_lease_expires_at < clock_timestamp()`)
+- Not waiting for backoff (`next_reconcile_at IS NULL` or
+  `next_reconcile_at <= clock_timestamp()`)
+
+On successful resolution, `ResolveRecovery` clears all reconcile claim
+fields. On failure or continued UNKNOWN, `ReleaseReconcileClaim` sets
+`next_reconcile_at` with exponential backoff (30s, 1m, 2m, ..., 30m cap)
+and records `last_reconcile_error`.
 
 ### NoopResolver
 

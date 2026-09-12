@@ -436,9 +436,7 @@ func TestLegalTransitionMatrix(t *testing.T) {
 	}{
 		// Legal transitions
 		{"PREPARED→EXECUTING", StatePrepared, StateExecuting, true},
-		{"PREPARED→DENIED", StatePrepared, StateDenied, true},
 		{"EXECUTING→IN_FLIGHT", StateExecuting, StateInFlight, true},
-		{"EXECUTING→DENIED", StateExecuting, StateDenied, true},
 		{"EXECUTING→PREPARED", StateExecuting, StatePrepared, true},
 		{"IN_FLIGHT→COMMITTED", StateInFlight, StateCommitted, true},
 		{"IN_FLIGHT→FAILED", StateInFlight, StateFailed, true},
@@ -446,7 +444,10 @@ func TestLegalTransitionMatrix(t *testing.T) {
 		{"UNKNOWN→COMMITTED", StateUnknown, StateCommitted, true},
 		{"UNKNOWN→FAILED", StateUnknown, StateFailed, true},
 
-		// Illegal transitions
+		// Illegal transitions — DENIED is a wire-level admission status,
+		// not a durable store state. It is not reachable via the store.
+		{"PREPARED→DENIED", StatePrepared, StateDenied, false},
+		{"EXECUTING→DENIED", StateExecuting, StateDenied, false},
 		{"PREPARED→COMMITTED", StatePrepared, StateCommitted, false},
 		{"PREPARED→IN_FLIGHT", StatePrepared, StateInFlight, false},
 		{"PREPARED→UNKNOWN", StatePrepared, StateUnknown, false},

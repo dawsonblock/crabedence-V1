@@ -67,9 +67,9 @@ func TestWorkerNilDefaultResolver(t *testing.T) {
 }
 
 // mockResolver is a test RecoveryResolver that returns a fixed decision.
+// For tests that need the full RecoveryResult, use fullResultResolver.
 type mockResolver struct {
 	decision idempotency.RecoveryDecision
-	result   idempotency.RecoveryResult
 }
 
 func (m *mockResolver) Resolve(_ context.Context, _ *idempotency.Record) (idempotency.RecoveryResult, error) {

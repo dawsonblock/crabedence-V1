@@ -37,7 +37,12 @@
 - Execution: `execution_id` generated application-side (UUID v4) — the insert no longer depends on `gen_random_uuid()` or the `pgcrypto` extension.
 - Execution: CRITICAL `RecoveryFailed` requires the same proof as `RecoveryCommitted` — evidence digest, receipt version 3, provider ID, provider run ID. A CRITICAL execution cannot be claimed FAILED without proof.
 - Execution: `ResolveRecovery` signature simplified — `result.Decision` is the single source of truth for recovery decisions.
-- Execution: store enforces legal transition matrix (`legalTransitions`) — `COMMITTED`/`FAILED` may only finalize from `IN_FLIGHT`; `DENIED` is pre-dispatch only; terminal states are immutable.
+- Execution: store enforces legal transition matrix (`legalTransitions`) — `COMMITTED`/`FAILED` may only finalize from `IN_FLIGHT`; terminal states are immutable.
+- Execution: `DENIED` removed from reachable durable transitions — it is a wire-level admission status, not a durable store state. `legalTransitions` no longer includes `StateDenied` as a target. The constant remains in `IsDurablyFinal`/`IsCallerTerminal` for backward compatibility with any pre-existing DENIED records.
+- Execution: duplicate CRITICAL evidence validation removed from `service.go` — `DispatchExecutor` handles it internally.
+- Reconciliation: work distribution via `ClaimUnknownBatch` — `FOR UPDATE SKIP LOCKED` claims a batch of UNKNOWN records with `reconcile_owner` and `reconcile_lease_expires_at`. Multiple concurrent workers do not process the same records.
+- Reconciliation: `ReleaseReconcileClaim` releases a claimed record back to the pool with exponential backoff (`next_reconcile_at`) and `last_reconcile_error`. Successful `ResolveRecovery` clears claim fields automatically.
+- Reconciliation: `Worker` gains `SetWorkerID`, `SetBatchSize`, `SetClaimDuration` for configurable work distribution. Default: batch=100, claim=5m, worker=reconcile-PID.
 - Execution: `Record.RecoveryLocator` added — persisted JSONB locator for provider-specific recovery.
 - Execution: `CounterHandler.Resolve` implements `RecoveryResolver` — checks the counter state to determine if the increment occurred.
 - Tests: transition matrix coverage, UUID generation validity/uniqueness, `RenewLease` monotonicity, recovery locator persistence, CRITICAL `RecoveryFailed` proof requirements, stored provider metadata replay, and live worker+PG reconciliation.

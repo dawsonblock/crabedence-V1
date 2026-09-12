@@ -45,6 +45,13 @@ type Record struct {
 	Version               int             `json:"version"`
 	CreatedAt             time.Time       `json:"created_at"`
 	UpdatedAt             time.Time       `json:"updated_at"`
+
+	// Reconciliation work distribution fields.
+	ReconcileOwner          string     `json:"reconcile_owner,omitempty"`
+	ReconcileLeaseExpiresAt *time.Time `json:"reconcile_lease_expires_at,omitempty"`
+	ReconcileAttempt        int        `json:"reconcile_attempt,omitempty"`
+	NextReconcileAt         *time.Time `json:"next_reconcile_at,omitempty"`
+	LastReconcileError      string     `json:"last_reconcile_error,omitempty"`
 }
 
 // ─── Store ───────────────────────────────────────────────────────────
@@ -161,6 +168,21 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 	}
 	if err := s.addColumnIfMissing(ctx, "recovery_locator", "JSONB"); err != nil {
 		return fmt.Errorf("migration failed (recovery_locator): %w", err)
+	}
+	if err := s.addColumnIfMissing(ctx, "reconcile_owner", "TEXT"); err != nil {
+		return fmt.Errorf("migration failed (reconcile_owner): %w", err)
+	}
+	if err := s.addColumnIfMissing(ctx, "reconcile_lease_expires_at", "TIMESTAMPTZ"); err != nil {
+		return fmt.Errorf("migration failed (reconcile_lease_expires_at): %w", err)
+	}
+	if err := s.addColumnIfMissing(ctx, "reconcile_attempt", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("migration failed (reconcile_attempt): %w", err)
+	}
+	if err := s.addColumnIfMissing(ctx, "next_reconcile_at", "TIMESTAMPTZ"); err != nil {
+		return fmt.Errorf("migration failed (next_reconcile_at): %w", err)
+	}
+	if err := s.addColumnIfMissing(ctx, "last_reconcile_error", "TEXT"); err != nil {
+		return fmt.Errorf("migration failed (last_reconcile_error): %w", err)
 	}
 	// Legacy columns from earlier versions.
 	if err := s.addColumnIfMissing(ctx, "receipt_version", "INTEGER NOT NULL DEFAULT 0"); err != nil {
@@ -598,9 +620,15 @@ func (s *Store) MarkInFlight(ctx context.Context, executionID, leaseToken string
 // legalTransitions defines the allowed state transitions.
 // This enforces the lifecycle graph inside the Store rather than
 // relying on caller convention.
+//
+// DENIED is excluded: it is a wire-level admission status, not a
+// durable store state. Admission denial happens in the service layer
+// before the idempotency envelope, so no code path persists StateDenied.
+// The constant is retained in IsDurablyFinal/IsCallerTerminal for
+// backward compatibility with any pre-existing DENIED records.
 var legalTransitions = map[State][]State{
-	StatePrepared:  {StateExecuting, StateDenied},
-	StateExecuting: {StateInFlight, StateDenied, StatePrepared},
+	StatePrepared:  {StateExecuting},
+	StateExecuting: {StateInFlight, StatePrepared},
 	StateInFlight:  {StateCommitted, StateFailed, StateUnknown},
 	StateUnknown:   {StateCommitted, StateFailed},
 }
@@ -782,7 +810,8 @@ func (s *Store) Finalize(ctx context.Context, executionID, leaseToken string, le
 
 	// Enforce the legal transition matrix for finalization:
 	//   COMMITTED, FAILED → only from IN_FLIGHT (post-dispatch)
-	//   DENIED            → only from PREPARED or EXECUTING (pre-dispatch)
+	// DENIED is not a reachable durable state — admission denial
+	// happens in the service layer before the idempotency envelope.
 	// This prevents illegal transitions like PREPARED → COMMITTED.
 	if !isLegalTransition(expectedState, receipt.TerminalStatus) {
 		return fmt.Errorf("%w: illegal finalization transition %s → %s", LeaseStateConflict, expectedState, receipt.TerminalStatus)
@@ -1026,6 +1055,8 @@ func (s *Store) ResolveRecovery(ctx context.Context, executionID string, expecte
 		SET state = $1, result = $2, evidence_digest = $3, receipt_version = $4,
 		    provider_id = $5, provider_run_id = $6,
 		    terminal_receipt_digest = $7,
+		    reconcile_owner = NULL, reconcile_lease_expires_at = NULL,
+		    next_reconcile_at = NULL, last_reconcile_error = NULL,
 		    version = version + 1, updated_at = clock_timestamp()
 		WHERE execution_id = $8 AND state = 'UNKNOWN' AND version = $9
 	`, string(newState),
@@ -1049,66 +1080,129 @@ func (s *Store) ResolveRecovery(ctx context.Context, executionID string, expecte
 	return nil
 }
 
+// ─── Reconciliation work distribution ────────────────────────────────
+//
+// UNKNOWN records need provider-specific resolution. Multiple service
+// replicas may run reconciliation workers concurrently. ClaimUnknownBatch
+// claims a batch of UNKNOWN records using FOR UPDATE SKIP LOCKED so
+// that each record is processed by exactly one worker per claim window.
+//
+// After claiming, the worker calls the resolver. On resolution, the
+// claim fields are cleared by ResolveRecovery. On failure or continued
+// UNKNOWN, ReleaseReconcileClaim sets next_reconcile_at with exponential
+// backoff and records last_reconcile_error.
+
+// selectColumns is the canonical column list for all record reads.
+// It includes the reconciliation work distribution fields.
+const selectColumns = `execution_id, idempotency_key, principal_id, capability_id,
+	request_digest, COALESCE(grant_id, ''), execution_class, state,
+	result, COALESCE(evidence_digest, ''), COALESCE(receipt_version, 0),
+	lease_owner, lease_token, lease_started_at, lease_expires_at,
+	COALESCE(lease_generation, 1),
+	provider_id, provider_run_id, terminal_receipt_digest, recovery_locator,
+	COALESCE(attempt, 0), COALESCE(version, 1), created_at, updated_at,
+	reconcile_owner, reconcile_lease_expires_at,
+	COALESCE(reconcile_attempt, 0), next_reconcile_at, last_reconcile_error`
+
+// ClaimUnknownBatch atomically claims up to batchSize UNKNOWN records
+// for reconciliation. Uses FOR UPDATE SKIP LOCKED so that multiple
+// concurrent workers do not process the same records.
+//
+// A record is claimable when:
+//   - state = 'UNKNOWN'
+//   - No active reconcile claim (owner IS NULL or lease expired)
+//   - Not waiting for backoff (next_reconcile_at IS NULL or <= now)
+//
+// The claim sets reconcile_owner and reconcile_lease_expires_at, and
+// increments reconcile_attempt and version. The returned records have
+// the updated version — pass it to ResolveRecovery or
+// ReleaseReconcileClaim.
+func (s *Store) ClaimUnknownBatch(ctx context.Context, owner string, batchSize int, claimDuration time.Duration) ([]*Record, error) {
+	if batchSize <= 0 {
+		batchSize = 100
+	}
+	if claimDuration <= 0 {
+		claimDuration = 5 * time.Minute
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		WITH claimed AS (
+			SELECT execution_id FROM execution_requests
+			WHERE state = 'UNKNOWN'
+			  AND (reconcile_owner IS NULL
+			       OR reconcile_lease_expires_at < clock_timestamp())
+			  AND (next_reconcile_at IS NULL
+			       OR next_reconcile_at <= clock_timestamp())
+			ORDER BY updated_at
+			LIMIT $3
+			FOR UPDATE SKIP LOCKED
+		)
+		UPDATE execution_requests er
+		SET reconcile_owner = $1,
+		    reconcile_lease_expires_at = clock_timestamp() + $2::interval,
+		    reconcile_attempt = er.reconcile_attempt + 1,
+		    version = er.version + 1,
+		    updated_at = clock_timestamp()
+		FROM claimed
+		WHERE er.execution_id = claimed.execution_id
+		RETURNING `+selectColumns,
+		owner,
+		fmt.Sprintf("%d microseconds", claimDuration.Microseconds()),
+		batchSize,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("claim unknown batch failed: %w", err)
+	}
+	return scanRecordsWithReconcile(rows)
+}
+
+// ReleaseReconcileClaim releases a claimed UNKNOWN record back to the
+// reconciliation pool. Sets next_reconcile_at for backoff and records
+// last_reconcile_error. Uses CAS on version to prevent releasing a
+// claim that was already superseded.
+func (s *Store) ReleaseReconcileClaim(ctx context.Context, executionID string, expectedVersion int, nextAttemptAt time.Time, lastError string) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE execution_requests
+		SET reconcile_owner = NULL,
+		    reconcile_lease_expires_at = NULL,
+		    next_reconcile_at = $1,
+		    last_reconcile_error = $2,
+		    version = version + 1,
+		    updated_at = clock_timestamp()
+		WHERE execution_id = $3
+		  AND state = 'UNKNOWN'
+		  AND version = $4
+	`, nextAttemptAt, nullableString(lastError), executionID, expectedVersion)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return fmt.Errorf("%w: execution %s release reconcile claim CAS failed (state/version mismatch)", LeaseStateConflict, executionID)
+	}
+	return nil
+}
+
 // ─── Lookup ─────────────────────────────────────────────────────────
 
 // Lookup retrieves a record by execution ID.
 func (s *Store) Lookup(ctx context.Context, executionID string) (*Record, error) {
-	var rec Record
-	var resultJSON []byte
-	var leaseOwner, leaseToken, providerID, providerRunID, terminalDigest sql.NullString
-	var recoveryLocator []byte
-	var leaseStartedAt, leaseExpiresAt sql.NullTime
-	err := s.db.QueryRowContext(ctx, `
-		SELECT execution_id, idempotency_key, principal_id, capability_id,
-		       request_digest, COALESCE(grant_id, ''), execution_class, state,
-		       result, COALESCE(evidence_digest, ''), COALESCE(receipt_version, 0),
-		       lease_owner, lease_token, lease_started_at, lease_expires_at,
-		       COALESCE(lease_generation, 1),
-		       provider_id, provider_run_id, terminal_receipt_digest, recovery_locator,
-		       COALESCE(attempt, 0), COALESCE(version, 1), created_at, updated_at
-		FROM execution_requests
-		WHERE execution_id = $1
-	`, executionID).Scan(
-		&rec.ExecutionID, &rec.IdempotencyKey, &rec.PrincipalID,
-		&rec.CapabilityID, &rec.RequestDigest, &rec.GrantID,
-		&rec.ExecutionClass, &rec.State, &resultJSON,
-		&rec.EvidenceDigest, &rec.ReceiptVersion,
-		&leaseOwner, &leaseToken, &leaseStartedAt, &leaseExpiresAt,
-		&rec.LeaseGeneration,
-		&providerID, &providerRunID, &terminalDigest, &recoveryLocator,
-		&rec.Attempt, &rec.Version, &rec.CreatedAt, &rec.UpdatedAt,
-	)
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+selectColumns+` FROM execution_requests WHERE execution_id = $1`,
+		executionID)
 	if err != nil {
 		return nil, err
 	}
-	rec.Result = json.RawMessage(resultJSON)
-	if leaseOwner.Valid {
-		rec.LeaseOwner = leaseOwner.String
+	recs, err := scanRecordsWithReconcile(rows)
+	if err != nil {
+		return nil, err
 	}
-	if leaseToken.Valid {
-		rec.LeaseToken = leaseToken.String
+	if len(recs) == 0 {
+		return nil, sql.ErrNoRows
 	}
-	if leaseStartedAt.Valid {
-		t := leaseStartedAt.Time
-		rec.LeaseStartedAt = &t
-	}
-	if leaseExpiresAt.Valid {
-		t := leaseExpiresAt.Time
-		rec.LeaseExpiresAt = &t
-	}
-	if providerID.Valid {
-		rec.ProviderID = providerID.String
-	}
-	if providerRunID.Valid {
-		rec.ProviderRunID = providerRunID.String
-	}
-	if terminalDigest.Valid {
-		rec.TerminalReceiptDigest = terminalDigest.String
-	}
-	if len(recoveryLocator) > 0 {
-		rec.RecoveryLocator = json.RawMessage(recoveryLocator)
-	}
-	return &rec, nil
+	return recs[0], nil
 }
 
 // LookupByKey retrieves a record by idempotency key.
@@ -1117,62 +1211,21 @@ func (s *Store) LookupByKey(ctx context.Context, principal, capability, key stri
 }
 
 func (s *Store) lookupByKey(ctx context.Context, principal, capability, key string) (*Record, error) {
-	var rec Record
-	var resultJSON []byte
-	var leaseOwner, leaseToken, providerID, providerRunID, terminalDigest sql.NullString
-	var recoveryLocator []byte
-	var leaseStartedAt, leaseExpiresAt sql.NullTime
-	err := s.db.QueryRowContext(ctx, `
-		SELECT execution_id, idempotency_key, principal_id, capability_id,
-		       request_digest, COALESCE(grant_id, ''), execution_class, state,
-		       result, COALESCE(evidence_digest, ''), COALESCE(receipt_version, 0),
-		       lease_owner, lease_token, lease_started_at, lease_expires_at,
-		       COALESCE(lease_generation, 1),
-		       provider_id, provider_run_id, terminal_receipt_digest, recovery_locator,
-		       COALESCE(attempt, 0), COALESCE(version, 1), created_at, updated_at
-		FROM execution_requests
-		WHERE principal_id = $1 AND capability_id = $2 AND idempotency_key = $3
-	`, principal, capability, key).Scan(
-		&rec.ExecutionID, &rec.IdempotencyKey, &rec.PrincipalID,
-		&rec.CapabilityID, &rec.RequestDigest, &rec.GrantID,
-		&rec.ExecutionClass, &rec.State, &resultJSON,
-		&rec.EvidenceDigest, &rec.ReceiptVersion,
-		&leaseOwner, &leaseToken, &leaseStartedAt, &leaseExpiresAt,
-		&rec.LeaseGeneration,
-		&providerID, &providerRunID, &terminalDigest, &recoveryLocator,
-		&rec.Attempt, &rec.Version, &rec.CreatedAt, &rec.UpdatedAt,
-	)
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+selectColumns+` FROM execution_requests
+		 WHERE principal_id = $1 AND capability_id = $2 AND idempotency_key = $3`,
+		principal, capability, key)
 	if err != nil {
 		return nil, err
 	}
-	rec.Result = json.RawMessage(resultJSON)
-	if leaseOwner.Valid {
-		rec.LeaseOwner = leaseOwner.String
+	recs, err := scanRecordsWithReconcile(rows)
+	if err != nil {
+		return nil, err
 	}
-	if leaseToken.Valid {
-		rec.LeaseToken = leaseToken.String
+	if len(recs) == 0 {
+		return nil, sql.ErrNoRows
 	}
-	if leaseStartedAt.Valid {
-		t := leaseStartedAt.Time
-		rec.LeaseStartedAt = &t
-	}
-	if leaseExpiresAt.Valid {
-		t := leaseExpiresAt.Time
-		rec.LeaseExpiresAt = &t
-	}
-	if providerID.Valid {
-		rec.ProviderID = providerID.String
-	}
-	if providerRunID.Valid {
-		rec.ProviderRunID = providerRunID.String
-	}
-	if terminalDigest.Valid {
-		rec.TerminalReceiptDigest = terminalDigest.String
-	}
-	if len(recoveryLocator) > 0 {
-		rec.RecoveryLocator = json.RawMessage(recoveryLocator)
-	}
-	return &rec, nil
+	return recs[0], nil
 }
 
 // ─── Listing ─────────────────────────────────────────────────────────
@@ -1185,24 +1238,16 @@ func (s *Store) ListUnknown(ctx context.Context) ([]*Record, error) {
 // ListExpiredLeases returns all PREPARED/EXECUTING/IN_FLIGHT records
 // whose lease has expired. These need recovery.
 func (s *Store) ListExpiredLeases(ctx context.Context) ([]*Record, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT execution_id, idempotency_key, principal_id, capability_id,
-		       request_digest, COALESCE(grant_id, ''), execution_class, state,
-		       result, COALESCE(evidence_digest, ''), COALESCE(receipt_version, 0),
-		       lease_owner, lease_token, lease_started_at, lease_expires_at,
-		       COALESCE(lease_generation, 1),
-		       provider_id, provider_run_id, terminal_receipt_digest, recovery_locator,
-		       COALESCE(attempt, 0), COALESCE(version, 1), created_at, updated_at
-		FROM execution_requests
-		WHERE state IN ('PREPARED', 'EXECUTING', 'IN_FLIGHT')
-		  AND lease_expires_at IS NOT NULL
-		  AND lease_expires_at < clock_timestamp()
-		ORDER BY updated_at
-	`)
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+selectColumns+` FROM execution_requests
+		 WHERE state IN ('PREPARED', 'EXECUTING', 'IN_FLIGHT')
+		   AND lease_expires_at IS NOT NULL
+		   AND lease_expires_at < clock_timestamp()
+		 ORDER BY updated_at`)
 	if err != nil {
 		return nil, err
 	}
-	return scanRecords(rows)
+	return scanRecordsWithReconcile(rows)
 }
 
 // ListStuck returns all records needing attention: UNKNOWN or
@@ -1230,25 +1275,16 @@ func (s *Store) listByStates(ctx context.Context, states []State) ([]*Record, er
 		args[i] = string(st)
 	}
 
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT execution_id, idempotency_key, principal_id, capability_id,
-		       request_digest, COALESCE(grant_id, ''), execution_class, state,
-		       result, COALESCE(evidence_digest, ''), COALESCE(receipt_version, 0),
-		       lease_owner, lease_token, lease_started_at, lease_expires_at,
-		       COALESCE(lease_generation, 1),
-		       provider_id, provider_run_id, terminal_receipt_digest, recovery_locator,
-		       COALESCE(attempt, 0), COALESCE(version, 1), created_at, updated_at
-		FROM execution_requests
-		WHERE state IN (`+placeholders+`)
-		ORDER BY updated_at
-	`, args...)
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+selectColumns+` FROM execution_requests
+		 WHERE state IN (`+placeholders+`) ORDER BY updated_at`, args...)
 	if err != nil {
 		return nil, err
 	}
-	return scanRecords(rows)
+	return scanRecordsWithReconcile(rows)
 }
 
-func scanRecords(rows *sql.Rows) ([]*Record, error) {
+func scanRecordsWithReconcile(rows *sql.Rows) ([]*Record, error) {
 	defer rows.Close()
 
 	var records []*Record
@@ -1258,6 +1294,8 @@ func scanRecords(rows *sql.Rows) ([]*Record, error) {
 		var leaseOwner, leaseToken, providerID, providerRunID, terminalDigest sql.NullString
 		var recoveryLocator []byte
 		var leaseStartedAt, leaseExpiresAt sql.NullTime
+		var recOwner, lastRecErr sql.NullString
+		var recLeaseExp, nextRecAt sql.NullTime
 		if err := rows.Scan(
 			&rec.ExecutionID, &rec.IdempotencyKey, &rec.PrincipalID,
 			&rec.CapabilityID, &rec.RequestDigest, &rec.GrantID,
@@ -1267,6 +1305,7 @@ func scanRecords(rows *sql.Rows) ([]*Record, error) {
 			&rec.LeaseGeneration,
 			&providerID, &providerRunID, &terminalDigest, &recoveryLocator,
 			&rec.Attempt, &rec.Version, &rec.CreatedAt, &rec.UpdatedAt,
+			&recOwner, &recLeaseExp, &rec.ReconcileAttempt, &nextRecAt, &lastRecErr,
 		); err != nil {
 			return nil, err
 		}
@@ -1296,6 +1335,20 @@ func scanRecords(rows *sql.Rows) ([]*Record, error) {
 		}
 		if len(recoveryLocator) > 0 {
 			rec.RecoveryLocator = json.RawMessage(recoveryLocator)
+		}
+		if recOwner.Valid {
+			rec.ReconcileOwner = recOwner.String
+		}
+		if recLeaseExp.Valid {
+			t := recLeaseExp.Time
+			rec.ReconcileLeaseExpiresAt = &t
+		}
+		if nextRecAt.Valid {
+			t := nextRecAt.Time
+			rec.NextReconcileAt = &t
+		}
+		if lastRecErr.Valid {
+			rec.LastReconcileError = lastRecErr.String
 		}
 		records = append(records, &rec)
 	}

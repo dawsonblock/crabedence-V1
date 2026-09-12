@@ -2005,3 +2005,301 @@ func TestLiveStoreReplayProviderMetadata(t *testing.T) {
 		t.Errorf("expected provider_run_id=issue-98765, got %q", acq2.Record.ProviderRunID)
 	}
 }
+
+// TestLiveClaimUnknownBatch verifies that ClaimUnknownBatch claims
+// UNKNOWN records with FOR UPDATE SKIP LOCKED, setting reconcile_owner
+// and reconcile_lease_expires_at, and that claimed records are not
+// re-claimed by a second call.
+func TestLiveClaimUnknownBatch(t *testing.T) {
+	dbURL := os.Getenv("CRABBOX_TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live PostgreSQL test")
+	}
+	db, err := openTestDB(dbURL)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+	store, err := NewStore(db)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	ctx := context.Background()
+
+	prefix := fmt.Sprintf("test-claim-%d", time.Now().UnixNano())
+	db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key LIKE $1`, prefix+"%")
+
+	// Create 3 UNKNOWN records.
+	execIDs := make([]string, 3)
+	for i := 0; i < 3; i++ {
+		key := fmt.Sprintf("%s-%d", prefix, i)
+		acq, err := store.Acquire(ctx, key, "alice@example.com", "test.counter.increment",
+			fmt.Sprintf("digest-claim-%d", i), "grant_claim", "MUTATION", time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !acq.Acquired() {
+			t.Fatalf("expected lease acquired for %s, got %s", key, acq.Kind)
+		}
+		execIDs[i] = acq.Record.ExecutionID
+		if err := store.BeginExecution(ctx, execIDs[i], acq.LeaseToken, acq.Generation); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.MarkInFlight(ctx, execIDs[i], acq.LeaseToken, acq.Generation, "test-counter", nil); err != nil {
+			t.Fatal(err)
+		}
+		rec, _ := store.Lookup(ctx, execIDs[i])
+		if err := store.EnterRecovery(ctx, execIDs[i], StateInFlight, rec.Version); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Worker A claims 2 records.
+	batch1, err := store.ClaimUnknownBatch(ctx, "worker-a", 2, 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(batch1) != 2 {
+		t.Fatalf("expected 2 claimed, got %d", len(batch1))
+	}
+	for _, rec := range batch1 {
+		if rec.ReconcileOwner != "worker-a" {
+			t.Errorf("expected reconcile_owner=worker-a, got %q", rec.ReconcileOwner)
+		}
+		if rec.ReconcileAttempt != 1 {
+			t.Errorf("expected reconcile_attempt=1, got %d", rec.ReconcileAttempt)
+		}
+		if rec.ReconcileLeaseExpiresAt == nil {
+			t.Error("expected reconcile_lease_expires_at to be set")
+		}
+	}
+
+	// Worker B claims — should only get the remaining 1 record
+	// (the other 2 are claimed by worker-a).
+	batch2, err := store.ClaimUnknownBatch(ctx, "worker-b", 10, 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(batch2) != 1 {
+		t.Fatalf("expected 1 claimed by worker-b, got %d", len(batch2))
+	}
+	if batch2[0].ReconcileOwner != "worker-b" {
+		t.Errorf("expected reconcile_owner=worker-b, got %q", batch2[0].ReconcileOwner)
+	}
+
+	// Verify the claimed records are the disjoint set.
+	claimedIDs := map[string]bool{}
+	for _, rec := range batch1 {
+		claimedIDs[rec.ExecutionID] = true
+	}
+	for _, rec := range batch2 {
+		if claimedIDs[rec.ExecutionID] {
+			t.Errorf("record %s claimed by both workers", rec.ExecutionID)
+		}
+	}
+}
+
+// TestLiveClaimUnknownBatchRespectsBackoff verifies that records with a
+// future next_reconcile_at are not claimed.
+func TestLiveClaimUnknownBatchRespectsBackoff(t *testing.T) {
+	dbURL := os.Getenv("CRABBOX_TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live PostgreSQL test")
+	}
+	db, err := openTestDB(dbURL)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+	store, err := NewStore(db)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	ctx := context.Background()
+
+	prefix := fmt.Sprintf("test-backoff-%d", time.Now().UnixNano())
+	db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key LIKE $1`, prefix+"%")
+
+	// Create an UNKNOWN record.
+	acq, err := store.Acquire(ctx, prefix+"-0", "alice@example.com", "test.counter.increment",
+		"digest-backoff", "grant_backoff", "MUTATION", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execID := acq.Record.ExecutionID
+	if err := store.BeginExecution(ctx, execID, acq.LeaseToken, acq.Generation); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkInFlight(ctx, execID, acq.LeaseToken, acq.Generation, "test-counter", nil); err != nil {
+		t.Fatal(err)
+	}
+	rec, _ := store.Lookup(ctx, execID)
+	if err := store.EnterRecovery(ctx, execID, StateInFlight, rec.Version); err != nil {
+		t.Fatal(err)
+	}
+
+	// Claim it.
+	batch, err := store.ClaimUnknownBatch(ctx, "worker-a", 10, 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(batch) != 1 {
+		t.Fatalf("expected 1 claimed, got %d", len(batch))
+	}
+
+	// Release with a future next_reconcile_at (backoff).
+	futureAt := time.Now().Add(10 * time.Minute)
+	if err := store.ReleaseReconcileClaim(ctx, execID, batch[0].Version, futureAt, "test backoff"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Try to claim again — should get 0 (backoff active).
+	batch2, err := store.ClaimUnknownBatch(ctx, "worker-b", 10, 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(batch2) != 0 {
+		t.Fatalf("expected 0 claimed (backoff), got %d", len(batch2))
+	}
+
+	// Verify the record has the backoff fields set.
+	rec, _ = store.Lookup(ctx, execID)
+	if rec.NextReconcileAt == nil {
+		t.Error("expected next_reconcile_at to be set")
+	}
+	if rec.LastReconcileError != "test backoff" {
+		t.Errorf("expected last_reconcile_error='test backoff', got %q", rec.LastReconcileError)
+	}
+	if rec.ReconcileOwner != "" {
+		t.Errorf("expected reconcile_owner cleared, got %q", rec.ReconcileOwner)
+	}
+}
+
+// TestLiveResolveRecoveryClearsClaim verifies that a successful
+// ResolveRecovery clears the reconcile claim fields.
+func TestLiveResolveRecoveryClearsClaim(t *testing.T) {
+	dbURL := os.Getenv("CRABBOX_TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live PostgreSQL test")
+	}
+	db, err := openTestDB(dbURL)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+	store, err := NewStore(db)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	ctx := context.Background()
+
+	prefix := fmt.Sprintf("test-resolve-clear-%d", time.Now().UnixNano())
+	db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key LIKE $1`, prefix+"%")
+
+	// Create an UNKNOWN record and claim it.
+	acq, err := store.Acquire(ctx, prefix+"-0", "alice@example.com", "test.counter.increment",
+		"digest-resolve-clear", "grant_rc", "MUTATION", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execID := acq.Record.ExecutionID
+	if err := store.BeginExecution(ctx, execID, acq.LeaseToken, acq.Generation); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkInFlight(ctx, execID, acq.LeaseToken, acq.Generation, "test-counter", nil); err != nil {
+		t.Fatal(err)
+	}
+	rec, _ := store.Lookup(ctx, execID)
+	if err := store.EnterRecovery(ctx, execID, StateInFlight, rec.Version); err != nil {
+		t.Fatal(err)
+	}
+
+	batch, err := store.ClaimUnknownBatch(ctx, "worker-a", 10, 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(batch) != 1 {
+		t.Fatalf("expected 1 claimed, got %d", len(batch))
+	}
+
+	// Resolve with proof.
+	err = store.ResolveRecovery(ctx, execID, batch[0].Version, RecoveryResult{
+		Decision:       RecoveryCommitted,
+		Result:         []byte(`{"resolved":true}`),
+		EvidenceDigest: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+		ReceiptVersion: 3,
+		ProviderID:     "test-counter",
+		ProviderRunID:  "run-resolve-clear",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify claim fields are cleared.
+	rec, _ = store.Lookup(ctx, execID)
+	if rec.State != StateCommitted {
+		t.Fatalf("expected COMMITTED, got %s", rec.State)
+	}
+	if rec.ReconcileOwner != "" {
+		t.Errorf("expected reconcile_owner cleared, got %q", rec.ReconcileOwner)
+	}
+	if rec.NextReconcileAt != nil {
+		t.Error("expected next_reconcile_at cleared")
+	}
+	if rec.LastReconcileError != "" {
+		t.Errorf("expected last_reconcile_error cleared, got %q", rec.LastReconcileError)
+	}
+}
+
+// TestLiveFinalizeDeniedRejected verifies that Finalize with a DENIED
+// terminal status is rejected — DENIED is a wire-level admission status,
+// not a durable store state.
+func TestLiveFinalizeDeniedRejected(t *testing.T) {
+	dbURL := os.Getenv("CRABBOX_TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live PostgreSQL test")
+	}
+	db, err := openTestDB(dbURL)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+	store, err := NewStore(db)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	ctx := context.Background()
+
+	prefix := fmt.Sprintf("test-denied-%d", time.Now().UnixNano())
+	db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key LIKE $1`, prefix+"%")
+
+	// Create a PREPARED record.
+	acq, err := store.Acquire(ctx, prefix+"-0", "alice@example.com", "test.counter.increment",
+		"digest-denied", "grant_denied", "MUTATION", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execID := acq.Record.ExecutionID
+
+	// Try to finalize as DENIED from PREPARED — should be rejected.
+	err = store.Finalize(ctx, execID, acq.LeaseToken, acq.Generation, StatePrepared, TerminalReceipt{
+		ExecutionID:    execID,
+		TerminalStatus: StateDenied,
+	})
+	if err == nil {
+		t.Fatal("expected DENIED finalization to be rejected, got nil error")
+	}
+
+	// Try to finalize as DENIED from EXECUTING — should also be rejected.
+	if err := store.BeginExecution(ctx, execID, acq.LeaseToken, acq.Generation); err != nil {
+		t.Fatal(err)
+	}
+	rec, _ := store.Lookup(ctx, execID)
+	err = store.Finalize(ctx, execID, acq.LeaseToken, rec.LeaseGeneration, StateExecuting, TerminalReceipt{
+		ExecutionID:    execID,
+		TerminalStatus: StateDenied,
+	})
+	if err == nil {
+		t.Fatal("expected DENIED finalization from EXECUTING to be rejected, got nil error")
+	}
+}

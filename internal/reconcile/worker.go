@@ -14,6 +14,7 @@ package reconcile
 import (
 	"context"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/openclaw/crabbox/internal/idempotency"
@@ -26,11 +27,19 @@ import (
 // RecoveryResult (decision, result, evidence, provider identity). This
 // is propagated directly to ResolveRecovery, which requires evidence
 // for definitive conclusions.
+//
+// Work distribution: UNKNOWN records are claimed via ClaimUnknownBatch
+// (FOR UPDATE SKIP LOCKED), so multiple concurrent workers do not
+// process the same records. Failed or unresolved claims are released
+// with exponential backoff via ReleaseReconcileClaim.
 type Worker struct {
-	store     *idempotency.Store
-	resolvers map[string]idempotency.RecoveryResolver // keyed by capability_id
-	default_  idempotency.RecoveryResolver
-	interval  time.Duration
+	store         *idempotency.Store
+	resolvers     map[string]idempotency.RecoveryResolver // keyed by capability_id
+	default_      idempotency.RecoveryResolver
+	interval      time.Duration
+	workerID      string
+	batchSize     int
+	claimDuration time.Duration
 }
 
 // NewWorker creates a reconciliation worker with a default resolver.
@@ -38,12 +47,25 @@ type Worker struct {
 // is registered.
 func NewWorker(store *idempotency.Store, defaultResolver idempotency.RecoveryResolver, interval time.Duration) *Worker {
 	return &Worker{
-		store:     store,
-		resolvers: make(map[string]idempotency.RecoveryResolver),
-		default_:  defaultResolver,
-		interval:  interval,
+		store:         store,
+		resolvers:     make(map[string]idempotency.RecoveryResolver),
+		default_:      defaultResolver,
+		interval:      interval,
+		workerID:      fmt.Sprintf("reconcile-%d", os.Getpid()),
+		batchSize:     100,
+		claimDuration: 5 * time.Minute,
 	}
 }
+
+// SetWorkerID overrides the default worker identity (pid-based).
+// Useful for testing or when a stable identity is needed.
+func (w *Worker) SetWorkerID(id string) { w.workerID = id }
+
+// SetBatchSize overrides the default batch size (100).
+func (w *Worker) SetBatchSize(n int) { w.batchSize = n }
+
+// SetClaimDuration overrides the default claim duration (5 min).
+func (w *Worker) SetClaimDuration(d time.Duration) { w.claimDuration = d }
 
 // RegisterResolver registers a capability-specific recovery resolver.
 // When a UNKNOWN record's capability_id matches, this resolver is used
@@ -82,14 +104,16 @@ func (w *Worker) Run(ctx context.Context) error {
 	}
 }
 
-// reconcileAll finds all records needing attention and attempts recovery.
+// reconcileAll claims a batch of UNKNOWN records and attempts recovery.
+// ClaimUnknownBatch uses FOR UPDATE SKIP LOCKED so that multiple
+// concurrent workers do not process the same records.
 func (w *Worker) reconcileAll(ctx context.Context) error {
 	// Category 1: UNKNOWN records needing provider resolution.
-	unknown, err := w.store.ListUnknown(ctx)
+	claimed, err := w.store.ClaimUnknownBatch(ctx, w.workerID, w.batchSize, w.claimDuration)
 	if err != nil {
-		return fmt.Errorf("failed to list unknown records: %w", err)
+		return fmt.Errorf("failed to claim unknown records: %w", err)
 	}
-	for _, rec := range unknown {
+	for _, rec := range claimed {
 		if err := w.reconcileOne(ctx, rec); err != nil {
 			fmt.Printf("reconciliation failed for %s: %v\n", rec.ExecutionID, err)
 		}
@@ -153,27 +177,63 @@ func (w *Worker) recoverCrashed(ctx context.Context, rec *idempotency.Record) er
 // and result) is propagated to ResolveRecovery. This is critical:
 // ResolveRecovery rejects definitive recovery without proof, so
 // the resolver MUST supply evidence for COMMITTED/FAILED decisions.
+//
+// On failure or continued UNKNOWN, the reconcile claim is released
+// with exponential backoff so another worker (or this one later)
+// can retry.
 func (w *Worker) reconcileOne(ctx context.Context, rec *idempotency.Record) error {
 	// Query the resolver for the actual outcome.
 	result, err := w.resolve(ctx, rec)
 	if err != nil {
-		return fmt.Errorf("resolver error: %w", err)
+		return w.releaseClaim(ctx, rec, fmt.Errorf("resolver error: %w", err))
 	}
 
-	// If still UNKNOWN, no state change needed.
+	// If still UNKNOWN, release the claim with backoff for later retry.
 	if result.Decision == idempotency.RecoveryUnknown {
-		return nil
+		return w.releaseClaim(ctx, rec, nil)
 	}
 
 	// Resolve with CAS — expected state is UNKNOWN, expected version
 	// is rec.Version. The full RecoveryResult is propagated so
 	// ResolveRecovery can validate evidence and build a canonical
-	// terminal receipt.
+	// terminal receipt. On success, ResolveRecovery clears the
+	// reconcile claim fields automatically.
 	if err := w.store.ResolveRecovery(ctx, rec.ExecutionID, rec.Version, result); err != nil {
-		return fmt.Errorf("failed to resolve recovery: %w", err)
+		return w.releaseClaim(ctx, rec, fmt.Errorf("failed to resolve recovery: %w", err))
 	}
 
 	return nil
+}
+
+// releaseClaim releases a reconcile claim back to the pool with
+// exponential backoff. The record stays UNKNOWN but gets a
+// next_reconcile_at timestamp so it is not immediately reclaimed.
+func (w *Worker) releaseClaim(ctx context.Context, rec *idempotency.Record, resolveErr error) error {
+	backoff := reconcileBackoff(rec.ReconcileAttempt)
+	nextAt := time.Now().Add(backoff)
+	errMsg := ""
+	if resolveErr != nil {
+		errMsg = resolveErr.Error()
+	}
+	if err := w.store.ReleaseReconcileClaim(ctx, rec.ExecutionID, rec.Version, nextAt, errMsg); err != nil {
+		return fmt.Errorf("failed to release reconcile claim: %w (original: %v)", err, resolveErr)
+	}
+	return resolveErr
+}
+
+// reconcileBackoff computes exponential backoff for reconciliation
+// retries: 30s, 1m, 2m, 4m, 8m, ..., capped at 30m.
+func reconcileBackoff(attempt int) time.Duration {
+	base := 30 * time.Second
+	maxBackoff := 30 * time.Minute
+	if attempt < 0 {
+		attempt = 0
+	}
+	d := base << uint(attempt)
+	if d > maxBackoff || d < 0 {
+		d = maxBackoff
+	}
+	return d
 }
 
 // NoopResolver is a RecoveryResolver that always returns UNKNOWN.
