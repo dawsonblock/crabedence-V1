@@ -120,9 +120,11 @@ func (w *Worker) reconcileAll(ctx context.Context) error {
 	}
 
 	// Category 2: crashed executions with expired leases.
-	expired, err := w.store.ListExpiredLeases(ctx)
+	// Uses ClaimExpiredBatch (FOR UPDATE SKIP LOCKED) so multiple
+	// concurrent workers do not process the same expired records.
+	expired, err := w.store.ClaimExpiredBatch(ctx, w.workerID, w.batchSize, w.claimDuration)
 	if err != nil {
-		return fmt.Errorf("failed to list expired leases: %w", err)
+		return fmt.Errorf("failed to claim expired leases: %w", err)
 	}
 	for _, rec := range expired {
 		if err := w.recoverCrashed(ctx, rec); err != nil {
@@ -134,16 +136,27 @@ func (w *Worker) reconcileAll(ctx context.Context) error {
 }
 
 // recoverCrashed handles a crashed execution with an expired lease.
+// The record was claimed via ClaimExpiredBatch — the reconcile_owner
+// claim must be released after processing.
 //
 // The key distinction is the dispatch boundary:
 //   - PREPARED (pre-dispatch): no side effect could have occurred.
 //     The lease is already reclaimable by the next Acquire() call.
-//     No action needed here.
+//     Release the reconcile claim — no action needed.
 //   - EXECUTING (pre-dispatch): dispatch boundary not crossed.
 //     Same as PREPARED — reclaimable.
 //   - IN_FLIGHT (post-dispatch): the side effect MAY have occurred.
 //     Mark as UNKNOWN for reconciliation. Never blind-retry.
 func (w *Worker) recoverCrashed(ctx context.Context, rec *idempotency.Record) error {
+	defer func() {
+		// Release the expired-lease claim so the record is not
+		// permanently owned by this worker. For IN_FLIGHT → UNKNOWN,
+		// EnterRecovery clears the reconcile claim fields itself.
+		if rec.State != idempotency.StateInFlight {
+			_ = w.store.ReleaseReconcileClaim(ctx, rec.ExecutionID, rec.Version, 0, "")
+		}
+	}()
+
 	switch rec.State {
 	case idempotency.StatePrepared, idempotency.StateExecuting:
 		// Pre-dispatch crash — no side effect occurred.
@@ -208,14 +221,22 @@ func (w *Worker) reconcileOne(ctx context.Context, rec *idempotency.Record) erro
 // releaseClaim releases a reconcile claim back to the pool with
 // exponential backoff. The record stays UNKNOWN but gets a
 // next_reconcile_at timestamp so it is not immediately reclaimed.
+// The backoff duration is passed to the store which computes
+// next_reconcile_at using clock_timestamp() — DB-owned time.
 func (w *Worker) releaseClaim(ctx context.Context, rec *idempotency.Record, resolveErr error) error {
-	backoff := reconcileBackoff(rec.ReconcileAttempt)
-	nextAt := time.Now().Add(backoff)
+	// reconcile_attempt is incremented by ClaimUnknownBatch before
+	// the record is returned, so attempt=1 is the first retry.
+	// Subtract 1 so the first retry gets base backoff (30s), not 1m.
+	effectiveAttempt := rec.ReconcileAttempt - 1
+	if effectiveAttempt < 0 {
+		effectiveAttempt = 0
+	}
+	backoff := reconcileBackoff(effectiveAttempt)
 	errMsg := ""
 	if resolveErr != nil {
 		errMsg = resolveErr.Error()
 	}
-	if err := w.store.ReleaseReconcileClaim(ctx, rec.ExecutionID, rec.Version, nextAt, errMsg); err != nil {
+	if err := w.store.ReleaseReconcileClaim(ctx, rec.ExecutionID, rec.Version, backoff, errMsg); err != nil {
 		return fmt.Errorf("failed to release reconcile claim: %w (original: %v)", err, resolveErr)
 	}
 	return resolveErr
@@ -223,14 +244,20 @@ func (w *Worker) releaseClaim(ctx context.Context, rec *idempotency.Record, reso
 
 // reconcileBackoff computes exponential backoff for reconciliation
 // retries: 30s, 1m, 2m, 4m, 8m, ..., capped at 30m.
+// Uses saturating arithmetic — no integer-shift overflow.
 func reconcileBackoff(attempt int) time.Duration {
 	base := 30 * time.Second
 	maxBackoff := 30 * time.Minute
 	if attempt < 0 {
 		attempt = 0
 	}
+	// Maximum useful shift: 30s * 2^6 = 32m > 30m cap.
+	// Beyond attempt 6, always return maxBackoff.
+	if attempt > 6 {
+		return maxBackoff
+	}
 	d := base << uint(attempt)
-	if d > maxBackoff || d < 0 {
+	if d > maxBackoff || d <= 0 {
 		d = maxBackoff
 	}
 	return d

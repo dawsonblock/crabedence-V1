@@ -209,6 +209,32 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 		return fmt.Errorf("state name migration failed: %w", err)
 	}
 
+	// Partial indexes for the two hot maintenance queries:
+	//   - UNKNOWN records needing reconciliation
+	//   - Active records with expired leases
+	// These avoid full-table scans on every reconciliation cycle.
+	if err := s.ensureIndexes(ctx); err != nil {
+		return fmt.Errorf("index migration failed: %w", err)
+	}
+
+	return nil
+}
+
+func (s *Store) ensureIndexes(ctx context.Context) error {
+	indexes := []string{
+		`CREATE INDEX IF NOT EXISTS idx_exec_reconcile
+		 ON execution_requests (next_reconcile_at, updated_at)
+		 WHERE state = 'UNKNOWN'`,
+		`CREATE INDEX IF NOT EXISTS idx_exec_expired_leases
+		 ON execution_requests (lease_expires_at)
+		 WHERE state IN ('PREPARED', 'EXECUTING', 'IN_FLIGHT')
+		   AND lease_expires_at IS NOT NULL`,
+	}
+	for _, ddl := range indexes {
+		if _, err := s.db.ExecContext(ctx, ddl); err != nil {
+			return fmt.Errorf("failed to create index: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -862,6 +888,24 @@ func (s *Store) Finalize(ctx context.Context, executionID, leaseToken string, le
 		return fmt.Errorf("failed to compute terminal receipt digest: %w", err)
 	}
 
+	// Enforce CRITICAL proof requirements at the store boundary.
+	// Normal finalization must meet the same assurance standard as
+	// recovery — a caller that bypasses DispatchExecutor cannot
+	// finalize CRITICAL without provider-correlated evidence.
+	if existing.ExecutionClass == "CRITICAL" {
+		if receipt.TerminalStatus == StateCommitted || receipt.TerminalStatus == StateFailed {
+			if receipt.EvidenceDigest == "" || !isValidEvidenceDigest(receipt.EvidenceDigest) {
+				return fmt.Errorf("CRITICAL finalization to %s requires valid evidence digest (64-char lowercase hex)", receipt.TerminalStatus)
+			}
+			if receipt.ReceiptVersion != 3 {
+				return fmt.Errorf("CRITICAL finalization to %s requires receipt_version 3, got %d", receipt.TerminalStatus, receipt.ReceiptVersion)
+			}
+			if receipt.ProviderID == "" || receipt.ProviderRunID == "" {
+				return fmt.Errorf("CRITICAL finalization to %s requires provider_id and provider_run_id", receipt.TerminalStatus)
+			}
+		}
+	}
+
 	if existing.State.IsDurablyFinal() {
 		// Already finalized — compare the full receipt.
 		if existing.TerminalReceiptDigest == receiptDigest {
@@ -879,6 +923,7 @@ func (s *Store) Finalize(ctx context.Context, executionID, leaseToken string, le
 		    terminal_receipt_digest = $7,
 		    lease_owner = NULL, lease_token = NULL,
 		    lease_started_at = NULL, lease_expires_at = NULL,
+		    recovery_locator = NULL,
 		    version = version + 1, updated_at = clock_timestamp()
 		WHERE execution_id = $8
 		  AND state = $9
@@ -902,6 +947,14 @@ func (s *Store) Finalize(ctx context.Context, executionID, leaseToken string, le
 		return err
 	}
 	if rows == 0 {
+		// CAS lost — another writer may have finalized concurrently.
+		// Re-read and check for idempotent replay before reporting
+		// a conflict. Two workers finalizing with identical receipts
+		// must both succeed, not produce a false conflict.
+		current, lookupErr := s.Lookup(ctx, executionID)
+		if lookupErr == nil && current.State.IsDurablyFinal() && current.TerminalReceiptDigest == receiptDigest {
+			return nil // Concurrent identical finalization — idempotent.
+		}
 		return s.classifyTransitionFailure(ctx, executionID, leaseToken, leaseGeneration, expectedState)
 	}
 	return nil
@@ -914,14 +967,23 @@ func (s *Store) Finalize(ctx context.Context, executionID, leaseToken string, le
 // (the side effect may have occurred) or for records where the
 // handler returned an ambiguous result.
 //
+// Enforces the legal transition matrix: only IN_FLIGHT → UNKNOWN is
+// permitted. Terminal states (COMMITTED, FAILED, DENIED) and
+// pre-dispatch states (PREPARED, EXECUTING) cannot enter recovery —
+// PREPARED/EXECUTING records are safe to reclaim, not reconcile.
+//
 // Uses CAS with expected state to prevent overwriting a state that
 // changed after it was read.
 func (s *Store) EnterRecovery(ctx context.Context, executionID string, expectedState State, expectedVersion int) error {
+	if !isLegalTransition(expectedState, StateUnknown) {
+		return fmt.Errorf("%w: illegal recovery transition %s → UNKNOWN (only IN_FLIGHT may enter recovery)", LeaseStateConflict, expectedState)
+	}
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE execution_requests
 		SET state = 'UNKNOWN', version = version + 1,
 		    lease_owner = NULL, lease_token = NULL,
 		    lease_started_at = NULL, lease_expires_at = NULL,
+		    reconcile_owner = NULL, reconcile_lease_expires_at = NULL,
 		    updated_at = clock_timestamp()
 		WHERE execution_id = $1
 		  AND state = $2
@@ -936,6 +998,48 @@ func (s *Store) EnterRecovery(ctx context.Context, executionID string, expectedS
 	}
 	if rows == 0 {
 		return fmt.Errorf("%w: execution %s enter recovery CAS failed (state/version mismatch)", LeaseStateConflict, executionID)
+	}
+	return nil
+}
+
+// EnterRecoveryWithObservation transitions a record to UNKNOWN while
+// persisting a provider observation. This is used when the provider
+// returned a result but Finalize could not commit (lease expiry,
+// CAS conflict, etc.). The observation preserves the provider's
+// identity and evidence so the recovery resolver can correlate.
+//
+// The observation fields (provider_id, provider_run_id, evidence)
+// are written atomically with the UNKNOWN transition. Unlike
+// Finalize, this does NOT create a terminal receipt — the record
+// remains UNKNOWN pending reconciliation.
+func (s *Store) EnterRecoveryWithObservation(ctx context.Context, executionID string, expectedState State, expectedVersion int, providerID, providerRunID, evidenceDigest string, result json.RawMessage) error {
+	if !isLegalTransition(expectedState, StateUnknown) {
+		return fmt.Errorf("%w: illegal recovery transition %s → UNKNOWN (only IN_FLIGHT may enter recovery)", LeaseStateConflict, expectedState)
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE execution_requests
+		SET state = 'UNKNOWN', version = version + 1,
+		    lease_owner = NULL, lease_token = NULL,
+		    lease_started_at = NULL, lease_expires_at = NULL,
+		    reconcile_owner = NULL, reconcile_lease_expires_at = NULL,
+		    provider_id = $4, provider_run_id = $5,
+		    evidence_digest = $6, result = $7,
+		    updated_at = clock_timestamp()
+		WHERE execution_id = $1
+		  AND state = $2
+		  AND version = $3
+	`, executionID, string(expectedState), expectedVersion,
+		nullableString(providerID), nullableString(providerRunID),
+		nullableString(evidenceDigest), nullableBytes(result))
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return fmt.Errorf("%w: execution %s enter recovery with observation CAS failed (state/version mismatch)", LeaseStateConflict, executionID)
 	}
 	return nil
 }
@@ -1057,6 +1161,7 @@ func (s *Store) ResolveRecovery(ctx context.Context, executionID string, expecte
 		    terminal_receipt_digest = $7,
 		    reconcile_owner = NULL, reconcile_lease_expires_at = NULL,
 		    next_reconcile_at = NULL, last_reconcile_error = NULL,
+		    recovery_locator = NULL,
 		    version = version + 1, updated_at = clock_timestamp()
 		WHERE execution_id = $8 AND state = 'UNKNOWN' AND version = $9
 	`, string(newState),
@@ -1155,23 +1260,36 @@ func (s *Store) ClaimUnknownBatch(ctx context.Context, owner string, batchSize i
 	return scanRecordsWithReconcile(rows)
 }
 
-// ReleaseReconcileClaim releases a claimed UNKNOWN record back to the
-// reconciliation pool. Sets next_reconcile_at for backoff and records
-// last_reconcile_error. Uses CAS on version to prevent releasing a
-// claim that was already superseded.
-func (s *Store) ReleaseReconcileClaim(ctx context.Context, executionID string, expectedVersion int, nextAttemptAt time.Time, lastError string) error {
+// ReleaseReconcileClaim releases a claimed record back to the
+// reconciliation/expired-lease pool. The caller provides a backoff
+// duration — the database computes next_reconcile_at using
+// clock_timestamp() so scheduling time is DB-owned, not
+// app-clock-dependent. This prevents replicas with skewed clocks
+// from distorting retry timing.
+//
+// The claim fields (reconcile_owner, reconcile_lease_expires_at)
+// are cleared regardless of record state — this method works for
+// both UNKNOWN resolution claims and expired-lease crash claims.
+//
+// Uses CAS on version to prevent releasing a claim that was already
+// superseded.
+func (s *Store) ReleaseReconcileClaim(ctx context.Context, executionID string, expectedVersion int, backoffDuration time.Duration, lastError string) error {
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE execution_requests
 		SET reconcile_owner = NULL,
 		    reconcile_lease_expires_at = NULL,
-		    next_reconcile_at = $1,
+		    next_reconcile_at = CASE
+		        WHEN state = 'UNKNOWN' AND $1::interval > '0'::interval
+		            THEN clock_timestamp() + $1::interval
+		        ELSE NULL
+		    END,
 		    last_reconcile_error = $2,
 		    version = version + 1,
 		    updated_at = clock_timestamp()
 		WHERE execution_id = $3
-		  AND state = 'UNKNOWN'
 		  AND version = $4
-	`, nextAttemptAt, nullableString(lastError), executionID, expectedVersion)
+	`, fmt.Sprintf("%d microseconds", backoffDuration.Microseconds()),
+		nullableString(lastError), executionID, expectedVersion)
 	if err != nil {
 		return err
 	}
@@ -1183,6 +1301,89 @@ func (s *Store) ReleaseReconcileClaim(ctx context.Context, executionID string, e
 		return fmt.Errorf("%w: execution %s release reconcile claim CAS failed (state/version mismatch)", LeaseStateConflict, executionID)
 	}
 	return nil
+}
+
+// RenewReconcileClaim extends an active reconciliation claim. This is
+// the reconciliation equivalent of RenewLease — a long-running resolver
+// can renew its claim to prevent another worker from reclaiming the
+// same UNKNOWN record.
+//
+// The claim is extended to GREATEST(current, clock_timestamp() +
+// duration) so renewal cannot shorten an existing claim.
+func (s *Store) RenewReconcileClaim(ctx context.Context, executionID string, expectedVersion int, duration time.Duration) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE execution_requests
+		SET reconcile_lease_expires_at = GREATEST(
+		        reconcile_lease_expires_at,
+		        clock_timestamp() + $1::interval),
+		    updated_at = clock_timestamp()
+		WHERE execution_id = $2
+		  AND state = 'UNKNOWN'
+		  AND version = $3
+		  AND reconcile_lease_expires_at > clock_timestamp()
+	`, fmt.Sprintf("%d microseconds", duration.Microseconds()),
+		executionID, expectedVersion)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return fmt.Errorf("%w: execution %s renew reconcile claim failed (expired or version mismatch)", LeaseStateConflict, executionID)
+	}
+	return nil
+}
+
+// ClaimExpiredBatch atomically claims a batch of PREPARED/EXECUTING/
+// IN_FLIGHT records whose execution leases have expired. Uses
+// FOR UPDATE SKIP LOCKED so multiple workers do not process the
+// same expired records.
+//
+// Unlike ClaimUnknownBatch (which claims for resolution), this
+// claims for crash recovery — the caller inspects each record's
+// state to decide whether it needs reconciliation or simple
+// re-dispatch.
+//
+// The claim uses the reconcile_owner/reconcile_lease_expires_at
+// fields (shared with UNKNOWN claiming) to avoid adding yet
+// another claim namespace.
+func (s *Store) ClaimExpiredBatch(ctx context.Context, owner string, batchSize int, claimDuration time.Duration) ([]*Record, error) {
+	if batchSize <= 0 {
+		batchSize = 100
+	}
+	if claimDuration <= 0 {
+		claimDuration = 5 * time.Minute
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		WITH claimed AS (
+			SELECT execution_id FROM execution_requests
+			WHERE state IN ('PREPARED', 'EXECUTING', 'IN_FLIGHT')
+			  AND lease_expires_at IS NOT NULL
+			  AND lease_expires_at < clock_timestamp()
+			  AND (reconcile_owner IS NULL
+			       OR reconcile_lease_expires_at < clock_timestamp())
+			ORDER BY updated_at
+			LIMIT $3
+			FOR UPDATE SKIP LOCKED
+		)
+		UPDATE execution_requests er
+		SET reconcile_owner = $1,
+		    reconcile_lease_expires_at = clock_timestamp() + $2::interval,
+		    version = er.version + 1,
+		    updated_at = clock_timestamp()
+		FROM claimed
+		WHERE er.execution_id = claimed.execution_id
+		RETURNING `+selectColumns,
+		owner,
+		fmt.Sprintf("%d microseconds", claimDuration.Microseconds()),
+		batchSize,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("claim expired batch failed: %w", err)
+	}
+	return scanRecordsWithReconcile(rows)
 }
 
 // ─── Lookup ─────────────────────────────────────────────────────────

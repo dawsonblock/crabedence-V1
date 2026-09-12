@@ -46,9 +46,12 @@ MarkInFlight (dispatch boundary crossed)
 IN_FLIGHT
    │
    ├── Finalize(COMMITTED)
+   │      — CRITICAL requires proof at store boundary
    ├── Finalize(FAILED)
-   └── EnterRecovery
-          │
+   │      — CRITICAL requires proof at store boundary
+   └── EnterRecovery (only from IN_FLIGHT)
+          │  or EnterRecoveryWithObservation
+          │  (persists provider_id/provider_run_id/evidence)
           ▼
       UNKNOWN
           │
@@ -59,6 +62,11 @@ IN_FLIGHT
           ├── COMMITTED (claim fields cleared)
           ├── FAILED (claim fields cleared)
           └── UNKNOWN → ReleaseReconcileClaim (backoff)
+
+      Expired leases → ClaimExpiredBatch (FOR UPDATE SKIP LOCKED)
+          │
+          ├── PREPARED/EXECUTING → reclaimable
+          └── IN_FLIGHT → EnterRecovery → UNKNOWN
 ```
 
 ## 2. Terminal predicates
@@ -177,6 +185,26 @@ Terminal receipts are immutable. Once a record is durably final
 The same canonical terminal receipt may be finalized again. The
 result is `ALREADY_FINALIZED` — not an error.
 
+Concurrent identical finalization is also idempotent: if two workers
+race to finalize the same execution with the same receipt, the CAS
+loser re-reads the terminal state and sees the matching digest —
+it returns success, not a conflict.
+
+### CRITICAL proof enforcement
+
+The store enforces CRITICAL proof requirements inside `Finalize()`:
+both COMMITTED and FAILED require a valid SHA-256 evidence digest,
+receipt_version 3, provider_id, and provider_run_id. This prevents
+a caller that bypasses DispatchExecutor from finalizing CRITICAL
+with weaker evidence than the recovery path requires.
+
+### Recovery locator cleanup
+
+`recovery_locator` is cleared to NULL on terminal finalization
+(both `Finalize` and `ResolveRecovery`). The locator may contain
+raw request arguments — it must not persist beyond the terminal
+transition.
+
 ### Conflict detection
 
 A different canonical terminal receipt for the same execution is a
@@ -229,6 +257,17 @@ cannot determine        → UNKNOWN
 
 Never: cannot determine → PREPARED → retry.
 
+`EnterRecovery` enforces the legal transition matrix — only
+IN_FLIGHT → UNKNOWN is permitted. Terminal states (COMMITTED,
+FAILED, DENIED) and pre-dispatch states (PREPARED, EXECUTING)
+cannot enter recovery.
+
+`EnterRecoveryWithObservation` persists provider metadata
+(provider_id, provider_run_id, evidence_digest, result) atomically
+with the UNKNOWN transition. This is used when the provider returned
+a result but finalization could not commit — the observation is
+the best available evidence for the recovery resolver.
+
 ### CAS for reconciliation
 
 Reconciliation must use CAS transitions with expected state/version.
@@ -237,14 +276,23 @@ It must never overwrite a state that changed after it was read.
 ### Work distribution
 
 Multiple service replicas may run reconciliation workers concurrently.
-`ClaimUnknownBatch` claims a batch of UNKNOWN records using
-`FOR UPDATE SKIP LOCKED`, setting `reconcile_owner` and
+
+**UNKNOWN resolution**: `ClaimUnknownBatch` claims a batch of UNKNOWN
+records using `FOR UPDATE SKIP LOCKED`, setting `reconcile_owner` and
 `reconcile_lease_expires_at`. Each record is processed by exactly one
 worker per claim window.
 
+**Expired-lease crash recovery**: `ClaimExpiredBatch` claims a batch
+of PREPARED/EXECUTING/IN_FLIGHT records with expired leases using
+`FOR UPDATE SKIP LOCKED`. The caller inspects each record's state
+to decide whether it needs reconciliation (IN_FLIGHT → UNKNOWN) or
+simple re-dispatch (PREPARED/EXECUTING → reclaimable).
+
 Claimable records must satisfy:
 
-- `state = 'UNKNOWN'`
+- `state = 'UNKNOWN'` (for ClaimUnknownBatch) or
+  `state IN ('PREPARED','EXECUTING','IN_FLIGHT')` with expired lease
+  (for ClaimExpiredBatch)
 - No active reconcile claim (`reconcile_owner IS NULL` or
   `reconcile_lease_expires_at < clock_timestamp()`)
 - Not waiting for backoff (`next_reconcile_at IS NULL` or
@@ -252,8 +300,13 @@ Claimable records must satisfy:
 
 On successful resolution, `ResolveRecovery` clears all reconcile claim
 fields. On failure or continued UNKNOWN, `ReleaseReconcileClaim` sets
-`next_reconcile_at` with exponential backoff (30s, 1m, 2m, ..., 30m cap)
-and records `last_reconcile_error`.
+`next_reconcile_at` using `clock_timestamp() + backoff` (DB-owned time)
+and records `last_reconcile_error`. Backoff is exponential: 30s, 1m,
+2m, 4m, 8m, 16m, 30m cap — saturating, never overflowing.
+
+`RenewReconcileClaim` extends an active claim using
+`GREATEST(current, clock_timestamp() + duration)` — renewal cannot
+shorten an existing claim.
 
 ### NoopResolver
 

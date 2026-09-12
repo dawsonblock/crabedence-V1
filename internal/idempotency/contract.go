@@ -300,8 +300,50 @@ type RecoveryResult struct {
 
 // RecoveryResolver queries a provider to determine if an operation
 // actually happened. Resolvers are registered per provider/capability.
+//
+// The returned RecoveryResult must contain VERIFIED evidence — not
+// merely a syntactically valid digest string. For CRITICAL executions,
+// the resolver must have actually queried the provider and confirmed
+// the outcome. Fabricated digests are rejected by the store's proof
+// requirements but the resolver contract requires genuine verification.
+//
+// Implementations should be side-effect-free: Resolve() may be called
+// multiple times for the same record (retries, concurrent workers).
+// It must not itself perform mutations — it only queries.
 type RecoveryResolver interface {
 	Resolve(ctx context.Context, record *Record) (RecoveryResult, error)
+}
+
+// RecoveryLocatorProvider generates a provider-specific recovery
+// locator before dispatch. The locator contains the minimum durable
+// information needed to determine whether the external side effect
+// occurred — typically a provider-side operation token, external
+// idempotency key, or lookup coordinates.
+//
+// This replaces the generic raw-argument snapshot with a provider-owned
+// minimal locator. The provider decides what it needs for recovery;
+// the store persists whatever it returns.
+//
+// If a provider does not implement this interface, the generic
+// buildRecoveryLocator produces a snapshot containing the request
+// metadata and arguments as a fallback.
+type RecoveryLocatorProvider interface {
+	// PrepareRecovery generates the recovery locator before dispatch.
+	// The locator is persisted atomically with the IN_FLIGHT transition.
+	// It should contain provider-specific lookup coordinates — NOT the
+	// raw request arguments (which may contain sensitive data).
+	PrepareRecovery(ctx context.Context, capabilityID string, idempotencyKey string, requestDigest string, args json.RawMessage) (json.RawMessage, error)
+}
+
+// CanonicalizeArguments normalizes a JSON argument blob so that
+// semantically equivalent inputs produce identical bytes. This is
+// used by recovery locators to store the canonical form — the form
+// that was actually executed — rather than the raw request bytes.
+// Without canonicalization, a request with {"by":0} (defaulted to 1)
+// would produce a recovery locator that disagrees with the executed
+// parameters.
+func CanonicalizeArguments(raw json.RawMessage) (json.RawMessage, error) {
+	return canonicalizeJSON(raw)
 }
 
 // Ctx is an alias for context.Context to avoid importing context in

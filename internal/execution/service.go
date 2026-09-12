@@ -61,12 +61,18 @@ type Response struct {
 	Execution   *ExecutionMeta  `json:"execution,omitempty"`
 
 	// DefinitiveFailure indicates that a FAILED response is a
-	// definitive failure — the handler can prove no external side
+	// definitive failure — the handler asserts no external side
 	// effect occurred. This is required for a FAILED response after
 	// the dispatch boundary (IN_FLIGHT) to be persisted as StateFailed
 	// rather than StateUnknown. If false (the default), a FAILED
 	// response after dispatch is treated as UNKNOWN (post-dispatch
 	// uncertainty) per the durable execution contract §6.
+	//
+	// For CRITICAL operations, this flag alone is NOT sufficient —
+	// the Store enforces proof requirements (evidence digest,
+	// receipt_version 3, provider_id, provider_run_id) inside
+	// Finalize(). The flag is a routing signal; the proof is in
+	// the receipt fields.
 	DefinitiveFailure bool `json:"definitive_failure,omitempty"`
 }
 

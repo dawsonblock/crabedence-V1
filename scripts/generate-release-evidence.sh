@@ -216,18 +216,18 @@ EOF
 echo ""
 echo "=== Go gates ==="
 run_gate go-vet go vet ./...
-run_gate go-evidence-tests go test -count=1 -timeout=120s \
+run_gate go-evidence-tests go test -v -count=1 -timeout=120s \
   -run "TestTerminalReceipt|TestTerminalLog|TestRunEvidence|TestFinalizeRun|TestEvidence|TestCoordinatorFinish|TestCoordinatorRunReceipt|TestReceipt|TestRunRecorder|TestTiming" \
   ./internal/cli/
-run_gate go-tart-tests go test -count=1 -timeout=120s ./internal/providers/tart/
-run_gate go-lume-tests go test -count=1 -timeout=60s ./internal/providers/lume/
-run_gate go-shared-tests go test -count=1 -timeout=60s ./internal/providers/shared/
+run_gate go-tart-tests go test -v -count=1 -timeout=120s ./internal/providers/tart/
+run_gate go-lume-tests go test -v -count=1 -timeout=60s ./internal/providers/lume/
+run_gate go-shared-tests go test -v -count=1 -timeout=60s ./internal/providers/shared/
 
 # Phase 9: Go race evidence
-run_gate go-race-evidence go test -race -count=1 -timeout=120s \
+run_gate go-race-evidence go test -v -race -count=1 -timeout=120s \
   -run "TestTerminalReceipt|TestTerminalLog|TestRunEvidence|TestFinalizeRun|TestEvidence|TestReceiptContract" \
   ./internal/cli/
-run_gate go-race-providers go test -race -count=1 -timeout=120s \
+run_gate go-race-providers go test -v -race -count=1 -timeout=120s \
   ./internal/providers/tart/ ./internal/providers/lume/ ./internal/providers/shared/
 
 # ─── Effect Fabric contract gates ────────────────────────────────────────────
@@ -242,13 +242,13 @@ echo "=== Effect Fabric contract gates ==="
 # kinds, terminal receipt digest, recovery decision types, receipt
 # identity fields, digest determinism, FinalizedAt exclusion, clock
 # interface, state aliases, and RecoveryRetryable rejection.
-run_gate effect-fabric-contract go test -count=1 -timeout=60s \
+run_gate effect-fabric-contract go test -v -count=1 -timeout=60s \
   -run "TestState|TestLeaseConfig|TestAcquireResult|TestTerminalReceipt|TestRecovery|TestLeaseError|TestMigrateState|TestDefaultLeaseConfig|TestFixedClock|TestSystemClock" \
   ./internal/idempotency/
 
 # effect-fabric-reconciliation: reconciliation worker unit tests.
 # Verifies NoopResolver, resolver registration, and fail-closed behavior.
-run_gate effect-fabric-reconciliation go test -count=1 -timeout=60s \
+run_gate effect-fabric-reconciliation go test -v -count=1 -timeout=60s \
   ./internal/reconcile/
 
 # effect-fabric-race: race-detector run over the execution + idempotency
@@ -258,7 +258,7 @@ run_gate effect-fabric-reconciliation go test -count=1 -timeout=60s \
 # should not run live PostgreSQL tests (they're too slow with -race
 # and are covered by effect-fabric-postgres separately).
 run_gate effect-fabric-race env -u CRABBOX_TEST_DATABASE_URL \
-  go test -race -count=1 -timeout=120s \
+  go test -v -race -count=1 -timeout=120s \
   ./internal/capability/ ./internal/execution/ ./internal/idempotency/ ./internal/reconcile/
 
 # ─── Phase 10-12: Live PostgreSQL gates ────────────────────────────────────
@@ -384,18 +384,18 @@ run_effect_fabric_postgres_gate() {
   fi
 
   {
-    echo "command=go test -count=1 -timeout=300s -run TestLiveEffectFabric ./internal/idempotency/ && go test -count=1 -timeout=300s -run TestLiveConcurrent ./internal/execution/"
+    echo "command=go test -v -count=1 -timeout=300s -run TestLiveEffectFabric ./internal/idempotency/ && go test -v -count=1 -timeout=300s -run TestLiveConcurrent ./internal/execution/"
     echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "---"
   } > "$log"
 
   set +e
-  go test -count=1 -timeout=300s \
+  go test -v -count=1 -timeout=300s \
     -run "TestLiveEffectFabric|TestLiveStore" \
     ./internal/idempotency/ >> "$log" 2>&1
   local rc1=$?
   # Also run the 100-way concurrent mutation dispatch test (CRAB-V1-021).
-  go test -count=1 -timeout=300s \
+  go test -v -count=1 -timeout=300s \
     -run "TestLiveConcurrentIdenticalMutationSingleDispatch" \
     ./internal/execution/ >> "$log" 2>&1
   local rc2=$?
@@ -416,10 +416,10 @@ run_effect_fabric_postgres_gate() {
     return
   fi
 
-  # Verify tests actually executed (not skipped). Go test prints "ok"
-  # lines for packages that ran tests.
+  # Verify tests actually executed (not skipped). With -v, Go test
+  # prints "--- PASS:"/"--- FAIL:"/"--- SKIP:" per test. Count those.
   local executed
-  executed=$(grep -cE '^(ok|FAIL|--- PASS|--- FAIL)' "$log" 2>/dev/null || true)
+  executed=$(grep -cE '^\s*--- (PASS|FAIL|SKIP):' "$log" 2>/dev/null || true)
   if [ "$executed" -le 0 ]; then
     {
       echo ""
@@ -432,7 +432,7 @@ run_effect_fabric_postgres_gate() {
   fi
 
   record_gate "$name" "PASS" 0 "$log"
-  echo "  PASS  $name ($executed test lines)"
+  echo "  PASS  $name ($executed tests executed)"
 }
 
 run_effect_fabric_postgres_gate
@@ -462,13 +462,13 @@ run_authority_postgres_gate() {
   fi
 
   {
-    echo "command=go test -count=1 -timeout=120s -run TestLiveAuthority ./internal/authority/"
+    echo "command=go test -v -count=1 -timeout=120s -run TestLiveAuthority ./internal/authority/"
     echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "---"
   } > "$log"
 
   set +e
-  go test -count=1 -timeout=120s \
+  go test -v -count=1 -timeout=120s \
     -run "TestLiveAuthority" \
     ./internal/authority/ >> "$log" 2>&1
   local rc=$?
@@ -488,7 +488,7 @@ run_authority_postgres_gate() {
   fi
 
   local executed
-  executed=$(grep -cE '^(ok|FAIL|--- PASS|--- FAIL)' "$log" 2>/dev/null || true)
+  executed=$(grep -cE '^\s*--- (PASS|FAIL|SKIP):' "$log" 2>/dev/null || true)
   if [ "$executed" -le 0 ]; then
     {
       echo ""
@@ -501,7 +501,7 @@ run_authority_postgres_gate() {
   fi
 
   record_gate "$name" "PASS" 0 "$log"
-  echo "  PASS  $name ($executed test lines)"
+  echo "  PASS  $name ($executed tests executed)"
 }
 
 run_authority_postgres_gate
@@ -510,7 +510,7 @@ run_authority_postgres_gate
 echo ""
 echo "=== Cross-language conformance ==="
 run_gate cross-language-conformance \
-  go test -count=1 -timeout=60s \
+  go test -v -count=1 -timeout=60s \
   -run "TestRunEvidenceConformanceCorpus|TestReceiptContractConformance" \
   ./internal/cli/
 
@@ -589,14 +589,16 @@ extract_tests_executed() {
 
   case "$gate_name" in
     go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-cli|effect-fabric-contract|effect-fabric-reconciliation|effect-fabric-race|effect-fabric-postgres|authority-postgres)
-      # Go test without -v prints one line per package:
-      #   ok  \t<package>\t<duration>
-      #   FAIL\t<package>\t<duration>
-      # Count those lines as evidence tests ran.
-      # Also check for -v output (--- PASS/--- FAIL) in case verbose is used.
+      # Go test with -v prints one line per test:
+      #   --- PASS: TestName (0.00s)
+      #   --- FAIL: TestName (0.00s)
+      #   --- SKIP: TestName (0.00s)
+      # Count per-test result lines, not package-level ok/FAIL lines.
+      # A go test -run expression matching zero tests produces "ok" but
+      # no --- PASS lines — the count correctly returns 0.
       # NOTE: grep -c outputs "0" and exits 1 when no matches. Using
       # `|| true` (not `|| echo 0`) avoids appending a second "0".
-      count=$(grep -cE '^(ok|FAIL|--- PASS|--- FAIL)' "$log" 2>/dev/null || true)
+      count=$(grep -cE '^\s*--- (PASS|FAIL|SKIP):' "$log" 2>/dev/null || true)
       ;;
     worker-tests|nemo-tests)
       # Vitest prints a summary like:
@@ -639,8 +641,8 @@ extract_tests_executed() {
       fi
       ;;
     cross-language-conformance)
-      # Conformance runner prints PASS/FAIL lines per case.
-      count=$(grep -cE '^(PASS|FAIL|ok|not ok)' "$log" 2>/dev/null || true)
+      # With -v, count per-test result lines.
+      count=$(grep -cE '^\s*--- (PASS|FAIL|SKIP):' "$log" 2>/dev/null || true)
       ;;
     *)
       # Non-test gates (vet, typecheck, format, lint, build) have no test count.

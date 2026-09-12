@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -73,6 +74,23 @@ func testFinalize(store *Store, ctx context.Context, executionID, leaseToken str
 		ReceiptVersion:  receiptVersion,
 	}
 	return store.Finalize(ctx, executionID, leaseToken, rec.LeaseGeneration, expectedState, receipt)
+}
+
+// testEnterRecovery traverses the full lifecycle to enter recovery:
+// PREPARED → EXECUTING → IN_FLIGHT → UNKNOWN. This is the only legal
+// path — EnterRecovery enforces IN_FLIGHT as the sole origin.
+func testEnterRecovery(store *Store, ctx context.Context, executionID, leaseToken string) error {
+	if err := testTransition(store, ctx, executionID, leaseToken, StatePrepared, StateExecuting); err != nil {
+		return fmt.Errorf("testEnterRecovery: %w", err)
+	}
+	if err := testTransition(store, ctx, executionID, leaseToken, StateExecuting, StateInFlight); err != nil {
+		return fmt.Errorf("testEnterRecovery: %w", err)
+	}
+	rec, err := store.Lookup(ctx, executionID)
+	if err != nil {
+		return err
+	}
+	return store.EnterRecovery(ctx, executionID, StateInFlight, rec.Version)
 }
 
 // testRenewLease looks up the generation and calls RenewLease.
@@ -802,10 +820,10 @@ func TestLiveStoreRetryAfterInvalidEvidenceNoMagicV3(t *testing.T) {
 
 	key := fmt.Sprintf("test-novoodoo-%d", time.Now().UnixNano())
 	principal := "alice@example.com"
-	capability := "test.critical.op"
+	capability := "test.mutation.op"
 	digest := "digest-novoodoo"
 	grantID := "grant_test"
-	class := "CRITICAL"
+	class := "MUTATION"
 
 	// Reserve and transition through the lifecycle.
 	reserve, err := testReserve(store, ctx, key, principal, capability, digest, grantID, class)
@@ -887,18 +905,15 @@ func TestLiveStoreRecoveryWithProofOfCompletion(t *testing.T) {
 	}
 	execID := reserve.Record.ExecutionID
 
-	// Transition to UNKNOWN via the contract's EnterRecovery (CAS).
-	rec, err := store.Lookup(ctx, execID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.EnterRecovery(ctx, execID, StatePrepared, rec.Version); err != nil {
+	// Transition to UNKNOWN via the full lifecycle:
+	// PREPARED → EXECUTING → IN_FLIGHT → UNKNOWN.
+	if err := testEnterRecovery(store, ctx, execID, reserve.LeaseToken); err != nil {
 		t.Fatal(err)
 	}
 
 	// Simulate the reconcile worker: resolver confirms completion.
 	proofResult := []byte(`{"confirmed":true,"provider_run_id":"run_123"}`)
-	rec, err = store.Lookup(ctx, execID)
+	rec, err := store.Lookup(ctx, execID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -960,18 +975,15 @@ func TestLiveStoreRecoveryWithProofOfFailure(t *testing.T) {
 	}
 	execID := reserve.Record.ExecutionID
 
-	// Transition to UNKNOWN via the contract's EnterRecovery (CAS).
-	rec, err := store.Lookup(ctx, execID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.EnterRecovery(ctx, execID, StatePrepared, rec.Version); err != nil {
+	// Transition to UNKNOWN via the full lifecycle:
+	// PREPARED → EXECUTING → IN_FLIGHT → UNKNOWN.
+	if err := testEnterRecovery(store, ctx, execID, reserve.LeaseToken); err != nil {
 		t.Fatal(err)
 	}
 
 	// Simulate the reconcile worker: resolver confirms failure.
 	proofResult := []byte(`{"confirmed":false,"error":"provider returned error"}`)
-	rec, err = store.Lookup(ctx, execID)
+	rec, err := store.Lookup(ctx, execID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1024,25 +1036,22 @@ func TestLiveStoreRecoveryWithoutProofStaysUnknown(t *testing.T) {
 	grantID := "grant_test"
 	class := "MUTATION"
 
-	// Create a record in UNKNOWN state via EnterRecovery (CAS).
+	// Create a record in UNKNOWN state via the full lifecycle:
+	// PREPARED → EXECUTING → IN_FLIGHT → UNKNOWN.
 	reserve, err := testReserve(store, ctx, key, principal, capability, digest, grantID, class)
 	if err != nil {
 		t.Fatal(err)
 	}
 	execID := reserve.Record.ExecutionID
 
-	rec, err := store.Lookup(ctx, execID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.EnterRecovery(ctx, execID, StatePrepared, rec.Version); err != nil {
+	if err := testEnterRecovery(store, ctx, execID, reserve.LeaseToken); err != nil {
 		t.Fatal(err)
 	}
 
 	// Simulate the reconcile worker: NoopResolver returns UNKNOWN.
 	// The worker should NOT change state (stays UNKNOWN).
 	// Verify the record is still UNKNOWN after "reconciliation".
-	rec, err = store.Lookup(ctx, execID)
+	rec, err := store.Lookup(ctx, execID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2209,9 +2218,8 @@ func TestLiveClaimUnknownBatchRespectsBackoff(t *testing.T) {
 		t.Fatalf("expected 1 claimed, got %d", len(batch))
 	}
 
-	// Release with a future next_reconcile_at (backoff).
-	futureAt := time.Now().Add(10 * time.Minute)
-	if err := store.ReleaseReconcileClaim(ctx, execID, batch[0].Version, futureAt, "test backoff"); err != nil {
+	// Release with a 10-minute backoff duration (DB computes timestamp).
+	if err := store.ReleaseReconcileClaim(ctx, execID, batch[0].Version, 10*time.Minute, "test backoff"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2363,5 +2371,415 @@ func TestLiveFinalizeDeniedRejected(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected DENIED finalization from EXECUTING to be rejected, got nil error")
+	}
+}
+
+// TestLiveEnterRecoveryRejectsNonInFlight verifies that EnterRecovery
+// enforces the legal transition matrix — only IN_FLIGHT → UNKNOWN is
+// permitted. PREPARED, COMMITTED, and FAILED must be rejected.
+func TestLiveEnterRecoveryRejectsNonInFlight(t *testing.T) {
+	dbURL := os.Getenv("CRABBOX_TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live PostgreSQL test")
+	}
+	db, err := openTestDB(dbURL)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+	store, err := NewStore(db)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	ctx := context.Background()
+
+	prefix := fmt.Sprintf("test-recovery-guard-%d", time.Now().UnixNano())
+	db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key LIKE $1`, prefix+"%")
+
+	// Create a PREPARED record.
+	acq, err := store.Acquire(ctx, prefix+"-0", "alice@example.com", "test.counter.increment",
+		"digest-guard", "grant_g", "MUTATION", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execID := acq.Record.ExecutionID
+
+	// PREPARED → UNKNOWN must be rejected.
+	rec, _ := store.Lookup(ctx, execID)
+	err = store.EnterRecovery(ctx, execID, StatePrepared, rec.Version)
+	if err == nil {
+		t.Fatal("expected PREPARED → UNKNOWN to be rejected")
+	}
+
+	// EXECUTING → UNKNOWN must be rejected.
+	if err := store.BeginExecution(ctx, execID, acq.LeaseToken, acq.Generation); err != nil {
+		t.Fatal(err)
+	}
+	rec, _ = store.Lookup(ctx, execID)
+	err = store.EnterRecovery(ctx, execID, StateExecuting, rec.Version)
+	if err == nil {
+		t.Fatal("expected EXECUTING → UNKNOWN to be rejected")
+	}
+
+	// COMMITTED → UNKNOWN must be rejected (terminal is immutable).
+	if err := store.MarkInFlight(ctx, execID, acq.LeaseToken, acq.Generation, "test-counter", nil); err != nil {
+		t.Fatal(err)
+	}
+	rec, _ = store.Lookup(ctx, execID)
+	err = store.Finalize(ctx, execID, acq.LeaseToken, rec.LeaseGeneration, StateInFlight, TerminalReceipt{
+		ExecutionID:     execID,
+		TerminalStatus:  StateCommitted,
+		CanonicalResult: json.RawMessage(`{"ok":true}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, _ = store.Lookup(ctx, execID)
+	err = store.EnterRecovery(ctx, execID, StateCommitted, rec.Version)
+	if err == nil {
+		t.Fatal("expected COMMITTED → UNKNOWN to be rejected")
+	}
+}
+
+// TestLiveConcurrentIdenticalFinalize verifies that two concurrent
+// workers finalizing the same execution with identical receipts both
+// succeed — the CAS loser sees the terminal state and matching digest
+// and returns success (idempotent), not a conflict.
+func TestLiveConcurrentIdenticalFinalize(t *testing.T) {
+	dbURL := os.Getenv("CRABBOX_TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live PostgreSQL test")
+	}
+	db, err := openTestDB(dbURL)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+	store, err := NewStore(db)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	ctx := context.Background()
+
+	prefix := fmt.Sprintf("test-conc-finalize-%d", time.Now().UnixNano())
+	db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key LIKE $1`, prefix+"%")
+
+	// Create and dispatch a MUTATION record.
+	acq, err := store.Acquire(ctx, prefix+"-0", "alice@example.com", "test.counter.increment",
+		"digest-conc", "grant_c", "MUTATION", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execID := acq.Record.ExecutionID
+	if err := store.BeginExecution(ctx, execID, acq.LeaseToken, acq.Generation); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkInFlight(ctx, execID, acq.LeaseToken, acq.Generation, "test-counter", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Build the identical receipt both workers will try to finalize.
+	rec, _ := store.Lookup(ctx, execID)
+	receipt := TerminalReceipt{
+		ExecutionID:     execID,
+		Capability:      rec.CapabilityID,
+		Principal:       rec.PrincipalID,
+		RequestDigest:   rec.RequestDigest,
+		TerminalStatus:  StateCommitted,
+		CanonicalResult: json.RawMessage(`{"value":42}`),
+		ProviderID:      "test-counter",
+		ProviderRunID:   "run-conc",
+		EvidenceDigest:  "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+		ReceiptVersion:  3,
+	}
+
+	// Launch two concurrent finalizations with the same receipt.
+	const workers = 2
+	var wg sync.WaitGroup
+	var successes, conflicts, other int64
+	start := make(chan struct{})
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			err := store.Finalize(ctx, execID, acq.LeaseToken, rec.LeaseGeneration, StateInFlight, receipt)
+			if err == nil {
+				atomic.AddInt64(&successes, 1)
+			} else if strings.Contains(err.Error(), "FINALIZATION_CONFLICT") {
+				atomic.AddInt64(&conflicts, 1)
+			} else {
+				atomic.AddInt64(&other, 1)
+				t.Logf("unexpected finalize error: %v", err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	// Both should succeed — the first commits, the second sees the
+	// identical receipt and returns idempotent success.
+	if successes != workers {
+		t.Errorf("expected %d successes, got %d (conflicts=%d, other=%d)", workers, successes, conflicts, other)
+	}
+
+	// Verify the record is COMMITTED.
+	rec, _ = store.Lookup(ctx, execID)
+	if rec.State != StateCommitted {
+		t.Errorf("expected COMMITTED, got %s", rec.State)
+	}
+}
+
+// TestLiveCriticalFinalizeRequiresProof verifies that CRITICAL
+// finalization to COMMITTED or FAILED requires evidence at the
+// store boundary — not just in DispatchExecutor.
+func TestLiveCriticalFinalizeRequiresProof(t *testing.T) {
+	dbURL := os.Getenv("CRABBOX_TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live PostgreSQL test")
+	}
+	db, err := openTestDB(dbURL)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+	store, err := NewStore(db)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	ctx := context.Background()
+
+	prefix := fmt.Sprintf("test-crit-finalize-%d", time.Now().UnixNano())
+	db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key LIKE $1`, prefix+"%")
+
+	// Create a CRITICAL record.
+	acq, err := store.Acquire(ctx, prefix+"-0", "alice@example.com", "test.critical.deploy",
+		"digest-crit", "grant_c", "CRITICAL", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execID := acq.Record.ExecutionID
+	if err := store.BeginExecution(ctx, execID, acq.LeaseToken, acq.Generation); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkInFlight(ctx, execID, acq.LeaseToken, acq.Generation, "deploy-adapter", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// CRITICAL → COMMITTED without evidence must fail.
+	rec, _ := store.Lookup(ctx, execID)
+	err = store.Finalize(ctx, execID, acq.LeaseToken, rec.LeaseGeneration, StateInFlight, TerminalReceipt{
+		ExecutionID:    execID,
+		TerminalStatus: StateCommitted,
+	})
+	if err == nil {
+		t.Fatal("expected CRITICAL → COMMITTED without evidence to be rejected")
+	}
+
+	// CRITICAL → FAILED without evidence must fail.
+	err = store.Finalize(ctx, execID, acq.LeaseToken, rec.LeaseGeneration, StateInFlight, TerminalReceipt{
+		ExecutionID:    execID,
+		TerminalStatus: StateFailed,
+	})
+	if err == nil {
+		t.Fatal("expected CRITICAL → FAILED without evidence to be rejected")
+	}
+
+	// CRITICAL → COMMITTED with full proof must succeed.
+	err = store.Finalize(ctx, execID, acq.LeaseToken, rec.LeaseGeneration, StateInFlight, TerminalReceipt{
+		ExecutionID:     execID,
+		TerminalStatus:  StateCommitted,
+		CanonicalResult: json.RawMessage(`{"deployed":true}`),
+		ProviderID:      "deploy-adapter",
+		ProviderRunID:   "run-crit-1",
+		EvidenceDigest:  "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+		ReceiptVersion:  3,
+	})
+	if err != nil {
+		t.Fatalf("CRITICAL → COMMITTED with proof should succeed: %v", err)
+	}
+}
+
+// TestLiveRecoveryLocatorCleared verifies that the recovery_locator
+// is cleared after terminal finalization — it contains raw request
+// arguments and must not persist beyond the terminal transition.
+func TestLiveRecoveryLocatorCleared(t *testing.T) {
+	dbURL := os.Getenv("CRABBOX_TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live PostgreSQL test")
+	}
+	db, err := openTestDB(dbURL)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+	store, err := NewStore(db)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	ctx := context.Background()
+
+	prefix := fmt.Sprintf("test-locator-clear-%d", time.Now().UnixNano())
+	db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key LIKE $1`, prefix+"%")
+
+	// Create and dispatch a record with a recovery locator.
+	acq, err := store.Acquire(ctx, prefix+"-0", "alice@example.com", "test.counter.increment",
+		"digest-loc", "grant_l", "MUTATION", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execID := acq.Record.ExecutionID
+	if err := store.BeginExecution(ctx, execID, acq.LeaseToken, acq.Generation); err != nil {
+		t.Fatal(err)
+	}
+	locator := json.RawMessage(`{"capability_id":"test.counter.increment","arguments":{"counter":"test"}}`)
+	if err := store.MarkInFlight(ctx, execID, acq.LeaseToken, acq.Generation, "test-counter", locator); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the locator was persisted.
+	rec, _ := store.Lookup(ctx, execID)
+	if len(rec.RecoveryLocator) == 0 {
+		t.Fatal("expected recovery_locator to be persisted")
+	}
+
+	// Finalize — the locator should be cleared.
+	err = store.Finalize(ctx, execID, acq.LeaseToken, rec.LeaseGeneration, StateInFlight, TerminalReceipt{
+		ExecutionID:     execID,
+		TerminalStatus:  StateCommitted,
+		CanonicalResult: json.RawMessage(`{"done":true}`),
+		ProviderID:      "test-counter",
+		ProviderRunID:   "run-loc",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, _ = store.Lookup(ctx, execID)
+	if len(rec.RecoveryLocator) != 0 {
+		t.Errorf("expected recovery_locator cleared after finalization, got %d bytes", len(rec.RecoveryLocator))
+	}
+}
+
+// TestLiveEnterRecoveryWithObservation verifies that
+// EnterRecoveryWithObservation persists provider metadata alongside
+// the UNKNOWN transition.
+func TestLiveEnterRecoveryWithObservation(t *testing.T) {
+	dbURL := os.Getenv("CRABBOX_TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live PostgreSQL test")
+	}
+	db, err := openTestDB(dbURL)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+	store, err := NewStore(db)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	ctx := context.Background()
+
+	prefix := fmt.Sprintf("test-obs-%d", time.Now().UnixNano())
+	db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key LIKE $1`, prefix+"%")
+
+	acq, err := store.Acquire(ctx, prefix+"-0", "alice@example.com", "test.counter.increment",
+		"digest-obs", "grant_o", "MUTATION", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execID := acq.Record.ExecutionID
+	if err := store.BeginExecution(ctx, execID, acq.LeaseToken, acq.Generation); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkInFlight(ctx, execID, acq.LeaseToken, acq.Generation, "test-counter", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Enter recovery with provider observation.
+	rec, _ := store.Lookup(ctx, execID)
+	err = store.EnterRecoveryWithObservation(ctx, execID, StateInFlight, rec.Version,
+		"github-adapter", "issue-98765", "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+		json.RawMessage(`{"issue_url":"https://github.com/org/repo/issues/1"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the observation was persisted.
+	rec, _ = store.Lookup(ctx, execID)
+	if rec.State != StateUnknown {
+		t.Fatalf("expected UNKNOWN, got %s", rec.State)
+	}
+	if rec.ProviderID != "github-adapter" {
+		t.Errorf("expected provider_id=github-adapter, got %q", rec.ProviderID)
+	}
+	if rec.ProviderRunID != "issue-98765" {
+		t.Errorf("expected provider_run_id=issue-98765, got %q", rec.ProviderRunID)
+	}
+	if rec.EvidenceDigest != "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2" {
+		t.Errorf("expected evidence_digest preserved, got %q", rec.EvidenceDigest)
+	}
+}
+
+// TestLiveClaimExpiredBatch verifies that expired-lease claiming uses
+// FOR UPDATE SKIP LOCKED and does not process the same records twice.
+func TestLiveClaimExpiredBatch(t *testing.T) {
+	dbURL := os.Getenv("CRABBOX_TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live PostgreSQL test")
+	}
+	db, err := openTestDB(dbURL)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+	store, err := NewStore(db)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	ctx := context.Background()
+
+	prefix := fmt.Sprintf("test-expired-claim-%d", time.Now().UnixNano())
+	db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key LIKE $1`, prefix+"%")
+
+	// Create records with very short leases.
+	for i := 0; i < 3; i++ {
+		key := fmt.Sprintf("%s-%d", prefix, i)
+		_, err := store.Acquire(ctx, key, "alice@example.com", "test.counter.increment",
+			fmt.Sprintf("digest-exp-%d", i), "grant_e", "MUTATION", 50*time.Millisecond)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(200 * time.Millisecond) // Let leases expire.
+
+	// Claim expired batch — should get all 3.
+	batch, err := store.ClaimExpiredBatch(ctx, "worker-a", 10, 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed := 0
+	for _, rec := range batch {
+		if strings.HasPrefix(rec.IdempotencyKey, prefix) {
+			claimed++
+		}
+	}
+	if claimed != 3 {
+		t.Fatalf("expected 3 claimed expired records, got %d", claimed)
+	}
+
+	// Second claim should get 0 — already claimed.
+	batch2, err := store.ClaimExpiredBatch(ctx, "worker-b", 10, 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed2 := 0
+	for _, rec := range batch2 {
+		if strings.HasPrefix(rec.IdempotencyKey, prefix) {
+			claimed2++
+		}
+	}
+	if claimed2 != 0 {
+		t.Fatalf("expected 0 on second claim, got %d", claimed2)
 	}
 }

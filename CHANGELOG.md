@@ -58,6 +58,22 @@
 - Execution: schema migration errors now propagate — `NewStore` fails closed if `ALTER TABLE` or state-name migration fails.
 - Execution: UUID fallback schema uses TEXT primary key (application-side UUID) instead of UUID with no default.
 - Execution: `Acquire()` IN_FLIGHT race fixed — re-read after CAS failure now checks `IsDurablyFinal()` and returns `TerminalReplay` instead of `LeaseHeldByOther`.
+- Execution: `EnterRecovery` enforces the legal transition matrix — only `IN_FLIGHT → UNKNOWN` is permitted. Terminal and pre-dispatch states cannot enter recovery.
+- Execution: `Finalize` enforces CRITICAL proof requirements at the store boundary — both COMMITTED and FAILED require evidence digest, receipt_version 3, provider_id, provider_run_id. A caller bypassing `DispatchExecutor` cannot finalize CRITICAL without proof.
+- Execution: `Finalize` handles concurrent identical finalization idempotently — CAS loser re-reads the terminal state and returns success when the receipt digest matches.
+- Execution: `EnterRecoveryWithObservation` persists provider observation (provider_id, provider_run_id, evidence_digest, result) atomically with the UNKNOWN transition — best available evidence is not discarded when finalization fails after provider return.
+- Execution: `recovery_locator` is cleared to NULL on terminal finalization — raw request arguments do not persist beyond the terminal transition.
+- Execution: lease heartbeat stays alive through finalization — the lease remains valid while evidence is validated, the receipt is constructed, and the terminal state is committed.
+- Reconciliation: `reconcileBackoff` uses saturating arithmetic — no integer-shift overflow at large attempt counts; backoff never returns zero.
+- Reconciliation: `ReleaseReconcileClaim` takes a backoff duration — `next_reconcile_at` is computed by `clock_timestamp()` on the DB side, not `time.Now()` on the app side. Replicas with skewed clocks cannot distort retry timing.
+- Reconciliation: `ClaimExpiredBatch` claims expired PREPARED/EXECUTING/IN_FLIGHT records via `FOR UPDATE SKIP LOCKED` — multiple workers do not process the same expired leases.
+- Reconciliation: `RenewReconcileClaim` extends an active claim using `GREATEST` — a slow resolver can renew its claim to prevent reclaiming by another worker.
+- Reconciliation: partial indexes added for UNKNOWN reconciliation and expired-lease queries — `idx_exec_reconcile` on `(next_reconcile_at, updated_at) WHERE state = 'UNKNOWN'`, `idx_exec_expired_leases` on `(lease_expires_at) WHERE state IN ('PREPARED','EXECUTING','IN_FLIGHT')`.
+- Execution: `CounterHandler.Resolve` normalizes `by:0` to `by:1` matching `Execute` — recovered results are semantically identical to the original execution.
+- Execution: `DefinitiveFailure` documented as a routing signal, not proof — CRITICAL operations require evidence in the receipt fields.
+- Release: all Go test gates use `-v` flag — `tests_executed` counts per-test `--- PASS`/`--- FAIL`/`--- SKIP` lines, not package-level `ok`/`FAIL` summaries. A `go test -run` matching zero tests correctly reports 0 executed.
+- Tests: `testEnterRecovery` helper traverses the full lifecycle (PREPARED→EXECUTING→IN_FLIGHT→UNKNOWN) — no more illegal `EnterRecovery(StatePrepared)` shortcuts.
+- Tests: live PG tests added for `EnterRecovery` transition enforcement, concurrent identical finalization, CRITICAL finalize proof, recovery locator cleanup, `EnterRecoveryWithObservation`, and `ClaimExpiredBatch`.
 - Execution: terminal receipt `CanonicalResult` canonicalized before hashing — sorted JSON keys ensure semantically identical results produce identical digests.
 - Execution: lease token encoding changed from hex to base64url (matches frozen contract spec).
 - Release: dedicated gates `effect-fabric-contract`, `effect-fabric-postgres`, `effect-fabric-race`, `effect-fabric-reconciliation`, `authority-postgres`. New invariants CRAB-V1-017 through CRAB-V1-021. `RELEASE_VERSION` required explicitly (no hardcoded default). Attestation subject matches actual attested object (`evidence-manifest.json`).

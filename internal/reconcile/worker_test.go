@@ -3,6 +3,7 @@ package reconcile
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -63,6 +64,51 @@ func TestWorkerNilDefaultResolver(t *testing.T) {
 	}
 	if result.Decision != idempotency.RecoveryUnknown {
 		t.Errorf("expected RecoveryUnknown with nil default resolver, got %s", result.Decision)
+	}
+}
+
+// TestReconcileBackoff verifies the exponential backoff function
+// produces the correct sequence and saturates at the maximum without
+// integer-shift overflow.
+func TestReconcileBackoff(t *testing.T) {
+	tests := []struct {
+		attempt int
+		want    time.Duration
+	}{
+		{0, 30 * time.Second},
+		{1, 1 * time.Minute},
+		{2, 2 * time.Minute},
+		{3, 4 * time.Minute},
+		{4, 8 * time.Minute},
+		{5, 16 * time.Minute},
+		{6, 30 * time.Minute},  // 32m > 30m cap → saturated
+		{7, 30 * time.Minute},  // beyond cap → saturated
+		{10, 30 * time.Minute}, // far beyond → saturated
+		{50, 30 * time.Minute}, // extreme overflow → saturated (not 0)
+		{-1, 30 * time.Second}, // negative → clamped to base
+	}
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("attempt_%d", tt.attempt), func(t *testing.T) {
+			got := reconcileBackoff(tt.attempt)
+			if got != tt.want {
+				t.Errorf("reconcileBackoff(%d) = %v, want %v", tt.attempt, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestReconcileBackoffNeverZero verifies that backoff never returns
+// zero or negative — a permanently unresolved record must not enter
+// a hot retry loop.
+func TestReconcileBackoffNeverZero(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		d := reconcileBackoff(i)
+		if d <= 0 {
+			t.Fatalf("reconcileBackoff(%d) = %v, must be positive", i, d)
+		}
+		if d > 30*time.Minute {
+			t.Fatalf("reconcileBackoff(%d) = %v, exceeds 30m cap", i, d)
+		}
 	}
 }
 

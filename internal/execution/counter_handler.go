@@ -16,15 +16,21 @@ import (
 // This is a harmless mutation capability backed by an in-memory counter
 // (or optionally a database). It proves that idempotency works:
 // 100 concurrent identical calls result in exactly one increment.
+//
+// For recovery, the handler tracks which execution IDs incremented
+// which counters. This allows Resolve() to prove "this specific
+// execution caused the effect" rather than just "the counter exists."
 type CounterHandler struct {
-	mu       sync.Mutex
-	counters map[string]int64
+	mu         sync.Mutex
+	counters   map[string]int64
+	executions map[string]map[string]int64 // counter → execution_id → amount
 }
 
 // NewCounterHandler creates a handler for test.counter.increment.
 func NewCounterHandler() *CounterHandler {
 	return &CounterHandler{
-		counters: make(map[string]int64),
+		counters:   make(map[string]int64),
+		executions: make(map[string]map[string]int64),
 	}
 }
 
@@ -62,10 +68,17 @@ func (h *CounterHandler) Execute(ctx context.Context, req Request, desc capabili
 		args.By = 1
 	}
 
-	// Increment the counter
+	// Increment the counter and record the idempotency key that
+	// caused it. The idempotency key uniquely identifies the logical
+	// execution — two different executions with different keys are
+	// tracked separately.
 	h.mu.Lock()
 	h.counters[args.Counter] += args.By
 	newValue := h.counters[args.Counter]
+	if h.executions[args.Counter] == nil {
+		h.executions[args.Counter] = make(map[string]int64)
+	}
+	h.executions[args.Counter][req.IdempotencyKey] = args.By
 	h.mu.Unlock()
 
 	result, _ := json.Marshal(map[string]any{
@@ -86,12 +99,16 @@ func (h *CounterHandler) Execute(ctx context.Context, req Request, desc capabili
 
 // Resolve implements idempotency.RecoveryResolver for the counter
 // capability. It checks whether the counter described in the recovery
-// locator was actually incremented.
+// locator was actually incremented BY THIS SPECIFIC EXECUTION.
+//
+// Execution correlation: the handler tracks which idempotency keys
+// incremented which counters. Recovery proves "this execution caused
+// the effect" — not merely "the counter exists."
 //
 // For an in-memory counter, a process crash loses all state — so this
-// resolver can only prove COMMITTED (the counter exists and was
-// incremented), not FAILED (the counter may have existed before the
-// crash). RecoveryFailed is not possible for in-memory providers.
+// resolver can only prove COMMITTED (the idempotency key is recorded),
+// not FAILED (the counter may have existed before the crash).
+// RecoveryFailed is not possible for in-memory providers.
 func (h *CounterHandler) Resolve(ctx context.Context, rec *idempotency.Record) (idempotency.RecoveryResult, error) {
 	// Parse the recovery locator to find which counter was incremented.
 	var locator struct {
@@ -113,31 +130,42 @@ func (h *CounterHandler) Resolve(ctx context.Context, rec *idempotency.Record) (
 	if counterName == "" {
 		counterName = "default"
 	}
+	// Apply the same normalization as Execute: By defaults to 1.
+	by := locator.Arguments.By
+	if by == 0 {
+		by = 1
+	}
 
 	h.mu.Lock()
-	value, exists := h.counters[counterName]
+	execAmount, wasExecuted := h.executions[counterName][rec.IdempotencyKey]
+	value := h.counters[counterName]
 	h.mu.Unlock()
 
-	if !exists {
-		// The counter does not exist — either the handler never ran,
-		// or the process crashed and in-memory state was lost.
-		// We cannot distinguish these cases, so return UNKNOWN.
+	if !wasExecuted {
+		// This specific execution did not increment the counter.
+		// Either the handler never ran for this execution, or the
+		// process crashed and in-memory state was lost.
+		// We cannot distinguish these cases — return UNKNOWN.
 		return idempotency.RecoveryResult{
 			Decision: idempotency.RecoveryUnknown,
 		}, nil
 	}
 
-	// The counter exists — the increment happened (or the counter
-	// was incremented by a different execution). For the test counter,
-	// this is sufficient proof of COMMITTED.
+	// This execution provably incremented the counter. The amount
+	// matches the canonical parameters.
+	if execAmount != by {
+		// The recorded amount differs from the recovery parameters —
+		// something is inconsistent. Stay UNKNOWN.
+		return idempotency.RecoveryResult{
+			Decision: idempotency.RecoveryUnknown,
+		}, nil
+	}
+
 	result, _ := json.Marshal(map[string]any{
 		"counter": counterName,
 		"value":   value,
-		"by":      locator.Arguments.By,
+		"by":      by,
 	})
-	// Compute a deterministic evidence digest from the result so the
-	// recovery receipt carries the same proof schema as a normal
-	// finalization (receipt_version=3, non-empty evidence digest).
 	evidenceDigest := fmt.Sprintf("%x", sha256.Sum256(result))
 	return idempotency.RecoveryResult{
 		Decision:       idempotency.RecoveryCommitted,
@@ -145,7 +173,7 @@ func (h *CounterHandler) Resolve(ctx context.Context, rec *idempotency.Record) (
 		EvidenceDigest: evidenceDigest,
 		ReceiptVersion: 3,
 		ProviderID:     "test-counter",
-		ProviderRunID:  fmt.Sprintf("counter-recovered-%s", counterName),
+		ProviderRunID:  fmt.Sprintf("counter-recovered-%s-%s", counterName, rec.IdempotencyKey),
 	}, nil
 }
 

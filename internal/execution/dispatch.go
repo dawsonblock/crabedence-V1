@@ -195,9 +195,11 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	// Any failure after this point is UNKNOWN (may have executed).
 	resp := e.dispatch(ctx, req, desc)
 
-	// Stop the heartbeat as soon as the provider call returns.
-	// Finalization does not require an active lease renewal.
-	heartbeatCancel()
+	// The heartbeat stays alive through finalization — the lease must
+	// remain valid while we validate evidence, construct the receipt,
+	// and commit the terminal state. Cancelling it here would create
+	// a window where the lease expires between provider return and
+	// Finalize.
 
 	// ─── CRITICAL EVIDENCE VALIDATION BEFORE PERSISTENCE ──────────────────
 	// The evidence contract MUST be validated BEFORE the terminal state
@@ -337,15 +339,38 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	}
 
 	if err := e.store.Finalize(ctx, executionID, leaseToken, rec.LeaseGeneration, idempotency.StateInFlight, receipt); err != nil {
-		// Finalization failed AFTER dispatch — return UNKNOWN.
-		// The side effect may have occurred; we cannot claim FAILED.
+		// Finalization failed AFTER dispatch — the side effect may
+		// have occurred. Persist the provider observation before
+		// entering recovery so the resolver can correlate. This
+		// preserves provider_id, provider_run_id, evidence, and
+		// result — the best information we may ever obtain.
+		obsProviderID := ""
+		obsProviderRunID := ""
+		obsEvidence := ""
+		if resp.Execution != nil {
+			obsProviderID = resp.Execution.Provider
+			obsProviderRunID = resp.Execution.RunID
+		}
+		if resp.Evidence != nil {
+			obsEvidence = resp.Evidence.Digest
+		}
+		if obsProviderID == "" {
+			obsProviderID = desc.AdapterID
+		}
+		// Re-lookup for current version — the record may have
+		// advanced since our earlier read.
+		if rec2, err2 := e.store.Lookup(ctx, executionID); err2 == nil {
+			_ = e.store.EnterRecoveryWithObservation(ctx, executionID,
+				idempotency.StateInFlight, rec2.Version,
+				obsProviderID, obsProviderRunID, obsEvidence, resp.Result)
+		}
 		return Response{
 			Status:      StatusUnknown,
 			FailureCode: string(capability.FailureExecutionUnknown),
-			Error:       fmt.Sprintf("failed to finalize execution after dispatch: %v", err),
+			Error:       fmt.Sprintf("failed to finalize execution after dispatch (provider observation persisted): %v", err),
 			Execution: &ExecutionMeta{
-				Provider: desc.AdapterID,
-				RunID:    executionID,
+				Provider: obsProviderID,
+				RunID:    obsProviderRunID,
 			},
 		}
 	}
@@ -395,6 +420,15 @@ func (e *DispatchExecutor) dispatch(ctx context.Context, req Request, desc capab
 //   - provider_id — which adapter handled the operation
 //   - timestamp — when the dispatch was initiated
 func buildRecoveryLocator(req Request, desc capability.ResolvedDescriptor, digest string) json.RawMessage {
+	// Canonicalize arguments so the locator stores the form that was
+	// actually executed, not the raw request bytes. Semantically
+	// equivalent arguments (e.g., key ordering, default values)
+	// produce identical locators.
+	canonicalArgs, err := idempotency.CanonicalizeArguments(req.Arguments)
+	if err != nil {
+		// Non-canonical arguments — store the raw form as fallback.
+		canonicalArgs = req.Arguments
+	}
 	locator := map[string]any{
 		"capability_id":   req.Capability,
 		"idempotency_key": req.IdempotencyKey,
@@ -402,7 +436,7 @@ func buildRecoveryLocator(req Request, desc capability.ResolvedDescriptor, diges
 		"request_digest":  digest,
 		"provider_id":     desc.AdapterID,
 		"execution_class": string(desc.ExecutionClass),
-		"arguments":       json.RawMessage(req.Arguments),
+		"arguments":       json.RawMessage(canonicalArgs),
 		"dispatched_at":   time.Now().UTC().Format(time.RFC3339Nano),
 	}
 	data, err := json.Marshal(locator)
