@@ -121,7 +121,7 @@ func TestLiveWorkerReconciliation(t *testing.T) {
 		result: idempotency.RecoveryResult{
 			Decision:       idempotency.RecoveryCommitted,
 			Result:         []byte(`{"counter":"test","value":1}`),
-			EvidenceDigest: "proof_digest_000000000000000000000000000000000000000000000000000000123456",
+			EvidenceDigest: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
 			ReceiptVersion: 3,
 			ProviderID:     "test-counter",
 			ProviderRunID:  "run_worker_reconcile",

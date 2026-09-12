@@ -1919,7 +1919,7 @@ func TestLiveStoreCriticalRecoveryFailedRequiresProof(t *testing.T) {
 	rec, _ = store.Lookup(ctx, execID)
 	err = store.ResolveRecovery(ctx, execID, rec.Version, RecoveryResult{
 		Decision:       RecoveryFailed,
-		EvidenceDigest: "proof_digest_000000000000000000000000000000000000000000000000000000123456",
+		EvidenceDigest: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
 		ReceiptVersion: 3,
 		ProviderID:     "deploy-adapter",
 		ProviderRunID:  "run_critical_fail_proof",
