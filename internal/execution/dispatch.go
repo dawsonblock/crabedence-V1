@@ -413,3 +413,47 @@ func stateToStatus(state idempotency.State) string {
 		return string(state)
 	}
 }
+
+// leaseHeartbeat periodically renews the lease while a provider call is
+// active. This prevents long-running provider calls from exceeding the
+// lease duration and falling into UNKNOWN despite successful execution.
+//
+// The heartbeat runs in a goroutine started after IN_FLIGHT is persisted.
+// It renews the lease at the configured interval until the provider call
+// completes or the context is cancelled.
+//
+// Renewal failures are logged but do not cancel the provider call —
+// the provider may still succeed, and finalization will fail-closed
+// if the lease was actually lost.
+func (e *DispatchExecutor) leaseHeartbeat(ctx context.Context, executionID, leaseToken string, leaseGeneration int) {
+	// Renew at 80% of the default lease duration to stay well ahead of
+	// expiry. The store's RenewLease checks that the lease is still
+	// valid before extending.
+	renewalInterval := defaultLeaseRenewalInterval
+	ticker := time.NewTicker(renewalInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := e.store.RenewLease(ctx, executionID, leaseToken, leaseGeneration, defaultLeaseRenewalDuration); err != nil {
+				// Lease renewal failed — the lease may have expired,
+				// been taken over, or the record advanced. Log and
+				// stop renewing. The provider call continues; if it
+				// succeeds, Finalize will fail-closed on the stale lease.
+				return
+			}
+		}
+	}
+}
+
+// defaultLeaseRenewalInterval is the interval at which the lease heartbeat
+// attempts renewal. It is set to 4 minutes, which is 80% of the default
+// 5-minute lease duration, providing a comfortable margin before expiry.
+const defaultLeaseRenewalInterval = 4 * time.Minute
+
+// defaultLeaseRenewalDuration is the duration for which each renewal
+// extends the lease. It matches the default lease duration of 5 minutes.
+const defaultLeaseRenewalDuration = 5 * time.Minute

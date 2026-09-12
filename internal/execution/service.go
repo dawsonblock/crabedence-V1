@@ -59,6 +59,15 @@ type Response struct {
 	Error       string          `json:"error,omitempty"`
 	Evidence    *EvidenceRef    `json:"evidence,omitempty"`
 	Execution   *ExecutionMeta  `json:"execution,omitempty"`
+
+	// DefinitiveFailure indicates that a FAILED response is a
+	// definitive failure — the handler can prove no external side
+	// effect occurred. This is required for a FAILED response after
+	// the dispatch boundary (IN_FLIGHT) to be persisted as StateFailed
+	// rather than StateUnknown. If false (the default), a FAILED
+	// response after dispatch is treated as UNKNOWN (post-dispatch
+	// uncertainty) per the durable execution contract §6.
+	DefinitiveFailure bool `json:"definitive_failure,omitempty"`
 }
 
 // EvidenceRef is the evidence reference returned to the caller.

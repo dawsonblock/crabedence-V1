@@ -1201,6 +1201,7 @@ type ReserveResult struct {
 	Acquired   bool    `json:"acquired"`
 	Conflict   bool    `json:"conflict"`
 	LeaseToken string  `json:"lease_token,omitempty"`
+	Generation int     `json:"generation,omitempty"`
 }
 
 // DefaultLeaseDuration is the default lease duration for new reservations.
@@ -1229,6 +1230,7 @@ func (s *Store) ReserveWithLease(ctx context.Context, key, principal, capability
 		Acquired:   result.Acquired(),
 		Conflict:   result.Kind == IdempotencyConflict,
 		LeaseToken: result.LeaseToken,
+		Generation: result.Generation,
 	}, nil
 }
 
