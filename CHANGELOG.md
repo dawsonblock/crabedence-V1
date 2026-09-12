@@ -48,6 +48,10 @@
 - Tests: transition matrix coverage, UUID generation validity/uniqueness, `RenewLease` monotonicity, recovery locator persistence, CRITICAL `RecoveryFailed` proof requirements, stored provider metadata replay, and live worker+PG reconciliation.
 - Reconciliation: dedicated `effect-fabric-reconciliation` release gate added; `internal/reconcile` included in `effect-fabric-race`.
 - Execution: `RecoveryUnknown` CAS now checks `RowsAffected` — stale CAS returns `LeaseStateConflict` instead of silent success.
+- Execution: legacy `Reserve`/`TransitionState`/`FinalizeLegacy`/`RenewLeaseLegacy` wrappers removed — all callers migrated to the typed `Acquire`/`BeginExecution`/`MarkInFlight`/`Finalize`/`RenewLease` API. Illegal transitions are now structurally impossible outside the store's `legalTransitions` matrix.
+- Execution: deprecated state aliases `StateReserved`/`StateDispatching`/`StateSucceeded`/`StateReconciliationRequired` removed — canonical names are `StatePrepared`/`StateExecuting`/`StateCommitted`/`StateUnknown`.
+- Execution: `CounterHandler.Resolve` sets `ReceiptVersion=3` and computes a SHA-256 `EvidenceDigest` — recovery receipts now carry the same proof schema as normal finalization.
+- Execution: `canonicalizeJSON` rejects trailing data after the first JSON value — malformed input no longer silently canonicalizes.
 - Execution: CRITICAL recovery proof is class-aware — `RecoveryCommitted` for CRITICAL executions requires valid SHA-256 evidence digest, receipt v3, provider_id, and provider_run_id (equal to normal CRITICAL finalization).
 - Execution: `SetStateWithVersion` removed — no unfenced state mutations remain.
 - Execution: DENIED after dispatch boundary (IN_FLIGHT) mapped to UNKNOWN — DENIED is pre-dispatch admission only.

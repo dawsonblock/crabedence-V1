@@ -2,6 +2,7 @@ package execution
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"sync"
@@ -134,11 +135,17 @@ func (h *CounterHandler) Resolve(ctx context.Context, rec *idempotency.Record) (
 		"value":   value,
 		"by":      locator.Arguments.By,
 	})
+	// Compute a deterministic evidence digest from the result so the
+	// recovery receipt carries the same proof schema as a normal
+	// finalization (receipt_version=3, non-empty evidence digest).
+	evidenceDigest := fmt.Sprintf("%x", sha256.Sum256(result))
 	return idempotency.RecoveryResult{
-		Decision:      idempotency.RecoveryCommitted,
-		Result:        result,
-		ProviderID:    "test-counter",
-		ProviderRunID: fmt.Sprintf("counter-recovered-%s", counterName),
+		Decision:       idempotency.RecoveryCommitted,
+		Result:         result,
+		EvidenceDigest: evidenceDigest,
+		ReceiptVersion: 3,
+		ProviderID:     "test-counter",
+		ProviderRunID:  fmt.Sprintf("counter-recovered-%s", counterName),
 	}, nil
 }
 

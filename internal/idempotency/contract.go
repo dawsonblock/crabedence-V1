@@ -267,6 +267,11 @@ func canonicalizeJSON(raw json.RawMessage) (json.RawMessage, error) {
 	if err := dec.Decode(&v); err != nil {
 		return nil, err
 	}
+	// Verify complete consumption — trailing data after the first
+	// JSON value means the input is malformed.
+	if dec.More() {
+		return nil, fmt.Errorf("invalid JSON: trailing data after first value")
+	}
 	return json.Marshal(v)
 }
 
@@ -312,14 +317,3 @@ type Ctx interface {
 //
 // These map old state names to new ones for any code that has not yet
 // been migrated. New code must use the canonical names above.
-
-const (
-	// Deprecated: use StatePrepared
-	StateReserved State = "PREPARED"
-	// Deprecated: use StateExecuting
-	StateDispatching State = "EXECUTING"
-	// Deprecated: use StateCommitted
-	StateSucceeded State = "COMMITTED"
-	// Deprecated: UNKNOWN replaces RECONCILIATION_REQUIRED
-	StateReconciliationRequired State = "UNKNOWN"
-)

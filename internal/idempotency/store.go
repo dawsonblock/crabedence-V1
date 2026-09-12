@@ -1355,99 +1355,11 @@ func scanRecordsWithReconcile(rows *sql.Rows) ([]*Record, error) {
 	return records, rows.Err()
 }
 
-// ─── Backward-compatible wrappers ────────────────────────────────────
-//
-// These wrap the new contract methods with the old API to minimize
-// caller changes during migration. New code should use the typed API.
-
-// ReserveResult is the legacy outcome of a reservation attempt.
-type ReserveResult struct {
-	State      State   `json:"state"`
-	Record     *Record `json:"record,omitempty"`
-	Acquired   bool    `json:"acquired"`
-	Conflict   bool    `json:"conflict"`
-	LeaseToken string  `json:"lease_token,omitempty"`
-	Generation int     `json:"generation,omitempty"`
-}
-
 // DefaultLeaseDuration is the default lease duration for new reservations.
 const DefaultLeaseDuration = 5 * time.Minute
 
-// Reserve atomically reserves an execution request (legacy wrapper).
-// Uses the store's configured DefaultDuration rather than the package-level
-// DefaultLeaseDuration constant.
-func (s *Store) Reserve(ctx context.Context, key, principal, capability, digest, grantID, class string) (*ReserveResult, error) {
-	duration := s.leaseCfg.DefaultDuration
-	if duration <= 0 {
-		duration = DefaultLeaseDuration
-	}
-	return s.ReserveWithLease(ctx, key, principal, capability, digest, grantID, class, duration)
-}
-
-// ReserveWithLease is Reserve with a configurable lease duration (legacy wrapper).
-func (s *Store) ReserveWithLease(ctx context.Context, key, principal, capability, digest, grantID, class string, leaseDuration time.Duration) (*ReserveResult, error) {
-	result, err := s.Acquire(ctx, key, principal, capability, digest, grantID, class, leaseDuration)
-	if err != nil {
-		return nil, err
-	}
-	return &ReserveResult{
-		State:      result.State,
-		Record:     result.Record,
-		Acquired:   result.Acquired(),
-		Conflict:   result.Kind == IdempotencyConflict,
-		LeaseToken: result.LeaseToken,
-		Generation: result.Generation,
-	}, nil
-}
-
-// TransitionState performs a non-terminal state transition (legacy wrapper).
-// Maps old state names to new ones.
-func (s *Store) TransitionState(ctx context.Context, executionID, leaseToken string, expectedState, newState State) error {
-	// Map legacy state names.
-	expectedState = migrateState(expectedState)
-	newState = migrateState(newState)
-	// Look up the generation from the record.
-	rec, err := s.Lookup(ctx, executionID)
-	if err != nil {
-		return err
-	}
-	return s.leaseFencedTransition(ctx, executionID, leaseToken, rec.LeaseGeneration, expectedState, newState)
-}
-
-// FinalizeLegacy atomically finalizes an execution (legacy wrapper).
-// Maps old state names and constructs a TerminalReceipt from loose fields.
-// New code should use Finalize with a TerminalReceipt directly.
-func (s *Store) FinalizeLegacy(ctx context.Context, executionID, leaseToken string, expectedState, newState State, result json.RawMessage, evidenceDigest string, receiptVersion int) error {
-	expectedState = migrateState(expectedState)
-	newState = migrateState(newState)
-	rec, err := s.Lookup(ctx, executionID)
-	if err != nil {
-		return fmt.Errorf("finalize lookup failed: %w", err)
-	}
-	receipt := TerminalReceipt{
-		ExecutionID:     executionID,
-		Capability:      rec.CapabilityID,
-		Principal:       rec.PrincipalID,
-		RequestDigest:   rec.RequestDigest,
-		TerminalStatus:  newState,
-		CanonicalResult: result,
-		EvidenceDigest:  evidenceDigest,
-		ReceiptVersion:  receiptVersion,
-	}
-	return s.Finalize(ctx, executionID, leaseToken, rec.LeaseGeneration, expectedState, receipt)
-}
-
-// RenewLeaseLegacy extends the lease for the current holder (legacy wrapper).
-// Looks up the generation from the record. New code should pass generation explicitly.
-func (s *Store) RenewLeaseLegacy(ctx context.Context, executionID, leaseToken string, duration time.Duration) error {
-	rec, err := s.Lookup(ctx, executionID)
-	if err != nil {
-		return err
-	}
-	return s.RenewLease(ctx, executionID, leaseToken, rec.LeaseGeneration, duration)
-}
-
 // migrateState maps legacy state names to the new vocabulary.
+// Used only by migrateStateNames for database migration of existing rows.
 func migrateState(s State) State {
 	switch s {
 	case "RESERVED":

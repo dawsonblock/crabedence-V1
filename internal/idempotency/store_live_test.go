@@ -22,6 +22,68 @@ import (
 //
 // The tests are skipped when the environment variable is absent.
 
+// ─── Test helpers ────────────────────────────────────────────────────────────
+// These helpers adapt the typed API for tests written against the legacy
+// Reserve/TransitionState/FinalizeLegacy signatures. They look up the lease
+// generation internally, matching the legacy wrapper behavior.
+
+// testReserve wraps Acquire with the default lease duration.
+func testReserve(store *Store, ctx context.Context, key, principal, capability, digest, grantID, class string) (*AcquireResult, error) {
+	return store.Acquire(ctx, key, principal, capability, digest, grantID, class, DefaultLeaseDuration)
+}
+
+// testReserveWithLease wraps Acquire with an explicit lease duration.
+func testReserveWithLease(store *Store, ctx context.Context, key, principal, capability, digest, grantID, class string, duration time.Duration) (*AcquireResult, error) {
+	return store.Acquire(ctx, key, principal, capability, digest, grantID, class, duration)
+}
+
+// testTransition performs a typed state transition, looking up the lease
+// generation from the store. Only the transitions used in tests are supported.
+func testTransition(store *Store, ctx context.Context, executionID, leaseToken string, expectedState, newState State) error {
+	rec, err := store.Lookup(ctx, executionID)
+	if err != nil {
+		return err
+	}
+	gen := rec.LeaseGeneration
+	switch {
+	case expectedState == StatePrepared && newState == StateExecuting:
+		return store.BeginExecution(ctx, executionID, leaseToken, gen)
+	case expectedState == StateExecuting && newState == StateInFlight:
+		return store.MarkInFlight(ctx, executionID, leaseToken, gen, "", nil)
+	default:
+		return fmt.Errorf("unsupported test transition %s → %s", expectedState, newState)
+	}
+}
+
+// testFinalize builds a TerminalReceipt and calls Finalize with the store's
+// current lease generation. TerminalStatus is mapped from the legacy name.
+func testFinalize(store *Store, ctx context.Context, executionID, leaseToken string, expectedState, terminalStatus State, result json.RawMessage, evidenceDigest string, receiptVersion int) error {
+	rec, err := store.Lookup(ctx, executionID)
+	if err != nil {
+		return err
+	}
+	receipt := TerminalReceipt{
+		ExecutionID:     executionID,
+		Capability:      rec.CapabilityID,
+		Principal:       rec.PrincipalID,
+		RequestDigest:   rec.RequestDigest,
+		TerminalStatus:  terminalStatus,
+		CanonicalResult: result,
+		EvidenceDigest:  evidenceDigest,
+		ReceiptVersion:  receiptVersion,
+	}
+	return store.Finalize(ctx, executionID, leaseToken, rec.LeaseGeneration, expectedState, receipt)
+}
+
+// testRenewLease looks up the generation and calls RenewLease.
+func testRenewLease(store *Store, ctx context.Context, executionID, leaseToken string, duration time.Duration) error {
+	rec, err := store.Lookup(ctx, executionID)
+	if err != nil {
+		return err
+	}
+	return store.RenewLease(ctx, executionID, leaseToken, rec.LeaseGeneration, duration)
+}
+
 func TestLiveStoreConcurrentReserveSingleExecution(t *testing.T) {
 	dbURL := os.Getenv("CRABBOX_TEST_DATABASE_URL")
 	if dbURL == "" {
@@ -65,33 +127,33 @@ func TestLiveStoreConcurrentReserveSingleExecution(t *testing.T) {
 			defer wg.Done()
 			<-start
 
-			reserve, err := store.Reserve(ctx, key, principal, capability, digest, grantID, class)
+			reserve, err := testReserve(store, ctx, key, principal, capability, digest, grantID, class)
 			if err != nil {
 				atomic.AddInt64(&errorCount, 1)
 				return
 			}
 
-			if reserve.Conflict {
+			if reserve.Kind == IdempotencyConflict {
 				atomic.AddInt64(&errorCount, 1)
 				return
 			}
 
-			if reserve.Acquired {
+			if reserve.Acquired() {
 				// This caller owns the reservation — only ONE caller should get this.
 				atomic.AddInt64(&acquiredCount, 1)
 
 				// Simulate the execution lifecycle.
 				// Transition RESERVED → DISPATCHING
-				if err := store.TransitionState(ctx, reserve.Record.ExecutionID, reserve.LeaseToken, StateReserved, StateDispatching); err != nil {
+				if err := testTransition(store, ctx, reserve.Record.ExecutionID, reserve.LeaseToken, StatePrepared, StateExecuting); err != nil {
 					t.Errorf("lease holder failed to transition to DISPATCHING: %v", err)
 				}
-				if err := store.TransitionState(ctx, reserve.Record.ExecutionID, reserve.LeaseToken, StateDispatching, StateInFlight); err != nil {
+				if err := testTransition(store, ctx, reserve.Record.ExecutionID, reserve.LeaseToken, StateExecuting, StateInFlight); err != nil {
 					t.Errorf("lease holder failed to transition to IN_FLIGHT: %v", err)
 				}
 
 				// Finalize with SUCCEEDED
 				result := []byte(`{"value":42}`)
-				if err := store.FinalizeLegacy(ctx, reserve.Record.ExecutionID, reserve.LeaseToken, StateInFlight, StateSucceeded, result, "evidencedigest000000000000000000000000000000000000000000000000000000123456", 3); err != nil {
+				if err := testFinalize(store, ctx, reserve.Record.ExecutionID, reserve.LeaseToken, StateInFlight, StateCommitted, result, "evidencedigest000000000000000000000000000000000000000000000000000000123456", 3); err != nil {
 					t.Errorf("lease holder failed to finalize: %v", err)
 				}
 			} else {
@@ -151,24 +213,24 @@ func TestLiveStoreSameKeyDifferentDigestConflict(t *testing.T) {
 	class := "MUTATION"
 
 	// First caller reserves with digest A.
-	reserve1, err := store.Reserve(ctx, key, principal, capability, "digest-A", grantID, class)
+	reserve1, err := testReserve(store, ctx, key, principal, capability, "digest-A", grantID, class)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reserve1.Acquired {
+	if !reserve1.Acquired() {
 		t.Fatal("first caller should acquire the reservation")
 	}
 
 	// Second caller uses the same key with a DIFFERENT digest.
-	reserve2, err := store.Reserve(ctx, key, principal, capability, "digest-B", grantID, class)
+	reserve2, err := testReserve(store, ctx, key, principal, capability, "digest-B", grantID, class)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if !reserve2.Conflict {
+	if reserve2.Kind != IdempotencyConflict {
 		t.Error("same key + different digest must produce CONFLICT")
 	}
-	if reserve2.Acquired {
+	if reserve2.Acquired() {
 		t.Error("conflicting caller must NOT acquire the reservation")
 	}
 
@@ -204,20 +266,20 @@ func TestLiveStoreLeaseExpiryReclaim(t *testing.T) {
 	class := "MUTATION"
 
 	// Caller A reserves with a very short lease (100ms).
-	reserveA, err := store.ReserveWithLease(ctx, key, principal, capability, digest, grantID, class, 100*time.Millisecond)
+	reserveA, err := testReserveWithLease(store, ctx, key, principal, capability, digest, grantID, class, 100*time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reserveA.Acquired {
+	if !reserveA.Acquired() {
 		t.Fatal("caller A should acquire with fresh key")
 	}
 
 	// Caller B tries immediately — should NOT acquire (lease still valid).
-	reserveB, err := store.ReserveWithLease(ctx, key, principal, capability, digest, grantID, class, time.Minute)
+	reserveB, err := testReserveWithLease(store, ctx, key, principal, capability, digest, grantID, class, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reserveB.Acquired {
+	if reserveB.Acquired() {
 		t.Error("caller B should NOT acquire while lease is valid")
 	}
 
@@ -225,28 +287,28 @@ func TestLiveStoreLeaseExpiryReclaim(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	// Caller C tries after expiry — SHOULD acquire via lease reclaim.
-	reserveC, err := store.ReserveWithLease(ctx, key, principal, capability, digest, grantID, class, time.Minute)
+	reserveC, err := testReserveWithLease(store, ctx, key, principal, capability, digest, grantID, class, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reserveC.Acquired {
+	if !reserveC.Acquired() {
 		t.Error("caller C should acquire after lease expiry")
 	}
 
 	// Caller A's old lease token should NOT be able to finalize.
-	err = store.FinalizeLegacy(ctx, reserveA.Record.ExecutionID, reserveA.LeaseToken, StateInFlight, StateSucceeded, nil, "", 3)
+	err = testFinalize(store, ctx, reserveA.Record.ExecutionID, reserveA.LeaseToken, StateInFlight, StateCommitted, nil, "", 3)
 	if err == nil {
 		t.Error("old lease holder (A) should NOT be able to finalize after lease takeover")
 	}
 
 	// Caller C (new lease holder) CAN finalize.
-	if err := store.TransitionState(ctx, reserveC.Record.ExecutionID, reserveC.LeaseToken, StateReserved, StateDispatching); err != nil {
+	if err := testTransition(store, ctx, reserveC.Record.ExecutionID, reserveC.LeaseToken, StatePrepared, StateExecuting); err != nil {
 		t.Errorf("new lease holder (C) failed to transition: %v", err)
 	}
-	if err := store.TransitionState(ctx, reserveC.Record.ExecutionID, reserveC.LeaseToken, StateDispatching, StateInFlight); err != nil {
+	if err := testTransition(store, ctx, reserveC.Record.ExecutionID, reserveC.LeaseToken, StateExecuting, StateInFlight); err != nil {
 		t.Errorf("new lease holder (C) failed to transition to IN_FLIGHT: %v", err)
 	}
-	err = store.FinalizeLegacy(ctx, reserveC.Record.ExecutionID, reserveC.LeaseToken, StateInFlight, StateSucceeded, []byte(`{"ok":true}`), "", 0)
+	err = testFinalize(store, ctx, reserveC.Record.ExecutionID, reserveC.LeaseToken, StateInFlight, StateCommitted, []byte(`{"ok":true}`), "", 0)
 	if err != nil {
 		t.Errorf("new lease holder (C) failed to finalize: %v", err)
 	}
@@ -283,41 +345,41 @@ func TestLiveStoreFinalizeConflict(t *testing.T) {
 	class := "MUTATION"
 
 	// Reserve and transition to DISPATCHING.
-	reserve, err := store.Reserve(ctx, key, principal, capability, digest, grantID, class)
+	reserve, err := testReserve(store, ctx, key, principal, capability, digest, grantID, class)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reserve.Acquired {
+	if !reserve.Acquired() {
 		t.Fatal("should acquire")
 	}
 	executionID := reserve.Record.ExecutionID
 	leaseToken := reserve.LeaseToken
 
-	if err := store.TransitionState(ctx, executionID, leaseToken, StateReserved, StateDispatching); err != nil {
+	if err := testTransition(store, ctx, executionID, leaseToken, StatePrepared, StateExecuting); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.TransitionState(ctx, executionID, leaseToken, StateDispatching, StateInFlight); err != nil {
+	if err := testTransition(store, ctx, executionID, leaseToken, StateExecuting, StateInFlight); err != nil {
 		t.Fatal(err)
 	}
 
 	// Finalize with SUCCEEDED and evidence digest X.
-	if err := store.FinalizeLegacy(ctx, executionID, leaseToken, StateInFlight, StateSucceeded, []byte(`{"result":"A"}`), "digest_X", 3); err != nil {
+	if err := testFinalize(store, ctx, executionID, leaseToken, StateInFlight, StateCommitted, []byte(`{"result":"A"}`), "digest_X", 3); err != nil {
 		t.Fatalf("first finalize failed: %v", err)
 	}
 
 	// Identical re-finalize — should be idempotent (no error).
-	if err := store.FinalizeLegacy(ctx, executionID, leaseToken, StateInFlight, StateSucceeded, []byte(`{"result":"A"}`), "digest_X", 3); err != nil {
+	if err := testFinalize(store, ctx, executionID, leaseToken, StateInFlight, StateCommitted, []byte(`{"result":"A"}`), "digest_X", 3); err != nil {
 		t.Errorf("identical re-finalize should be idempotent, got: %v", err)
 	}
 
 	// Conflicting finalize — different terminal state.
-	err = store.FinalizeLegacy(ctx, executionID, leaseToken, StateInFlight, StateFailed, []byte(`{"result":"B"}`), "", 0)
+	err = testFinalize(store, ctx, executionID, leaseToken, StateInFlight, StateFailed, []byte(`{"result":"B"}`), "", 0)
 	if err == nil {
 		t.Error("conflicting finalize (SUCCEEDED → FAILED) must be rejected")
 	}
 
 	// Conflicting finalize — same state but different evidence.
-	err = store.FinalizeLegacy(ctx, executionID, leaseToken, StateInFlight, StateSucceeded, []byte(`{"result":"B"}`), "digest_Y", 3)
+	err = testFinalize(store, ctx, executionID, leaseToken, StateInFlight, StateCommitted, []byte(`{"result":"B"}`), "digest_Y", 3)
 	if err == nil {
 		t.Error("conflicting finalize (different evidence) must be rejected")
 	}
@@ -327,7 +389,7 @@ func TestLiveStoreFinalizeConflict(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rec.State != StateSucceeded {
+	if rec.State != StateCommitted {
 		t.Errorf("state should still be SUCCEEDED, got %s", rec.State)
 	}
 	if rec.EvidenceDigest != "digest_X" {
@@ -361,7 +423,7 @@ func TestLiveStoreListExpiredLeases(t *testing.T) {
 	key := fmt.Sprintf("test-expired-%d", time.Now().UnixNano())
 
 	// Create a record with a short lease.
-	_, err = store.ReserveWithLease(ctx, key, "alice", "test.cap", "digest", "", "MUTATION", 50*time.Millisecond)
+	_, err = testReserveWithLease(store, ctx, key, "alice", "test.cap", "digest", "", "MUTATION", 50*time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -456,23 +518,23 @@ func TestLiveStoreLargeIntegerConflict(t *testing.T) {
 	}
 
 	// First caller reserves with digest A.
-	reserve1, err := store.Reserve(ctx, key, principal, capability, digestA, grantID, class)
+	reserve1, err := testReserve(store, ctx, key, principal, capability, digestA, grantID, class)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reserve1.Acquired {
+	if !reserve1.Acquired() {
 		t.Fatal("first caller should acquire")
 	}
 
 	// Second caller uses same key with digest B (different large integer).
-	reserve2, err := store.Reserve(ctx, key, principal, capability, digestB, grantID, class)
+	reserve2, err := testReserve(store, ctx, key, principal, capability, digestB, grantID, class)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reserve2.Conflict {
+	if reserve2.Kind != IdempotencyConflict {
 		t.Error("same key + different large integer digest must produce CONFLICT")
 	}
-	if reserve2.Acquired {
+	if reserve2.Acquired() {
 		t.Error("conflicting caller must NOT acquire")
 	}
 
@@ -512,14 +574,14 @@ func TestLiveStoreCrashInDispatchingRecovery(t *testing.T) {
 
 	// Caller A reserves with a short lease and transitions to DISPATCHING,
 	// then "crashes" (does not call the provider, does not finalize).
-	reserveA, err := store.ReserveWithLease(ctx, key, principal, capability, digest, grantID, class, 100*time.Millisecond)
+	reserveA, err := testReserveWithLease(store, ctx, key, principal, capability, digest, grantID, class, 100*time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reserveA.Acquired {
+	if !reserveA.Acquired() {
 		t.Fatal("caller A should acquire")
 	}
-	if err := store.TransitionState(ctx, reserveA.Record.ExecutionID, reserveA.LeaseToken, StateReserved, StateDispatching); err != nil {
+	if err := testTransition(store, ctx, reserveA.Record.ExecutionID, reserveA.LeaseToken, StatePrepared, StateExecuting); err != nil {
 		t.Fatalf("A failed to transition to DISPATCHING: %v", err)
 	}
 	// Simulate crash: no further action from caller A.
@@ -528,30 +590,30 @@ func TestLiveStoreCrashInDispatchingRecovery(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	// Caller B reclaims after expiry.
-	reserveB, err := store.ReserveWithLease(ctx, key, principal, capability, digest, grantID, class, time.Minute)
+	reserveB, err := testReserveWithLease(store, ctx, key, principal, capability, digest, grantID, class, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reserveB.Acquired {
+	if !reserveB.Acquired() {
 		t.Fatal("caller B should acquire after lease expiry (DISPATCHING crash recovery)")
 	}
 
 	// Caller A's old token cannot transition or finalize.
-	if err := store.TransitionState(ctx, reserveA.Record.ExecutionID, reserveA.LeaseToken, StateDispatching, StateInFlight); err == nil {
+	if err := testTransition(store, ctx, reserveA.Record.ExecutionID, reserveA.LeaseToken, StateExecuting, StateInFlight); err == nil {
 		t.Error("old lease holder (A) should NOT be able to transition after takeover")
 	}
-	if err := store.FinalizeLegacy(ctx, reserveA.Record.ExecutionID, reserveA.LeaseToken, StateInFlight, StateSucceeded, nil, "", 0); err == nil {
+	if err := testFinalize(store, ctx, reserveA.Record.ExecutionID, reserveA.LeaseToken, StateInFlight, StateCommitted, nil, "", 0); err == nil {
 		t.Error("old lease holder (A) should NOT be able to finalize after takeover")
 	}
 
 	// Caller B can complete the lifecycle.
-	if err := store.TransitionState(ctx, reserveB.Record.ExecutionID, reserveB.LeaseToken, StateReserved, StateDispatching); err != nil {
+	if err := testTransition(store, ctx, reserveB.Record.ExecutionID, reserveB.LeaseToken, StatePrepared, StateExecuting); err != nil {
 		t.Errorf("B failed to transition to DISPATCHING: %v", err)
 	}
-	if err := store.TransitionState(ctx, reserveB.Record.ExecutionID, reserveB.LeaseToken, StateDispatching, StateInFlight); err != nil {
+	if err := testTransition(store, ctx, reserveB.Record.ExecutionID, reserveB.LeaseToken, StateExecuting, StateInFlight); err != nil {
 		t.Errorf("B failed to transition to IN_FLIGHT: %v", err)
 	}
-	if err := store.FinalizeLegacy(ctx, reserveB.Record.ExecutionID, reserveB.LeaseToken, StateInFlight, StateSucceeded, []byte(`{"ok":true}`), "", 0); err != nil {
+	if err := testFinalize(store, ctx, reserveB.Record.ExecutionID, reserveB.LeaseToken, StateInFlight, StateCommitted, []byte(`{"ok":true}`), "", 0); err != nil {
 		t.Errorf("B failed to finalize: %v", err)
 	}
 
@@ -590,20 +652,20 @@ func TestLiveStoreCrashInFlightUnknown(t *testing.T) {
 
 	// Caller A reserves, transitions to DISPATCHING, then IN_FLIGHT,
 	// then "crashes" (provider accepted but no terminal result).
-	reserveA, err := store.ReserveWithLease(ctx, key, principal, capability, digest, grantID, class, 100*time.Millisecond)
+	reserveA, err := testReserveWithLease(store, ctx, key, principal, capability, digest, grantID, class, 100*time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reserveA.Acquired {
+	if !reserveA.Acquired() {
 		t.Fatal("caller A should acquire")
 	}
 	execID := reserveA.Record.ExecutionID
 	leaseToken := reserveA.LeaseToken
 
-	if err := store.TransitionState(ctx, execID, leaseToken, StateReserved, StateDispatching); err != nil {
+	if err := testTransition(store, ctx, execID, leaseToken, StatePrepared, StateExecuting); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.TransitionState(ctx, execID, leaseToken, StateDispatching, StateInFlight); err != nil {
+	if err := testTransition(store, ctx, execID, leaseToken, StateExecuting, StateInFlight); err != nil {
 		t.Fatal(err)
 	}
 	// Simulate crash after dispatch: no finalize.
@@ -637,11 +699,11 @@ func TestLiveStoreCrashInFlightUnknown(t *testing.T) {
 
 	// A new caller with the same key should see UNKNOWN (terminal),
 	// not acquire a new reservation.
-	reserveB, err := store.ReserveWithLease(ctx, key, principal, capability, digest, grantID, class, time.Minute)
+	reserveB, err := testReserveWithLease(store, ctx, key, principal, capability, digest, grantID, class, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reserveB.Acquired {
+	if reserveB.Acquired() {
 		t.Error("new caller should NOT acquire when record is UNKNOWN (may have side-effected)")
 	}
 
@@ -678,11 +740,11 @@ func TestLiveStoreLeaseRenewalByOldTokenRejected(t *testing.T) {
 	class := "MUTATION"
 
 	// Caller A reserves with a short lease.
-	reserveA, err := store.ReserveWithLease(ctx, key, principal, capability, digest, grantID, class, 100*time.Millisecond)
+	reserveA, err := testReserveWithLease(store, ctx, key, principal, capability, digest, grantID, class, 100*time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reserveA.Acquired {
+	if !reserveA.Acquired() {
 		t.Fatal("caller A should acquire")
 	}
 	oldToken := reserveA.LeaseToken
@@ -691,22 +753,22 @@ func TestLiveStoreLeaseRenewalByOldTokenRejected(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	// Caller B takes over.
-	reserveB, err := store.ReserveWithLease(ctx, key, principal, capability, digest, grantID, class, time.Minute)
+	reserveB, err := testReserveWithLease(store, ctx, key, principal, capability, digest, grantID, class, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reserveB.Acquired {
+	if !reserveB.Acquired() {
 		t.Fatal("caller B should acquire after expiry")
 	}
 
 	// Caller A tries to renew with the old token — must be rejected.
-	err = store.RenewLeaseLegacy(ctx, reserveA.Record.ExecutionID, oldToken, time.Minute)
+	err = testRenewLease(store, ctx, reserveA.Record.ExecutionID, oldToken, time.Minute)
 	if err == nil {
 		t.Error("old lease holder (A) should NOT be able to renew after takeover")
 	}
 
 	// Caller B (current holder) CAN renew.
-	err = store.RenewLeaseLegacy(ctx, reserveB.Record.ExecutionID, reserveB.LeaseToken, time.Minute)
+	err = testRenewLease(store, ctx, reserveB.Record.ExecutionID, reserveB.LeaseToken, time.Minute)
 	if err != nil {
 		t.Errorf("current lease holder (B) should be able to renew: %v", err)
 	}
@@ -746,32 +808,32 @@ func TestLiveStoreRetryAfterInvalidEvidenceNoMagicV3(t *testing.T) {
 	class := "CRITICAL"
 
 	// Reserve and transition through the lifecycle.
-	reserve, err := store.Reserve(ctx, key, principal, capability, digest, grantID, class)
+	reserve, err := testReserve(store, ctx, key, principal, capability, digest, grantID, class)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reserve.Acquired {
+	if !reserve.Acquired() {
 		t.Fatal("should acquire")
 	}
 	execID := reserve.Record.ExecutionID
 	leaseToken := reserve.LeaseToken
 
-	if err := store.TransitionState(ctx, execID, leaseToken, StateReserved, StateDispatching); err != nil {
+	if err := testTransition(store, ctx, execID, leaseToken, StatePrepared, StateExecuting); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.TransitionState(ctx, execID, leaseToken, StateDispatching, StateInFlight); err != nil {
+	if err := testTransition(store, ctx, execID, leaseToken, StateExecuting, StateInFlight); err != nil {
 		t.Fatal(err)
 	}
 
 	// Finalize with FAILED (simulating: CRITICAL returned invalid V2
 	// evidence, kernel rejected it as FAILED).
-	if err := store.FinalizeLegacy(ctx, execID, leaseToken, StateInFlight, StateFailed, []byte(`{"error":"invalid evidence"}`), "", 0); err != nil {
+	if err := testFinalize(store, ctx, execID, leaseToken, StateInFlight, StateFailed, []byte(`{"error":"invalid evidence"}`), "", 0); err != nil {
 		t.Fatalf("first finalize failed: %v", err)
 	}
 
 	// Retry: attempt to finalize as SUCCEEDED with valid V3 evidence.
 	// This must be rejected — FAILED is terminal and immutable.
-	err = store.FinalizeLegacy(ctx, execID, leaseToken, StateInFlight, StateSucceeded, []byte(`{"ok":true}`), "valid_digest_000000000000000000000000000000000000000000000000000000123456", 3)
+	err = testFinalize(store, ctx, execID, leaseToken, StateInFlight, StateCommitted, []byte(`{"ok":true}`), "valid_digest_000000000000000000000000000000000000000000000000000000123456", 3)
 	if err == nil {
 		t.Error("retry with V3 evidence must NOT overwrite terminal FAILED state")
 	}
@@ -819,7 +881,7 @@ func TestLiveStoreRecoveryWithProofOfCompletion(t *testing.T) {
 	class := "MUTATION"
 
 	// Create a record in UNKNOWN state (crashed after dispatch).
-	reserve, err := store.Reserve(ctx, key, principal, capability, digest, grantID, class)
+	reserve, err := testReserve(store, ctx, key, principal, capability, digest, grantID, class)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -892,7 +954,7 @@ func TestLiveStoreRecoveryWithProofOfFailure(t *testing.T) {
 	class := "MUTATION"
 
 	// Create a record in UNKNOWN state.
-	reserve, err := store.Reserve(ctx, key, principal, capability, digest, grantID, class)
+	reserve, err := testReserve(store, ctx, key, principal, capability, digest, grantID, class)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -963,7 +1025,7 @@ func TestLiveStoreRecoveryWithoutProofStaysUnknown(t *testing.T) {
 	class := "MUTATION"
 
 	// Create a record in UNKNOWN state via EnterRecovery (CAS).
-	reserve, err := store.Reserve(ctx, key, principal, capability, digest, grantID, class)
+	reserve, err := testReserve(store, ctx, key, principal, capability, digest, grantID, class)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -990,11 +1052,11 @@ func TestLiveStoreRecoveryWithoutProofStaysUnknown(t *testing.T) {
 
 	// A new caller with the same key should see UNKNOWN (terminal),
 	// not acquire a new reservation.
-	reserve2, err := store.Reserve(ctx, key, principal, capability, digest, grantID, class)
+	reserve2, err := testReserve(store, ctx, key, principal, capability, digest, grantID, class)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reserve2.Acquired {
+	if reserve2.Acquired() {
 		t.Error("new caller should NOT acquire when record is UNKNOWN — no retry by assumption")
 	}
 

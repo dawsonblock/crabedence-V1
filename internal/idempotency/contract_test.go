@@ -263,22 +263,6 @@ func TestAcquireResultKindValues(t *testing.T) {
 
 // ─── State name backward compatibility ────────────────────────────────
 
-func TestStateAliases(t *testing.T) {
-	// Legacy state names must map to the new vocabulary.
-	if StateReserved != StatePrepared {
-		t.Errorf("StateReserved = %s, want %s", StateReserved, StatePrepared)
-	}
-	if StateDispatching != StateExecuting {
-		t.Errorf("StateDispatching = %s, want %s", StateDispatching, StateExecuting)
-	}
-	if StateSucceeded != StateCommitted {
-		t.Errorf("StateSucceeded = %s, want %s", StateSucceeded, StateCommitted)
-	}
-	if StateReconciliationRequired != StateUnknown {
-		t.Errorf("StateReconciliationRequired = %s, want %s", StateReconciliationRequired, StateUnknown)
-	}
-}
-
 // ─── Clock interface ─────────────────────────────────────────────────
 
 func TestFixedClock(t *testing.T) {
