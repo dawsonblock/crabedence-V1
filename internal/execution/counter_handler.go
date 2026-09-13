@@ -12,23 +12,35 @@ import (
 	"github.com/openclaw/crabbox/internal/idempotency"
 )
 
-// counterExecution records one applied increment: the amount and the
-// provider run ID assigned at execution time. The run ID is preserved
-// so recovery can return the real external operation identity instead
-// of fabricating a replacement.
-type counterExecution struct {
-	amount int64
-	runID  string
+// CounterExecution records one applied increment with its full durable
+// execution identity. The provider run ID is preserved so recovery can
+// return the real external operation identity instead of fabricating a
+// replacement.
+type CounterExecution struct {
+	ExecutionID    string
+	PrincipalID    string
+	CapabilityID   string
+	IdempotencyKey string
+	Counter        string
+	Amount         int64
+	ProviderRunID  string
 }
 
 // counterExecutionKey scopes an applied increment to the durable
-// execution identity the store uses: (principal, idempotency_key) —
-// the same pair that, together with the capability this handler serves,
-// forms the store's uniqueness constraint. Keying by the bare
-// idempotency key is wrong: two different principals may reuse the same
-// key and are distinct durable executions.
-func counterExecutionKey(principal, idempotencyKey string) string {
-	return principal + "\x1f" + idempotencyKey
+// execution identity the store uses: (principal, capability,
+// idempotency_key) — the store's uniqueness constraint. Keying by the
+// bare idempotency key is wrong: different principals or capabilities
+// may reuse the same key and are distinct durable executions.
+func counterExecutionKey(principal, capability, idempotencyKey string) string {
+	return "pk:" + principal + "\x1f" + capability + "\x1f" + idempotencyKey
+}
+
+// counterTokenKey scopes an applied increment to the external operation
+// token persisted in the recovery locator — the strongest correlation,
+// since the token is derived from the durable execution_id and is the
+// same token used in the external request.
+func counterTokenKey(externalToken string) string {
+	return "tok:" + externalToken
 }
 
 // CounterHandler implements the test.counter.increment capability.
@@ -37,21 +49,23 @@ func counterExecutionKey(principal, idempotencyKey string) string {
 // 100 concurrent identical calls result in exactly one increment.
 //
 // For recovery, the handler tracks which executions incremented which
-// counters — keyed by (principal, idempotency_key) and storing the
-// applied amount plus the original run ID. This allows Resolve() to
-// prove "this specific execution caused the effect" and to return the
-// real provider run ID rather than a fabricated one.
+// counters — keyed by the locator's external token (derived from
+// execution_id) and by (principal, capability, idempotency_key) for
+// records that predate tokens — storing the applied amount plus the
+// original run ID. This allows Resolve() to prove "this specific
+// execution caused the effect" and to return the real provider run ID
+// rather than a fabricated one.
 type CounterHandler struct {
 	mu         sync.Mutex
 	counters   map[string]int64
-	executions map[string]map[string]counterExecution // counter → (principal,key) → execution
+	executions map[string]map[string]CounterExecution // counter → correlation key → execution
 }
 
 // NewCounterHandler creates a handler for test.counter.increment.
 func NewCounterHandler() *CounterHandler {
 	return &CounterHandler{
 		counters:   make(map[string]int64),
-		executions: make(map[string]map[string]counterExecution),
+		executions: make(map[string]map[string]CounterExecution),
 	}
 }
 
@@ -105,19 +119,30 @@ func (h *CounterHandler) Execute(ctx context.Context, req Request, desc capabili
 	}
 
 	// Increment the counter and record the execution identity that
-	// caused it: (principal, idempotency_key) → {amount, runID}. This
-	// matches the store's durable uniqueness scope — the bare key alone
-	// does not uniquely identify an execution across principals.
+	// caused it. The record is keyed under the external operation token
+	// (from the persisted recovery locator, derived from execution_id)
+	// when present, and always under (principal, capability,
+	// idempotency_key) — the store's durable uniqueness scope — so
+	// records written before tokens existed still resolve.
 	h.mu.Lock()
 	h.counters[args.Counter] += args.By
 	newValue := h.counters[args.Counter]
 	if h.executions[args.Counter] == nil {
-		h.executions[args.Counter] = make(map[string]counterExecution)
+		h.executions[args.Counter] = make(map[string]CounterExecution)
 	}
-	h.executions[args.Counter][counterExecutionKey(req.Authority.Principal, req.IdempotencyKey)] = counterExecution{
-		amount: args.By,
-		runID:  runID,
+	exec := CounterExecution{
+		PrincipalID:    req.Authority.Principal,
+		CapabilityID:   req.Capability,
+		IdempotencyKey: req.IdempotencyKey,
+		Counter:        args.Counter,
+		Amount:         args.By,
+		ProviderRunID:  runID,
 	}
+	if token := ExternalTokenFromContext(ctx); token != "" {
+		exec.ExecutionID = token // token encodes the execution identity
+		h.executions[args.Counter][counterTokenKey(token)] = exec
+	}
+	h.executions[args.Counter][counterExecutionKey(req.Authority.Principal, req.Capability, req.IdempotencyKey)] = exec
 	h.mu.Unlock()
 
 	result, _ := json.Marshal(map[string]any{
@@ -137,25 +162,32 @@ func (h *CounterHandler) Execute(ctx context.Context, req Request, desc capabili
 }
 
 // PrepareRecovery implements idempotency.RecoveryLocatorProvider. The
-// counter's recovery locator is minimal and normalized: it stores the
-// counter name and increment amount in the form actually executed
-// (semantic defaults applied), plus the durable execution identity —
-// never the raw argument blob.
-func (h *CounterHandler) PrepareRecovery(_ context.Context, in idempotency.RecoveryLocatorInput) (json.RawMessage, error) {
+// counter's recovery locator is minimal and normalized: a typed
+// RecoveryLocator carrying the external operation token (derived from
+// the durable execution_id — the same token DispatchExecutor injects
+// into the dispatch context for Execute) plus the normalized executed
+// parameters in Extensions. Never the raw argument blob.
+func (h *CounterHandler) PrepareRecovery(_ context.Context, in idempotency.RecoveryLocatorInput) (*idempotency.RecoveryLocator, error) {
 	args, err := normalizeCounterArgs(in.Arguments)
 	if err != nil {
 		return nil, fmt.Errorf("invalid arguments: %v", err)
 	}
-	return json.Marshal(map[string]any{
-		"v":               1,
-		"provider":        "test-counter",
-		"capability_id":   in.CapabilityID,
-		"execution_id":    in.ExecutionID,
-		"principal":       in.Principal,
-		"idempotency_key": in.IdempotencyKey,
-		"counter":         args.Counter,
-		"by":              args.By,
+	ext, _ := json.Marshal(map[string]any{
+		"counter": args.Counter,
+		"by":      args.By,
 	})
+	return &idempotency.RecoveryLocator{
+		Version:        1,
+		ProviderID:     "test-counter",
+		Strategy:       "external-token",
+		ExternalToken:  "ctr-op-" + in.ExecutionID,
+		RequestDigest:  in.RequestDigest,
+		ExecutionID:    in.ExecutionID,
+		PrincipalID:    in.Principal,
+		CapabilityID:   in.CapabilityID,
+		IdempotencyKey: in.IdempotencyKey,
+		Extensions:     ext,
+	}, nil
 }
 
 // Resolve implements idempotency.RecoveryResolver for the counter
@@ -174,28 +206,49 @@ func (h *CounterHandler) PrepareRecovery(_ context.Context, in idempotency.Recov
 // FAILED (the counter may have existed before the crash).
 // RecoveryFailed is not possible for in-memory providers.
 func (h *CounterHandler) Resolve(ctx context.Context, rec *idempotency.Record) (idempotency.RecoveryResult, error) {
-	// Parse the recovery locator. The provider-owned locator stores
-	// counter/by at top level; the legacy generic locator nested them
-	// under "arguments". Support both for records written before the
-	// provider-owned path existed.
+	// Parse the recovery locator. The typed provider-owned locator
+	// carries the external token and normalized params in Extensions;
+	// legacy locators stored counter/by at top level or nested under
+	// "arguments". Support all for records written before the typed
+	// path existed.
 	counterName := ""
 	var by int64
+	externalToken := ""
 	if len(rec.RecoveryLocator) > 0 {
-		var loc struct {
+		var loc idempotency.RecoveryLocator
+		if err := json.Unmarshal(rec.RecoveryLocator, &loc); err == nil {
+			externalToken = loc.ExternalToken
+			if len(loc.Extensions) > 0 {
+				var ext struct {
+					Counter string `json:"counter"`
+					By      int64  `json:"by"`
+				}
+				if err := json.Unmarshal(loc.Extensions, &ext); err == nil {
+					counterName = ext.Counter
+					by = ext.By
+				}
+			}
+		}
+		// Legacy formats.
+		var legacy struct {
 			Counter   string          `json:"counter"`
 			By        int64           `json:"by"`
 			Arguments json.RawMessage `json:"arguments"`
 		}
-		if err := json.Unmarshal(rec.RecoveryLocator, &loc); err == nil {
-			counterName = loc.Counter
-			by = loc.By
-			if len(loc.Arguments) > 0 {
+		if err := json.Unmarshal(rec.RecoveryLocator, &legacy); err == nil {
+			if counterName == "" {
+				counterName = legacy.Counter
+			}
+			if by == 0 {
+				by = legacy.By
+			}
+			if len(legacy.Arguments) > 0 {
 				var args counterArgs
-				if err := json.Unmarshal(loc.Arguments, &args); err == nil {
-					if args.Counter != "" {
+				if err := json.Unmarshal(legacy.Arguments, &args); err == nil {
+					if args.Counter != "" && counterName == "" {
 						counterName = args.Counter
 					}
-					if args.By != 0 {
+					if args.By != 0 && by == 0 {
 						by = args.By
 					}
 				}
@@ -210,7 +263,25 @@ func (h *CounterHandler) Resolve(ctx context.Context, rec *idempotency.Record) (
 	}
 
 	h.mu.Lock()
-	exec, wasExecuted := h.executions[counterName][counterExecutionKey(rec.PrincipalID, rec.IdempotencyKey)]
+	// Strongest correlation first: the external token bound to the
+	// durable execution_id. Fall back to (principal, capability,
+	// idempotency_key) for pre-token records.
+	var exec CounterExecution
+	wasExecuted := false
+	if externalToken != "" {
+		exec, wasExecuted = h.executions[counterName][counterTokenKey(externalToken)]
+		if wasExecuted && (exec.PrincipalID != rec.PrincipalID ||
+			exec.CapabilityID != rec.CapabilityID ||
+			exec.IdempotencyKey != rec.IdempotencyKey) {
+			// The token resolves to an execution whose durable
+			// identity contradicts this record — a grafted or stale
+			// locator, not proof for this record.
+			wasExecuted = false
+		}
+	}
+	if !wasExecuted {
+		exec, wasExecuted = h.executions[counterName][counterExecutionKey(rec.PrincipalID, rec.CapabilityID, rec.IdempotencyKey)]
+	}
 	value := h.counters[counterName]
 	h.mu.Unlock()
 
@@ -227,7 +298,7 @@ func (h *CounterHandler) Resolve(ctx context.Context, rec *idempotency.Record) (
 	// This execution provably incremented the counter. The recorded
 	// amount must match the recovery parameters — a mismatch means the
 	// locator does not describe the recorded effect.
-	if exec.amount != by {
+	if exec.Amount != by {
 		return idempotency.RecoveryResult{
 			Decision: idempotency.RecoveryUnknown,
 		}, nil
@@ -247,7 +318,7 @@ func (h *CounterHandler) Resolve(ctx context.Context, rec *idempotency.Record) (
 		ProviderID:     "test-counter",
 		// Return the original provider run ID recorded at execution
 		// time — never a fabricated replacement.
-		ProviderRunID: exec.runID,
+		ProviderRunID: exec.ProviderRunID,
 	}, nil
 }
 

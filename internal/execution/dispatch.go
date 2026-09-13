@@ -40,6 +40,14 @@ type DispatchExecutor struct {
 	signer   *evidence.Signer
 	mu       sync.Mutex
 	inFlight map[string]context.CancelFunc
+	// preFinalizeHook, when set, runs after the terminal decision and
+	// before Finalize — a test seam for simulating slow evidence
+	// verification while the lease heartbeat must keep the lease alive.
+	preFinalizeHook func()
+	// postDispatchHook, when set, runs immediately after the provider
+	// returns and before the observation is persisted — a test seam for
+	// simulating a crash inside the observation window.
+	postDispatchHook func()
 }
 
 // NewDispatchExecutor creates a new dispatch executor with durable idempotency.
@@ -195,7 +203,23 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 			Error:       fmt.Sprintf("failed to prepare recovery locator: %v", err),
 		}
 	}
-	if err := e.store.MarkInFlight(ctx, executionID, leaseToken, leaseGen, desc.AdapterID, recoveryLocator); err != nil {
+	locatorRaw, err := json.Marshal(recoveryLocator)
+	if err != nil {
+		return Response{
+			Status:      StatusFailed,
+			FailureCode: string(capability.FailureInternalError),
+			Error:       fmt.Sprintf("failed to marshal recovery locator: %v", err),
+		}
+	}
+	if len(locatorRaw) > idempotency.MaxRecoveryLocatorBytes {
+		return Response{
+			Status:      StatusFailed,
+			FailureCode: string(capability.FailureInternalError),
+			Error: fmt.Sprintf("recovery locator exceeds %d bytes (got %d)",
+				idempotency.MaxRecoveryLocatorBytes, len(locatorRaw)),
+		}
+	}
+	if err := e.store.MarkInFlight(ctx, executionID, leaseToken, leaseGen, desc.AdapterID, locatorRaw); err != nil {
 		return Response{
 			Status:      StatusFailed,
 			FailureCode: string(capability.FailureInternalError),
@@ -214,7 +238,14 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 
 	// Dispatch — from this point, we are POST_DISPATCH.
 	// Any failure after this point is UNKNOWN (may have executed).
-	resp := e.dispatch(ctx, req, desc)
+	// The external token persisted in the recovery locator is injected
+	// into the dispatch context so the provider uses the SAME token in
+	// the external request — the stable external operation identity.
+	dispatchCtx := ctx
+	if recoveryLocator.ExternalToken != "" {
+		dispatchCtx = context.WithValue(ctx, externalTokenKey{}, recoveryLocator.ExternalToken)
+	}
+	resp := e.dispatch(dispatchCtx, req, desc)
 
 	// ─── DURABLE PROVIDER OBSERVATION ────────────────────────────────────
 	// Persist the provider's response metadata BEFORE any terminal
@@ -224,7 +255,15 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	// does not depend on winning another state-transition race.
 	// RecordProviderObservation accepts both the fenced IN_FLIGHT write
 	// and the already-UNKNOWN update.
-	obsErr := e.recordObservation(ctx, executionID, leaseToken, leaseGen, resp, desc)
+	//
+	// providerResp preserves the raw provider response — the classifier
+	// may rewrite resp to an UNKNOWN wire response, but the durable
+	// observation must always carry what the provider actually said.
+	providerResp := resp
+	if e.postDispatchHook != nil {
+		e.postDispatchHook()
+	}
+	obsErr := e.recordObservation(ctx, executionID, leaseToken, leaseGen, providerResp, desc)
 
 	// The heartbeat stays alive through finalization — the lease must
 	// remain valid while we validate evidence, construct the receipt,
@@ -232,75 +271,8 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	// a window where the lease expires between provider return and
 	// Finalize.
 
-	// ─── CRITICAL EVIDENCE VALIDATION BEFORE PERSISTENCE ──────────────────
-	// The evidence contract MUST be validated BEFORE the terminal state
-	// is persisted. Persisting SUCCEEDED with invalid evidence would
-	// create a poisoned record that replays invalid evidence on retry.
-	//
-	// CRITICAL: if evidence validation fails AFTER the dispatch boundary
-	// has been crossed (IN_FLIGHT is already persisted), the result is
-	// UNKNOWN — not FAILED. The provider may have executed the side
-	// effect. Returning FAILED would allow a blind retry. Per the
-	// durable execution contract §6: "provider says success + required
-	// evidence invalid/missing → UNKNOWN / EVIDENCE_INVALID →
-	// reconciliation required."
-	if desc.ExecutionClass.RequiresEvidence() && resp.Status == StatusSucceeded {
-		if resp.Evidence == nil || resp.Evidence.Digest == "" {
-			resp = Response{
-				Status:      StatusUnknown,
-				FailureCode: string(capability.FailureExecutionUnknown),
-				Error:       "CRITICAL capability returned SUCCEEDED without evidence digest (post-dispatch uncertainty)",
-				Execution:   resp.Execution,
-			}
-		} else if !isValidEvidenceDigest(resp.Evidence.Digest) {
-			resp = Response{
-				Status:      StatusUnknown,
-				FailureCode: string(capability.FailureExecutionUnknown),
-				Error:       "CRITICAL capability returned invalid evidence digest (post-dispatch uncertainty)",
-				Execution:   resp.Execution,
-			}
-		} else if resp.Evidence.ReceiptVersion != 3 {
-			resp = Response{
-				Status:      StatusUnknown,
-				FailureCode: string(capability.FailureExecutionUnknown),
-				Error:       fmt.Sprintf("CRITICAL capability returned receipt_version %d (must be 3, post-dispatch uncertainty)", resp.Evidence.ReceiptVersion),
-				Execution:   resp.Execution,
-			}
-		} else if resp.Execution == nil || resp.Execution.RunID == "" {
-			resp = Response{
-				Status:      StatusUnknown,
-				FailureCode: string(capability.FailureExecutionUnknown),
-				Error:       "CRITICAL capability returned SUCCEEDED without run_id (post-dispatch uncertainty)",
-			}
-		}
-	}
-
-	// ─── DETERMINE TERMINAL STATE ──────────────────────────────────────────
-	// P1 #5: DENIED is a pre-dispatch admission concept. After the
-	// dispatch boundary (IN_FLIGHT has been persisted), a handler
-	// returning StatusDenied cannot prove no side effect occurred.
-	// Map it to UNKNOWN for reconciliation, not DENIED.
-	var state idempotency.State
-	switch resp.Status {
-	case StatusSucceeded:
-		state = idempotency.StateCommitted
-	case StatusFailed:
-		if resp.DefinitiveFailure {
-			state = idempotency.StateFailed
-		} else {
-			// Post-dispatch uncertainty: the handler returned FAILED
-			// but cannot prove no side effect occurred. Per the
-			// durable execution contract §6, this is UNKNOWN.
-			state = idempotency.StateUnknown
-		}
-	case StatusDenied:
-		// DENIED after dispatch is semantically incorrect — the
-		// dispatch boundary was already crossed. Treat as UNKNOWN
-		// since we cannot prove the provider didn't act.
-		state = idempotency.StateUnknown
-	default:
-		state = idempotency.StateUnknown
-	}
+	// ─── TERMINAL DECISION — single post-dispatch decision table ─────────
+	state, resp := classifyPostDispatch(providerResp, desc)
 
 	evidenceDigest := ""
 	receiptVersion := 0
@@ -320,9 +292,9 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	// finalize as FAILED. The side effect may have occurred.
 	if state == idempotency.StateUnknown {
 		// Post-dispatch uncertainty — enter recovery carrying the
-		// provider observation (already persisted above; the atomic
-		// transition also writes it). Do not finalize.
-		recErr := e.enterRecoveryWithObservation(ctx, executionID, resp, desc)
+		// ORIGINAL provider observation (already persisted above; the
+		// atomic transition also writes it). Do not finalize.
+		recErr := e.enterRecoveryWithObservation(ctx, executionID, providerResp, desc)
 		errMsg := "post-dispatch ambiguity: entered recovery (side effect may have occurred)"
 		if recErr != nil {
 			errMsg = fmt.Sprintf("post-dispatch ambiguity: %v", recErr)
@@ -354,13 +326,25 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		providerID = desc.AdapterID
 	}
 
+	// The unified terminal policy requires every definitive outcome to
+	// carry proof — an evidence digest or a result payload. A definitive
+	// failure without a provider result is recorded as an error payload
+	// so the receipt is never empty.
+	canonicalResult := resp.Result
+	if len(canonicalResult) == 0 && state == idempotency.StateFailed {
+		canonicalResult, _ = json.Marshal(map[string]string{
+			"error":        resp.Error,
+			"failure_code": resp.FailureCode,
+		})
+	}
+
 	receipt := idempotency.TerminalReceipt{
 		ExecutionID:     executionID,
 		Capability:      req.Capability,
 		Principal:       req.Authority.Principal,
 		RequestDigest:   digest,
 		TerminalStatus:  state,
-		CanonicalResult: resp.Result,
+		CanonicalResult: canonicalResult,
 		ProviderID:      providerID,
 		ProviderRunID:   providerRunID,
 		EvidenceDigest:  evidenceDigest,
@@ -374,6 +358,13 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	// unsigned digest is not proof. Without a configured signer the
 	// receipt stays unsigned and the store fails closed below.
 	if desc.ExecutionClass == capability.ClassCritical && e.signer != nil {
+		// The signed outcome is the semantic attestation about the
+		// external world, not the state name: COMMITTED requires
+		// COMPLETED proof; FAILED requires NO_EFFECT proof.
+		outcome := evidence.OutcomeCompleted
+		if state == idempotency.StateFailed {
+			outcome = evidence.OutcomeNoEffect
+		}
 		signed, signErr := e.signer.Sign(evidence.Binding{
 			ExecutionID:    executionID,
 			Capability:     req.Capability,
@@ -381,13 +372,13 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 			RequestDigest:  digest,
 			ProviderID:     providerID,
 			ProviderRunID:  providerRunID,
-			Outcome:        string(state),
+			Outcome:        outcome,
 			EvidenceSHA256: evidenceDigest,
 		})
 		if signErr != nil {
 			// Cannot produce the required proof — treat as post-dispatch
 			// uncertainty, not a terminal outcome.
-			recErr := e.enterRecoveryWithObservation(ctx, executionID, resp, desc)
+			recErr := e.enterRecoveryWithObservation(ctx, executionID, providerResp, desc)
 			errMsg := fmt.Sprintf("failed to sign CRITICAL evidence receipt: %v", signErr)
 			if recErr != nil {
 				errMsg += fmt.Sprintf("; %v", recErr)
@@ -419,13 +410,16 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		}
 	}
 
+	if e.preFinalizeHook != nil {
+		e.preFinalizeHook()
+	}
 	if err := e.store.Finalize(ctx, executionID, leaseToken, rec.LeaseGeneration, idempotency.StateInFlight, receipt); err != nil {
 		// Finalization failed AFTER dispatch — the side effect may
 		// have occurred. The provider observation was already persisted
 		// durably right after the provider returned; the recovery
 		// transition below also writes it atomically. Report persistence
 		// honestly — never claim the observation was stored if it wasn't.
-		recErr := e.enterRecoveryWithObservation(ctx, executionID, resp, desc)
+		recErr := e.enterRecoveryWithObservation(ctx, executionID, providerResp, desc)
 		errMsg := fmt.Sprintf("failed to finalize execution after dispatch: %v", err)
 		if recErr == nil {
 			errMsg += " (provider observation persisted)"
@@ -480,14 +474,77 @@ func (e *DispatchExecutor) dispatch(ctx context.Context, req Request, desc capab
 	return resp
 }
 
-// recordObservation durably records the provider's response metadata
-// via Store.RecordProviderObservation. Returns nil when nothing needs
-// recording (empty observation) or when the write succeeds; returns the
-// store error otherwise so callers can report persistence honestly.
-func (e *DispatchExecutor) recordObservation(ctx context.Context, executionID, leaseToken string, leaseGen int, resp Response, desc capability.ResolvedDescriptor) error {
+// classifyPostDispatch is the single post-dispatch decision table.
+// Every provider response maps to exactly one durable decision:
+//
+//	Provider result                    Durable decision
+//	───────────────────────────────    ───────────────
+//	SUCCEEDED (evidence valid)         COMMITTED
+//	SUCCEEDED, CRITICAL evidence
+//	  missing/invalid/mismatched       UNKNOWN
+//	FAILED + DefinitiveFailure         FAILED
+//	FAILED (not definitive)            UNKNOWN
+//	DENIED after dispatch              UNKNOWN
+//	anything else                      UNKNOWN
+//
+// DENIED is a pre-dispatch admission concept: after IN_FLIGHT has been
+// persisted the handler cannot prove no side effect occurred, so it maps
+// to UNKNOWN for reconciliation — never to a terminal failure that would
+// permit a blind retry.
+//
+// The returned Response may be rewritten to an UNKNOWN wire response
+// when the provider's answer cannot be trusted; the caller must keep the
+// original response for observation persistence.
+func classifyPostDispatch(resp Response, desc capability.ResolvedDescriptor) (idempotency.State, Response) {
+	unknown := func(reason string) (idempotency.State, Response) {
+		return idempotency.StateUnknown, Response{
+			Status:      StatusUnknown,
+			FailureCode: string(capability.FailureExecutionUnknown),
+			Error:       reason,
+			Execution:   resp.Execution,
+		}
+	}
+
+	// CRITICAL evidence contract — validated before the terminal state
+	// is persisted. Persisting SUCCEEDED with invalid evidence would
+	// create a poisoned record that replays invalid evidence on retry.
+	// Per the durable execution contract: "provider says success +
+	// required evidence invalid/missing → UNKNOWN → reconciliation."
+	if desc.ExecutionClass.RequiresEvidence() && resp.Status == StatusSucceeded {
+		switch {
+		case resp.Evidence == nil || resp.Evidence.Digest == "":
+			return unknown("CRITICAL capability returned SUCCEEDED without evidence digest (post-dispatch uncertainty)")
+		case !isValidEvidenceDigest(resp.Evidence.Digest):
+			return unknown("CRITICAL capability returned invalid evidence digest (post-dispatch uncertainty)")
+		case resp.Evidence.ReceiptVersion != 3:
+			return unknown(fmt.Sprintf("CRITICAL capability returned receipt_version %d (must be 3, post-dispatch uncertainty)", resp.Evidence.ReceiptVersion))
+		case resp.Execution == nil || resp.Execution.RunID == "":
+			return unknown("CRITICAL capability returned SUCCEEDED without run_id (post-dispatch uncertainty)")
+		}
+		return idempotency.StateCommitted, resp
+	}
+
+	switch resp.Status {
+	case StatusSucceeded:
+		return idempotency.StateCommitted, resp
+	case StatusFailed:
+		if resp.DefinitiveFailure {
+			return idempotency.StateFailed, resp
+		}
+		return idempotency.StateUnknown, resp
+	default:
+		return idempotency.StateUnknown, resp
+	}
+}
+
+// buildObservation constructs the provider observation from the
+// provider's response — the durable snapshot persisted before any
+// terminal decision.
+func buildObservation(resp Response, desc capability.ResolvedDescriptor) idempotency.ProviderObservation {
 	obs := idempotency.ProviderObservation{
-		ProviderID: desc.AdapterID,
-		Result:     resp.Result,
+		ProviderID:     desc.AdapterID,
+		ProviderStatus: string(resp.Status),
+		Result:         resp.Result,
 	}
 	if resp.Execution != nil {
 		if resp.Execution.Provider != "" {
@@ -497,7 +554,17 @@ func (e *DispatchExecutor) recordObservation(ctx context.Context, executionID, l
 	}
 	if resp.Evidence != nil {
 		obs.EvidenceDigest = resp.Evidence.Digest
+		obs.ReceiptVersion = resp.Evidence.ReceiptVersion
 	}
+	return obs
+}
+
+// recordObservation durably records the provider's response metadata
+// via Store.RecordProviderObservation. Returns nil when nothing needs
+// recording (empty observation) or when the write succeeds; returns the
+// store error otherwise so callers can report persistence honestly.
+func (e *DispatchExecutor) recordObservation(ctx context.Context, executionID, leaseToken string, leaseGen int, resp Response, desc capability.ResolvedDescriptor) error {
+	obs := buildObservation(resp, desc)
 	if obs.ProviderRunID == "" && obs.EvidenceDigest == "" && len(obs.Result) == 0 {
 		return nil // nothing worth persisting
 	}
@@ -510,39 +577,21 @@ func (e *DispatchExecutor) recordObservation(ctx context.Context, executionID, l
 // falls back to a direct observation update — the observation is still
 // persisted rather than lost to the CAS race.
 func (e *DispatchExecutor) enterRecoveryWithObservation(ctx context.Context, executionID string, resp Response, desc capability.ResolvedDescriptor) error {
-	obsProviderID := desc.AdapterID
-	obsProviderRunID := ""
-	obsEvidence := ""
-	if resp.Execution != nil {
-		if resp.Execution.Provider != "" {
-			obsProviderID = resp.Execution.Provider
-		}
-		obsProviderRunID = resp.Execution.RunID
-	}
-	if resp.Evidence != nil {
-		obsEvidence = resp.Evidence.Digest
-	}
+	obs := buildObservation(resp, desc)
 	rec, lookupErr := e.store.Lookup(ctx, executionID)
 	if lookupErr != nil {
 		return fmt.Errorf("recovery entry failed (lookup error: %v); provider observation may not be persisted", lookupErr)
 	}
 	if rec.State == idempotency.StateInFlight {
 		if err := e.store.EnterRecoveryWithObservation(ctx, executionID,
-			idempotency.StateInFlight, rec.Version,
-			obsProviderID, obsProviderRunID, obsEvidence, resp.Result); err != nil {
+			idempotency.StateInFlight, rec.Version, obs); err != nil {
 			return fmt.Errorf("recovery entry failed: %v; provider observation may not be persisted", err)
 		}
 		return nil
 	}
 	if rec.State == idempotency.StateUnknown {
 		// Already in recovery — persist the observation directly.
-		if err := e.store.RecordProviderObservation(ctx, executionID, "", 0,
-			idempotency.ProviderObservation{
-				ProviderID:     obsProviderID,
-				ProviderRunID:  obsProviderRunID,
-				EvidenceDigest: obsEvidence,
-				Result:         resp.Result,
-			}); err != nil {
+		if err := e.store.RecordProviderObservation(ctx, executionID, "", 0, obs); err != nil {
 			return fmt.Errorf("execution already in recovery; observation update failed: %v", err)
 		}
 		return nil
@@ -555,60 +604,76 @@ func (e *DispatchExecutor) enterRecoveryWithObservation(ctx context.Context, exe
 	return fmt.Errorf("cannot enter recovery from state %s", rec.State)
 }
 
+// recoveryPreparer is the explicit recovery-locator routing contract
+// DispatchExecutor requires of its handler. MultiHandler implements
+// it by delegating to the adapter's handler — the executor never
+// type-asserts into nested handler structure.
+type recoveryPreparer interface {
+	PrepareRecovery(ctx context.Context, adapterID string, in idempotency.RecoveryLocatorInput) (*idempotency.RecoveryLocator, error)
+}
+
 // prepareRecoveryLocator asks the provider for a minimal recovery
 // locator via the RecoveryLocatorProvider contract (delegated through
-// MultiHandler to the adapter's handler). Providers that do not
+// the handler's PrepareRecovery routing). Providers that do not
 // implement the contract get the generic metadata-only locator — raw
 // request arguments are never persisted for them.
-func (e *DispatchExecutor) prepareRecoveryLocator(ctx context.Context, req Request, desc capability.ResolvedDescriptor, digest, executionID string) (json.RawMessage, error) {
-	if provider, ok := e.handler.(idempotency.RecoveryLocatorProvider); ok {
-		locator, err := provider.PrepareRecovery(ctx, idempotency.RecoveryLocatorInput{
-			ExecutionID:    executionID,
-			AdapterID:      desc.AdapterID,
-			CapabilityID:   req.Capability,
-			Principal:      req.Authority.Principal,
-			IdempotencyKey: req.IdempotencyKey,
-			RequestDigest:  digest,
-			Arguments:      req.Arguments,
-		})
+func (e *DispatchExecutor) prepareRecoveryLocator(ctx context.Context, req Request, desc capability.ResolvedDescriptor, digest, executionID string) (*idempotency.RecoveryLocator, error) {
+	in := idempotency.RecoveryLocatorInput{
+		ExecutionID:    executionID,
+		AdapterID:      desc.AdapterID,
+		CapabilityID:   req.Capability,
+		Principal:      req.Authority.Principal,
+		IdempotencyKey: req.IdempotencyKey,
+		RequestDigest:  digest,
+		Arguments:      req.Arguments,
+	}
+	var locator *idempotency.RecoveryLocator
+	if preparer, ok := e.handler.(recoveryPreparer); ok {
+		l, err := preparer.PrepareRecovery(ctx, desc.AdapterID, in)
 		if err != nil {
 			return nil, err
 		}
-		if len(locator) > 0 {
-			return locator, nil
-		}
+		locator = l
 	}
-	return buildRecoveryLocator(req, desc, digest), nil
+	if locator == nil {
+		// Generic fallback: metadata only, never raw arguments.
+		locator = genericRecoveryLocator(req, desc, digest, executionID)
+	}
+	return locator, nil
 }
 
-// buildRecoveryLocator constructs the generic fallback recovery locator
-// persisted before crossing IN_FLIGHT. It carries request metadata only:
-//   - capability_id, principal, idempotency_key — to reconstruct the
-//     durable identity (principal_id, capability_id, idempotency_key)
-//   - request_digest — for providers that support content-based lookup
-//   - provider_id, execution_class — dispatch context
-//   - timestamp — when the dispatch was initiated
-//
-// Raw arguments are deliberately excluded: they may contain sensitive
-// operation data that would otherwise sit in the ledger for as long as
-// the record remains UNKNOWN. Providers that need argument-derived
-// lookup coordinates implement RecoveryLocatorProvider and return a
-// minimal provider-owned locator instead.
-func buildRecoveryLocator(req Request, desc capability.ResolvedDescriptor, digest string) json.RawMessage {
-	locator := map[string]any{
-		"capability_id":   req.Capability,
-		"idempotency_key": req.IdempotencyKey,
-		"principal":       req.Authority.Principal,
-		"request_digest":  digest,
-		"provider_id":     desc.AdapterID,
-		"execution_class": string(desc.ExecutionClass),
-		"dispatched_at":   time.Now().UTC().Format(time.RFC3339Nano),
+// genericRecoveryLocator is the fallback locator for providers that do
+// not implement RecoveryLocatorProvider. It carries request metadata
+// only — never raw arguments, which may contain sensitive operation
+// data that would otherwise sit in the ledger while UNKNOWN.
+func genericRecoveryLocator(req Request, desc capability.ResolvedDescriptor, digest, executionID string) *idempotency.RecoveryLocator {
+	return &idempotency.RecoveryLocator{
+		Version:        1,
+		ProviderID:     desc.AdapterID,
+		Strategy:       "metadata",
+		RequestDigest:  digest,
+		ExecutionID:    executionID,
+		PrincipalID:    req.Authority.Principal,
+		CapabilityID:   req.Capability,
+		IdempotencyKey: req.IdempotencyKey,
 	}
-	data, err := json.Marshal(locator)
-	if err != nil {
-		return nil
+}
+
+// externalTokenKey carries the provider external-operation token from
+// the persisted recovery locator to the provider's Execute call, so
+// the token recorded before IN_FLIGHT is the same token used in the
+// external request.
+type externalTokenKey struct{}
+
+// ExternalTokenFromContext returns the provider external-operation
+// token DispatchExecutor persisted in the recovery locator, if any.
+// Providers use it as their idempotency/operation token in the
+// external request.
+func ExternalTokenFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(externalTokenKey{}).(string); ok {
+		return v
 	}
-	return data
+	return ""
 }
 
 // parseEvidence reconstructs an EvidenceRef from stored evidence data.
@@ -695,9 +760,11 @@ func (e *DispatchExecutor) leaseHeartbeat(ctx context.Context, executionID, leas
 		// Fallback: renew at 80% of the lease duration.
 		renewalInterval = renewDuration * 4 / 5
 	}
-	// Floor at 1 second to prevent a degenerate tight loop.
-	if renewalInterval < time.Second {
-		renewalInterval = time.Second
+	// Floor at 50ms to prevent a degenerate tight loop while still
+	// supporting sub-second leases (used by qualification tests with
+	// deliberately tiny lease durations).
+	if renewalInterval < 50*time.Millisecond {
+		renewalInterval = 50 * time.Millisecond
 	}
 
 	ticker := time.NewTicker(renewalInterval)

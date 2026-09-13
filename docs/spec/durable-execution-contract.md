@@ -5,6 +5,83 @@ execution store. All code in `internal/idempotency` and
 `internal/reconcile` must satisfy these rules. Changes to this
 document require the same review as changes to the store itself.
 
+## 0. Revision-8 normative invariants
+
+The following are requirements, not commentary. Any implementation
+that violates one is defective, regardless of test results.
+
+1.  **Frozen state graph.** The only legal transitions are:
+    `PREPARED → EXECUTING`, `EXECUTING → IN_FLIGHT`,
+    `IN_FLIGHT → COMMITTED | FAILED | UNKNOWN`, and
+    `UNKNOWN → COMMITTED | FAILED`. `COMMITTED` and `FAILED` are
+    immutable. `EnterRecovery` is legal only from `IN_FLIGHT`.
+
+2.  **Provider observations are durable before classification.** The
+    dispatcher MUST call `RecordProviderObservation` immediately after
+    the provider returns, before evidence validation and before any
+    terminal decision. Observation writes MUST NOT require a state
+    change, MUST be accepted while `IN_FLIGHT` (lease-fenced) or
+    already `UNKNOWN` (the CAS-loss race), and MUST be monotonic:
+    re-recording the identical observation is idempotent, and a
+    conflicting observation on the same record is rejected with a
+    typed `PROVIDER_OBSERVATION_CONFLICT`. Observation persistence
+    errors MUST NOT be swallowed or reported as success.
+
+3.  **CRITICAL terminal states require authenticated evidence.**
+    `COMMITTED` requires an Ed25519-signed effect receipt attesting
+    outcome `COMPLETED`; `FAILED` requires a signed receipt attesting
+    `NO_EFFECT`. The receipt MUST be verified against trusted signer
+    fingerprints and MUST bind execution ID, capability, principal,
+    request digest, provider ID, provider run ID, outcome, and
+    evidence SHA-256. A syntactically valid digest alone is not proof.
+    `DefinitiveFailure` is a routing hint for MUTATION; it is never
+    sufficient proof for CRITICAL `FAILED`.
+
+4.  **One terminal policy.** `Finalize` and `ResolveRecovery` MUST
+    enforce identical proof requirements through a single shared
+    terminal-transition policy. There is no weaker recovery path and
+    no weaker normal path.
+
+5.  **Recovery decisions are execution-specific.** A resolver MUST
+    correlate the record under recovery to the specific external
+    operation it caused — by durable `execution_id`, or by the
+    `(principal_id, capability_id, idempotency_key)` uniqueness
+    triple plus the provider operation identity. The resolver MUST
+    return the original provider run ID, never a fabricated
+    replacement.
+
+6.  **Resolvers are observational.** `RecoveryResolver.Resolve` MUST
+    be side-effect-free and idempotent. It may be invoked multiple
+    times and concurrently; it must never cause an external effect.
+
+7.  **Database time is authoritative.** Lease timestamps, lease
+    expiry, reconcile claim expiry, and reconcile backoff are computed
+    by PostgreSQL (`clock_timestamp()`), never by application clocks.
+
+8.  **Recovery locators are provider-specific and minimal.** When a
+    provider implements `RecoveryLocatorProvider`, the persisted
+    locator contains only provider lookup material: provider
+    idempotency token, provider operation token, resource identifier,
+    request fingerprint, execution ID — never the raw request body.
+    Whatever token is persisted before `IN_FLIGHT` MUST be the same
+    token used in the external request. Raw arguments are a
+    compatibility fallback only, subject to bounded size, redaction,
+    and a retention window; `recovery_locator` is cleared on terminal
+    transition and scrubbed from stale `UNKNOWN` records.
+
+9.  **Lease and claim ownership are held until durable ownership is
+    no longer required.** The execution heartbeat ends only after a
+    durable terminal or recovery state is persisted, or another worker
+    has definitively taken ownership. Provider return alone is not a
+    stopping condition. Reconcile claims are renewed while a resolver
+    runs, and resolver deadlines are enforced below the claim TTL.
+
+10. **Expired pre-dispatch work is normalized once.** Expired
+    `PREPARED`/`EXECUTING` records are reset to lease-less `PREPARED`
+    in a single CAS write. They leave the expired-lease claim set
+    until a caller reacquires them — reconciliation must not
+    claim/release dormant work every cycle.
+
 ## 1. State vocabulary
 
 ```
@@ -65,7 +142,8 @@ IN_FLIGHT
 
       Expired leases → ClaimExpiredBatch (FOR UPDATE SKIP LOCKED)
           │
-          ├── PREPARED/EXECUTING → reclaimable
+          ├── PREPARED/EXECUTING → RecoverExpiredPreDispatch
+          │    (normalize once to lease-less PREPARED)
           └── IN_FLIGHT → EnterRecovery → UNKNOWN
 ```
 
@@ -194,16 +272,24 @@ it returns success, not a conflict.
 
 The store enforces CRITICAL proof requirements inside `Finalize()`:
 both COMMITTED and FAILED require a valid SHA-256 evidence digest,
-receipt_version 3, provider_id, and provider_run_id. This prevents
-a caller that bypasses DispatchExecutor from finalizing CRITICAL
-with weaker evidence than the recovery path requires.
+receipt_version 3, provider_id, and provider_run_id — **plus** a
+signed `evidence_receipt` (ReceiptV3) verified against trusted signer
+fingerprints and bound to the execution, request, provider identity,
+outcome, and evidence digest. COMMITTED requires outcome `COMPLETED`;
+FAILED requires outcome `NO_EFFECT`. A digest without a verified
+signed receipt is rejected. This prevents a caller that bypasses
+DispatchExecutor from finalizing CRITICAL with weaker evidence than
+the recovery path requires — and both paths share the same policy
+function (`ValidateTerminalTransition`).
 
 ### Recovery locator cleanup
 
 `recovery_locator` is cleared to NULL on terminal finalization
-(both `Finalize` and `ResolveRecovery`). The locator may contain
-raw request arguments — it must not persist beyond the terminal
-transition.
+(both `Finalize` and `ResolveRecovery`) and scrubbed from UNKNOWN
+records older than the configured retention window. Provider-owned
+locators contain only provider lookup material; raw request
+arguments are a compatibility fallback subject to bounded size and
+redaction, and must not persist beyond the terminal transition.
 
 ### Conflict detection
 
@@ -268,6 +354,15 @@ with the UNKNOWN transition. This is used when the provider returned
 a result but finalization could not commit — the observation is
 the best available evidence for the recovery resolver.
 
+`RecordProviderObservation` persists provider response metadata
+(provider_status, result, result_digest, evidence digest, receipt
+version, observed-at) independently of state transitions — while
+`IN_FLIGHT` under lease fencing, or on a record that already raced
+to `UNKNOWN`. The write is monotonic: identical re-observation is
+idempotent; conflicting provider identity, status, result, or
+evidence is a typed `PROVIDER_OBSERVATION_CONFLICT`. It does not
+increment `version`, so it cannot invalidate reconciliation CAS.
+
 ### CAS for reconciliation
 
 Reconciliation must use CAS transitions with expected state/version.
@@ -284,9 +379,12 @@ worker per claim window.
 
 **Expired-lease crash recovery**: `ClaimExpiredBatch` claims a batch
 of PREPARED/EXECUTING/IN_FLIGHT records with expired leases using
-`FOR UPDATE SKIP LOCKED`. The caller inspects each record's state
-to decide whether it needs reconciliation (IN_FLIGHT → UNKNOWN) or
-simple re-dispatch (PREPARED/EXECUTING → reclaimable).
+`FOR UPDATE SKIP LOCKED`. The caller inspects each record's state:
+IN_FLIGHT records enter recovery (`UNKNOWN`); expired
+PREPARED/EXECUTING records are normalized once to lease-less
+`PREPARED` via `RecoverExpiredPreDispatch` — the claim, lease, and
+lease expiry are cleared in one CAS write so the record leaves the
+expired-lease claim set until a caller reacquires it.
 
 Claimable records must satisfy:
 
@@ -306,7 +404,14 @@ and records `last_reconcile_error`. Backoff is exponential: 30s, 1m,
 
 `RenewReconcileClaim` extends an active claim using
 `GREATEST(current, clock_timestamp() + duration)` — renewal cannot
-shorten an existing claim.
+shorten an existing claim. The reconciliation worker runs a claim
+heartbeat while the resolver executes and enforces a resolver
+deadline below the claim TTL; losing the claim cancels the resolver
+context rather than committing under a lost claim.
+
+`RecoveryResolver.Resolve` MUST be observational, side-effect-free,
+and idempotent. Claim renewal minimizes duplicate provider queries;
+the side-effect-free contract makes any residual overlap harmless.
 
 ### NoopResolver
 
@@ -387,6 +492,19 @@ CRAB-V1-020: Post-dispatch uncertainty cannot become retryable
              without evidence.
 CRAB-V1-021: Concurrent identical mutations cause at most one
              provider dispatch.
+CRAB-V1-022: Provider observations are durable before terminal
+             classification and monotonic thereafter.
+CRAB-V1-023: CRITICAL terminal transitions require authenticated
+             (signed, trust- and binding-verified) evidence receipts.
+CRAB-V1-024: Recovery resolvers are observational, side-effect-free,
+             and execution-specific; they return the original provider
+             operation identity.
+CRAB-V1-025: Reconciliation claims are renewed while resolvers run;
+             resolver deadlines stay below claim TTL.
+CRAB-V1-026: Expired pre-dispatch records normalize once; dormant
+             work does not churn.
+CRAB-V1-027: Recovery locators are provider-specific, minimal,
+             bounded, and cleared at terminal completion or retention.
 ```
 
 ## 14. Acceptance conditions
@@ -401,9 +519,15 @@ expired token renewals = 0 successful
 stale generation transitions = 0 successful
 terminal conflicting overwrites = 0 successful
 recovery without proof → UNKNOWN, not retry
+provider observation conflicts accepted = 0
+CRITICAL finalize/recover without verified signed receipt = 0
+cross-principal/cross-capability recovery false positives = 0
+expired PREPARED/EXECUTING churn cycles = 0 (normalize once)
+recovery locators surviving terminal transition = 0
 source manifest mismatches = 0
 source manifest unexpected = 0
 mandatory live tests executed > 0
+mandatory live tests skipped = 0 (unless allowlisted)
 release admission = PASS
 clean-room verifier = PASS
 ```

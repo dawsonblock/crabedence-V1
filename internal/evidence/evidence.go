@@ -44,12 +44,15 @@ const ReceiptType = "crabedence-effect-receipt"
 // signingDomain is the domain-separation prefix for the signing payload.
 const signingDomain = "crabedence-effect-receipt-v3\x00"
 
-// Outcome vocabulary — the semantic verdict the signer attests to.
+// Outcome vocabulary — the semantic verdict the signer attests to about
+// the external world, deliberately distinct from durable state names.
 const (
-	OutcomeCommitted = "COMMITTED"
-	OutcomeFailed    = "FAILED"
-	// OutcomeNoEffect means the provider confirmed no side effect
-	// occurred — a FAILED-equivalent terminal outcome for recovery.
+	// OutcomeCompleted attests the external effect occurred. Required
+	// for COMMITTED terminal transitions.
+	OutcomeCompleted = "COMPLETED"
+	// OutcomeNoEffect attests the external effect provably did not
+	// occur. Required for FAILED terminal transitions — including
+	// definitive provider failures and no-effect recovery proofs.
 	OutcomeNoEffect = "NO_EFFECT"
 )
 
@@ -81,7 +84,7 @@ type Binding struct {
 	RequestDigest  string
 	ProviderID     string
 	ProviderRunID  string
-	Outcome        string // OutcomeCommitted, OutcomeFailed, or OutcomeNoEffect
+	Outcome        string // OutcomeCompleted or OutcomeNoEffect
 	EvidenceSHA256 string
 }
 
@@ -200,7 +203,7 @@ func validateFields(r ReceiptV3) error {
 		}
 	}
 	switch r.Outcome {
-	case OutcomeCommitted, OutcomeFailed, OutcomeNoEffect:
+	case OutcomeCompleted, OutcomeNoEffect:
 	default:
 		return fmt.Errorf("invalid outcome %q", r.Outcome)
 	}

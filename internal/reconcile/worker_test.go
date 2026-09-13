@@ -264,6 +264,203 @@ func (r *fullResultResolver) Resolve(_ context.Context, _ *idempotency.Record) (
 	return r.result, nil
 }
 
+// slowResolver sleeps for delay (honoring context cancellation) before
+// returning a fixed result — simulates a provider lookup slower than
+// one claim TTL.
+type slowResolver struct {
+	delay  time.Duration
+	result idempotency.RecoveryResult
+}
+
+func (r *slowResolver) Resolve(ctx context.Context, _ *idempotency.Record) (idempotency.RecoveryResult, error) {
+	select {
+	case <-ctx.Done():
+		return idempotency.RecoveryResult{Decision: idempotency.RecoveryUnknown}, ctx.Err()
+	case <-time.After(r.delay):
+	}
+	return r.result, nil
+}
+
+// makeUnknownRecord creates an UNKNOWN execution record for testing:
+// acquire → begin → in-flight → enter recovery.
+func makeUnknownRecord(t *testing.T, db *sql.DB, store *idempotency.Store, ctx context.Context, key, capability, class string) string {
+	t.Helper()
+	db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key = $1`, key)
+	acq, err := store.Acquire(ctx, key, "alice@example.com", capability,
+		"digest-"+key, "grant_t", class, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !acq.Acquired() {
+		t.Fatalf("expected lease acquired, got %s", acq.Kind)
+	}
+	execID := acq.Record.ExecutionID
+	if err := store.BeginExecution(ctx, execID, acq.LeaseToken, acq.Generation); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkInFlight(ctx, execID, acq.LeaseToken, acq.Generation, "test-provider", nil); err != nil {
+		t.Fatal(err)
+	}
+	rec, _ := store.Lookup(ctx, execID)
+	if err := store.EnterRecovery(ctx, execID, idempotency.StateInFlight, rec.Version); err != nil {
+		t.Fatal(err)
+	}
+	return execID
+}
+
+// TestLiveClaimHeartbeatBlocksSecondWorker proves a resolver that runs
+// LONGER than one claim TTL keeps its claim: the claim heartbeat renews
+// reconcile_lease_expires_at, so a second worker's ClaimUnknownBatch
+// must not be able to steal the record mid-resolution.
+//
+// Timing: claim TTL = 400ms, resolver = 900ms (> 2× initial TTL).
+// At t=600ms — past the initial TTL — the record must be unclaimable.
+func TestLiveClaimHeartbeatBlocksSecondWorker(t *testing.T) {
+	dbURL := os.Getenv("CRABBOX_TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live PostgreSQL test")
+	}
+	db, err := openTestDB(dbURL)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+	store, err := idempotency.NewStore(db)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	ctx := context.Background()
+
+	key := fmt.Sprintf("test-claim-hb-%d", time.Now().UnixNano())
+	execID := makeUnknownRecord(t, db, store, ctx, key, "test.counter.increment", "MUTATION")
+	defer db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key = $1`, key)
+
+	w := NewWorker(store, NoopResolver{}, 0)
+	w.SetWorkerID("worker-hb-1")
+	w.SetClaimDuration(400 * time.Millisecond)
+	w.RegisterResolver("test.counter.increment", &slowResolver{
+		delay:  900 * time.Millisecond,
+		result: idempotency.RecoveryResult{Decision: idempotency.RecoveryUnknown},
+	})
+
+	claimed, err := store.ClaimUnknownBatch(ctx, "worker-hb-1", 50, 400*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rec *idempotency.Record
+	for _, r := range claimed {
+		if r.ExecutionID == execID {
+			rec = r
+		}
+	}
+	if rec == nil {
+		t.Fatal("test record was not claimed by worker-hb-1")
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- w.reconcileOne(ctx, rec) }()
+
+	// At t=600ms the initial 400ms claim TTL has elapsed — but the
+	// heartbeat must have renewed it, so worker-hb-2 cannot claim.
+	time.Sleep(600 * time.Millisecond)
+	other, err := store.ClaimUnknownBatch(ctx, "worker-hb-2", 50, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range other {
+		if r.ExecutionID == execID {
+			t.Error("second worker claimed the record while the claim heartbeat held it")
+		}
+	}
+	// Release any other records the probe claim grabbed so they are not
+	// stranded.
+	for _, r := range other {
+		_ = store.ReleaseReconcileClaim(ctx, r.ExecutionID, r.Version, 0, "")
+	}
+
+	if err := <-done; err != nil {
+		t.Fatalf("reconcileOne failed: %v", err)
+	}
+	rec2, _ := store.Lookup(ctx, execID)
+	if rec2.State != idempotency.StateUnknown {
+		t.Errorf("expected UNKNOWN after unresolved reconciliation, got %s", rec2.State)
+	}
+	if rec2.ReconcileOwner != "" {
+		t.Errorf("claim should be released after reconcileOne, got owner %q", rec2.ReconcileOwner)
+	}
+}
+
+// TestLiveClaimExpiryRecovery proves a crashed claim owner does not hold
+// a record forever: once the claim TTL elapses without renewal, another
+// worker recovers the record.
+func TestLiveClaimExpiryRecovery(t *testing.T) {
+	dbURL := os.Getenv("CRABBOX_TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live PostgreSQL test")
+	}
+	db, err := openTestDB(dbURL)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+	store, err := idempotency.NewStore(db)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	ctx := context.Background()
+
+	key := fmt.Sprintf("test-claim-expiry-%d", time.Now().UnixNano())
+	execID := makeUnknownRecord(t, db, store, ctx, key, "test.counter.increment", "MUTATION")
+	defer db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key = $1`, key)
+
+	// Worker 1 claims with a 150ms claim TTL, then "crashes" — no
+	// renewal, no release.
+	claimed, err := store.ClaimUnknownBatch(ctx, "worker-crash-1", 50, 150*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	held := false
+	for _, r := range claimed {
+		if r.ExecutionID == execID {
+			held = true
+		}
+	}
+	if !held {
+		t.Fatal("worker-crash-1 did not claim the record")
+	}
+
+	// Immediately after the claim, a second worker must not get it.
+	other, err := store.ClaimUnknownBatch(ctx, "worker-crash-2", 50, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range other {
+		if r.ExecutionID == execID {
+			t.Fatal("record claimable while claim still valid")
+		}
+	}
+	for _, r := range other {
+		_ = store.ReleaseReconcileClaim(ctx, r.ExecutionID, r.Version, 0, "")
+	}
+
+	// After the claim TTL elapses without renewal, worker 2 recovers it.
+	time.Sleep(300 * time.Millisecond)
+	other, err = store.ClaimUnknownBatch(ctx, "worker-crash-2", 50, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered := false
+	for _, r := range other {
+		if r.ExecutionID == execID {
+			recovered = true
+			_ = store.ReleaseReconcileClaim(ctx, r.ExecutionID, r.Version, 0, "")
+		}
+	}
+	if !recovered {
+		t.Error("expired claim was not recoverable by a second worker")
+	}
+}
+
 // openTestDB opens a test database connection.
 func openTestDB(dbURL string) (*sql.DB, error) {
 	return sql.Open("pgx", dbURL)

@@ -168,6 +168,19 @@ func (w *Worker) reconcileAll(ctx context.Context) error {
 	return nil
 }
 
+// RecoverCrashedForTest exposes recoverCrashed for cross-package
+// integration tests (e.g. provider fault-injection suites that must
+// drive the crash-recovery path directly).
+func (w *Worker) RecoverCrashedForTest(ctx context.Context, rec *idempotency.Record) error {
+	return w.recoverCrashed(ctx, rec)
+}
+
+// ReconcileOneForTest exposes reconcileOne for cross-package
+// integration tests.
+func (w *Worker) ReconcileOneForTest(ctx context.Context, rec *idempotency.Record) error {
+	return w.reconcileOne(ctx, rec)
+}
+
 // recoverCrashed handles a crashed execution with an expired lease.
 // The record was claimed via ClaimExpiredBatch — the reconcile_owner
 // claim must be released after processing.
@@ -237,27 +250,29 @@ func (w *Worker) recoverCrashed(ctx context.Context, rec *idempotency.Record) er
 // with exponential backoff so another worker (or this one later)
 // can retry.
 func (w *Worker) reconcileOne(ctx context.Context, rec *idempotency.Record) error {
-	// Resolver deadline: the resolver must finish well below the claim
-	// TTL so the result can be committed while the claim is still held.
-	// At the same time, a heartbeat renews the claim for legitimately
-	// slow resolvers — without renewal, a resolver running past the
-	// claim duration lets a second worker claim the same record and
-	// issue duplicate external recovery queries.
-	resolveTimeout := w.claimDuration * 4 / 5
+	// Resolver deadline: bounded at 4 claim TTLs — long enough for a
+	// legitimately slow resolver whose claim the heartbeat keeps
+	// renewing, short enough that a wedged resolver cannot hold the
+	// record forever. The deadline is deliberately NOT below one TTL:
+	// the heartbeat exists precisely so resolution longer than one
+	// claim window remains safe.
+	resolveTimeout := w.claimDuration * 4
 	if resolveTimeout <= 0 {
-		resolveTimeout = 4 * time.Minute
+		resolveTimeout = 20 * time.Minute
 	}
 	rctx, cancel := context.WithTimeout(ctx, resolveTimeout)
 
-	// Claim heartbeat — renew while the resolver runs. If renewal fails
-	// (claim lost or expired), cancel the resolver context: committing
-	// with a lost claim would race another worker anyway.
+	// Claim heartbeat — renew while the resolver runs. The heartbeat
+	// has its own context: it must keep renewing across resolver
+	// deadline boundaries so the claim outlives the initial TTL. If
+	// renewal fails (claim lost or expired), cancel the resolver
+	// context: committing with a lost claim would race another worker.
+	hbCtx, hbCancel := context.WithCancel(ctx)
 	heartbeatDone := make(chan struct{})
-	go w.claimHeartbeat(rctx, cancel, rec, heartbeatDone)
-	// Wait for the heartbeat goroutine AFTER cancelling rctx — the
-	// heartbeat exits on ctx.Done(), so waiting before cancelling
-	// would deadlock.
-	defer func() { cancel(); <-heartbeatDone }()
+	go w.claimHeartbeat(hbCtx, cancel, rec, heartbeatDone)
+	// Wait for the heartbeat goroutine AFTER stopping it — the
+	// heartbeat exits on hbCtx.Done(), so waiting first would deadlock.
+	defer func() { hbCancel(); cancel(); <-heartbeatDone }()
 
 	// Query the resolver for the actual outcome.
 	result, err := w.resolve(rctx, rec)
@@ -319,8 +334,8 @@ func (w *Worker) claimHeartbeat(ctx context.Context, cancel context.CancelFunc, 
 	if interval <= 0 {
 		interval = time.Minute
 	}
-	if interval < time.Second {
-		interval = time.Second
+	if interval < 50*time.Millisecond {
+		interval = 50 * time.Millisecond
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -339,13 +354,15 @@ func (w *Worker) claimHeartbeat(ctx context.Context, cancel context.CancelFunc, 
 	}
 }
 
-// recoveryOutcome maps a definitive recovery decision to the receipt
-// outcome vocabulary.
+// recoveryOutcome maps a definitive recovery decision to the semantic
+// attestation vocabulary: RecoveryCommitted requires COMPLETED proof
+// (the effect happened); RecoveryFailed requires NO_EFFECT proof (the
+// effect provably did not happen).
 func recoveryOutcome(d idempotency.RecoveryDecision) string {
 	if d == idempotency.RecoveryCommitted {
-		return evidence.OutcomeCommitted
+		return evidence.OutcomeCompleted
 	}
-	return evidence.OutcomeFailed
+	return evidence.OutcomeNoEffect
 }
 
 // releaseClaim releases a reconcile claim back to the pool with

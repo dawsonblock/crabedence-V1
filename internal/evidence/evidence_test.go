@@ -15,7 +15,7 @@ func testBinding() Binding {
 		RequestDigest:  "digest-1",
 		ProviderID:     "deploy-adapter",
 		ProviderRunID:  "run-1",
-		Outcome:        OutcomeCommitted,
+		Outcome:        OutcomeCompleted,
 		EvidenceSHA256: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
 	}
 }
@@ -44,7 +44,7 @@ func TestVerifyRejectsTamperedSignature(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Tamper with the bound outcome — signature no longer matches.
-	tampered := strings.Replace(string(raw), `"outcome":"COMMITTED"`, `"outcome":"FAILED"`, 1)
+	tampered := strings.Replace(string(raw), `"outcome":"COMPLETED"`, `"outcome":"NO_EFFECT"`, 1)
 	trusted := map[string]bool{signer.Fingerprint(): true}
 	if err := VerifyReceipt(json.RawMessage(tampered), b, trusted); err == nil {
 		t.Error("tampered receipt must be rejected")
@@ -82,7 +82,7 @@ func TestVerifyRejectsBindingMismatch(t *testing.T) {
 		func(b *Binding) { b.ExecutionID = "exec-2" },
 		func(b *Binding) { b.Principal = "bob@example.com" },
 		func(b *Binding) { b.ProviderRunID = "run-2" },
-		func(b *Binding) { b.Outcome = OutcomeFailed },
+		func(b *Binding) { b.Outcome = OutcomeNoEffect },
 		func(b *Binding) {
 			b.EvidenceSHA256 = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
 		},

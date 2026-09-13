@@ -3,6 +3,7 @@ package idempotency
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -2023,7 +2024,7 @@ func TestLiveStoreCriticalRecoveryFailedRequiresProof(t *testing.T) {
 			RequestDigest:  rec.RequestDigest,
 			ProviderID:     "deploy-adapter",
 			ProviderRunID:  "run_critical_fail_proof",
-			Outcome:        evidence.OutcomeFailed,
+			Outcome:        evidence.OutcomeNoEffect,
 			EvidenceSHA256: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
 		}),
 	})
@@ -2048,7 +2049,7 @@ func TestLiveStoreCriticalRecoveryFailedRequiresProof(t *testing.T) {
 			RequestDigest:  rec.RequestDigest,
 			ProviderID:     "deploy-adapter",
 			ProviderRunID:  "run_critical_fail_proof",
-			Outcome:        evidence.OutcomeFailed,
+			Outcome:        evidence.OutcomeNoEffect,
 			EvidenceSHA256: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
 		}),
 	})
@@ -2103,13 +2104,14 @@ func TestLiveStoreReplayProviderMetadata(t *testing.T) {
 
 	// Finalize with specific provider metadata.
 	receipt := TerminalReceipt{
-		ExecutionID:    execID,
-		Capability:     "test.counter.increment",
-		Principal:      "alice@example.com",
-		RequestDigest:  "digest-replay-meta",
-		TerminalStatus: StateCommitted,
-		ProviderID:     "github",
-		ProviderRunID:  "issue-98765",
+		ExecutionID:     execID,
+		Capability:      "test.counter.increment",
+		Principal:       "alice@example.com",
+		RequestDigest:   "digest-replay-meta",
+		TerminalStatus:  StateCommitted,
+		CanonicalResult: json.RawMessage(`{"issue":98765}`),
+		ProviderID:      "github",
+		ProviderRunID:   "issue-98765",
 	}
 	if err := store.Finalize(ctx, execID, acq.LeaseToken, acq.Generation, StateInFlight, receipt); err != nil {
 		t.Fatal(err)
@@ -2678,7 +2680,7 @@ func TestLiveCriticalFinalizeRequiresProof(t *testing.T) {
 		RequestDigest:  rec.RequestDigest,
 		ProviderID:     "deploy-adapter",
 		ProviderRunID:  "run-crit-1",
-		Outcome:        evidence.OutcomeCommitted,
+		Outcome:        evidence.OutcomeCompleted,
 		EvidenceSHA256: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
 	})
 	err = store.Finalize(ctx, execID, acq.LeaseToken, rec.LeaseGeneration, StateInFlight, TerminalReceipt{
@@ -2712,7 +2714,7 @@ func TestLiveCriticalFinalizeRequiresProof(t *testing.T) {
 			RequestDigest:  rec.RequestDigest,
 			ProviderID:     "deploy-adapter",
 			ProviderRunID:  "run-crit-1",
-			Outcome:        evidence.OutcomeCommitted,
+			Outcome:        evidence.OutcomeCompleted,
 			EvidenceSHA256: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
 		}),
 	})
@@ -2819,8 +2821,13 @@ func TestLiveEnterRecoveryWithObservation(t *testing.T) {
 	// Enter recovery with provider observation.
 	rec, _ := store.Lookup(ctx, execID)
 	err = store.EnterRecoveryWithObservation(ctx, execID, StateInFlight, rec.Version,
-		"github-adapter", "issue-98765", "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
-		json.RawMessage(`{"issue_url":"https://github.com/org/repo/issues/1"}`))
+		ProviderObservation{
+			ProviderID:     "github-adapter",
+			ProviderRunID:  "issue-98765",
+			ProviderStatus: "SUCCEEDED",
+			EvidenceDigest: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+			Result:         json.RawMessage(`{"issue_url":"https://github.com/org/repo/issues/1"}`),
+		})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2971,12 +2978,49 @@ func TestLiveRecordProviderObservation(t *testing.T) {
 		t.Errorf("rejected observation must not overwrite, got %q", rec.ProviderRunID)
 	}
 
-	// Case 2: record races to UNKNOWN — the observation must still land.
+	// Duplicate identical observation is idempotent.
+	err = store.RecordProviderObservation(ctx, execID, acq.LeaseToken, acq.Generation, ProviderObservation{
+		ProviderID:     "test-counter",
+		ProviderRunID:  "run-obs-1",
+		EvidenceDigest: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+		Result:         json.RawMessage(`{"value":1}`),
+	})
+	if err != nil {
+		t.Errorf("identical re-observation must be idempotent, got %v", err)
+	}
+
+	// Conflicting observation while IN_FLIGHT → PROVIDER_OBSERVATION_CONFLICT.
+	err = store.RecordProviderObservation(ctx, execID, acq.LeaseToken, acq.Generation, ProviderObservation{
+		ProviderID:    "test-counter",
+		ProviderRunID: "run-DIFFERENT",
+	})
+	if err == nil || !errors.Is(err, ProviderObservationConflict) {
+		t.Errorf("conflicting observation must return PROVIDER_OBSERVATION_CONFLICT, got %v", err)
+	}
 	rec, _ = store.Lookup(ctx, execID)
-	if err := store.EnterRecovery(ctx, execID, StateInFlight, rec.Version); err != nil {
+	if rec.ProviderRunID != "run-obs-1" {
+		t.Errorf("conflicting observation must not overwrite, got %q", rec.ProviderRunID)
+	}
+
+	// Case 2: record races to UNKNOWN before the observation lands —
+	// the observation must still attach (no prior observation stored).
+	acqU, err := store.Acquire(ctx, prefix+"-unknown", "alice@example.com", "test.counter.increment",
+		"digest-obs-u", "grant_o", "MUTATION", time.Minute)
+	if err != nil {
 		t.Fatal(err)
 	}
-	err = store.RecordProviderObservation(ctx, execID, "", 0, ProviderObservation{
+	execIDU := acqU.Record.ExecutionID
+	if err := store.BeginExecution(ctx, execIDU, acqU.LeaseToken, acqU.Generation); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkInFlight(ctx, execIDU, acqU.LeaseToken, acqU.Generation, "test-counter", nil); err != nil {
+		t.Fatal(err)
+	}
+	recU, _ := store.Lookup(ctx, execIDU)
+	if err := store.EnterRecovery(ctx, execIDU, StateInFlight, recU.Version); err != nil {
+		t.Fatal(err)
+	}
+	err = store.RecordProviderObservation(ctx, execIDU, "", 0, ProviderObservation{
 		ProviderID:     "test-counter",
 		ProviderRunID:  "run-obs-late",
 		EvidenceDigest: "b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3",
@@ -2985,12 +3029,20 @@ func TestLiveRecordProviderObservation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("observation on already-UNKNOWN record failed: %v", err)
 	}
-	rec, _ = store.Lookup(ctx, execID)
-	if rec.ProviderRunID != "run-obs-late" {
-		t.Errorf("expected provider_run_id=run-obs-late on UNKNOWN record, got %q", rec.ProviderRunID)
+	recU, _ = store.Lookup(ctx, execIDU)
+	if recU.ProviderRunID != "run-obs-late" {
+		t.Errorf("expected provider_run_id=run-obs-late on UNKNOWN record, got %q", recU.ProviderRunID)
 	}
-	if rec.State != StateUnknown {
-		t.Errorf("expected UNKNOWN preserved, got %s", rec.State)
+	if recU.State != StateUnknown {
+		t.Errorf("expected UNKNOWN preserved, got %s", recU.State)
+	}
+	// A contradictory observation on UNKNOWN must also conflict —
+	// the first observation to land is authoritative.
+	err = store.RecordProviderObservation(ctx, execIDU, "", 0, ProviderObservation{
+		ProviderRunID: "run-obs-OTHER",
+	})
+	if err == nil || !errors.Is(err, ProviderObservationConflict) {
+		t.Errorf("conflicting observation on UNKNOWN must return PROVIDER_OBSERVATION_CONFLICT, got %v", err)
 	}
 
 	// Case 3: terminal records reject observations.
@@ -3008,8 +3060,9 @@ func TestLiveRecordProviderObservation(t *testing.T) {
 	}
 	rec2, _ := store.Lookup(ctx, execID2)
 	if err := store.Finalize(ctx, execID2, acq2.LeaseToken, rec2.LeaseGeneration, StateInFlight, TerminalReceipt{
-		ExecutionID:    execID2,
-		TerminalStatus: StateCommitted,
+		ExecutionID:     execID2,
+		TerminalStatus:  StateCommitted,
+		CanonicalResult: json.RawMessage(`{"value":1}`),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -3109,6 +3162,17 @@ func TestLiveRecoverExpiredPreDispatch(t *testing.T) {
 		}
 	}
 
+	// Normalization happens once: a second RecoverExpiredPreDispatch
+	// CAS-fails (lease fields are NULL) and the version does not churn.
+	versionAfterNormalize := rec.Version
+	if err := store.RecoverExpiredPreDispatch(ctx, execID, versionAfterNormalize); err == nil {
+		t.Error("second RecoverExpiredPreDispatch should CAS-fail on a normalized record")
+	}
+	rec2, _ := store.Lookup(ctx, execID)
+	if rec2.Version != versionAfterNormalize {
+		t.Errorf("version churned: %d -> %d", versionAfterNormalize, rec2.Version)
+	}
+
 	// A returning caller reacquires immediately (lease-less PREPARED).
 	acq2, err := store.Acquire(ctx, prefix+"-0", "alice@example.com", "test.counter.increment",
 		"digest-rpd", "grant_r", "MUTATION", time.Minute)
@@ -3187,4 +3251,97 @@ func TestLiveScrubStaleRecoveryLocators(t *testing.T) {
 		t.Errorf("scrub must not change state, got %s", rec.State)
 	}
 	_ = n
+}
+
+// TestLiveRecoveryLocatorBounds verifies the locator safety model:
+// maximum size enforcement, forbidden secret fields, and the redaction
+// hook — a durable-effect ledger must not become a second copy of
+// sensitive tool payloads.
+func TestLiveRecoveryLocatorBounds(t *testing.T) {
+	dbURL := os.Getenv("CRABBOX_TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live PostgreSQL test")
+	}
+	db, err := openTestDB(dbURL)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+	store, err := NewStore(db)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	ctx := context.Background()
+
+	prefix := fmt.Sprintf("test-locbounds-%d", time.Now().UnixNano())
+	defer db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key LIKE $1`, prefix+"%")
+
+	acquire := func(suffix string) (string, string, int) {
+		t.Helper()
+		acq, err := store.Acquire(ctx, prefix+suffix, "alice@example.com", "test.counter.increment",
+			"digest-"+suffix, "grant_b", "MUTATION", time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !acq.Acquired() {
+			t.Fatalf("expected lease acquired, got %s", acq.Kind)
+		}
+		if err := store.BeginExecution(ctx, acq.Record.ExecutionID, acq.LeaseToken, acq.Generation); err != nil {
+			t.Fatal(err)
+		}
+		return acq.Record.ExecutionID, acq.LeaseToken, acq.Generation
+	}
+
+	// Oversized locator → RECOVERY_LOCATOR_TOO_LARGE.
+	execID, token, gen := acquire("-big")
+	big := json.RawMessage(`{"pad":"` + strings.Repeat("x", MaxRecoveryLocatorBytes) + `"}`)
+	if err := store.MarkInFlight(ctx, execID, token, gen, "p", big); !errors.Is(err, LocatorTooLarge) {
+		t.Errorf("expected LocatorTooLarge, got %v", err)
+	}
+
+	// Forbidden secret field (nested, case/separator-normalized).
+	execID, token, gen = acquire("-secret")
+	for _, raw := range []string{
+		`{"api_key":"sk-live-123"}`,
+		`{"extensions":{"private-key":"-----BEGIN"}}`,
+		`{"data":[{"PASSWORD":"hunter2"}]}`,
+		`{"client_secret":"abc"}`,
+	} {
+		if err := store.MarkInFlight(ctx, execID, token, gen, "p", json.RawMessage(raw)); !errors.Is(err, LocatorContainsSecret) {
+			t.Errorf("locator %s: expected LocatorContainsSecret, got %v", raw, err)
+		}
+	}
+	// The record is still EXECUTING — the rejected writes were no-ops.
+	rec, _ := store.Lookup(ctx, execID)
+	if rec.State != StateExecuting {
+		t.Errorf("rejected locator writes must not change state, got %s", rec.State)
+	}
+
+	// Redaction hook rewrites before persistence.
+	store2, err := NewStore(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store2.SetLocatorRedactor(func(loc json.RawMessage) (json.RawMessage, error) {
+		var m map[string]any
+		if err := json.Unmarshal(loc, &m); err != nil {
+			return nil, err
+		}
+		if _, ok := m["raw_payload"]; ok {
+			m["raw_payload"] = "<redacted>"
+		}
+		return json.Marshal(m)
+	})
+	execID, token, gen = acquire("-redact")
+	if err := store2.MarkInFlight(ctx, execID, token, gen, "p",
+		json.RawMessage(`{"raw_payload":"sensitive-thing","external_token":"tok-1"}`)); err != nil {
+		t.Fatal(err)
+	}
+	rec, _ = store.Lookup(ctx, execID)
+	if strings.Contains(string(rec.RecoveryLocator), "sensitive-thing") {
+		t.Error("redaction hook was not applied before persistence")
+	}
+	if !strings.Contains(string(rec.RecoveryLocator), "<redacted>") {
+		t.Errorf("expected redacted payload in locator, got %s", rec.RecoveryLocator)
+	}
 }

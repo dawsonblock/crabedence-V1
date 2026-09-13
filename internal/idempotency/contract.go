@@ -126,6 +126,21 @@ const (
 	LeaseStateConflict        LeaseError = "STATE_CONFLICT"
 	LeaseRecoveryRequired     LeaseError = "RECOVERY_REQUIRED"
 	LeaseErrorInvalidDuration LeaseError = "INVALID_DURATION"
+	// ProviderObservationConflict is returned when a recorded provider
+	// observation contradicts the already-stored observation — e.g. a
+	// different provider run ID or evidence digest for the same
+	// execution. Provider observations are monotonic: identical
+	// re-observation is idempotent; conflicting observation is rejected.
+	ProviderObservationConflict LeaseError = "PROVIDER_OBSERVATION_CONFLICT"
+	// LocatorTooLarge is returned when a recovery locator exceeds
+	// MaxRecoveryLocatorBytes — locators carry lookup material, not
+	// request payloads.
+	LocatorTooLarge LeaseError = "RECOVERY_LOCATOR_TOO_LARGE"
+	// LocatorContainsSecret is returned when a recovery locator carries
+	// a field on the forbidden-secret denylist (passwords, API keys,
+	// private keys, authorization headers, ...). Locators are lookup
+	// coordinates, never a second copy of sensitive payloads.
+	LocatorContainsSecret LeaseError = "RECOVERY_LOCATOR_CONTAINS_SECRET"
 )
 
 func (e LeaseError) Error() string { return string(e) }
@@ -329,6 +344,41 @@ type RecoveryResolver interface {
 	Resolve(ctx context.Context, record *Record) (RecoveryResult, error)
 }
 
+// RecoveryLocator is the typed provider lookup material persisted
+// before the dispatch boundary is crossed. It contains only what a
+// RecoveryResolver needs to find the external operation: the provider
+// identity, the correlation strategy, the external token that was sent
+// with the request, the resource reference, and the durable execution
+// identity. Raw request arguments do not belong here.
+type RecoveryLocator struct {
+	Version    int    `json:"v"`
+	ProviderID string `json:"provider_id"`
+	// Strategy names the correlation approach the provider uses —
+	// e.g. "idempotency-token", "operation-id", "marker-scan", or
+	// "metadata" for the generic fallback.
+	Strategy string `json:"strategy"`
+	// ExternalToken is the provider idempotency or operation token
+	// sent with the external request. The token persisted here MUST
+	// be the same token used in the external call.
+	ExternalToken string `json:"external_token,omitempty"`
+	// ResourceRef is the provider-side resource identifier when known.
+	ResourceRef   string `json:"resource_ref,omitempty"`
+	RequestDigest string `json:"request_digest,omitempty"`
+	// Durable execution identity for execution-specific correlation.
+	ExecutionID    string `json:"execution_id,omitempty"`
+	PrincipalID    string `json:"principal_id,omitempty"`
+	CapabilityID   string `json:"capability_id,omitempty"`
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
+	// Extensions carries bounded provider-specific lookup data. It is
+	// deliberately not free-form request storage.
+	Extensions json.RawMessage `json:"extensions,omitempty"`
+}
+
+// MaxRecoveryLocatorBytes bounds the serialized recovery locator.
+// Locators carry lookup material, not payloads — anything larger is a
+// defect, not a legitimate locator.
+const MaxRecoveryLocatorBytes = 8192
+
 // RecoveryLocatorInput carries the dispatch context a provider needs
 // to build a recovery locator. Arguments is the raw request argument
 // blob — the provider is responsible for extracting only what it needs
@@ -366,7 +416,7 @@ type RecoveryLocatorProvider interface {
 	// An error fails the dispatch pre-dispatch (safe FAILED): crossing
 	// the IN_FLIGHT boundary without a persistable recovery locator
 	// would leave a potential side effect undiscoverable.
-	PrepareRecovery(ctx context.Context, in RecoveryLocatorInput) (json.RawMessage, error)
+	PrepareRecovery(ctx context.Context, in RecoveryLocatorInput) (*RecoveryLocator, error)
 }
 
 // CanonicalizeArguments canonicalizes a JSON argument blob — parses and
@@ -377,7 +427,15 @@ type RecoveryLocatorProvider interface {
 // treats 0 as "use the default"). Provider argument normalization is
 // the provider's job inside PrepareRecovery — the two operations must
 // not be conflated.
+//
+// Deprecated name retained for callers; CanonicalizeJSON is identical.
 func CanonicalizeArguments(raw json.RawMessage) (json.RawMessage, error) {
+	return CanonicalizeJSON(raw)
+}
+
+// CanonicalizeJSON canonicalizes a JSON blob: sorted object keys,
+// no semantic interpretation.
+func CanonicalizeJSON(raw json.RawMessage) (json.RawMessage, error) {
 	return canonicalizeJSON(raw)
 }
 

@@ -190,6 +190,18 @@ WORKER_PKG_VERSION="$(node -e "console.log(require('./worker/package.json').vers
 GIT_VERSION="$(git --version 2>/dev/null || echo 'unavailable')"
 PG_VERSION="$(psql --version 2>/dev/null || echo 'not-installed')"
 
+# Live-database qualification environment: capture the PostgreSQL
+# SERVER version and the Effect Fabric schema migration version so the
+# evidence records exactly what the live gates ran against.
+PG_SERVER_VERSION="unavailable"
+SCHEMA_VERSION="unavailable"
+if [ -n "${CRABBOX_TEST_DATABASE_URL:-}" ]; then
+  PG_SERVER_VERSION="$(psql "$CRABBOX_TEST_DATABASE_URL" -tAc 'SHOW server_version' 2>/dev/null | tr -d '[:space:]' || true)"
+  PG_SERVER_VERSION="${PG_SERVER_VERSION:-unavailable}"
+  SCHEMA_VERSION="$(psql "$CRABBOX_TEST_DATABASE_URL" -tAc 'SELECT COALESCE(MAX(version),0) FROM schema_migrations' 2>/dev/null | tr -d '[:space:]' || true)"
+  SCHEMA_VERSION="${SCHEMA_VERSION:-unavailable}"
+fi
+
 cat > "$EVIDENCE_DIR/toolchains.json" << EOF
 {
   "go": "$GO_VERSION",
@@ -197,6 +209,8 @@ cat > "$EVIDENCE_DIR/toolchains.json" << EOF
   "npm": "$NPM_VERSION",
   "git": "$GIT_VERSION",
   "postgres_client": "$PG_VERSION",
+  "postgres_server": "$PG_SERVER_VERSION",
+  "effect_fabric_schema_version": "$SCHEMA_VERSION",
   "worker_package_version": "$WORKER_PKG_VERSION",
   "go_os": "$(go env GOOS 2>/dev/null || echo 'unknown')",
   "go_arch": "$(go env GOARCH 2>/dev/null || echo 'unknown')"
@@ -384,11 +398,12 @@ run_effect_fabric_postgres_gate() {
   fi
 
   {
-    echo "command=go test -v -count=1 -p 1 -timeout=300s -run TestLive ./internal/idempotency/ ./internal/reconcile/ ./internal/execution/"
+    echo "command=go test -json -count=1 -p 1 -timeout=300s -run TestLive ./internal/idempotency/ ./internal/reconcile/ ./internal/execution/"
     echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "---"
   } > "$log"
 
+  local json_out="$EVIDENCE_DIR/effect-fabric-postgres.json"
   set +e
   # Run ALL live PostgreSQL tests in the effect-fabric packages — not a
   # curated name pattern. A pattern that silently excludes new live
@@ -396,12 +411,15 @@ run_effect_fabric_postgres_gate() {
   # evidence claim coverage that was never exercised. -p 1 serializes
   # the packages: all three share one database, and the reconcile
   # worker's table-wide claim batch would otherwise race another
-  # package's live assertions.
-  go test -v -count=1 -p 1 -timeout=300s \
+  # package's live assertions. -json produces structured per-test
+  # pass/fail/skip accounting for the evidence bundle.
+  go test -json -count=1 -p 1 -timeout=300s \
     -run "TestLive" \
-    ./internal/idempotency/ ./internal/reconcile/ ./internal/execution/ >> "$log" 2>&1
+    ./internal/idempotency/ ./internal/reconcile/ ./internal/execution/ \
+    > "$json_out" 2>&1
   local rc=$?
   set -e
+  cat "$json_out" >> "$log"
 
   {
     echo "---"
@@ -409,39 +427,124 @@ run_effect_fabric_postgres_gate() {
     echo "exit=$rc"
   } >> "$log"
 
-  if [ "$rc" -ne 0 ]; then
-    record_gate "$name" "FAIL" "$rc" "$log"
-    echo "  FAIL  $name (exit=$rc)"
-    # Print the test output to stdout so failures are visible in CI.
+  # Structured accounting: count per-test actions from the -json
+  # stream (test events carry .Test; package events do not).
+  local discovered passed failed skipped
+  discovered=$(jq -r '[.[]? | select(.Test != null and (.Action == "pass" or .Action == "fail" or .Action == "skip"))] | length' \
+    < <(jq -s '.' "$json_out" 2>/dev/null || echo '[]') 2>/dev/null || echo 0)
+  passed=$(jq -r '[.[]? | select(.Test != null and .Action == "pass")] | length' \
+    < <(jq -s '.' "$json_out" 2>/dev/null || echo '[]') 2>/dev/null || echo 0)
+  failed=$(jq -r '[.[]? | select(.Test != null and .Action == "fail")] | length' \
+    < <(jq -s '.' "$json_out" 2>/dev/null || echo '[]') 2>/dev/null || echo 0)
+  skipped=$(jq -r '[.[]? | select(.Test != null and .Action == "skip")] | length' \
+    < <(jq -s '.' "$json_out" 2>/dev/null || echo '[]') 2>/dev/null || echo 0)
+
+  {
+    echo "tests_discovered=$discovered"
+    echo "tests_passed=$passed"
+    echo "tests_failed=$failed"
+    echo "tests_skipped=$skipped"
+  } >> "$log"
+
+  # Mandatory live gate: fail on any failure, on zero passes, and on
+  # any skip — a SKIP is not evidence of execution.
+  if [ "$rc" -ne 0 ] || [ "$failed" -gt 0 ] || [ "$passed" -le 0 ] || [ "$skipped" -gt 0 ]; then
+    {
+      echo ""
+      echo "FAIL: discovered=$discovered passed=$passed failed=$failed skipped=$skipped exit=$rc (mandatory live gate requires >0 passes, 0 failures, 0 skips)"
+      echo "exit=1"
+    } >> "$log"
+    record_gate "$name" "FAIL" 1 "$log"
+    echo "  FAIL  $name (discovered=$discovered passed=$passed failed=$failed skipped=$skipped)"
     cat "$log"
     return
   fi
 
-  # Verify tests actually executed and passed. With -v, Go test prints
-  # "--- PASS:"/"--- FAIL:"/"--- SKIP:" per test — count them
-  # separately. A SKIP is not evidence of execution, and a FAIL must
-  # fail the gate even if the test binary exited 0 (e.g. t.Fatal in a
-  # goroutine-adjacent helper reported oddly).
-  local passed failed skipped
-  passed=$(grep -cE '^\s*--- PASS:' "$log" 2>/dev/null || true)
-  failed=$(grep -cE '^\s*--- FAIL:' "$log" 2>/dev/null || true)
-  skipped=$(grep -cE '^\s*--- SKIP:' "$log" 2>/dev/null || true)
-  if [ "$failed" -gt 0 ] || [ "$passed" -le 0 ]; then
+  record_gate "$name" "PASS" 0 "$log"
+  echo "  PASS  $name (discovered=$discovered passed=$passed failed=$failed skipped=$skipped)"
+}
+
+run_effect_fabric_postgres_gate
+
+# provider-github-faults: dedicated evidence for the real external
+# provider qualification — github.issue.create fault injection at every
+# dispatch boundary, proving at-most-once external effect across crashes.
+# The tests also run inside effect-fabric-postgres; this gate emits their
+# own structured evidence file for the bundle.
+run_provider_github_faults_gate() {
+  local name="provider-github-faults"
+  local log="$EVIDENCE_DIR/gate-results/${name}.log"
+
+  if [ -z "${CRABBOX_TEST_DATABASE_URL:-}" ]; then
+    {
+      echo "command=run_provider_github_faults_gate"
+      echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      echo "---"
+      echo "SKIP: CRABBOX_TEST_DATABASE_URL not set"
+      echo "exit=1"
+      echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "$log"
+    record_gate "$name" "FAIL" 1 "$log"
+    echo "  FAIL  $name (CRABBOX_TEST_DATABASE_URL not set)"
+    return
+  fi
+
+  {
+    echo "command=go test -json -count=1 -timeout=120s -run TestLiveGitHub ./internal/execution/"
+    echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "---"
+  } > "$log"
+
+  local json_out="$EVIDENCE_DIR/provider-github-faults.json"
+  set +e
+  go test -json -count=1 -timeout=120s \
+    -run "TestLiveGitHub" \
+    ./internal/execution/ \
+    > "$json_out" 2>&1
+  local rc=$?
+  set -e
+  cat "$json_out" >> "$log"
+
+  {
+    echo "---"
+    echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "exit=$rc"
+  } >> "$log"
+
+  local discovered passed failed skipped
+  discovered=$(jq -r '[.[]? | select(.Test != null and (.Action == "pass" or .Action == "fail" or .Action == "skip"))] | length' \
+    < <(jq -s '.' "$json_out" 2>/dev/null || echo '[]') 2>/dev/null || echo 0)
+  passed=$(jq -r '[.[]? | select(.Test != null and .Action == "pass")] | length' \
+    < <(jq -s '.' "$json_out" 2>/dev/null || echo '[]') 2>/dev/null || echo 0)
+  failed=$(jq -r '[.[]? | select(.Test != null and .Action == "fail")] | length' \
+    < <(jq -s '.' "$json_out" 2>/dev/null || echo '[]') 2>/dev/null || echo 0)
+  skipped=$(jq -r '[.[]? | select(.Test != null and .Action == "skip")] | length' \
+    < <(jq -s '.' "$json_out" 2>/dev/null || echo '[]') 2>/dev/null || echo 0)
+
+  {
+    echo "tests_discovered=$discovered"
+    echo "tests_passed=$passed"
+    echo "tests_failed=$failed"
+    echo "tests_skipped=$skipped"
+  } >> "$log"
+
+  if [ "$rc" -ne 0 ] || [ "$failed" -gt 0 ] || [ "$passed" -le 0 ] || [ "$skipped" -gt 0 ]; then
     {
       echo ""
-      echo "FAIL: passed=$passed failed=$failed skipped=$skipped (mandatory live gate requires >0 passes and 0 failures)"
+      echo "FAIL: discovered=$discovered passed=$passed failed=$failed skipped=$skipped exit=$rc (provider fault gate requires >0 passes, 0 failures, 0 skips)"
       echo "exit=1"
     } >> "$log"
     record_gate "$name" "FAIL" 1 "$log"
-    echo "  FAIL  $name (passed=$passed failed=$failed skipped=$skipped)"
+    echo "  FAIL  $name (discovered=$discovered passed=$passed failed=$failed skipped=$skipped)"
+    cat "$log"
     return
   fi
 
   record_gate "$name" "PASS" 0 "$log"
-  echo "  PASS  $name ($passed passed, $skipped skipped)"
+  echo "  PASS  $name (discovered=$discovered passed=$passed failed=$failed skipped=$skipped)"
 }
 
-run_effect_fabric_postgres_gate
+run_provider_github_faults_gate
 
 # ─── Authority store live PostgreSQL gate ─────────────────────────────────────
 # Tests grant lookup, principal mismatch, capability mismatch, expiry,
@@ -594,7 +697,18 @@ extract_tests_executed() {
   local count=0
 
   case "$gate_name" in
-    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-cli|effect-fabric-contract|effect-fabric-reconciliation|effect-fabric-race|effect-fabric-postgres|authority-postgres)
+    effect-fabric-postgres|provider-github-faults)
+      # -json gates write structured accounting lines into the log:
+      #   tests_discovered=N / tests_passed=N / tests_failed=N / tests_skipped=N
+      # (the -json event stream has no "--- PASS:" lines to grep).
+      local d p f s
+      d=$(grep -oE '^tests_discovered=[0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$' || true)
+      p=$(grep -oE '^tests_passed=[0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$' || true)
+      f=$(grep -oE '^tests_failed=[0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$' || true)
+      s=$(grep -oE '^tests_skipped=[0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$' || true)
+      count=$((${d:-0} > 0 ? ${d:-0} : ${p:-0} + ${f:-0} + ${s:-0}))
+      ;;
+    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-cli|effect-fabric-contract|effect-fabric-reconciliation|effect-fabric-race|authority-postgres)
       # Go test with -v prints one line per test:
       #   --- PASS: TestName (0.00s)
       #   --- FAIL: TestName (0.00s)
@@ -748,6 +862,8 @@ cat > "$EVIDENCE_DIR/qualification.json" << EOF
     "npm": "$NPM_VERSION",
     "git": "$GIT_VERSION",
     "postgres_client": "$PG_VERSION",
+    "postgres_server": "$PG_SERVER_VERSION",
+    "effect_fabric_schema_version": "$SCHEMA_VERSION",
     "worker_package_version": "$WORKER_PKG_VERSION"
   },
   "environment": {

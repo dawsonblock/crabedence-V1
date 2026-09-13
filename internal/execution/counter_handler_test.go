@@ -3,6 +3,7 @@ package execution
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"testing"
 
 	"github.com/openclaw/crabbox/internal/capability"
@@ -78,6 +79,93 @@ func TestCounterResolverCrossPrincipal(t *testing.T) {
 	}
 }
 
+// TestCounterResolverCrossCapability verifies that the same principal
+// reusing the same idempotency key under a DIFFERENT capability is a
+// distinct durable execution — the store's uniqueness scope includes
+// capability_id.
+func TestCounterResolverCrossCapability(t *testing.T) {
+	h := NewCounterHandler()
+	desc := testCounterDescriptor()
+	ctx := context.Background()
+
+	h.Execute(ctx, Request{
+		Capability:     "test.counter.increment",
+		Arguments:      json.RawMessage(`{"counter":"shared","by":1}`),
+		Authority:      RequestAuthority{Principal: "alice@example.com"},
+		IdempotencyKey: "same-key",
+	}, desc)
+
+	// Same principal, same key, different capability: never ran.
+	res, err := h.Resolve(ctx, &idempotency.Record{
+		PrincipalID:    "alice@example.com",
+		CapabilityID:   "test.counter.other",
+		IdempotencyKey: "same-key",
+		RecoveryLocator: json.RawMessage(
+			`{"counter":"shared","by":1}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Decision == idempotency.RecoveryCommitted {
+		t.Error("FALSE POSITIVE: different capability resolved COMMITTED from another capability's execution")
+	}
+}
+
+// TestCounterResolverTokenGraft verifies that a locator carrying
+// another execution's external token cannot resolve this record — the
+// token identifies a specific execution and its recorded identity must
+// match the record's durable identity.
+func TestCounterResolverTokenGraft(t *testing.T) {
+	h := NewCounterHandler()
+	desc := testCounterDescriptor()
+	ctx := context.Background()
+
+	// Execution A runs under its token (as DispatchExecutor injects).
+	ctxA := context.WithValue(ctx, externalTokenKey{}, "ctr-op-exec-A")
+	h.Execute(ctxA, Request{
+		Capability:     "test.counter.increment",
+		Arguments:      json.RawMessage(`{"counter":"shared","by":1}`),
+		Authority:      RequestAuthority{Principal: "alice@example.com"},
+		IdempotencyKey: "k-exec-a",
+	}, desc)
+
+	// Record B (a different durable execution) carries A's token — the
+	// token matches an execution but the identities contradict.
+	res, err := h.Resolve(ctx, &idempotency.Record{
+		ExecutionID:    "exec-B",
+		PrincipalID:    "alice@example.com",
+		CapabilityID:   "test.counter.increment",
+		IdempotencyKey: "k-exec-b",
+		RecoveryLocator: json.RawMessage(
+			`{"external_token":"ctr-op-exec-A","extensions":{"counter":"shared","by":1}}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Decision == idempotency.RecoveryCommitted {
+		t.Error("FALSE POSITIVE: grafted token resolved a different execution COMMITTED")
+	}
+
+	// The genuine record for A still resolves via its token.
+	res, err = h.Resolve(ctx, &idempotency.Record{
+		ExecutionID:    "exec-A",
+		PrincipalID:    "alice@example.com",
+		CapabilityID:   "test.counter.increment",
+		IdempotencyKey: "k-exec-a",
+		RecoveryLocator: json.RawMessage(
+			`{"external_token":"ctr-op-exec-A","extensions":{"counter":"shared","by":1}}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Decision != idempotency.RecoveryCommitted {
+		t.Fatalf("genuine token record must resolve COMMITTED, got %s", res.Decision)
+	}
+	if res.ProviderRunID == "" {
+		t.Error("resolver must return the original provider run ID")
+	}
+}
+
 // TestCounterResolverAmountMismatch verifies that a recorded execution
 // with a different amount does not resolve — the locator's normalized
 // parameters must match the recorded effect.
@@ -124,21 +212,35 @@ func TestCounterPrepareRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var loc map[string]any
-	if err := json.Unmarshal(locator, &loc); err != nil {
+	if locator.ProviderID != "test-counter" {
+		t.Errorf("expected provider_id=test-counter, got %q", locator.ProviderID)
+	}
+	if locator.ExecutionID != "exec-1" {
+		t.Errorf("expected execution_id in locator, got %q", locator.ExecutionID)
+	}
+	if locator.PrincipalID != "alice@example.com" {
+		t.Errorf("expected principal in locator, got %q", locator.PrincipalID)
+	}
+	if locator.ExternalToken != "ctr-op-exec-1" {
+		t.Errorf("expected external token derived from execution_id, got %q", locator.ExternalToken)
+	}
+	var ext struct {
+		Counter string `json:"counter"`
+		By      int64  `json:"by"`
+	}
+	if err := json.Unmarshal(locator.Extensions, &ext); err != nil {
 		t.Fatal(err)
 	}
-	if loc["by"] != float64(1) {
-		t.Errorf("expected normalized by=1 (default applied), got %v", loc["by"])
+	if ext.By != 1 {
+		t.Errorf("expected normalized by=1 (default applied), got %v", ext.By)
 	}
-	if loc["counter"] != "x" {
-		t.Errorf("expected counter=x, got %v", loc["counter"])
+	if ext.Counter != "x" {
+		t.Errorf("expected counter=x, got %v", ext.Counter)
 	}
-	if loc["execution_id"] != "exec-1" {
-		t.Errorf("expected execution_id in locator, got %v", loc["execution_id"])
-	}
-	if loc["principal"] != "alice@example.com" {
-		t.Errorf("expected principal in locator, got %v", loc["principal"])
+	raw, _ := json.Marshal(locator)
+	var loc map[string]any
+	if err := json.Unmarshal(raw, &loc); err != nil {
+		t.Fatal(err)
 	}
 	if _, hasArgs := loc["arguments"]; hasArgs {
 		t.Error("provider locator must not embed raw arguments")
@@ -162,8 +264,8 @@ func TestCounterPrepareRecoveryEquivalence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(a) != string(b) {
-		t.Errorf("semantically equivalent args produced different locators:\n%s\n%s", a, b)
+	if !reflect.DeepEqual(a, b) {
+		t.Errorf("semantically equivalent args produced different locators:\n%+v\n%+v", a, b)
 	}
 }
 
@@ -176,15 +278,16 @@ func withArgs(in idempotency.RecoveryLocatorInput, args string) idempotency.Reco
 // never embeds raw arguments — only metadata needed for correlation.
 func TestGenericRecoveryLocatorMinimization(t *testing.T) {
 	desc := testCounterDescriptor()
-	locator := buildRecoveryLocator(Request{
+	locator := genericRecoveryLocator(Request{
 		Capability:     "test.counter.increment",
 		Arguments:      json.RawMessage(`{"counter":"secret-data","secret":"sensitive"}`),
 		Authority:      RequestAuthority{Principal: "alice@example.com"},
 		IdempotencyKey: "k1",
-	}, desc, "digest-1")
+	}, desc, "digest-1", "exec-1")
 
+	raw, _ := json.Marshal(locator)
 	var loc map[string]any
-	if err := json.Unmarshal(locator, &loc); err != nil {
+	if err := json.Unmarshal(raw, &loc); err != nil {
 		t.Fatal(err)
 	}
 	if _, hasArgs := loc["arguments"]; hasArgs {
@@ -196,7 +299,7 @@ func TestGenericRecoveryLocatorMinimization(t *testing.T) {
 	if loc["idempotency_key"] != "k1" {
 		t.Error("generic locator must carry idempotency_key")
 	}
-	if loc["principal"] != "alice@example.com" {
+	if loc["principal_id"] != "alice@example.com" {
 		t.Error("generic locator must carry principal")
 	}
 }
