@@ -3,7 +3,6 @@ package execution
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -155,12 +154,18 @@ func (h *GitHubIssueHandler) Execute(ctx context.Context, req Request, desc capa
 
 	httpResp, err := h.client.Do(httpReq)
 	if err != nil {
-		// Connection refused / DNS failures happen before any bytes
-		// were written — the provider never saw the request, so no
-		// effect is provable. Timeouts and mid-request drops are
-		// ambiguous: the request may have reached the provider.
-		definitive := errors.Is(err, syscall.ECONNREFUSED) ||
-			errors.Is(err, syscall.ECONNRESET) && !errors.Is(err, context.DeadlineExceeded)
+		// Only a failure provably BEFORE any request bytes were
+		// transmitted is a no-effect proof: the connection was refused
+		// or the name never resolved, so GitHub never saw the request.
+		// A TCP reset (ECONNRESET) is NOT definitive — the request may
+		// have been fully received and the issue created before the
+		// connection dropped. Everything else — resets, timeouts,
+		// mid-request drops — is ambiguous: UNKNOWN.
+		definitive := errors.Is(err, syscall.ECONNREFUSED)
+		var dnsErr *net.DNSError
+		if errors.As(err, &dnsErr) {
+			definitive = true // name resolution failed — no request sent
+		}
 		var ne net.Error
 		if errors.As(err, &ne) && ne.Timeout() {
 			definitive = false // timeout — may have executed
@@ -201,15 +206,12 @@ func (h *GitHubIssueHandler) Execute(ctx context.Context, req Request, desc capa
 			"issue_url":    runID,
 			"repo":         args.Repo,
 		})
-		sum := sha256.Sum256(result)
 		return Response{
-			Status: StatusSucceeded,
-			Result: result,
-			Evidence: &EvidenceRef{
-				Digest:         fmt.Sprintf("%x", sum),
-				ReceiptVersion: 3,
-			},
-			Execution: &ExecutionMeta{Provider: "github", RunID: runID},
+			Status:           StatusSucceeded,
+			Result:           result,
+			Evidence:         &EvidenceRef{ReceiptVersion: 3},
+			EvidenceArtifact: respBody, // raw provider response — digest is recomputed upstream
+			Execution:        &ExecutionMeta{Provider: "github", RunID: runID},
 		}
 	}
 
@@ -222,6 +224,7 @@ func (h *GitHubIssueHandler) Execute(ctx context.Context, req Request, desc capa
 		FailureCode:       string(capability.FailureExecutionFailed),
 		Error:             fmt.Sprintf("github returned %d: %s", httpResp.StatusCode, truncate(string(respBody), 512)),
 		DefinitiveFailure: definitive,
+		EvidenceArtifact:  respBody, // provider's rejection body — artifact for NO_EFFECT proof
 		Execution:         &ExecutionMeta{Provider: "github"},
 	}
 }
@@ -230,8 +233,9 @@ func (h *GitHubIssueHandler) Execute(ctx context.Context, req Request, desc capa
 // observational — a read-only marker scan, never a write — so duplicate
 // or racing resolvers are harmless. Marker found → COMMITTED with the
 // ORIGINAL provider run ID (the issue URL), never a fabricated one.
-// Marker absent after a successful authoritative listing → FAILED
-// (no-effect proof for this exercise).
+// Marker absent after exhausting all pages → UNKNOWN, not FAILED:
+// absence of positive evidence is not proof of no effect on an
+// eventually consistent provider listing.
 func (h *GitHubIssueHandler) Resolve(ctx context.Context, rec *idempotency.Record) (idempotency.RecoveryResult, error) {
 	var loc idempotency.RecoveryLocator
 	if len(rec.RecoveryLocator) > 0 {
@@ -254,65 +258,94 @@ func (h *GitHubIssueHandler) Resolve(ctx context.Context, rec *idempotency.Recor
 		return idempotency.RecoveryResult{Decision: idempotency.RecoveryUnknown}, nil
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		h.baseURL+"/repos/"+repo+"/issues?state=all&per_page=100", nil)
-	if err != nil {
-		return idempotency.RecoveryResult{}, err
-	}
-	httpReq.Header.Set("Accept", "application/vnd.github+json")
-	if h.token != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+h.token)
-	}
-	httpResp, err := h.client.Do(httpReq)
-	if err != nil {
-		return idempotency.RecoveryResult{}, fmt.Errorf("github issue list failed: %w", err)
-	}
-	defer httpResp.Body.Close()
-	respBody, _ := io.ReadAll(io.LimitReader(httpResp.Body, 4<<20))
-	if httpResp.StatusCode != http.StatusOK {
-		return idempotency.RecoveryResult{}, fmt.Errorf("github issue list returned %d", httpResp.StatusCode)
-	}
-
-	var issues []struct {
-		Number  int    `json:"number"`
-		HTMLURL string `json:"html_url"`
-		Body    string `json:"body"`
-	}
-	if err := json.Unmarshal(respBody, &issues); err != nil {
-		return idempotency.RecoveryResult{}, fmt.Errorf("github issue list unparseable: %w", err)
-	}
-
 	marker := opMarker(loc.ExternalToken)
-	for _, issue := range issues {
-		if strings.Contains(issue.Body, marker) {
-			result, _ := json.Marshal(map[string]any{
-				"issue_number": issue.Number,
-				"issue_url":    issue.HTMLURL,
-				"repo":         repo,
-			})
-			sum := sha256.Sum256(result)
-			return idempotency.RecoveryResult{
-				Decision:       idempotency.RecoveryCommitted,
-				Result:         result,
-				EvidenceDigest: fmt.Sprintf("%x", sum),
-				ReceiptVersion: 3,
-				ProviderID:     "github",
-				ProviderRunID:  issue.HTMLURL, // original provider run ID
-			}, nil
+	// Paginate completely. GitHub returns at most 100 issues per page;
+	// checking only page 1 would falsely conclude "no effect" when the
+	// marker sits on a later page. Follow Link rel="next" until the
+	// listing is exhausted (bounded to prevent pathological loops).
+	nextURL := h.baseURL + "/repos/" + repo + "/issues?state=all&per_page=100"
+	for pages := 0; nextURL != "" && pages < 50; pages++ {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, nextURL, nil)
+		if err != nil {
+			return idempotency.RecoveryResult{}, err
+		}
+		httpReq.Header.Set("Accept", "application/vnd.github+json")
+		if h.token != "" {
+			httpReq.Header.Set("Authorization", "Bearer "+h.token)
+		}
+		httpResp, err := h.client.Do(httpReq)
+		if err != nil {
+			return idempotency.RecoveryResult{}, fmt.Errorf("github issue list failed: %w", err)
+		}
+		respBody, _ := io.ReadAll(io.LimitReader(httpResp.Body, 4<<20))
+		linkHeader := httpResp.Header.Get("Link")
+		status := httpResp.StatusCode
+		httpResp.Body.Close()
+		if status != http.StatusOK {
+			return idempotency.RecoveryResult{}, fmt.Errorf("github issue list returned %d", status)
+		}
+
+		var rawIssues []json.RawMessage
+		if err := json.Unmarshal(respBody, &rawIssues); err != nil {
+			return idempotency.RecoveryResult{}, fmt.Errorf("github issue list unparseable: %w", err)
+		}
+		for _, rawIssue := range rawIssues {
+			var issue struct {
+				Number  int    `json:"number"`
+				HTMLURL string `json:"html_url"`
+				Body    string `json:"body"`
+			}
+			if err := json.Unmarshal(rawIssue, &issue); err != nil {
+				continue
+			}
+			if strings.Contains(issue.Body, marker) {
+				result, _ := json.Marshal(map[string]any{
+					"issue_number": issue.Number,
+					"issue_url":    issue.HTMLURL,
+					"repo":         repo,
+				})
+				return idempotency.RecoveryResult{
+					Decision:         idempotency.RecoveryCommitted,
+					Result:           result,
+					ReceiptVersion:   3,
+					ProviderID:       "github",
+					ProviderRunID:    issue.HTMLURL, // original provider run ID
+					EvidenceArtifact: rawIssue,      // raw provider object — digest recomputed by attestor
+				}, nil
+			}
+		}
+		nextURL = nextLinkURL(linkHeader)
+	}
+
+	// The marker was not found in the complete listing. That is absence
+	// of positive evidence, NOT proof of no effect: issue listing is
+	// eventually consistent — a freshly created issue may not yet be
+	// visible to a read-only scan. Without an authoritative provider
+	// operation-lookup API, a negative result stays UNKNOWN so the
+	// record remains reconcilable rather than terminally FAILED.
+	return idempotency.RecoveryResult{
+		Decision:   idempotency.RecoveryUnknown,
+		ProviderID: "github",
+		Result:     json.RawMessage(fmt.Sprintf(`{"repo":%q,"marker_absent":true}`, repo)),
+	}, nil
+}
+
+// nextLinkURL extracts the rel="next" URL from a GitHub Link header,
+// or "" when the listing is exhausted.
+func nextLinkURL(link string) string {
+	for _, part := range strings.Split(link, ",") {
+		sections := strings.Split(part, ";")
+		if len(sections) < 2 {
+			continue
+		}
+		urlPart := strings.TrimSpace(sections[0])
+		for _, attr := range sections[1:] {
+			if strings.TrimSpace(attr) == `rel="next"` {
+				return strings.Trim(urlPart, "<>")
+			}
 		}
 	}
-	// Authoritative listing succeeded and no issue carries the token —
-	// the effect provably did not happen under this execution.
-	result, _ := json.Marshal(map[string]any{"repo": repo, "marker_absent": true})
-	sum := sha256.Sum256(result)
-	return idempotency.RecoveryResult{
-		Decision:       idempotency.RecoveryFailed,
-		Result:         result,
-		EvidenceDigest: fmt.Sprintf("%x", sum),
-		ReceiptVersion: 3,
-		ProviderID:     "github",
-		ProviderRunID:  "none",
-	}, nil
+	return ""
 }
 
 func truncate(s string, n int) string {

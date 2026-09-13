@@ -323,6 +323,13 @@ type RecoveryResult struct {
 	// EvidenceReceipt carries the signed effect receipt (internal/
 	// evidence ReceiptV3) required for CRITICAL recovery decisions.
 	EvidenceReceipt json.RawMessage `json:"evidence_receipt,omitempty"`
+	// EvidenceArtifact carries the provider evidence bytes — e.g. the
+	// raw provider object proving the outcome. The attestor recomputes
+	// sha256(EvidenceArtifact) itself; a resolver-supplied digest is
+	// never signed. For CRITICAL executions a definitive decision
+	// without an artifact cannot be attested and stays UNKNOWN.
+	// Transient: never persisted.
+	EvidenceArtifact []byte `json:"-"`
 }
 
 // RecoveryResolver queries a provider to determine if an operation

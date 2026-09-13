@@ -22,11 +22,20 @@ const (
 )
 
 // VerifiedEvidence is what remains after an EvidenceVerifier has crossed
-// the authenticated-evidence boundary: artifact integrity recomputed,
-// signature verified, receipt version supported, and every binding field
-// (execution, request, provider, outcome) matched against the durable
-// record. The store consumes only this type for CRITICAL decisions —
-// callers cannot satisfy CRITICAL proof by supplying strings.
+// the authenticated-evidence boundary: a signature by a trusted signer
+// verified against a full binding (execution, request, provider, run ID,
+// outcome, evidence digest), receipt version supported, and every field
+// matched against the durable record. The store consumes only this type
+// for CRITICAL decisions — callers cannot satisfy CRITICAL proof by
+// supplying strings.
+//
+// Scope note: the attestation authenticates that a trusted signer
+// signed this digest and this outcome claim. The digest itself is
+// honest only because the dispatcher/reconciler recomputes it from the
+// provider's evidence artifact bytes before signing — a handler- or
+// resolver-supplied digest string is never signed. CRITICAL terminal
+// outcomes that lack a verifiable artifact are not attested and fail
+// closed to UNKNOWN.
 type VerifiedEvidence struct {
 	EvidenceDigest string
 	ReceiptVersion int

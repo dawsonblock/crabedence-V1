@@ -358,6 +358,15 @@ func hasDuplicateKeys(dec *json.Decoder) (bool, error) {
 // when the file does not exist.
 func LoadOrCreateSigner(path string) (*Signer, error) {
 	if data, err := os.ReadFile(path); err == nil {
+		// A private key that is group/other-accessible may have been
+		// copied — tighten it before trusting it. Fail closed if the
+		// permissions cannot be corrected.
+		if info, serr := os.Stat(path); serr == nil && info.Mode().Perm()&0o077 != 0 {
+			if cerr := os.Chmod(path, 0o600); cerr != nil {
+				return nil, fmt.Errorf("evidence key %s has permissive mode %04o and cannot be tightened: %w",
+					path, info.Mode().Perm(), cerr)
+			}
+		}
 		return ParseSignerPEM(data)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err

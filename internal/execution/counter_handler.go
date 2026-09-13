@@ -2,7 +2,6 @@ package execution
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"sync"
@@ -150,10 +149,15 @@ func (h *CounterHandler) Execute(ctx context.Context, req Request, desc capabili
 		"value":   newValue,
 		"by":      args.By,
 	})
+	// The evidence artifact is the provider's own execution record —
+	// the object that proves this execution caused the effect. The
+	// dispatcher recomputes its digest; the handler never supplies one.
+	artifact, _ := json.Marshal(exec)
 
 	return Response{
-		Status: StatusSucceeded,
-		Result: result,
+		Status:           StatusSucceeded,
+		Result:           result,
+		EvidenceArtifact: artifact,
 		Execution: &ExecutionMeta{
 			Provider: "test-counter",
 			RunID:    runID,
@@ -309,13 +313,16 @@ func (h *CounterHandler) Resolve(ctx context.Context, rec *idempotency.Record) (
 		"value":   value,
 		"by":      by,
 	})
-	evidenceDigest := fmt.Sprintf("%x", sha256.Sum256(result))
+	// The evidence artifact is the stored execution record — the
+	// provider-side object proving THIS execution caused the effect.
+	// The attestor recomputes its digest.
+	artifact, _ := json.Marshal(exec)
 	return idempotency.RecoveryResult{
-		Decision:       idempotency.RecoveryCommitted,
-		Result:         result,
-		EvidenceDigest: evidenceDigest,
-		ReceiptVersion: 3,
-		ProviderID:     "test-counter",
+		Decision:         idempotency.RecoveryCommitted,
+		Result:           result,
+		ReceiptVersion:   3,
+		ProviderID:       "test-counter",
+		EvidenceArtifact: artifact,
 		// Return the original provider run ID recorded at execution
 		// time — never a fabricated replacement.
 		ProviderRunID: exec.ProviderRunID,

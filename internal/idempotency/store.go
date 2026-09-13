@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // ─── Record ───────────────────────────────────────────────────────────
@@ -60,6 +61,13 @@ type Record struct {
 	ReconcileAttempt        int        `json:"reconcile_attempt,omitempty"`
 	NextReconcileAt         *time.Time `json:"next_reconcile_at,omitempty"`
 	LastReconcileError      string     `json:"last_reconcile_error,omitempty"`
+
+	// EnteredUnknownAt is when the record entered UNKNOWN — the start
+	// of the recovery condition. Recovery-locator retention is measured
+	// from this, not created_at: a long-lived execution that enters
+	// UNKNOWN recently must keep its locator for the full retention
+	// window.
+	EnteredUnknownAt *time.Time `json:"entered_unknown_at,omitempty"`
 }
 
 // ─── Store ───────────────────────────────────────────────────────────
@@ -144,7 +152,7 @@ func NewStoreWithConfig(db *sql.DB, cfg LeaseConfig) (*Store, error) {
 // requires. Startup verifies the migrated schema reaches this version —
 // a database older than the code fails closed rather than running
 // against a partial schema.
-const RequiredSchemaVersion = 3
+const RequiredSchemaVersion = 5
 
 // schemaMigration is one versioned, idempotent schema change. Each
 // migration must be safe to re-run (IF NOT EXISTS / addColumnIfMissing)
@@ -162,6 +170,8 @@ var schemaMigrations = []schemaMigration{
 	{1, "execution_requests_base", migrationBaseTable},
 	{2, "hot_path_indexes", migrationHotPathIndexes},
 	{3, "provider_observation_columns", migrationObservationColumns},
+	{4, "entered_unknown_at", migrationEnteredUnknownAt},
+	{5, "repair_invalid_indexes", migrationRepairInvalidIndexes},
 }
 
 func (s *Store) ensureSchema(ctx context.Context) error {
@@ -396,17 +406,82 @@ func migrationObservationColumns(ctx context.Context, conn *sql.Conn) error {
 // cannot run inside a transaction and two concurrent builds deadlock
 // each other, so the caller must hold the schema advisory lock on conn.
 func migrationHotPathIndexes(ctx context.Context, conn *sql.Conn) error {
-	indexes := []string{
-		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_exec_reconcile
+	for _, idx := range hotPathIndexes {
+		if err := ensureValidIndex(ctx, conn, idx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// hotPathIndex pairs an index name with its CREATE INDEX CONCURRENTLY
+// statement. The name is needed to detect and repair invalid indexes.
+type hotPathIndex struct {
+	name string
+	ddl  string
+}
+
+// hotPathIndexes is the set of concurrent indexes the ledger relies
+// on. Used by migration 2 (initial creation) and migration 5 (invalid-
+// index repair for deployments where a build was interrupted).
+var hotPathIndexes = []hotPathIndex{
+	{"idx_exec_reconcile", `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_exec_reconcile
 		 ON execution_requests (next_reconcile_at, updated_at)
-		 WHERE state = 'UNKNOWN'`,
-		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_exec_expired_leases
+		 WHERE state = 'UNKNOWN'`},
+	{"idx_exec_expired_leases", `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_exec_expired_leases
 		 ON execution_requests (lease_expires_at)
 		 WHERE state IN ('PREPARED', 'EXECUTING', 'IN_FLIGHT')
-		   AND lease_expires_at IS NOT NULL`,
+		   AND lease_expires_at IS NOT NULL`},
+}
+
+// ensureValidIndex creates an index CONCURRENTLY, first dropping any
+// invalid leftover from an interrupted CREATE INDEX CONCURRENTLY.
+// A failed/interrupted concurrent build leaves an invalid index that
+// "IF NOT EXISTS" would silently keep — the migration would record
+// success while PostgreSQL holds an unusable index. DROP INDEX
+// CONCURRENTLY removes the invalid shell before rebuilding.
+func ensureValidIndex(ctx context.Context, conn *sql.Conn, idx hotPathIndex) error {
+	var valid bool
+	err := conn.QueryRowContext(ctx, `
+		SELECT i.indisvalid
+		FROM pg_class c
+		JOIN pg_index i ON i.indexrelid = c.oid
+		WHERE c.relname = $1 AND c.relkind = 'i'
+	`, idx.name).Scan(&valid)
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("check index %s validity: %w", idx.name, err)
 	}
-	for _, idx := range indexes {
-		if _, err := conn.ExecContext(ctx, idx); err != nil {
+	if err == nil && !valid {
+		if _, err := conn.ExecContext(ctx,
+			fmt.Sprintf(`DROP INDEX CONCURRENTLY IF EXISTS %s`, idx.name)); err != nil {
+			return fmt.Errorf("drop invalid index %s: %w", idx.name, err)
+		}
+	}
+	if _, err := conn.ExecContext(ctx, idx.ddl); err != nil {
+		return fmt.Errorf("create index %s: %w", idx.name, err)
+	}
+	return nil
+}
+
+// migrationEnteredUnknownAt adds the entered_unknown_at column —
+// the timestamp the record entered UNKNOWN, used to measure recovery-
+// locator retention from the start of the recovery condition rather
+// than execution creation.
+func migrationEnteredUnknownAt(ctx context.Context, conn *sql.Conn) error {
+	if _, err := conn.ExecContext(ctx,
+		`ALTER TABLE execution_requests ADD COLUMN IF NOT EXISTS entered_unknown_at TIMESTAMPTZ`); err != nil {
+		return fmt.Errorf("column entered_unknown_at: %w", err)
+	}
+	return nil
+}
+
+// migrationRepairInvalidIndexes re-verifies every concurrent index and
+// rebuilds any left invalid by an interrupted CREATE INDEX
+// CONCURRENTLY — including deployments where migration 2 was already
+// recorded as applied before the interruption was discovered.
+func migrationRepairInvalidIndexes(ctx context.Context, conn *sql.Conn) error {
+	for _, idx := range hotPathIndexes {
+		if err := ensureValidIndex(ctx, conn, idx); err != nil {
 			return err
 		}
 	}
@@ -753,6 +828,7 @@ func (s *Store) markInFlightExpiredAsUnknown(ctx context.Context, rec *Record) (
 		SET state = 'UNKNOWN', version = version + 1,
 		    lease_owner = NULL, lease_token = NULL,
 		    lease_started_at = NULL, lease_expires_at = NULL,
+		    entered_unknown_at = clock_timestamp(),
 		    updated_at = clock_timestamp()
 		WHERE execution_id = $1
 		  AND version = $2
@@ -835,30 +911,45 @@ func (s *Store) MarkInFlight(ctx context.Context, executionID, leaseToken string
 	return nil
 }
 
-// forbiddenLocatorFields is a denylist of JSON object keys that must
-// never appear in a persisted recovery locator. Locators are lookup
-// coordinates — an execution- or provider-generated correlation token
-// ("external_token") is fine; credential material is not.
-var forbiddenLocatorFields = map[string]bool{
-	"password":       true,
-	"passwd":         true,
-	"secret":         true,
-	"client_secret":  true,
-	"api_key":        true,
-	"apikey":         true,
-	"private_key":    true,
-	"privatekey":     true,
-	"authorization":  true,
-	"credentials":    true,
-	"access_token":   true,
-	"refresh_token":  true,
-	"bearer":         true,
-	"session_cookie": true,
+// forbiddenLocatorKeyPatterns are normalized substrings that mark a
+// JSON object key as credential material. Keys are normalized by
+// lowercasing and stripping all non-alphanumeric characters, so
+// "clientSecret" → "clientsecret", "my_api_key" → "myapikey", and
+// "github_token" → "githubtoken" are all caught — exact-match
+// denylists are trivially bypassed by spelling variants.
+var forbiddenLocatorKeyPatterns = []string{
+	"secret", "password", "passwd", "passphrase",
+	"privatekey", "apikey", "accesskey", "secretkey",
+	"signingkey", "encryptionkey",
+	"accesstoken", "refreshtoken", "bearertoken", "authtoken",
+	"idtoken", "sessiontoken", "csrftoken",
+	"authorization", "credential", "sessioncookie", "bearer",
+	"token", // broad: any *token* key is suspect unless allowlisted below
+}
+
+// allowedLocatorKeys are normalized keys that look credential-shaped
+// but are legitimate locator schema fields — the durable execution's
+// correlation token is lookup material, not a credential.
+var allowedLocatorKeys = map[string]bool{
+	"externaltoken":  true,
+	"idempotencykey": true,
+}
+
+// normalizeLocatorKey strips separators and case so spelling variants
+// cannot evade the denylist.
+func normalizeLocatorKey(k string) string {
+	var b strings.Builder
+	b.Grow(len(k))
+	for _, r := range k {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			b.WriteRune(unicode.ToLower(r))
+		}
+	}
+	return b.String()
 }
 
 // forbiddenLocatorField returns the first denied key found anywhere in
-// the locator JSON tree, or "" when the locator is clean. Keys are
-// compared case-insensitively after separator normalization.
+// the locator JSON tree, or "" when the locator is clean.
 func forbiddenLocatorField(raw json.RawMessage) string {
 	if len(raw) == 0 {
 		return ""
@@ -874,9 +965,13 @@ func findForbiddenKey(v any) string {
 	switch t := v.(type) {
 	case map[string]any:
 		for k, val := range t {
-			norm := strings.ToLower(strings.ReplaceAll(k, "-", "_"))
-			if forbiddenLocatorFields[norm] {
-				return k
+			norm := normalizeLocatorKey(k)
+			if !allowedLocatorKeys[norm] {
+				for _, pat := range forbiddenLocatorKeyPatterns {
+					if strings.Contains(norm, pat) {
+						return k
+					}
+				}
 			}
 			if f := findForbiddenKey(val); f != "" {
 				return f
@@ -1234,6 +1329,7 @@ func (s *Store) EnterRecovery(ctx context.Context, executionID string, expectedS
 		    lease_owner = NULL, lease_token = NULL,
 		    lease_started_at = NULL, lease_expires_at = NULL,
 		    reconcile_owner = NULL, reconcile_lease_expires_at = NULL,
+		    entered_unknown_at = clock_timestamp(),
 		    updated_at = clock_timestamp()
 		WHERE execution_id = $1
 		  AND state = $2
@@ -1266,26 +1362,40 @@ func (s *Store) EnterRecoveryWithObservation(ctx context.Context, executionID st
 	if !isLegalTransition(expectedState, StateUnknown) {
 		return fmt.Errorf("%w: illegal recovery transition %s → UNKNOWN (only IN_FLIGHT may enter recovery)", LeaseStateConflict, expectedState)
 	}
+	obs = canonicalizeObservation(obs)
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE execution_requests
 		SET state = 'UNKNOWN', version = version + 1,
 		    lease_owner = NULL, lease_token = NULL,
 		    lease_started_at = NULL, lease_expires_at = NULL,
 		    reconcile_owner = NULL, reconcile_lease_expires_at = NULL,
-		    provider_id = $4, provider_run_id = $5,
-		    provider_status = $6, provider_result_digest = $7,
-		    provider_receipt_version = $8,
+		    entered_unknown_at = clock_timestamp(),
+		    provider_id = COALESCE($4::text, provider_id),
+		    provider_run_id = COALESCE($5::text, provider_run_id),
+		    provider_status = COALESCE($6::text, provider_status),
+		    result = COALESCE($10::jsonb, result),
+		    provider_result_digest = COALESCE($7::text, provider_result_digest),
+		    provider_receipt_version = COALESCE(NULLIF($8::int, 0), provider_receipt_version),
 		    provider_observed_at = clock_timestamp(),
-		    evidence_digest = $9, result = $10,
+		    evidence_digest = COALESCE($9::text, evidence_digest),
 		    updated_at = clock_timestamp()
 		WHERE execution_id = $1
 		  AND state = $2
 		  AND version = $3
+		  -- Same monotonic rule as RecordProviderObservation: supplied
+		  -- fields fill NULL columns and must equal any stored value.
+		  AND (provider_id IS NULL OR $4::text IS NULL OR provider_id = $4::text)
+		  AND (provider_run_id IS NULL OR $5::text IS NULL OR provider_run_id = $5::text)
+		  AND (provider_status IS NULL OR $6::text IS NULL OR provider_status = $6::text)
+		  AND (result IS NULL OR $10::jsonb IS NULL OR result = $10::jsonb)
+		  AND (provider_result_digest IS NULL OR $7::text IS NULL OR provider_result_digest = $7::text)
+		  AND (provider_receipt_version IS NULL OR provider_receipt_version = 0 OR NULLIF($8::int, 0) IS NULL OR provider_receipt_version = $8::int)
+		  AND (evidence_digest IS NULL OR $9::text IS NULL OR evidence_digest = $9::text)
 	`, executionID, string(expectedState), expectedVersion,
 		nullableString(obs.ProviderID), nullableString(obs.ProviderRunID),
 		nullableString(obs.ProviderStatus), nullableString(obs.ResultDigest),
 		obs.ReceiptVersion,
-		nullableString(obs.EvidenceDigest), nullableBytes(obs.Result))
+		nullableString(obs.EvidenceDigest), nullableString(string(obs.Result)))
 	if err != nil {
 		return err
 	}
@@ -1294,9 +1404,39 @@ func (s *Store) EnterRecoveryWithObservation(ctx context.Context, executionID st
 		return err
 	}
 	if rows == 0 {
-		return fmt.Errorf("%w: execution %s enter recovery with observation CAS failed (state/version mismatch)", LeaseStateConflict, executionID)
+		return s.classifyEnterRecoveryFailure(ctx, executionID, expectedState, expectedVersion)
 	}
 	return nil
+}
+
+// classifyEnterRecoveryFailure distinguishes a CAS failure (wrong
+// state/version) from a monotonic observation conflict so callers get
+// the correct typed error.
+func (s *Store) classifyEnterRecoveryFailure(ctx context.Context, executionID string, expectedState State, expectedVersion int) error {
+	rec, err := s.Lookup(ctx, executionID)
+	if err != nil {
+		return err
+	}
+	if rec.State != expectedState || rec.Version != expectedVersion {
+		return fmt.Errorf("%w: execution %s enter recovery with observation CAS failed (state/version mismatch)", LeaseStateConflict, executionID)
+	}
+	return fmt.Errorf("%w: execution %s observation contradicts stored provider data", ProviderObservationConflict, executionID)
+}
+
+// canonicalizeObservation canonicalizes the result payload and derives
+// its digest when omitted, so byte-level key ordering cannot create
+// false conflicts and stored digests are consistent.
+func canonicalizeObservation(obs ProviderObservation) ProviderObservation {
+	if len(obs.Result) > 0 {
+		if canonical, err := canonicalizeJSON(obs.Result); err == nil {
+			obs.Result = canonical
+		}
+		if obs.ResultDigest == "" {
+			sum := sha256.Sum256(obs.Result)
+			obs.ResultDigest = hex.EncodeToString(sum[:])
+		}
+	}
+	return obs
 }
 
 // ProviderObservation is the provider's durable response snapshot:
@@ -1348,19 +1488,7 @@ type ProviderObservation struct {
 // incremented — an observation is additive metadata, and bumping the
 // CAS token would invalidate reconciliation claims in flight.
 func (s *Store) RecordProviderObservation(ctx context.Context, executionID, leaseToken string, leaseGeneration int, obs ProviderObservation) error {
-	// Canonicalize the result so byte-level key ordering cannot create
-	// a false conflict, and derive the result digest when omitted.
-	result := obs.Result
-	resultDigest := obs.ResultDigest
-	if len(result) > 0 {
-		if canonical, err := canonicalizeJSON(result); err == nil {
-			result = canonical
-		}
-		if resultDigest == "" {
-			sum := sha256.Sum256(result)
-			resultDigest = hex.EncodeToString(sum[:])
-		}
-	}
+	obs = canonicalizeObservation(obs)
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE execution_requests
 		SET provider_id = COALESCE($4::text, provider_id),
@@ -1385,10 +1513,11 @@ func (s *Store) RecordProviderObservation(ctx context.Context, executionID, leas
 		  AND (result IS NULL OR $7::jsonb IS NULL OR result = $7::jsonb)
 		  AND (provider_result_digest IS NULL OR $8::text IS NULL OR provider_result_digest = $8::text)
 		  AND (evidence_digest IS NULL OR $9::text IS NULL OR evidence_digest = $9::text)
+		  AND (provider_receipt_version IS NULL OR provider_receipt_version = 0 OR NULLIF($10::int, 0) IS NULL OR provider_receipt_version = $10::int)
 	`, executionID, nullableString(leaseToken), leaseGeneration,
 		nullableString(obs.ProviderID), nullableString(obs.ProviderRunID),
-		nullableString(obs.ProviderStatus), nullableString(string(result)),
-		nullableString(resultDigest), nullableString(obs.EvidenceDigest),
+		nullableString(obs.ProviderStatus), nullableString(string(obs.Result)),
+		nullableString(obs.ResultDigest), nullableString(obs.EvidenceDigest),
 		obs.ReceiptVersion)
 	if err != nil {
 		return err
@@ -1457,10 +1586,13 @@ func (s *Store) RecoverExpiredPreDispatch(ctx context.Context, executionID strin
 }
 
 // ScrubStaleRecoveryLocators clears recovery_locator on UNKNOWN records
-// older than the given retention (measured from created_at). Recovery
-// locators may carry operation-identifying data; records that remain
-// unresolved past the retention window keep their UNKNOWN state but
-// stop retaining the locator. Returns the number of scrubbed records.
+// whose recovery condition is older than the given retention. The age
+// is measured from entered_unknown_at — when the record entered
+// UNKNOWN — not created_at: an execution created long ago that only
+// just became UNKNOWN must keep its locator for the full retention
+// window, or a single retention sweep would destroy its only provider
+// lookup coordinates. Records predating the column fall back to
+// created_at. Returns the number of scrubbed records.
 func (s *Store) ScrubStaleRecoveryLocators(ctx context.Context, olderThan time.Duration) (int64, error) {
 	if olderThan <= 0 {
 		return 0, fmt.Errorf("locator retention must be positive")
@@ -1470,7 +1602,7 @@ func (s *Store) ScrubStaleRecoveryLocators(ctx context.Context, olderThan time.D
 		SET recovery_locator = NULL
 		WHERE state = 'UNKNOWN'
 		  AND recovery_locator IS NOT NULL
-		  AND created_at < clock_timestamp() - make_interval(secs => $1)
+		  AND COALESCE(entered_unknown_at, created_at) < clock_timestamp() - make_interval(secs => $1)
 	`, pgInterval(olderThan))
 	if err != nil {
 		return 0, err
@@ -1632,7 +1764,8 @@ const selectColumns = `execution_id, idempotency_key, principal_id, capability_i
 	provider_observed_at, terminal_receipt_digest, evidence_receipt, recovery_locator,
 	COALESCE(attempt, 0), COALESCE(version, 1), created_at, updated_at,
 	reconcile_owner, reconcile_lease_expires_at,
-	COALESCE(reconcile_attempt, 0), next_reconcile_at, last_reconcile_error`
+	COALESCE(reconcile_attempt, 0), next_reconcile_at, last_reconcile_error,
+	entered_unknown_at`
 
 // selectColumnsER is selectColumns qualified with the `er` alias, for
 // use in UPDATE ... FROM ... RETURNING statements where the FROM clause
@@ -1647,7 +1780,8 @@ const selectColumnsER = `er.execution_id, er.idempotency_key, er.principal_id, e
 	er.provider_observed_at, er.terminal_receipt_digest, er.evidence_receipt, er.recovery_locator,
 	COALESCE(er.attempt, 0), COALESCE(er.version, 1), er.created_at, er.updated_at,
 	er.reconcile_owner, er.reconcile_lease_expires_at,
-	COALESCE(er.reconcile_attempt, 0), er.next_reconcile_at, er.last_reconcile_error`
+	COALESCE(er.reconcile_attempt, 0), er.next_reconcile_at, er.last_reconcile_error,
+	er.entered_unknown_at`
 
 // pgInterval converts a Go duration into a PostgreSQL interval
 // expression argument. make_interval(secs => x) accepts arbitrary
@@ -1946,7 +2080,7 @@ func scanRecordsWithReconcile(rows *sql.Rows) ([]*Record, error) {
 		var evidenceReceipt, recoveryLocator []byte
 		var leaseStartedAt, leaseExpiresAt sql.NullTime
 		var recOwner, lastRecErr sql.NullString
-		var recLeaseExp, nextRecAt sql.NullTime
+		var recLeaseExp, nextRecAt, enteredUnknownAt sql.NullTime
 		if err := rows.Scan(
 			&rec.ExecutionID, &rec.IdempotencyKey, &rec.PrincipalID,
 			&rec.CapabilityID, &rec.RequestDigest, &rec.GrantID,
@@ -1959,6 +2093,7 @@ func scanRecordsWithReconcile(rows *sql.Rows) ([]*Record, error) {
 			&terminalDigest, &evidenceReceipt, &recoveryLocator,
 			&rec.Attempt, &rec.Version, &rec.CreatedAt, &rec.UpdatedAt,
 			&recOwner, &recLeaseExp, &rec.ReconcileAttempt, &nextRecAt, &lastRecErr,
+			&enteredUnknownAt,
 		); err != nil {
 			return nil, err
 		}
@@ -1967,6 +2102,10 @@ func scanRecordsWithReconcile(rows *sql.Rows) ([]*Record, error) {
 		if providerObservedAt.Valid {
 			t := providerObservedAt.Time
 			rec.ProviderObservedAt = &t
+		}
+		if enteredUnknownAt.Valid {
+			t := enteredUnknownAt.Time
+			rec.EnteredUnknownAt = &t
 		}
 		rec.Result = json.RawMessage(resultJSON)
 		if leaseOwner.Valid {

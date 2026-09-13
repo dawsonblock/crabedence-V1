@@ -74,6 +74,16 @@ type Response struct {
 	// Finalize(). The flag is a routing signal; the proof is in
 	// the receipt fields.
 	DefinitiveFailure bool `json:"definitive_failure,omitempty"`
+
+	// EvidenceArtifact carries the provider evidence bytes the digest
+	// is computed FROM — e.g. the raw provider response body or the
+	// provider operation record. Crabedence recomputes
+	// sha256(EvidenceArtifact) itself before attesting or persisting
+	// an evidence digest; a handler-supplied digest string is never
+	// signed. For CRITICAL executions a terminal outcome without an
+	// artifact cannot be attested and fails closed to UNKNOWN.
+	// Transient: never serialized to the wire or the ledger.
+	EvidenceArtifact []byte `json:"-"`
 }
 
 // EvidenceRef is the evidence reference returned to the caller.

@@ -265,6 +265,14 @@ run_gate effect-fabric-contract go test -v -count=1 -timeout=60s \
 run_gate effect-fabric-reconciliation go test -v -count=1 -timeout=60s \
   ./internal/reconcile/
 
+# effect-fabric-evidence: the signed-receipt trust boundary that gates
+# every CRITICAL terminal transition. Signature verification, trusted-
+# signer enforcement, binding checks, tamper rejection, and signer
+# persistence are mandatory release evidence — vet compiles the
+# package but does not execute its adversarial tests.
+run_gate effect-fabric-evidence go test -v -race -count=1 -timeout=60s \
+  ./internal/evidence/
+
 # effect-fabric-race: race-detector run over the execution + idempotency
 # + capability + reconcile packages. Closes concurrent-acquisition races
 # and stale-worker fencing violations.
@@ -273,7 +281,7 @@ run_gate effect-fabric-reconciliation go test -v -count=1 -timeout=60s \
 # and are covered by effect-fabric-postgres separately).
 run_gate effect-fabric-race env -u CRABBOX_TEST_DATABASE_URL \
   go test -v -race -count=1 -timeout=120s \
-  ./internal/capability/ ./internal/execution/ ./internal/idempotency/ ./internal/reconcile/
+  ./internal/capability/ ./internal/execution/ ./internal/evidence/ ./internal/idempotency/ ./internal/reconcile/
 
 # ─── Phase 10-12: Live PostgreSQL gates ────────────────────────────────────
 echo ""
@@ -546,6 +554,21 @@ run_provider_github_faults_gate() {
 
 run_provider_github_faults_gate
 
+# provider-github-real-api: OPTIONAL real-provider qualification. The
+# httptest fault harness proves the adapter protocol deterministically;
+# this gate proves it against GitHub itself. Registered ONLY when a
+# test token and repo are configured — a missing gate is never recorded
+# as PASS, and a configured gate cannot pass by skipping.
+if [ -n "${CRABBOX_GITHUB_TEST_TOKEN:-}" ] && [ -n "${CRABBOX_GITHUB_TEST_REPO:-}" ]; then
+  run_gate provider-github-real-api env \
+    GITHUB_TOKEN="$CRABBOX_GITHUB_TEST_TOKEN" \
+    CRABBOX_GITHUB_TEST_REPO="$CRABBOX_GITHUB_TEST_REPO" \
+    go test -v -count=1 -timeout=120s \
+    -run "TestRealGitHubAPI" ./internal/execution/
+else
+  echo "  SKIP  provider-github-real-api (CRABBOX_GITHUB_TEST_TOKEN/CRABBOX_GITHUB_TEST_REPO not configured — gate not applicable)"
+fi
+
 # ─── Authority store live PostgreSQL gate ─────────────────────────────────────
 # Tests grant lookup, principal mismatch, capability mismatch, expiry,
 # revocation, and database error handling.
@@ -708,7 +731,7 @@ extract_tests_executed() {
       s=$(grep -oE '^tests_skipped=[0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$' || true)
       count=$((${d:-0} > 0 ? ${d:-0} : ${p:-0} + ${f:-0} + ${s:-0}))
       ;;
-    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-cli|effect-fabric-contract|effect-fabric-reconciliation|effect-fabric-race|authority-postgres)
+    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-cli|effect-fabric-contract|effect-fabric-reconciliation|effect-fabric-evidence|effect-fabric-race|authority-postgres)
       # Go test with -v prints one line per test:
       #   --- PASS: TestName (0.00s)
       #   --- FAIL: TestName (0.00s)

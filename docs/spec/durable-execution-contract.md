@@ -35,7 +35,13 @@ that violates one is defective, regardless of test results.
     request digest, provider ID, provider run ID, outcome, and
     evidence SHA-256. A syntactically valid digest alone is not proof.
     `DefinitiveFailure` is a routing hint for MUTATION; it is never
-    sufficient proof for CRITICAL `FAILED`.
+    sufficient proof for CRITICAL `FAILED`. The attested evidence
+    digest MUST be recomputed by the attestor from the provider's
+    evidence artifact bytes (e.g. the raw provider response or
+    operation record) — a handler- or resolver-supplied digest string
+    MUST NOT be signed. A CRITICAL terminal outcome without a
+    verifiable artifact cannot be attested and fails closed to
+    `UNKNOWN`.
 
 4.  **One terminal policy.** `Finalize` and `ResolveRecovery` MUST
     enforce identical proof requirements through a single shared
@@ -50,9 +56,19 @@ that violates one is defective, regardless of test results.
     return the original provider run ID, never a fabricated
     replacement.
 
-6.  **Resolvers are observational.** `RecoveryResolver.Resolve` MUST
-    be side-effect-free and idempotent. It may be invoked multiple
-    times and concurrently; it must never cause an external effect.
+6.  **Resolvers are observational and negative reads are not proof.**
+    `RecoveryResolver.Resolve` MUST be side-effect-free and idempotent.
+    It may be invoked multiple times and concurrently; it must never
+    cause an external effect. Finding the external operation is
+    positive evidence for `COMMITTED`; NOT finding it is only absence
+    of positive evidence. A negative lookup MUST default to `UNKNOWN`
+    unless the provider offers a strongly consistent operation-lookup
+    API that can genuinely prove non-execution — provider listing and
+    search APIs are typically eventually consistent. Provider transport
+    errors are definitive ONLY when the request provably never left
+    (connection refused, DNS failure); resets, timeouts, and
+    mid-request drops after transmission begins are ambiguous and
+    produce `UNKNOWN`.
 
 7.  **Database time is authoritative.** Lease timestamps, lease
     expiry, reconcile claim expiry, and reconcile backoff are computed
@@ -67,7 +83,11 @@ that violates one is defective, regardless of test results.
     token used in the external request. Raw arguments are a
     compatibility fallback only, subject to bounded size, redaction,
     and a retention window; `recovery_locator` is cleared on terminal
-    transition and scrubbed from stale `UNKNOWN` records.
+    transition and scrubbed from `UNKNOWN` records whose recovery
+    condition is older than the retention window — retention age is
+    measured from `entered_unknown_at`, never `created_at`, so a
+    long-lived execution that only just became `UNKNOWN` keeps its
+    locator for the full window.
 
 9.  **Lease and claim ownership are held until durable ownership is
     no longer required.** The execution heartbeat ends only after a

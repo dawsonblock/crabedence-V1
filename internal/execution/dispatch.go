@@ -2,6 +2,7 @@ package execution
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"sync"
@@ -260,6 +261,20 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	// may rewrite resp to an UNKNOWN wire response, but the durable
 	// observation must always carry what the provider actually said.
 	providerResp := resp
+	// Evidence authenticity boundary: the evidence digest is recomputed
+	// from the provider's evidence ARTIFACT bytes, never taken from a
+	// handler-supplied digest string. What the trusted signer attests
+	// is a digest Crabedence itself computed — a handler cannot invent
+	// a digest and have it blessed.
+	if len(resp.EvidenceArtifact) > 0 {
+		sum := sha256.Sum256(resp.EvidenceArtifact)
+		recomputed := fmt.Sprintf("%x", sum)
+		if resp.Evidence == nil {
+			resp.Evidence = &EvidenceRef{ReceiptVersion: 3}
+		}
+		resp.Evidence.Digest = recomputed
+		providerResp.Evidence = resp.Evidence
+	}
 	if e.postDispatchHook != nil {
 		e.postDispatchHook()
 	}
@@ -357,7 +372,11 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	// signature and binding against trusted signers — a well-formed but
 	// unsigned digest is not proof. Without a configured signer the
 	// receipt stays unsigned and the store fails closed below.
-	if desc.ExecutionClass == capability.ClassCritical && e.signer != nil {
+	// A CRITICAL terminal outcome can only be attested when the
+	// handler supplied an evidence ARTIFACT — bytes the digest was
+	// recomputed from. Without an artifact there is nothing to prove;
+	// leave the receipt unsigned and the store fails closed below.
+	if desc.ExecutionClass == capability.ClassCritical && e.signer != nil && len(resp.EvidenceArtifact) > 0 {
 		// The signed outcome is the semantic attestation about the
 		// external world, not the state name: COMMITTED requires
 		// COMPLETED proof; FAILED requires NO_EFFECT proof.

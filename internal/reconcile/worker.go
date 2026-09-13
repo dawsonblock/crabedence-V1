@@ -13,6 +13,7 @@ package reconcile
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"time"
@@ -285,16 +286,32 @@ func (w *Worker) reconcileOne(ctx context.Context, rec *idempotency.Record) erro
 		return w.releaseClaim(ctx, rec, nil)
 	}
 
+	// The evidence digest is recomputed from the resolver's evidence
+	// ARTIFACT bytes — a resolver-supplied digest is never signed.
+	// This is the same boundary the dispatch path enforces: what the
+	// trusted signer attests is a digest Crabedence itself computed.
+	if len(result.EvidenceArtifact) > 0 {
+		sum := sha256.Sum256(result.EvidenceArtifact)
+		result.EvidenceDigest = fmt.Sprintf("%x", sum)
+		if result.ReceiptVersion == 0 {
+			result.ReceiptVersion = 3
+		}
+	}
+
 	// CRITICAL decisions require a signed evidence receipt attested by
 	// a trusted signer. The worker signs on behalf of the verifying
 	// path — the receipt binds the resolver's verified outcome to this
 	// execution, provider identity, and evidence digest. Without a
-	// configured signer the decision cannot be proven; keep the record
-	// UNKNOWN rather than silently dropping the requirement.
+	// configured signer or a verifiable evidence artifact the decision
+	// cannot be proven; keep the record UNKNOWN rather than silently
+	// dropping the requirement.
 	if rec.ExecutionClass == "CRITICAL" &&
 		(result.Decision == idempotency.RecoveryCommitted || result.Decision == idempotency.RecoveryFailed) {
 		if w.signer == nil {
 			return w.releaseClaim(ctx, rec, fmt.Errorf("no evidence signer configured — cannot attest CRITICAL recovery"))
+		}
+		if len(result.EvidenceArtifact) == 0 {
+			return w.releaseClaim(ctx, rec, fmt.Errorf("no evidence artifact supplied — cannot attest CRITICAL recovery"))
 		}
 		signed, signErr := w.signer.Sign(evidence.Binding{
 			ExecutionID:    rec.ExecutionID,

@@ -2818,11 +2818,13 @@ func TestLiveEnterRecoveryWithObservation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Enter recovery with provider observation.
+	// Enter recovery with provider observation. The provider_id must
+	// match what MarkInFlight persisted — observations are monotonic,
+	// so a contradictory provider identity would conflict.
 	rec, _ := store.Lookup(ctx, execID)
 	err = store.EnterRecoveryWithObservation(ctx, execID, StateInFlight, rec.Version,
 		ProviderObservation{
-			ProviderID:     "github-adapter",
+			ProviderID:     "test-counter",
 			ProviderRunID:  "issue-98765",
 			ProviderStatus: "SUCCEEDED",
 			EvidenceDigest: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
@@ -2837,8 +2839,8 @@ func TestLiveEnterRecoveryWithObservation(t *testing.T) {
 	if rec.State != StateUnknown {
 		t.Fatalf("expected UNKNOWN, got %s", rec.State)
 	}
-	if rec.ProviderID != "github-adapter" {
-		t.Errorf("expected provider_id=github-adapter, got %q", rec.ProviderID)
+	if rec.ProviderID != "test-counter" {
+		t.Errorf("expected provider_id=test-counter, got %q", rec.ProviderID)
 	}
 	if rec.ProviderRunID != "issue-98765" {
 		t.Errorf("expected provider_run_id=issue-98765, got %q", rec.ProviderRunID)
@@ -3045,6 +3047,32 @@ func TestLiveRecordProviderObservation(t *testing.T) {
 		t.Errorf("conflicting observation on UNKNOWN must return PROVIDER_OBSERVATION_CONFLICT, got %v", err)
 	}
 
+	// Receipt version is monotonic too: filling an unset version is
+	// idempotent, but a CONTRADICTORY version conflicts — a stale
+	// worker must not rewrite the observation's receipt version.
+	err = store.RecordProviderObservation(ctx, execIDU, "", 0, ProviderObservation{
+		ReceiptVersion: 5,
+	})
+	if err != nil {
+		t.Errorf("filling unset receipt version must be idempotent, got %v", err)
+	}
+	err = store.RecordProviderObservation(ctx, execIDU, "", 0, ProviderObservation{
+		ReceiptVersion: 5,
+	})
+	if err != nil {
+		t.Errorf("identical receipt version must be idempotent, got %v", err)
+	}
+	err = store.RecordProviderObservation(ctx, execIDU, "", 0, ProviderObservation{
+		ReceiptVersion: 7,
+	})
+	if err == nil || !errors.Is(err, ProviderObservationConflict) {
+		t.Errorf("conflicting receipt version must return PROVIDER_OBSERVATION_CONFLICT, got %v", err)
+	}
+	recU, _ = store.Lookup(ctx, execIDU)
+	if recU.ProviderReceiptVersion != 5 {
+		t.Errorf("conflicting receipt version must not overwrite, got %d", recU.ProviderReceiptVersion)
+	}
+
 	// Case 3: terminal records reject observations.
 	acq2, err := store.Acquire(ctx, prefix+"-terminal", "alice@example.com", "test.counter.increment",
 		"digest-obs-2", "grant_o", "MUTATION", time.Minute)
@@ -3224,6 +3252,11 @@ func TestLiveScrubStaleRecoveryLocators(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	rec, _ = store.Lookup(ctx, execID)
+	if rec.EnteredUnknownAt == nil {
+		t.Fatal("entered_unknown_at must be set on recovery entry")
+	}
+
 	// Not yet old enough — a 1-hour retention must not scrub.
 	n, err := store.ScrubStaleRecoveryLocators(ctx, time.Hour)
 	if err != nil {
@@ -3234,9 +3267,26 @@ func TestLiveScrubStaleRecoveryLocators(t *testing.T) {
 		t.Error("locator scrubbed before retention elapsed")
 	}
 
-	// Age the record past the retention window.
+	// Retention is measured from entered_unknown_at, NOT created_at:
+	// an execution created long ago that just entered UNKNOWN keeps
+	// its locator for the full window — aging created_at alone must
+	// not scrub it.
 	if _, err := db.ExecContext(ctx,
-		`UPDATE execution_requests SET created_at = clock_timestamp() - interval '2 hours' WHERE execution_id = $1`,
+		`UPDATE execution_requests SET created_at = clock_timestamp() - interval '30 days' WHERE execution_id = $1`,
+		execID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ScrubStaleRecoveryLocators(ctx, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	rec, _ = store.Lookup(ctx, execID)
+	if len(rec.RecoveryLocator) == 0 {
+		t.Error("locator scrubbed on created_at age — retention must measure from entered_unknown_at")
+	}
+
+	// Aging the recovery condition itself past the window scrubs.
+	if _, err := db.ExecContext(ctx,
+		`UPDATE execution_requests SET entered_unknown_at = clock_timestamp() - interval '2 hours' WHERE execution_id = $1`,
 		execID); err != nil {
 		t.Fatal(err)
 	}
@@ -3306,6 +3356,13 @@ func TestLiveRecoveryLocatorBounds(t *testing.T) {
 		`{"extensions":{"private-key":"-----BEGIN"}}`,
 		`{"data":[{"PASSWORD":"hunter2"}]}`,
 		`{"client_secret":"abc"}`,
+		// Spelling variants an exact-match denylist would miss.
+		`{"github_token":"ghp_abc"}`,
+		`{"db_password":"pw"}`,
+		`{"clientSecret":"cs"}`,
+		`{"my_api_key":"mk"}`,
+		`{"aws_access_key_id":"AKIA..."}`,
+		`{"oauth":{"refreshToken":"rt"}}`,
 	} {
 		if err := store.MarkInFlight(ctx, execID, token, gen, "p", json.RawMessage(raw)); !errors.Is(err, LocatorContainsSecret) {
 			t.Errorf("locator %s: expected LocatorContainsSecret, got %v", raw, err)

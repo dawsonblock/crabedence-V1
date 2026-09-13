@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -66,6 +67,30 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 		return fmt.Errorf("failed to register system.info: %w", err)
 	}
 
+	// github.issue.create is opt-in: it is registered only when
+	// explicitly configured via CRABBOX_GITHUB_TOKEN (or GITHUB_TOKEN)
+	// or CRABBOX_GITHUB_ENABLED. Enabling without a token fails closed
+	// at startup rather than registering a capability that cannot run.
+	githubToken := os.Getenv("CRABBOX_GITHUB_TOKEN")
+	if githubToken == "" {
+		githubToken = os.Getenv("GITHUB_TOKEN")
+	}
+	githubEnabled := os.Getenv("CRABBOX_GITHUB_ENABLED") == "true" || githubToken != ""
+	var githubHandler *GitHubIssueHandler
+	if githubEnabled {
+		if githubToken == "" {
+			return fmt.Errorf("github.issue.create enabled (CRABBOX_GITHUB_ENABLED) but no CRABBOX_GITHUB_TOKEN or GITHUB_TOKEN configured")
+		}
+		baseURL := os.Getenv("CRABBOX_GITHUB_API_URL")
+		if baseURL == "" {
+			baseURL = "https://api.github.com"
+		}
+		githubHandler = NewGitHubIssueHandler(baseURL, githubToken)
+		if err := RegisterGitHubIssueCapability(registry); err != nil {
+			return fmt.Errorf("failed to register github.issue.create: %w", err)
+		}
+	}
+
 	// Create handlers
 	echoHandler := NewEchoHandler()
 	counterHandler := NewCounterHandler()
@@ -97,35 +122,54 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	}
 
 	// Evidence signer: the execution service attests CRITICAL terminal
-	// outcomes with an Ed25519-signed effect receipt. The key is shared
-	// with the CLI attest key (~/.config/crabbox/attest/id_ed25519.pem)
-	// so the deployment has one signer identity. Without durable storage
-	// there is nothing to sign for — MUTATION/CRITICAL fail closed
-	// before this path matters.
+	// outcomes with an Ed25519-signed effect receipt.
+	//
+	// Deployment configuration (multi-replica safe):
+	//   CRABBOX_EVIDENCE_KEY — path to the Ed25519 signing key PEM.
+	//     Replicas MUST share the same key material (mounted secret)
+	//     or receipts signed by one replica will be rejected by another.
+	//     Default: the CLI attest key path (~/.config/crabbox/attest/).
+	//   CRABBOX_EVIDENCE_TRUSTED_SIGNERS — comma-separated additional
+	//     signer fingerprints the store trusts, for key rotation or
+	//     distinct signing identities across replicas.
 	var signer *evidence.Signer
 	if store != nil {
-		keyPath, err := evidenceKeyPath()
-		if err != nil {
-			return fmt.Errorf("failed to resolve evidence key path: %w", err)
+		keyPath := os.Getenv("CRABBOX_EVIDENCE_KEY")
+		if keyPath == "" {
+			var err error
+			keyPath, err = evidenceKeyPath()
+			if err != nil {
+				return fmt.Errorf("failed to resolve evidence key path: %w", err)
+			}
 		}
+		var err error
 		signer, err = evidence.LoadOrCreateSigner(keyPath)
 		if err != nil {
 			return fmt.Errorf("failed to load evidence signer: %w", err)
 		}
-		// The store trusts this signer (and only this signer) for
-		// CRITICAL proof. Deployments with multiple signing identities
-		// can extend the set at initialization time.
-		store.SetTrustedEvidenceSigners(signer.Fingerprint())
+		trusted := []string{signer.Fingerprint()}
+		if extra := os.Getenv("CRABBOX_EVIDENCE_TRUSTED_SIGNERS"); extra != "" {
+			for _, fp := range strings.Split(extra, ",") {
+				if fp = strings.TrimSpace(fp); fp != "" {
+					trusted = append(trusted, fp)
+				}
+			}
+		}
+		store.SetTrustedEvidenceSigners(trusted...)
 	}
 
 	// Create a multi-handler that dispatches based on adapter ID
 	// If we have a durable store, wrap it in a DispatchExecutor
 	var handler Handler
-	multiHandler := NewMultiHandler(map[string]Handler{
+	handlers := map[string]Handler{
 		"system":       echoHandler,
 		"test-counter": counterHandler,
 		"system-info":  infoHandler,
-	})
+	}
+	if githubHandler != nil {
+		handlers["github"] = githubHandler
+	}
+	multiHandler := NewMultiHandler(handlers)
 
 	if store != nil {
 		// Use DispatchExecutor for durable idempotency
@@ -163,6 +207,9 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	if store != nil && opts.ReconcileInterval > 0 {
 		worker := reconcile.NewWorker(store, reconcile.NoopResolver{}, durationSeconds(opts.ReconcileInterval))
 		worker.RegisterResolver("test.counter.increment", counterHandler)
+		if githubHandler != nil {
+			worker.RegisterResolver("github.issue.create", githubHandler)
+		}
 		worker.SetEvidenceSigner(signer)
 		go worker.Run(ctx)
 	}
