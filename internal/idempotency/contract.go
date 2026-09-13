@@ -198,6 +198,15 @@ type TerminalReceipt struct {
 	ProviderRunID   string          `json:"provider_run_id"`
 	EvidenceDigest  string          `json:"evidence_digest,omitempty"`
 	ReceiptVersion  int             `json:"receipt_version,omitempty"`
+	// EvidenceReceipt carries the signed effect receipt
+	// (internal/evidence ReceiptV3) for CRITICAL executions. It is
+	// deliberately excluded from Digest(): two signers attesting the
+	// same terminal outcome produce different serialized receipts
+	// (distinct keys and issued_at), and including it would turn
+	// concurrent identical finalization into a false conflict. The
+	// digest still binds EvidenceDigest, which the signed receipt
+	// itself binds — the receipt authenticates the digest.
+	EvidenceReceipt json.RawMessage `json:"evidence_receipt,omitempty"`
 	FinalizedAt     time.Time       `json:"finalized_at"`
 }
 
@@ -296,6 +305,9 @@ type RecoveryResult struct {
 	ReceiptVersion int              `json:"receipt_version,omitempty"`
 	ProviderID     string           `json:"provider_id,omitempty"`
 	ProviderRunID  string           `json:"provider_run_id,omitempty"`
+	// EvidenceReceipt carries the signed effect receipt (internal/
+	// evidence ReceiptV3) required for CRITICAL recovery decisions.
+	EvidenceReceipt json.RawMessage `json:"evidence_receipt,omitempty"`
 }
 
 // RecoveryResolver queries a provider to determine if an operation
@@ -304,14 +316,32 @@ type RecoveryResult struct {
 // The returned RecoveryResult must contain VERIFIED evidence — not
 // merely a syntactically valid digest string. For CRITICAL executions,
 // the resolver must have actually queried the provider and confirmed
-// the outcome. Fabricated digests are rejected by the store's proof
-// requirements but the resolver contract requires genuine verification.
+// the outcome, and the result must carry an EvidenceReceipt signed by
+// a trusted signer binding the decision to this execution, provider,
+// and evidence digest. A well-formed but unsigned digest is NOT proof:
+// the store rejects definitive CRITICAL recovery without a verified
+// signed receipt.
 //
 // Implementations should be side-effect-free: Resolve() may be called
 // multiple times for the same record (retries, concurrent workers).
 // It must not itself perform mutations — it only queries.
 type RecoveryResolver interface {
 	Resolve(ctx context.Context, record *Record) (RecoveryResult, error)
+}
+
+// RecoveryLocatorInput carries the dispatch context a provider needs
+// to build a recovery locator. Arguments is the raw request argument
+// blob — the provider is responsible for extracting only what it needs
+// and applying its own semantic normalization (defaults, derived
+// fields) before embedding anything in the locator.
+type RecoveryLocatorInput struct {
+	ExecutionID    string
+	AdapterID      string
+	CapabilityID   string
+	Principal      string
+	IdempotencyKey string
+	RequestDigest  string
+	Arguments      json.RawMessage
 }
 
 // RecoveryLocatorProvider generates a provider-specific recovery
@@ -324,24 +354,29 @@ type RecoveryResolver interface {
 // minimal locator. The provider decides what it needs for recovery;
 // the store persists whatever it returns.
 //
-// If a provider does not implement this interface, the generic
-// buildRecoveryLocator produces a snapshot containing the request
-// metadata and arguments as a fallback.
+// If a provider does not implement this interface, DispatchExecutor
+// falls back to a minimal generic locator containing request metadata
+// only — never raw arguments.
 type RecoveryLocatorProvider interface {
 	// PrepareRecovery generates the recovery locator before dispatch.
 	// The locator is persisted atomically with the IN_FLIGHT transition.
 	// It should contain provider-specific lookup coordinates — NOT the
 	// raw request arguments (which may contain sensitive data).
-	PrepareRecovery(ctx context.Context, capabilityID string, idempotencyKey string, requestDigest string, args json.RawMessage) (json.RawMessage, error)
+	//
+	// An error fails the dispatch pre-dispatch (safe FAILED): crossing
+	// the IN_FLIGHT boundary without a persistable recovery locator
+	// would leave a potential side effect undiscoverable.
+	PrepareRecovery(ctx context.Context, in RecoveryLocatorInput) (json.RawMessage, error)
 }
 
-// CanonicalizeArguments normalizes a JSON argument blob so that
-// semantically equivalent inputs produce identical bytes. This is
-// used by recovery locators to store the canonical form — the form
-// that was actually executed — rather than the raw request bytes.
-// Without canonicalization, a request with {"by":0} (defaulted to 1)
-// would produce a recovery locator that disagrees with the executed
-// parameters.
+// CanonicalizeArguments canonicalizes a JSON argument blob — parses and
+// re-marshals with sorted object keys so that byte-level differences in
+// key ordering produce identical output. This is purely a JSON-level
+// transform: it does NOT apply provider semantics such as default
+// values ({"by":0} and {"by":1} remain distinct even when a provider
+// treats 0 as "use the default"). Provider argument normalization is
+// the provider's job inside PrepareRecovery — the two operations must
+// not be conflated.
 func CanonicalizeArguments(raw json.RawMessage) (json.RawMessage, error) {
 	return canonicalizeJSON(raw)
 }

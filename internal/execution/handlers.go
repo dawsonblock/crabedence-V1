@@ -2,8 +2,11 @@ package execution
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 
 	"github.com/openclaw/crabbox/internal/capability"
+	"github.com/openclaw/crabbox/internal/idempotency"
 )
 
 // MultiHandler dispatches to different handlers based on the adapter ID
@@ -28,6 +31,24 @@ func (h *MultiHandler) Execute(ctx context.Context, req Request, desc capability
 		}
 	}
 	return handler.Execute(ctx, req, desc)
+}
+
+// PrepareRecovery implements idempotency.RecoveryLocatorProvider by
+// delegating to the adapter's handler. Handlers that implement the
+// contract produce minimal provider-specific locators; handlers that
+// don't return (nil, nil) so DispatchExecutor falls back to the generic
+// metadata-only locator. An unregistered adapter fails closed — the
+// dispatch boundary must not be crossed without recovery coordinates.
+func (h *MultiHandler) PrepareRecovery(ctx context.Context, in idempotency.RecoveryLocatorInput) (json.RawMessage, error) {
+	handler, ok := h.handlers[in.AdapterID]
+	if !ok {
+		return nil, fmt.Errorf("no handler registered for adapter: %s", in.AdapterID)
+	}
+	provider, ok := handler.(idempotency.RecoveryLocatorProvider)
+	if !ok {
+		return nil, nil
+	}
+	return provider.PrepareRecovery(ctx, in)
 }
 
 // Execute implements Handler for DispatchExecutor.

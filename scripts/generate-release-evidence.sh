@@ -384,23 +384,24 @@ run_effect_fabric_postgres_gate() {
   fi
 
   {
-    echo "command=go test -v -count=1 -timeout=300s -run TestLiveEffectFabric ./internal/idempotency/ && go test -v -count=1 -timeout=300s -run TestLiveConcurrent ./internal/execution/"
+    echo "command=go test -v -count=1 -p 1 -timeout=300s -run TestLive ./internal/idempotency/ ./internal/reconcile/ ./internal/execution/"
     echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "---"
   } > "$log"
 
   set +e
-  go test -v -count=1 -timeout=300s \
-    -run "TestLiveEffectFabric|TestLiveStore" \
-    ./internal/idempotency/ >> "$log" 2>&1
-  local rc1=$?
-  # Also run the 100-way concurrent mutation dispatch test (CRAB-V1-021).
-  go test -v -count=1 -timeout=300s \
-    -run "TestLiveConcurrentIdenticalMutationSingleDispatch" \
-    ./internal/execution/ >> "$log" 2>&1
-  local rc2=$?
+  # Run ALL live PostgreSQL tests in the effect-fabric packages — not a
+  # curated name pattern. A pattern that silently excludes new live
+  # tests (as "TestLiveEffectFabric|TestLiveStore" did) lets release
+  # evidence claim coverage that was never exercised. -p 1 serializes
+  # the packages: all three share one database, and the reconcile
+  # worker's table-wide claim batch would otherwise race another
+  # package's live assertions.
+  go test -v -count=1 -p 1 -timeout=300s \
+    -run "TestLive" \
+    ./internal/idempotency/ ./internal/reconcile/ ./internal/execution/ >> "$log" 2>&1
+  local rc=$?
   set -e
-  local rc=$((rc1 + rc2))
 
   {
     echo "---"
@@ -416,23 +417,28 @@ run_effect_fabric_postgres_gate() {
     return
   fi
 
-  # Verify tests actually executed (not skipped). With -v, Go test
-  # prints "--- PASS:"/"--- FAIL:"/"--- SKIP:" per test. Count those.
-  local executed
-  executed=$(grep -cE '^\s*--- (PASS|FAIL|SKIP):' "$log" 2>/dev/null || true)
-  if [ "$executed" -le 0 ]; then
+  # Verify tests actually executed and passed. With -v, Go test prints
+  # "--- PASS:"/"--- FAIL:"/"--- SKIP:" per test — count them
+  # separately. A SKIP is not evidence of execution, and a FAIL must
+  # fail the gate even if the test binary exited 0 (e.g. t.Fatal in a
+  # goroutine-adjacent helper reported oddly).
+  local passed failed skipped
+  passed=$(grep -cE '^\s*--- PASS:' "$log" 2>/dev/null || true)
+  failed=$(grep -cE '^\s*--- FAIL:' "$log" 2>/dev/null || true)
+  skipped=$(grep -cE '^\s*--- SKIP:' "$log" 2>/dev/null || true)
+  if [ "$failed" -gt 0 ] || [ "$passed" -le 0 ]; then
     {
       echo ""
-      echo "FAIL: 0 tests executed (all skipped or no match)"
+      echo "FAIL: passed=$passed failed=$failed skipped=$skipped (mandatory live gate requires >0 passes and 0 failures)"
       echo "exit=1"
     } >> "$log"
     record_gate "$name" "FAIL" 1 "$log"
-    echo "  FAIL  $name (0 tests executed)"
+    echo "  FAIL  $name (passed=$passed failed=$failed skipped=$skipped)"
     return
   fi
 
   record_gate "$name" "PASS" 0 "$log"
-  echo "  PASS  $name ($executed tests executed)"
+  echo "  PASS  $name ($passed passed, $skipped skipped)"
 }
 
 run_effect_fabric_postgres_gate

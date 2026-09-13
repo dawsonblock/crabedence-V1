@@ -142,6 +142,7 @@ func TestLiveWorkerReconciliation(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a MUTATION record in UNKNOWN state.
+	db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key = 'test-worker-reconcile'`)
 	acq, err := store.Acquire(ctx, "test-worker-reconcile", "alice@example.com", "test.counter.increment",
 		"digest-worker", "grant_w", "MUTATION", time.Minute)
 	if err != nil {
@@ -213,6 +214,7 @@ func TestLiveWorkerReconcileCriticalFailedWithoutProof(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a CRITICAL record in UNKNOWN state.
+	db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key = 'test-worker-crit'`)
 	acq, err := store.Acquire(ctx, "test-worker-crit", "alice@example.com", "test.critical.deploy",
 		"digest-crit", "grant_c", "CRITICAL", time.Minute)
 	if err != nil {

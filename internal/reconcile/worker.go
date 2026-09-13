@@ -17,6 +17,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/openclaw/crabbox/internal/evidence"
 	"github.com/openclaw/crabbox/internal/idempotency"
 )
 
@@ -40,6 +41,14 @@ type Worker struct {
 	workerID      string
 	batchSize     int
 	claimDuration time.Duration
+	// locatorRetention bounds how long a recovery_locator is retained
+	// on an UNKNOWN record. Locators may carry operation-identifying
+	// data; records unresolved past the retention window are scrubbed.
+	locatorRetention time.Duration
+	// signer attests definitive CRITICAL recovery decisions. Without
+	// it, the worker cannot produce the signed evidence receipt the
+	// store requires for CRITICAL — such records stay UNKNOWN.
+	signer *evidence.Signer
 }
 
 // NewWorker creates a reconciliation worker with a default resolver.
@@ -47,13 +56,14 @@ type Worker struct {
 // is registered.
 func NewWorker(store *idempotency.Store, defaultResolver idempotency.RecoveryResolver, interval time.Duration) *Worker {
 	return &Worker{
-		store:         store,
-		resolvers:     make(map[string]idempotency.RecoveryResolver),
-		default_:      defaultResolver,
-		interval:      interval,
-		workerID:      fmt.Sprintf("reconcile-%d", os.Getpid()),
-		batchSize:     100,
-		claimDuration: 5 * time.Minute,
+		store:            store,
+		resolvers:        make(map[string]idempotency.RecoveryResolver),
+		default_:         defaultResolver,
+		interval:         interval,
+		workerID:         fmt.Sprintf("reconcile-%d", os.Getpid()),
+		batchSize:        100,
+		claimDuration:    5 * time.Minute,
+		locatorRetention: 7 * 24 * time.Hour,
 	}
 }
 
@@ -66,6 +76,18 @@ func (w *Worker) SetBatchSize(n int) { w.batchSize = n }
 
 // SetClaimDuration overrides the default claim duration (5 min).
 func (w *Worker) SetClaimDuration(d time.Duration) { w.claimDuration = d }
+
+// SetLocatorRetention overrides the default recovery-locator retention
+// (7 days). UNKNOWN records older than the retention have their
+// recovery_locator scrubbed — they stay UNKNOWN but stop retaining
+// potentially sensitive locator data.
+func (w *Worker) SetLocatorRetention(d time.Duration) { w.locatorRetention = d }
+
+// SetEvidenceSigner configures the Ed25519 receipt signer used to
+// attest definitive CRITICAL recovery decisions. The signer must be a
+// trusted evidence signer on the store (SetTrustedEvidenceSigners) or
+// the store will reject the receipts it produces.
+func (w *Worker) SetEvidenceSigner(s *evidence.Signer) { w.signer = s }
 
 // RegisterResolver registers a capability-specific recovery resolver.
 // When a UNKNOWN record's capability_id matches, this resolver is used
@@ -132,6 +154,17 @@ func (w *Worker) reconcileAll(ctx context.Context) error {
 		}
 	}
 
+	// Category 3: retention — scrub recovery locators on UNKNOWN
+	// records older than the retention window. Locators may carry
+	// operation-identifying data that should not live forever.
+	if w.locatorRetention > 0 {
+		if n, err := w.store.ScrubStaleRecoveryLocators(ctx, w.locatorRetention); err != nil {
+			fmt.Printf("recovery locator scrub failed: %v\n", err)
+		} else if n > 0 {
+			fmt.Printf("scrubbed recovery locators on %d stale UNKNOWN record(s)\n", n)
+		}
+	}
+
 	return nil
 }
 
@@ -151,7 +184,11 @@ func (w *Worker) recoverCrashed(ctx context.Context, rec *idempotency.Record) er
 	defer func() {
 		// Release the expired-lease claim so the record is not
 		// permanently owned by this worker. For IN_FLIGHT → UNKNOWN,
-		// EnterRecovery clears the reconcile claim fields itself.
+		// EnterRecovery clears the reconcile claim fields itself. For
+		// PREPARED/EXECUTING, a successful RecoverExpiredPreDispatch has
+		// already cleared the claim (and bumped the version, so this
+		// stale-version release harmlessly no-ops); on its failure this
+		// still frees the claim.
 		if rec.State != idempotency.StateInFlight {
 			_ = w.store.ReleaseReconcileClaim(ctx, rec.ExecutionID, rec.Version, 0, "")
 		}
@@ -159,10 +196,15 @@ func (w *Worker) recoverCrashed(ctx context.Context, rec *idempotency.Record) er
 
 	switch rec.State {
 	case idempotency.StatePrepared, idempotency.StateExecuting:
-		// Pre-dispatch crash — no side effect occurred.
-		// The expired lease is automatically reclaimable by the next
-		// Acquire() call. Log for observability but take no action.
-		fmt.Printf("crash recovery: execution %s crashed in %s (pre-dispatch, safe to reclaim)\n", rec.ExecutionID, rec.State)
+		// Pre-dispatch crash — no side effect occurred. Normalize the
+		// record once to a lease-less PREPARED: this clears the expired
+		// lease and the reconcile claim in one CAS update, so the record
+		// stops being eligible for expired-lease claiming (no per-cycle
+		// claim/release churn) and the next Acquire() reacquires it
+		// immediately via the lease-less PREPARED path.
+		if err := w.store.RecoverExpiredPreDispatch(ctx, rec.ExecutionID, rec.Version); err != nil {
+			return fmt.Errorf("failed to normalize expired pre-dispatch execution: %w", err)
+		}
 		return nil
 
 	case idempotency.StateInFlight:
@@ -195,8 +237,30 @@ func (w *Worker) recoverCrashed(ctx context.Context, rec *idempotency.Record) er
 // with exponential backoff so another worker (or this one later)
 // can retry.
 func (w *Worker) reconcileOne(ctx context.Context, rec *idempotency.Record) error {
+	// Resolver deadline: the resolver must finish well below the claim
+	// TTL so the result can be committed while the claim is still held.
+	// At the same time, a heartbeat renews the claim for legitimately
+	// slow resolvers — without renewal, a resolver running past the
+	// claim duration lets a second worker claim the same record and
+	// issue duplicate external recovery queries.
+	resolveTimeout := w.claimDuration * 4 / 5
+	if resolveTimeout <= 0 {
+		resolveTimeout = 4 * time.Minute
+	}
+	rctx, cancel := context.WithTimeout(ctx, resolveTimeout)
+
+	// Claim heartbeat — renew while the resolver runs. If renewal fails
+	// (claim lost or expired), cancel the resolver context: committing
+	// with a lost claim would race another worker anyway.
+	heartbeatDone := make(chan struct{})
+	go w.claimHeartbeat(rctx, cancel, rec, heartbeatDone)
+	// Wait for the heartbeat goroutine AFTER cancelling rctx — the
+	// heartbeat exits on ctx.Done(), so waiting before cancelling
+	// would deadlock.
+	defer func() { cancel(); <-heartbeatDone }()
+
 	// Query the resolver for the actual outcome.
-	result, err := w.resolve(ctx, rec)
+	result, err := w.resolve(rctx, rec)
 	if err != nil {
 		return w.releaseClaim(ctx, rec, fmt.Errorf("resolver error: %w", err))
 	}
@@ -204,6 +268,33 @@ func (w *Worker) reconcileOne(ctx context.Context, rec *idempotency.Record) erro
 	// If still UNKNOWN, release the claim with backoff for later retry.
 	if result.Decision == idempotency.RecoveryUnknown {
 		return w.releaseClaim(ctx, rec, nil)
+	}
+
+	// CRITICAL decisions require a signed evidence receipt attested by
+	// a trusted signer. The worker signs on behalf of the verifying
+	// path — the receipt binds the resolver's verified outcome to this
+	// execution, provider identity, and evidence digest. Without a
+	// configured signer the decision cannot be proven; keep the record
+	// UNKNOWN rather than silently dropping the requirement.
+	if rec.ExecutionClass == "CRITICAL" &&
+		(result.Decision == idempotency.RecoveryCommitted || result.Decision == idempotency.RecoveryFailed) {
+		if w.signer == nil {
+			return w.releaseClaim(ctx, rec, fmt.Errorf("no evidence signer configured — cannot attest CRITICAL recovery"))
+		}
+		signed, signErr := w.signer.Sign(evidence.Binding{
+			ExecutionID:    rec.ExecutionID,
+			Capability:     rec.CapabilityID,
+			Principal:      rec.PrincipalID,
+			RequestDigest:  rec.RequestDigest,
+			ProviderID:     result.ProviderID,
+			ProviderRunID:  result.ProviderRunID,
+			Outcome:        recoveryOutcome(result.Decision),
+			EvidenceSHA256: result.EvidenceDigest,
+		})
+		if signErr != nil {
+			return w.releaseClaim(ctx, rec, fmt.Errorf("failed to sign recovery evidence receipt: %w", signErr))
+		}
+		result.EvidenceReceipt = signed
 	}
 
 	// Resolve with CAS — expected state is UNKNOWN, expected version
@@ -216,6 +307,45 @@ func (w *Worker) reconcileOne(ctx context.Context, rec *idempotency.Record) erro
 	}
 
 	return nil
+}
+
+// claimHeartbeat renews the reconciliation claim while a resolver runs.
+// It stops when the context ends, the done channel closes after a
+// terminal renewal failure (which also cancels the resolver context),
+// or the parent signals completion.
+func (w *Worker) claimHeartbeat(ctx context.Context, cancel context.CancelFunc, rec *idempotency.Record, done chan<- struct{}) {
+	defer close(done)
+	interval := w.claimDuration / 3
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	if interval < time.Second {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := w.store.RenewReconcileClaim(ctx, rec.ExecutionID, rec.Version, w.claimDuration); err != nil {
+				// Claim lost — the resolver's result can no longer be
+				// committed under our claim. Cancel the resolver context.
+				cancel()
+				return
+			}
+		}
+	}
+}
+
+// recoveryOutcome maps a definitive recovery decision to the receipt
+// outcome vocabulary.
+func recoveryOutcome(d idempotency.RecoveryDecision) string {
+	if d == idempotency.RecoveryCommitted {
+		return evidence.OutcomeCommitted
+	}
+	return evidence.OutcomeFailed
 }
 
 // releaseClaim releases a reconcile claim back to the pool with

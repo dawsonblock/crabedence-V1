@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/openclaw/crabbox/internal/evidence"
 )
 
 // This file contains live PostgreSQL tests for the lease-based idempotency
@@ -1883,6 +1885,7 @@ func TestLiveStoreRecoveryLocatorPersisted(t *testing.T) {
 	ctx := context.Background()
 
 	key := "test-locator-" + t.Name()
+	db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key = $1`, key)
 	acq, err := store.Acquire(ctx, key, "alice@example.com", "test.counter.increment",
 		"digest-locator", "grant_loc", "MUTATION", time.Minute)
 	if err != nil {
@@ -1945,6 +1948,7 @@ func TestLiveStoreCriticalRecoveryFailedRequiresProof(t *testing.T) {
 	ctx := context.Background()
 
 	key := "test-crit-fail-" + t.Name()
+	db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key = $1`, key)
 	acq, err := store.Acquire(ctx, key, "alice@example.com", "test.critical.deploy",
 		"digest-crit-fail", "grant_crit", "CRITICAL", time.Minute)
 	if err != nil {
@@ -1986,7 +1990,8 @@ func TestLiveStoreCriticalRecoveryFailedRequiresProof(t *testing.T) {
 		t.Error("CRITICAL RecoveryCommitted without proof should be rejected")
 	}
 
-	// With full proof, RecoveryFailed should succeed.
+	// Format-shaped proof WITHOUT a signed receipt must be rejected —
+	// a well-formed digest is an integrity checksum, not authenticity.
 	rec, _ = store.Lookup(ctx, execID)
 	err = store.ResolveRecovery(ctx, execID, rec.Version, RecoveryResult{
 		Decision:       RecoveryFailed,
@@ -1995,8 +2000,60 @@ func TestLiveStoreCriticalRecoveryFailedRequiresProof(t *testing.T) {
 		ProviderID:     "deploy-adapter",
 		ProviderRunID:  "run_critical_fail_proof",
 	})
+	if err == nil {
+		t.Error("CRITICAL RecoveryFailed with unsigned proof should be rejected")
+	}
+
+	// A receipt signed by an UNTRUSTED signer must be rejected.
+	untrusted, err := evidence.GenerateSigner()
 	if err != nil {
-		t.Errorf("CRITICAL RecoveryFailed with proof should succeed: %v", err)
+		t.Fatal(err)
+	}
+	rec, _ = store.Lookup(ctx, execID)
+	err = store.ResolveRecovery(ctx, execID, rec.Version, RecoveryResult{
+		Decision:       RecoveryFailed,
+		EvidenceDigest: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+		ReceiptVersion: 3,
+		ProviderID:     "deploy-adapter",
+		ProviderRunID:  "run_critical_fail_proof",
+		EvidenceReceipt: signTestReceipt(t, untrusted, evidence.Binding{
+			ExecutionID:    execID,
+			Capability:     rec.CapabilityID,
+			Principal:      rec.PrincipalID,
+			RequestDigest:  rec.RequestDigest,
+			ProviderID:     "deploy-adapter",
+			ProviderRunID:  "run_critical_fail_proof",
+			Outcome:        evidence.OutcomeFailed,
+			EvidenceSHA256: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+		}),
+	})
+	if err == nil {
+		t.Error("CRITICAL RecoveryFailed with untrusted signer should be rejected")
+	}
+
+	// With a signed receipt from a TRUSTED signer binding the outcome,
+	// provider identity, and evidence digest, RecoveryFailed succeeds.
+	signer := testEvidenceSigner(t, store)
+	rec, _ = store.Lookup(ctx, execID)
+	err = store.ResolveRecovery(ctx, execID, rec.Version, RecoveryResult{
+		Decision:       RecoveryFailed,
+		EvidenceDigest: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+		ReceiptVersion: 3,
+		ProviderID:     "deploy-adapter",
+		ProviderRunID:  "run_critical_fail_proof",
+		EvidenceReceipt: signTestReceipt(t, signer, evidence.Binding{
+			ExecutionID:    execID,
+			Capability:     rec.CapabilityID,
+			Principal:      rec.PrincipalID,
+			RequestDigest:  rec.RequestDigest,
+			ProviderID:     "deploy-adapter",
+			ProviderRunID:  "run_critical_fail_proof",
+			Outcome:        evidence.OutcomeFailed,
+			EvidenceSHA256: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+		}),
+	})
+	if err != nil {
+		t.Errorf("CRITICAL RecoveryFailed with signed proof should succeed: %v", err)
 	}
 
 	// Verify final state is FAILED.
@@ -2026,6 +2083,7 @@ func TestLiveStoreReplayProviderMetadata(t *testing.T) {
 	ctx := context.Background()
 
 	key := "test-replay-meta-" + t.Name()
+	db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key = $1`, key)
 	acq, err := store.Acquire(ctx, key, "alice@example.com", "test.counter.increment",
 		"digest-replay-meta", "grant_replay", "MUTATION", time.Minute)
 	if err != nil {
@@ -2099,6 +2157,9 @@ func TestLiveClaimUnknownBatch(t *testing.T) {
 
 	prefix := fmt.Sprintf("test-claim-%d", time.Now().UnixNano())
 	db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key LIKE $1`, prefix+"%")
+	// Batch claims scan ALL UNKNOWN rows — purge leftovers from
+	// prior tests/runs so exact-count assertions are isolated.
+	db.ExecContext(ctx, `DELETE FROM execution_requests WHERE state = 'UNKNOWN'`)
 
 	// Create 3 UNKNOWN records.
 	execIDs := make([]string, 3)
@@ -2190,6 +2251,9 @@ func TestLiveClaimUnknownBatchRespectsBackoff(t *testing.T) {
 
 	prefix := fmt.Sprintf("test-backoff-%d", time.Now().UnixNano())
 	db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key LIKE $1`, prefix+"%")
+	// Batch claims scan ALL UNKNOWN rows — purge leftovers from
+	// prior tests/runs so exact-count assertions are isolated.
+	db.ExecContext(ctx, `DELETE FROM execution_requests WHERE state = 'UNKNOWN'`)
 
 	// Create an UNKNOWN record.
 	acq, err := store.Acquire(ctx, prefix+"-0", "alice@example.com", "test.counter.increment",
@@ -2265,6 +2329,9 @@ func TestLiveResolveRecoveryClearsClaim(t *testing.T) {
 
 	prefix := fmt.Sprintf("test-resolve-clear-%d", time.Now().UnixNano())
 	db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key LIKE $1`, prefix+"%")
+	// Batch claims scan ALL UNKNOWN rows — purge leftovers from
+	// prior tests/runs so exact-count assertions are isolated.
+	db.ExecContext(ctx, `DELETE FROM execution_requests WHERE state = 'UNKNOWN'`)
 
 	// Create an UNKNOWN record and claim it.
 	acq, err := store.Acquire(ctx, prefix+"-0", "alice@example.com", "test.counter.increment",
@@ -2586,7 +2653,8 @@ func TestLiveCriticalFinalizeRequiresProof(t *testing.T) {
 		t.Fatal("expected CRITICAL → FAILED without evidence to be rejected")
 	}
 
-	// CRITICAL → COMMITTED with full proof must succeed.
+	// CRITICAL → COMMITTED with format-shaped but UNSIGNED proof must
+	// fail — the digest shape check is integrity, not authenticity.
 	err = store.Finalize(ctx, execID, acq.LeaseToken, rec.LeaseGeneration, StateInFlight, TerminalReceipt{
 		ExecutionID:     execID,
 		TerminalStatus:  StateCommitted,
@@ -2596,8 +2664,60 @@ func TestLiveCriticalFinalizeRequiresProof(t *testing.T) {
 		EvidenceDigest:  "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
 		ReceiptVersion:  3,
 	})
+	if err == nil {
+		t.Fatal("expected CRITICAL → COMMITTED with unsigned proof to be rejected")
+	}
+
+	// A signed receipt binding the WRONG evidence digest must fail —
+	// the binding must cover the evidence, not merely be well-signed.
+	signer := testEvidenceSigner(t, store)
+	wrongBinding := signTestReceipt(t, signer, evidence.Binding{
+		ExecutionID:    execID,
+		Capability:     rec.CapabilityID,
+		Principal:      rec.PrincipalID,
+		RequestDigest:  rec.RequestDigest,
+		ProviderID:     "deploy-adapter",
+		ProviderRunID:  "run-crit-1",
+		Outcome:        evidence.OutcomeCommitted,
+		EvidenceSHA256: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+	})
+	err = store.Finalize(ctx, execID, acq.LeaseToken, rec.LeaseGeneration, StateInFlight, TerminalReceipt{
+		ExecutionID:     execID,
+		TerminalStatus:  StateCommitted,
+		CanonicalResult: json.RawMessage(`{"deployed":true}`),
+		ProviderID:      "deploy-adapter",
+		ProviderRunID:   "run-crit-1",
+		EvidenceDigest:  "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+		ReceiptVersion:  3,
+		EvidenceReceipt: wrongBinding,
+	})
+	if err == nil {
+		t.Fatal("expected CRITICAL → COMMITTED with misbound receipt to be rejected")
+	}
+
+	// CRITICAL → COMMITTED with a properly signed, correctly bound
+	// receipt from a trusted signer must succeed.
+	err = store.Finalize(ctx, execID, acq.LeaseToken, rec.LeaseGeneration, StateInFlight, TerminalReceipt{
+		ExecutionID:     execID,
+		TerminalStatus:  StateCommitted,
+		CanonicalResult: json.RawMessage(`{"deployed":true}`),
+		ProviderID:      "deploy-adapter",
+		ProviderRunID:   "run-crit-1",
+		EvidenceDigest:  "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+		ReceiptVersion:  3,
+		EvidenceReceipt: signTestReceipt(t, signer, evidence.Binding{
+			ExecutionID:    execID,
+			Capability:     rec.CapabilityID,
+			Principal:      rec.PrincipalID,
+			RequestDigest:  rec.RequestDigest,
+			ProviderID:     "deploy-adapter",
+			ProviderRunID:  "run-crit-1",
+			Outcome:        evidence.OutcomeCommitted,
+			EvidenceSHA256: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+		}),
+	})
 	if err != nil {
-		t.Fatalf("CRITICAL → COMMITTED with proof should succeed: %v", err)
+		t.Fatalf("CRITICAL → COMMITTED with signed proof should succeed: %v", err)
 	}
 }
 
@@ -2740,7 +2860,9 @@ func TestLiveClaimExpiredBatch(t *testing.T) {
 	ctx := context.Background()
 
 	prefix := fmt.Sprintf("test-expired-claim-%d", time.Now().UnixNano())
-	db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key LIKE $1`, prefix+"%")
+	// The batch claim is ORDER BY updated_at LIMIT n — expired
+	// leftovers from earlier tests fill the batch ahead of ours.
+	db.ExecContext(ctx, `DELETE FROM execution_requests`)
 
 	// Create records with very short leases.
 	for i := 0; i < 3; i++ {
@@ -2782,4 +2904,287 @@ func TestLiveClaimExpiredBatch(t *testing.T) {
 	if claimed2 != 0 {
 		t.Fatalf("expected 0 on second claim, got %d", claimed2)
 	}
+}
+
+// TestLiveRecordProviderObservation verifies that a provider's response
+// metadata can be durably recorded independently of the terminal state
+// transition — both while IN_FLIGHT (lease-fenced) and after the record
+// has already raced into UNKNOWN (the CAS-loss case).
+func TestLiveRecordProviderObservation(t *testing.T) {
+	dbURL := os.Getenv("CRABBOX_TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live PostgreSQL test")
+	}
+	db, err := openTestDB(dbURL)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+	store, err := NewStore(db)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	ctx := context.Background()
+
+	prefix := fmt.Sprintf("test-observation-%d", time.Now().UnixNano())
+	db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key LIKE $1`, prefix+"%")
+
+	// Case 1: fenced write while IN_FLIGHT.
+	acq, err := store.Acquire(ctx, prefix+"-inflight", "alice@example.com", "test.counter.increment",
+		"digest-obs-1", "grant_o", "MUTATION", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execID := acq.Record.ExecutionID
+	if err := store.BeginExecution(ctx, execID, acq.LeaseToken, acq.Generation); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkInFlight(ctx, execID, acq.LeaseToken, acq.Generation, "test-counter", nil); err != nil {
+		t.Fatal(err)
+	}
+	err = store.RecordProviderObservation(ctx, execID, acq.LeaseToken, acq.Generation, ProviderObservation{
+		ProviderID:     "test-counter",
+		ProviderRunID:  "run-obs-1",
+		EvidenceDigest: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+		Result:         json.RawMessage(`{"value":1}`),
+	})
+	if err != nil {
+		t.Fatalf("IN_FLIGHT observation write failed: %v", err)
+	}
+	rec, _ := store.Lookup(ctx, execID)
+	if rec.ProviderRunID != "run-obs-1" {
+		t.Errorf("expected provider_run_id=run-obs-1, got %q", rec.ProviderRunID)
+	}
+	if rec.State != StateInFlight {
+		t.Errorf("observation must not change state, got %s", rec.State)
+	}
+
+	// A wrong lease token must be rejected while IN_FLIGHT.
+	err = store.RecordProviderObservation(ctx, execID, "wrong-token", acq.Generation, ProviderObservation{
+		ProviderRunID: "run-evil",
+	})
+	if err == nil {
+		t.Error("observation with wrong lease token should be rejected while IN_FLIGHT")
+	}
+	rec, _ = store.Lookup(ctx, execID)
+	if rec.ProviderRunID != "run-obs-1" {
+		t.Errorf("rejected observation must not overwrite, got %q", rec.ProviderRunID)
+	}
+
+	// Case 2: record races to UNKNOWN — the observation must still land.
+	rec, _ = store.Lookup(ctx, execID)
+	if err := store.EnterRecovery(ctx, execID, StateInFlight, rec.Version); err != nil {
+		t.Fatal(err)
+	}
+	err = store.RecordProviderObservation(ctx, execID, "", 0, ProviderObservation{
+		ProviderID:     "test-counter",
+		ProviderRunID:  "run-obs-late",
+		EvidenceDigest: "b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3",
+		Result:         json.RawMessage(`{"value":2}`),
+	})
+	if err != nil {
+		t.Fatalf("observation on already-UNKNOWN record failed: %v", err)
+	}
+	rec, _ = store.Lookup(ctx, execID)
+	if rec.ProviderRunID != "run-obs-late" {
+		t.Errorf("expected provider_run_id=run-obs-late on UNKNOWN record, got %q", rec.ProviderRunID)
+	}
+	if rec.State != StateUnknown {
+		t.Errorf("expected UNKNOWN preserved, got %s", rec.State)
+	}
+
+	// Case 3: terminal records reject observations.
+	acq2, err := store.Acquire(ctx, prefix+"-terminal", "alice@example.com", "test.counter.increment",
+		"digest-obs-2", "grant_o", "MUTATION", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execID2 := acq2.Record.ExecutionID
+	if err := store.BeginExecution(ctx, execID2, acq2.LeaseToken, acq2.Generation); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkInFlight(ctx, execID2, acq2.LeaseToken, acq2.Generation, "test-counter", nil); err != nil {
+		t.Fatal(err)
+	}
+	rec2, _ := store.Lookup(ctx, execID2)
+	if err := store.Finalize(ctx, execID2, acq2.LeaseToken, rec2.LeaseGeneration, StateInFlight, TerminalReceipt{
+		ExecutionID:    execID2,
+		TerminalStatus: StateCommitted,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	err = store.RecordProviderObservation(ctx, execID2, "", 0, ProviderObservation{
+		ProviderRunID: "run-after-terminal",
+	})
+	if err == nil {
+		t.Error("observation on terminal record should be rejected")
+	}
+	rec2, _ = store.Lookup(ctx, execID2)
+	if rec2.ProviderRunID == "run-after-terminal" {
+		t.Error("terminal record observation must not be written")
+	}
+}
+
+// TestLiveRecoverExpiredPreDispatch verifies that an expired
+// PREPARED/EXECUTING record is normalized once to a lease-less
+// PREPARED: the claim is cleared, the record stops being eligible for
+// expired-lease claiming (no claim/release churn), and a returning
+// caller reacquires it immediately.
+func TestLiveRecoverExpiredPreDispatch(t *testing.T) {
+	dbURL := os.Getenv("CRABBOX_TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live PostgreSQL test")
+	}
+	db, err := openTestDB(dbURL)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+	store, err := NewStore(db)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	ctx := context.Background()
+
+	prefix := fmt.Sprintf("test-recover-predispatch-%d", time.Now().UnixNano())
+	// The batch claim is ORDER BY updated_at LIMIT n — expired
+	// leftovers from earlier tests fill the batch ahead of ours.
+	db.ExecContext(ctx, `DELETE FROM execution_requests`)
+
+	acq, err := store.Acquire(ctx, prefix+"-0", "alice@example.com", "test.counter.increment",
+		"digest-rpd", "grant_r", "MUTATION", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execID := acq.Record.ExecutionID
+	if err := store.BeginExecution(ctx, execID, acq.LeaseToken, acq.Generation); err != nil {
+		t.Fatal(err)
+	}
+
+	// Force the lease to expire.
+	if _, err := db.ExecContext(ctx,
+		`UPDATE execution_requests SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE execution_id = $1`,
+		execID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Claim it as expired, then normalize.
+	batch, err := store.ClaimExpiredBatch(ctx, "worker-a", 10, 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var claimed *Record
+	for _, r := range batch {
+		if r.ExecutionID == execID {
+			claimed = r
+		}
+	}
+	if claimed == nil {
+		t.Fatal("expired EXECUTING record was not claimed")
+	}
+	if err := store.RecoverExpiredPreDispatch(ctx, execID, claimed.Version); err != nil {
+		t.Fatalf("RecoverExpiredPreDispatch failed: %v", err)
+	}
+
+	// The record must now be lease-less PREPARED with no claim.
+	rec, _ := store.Lookup(ctx, execID)
+	if rec.State != StatePrepared {
+		t.Errorf("expected PREPARED, got %s", rec.State)
+	}
+	if rec.LeaseExpiresAt != nil || rec.LeaseToken != "" {
+		t.Error("expected lease fields cleared")
+	}
+	if rec.ReconcileOwner != "" {
+		t.Error("expected reconcile claim cleared")
+	}
+
+	// It must not be re-claimed by the next expired-lease batch.
+	batch2, err := store.ClaimExpiredBatch(ctx, "worker-b", 10, 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range batch2 {
+		if r.ExecutionID == execID {
+			t.Error("normalized record re-claimed — claim/release churn not fixed")
+		}
+	}
+
+	// A returning caller reacquires immediately (lease-less PREPARED).
+	acq2, err := store.Acquire(ctx, prefix+"-0", "alice@example.com", "test.counter.increment",
+		"digest-rpd", "grant_r", "MUTATION", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !acq2.Acquired() {
+		t.Fatalf("expected reacquire of normalized record, got %s", acq2.Kind)
+	}
+}
+
+// TestLiveScrubStaleRecoveryLocators verifies that UNKNOWN records
+// older than the retention window have their recovery_locator cleared
+// while retaining UNKNOWN state.
+func TestLiveScrubStaleRecoveryLocators(t *testing.T) {
+	dbURL := os.Getenv("CRABBOX_TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live PostgreSQL test")
+	}
+	db, err := openTestDB(dbURL)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+	store, err := NewStore(db)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	ctx := context.Background()
+
+	prefix := fmt.Sprintf("test-scrub-%d", time.Now().UnixNano())
+	db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key LIKE $1`, prefix+"%")
+
+	acq, err := store.Acquire(ctx, prefix+"-0", "alice@example.com", "test.counter.increment",
+		"digest-scrub", "grant_s", "MUTATION", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execID := acq.Record.ExecutionID
+	if err := store.BeginExecution(ctx, execID, acq.LeaseToken, acq.Generation); err != nil {
+		t.Fatal(err)
+	}
+	locator := json.RawMessage(`{"capability_id":"test.counter.increment","counter":"x"}`)
+	if err := store.MarkInFlight(ctx, execID, acq.LeaseToken, acq.Generation, "test-counter", locator); err != nil {
+		t.Fatal(err)
+	}
+	rec, _ := store.Lookup(ctx, execID)
+	if err := store.EnterRecovery(ctx, execID, StateInFlight, rec.Version); err != nil {
+		t.Fatal(err)
+	}
+
+	// Not yet old enough — a 1-hour retention must not scrub.
+	n, err := store.ScrubStaleRecoveryLocators(ctx, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, _ = store.Lookup(ctx, execID)
+	if len(rec.RecoveryLocator) == 0 {
+		t.Error("locator scrubbed before retention elapsed")
+	}
+
+	// Age the record past the retention window.
+	if _, err := db.ExecContext(ctx,
+		`UPDATE execution_requests SET created_at = clock_timestamp() - interval '2 hours' WHERE execution_id = $1`,
+		execID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ScrubStaleRecoveryLocators(ctx, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	rec, _ = store.Lookup(ctx, execID)
+	if len(rec.RecoveryLocator) != 0 {
+		t.Error("expected locator scrubbed after retention elapsed")
+	}
+	if rec.State != StateUnknown {
+		t.Errorf("scrub must not change state, got %s", rec.State)
+	}
+	_ = n
 }

@@ -14,6 +14,7 @@ import (
 
 	"github.com/openclaw/crabbox/internal/authority"
 	"github.com/openclaw/crabbox/internal/capability"
+	"github.com/openclaw/crabbox/internal/evidence"
 	"github.com/openclaw/crabbox/internal/idempotency"
 	"github.com/openclaw/crabbox/internal/reconcile"
 )
@@ -95,6 +96,28 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 		}
 	}
 
+	// Evidence signer: the execution service attests CRITICAL terminal
+	// outcomes with an Ed25519-signed effect receipt. The key is shared
+	// with the CLI attest key (~/.config/crabbox/attest/id_ed25519.pem)
+	// so the deployment has one signer identity. Without durable storage
+	// there is nothing to sign for — MUTATION/CRITICAL fail closed
+	// before this path matters.
+	var signer *evidence.Signer
+	if store != nil {
+		keyPath, err := evidenceKeyPath()
+		if err != nil {
+			return fmt.Errorf("failed to resolve evidence key path: %w", err)
+		}
+		signer, err = evidence.LoadOrCreateSigner(keyPath)
+		if err != nil {
+			return fmt.Errorf("failed to load evidence signer: %w", err)
+		}
+		// The store trusts this signer (and only this signer) for
+		// CRITICAL proof. Deployments with multiple signing identities
+		// can extend the set at initialization time.
+		store.SetTrustedEvidenceSigners(signer.Fingerprint())
+	}
+
 	// Create a multi-handler that dispatches based on adapter ID
 	// If we have a durable store, wrap it in a DispatchExecutor
 	var handler Handler
@@ -106,7 +129,9 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 
 	if store != nil {
 		// Use DispatchExecutor for durable idempotency
-		handler = NewDispatchExecutor(multiHandler, store)
+		executor := NewDispatchExecutor(multiHandler, store)
+		executor.SetEvidenceSigner(signer)
+		handler = executor
 	} else {
 		// No store — fail closed for MUTATION/CRITICAL
 		handler = NewFailClosedHandler(multiHandler)
@@ -138,6 +163,7 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	if store != nil && opts.ReconcileInterval > 0 {
 		worker := reconcile.NewWorker(store, reconcile.NoopResolver{}, durationSeconds(opts.ReconcileInterval))
 		worker.RegisterResolver("test.counter.increment", counterHandler)
+		worker.SetEvidenceSigner(signer)
 		go worker.Run(ctx)
 	}
 
@@ -182,4 +208,16 @@ func NewFailClosedHandler(inner Handler) *FailClosedHandler {
 // durationSeconds converts an int64 to a time.Duration.
 func durationSeconds(s int64) time.Duration {
 	return time.Duration(s) * time.Second
+}
+
+// evidenceKeyPath returns the shared attest key location
+// (~/.config/crabbox/attest/id_ed25519.pem) — the same key the CLI uses
+// for terminal run receipts gives the deployment a single signer
+// identity for both run receipts and effect-fabric evidence receipts.
+func evidenceKeyPath() (string, error) {
+	base, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(base, "crabbox", "attest", "id_ed25519.pem"), nil
 }

@@ -15,6 +15,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/openclaw/crabbox/internal/evidence"
 )
 
 // ─── Record ───────────────────────────────────────────────────────────
@@ -40,6 +42,7 @@ type Record struct {
 	ProviderID            string          `json:"provider_id,omitempty"`
 	ProviderRunID         string          `json:"provider_run_id,omitempty"`
 	TerminalReceiptDigest string          `json:"terminal_receipt_digest,omitempty"`
+	EvidenceReceipt       json.RawMessage `json:"evidence_receipt,omitempty"`
 	RecoveryLocator       json.RawMessage `json:"recovery_locator,omitempty"`
 	Attempt               int             `json:"attempt,omitempty"`
 	Version               int             `json:"version"`
@@ -60,6 +63,25 @@ type Record struct {
 type Store struct {
 	db       *sql.DB
 	leaseCfg LeaseConfig
+
+	// trustedSigners is the set of evidence-receipt signer fingerprints
+	// (SHA-256 of the Ed25519 public key) authorized to attest CRITICAL
+	// terminal transitions. When empty, CRITICAL finalization and
+	// definitive recovery fail closed — a syntactically valid evidence
+	// digest is never sufficient proof on its own.
+	trustedSigners map[string]bool
+}
+
+// SetTrustedEvidenceSigners configures the signer fingerprints trusted
+// to attest CRITICAL terminal transitions. Each fingerprint is the
+// lowercase hex SHA-256 of an Ed25519 public key — see
+// internal/evidence. Replacing the set is an administrative operation;
+// call it once at store initialization.
+func (s *Store) SetTrustedEvidenceSigners(fingerprints ...string) {
+	s.trustedSigners = make(map[string]bool, len(fingerprints))
+	for _, fp := range fingerprints {
+		s.trustedSigners[fp] = true
+	}
 }
 
 // NewStore creates a new durable execution store with default lease config.
@@ -79,7 +101,40 @@ func NewStoreWithConfig(db *sql.DB, cfg LeaseConfig) (*Store, error) {
 // ─── Schema ──────────────────────────────────────────────────────────
 
 func (s *Store) ensureSchema(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, `
+	// Serialize all schema DDL across replicas (and parallel test
+	// binaries) on a single dedicated connection. CREATE INDEX
+	// CONCURRENTLY holds SHARE UPDATE EXCLUSIVE while it waits for
+	// snapshots; a concurrent CREATE TABLE/ALTER TABLE that blocks on
+	// that lock inside an open transaction deadlocks the build. The
+	// advisory lock makes the whole migration phase mutually exclusive.
+	//
+	// Try-lock polling is deliberate: a session blocked inside
+	// pg_advisory_lock holds an open transaction that CONCURRENTLY
+	// waits on, recreating the deadlock cycle through the advisory
+	// lock itself. pg_try_advisory_lock never waits.
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	// Advisory lock key: arbitrary stable constant for schema migration.
+	for {
+		var locked bool
+		if err := conn.QueryRowContext(ctx, `SELECT pg_try_advisory_lock(727301)`).Scan(&locked); err != nil {
+			return fmt.Errorf("schema advisory lock failed: %w", err)
+		}
+		if locked {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+	defer conn.ExecContext(context.Background(), `SELECT pg_advisory_unlock(727301)`)
+
+	_, err = conn.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS execution_requests (
 			execution_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 			idempotency_key TEXT NOT NULL,
@@ -100,6 +155,7 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 			provider_id TEXT,
 			provider_run_id TEXT,
 			terminal_receipt_digest TEXT,
+			evidence_receipt JSONB,
 			recovery_locator JSONB,
 			attempt INTEGER NOT NULL DEFAULT 0,
 			version INTEGER NOT NULL DEFAULT 1,
@@ -114,7 +170,7 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 		// since Acquire() does not supply execution_id. Generate via
 		// a DEFAULT clause using a Go-side UUID if pgcrypto is unavailable.
 		// We use a TEXT primary key with a Go-generated UUID as default.
-		_, err = s.db.ExecContext(ctx, `
+		_, err = conn.ExecContext(ctx, `
 			CREATE TABLE IF NOT EXISTS execution_requests (
 				execution_id TEXT PRIMARY KEY,
 				idempotency_key TEXT NOT NULL,
@@ -135,6 +191,7 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 				provider_id TEXT,
 				provider_run_id TEXT,
 				terminal_receipt_digest TEXT,
+				evidence_receipt JSONB,
 				recovery_locator JSONB,
 				attempt INTEGER NOT NULL DEFAULT 0,
 				version INTEGER NOT NULL DEFAULT 1,
@@ -151,61 +208,64 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 	// Migrations: add new columns if they don't exist.
 	// P1/P2 #6: Migration failures must propagate — store initialization
 	// fails closed if schema alteration or state migration fails.
-	if err := s.addColumnIfMissing(ctx, "lease_started_at", "TIMESTAMPTZ"); err != nil {
+	if err := s.addColumnIfMissing(ctx, conn, "lease_started_at", "TIMESTAMPTZ"); err != nil {
 		return fmt.Errorf("migration failed (lease_started_at): %w", err)
 	}
-	if err := s.addColumnIfMissing(ctx, "lease_generation", "INTEGER NOT NULL DEFAULT 1"); err != nil {
+	if err := s.addColumnIfMissing(ctx, conn, "lease_generation", "INTEGER NOT NULL DEFAULT 1"); err != nil {
 		return fmt.Errorf("migration failed (lease_generation): %w", err)
 	}
-	if err := s.addColumnIfMissing(ctx, "provider_id", "TEXT"); err != nil {
+	if err := s.addColumnIfMissing(ctx, conn, "provider_id", "TEXT"); err != nil {
 		return fmt.Errorf("migration failed (provider_id): %w", err)
 	}
-	if err := s.addColumnIfMissing(ctx, "provider_run_id", "TEXT"); err != nil {
+	if err := s.addColumnIfMissing(ctx, conn, "provider_run_id", "TEXT"); err != nil {
 		return fmt.Errorf("migration failed (provider_run_id): %w", err)
 	}
-	if err := s.addColumnIfMissing(ctx, "terminal_receipt_digest", "TEXT"); err != nil {
+	if err := s.addColumnIfMissing(ctx, conn, "terminal_receipt_digest", "TEXT"); err != nil {
 		return fmt.Errorf("migration failed (terminal_receipt_digest): %w", err)
 	}
-	if err := s.addColumnIfMissing(ctx, "recovery_locator", "JSONB"); err != nil {
+	if err := s.addColumnIfMissing(ctx, conn, "recovery_locator", "JSONB"); err != nil {
 		return fmt.Errorf("migration failed (recovery_locator): %w", err)
 	}
-	if err := s.addColumnIfMissing(ctx, "reconcile_owner", "TEXT"); err != nil {
+	if err := s.addColumnIfMissing(ctx, conn, "reconcile_owner", "TEXT"); err != nil {
 		return fmt.Errorf("migration failed (reconcile_owner): %w", err)
 	}
-	if err := s.addColumnIfMissing(ctx, "reconcile_lease_expires_at", "TIMESTAMPTZ"); err != nil {
+	if err := s.addColumnIfMissing(ctx, conn, "reconcile_lease_expires_at", "TIMESTAMPTZ"); err != nil {
 		return fmt.Errorf("migration failed (reconcile_lease_expires_at): %w", err)
 	}
-	if err := s.addColumnIfMissing(ctx, "reconcile_attempt", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+	if err := s.addColumnIfMissing(ctx, conn, "reconcile_attempt", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return fmt.Errorf("migration failed (reconcile_attempt): %w", err)
 	}
-	if err := s.addColumnIfMissing(ctx, "next_reconcile_at", "TIMESTAMPTZ"); err != nil {
+	if err := s.addColumnIfMissing(ctx, conn, "next_reconcile_at", "TIMESTAMPTZ"); err != nil {
 		return fmt.Errorf("migration failed (next_reconcile_at): %w", err)
 	}
-	if err := s.addColumnIfMissing(ctx, "last_reconcile_error", "TEXT"); err != nil {
+	if err := s.addColumnIfMissing(ctx, conn, "last_reconcile_error", "TEXT"); err != nil {
 		return fmt.Errorf("migration failed (last_reconcile_error): %w", err)
 	}
+	if err := s.addColumnIfMissing(ctx, conn, "evidence_receipt", "JSONB"); err != nil {
+		return fmt.Errorf("migration failed (evidence_receipt): %w", err)
+	}
 	// Legacy columns from earlier versions.
-	if err := s.addColumnIfMissing(ctx, "receipt_version", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+	if err := s.addColumnIfMissing(ctx, conn, "receipt_version", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return fmt.Errorf("migration failed (receipt_version): %w", err)
 	}
-	if err := s.addColumnIfMissing(ctx, "lease_owner", "TEXT"); err != nil {
+	if err := s.addColumnIfMissing(ctx, conn, "lease_owner", "TEXT"); err != nil {
 		return fmt.Errorf("migration failed (lease_owner): %w", err)
 	}
-	if err := s.addColumnIfMissing(ctx, "lease_token", "TEXT"); err != nil {
+	if err := s.addColumnIfMissing(ctx, conn, "lease_token", "TEXT"); err != nil {
 		return fmt.Errorf("migration failed (lease_token): %w", err)
 	}
-	if err := s.addColumnIfMissing(ctx, "lease_expires_at", "TIMESTAMPTZ"); err != nil {
+	if err := s.addColumnIfMissing(ctx, conn, "lease_expires_at", "TIMESTAMPTZ"); err != nil {
 		return fmt.Errorf("migration failed (lease_expires_at): %w", err)
 	}
-	if err := s.addColumnIfMissing(ctx, "attempt", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+	if err := s.addColumnIfMissing(ctx, conn, "attempt", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return fmt.Errorf("migration failed (attempt): %w", err)
 	}
-	if err := s.addColumnIfMissing(ctx, "version", "INTEGER NOT NULL DEFAULT 1"); err != nil {
+	if err := s.addColumnIfMissing(ctx, conn, "version", "INTEGER NOT NULL DEFAULT 1"); err != nil {
 		return fmt.Errorf("migration failed (version): %w", err)
 	}
 
 	// Migrate old state names to new vocabulary.
-	if err := s.migrateStateNames(ctx); err != nil {
+	if err := s.migrateStateNames(ctx, conn); err != nil {
 		return fmt.Errorf("state name migration failed: %w", err)
 	}
 
@@ -213,32 +273,38 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 	//   - UNKNOWN records needing reconciliation
 	//   - Active records with expired leases
 	// These avoid full-table scans on every reconciliation cycle.
-	if err := s.ensureIndexes(ctx); err != nil {
+	if err := s.ensureIndexes(ctx, conn); err != nil {
 		return fmt.Errorf("index migration failed: %w", err)
 	}
 
 	return nil
 }
 
-func (s *Store) ensureIndexes(ctx context.Context) error {
+// ensureIndexes creates the hot-path partial indexes. CONCURRENTLY is
+// used so first deployment on a large ledger does not block writes —
+// a plain CREATE INDEX takes a SHARE lock that stalls all inserts and
+// updates for the duration of the build. CONCURRENTLY cannot run inside
+// a transaction and two concurrent builds deadlock each other; the
+// caller must therefore hold the schema advisory lock on conn.
+func (s *Store) ensureIndexes(ctx context.Context, conn *sql.Conn) error {
 	indexes := []string{
-		`CREATE INDEX IF NOT EXISTS idx_exec_reconcile
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_exec_reconcile
 		 ON execution_requests (next_reconcile_at, updated_at)
 		 WHERE state = 'UNKNOWN'`,
-		`CREATE INDEX IF NOT EXISTS idx_exec_expired_leases
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_exec_expired_leases
 		 ON execution_requests (lease_expires_at)
 		 WHERE state IN ('PREPARED', 'EXECUTING', 'IN_FLIGHT')
 		   AND lease_expires_at IS NOT NULL`,
 	}
 	for _, ddl := range indexes {
-		if _, err := s.db.ExecContext(ctx, ddl); err != nil {
+		if _, err := conn.ExecContext(ctx, ddl); err != nil {
 			return fmt.Errorf("failed to create index: %w", err)
 		}
 	}
 	return nil
 }
 
-func (s *Store) migrateStateNames(ctx context.Context) error {
+func (s *Store) migrateStateNames(ctx context.Context, conn *sql.Conn) error {
 	// Map old state names to new ones.
 	migrations := map[string]string{
 		"RESERVED":                "PREPARED",
@@ -247,15 +313,15 @@ func (s *Store) migrateStateNames(ctx context.Context) error {
 		"RECONCILIATION_REQUIRED": "UNKNOWN",
 	}
 	for old, newVal := range migrations {
-		if _, err := s.db.ExecContext(ctx, `UPDATE execution_requests SET state = $1 WHERE state = $2`, newVal, old); err != nil {
+		if _, err := conn.ExecContext(ctx, `UPDATE execution_requests SET state = $1 WHERE state = $2`, newVal, old); err != nil {
 			return fmt.Errorf("failed to migrate state %s -> %s: %w", old, newVal, err)
 		}
 	}
 	return nil
 }
 
-func (s *Store) addColumnIfMissing(ctx context.Context, column, ddl string) error {
-	_, err := s.db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE execution_requests ADD COLUMN IF NOT EXISTS %s %s", column, ddl))
+func (s *Store) addColumnIfMissing(ctx context.Context, conn *sql.Conn, column, ddl string) error {
+	_, err := conn.ExecContext(ctx, fmt.Sprintf("ALTER TABLE execution_requests ADD COLUMN IF NOT EXISTS %s %s", column, ddl))
 	return err
 }
 
@@ -327,12 +393,12 @@ func (s *Store) Acquire(ctx context.Context, key, principal, capability, digest,
 			 lease_owner, lease_token, lease_started_at, lease_expires_at,
 			 lease_generation, attempt, version)
 		VALUES ($10, $1, $2, $3, $4, $5, $6, 'PREPARED',
-				$7, $8, clock_timestamp(), clock_timestamp() + $9::interval,
+				$7, $8, clock_timestamp(), clock_timestamp() + make_interval(secs => $9),
 				1, 0, 1)
 		ON CONFLICT (principal_id, capability_id, idempotency_key) DO NOTHING
 		RETURNING execution_id, created_at
 	`, key, principal, capability, digest, nullableString(grantID), class,
-		leaseOwner, leaseToken, fmt.Sprintf("%d microseconds", leaseDuration.Microseconds()),
+		leaseOwner, leaseToken, pgInterval(leaseDuration),
 		genID,
 	).Scan(&executionID, &createdAt)
 
@@ -507,7 +573,7 @@ func (s *Store) acquireUnleased(ctx context.Context, rec *Record, newToken, newO
 		UPDATE execution_requests
 		SET lease_owner = $1, lease_token = $2,
 		    lease_started_at = clock_timestamp(),
-		    lease_expires_at = clock_timestamp() + $3::interval,
+		    lease_expires_at = clock_timestamp() + make_interval(secs => $3),
 		    lease_generation = lease_generation + 1,
 		    version = version + 1, updated_at = clock_timestamp()
 		WHERE execution_id = $4
@@ -515,7 +581,7 @@ func (s *Store) acquireUnleased(ctx context.Context, rec *Record, newToken, newO
 		  AND lease_token IS NULL
 		  AND lease_expires_at IS NULL
 		  AND version = $5
-	`, newOwner, newToken, fmt.Sprintf("%d microseconds", duration.Microseconds()),
+	`, newOwner, newToken, pgInterval(duration),
 		rec.ExecutionID, rec.Version)
 	if err != nil {
 		return false, err
@@ -542,7 +608,7 @@ func (s *Store) reclaimExpiredLease(ctx context.Context, rec *Record, newToken, 
 		UPDATE execution_requests
 		SET lease_owner = $1, lease_token = $2,
 		    lease_started_at = clock_timestamp(),
-		    lease_expires_at = clock_timestamp() + $3::interval,
+		    lease_expires_at = clock_timestamp() + make_interval(secs => $3),
 		    lease_generation = lease_generation + 1,
 		    attempt = attempt + 1, version = version + 1,
 		    state = 'PREPARED', updated_at = clock_timestamp()
@@ -550,7 +616,7 @@ func (s *Store) reclaimExpiredLease(ctx context.Context, rec *Record, newToken, 
 		  AND version = $5
 		  AND state IN ('PREPARED', 'EXECUTING')
 		  AND lease_expires_at < clock_timestamp()
-	`, newOwner, newToken, fmt.Sprintf("%d microseconds", duration.Microseconds()),
+	`, newOwner, newToken, pgInterval(duration),
 		rec.ExecutionID, rec.Version)
 	if err != nil {
 		return false, err
@@ -742,14 +808,14 @@ func (s *Store) RenewLease(ctx context.Context, executionID, leaseToken string, 
 	}
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE execution_requests
-		SET lease_expires_at = GREATEST(lease_expires_at, clock_timestamp() + $1::interval),
+		SET lease_expires_at = GREATEST(lease_expires_at, clock_timestamp() + make_interval(secs => $1)),
 		    updated_at = clock_timestamp()
 		WHERE execution_id = $2
 		  AND lease_token = $3
 		  AND lease_generation = $4
 		  AND lease_expires_at > clock_timestamp()
 		  AND state NOT IN ('COMMITTED', 'FAILED', 'DENIED', 'UNKNOWN')
-	`, fmt.Sprintf("%d microseconds", duration.Microseconds()),
+	`, pgInterval(duration),
 		executionID, leaseToken, leaseGeneration)
 	if err != nil {
 		return err
@@ -903,6 +969,23 @@ func (s *Store) Finalize(ctx context.Context, executionID, leaseToken string, le
 			if receipt.ProviderID == "" || receipt.ProviderRunID == "" {
 				return fmt.Errorf("CRITICAL finalization to %s requires provider_id and provider_run_id", receipt.TerminalStatus)
 			}
+			// Authenticity: a well-formed digest is only an integrity
+			// checksum. CRITICAL finalization additionally requires an
+			// Ed25519-signed effect receipt (internal/evidence) from a
+			// trusted signer, bound to this execution, request, provider
+			// identity, evidence digest, and terminal outcome.
+			if err := evidence.VerifyReceipt(receipt.EvidenceReceipt, evidence.Binding{
+				ExecutionID:    executionID,
+				Capability:     existing.CapabilityID,
+				Principal:      existing.PrincipalID,
+				RequestDigest:  existing.RequestDigest,
+				ProviderID:     receipt.ProviderID,
+				ProviderRunID:  receipt.ProviderRunID,
+				Outcome:        string(receipt.TerminalStatus),
+				EvidenceSHA256: receipt.EvidenceDigest,
+			}, s.trustedSigners); err != nil {
+				return fmt.Errorf("CRITICAL finalization to %s requires a verified signed evidence receipt: %w", receipt.TerminalStatus, err)
+			}
 		}
 	}
 
@@ -920,7 +1003,7 @@ func (s *Store) Finalize(ctx context.Context, executionID, leaseToken string, le
 		UPDATE execution_requests
 		SET state = $1, result = $2, evidence_digest = $3, receipt_version = $4,
 		    provider_id = $5, provider_run_id = $6,
-		    terminal_receipt_digest = $7,
+		    terminal_receipt_digest = $7, evidence_receipt = $13,
 		    lease_owner = NULL, lease_token = NULL,
 		    lease_started_at = NULL, lease_expires_at = NULL,
 		    recovery_locator = NULL,
@@ -938,7 +1021,8 @@ func (s *Store) Finalize(ctx context.Context, executionID, leaseToken string, le
 		nullableString(receipt.ProviderID),
 		nullableString(receipt.ProviderRunID),
 		receiptDigest,
-		executionID, string(expectedState), leaseToken, leaseGeneration, existing.Version)
+		executionID, string(expectedState), leaseToken, leaseGeneration, existing.Version,
+		nullableBytes(receipt.EvidenceReceipt))
 	if err != nil {
 		return err
 	}
@@ -1044,6 +1128,122 @@ func (s *Store) EnterRecoveryWithObservation(ctx context.Context, executionID st
 	return nil
 }
 
+// ProviderObservation is the provider's durable response snapshot:
+// the observation the recovery resolver needs most if the terminal
+// transition cannot be committed.
+type ProviderObservation struct {
+	ProviderID     string
+	ProviderRunID  string
+	EvidenceDigest string
+	Result         json.RawMessage
+}
+
+// RecordProviderObservation durably records a provider's response
+// metadata independently of the terminal state transition. It is the
+// fix for the "observation lost on CAS failure" class of bug: the
+// dispatcher calls it immediately after the provider returns, before
+// evidence validation and Finalize, so the observation survives even
+// when the record races into UNKNOWN.
+//
+// Semantics:
+//   - IN_FLIGHT: the write is lease-fenced (token + generation must
+//     match); the lease need not be unexpired — an expired lease whose
+//     record has not yet been claimed is still the legitimate owner.
+//   - UNKNOWN: the write is accepted unconditionally — the record
+//     already raced past the lease holder and this observation is the
+//     freshest provider truth the resolver will ever see.
+//   - Any other state (terminal, PREPARED, EXECUTING): rejected.
+//
+// Supplied fields overwrite; empty fields leave existing values intact
+// (COALESCE). The version is deliberately NOT incremented — an
+// observation is additive metadata, and bumping the CAS token would
+// invalidate reconciliation claims in flight.
+func (s *Store) RecordProviderObservation(ctx context.Context, executionID, leaseToken string, leaseGeneration int, obs ProviderObservation) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE execution_requests
+		SET provider_id = COALESCE($4, provider_id),
+		    provider_run_id = COALESCE($5, provider_run_id),
+		    evidence_digest = COALESCE($6, evidence_digest),
+		    result = COALESCE($7, result),
+		    updated_at = clock_timestamp()
+		WHERE execution_id = $1
+		  AND (
+		    (state = 'IN_FLIGHT' AND lease_token = $2 AND lease_generation = $3)
+		    OR state = 'UNKNOWN'
+		  )
+	`, executionID, nullableString(leaseToken), leaseGeneration,
+		nullableString(obs.ProviderID), nullableString(obs.ProviderRunID),
+		nullableString(obs.EvidenceDigest), nullableBytes(obs.Result))
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return fmt.Errorf("%w: execution %s observation rejected (not IN_FLIGHT with matching lease, not UNKNOWN)", LeaseStateConflict, executionID)
+	}
+	return nil
+}
+
+// RecoverExpiredPreDispatch normalizes a crashed PREPARED or EXECUTING
+// record whose execution lease has expired: it resets the record to a
+// lease-less PREPARED and clears the reconciliation claim in one CAS
+// update. After this, the record is no longer eligible for expired-
+// lease claiming (lease_expires_at IS NULL), so reconciliation does
+// not claim/release-churn on it every cycle — and the next Acquire()
+// reacquires it immediately via the lease-less PREPARED path.
+func (s *Store) RecoverExpiredPreDispatch(ctx context.Context, executionID string, expectedVersion int) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE execution_requests
+		SET state = 'PREPARED',
+		    lease_owner = NULL, lease_token = NULL,
+		    lease_started_at = NULL, lease_expires_at = NULL,
+		    reconcile_owner = NULL, reconcile_lease_expires_at = NULL,
+		    next_reconcile_at = NULL,
+		    version = version + 1, updated_at = clock_timestamp()
+		WHERE execution_id = $1
+		  AND state IN ('PREPARED', 'EXECUTING')
+		  AND version = $2
+		  AND lease_expires_at IS NOT NULL
+		  AND lease_expires_at < clock_timestamp()
+	`, executionID, expectedVersion)
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return fmt.Errorf("%w: execution %s recover expired pre-dispatch CAS failed (state/version/expiry mismatch)", LeaseStateConflict, executionID)
+	}
+	return nil
+}
+
+// ScrubStaleRecoveryLocators clears recovery_locator on UNKNOWN records
+// older than the given retention (measured from created_at). Recovery
+// locators may carry operation-identifying data; records that remain
+// unresolved past the retention window keep their UNKNOWN state but
+// stop retaining the locator. Returns the number of scrubbed records.
+func (s *Store) ScrubStaleRecoveryLocators(ctx context.Context, olderThan time.Duration) (int64, error) {
+	if olderThan <= 0 {
+		return 0, fmt.Errorf("locator retention must be positive")
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE execution_requests
+		SET recovery_locator = NULL
+		WHERE state = 'UNKNOWN'
+		  AND recovery_locator IS NOT NULL
+		  AND created_at < clock_timestamp() - make_interval(secs => $1)
+	`, pgInterval(olderThan))
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 // ResolveRecovery resolves an UNKNOWN record to a durably final state
 // using a recovery result. Uses CAS with expected state=UNKNOWN to
 // prevent overwriting a state that changed after it was read.
@@ -1124,6 +1324,21 @@ func (s *Store) ResolveRecovery(ctx context.Context, executionID string, expecte
 			if result.ProviderID == "" || result.ProviderRunID == "" {
 				return fmt.Errorf("CRITICAL recovery to %s requires provider_id and provider_run_id", decision)
 			}
+			// Authenticity: same standard as CRITICAL finalization — a
+			// signed effect receipt from a trusted signer, bound to this
+			// execution, provider identity, evidence digest, and outcome.
+			if err := evidence.VerifyReceipt(result.EvidenceReceipt, evidence.Binding{
+				ExecutionID:    executionID,
+				Capability:     existingRec.CapabilityID,
+				Principal:      existingRec.PrincipalID,
+				RequestDigest:  existingRec.RequestDigest,
+				ProviderID:     result.ProviderID,
+				ProviderRunID:  result.ProviderRunID,
+				Outcome:        string(newState),
+				EvidenceSHA256: result.EvidenceDigest,
+			}, s.trustedSigners); err != nil {
+				return fmt.Errorf("CRITICAL recovery to %s requires a verified signed evidence receipt: %w", decision, err)
+			}
 		}
 	} else {
 		// Non-CRITICAL: require at least evidence or result.
@@ -1158,7 +1373,7 @@ func (s *Store) ResolveRecovery(ctx context.Context, executionID string, expecte
 		UPDATE execution_requests
 		SET state = $1, result = $2, evidence_digest = $3, receipt_version = $4,
 		    provider_id = $5, provider_run_id = $6,
-		    terminal_receipt_digest = $7,
+		    terminal_receipt_digest = $7, evidence_receipt = $10,
 		    reconcile_owner = NULL, reconcile_lease_expires_at = NULL,
 		    next_reconcile_at = NULL, last_reconcile_error = NULL,
 		    recovery_locator = NULL,
@@ -1171,7 +1386,8 @@ func (s *Store) ResolveRecovery(ctx context.Context, executionID string, expecte
 		nullableString(result.ProviderID),
 		nullableString(result.ProviderRunID),
 		receiptDigest,
-		executionID, expectedVersion)
+		executionID, expectedVersion,
+		nullableBytes(result.EvidenceReceipt))
 	if err != nil {
 		return err
 	}
@@ -1204,10 +1420,31 @@ const selectColumns = `execution_id, idempotency_key, principal_id, capability_i
 	result, COALESCE(evidence_digest, ''), COALESCE(receipt_version, 0),
 	lease_owner, lease_token, lease_started_at, lease_expires_at,
 	COALESCE(lease_generation, 1),
-	provider_id, provider_run_id, terminal_receipt_digest, recovery_locator,
+	provider_id, provider_run_id, terminal_receipt_digest, evidence_receipt, recovery_locator,
 	COALESCE(attempt, 0), COALESCE(version, 1), created_at, updated_at,
 	reconcile_owner, reconcile_lease_expires_at,
 	COALESCE(reconcile_attempt, 0), next_reconcile_at, last_reconcile_error`
+
+// selectColumnsER is selectColumns qualified with the `er` alias, for
+// use in UPDATE ... FROM ... RETURNING statements where the FROM clause
+// makes unqualified column names ambiguous.
+const selectColumnsER = `er.execution_id, er.idempotency_key, er.principal_id, er.capability_id,
+	er.request_digest, COALESCE(er.grant_id, ''), er.execution_class, er.state,
+	er.result, COALESCE(er.evidence_digest, ''), COALESCE(er.receipt_version, 0),
+	er.lease_owner, er.lease_token, er.lease_started_at, er.lease_expires_at,
+	COALESCE(er.lease_generation, 1),
+	er.provider_id, er.provider_run_id, er.terminal_receipt_digest, er.evidence_receipt, er.recovery_locator,
+	COALESCE(er.attempt, 0), COALESCE(er.version, 1), er.created_at, er.updated_at,
+	er.reconcile_owner, er.reconcile_lease_expires_at,
+	COALESCE(er.reconcile_attempt, 0), er.next_reconcile_at, er.last_reconcile_error`
+
+// pgInterval converts a Go duration into a PostgreSQL interval
+// expression argument. make_interval(secs => x) accepts arbitrary
+// magnitudes — unlike "N microseconds" string casts, which overflow the
+// interval field for large durations.
+func pgInterval(d time.Duration) float64 {
+	return d.Seconds()
+}
 
 // ClaimUnknownBatch atomically claims up to batchSize UNKNOWN records
 // for reconciliation. Uses FOR UPDATE SKIP LOCKED so that multiple
@@ -1243,15 +1480,15 @@ func (s *Store) ClaimUnknownBatch(ctx context.Context, owner string, batchSize i
 		)
 		UPDATE execution_requests er
 		SET reconcile_owner = $1,
-		    reconcile_lease_expires_at = clock_timestamp() + $2::interval,
+		    reconcile_lease_expires_at = clock_timestamp() + make_interval(secs => $2),
 		    reconcile_attempt = er.reconcile_attempt + 1,
 		    version = er.version + 1,
 		    updated_at = clock_timestamp()
 		FROM claimed
 		WHERE er.execution_id = claimed.execution_id
-		RETURNING `+selectColumns,
+		RETURNING `+selectColumnsER,
 		owner,
-		fmt.Sprintf("%d microseconds", claimDuration.Microseconds()),
+		pgInterval(claimDuration),
 		batchSize,
 	)
 	if err != nil {
@@ -1279,8 +1516,8 @@ func (s *Store) ReleaseReconcileClaim(ctx context.Context, executionID string, e
 		SET reconcile_owner = NULL,
 		    reconcile_lease_expires_at = NULL,
 		    next_reconcile_at = CASE
-		        WHEN state = 'UNKNOWN' AND $1::interval > '0'::interval
-		            THEN clock_timestamp() + $1::interval
+		        WHEN state = 'UNKNOWN' AND make_interval(secs => $1) > '0'::interval
+		            THEN clock_timestamp() + make_interval(secs => $1)
 		        ELSE NULL
 		    END,
 		    last_reconcile_error = $2,
@@ -1288,7 +1525,7 @@ func (s *Store) ReleaseReconcileClaim(ctx context.Context, executionID string, e
 		    updated_at = clock_timestamp()
 		WHERE execution_id = $3
 		  AND version = $4
-	`, fmt.Sprintf("%d microseconds", backoffDuration.Microseconds()),
+	`, pgInterval(backoffDuration),
 		nullableString(lastError), executionID, expectedVersion)
 	if err != nil {
 		return err
@@ -1315,13 +1552,13 @@ func (s *Store) RenewReconcileClaim(ctx context.Context, executionID string, exp
 		UPDATE execution_requests
 		SET reconcile_lease_expires_at = GREATEST(
 		        reconcile_lease_expires_at,
-		        clock_timestamp() + $1::interval),
+		        clock_timestamp() + make_interval(secs => $1)),
 		    updated_at = clock_timestamp()
 		WHERE execution_id = $2
 		  AND state = 'UNKNOWN'
 		  AND version = $3
 		  AND reconcile_lease_expires_at > clock_timestamp()
-	`, fmt.Sprintf("%d microseconds", duration.Microseconds()),
+	`, pgInterval(duration),
 		executionID, expectedVersion)
 	if err != nil {
 		return err
@@ -1370,14 +1607,14 @@ func (s *Store) ClaimExpiredBatch(ctx context.Context, owner string, batchSize i
 		)
 		UPDATE execution_requests er
 		SET reconcile_owner = $1,
-		    reconcile_lease_expires_at = clock_timestamp() + $2::interval,
+		    reconcile_lease_expires_at = clock_timestamp() + make_interval(secs => $2),
 		    version = er.version + 1,
 		    updated_at = clock_timestamp()
 		FROM claimed
 		WHERE er.execution_id = claimed.execution_id
-		RETURNING `+selectColumns,
+		RETURNING `+selectColumnsER,
 		owner,
-		fmt.Sprintf("%d microseconds", claimDuration.Microseconds()),
+		pgInterval(claimDuration),
 		batchSize,
 	)
 	if err != nil {
@@ -1493,7 +1730,7 @@ func scanRecordsWithReconcile(rows *sql.Rows) ([]*Record, error) {
 		var rec Record
 		var resultJSON []byte
 		var leaseOwner, leaseToken, providerID, providerRunID, terminalDigest sql.NullString
-		var recoveryLocator []byte
+		var evidenceReceipt, recoveryLocator []byte
 		var leaseStartedAt, leaseExpiresAt sql.NullTime
 		var recOwner, lastRecErr sql.NullString
 		var recLeaseExp, nextRecAt sql.NullTime
@@ -1504,7 +1741,7 @@ func scanRecordsWithReconcile(rows *sql.Rows) ([]*Record, error) {
 			&rec.EvidenceDigest, &rec.ReceiptVersion,
 			&leaseOwner, &leaseToken, &leaseStartedAt, &leaseExpiresAt,
 			&rec.LeaseGeneration,
-			&providerID, &providerRunID, &terminalDigest, &recoveryLocator,
+			&providerID, &providerRunID, &terminalDigest, &evidenceReceipt, &recoveryLocator,
 			&rec.Attempt, &rec.Version, &rec.CreatedAt, &rec.UpdatedAt,
 			&recOwner, &recLeaseExp, &rec.ReconcileAttempt, &nextRecAt, &lastRecErr,
 		); err != nil {
@@ -1533,6 +1770,9 @@ func scanRecordsWithReconcile(rows *sql.Rows) ([]*Record, error) {
 		}
 		if terminalDigest.Valid {
 			rec.TerminalReceiptDigest = terminalDigest.String
+		}
+		if len(evidenceReceipt) > 0 {
+			rec.EvidenceReceipt = json.RawMessage(evidenceReceipt)
 		}
 		if len(recoveryLocator) > 0 {
 			rec.RecoveryLocator = json.RawMessage(recoveryLocator)
