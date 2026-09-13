@@ -1,10 +1,19 @@
 package execution
 
 import (
+	"database/sql"
 	"time"
 
 	"github.com/openclaw/crabbox/internal/capability"
+	"github.com/openclaw/crabbox/internal/testutil"
 )
+
+// openTestDB opens a PostgreSQL connection for live tests, scoped to a
+// package-private schema so parallel package test binaries cannot
+// interfere with each other's rows.
+func openTestDB(dbURL string) (*sql.DB, error) {
+	return testutil.OpenLiveDB(dbURL, "crabbox_test_execution")
+}
 
 // testGrantResolver creates an InMemoryGrantResolver with a test grant
 // that permits all capabilities for alice@example.com.

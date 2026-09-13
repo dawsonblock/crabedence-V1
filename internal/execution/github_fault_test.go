@@ -103,7 +103,7 @@ func liveStore(t *testing.T, lease time.Duration) (*idempotency.Store, *sql.DB) 
 	if dbURL == "" {
 		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live PostgreSQL test")
 	}
-	db, err := sql.Open("pgx", dbURL)
+	db, err := openTestDB(dbURL)
 	if err != nil {
 		t.Fatalf("failed to open database: %v", err)
 	}

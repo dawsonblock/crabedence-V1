@@ -9,11 +9,14 @@ import (
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/openclaw/crabbox/internal/testutil"
 )
 
-// openTestDB opens a PostgreSQL connection for live authority tests.
+// openTestDB opens a PostgreSQL connection for live authority tests,
+// scoped to a package-private schema so parallel package test binaries
+// cannot interfere.
 func openTestDB(dbURL string) (*sql.DB, error) {
-	return sql.Open("pgx", dbURL)
+	return testutil.OpenLiveDB(dbURL, "crabbox_test_authority")
 }
 
 // TestLiveAuthorityGrantLookup tests that a valid grant can be resolved.

@@ -11,6 +11,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/openclaw/crabbox/internal/idempotency"
+	"github.com/openclaw/crabbox/internal/testutil"
 )
 
 // TestNoopResolverReturnsUnknown verifies that the NoopResolver
@@ -461,7 +462,8 @@ func TestLiveClaimExpiryRecovery(t *testing.T) {
 	}
 }
 
-// openTestDB opens a test database connection.
+// openTestDB opens a test database connection scoped to a package-private
+// schema so parallel package test binaries cannot interfere.
 func openTestDB(dbURL string) (*sql.DB, error) {
-	return sql.Open("pgx", dbURL)
+	return testutil.OpenLiveDB(dbURL, "crabbox_test_reconcile")
 }

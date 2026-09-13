@@ -92,6 +92,7 @@
 - Execution: evidence signing is explicit deployment configuration — `CRABBOX_EVIDENCE_KEY` for the signing key path (replicas must share key material) and `CRABBOX_EVIDENCE_TRUSTED_SIGNERS` for additional trusted fingerprints during rotation. `LoadOrCreateSigner` now tightens permissive key-file permissions on load and fails closed if it cannot.
 - Release: new mandatory `effect-fabric-evidence` gate runs `internal/evidence` under `-race` — the signed-receipt trust boundary is first-class release evidence. New opt-in `provider-github-real-api` gate qualifies the adapter against real GitHub when `CRABBOX_GITHUB_TEST_TOKEN`/`CRABBOX_GITHUB_TEST_REPO` are configured (never recorded as a pass-by-skip).
 - Tests: adversarial coverage for TCP reset-after-send, page-2 marker recovery, negative-read → UNKNOWN, fabricated evidence digest (stored digest is `sha256(artifact)`), `entered_unknown_at` retention semantics, secret-key spelling variants, and conflicting provider receipt versions.
+- Tests: live PostgreSQL suites are isolated per package — `testutil.OpenLiveDB` pins each package's connections to a dedicated `search_path` schema (`crabbox_test_<package>`) and caps pool size, so `go test -race ./...` with `CRABBOX_TEST_DATABASE_URL` no longer flakes from cross-package `DELETE`s, claim stealing, or `max_connections` exhaustion.
 
 ### RC8 — Effect Fabric Recovery Boundary Closure
 
