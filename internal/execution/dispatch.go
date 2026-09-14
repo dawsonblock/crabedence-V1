@@ -72,7 +72,8 @@ func (e *DispatchExecutor) SetEvidenceSigner(s *evidence.Signer) {
 func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Request, desc capability.ResolvedDescriptor) Response {
 	// For PURE and READ, skip idempotency (no side effects)
 	if desc.ExecutionClass == capability.ClassPure || desc.ExecutionClass == capability.ClassRead {
-		return e.dispatch(ctx, req, desc)
+		resp, _ := e.dispatch(ctx, req, desc)
+		return resp
 	}
 
 	// For MUTATION and CRITICAL, durable idempotency is REQUIRED.
@@ -158,8 +159,27 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		replayRunID := ""
 		if acq.Record != nil {
 			replayRunID = acq.Record.ExecutionID
+			if acq.Record.ProviderRunID != "" {
+				replayRunID = acq.Record.ProviderRunID
+			}
 			if acq.Record.ProviderID != "" {
 				replayProvider = acq.Record.ProviderID
+			}
+		}
+		if acq.Kind == idempotency.RecoveryRequired {
+			// The record is UNKNOWN — caller-terminal, not in-flight.
+			// The prior dispatch outcome could not be determined and
+			// reconciliation owns the record; reporting IN_FLIGHT
+			// would invite the caller to wait or retry an operation
+			// that may already have executed.
+			return Response{
+				Status:      StatusUnknown,
+				FailureCode: string(capability.FailureExecutionUnknown),
+				Error:       "prior execution outcome is unknown and under reconciliation — do not retry",
+				Execution: &ExecutionMeta{
+					Provider: replayProvider,
+					RunID:    replayRunID,
+				},
 			}
 		}
 		return Response{
@@ -246,7 +266,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	if recoveryLocator.ExternalToken != "" {
 		dispatchCtx = context.WithValue(ctx, externalTokenKey{}, recoveryLocator.ExternalToken)
 	}
-	resp := e.dispatch(dispatchCtx, req, desc)
+	resp, provableNoEffect := e.dispatch(dispatchCtx, req, desc)
 
 	// ─── DURABLE PROVIDER OBSERVATION ────────────────────────────────────
 	// Persist the provider's response metadata BEFORE any terminal
@@ -261,12 +281,16 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	// may rewrite resp to an UNKNOWN wire response, but the durable
 	// observation must always carry what the provider actually said.
 	providerResp := resp
-	// A definitive (provable no-effect) failure without provider bytes
-	// still yields attestable evidence: the failure record itself.
-	// Synthesizing the artifact lets CRITICAL executions that provably
-	// never ran terminate FAILED instead of stranding in UNKNOWN with
-	// nothing to attest.
-	if len(resp.EvidenceArtifact) == 0 && resp.DefinitiveFailure {
+	// A definitive failure the EXECUTOR itself proved pre-transmission
+	// (the handler was never invoked) still yields attestable evidence:
+	// the dispatcher's synthesized failure record. The handler's
+	// DefinitiveFailure flag is only a routing hint — a handler that
+	// performed the effect and then asserts the flag must not be able
+	// to conjure signed NO_EFFECT proof, so synthesis requires the
+	// executor's own provable-no-effect provenance. A handler-claimed
+	// definitive failure without a real artifact fails closed to
+	// UNKNOWN at the CRITICAL sign gate below.
+	if len(resp.EvidenceArtifact) == 0 && resp.DefinitiveFailure && provableNoEffect {
 		resp.EvidenceArtifact, _ = json.Marshal(map[string]string{
 			"definitive_failure": "true",
 			"failure_code":       resp.FailureCode,
@@ -338,6 +362,30 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		}
 		if obsErr != nil {
 			errMsg += fmt.Sprintf("; provider observation NOT persisted: %v", obsErr)
+		}
+		return Response{
+			Status:      StatusUnknown,
+			FailureCode: string(capability.FailureExecutionUnknown),
+			Error:       errMsg,
+			Execution: &ExecutionMeta{
+				Provider: desc.AdapterID,
+				RunID:    executionID,
+			},
+		}
+	}
+
+	// The durable provider observation is part of the record the
+	// terminal receipt attests. If the write failed — including a
+	// monotonic conflict with a previously stored observation — the
+	// terminal outcome must not be committed over it: the receipt
+	// would contradict the durable observation. Route to UNKNOWN so
+	// reconciliation sees the record rather than sealing the
+	// contradiction into an immutable terminal state.
+	if obsErr != nil {
+		recErr := e.enterRecoveryWithObservation(ctx, executionID, providerResp, desc)
+		errMsg := fmt.Sprintf("provider observation not persisted: %v", obsErr)
+		if recErr != nil {
+			errMsg += fmt.Sprintf("; %v", recErr)
 		}
 		return Response{
 			Status:      StatusUnknown,
@@ -495,7 +543,14 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 // dispatch sends the request to the handler.
 // This crosses the dispatch boundary — any failure after this call
 // begins is POST_DISPATCH (may have executed).
-func (e *DispatchExecutor) dispatch(ctx context.Context, req Request, desc capability.ResolvedDescriptor) Response {
+//
+// The second return value reports executor-established pre-transmission
+// provenance: true only when the executor itself proved the provider was
+// never invoked (e.g. an already-expired deadline). A handler-set
+// DefinitiveFailure is a routing hint, not proof — only responses with
+// executor provenance may be synthesized into attestable no-effect
+// evidence upstream.
+func (e *DispatchExecutor) dispatch(ctx context.Context, req Request, desc capability.ResolvedDescriptor) (Response, bool) {
 	// Set a timeout if deadline is provided
 	dispatchCtx := ctx
 	if req.Deadline != "" {
@@ -511,7 +566,7 @@ func (e *DispatchExecutor) dispatch(ctx context.Context, req Request, desc capab
 					FailureCode:       string(capability.FailureInvalidRequest),
 					Error:             fmt.Sprintf("request deadline %s already passed", req.Deadline),
 					DefinitiveFailure: true,
-				}
+				}, true
 			}
 			var cancel context.CancelFunc
 			dispatchCtx, cancel = context.WithTimeout(ctx, remaining)
@@ -521,7 +576,7 @@ func (e *DispatchExecutor) dispatch(ctx context.Context, req Request, desc capab
 
 	// The handler.Execute call crosses the dispatch boundary.
 	resp := e.handler.Execute(dispatchCtx, req, desc)
-	return resp
+	return resp, false
 }
 
 // classifyPostDispatch is the single post-dispatch decision table.

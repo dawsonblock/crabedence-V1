@@ -263,12 +263,25 @@ func (h *GitHubIssueHandler) Resolve(ctx context.Context, rec *idempotency.Recor
 	// Paginate completely. GitHub returns at most 100 issues per page;
 	// checking only page 1 would falsely conclude "no effect" when the
 	// marker sits on a later page. Follow Link rel="next" until the
-	// listing is exhausted (bounded to prevent pathological loops).
+	// listing is exhausted — there is no page ceiling: a fixed cap
+	// would make operations on later pages permanently unreachable
+	// and dead-letter effects that could have resolved. Termination is
+	// guaranteed by the resolver context deadline and by visited-URL
+	// cycle detection, which bounds a hostile or looping Link header.
 	// A rel="next" URL is only followed when it stays on the API origin —
 	// the Authorization bearer must never leave the configured base URL.
 	truncated := false
+	seen := map[string]bool{}
 	nextURL := h.baseURL + "/repos/" + repo + "/issues?state=all&per_page=100"
-	for pages := 0; nextURL != "" && pages < 50; pages++ {
+	for nextURL != "" {
+		if seen[nextURL] {
+			// A rel="next" pointing back at a visited page means the
+			// listing cannot be fully traversed — report truncation
+			// rather than loop forever.
+			truncated = true
+			break
+		}
+		seen[nextURL] = true
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, nextURL, nil)
 		if err != nil {
 			return idempotency.RecoveryResult{}, err

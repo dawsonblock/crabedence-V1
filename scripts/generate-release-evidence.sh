@@ -620,7 +620,7 @@ run_authority_postgres_gate() {
   fi
 
   local executed
-  executed=$(grep -cE '^\s*--- (PASS|FAIL|SKIP):' "$log" 2>/dev/null || true)
+  executed=$(grep -cE '^\s*--- (PASS|FAIL):' "$log" 2>/dev/null || true)
   if [ "$executed" -le 0 ]; then
     {
       echo ""
@@ -724,24 +724,23 @@ extract_tests_executed() {
       # -json gates write structured accounting lines into the log:
       #   tests_discovered=N / tests_passed=N / tests_failed=N / tests_skipped=N
       # (the -json event stream has no "--- PASS:" lines to grep).
-      local d p f s
-      d=$(grep -oE '^tests_discovered=[0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$' || true)
+      local p f
       p=$(grep -oE '^tests_passed=[0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$' || true)
       f=$(grep -oE '^tests_failed=[0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$' || true)
-      s=$(grep -oE '^tests_skipped=[0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$' || true)
-      count=$((${d:-0} > 0 ? ${d:-0} : ${p:-0} + ${f:-0} + ${s:-0}))
+      count=$((${p:-0} + ${f:-0}))
       ;;
-    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-cli|effect-fabric-contract|effect-fabric-reconciliation|effect-fabric-evidence|effect-fabric-race|authority-postgres)
+    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-cli|effect-fabric-contract|effect-fabric-reconciliation|effect-fabric-evidence|effect-fabric-race|authority-postgres|provider-github-real-api)
       # Go test with -v prints one line per test:
       #   --- PASS: TestName (0.00s)
       #   --- FAIL: TestName (0.00s)
       #   --- SKIP: TestName (0.00s)
-      # Count per-test result lines, not package-level ok/FAIL lines.
+      # Count executed tests only — a SKIP is not evidence of execution.
+      # Per-test result lines, not package-level ok/FAIL lines.
       # A go test -run expression matching zero tests produces "ok" but
       # no --- PASS lines — the count correctly returns 0.
       # NOTE: grep -c outputs "0" and exits 1 when no matches. Using
       # `|| true` (not `|| echo 0`) avoids appending a second "0".
-      count=$(grep -cE '^\s*--- (PASS|FAIL|SKIP):' "$log" 2>/dev/null || true)
+      count=$(grep -cE '^\s*--- (PASS|FAIL):' "$log" 2>/dev/null || true)
       ;;
     worker-tests|nemo-tests)
       # Vitest prints a summary like:
@@ -750,21 +749,19 @@ extract_tests_executed() {
       local tests_line
       tests_line=$(sed 's/\x1b\[[0-9;]*m//g' "$log" 2>/dev/null | grep -E 'Tests[[:space:]]+[0-9]+' | tail -1 || true)
       if [ -n "$tests_line" ]; then
-        # Try to extract the number in parentheses first: "5 passed (5)"
-        local in_parens
-        in_parens=$(echo "$tests_line" | grep -oE '\([0-9]+\)' | grep -oE '[0-9]+' || true)
-        if [ -n "$in_parens" ]; then
-          count="$in_parens"
+        # Executed = passed + failed — a skip is not evidence of
+        # execution. The parenthesized total includes skips, so it is
+        # only a fallback when the per-status counts are absent.
+        local passed failed skipped
+        passed=$(echo "$tests_line" | grep -oE '[0-9]+ passed' | grep -oE '^[0-9]+' || true)
+        failed=$(echo "$tests_line" | grep -oE '[0-9]+ failed' | grep -oE '^[0-9]+' || true)
+        skipped=$(echo "$tests_line" | grep -oE '[0-9]+ skipped' | grep -oE '^[0-9]+' || true)
+        if [ -n "$passed" ] || [ -n "$failed" ]; then
+          count=$((${passed:-0} + ${failed:-0}))
         else
-          # Sum the individual counts: "5 passed | 2 failed | 1 skipped"
-          local passed failed skipped
-          passed=$(echo "$tests_line" | grep -oE '[0-9]+ passed' | grep -oE '^[0-9]+' || true)
-          failed=$(echo "$tests_line" | grep -oE '[0-9]+ failed' | grep -oE '^[0-9]+' || true)
-          skipped=$(echo "$tests_line" | grep -oE '[0-9]+ skipped' | grep -oE '^[0-9]+' || true)
-          passed="${passed:-0}"
-          failed="${failed:-0}"
-          skipped="${skipped:-0}"
-          count=$((passed + failed + skipped))
+          local in_parens
+          in_parens=$(echo "$tests_line" | grep -oE '\([0-9]+\)' | grep -oE '[0-9]+' || true)
+          count=$((${in_parens:-0} - ${skipped:-0}))
         fi
       fi
       ;;
@@ -779,13 +776,14 @@ extract_tests_executed() {
         fi
       done
       if [ -n "${json_summary:-}" ] && [ -f "$json_summary" ] && command -v jq >/dev/null 2>&1; then
-        # Count total assertion results across all test files.
-        count=$(jq '[.testResults[].assertionResults | length] | add // 0' "$json_summary" 2>/dev/null || true)
+        # Count executed assertion results — skipped/pending/todo are
+        # not evidence of execution.
+        count=$(jq '[.testResults[].assertionResults[] | select(.status == "passed" or .status == "failed")] | length' "$json_summary" 2>/dev/null || true)
       fi
       ;;
     cross-language-conformance)
-      # With -v, count per-test result lines.
-      count=$(grep -cE '^\s*--- (PASS|FAIL|SKIP):' "$log" 2>/dev/null || true)
+      # With -v, count executed per-test result lines (SKIP excluded).
+      count=$(grep -cE '^\s*--- (PASS|FAIL):' "$log" 2>/dev/null || true)
       ;;
     *)
       # Non-test gates (vet, typecheck, format, lint, build) have no test count.
@@ -794,6 +792,55 @@ extract_tests_executed() {
   esac
 
   # Ensure numeric and non-negative.
+  if ! [[ "$count" =~ ^[0-9]+$ ]]; then
+    count=0
+  fi
+  echo "$count"
+}
+
+# Extract tests_skipped from a gate log. Mirrors extract_tests_executed
+# so the release manifest reports real skip accounting instead of a
+# hardcoded 0.
+extract_tests_skipped() {
+  local gate_name="$1"
+  local log="$2"
+  local count=0
+
+  case "$gate_name" in
+    effect-fabric-postgres|provider-github-faults)
+      # -json gates write structured accounting lines into the log.
+      count=$(grep -oE '^tests_skipped=[0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$' || true)
+      count=${count:-0}
+      ;;
+    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-cli|effect-fabric-contract|effect-fabric-reconciliation|effect-fabric-evidence|effect-fabric-race|authority-postgres|provider-github-real-api|cross-language-conformance)
+      count=$(grep -cE '^\s*--- SKIP:' "$log" 2>/dev/null || true)
+      ;;
+    worker-tests|nemo-tests)
+      local tests_line
+      tests_line=$(sed 's/\x1b\[[0-9;]*m//g' "$log" 2>/dev/null | grep -E 'Tests[[:space:]]+[0-9]+' | tail -1 || true)
+      if [ -n "$tests_line" ]; then
+        local skipped
+        skipped=$(echo "$tests_line" | grep -oE '[0-9]+ skipped' | grep -oE '^[0-9]+' || true)
+        count=${skipped:-0}
+      fi
+      ;;
+    postgres-*)
+      local json_summary
+      for candidate in "${log%.log}.summary.json" "$EVIDENCE_DIR/${gate_name}.summary.json" "$EVIDENCE_DIR/${gate_name}.vitest.json"; do
+        if [ -f "$candidate" ]; then
+          json_summary="$candidate"
+          break
+        fi
+      done
+      if [ -n "${json_summary:-}" ] && [ -f "$json_summary" ] && command -v jq >/dev/null 2>&1; then
+        count=$(jq '[.testResults[].assertionResults[] | select(.status == "skipped" or .status == "pending" or .status == "todo")] | length' "$json_summary" 2>/dev/null || true)
+      fi
+      ;;
+    *)
+      count=0
+      ;;
+  esac
+
   if ! [[ "$count" =~ ^[0-9]+$ ]]; then
     count=0
   fi
@@ -922,15 +969,20 @@ if [ -z "${RELEASE_VERSION:-}" ]; then
 fi
 RELEASE_NAME="${RELEASE_NAME:-crabedence-v${RELEASE_VERSION}}"
 
-# Aggregate tests_executed across all test gates for the release manifest.
+# Aggregate tests_executed and tests_skipped across all test gates for
+# the release manifest. The test-gate pattern must stay in sync with
+# check-release-admission.sh — a test gate missing from it is silently
+# excluded from the manifest's test accounting.
 TOTAL_TESTS_EXECUTED=0
 TOTAL_TESTS_SKIPPED=0
 for i in "${!GATE_NAMES[@]}"; do
   gate_name="${GATE_NAMES[$i]}"
   case "$gate_name" in
-    *tests|postgres-*|effect-fabric-*|cross-language-conformance|authority-*)
+    *tests|postgres-*|effect-fabric-*|cross-language-conformance|authority-*|provider-*|go-race-*)
       te="$(extract_tests_executed "$gate_name" "${GATE_LOG[$i]}")"
+      ts="$(extract_tests_skipped "$gate_name" "${GATE_LOG[$i]}")"
       TOTAL_TESTS_EXECUTED=$((TOTAL_TESTS_EXECUTED + te))
+      TOTAL_TESTS_SKIPPED=$((TOTAL_TESTS_SKIPPED + ts))
       ;;
   esac
 done

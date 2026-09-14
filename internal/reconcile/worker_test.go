@@ -2,6 +2,7 @@ package reconcile
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"fmt"
 	"os"
@@ -164,15 +165,21 @@ func TestLiveWorkerReconciliation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Create a resolver that returns COMMITTED + proof.
+	// Create a resolver that returns COMMITTED + proof. The artifact
+	// carries the provider's raw observation; the resolver-supplied
+	// digest is deliberately wrong to prove the worker recomputes the
+	// evidence digest from artifact bytes rather than trusting it.
+	artifact := []byte(`{"counter":"test","value":1,"provider":"test-counter"}`)
+	wantDigest := fmt.Sprintf("%x", sha256.Sum256(artifact))
 	proofResolver := &fullResultResolver{
 		result: idempotency.RecoveryResult{
-			Decision:       idempotency.RecoveryCommitted,
-			Result:         []byte(`{"counter":"test","value":1}`),
-			EvidenceDigest: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
-			ReceiptVersion: 3,
-			ProviderID:     "test-counter",
-			ProviderRunID:  "run_worker_reconcile",
+			Decision:         idempotency.RecoveryCommitted,
+			Result:           []byte(`{"counter":"test","value":1}`),
+			EvidenceArtifact: artifact,
+			EvidenceDigest:   "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+			ReceiptVersion:   3,
+			ProviderID:       "test-counter",
+			ProviderRunID:    "run_worker_reconcile",
 		},
 	}
 
@@ -193,6 +200,9 @@ func TestLiveWorkerReconciliation(t *testing.T) {
 	}
 	if rec.ProviderRunID != "run_worker_reconcile" {
 		t.Errorf("expected provider_run_id=run_worker_reconcile, got %q", rec.ProviderRunID)
+	}
+	if rec.EvidenceDigest != wantDigest {
+		t.Errorf("expected evidence digest recomputed from artifact (%s), got %q", wantDigest, rec.EvidenceDigest)
 	}
 }
 

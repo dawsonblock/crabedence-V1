@@ -234,11 +234,11 @@ func TestLiveEvidenceDigestRecomputedFromArtifact(t *testing.T) {
 	}
 }
 
-// definitiveFailHandler provably never reaches the provider — a
-// definitive failure carrying no evidence artifact. The executor must
-// synthesize the artifact from the failure record so a CRITICAL
-// execution can attest NO_EFFECT and terminate FAILED instead of
-// stranding in UNKNOWN forever.
+// definitiveFailHandler claims a definitive failure carrying no
+// evidence artifact. The flag is a routing hint from handler code —
+// the handler ran, so its assertion is not executor-established
+// pre-transmission proof. The executor must NOT synthesize a signed
+// NO_EFFECT artifact from it.
 type definitiveFailHandler struct{}
 
 func (definitiveFailHandler) Execute(_ context.Context, _ Request, _ capability.ResolvedDescriptor) Response {
@@ -251,11 +251,90 @@ func (definitiveFailHandler) Execute(_ context.Context, _ Request, _ capability.
 	}
 }
 
+// invokedHandler records whether Execute was called.
+type invokedHandler struct {
+	called atomic.Bool
+	resp   Response
+}
+
+func (h *invokedHandler) Execute(_ context.Context, _ Request, _ capability.ResolvedDescriptor) Response {
+	h.called.Store(true)
+	return h.resp
+}
+
 // TestLiveCriticalDefinitiveFailureTerminatesFailed verifies the
-// synthesized-artifact path end to end: CRITICAL + DefinitiveFailure
-// with no provider bytes → evidence digest recomputed from the
-// synthesized failure record → signed NO_EFFECT receipt → FAILED.
+// synthesized-artifact path end to end for an executor-proven
+// pre-transmission failure: the deadline expires before dispatch, the
+// handler is never invoked, and the executor's own failure record
+// becomes the attested NO_EFFECT artifact — digest recomputed, signed
+// receipt, durable FAILED.
 func TestLiveCriticalDefinitiveFailureTerminatesFailed(t *testing.T) {
+	if os.Getenv("CRABBOX_TEST_DATABASE_URL") == "" {
+		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live PostgreSQL test")
+	}
+	store, db := liveStore(t, 5*time.Second)
+	defer db.Close()
+
+	signer, err := evidence.GenerateSigner()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.SetTrustedEvidenceSigners(signer.Fingerprint())
+
+	// The handler would succeed if invoked — the expired deadline must
+	// stop dispatch before it runs.
+	h := &invokedHandler{resp: Response{
+		Status:    StatusSucceeded,
+		Result:    json.RawMessage(`{"ok":true}`),
+		Execution: &ExecutionMeta{Provider: "fake"},
+	}}
+	exec := NewDispatchExecutor(NewMultiHandler(map[string]Handler{
+		"fake": h,
+	}), store)
+	exec.SetEvidenceSigner(signer)
+
+	key := fmt.Sprintf("test-crit-deffail-%d", time.Now().UnixNano())
+	defer db.ExecContext(context.Background(),
+		`DELETE FROM execution_requests WHERE idempotency_key = $1`, key)
+
+	resp := exec.ExecuteWithIdempotency(context.Background(), Request{
+		Capability:     "github.issue.create",
+		Arguments:      json.RawMessage(`{"repo":"octo/repo","title":"t"}`),
+		Authority:      RequestAuthority{Principal: "alice@example.com", AuthorityRef: "grant_f"},
+		IdempotencyKey: key,
+		Deadline:       time.Now().Add(-time.Minute).UTC().Format(time.RFC3339),
+	}, capability.ResolvedDescriptor{
+		ExecutionClass: capability.ClassCritical,
+		AdapterID:      "fake",
+	})
+	if h.called.Load() {
+		t.Fatal("handler must not be invoked after the deadline passed")
+	}
+	if resp.Status != StatusFailed {
+		t.Fatalf("executor-proven definitive failure must terminate FAILED, got %s (%s)", resp.Status, resp.Error)
+	}
+	rec, err := store.LookupByKey(context.Background(), "alice@example.com", "github.issue.create", key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.State != idempotency.StateFailed {
+		t.Errorf("record must be FAILED, got %s", rec.State)
+	}
+	if len(rec.EvidenceReceipt) == 0 {
+		t.Error("FAILED terminal record must carry a signed NO_EFFECT receipt")
+	}
+	if rec.EvidenceDigest == "" {
+		t.Error("synthesized failure artifact must produce an evidence digest")
+	}
+}
+
+// TestLiveCriticalHandlerClaimedDefinitiveFailureFailsClosed verifies
+// that a handler-asserted DefinitiveFailure without provider artifact
+// bytes is not proof: the handler ran, so its claim cannot be
+// synthesized into a signed NO_EFFECT receipt. The CRITICAL record
+// must fail closed to UNKNOWN for reconciliation — never silently
+// FAILED on the handler's own say-so.
+func TestLiveCriticalHandlerClaimedDefinitiveFailureFailsClosed(t *testing.T) {
 	if os.Getenv("CRABBOX_TEST_DATABASE_URL") == "" {
 		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live PostgreSQL test")
 	}
@@ -273,7 +352,7 @@ func TestLiveCriticalDefinitiveFailureTerminatesFailed(t *testing.T) {
 	}), store)
 	exec.SetEvidenceSigner(signer)
 
-	key := fmt.Sprintf("test-crit-deffail-%d", time.Now().UnixNano())
+	key := fmt.Sprintf("test-crit-claimed-deffail-%d", time.Now().UnixNano())
 	defer db.ExecContext(context.Background(),
 		`DELETE FROM execution_requests WHERE idempotency_key = $1`, key)
 
@@ -286,8 +365,48 @@ func TestLiveCriticalDefinitiveFailureTerminatesFailed(t *testing.T) {
 		ExecutionClass: capability.ClassCritical,
 		AdapterID:      "fake",
 	})
+	if resp.Status != StatusUnknown {
+		t.Fatalf("handler-claimed definitive failure without artifact must fail closed to UNKNOWN, got %s (%s)", resp.Status, resp.Error)
+	}
+	rec, err := store.LookupByKey(context.Background(), "alice@example.com", "github.issue.create", key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.State != idempotency.StateUnknown {
+		t.Errorf("record must remain UNKNOWN for reconciliation, got %s", rec.State)
+	}
+}
+
+// TestLiveMutationHandlerDefinitiveFailureTerminatesFailed verifies
+// that a non-CRITICAL handler-claimed definitive failure still
+// terminates FAILED: the canonical failure result satisfies the
+// non-CRITICAL terminal policy without attested evidence.
+func TestLiveMutationHandlerDefinitiveFailureTerminatesFailed(t *testing.T) {
+	if os.Getenv("CRABBOX_TEST_DATABASE_URL") == "" {
+		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live PostgreSQL test")
+	}
+	store, db := liveStore(t, 5*time.Second)
+	defer db.Close()
+
+	exec := NewDispatchExecutor(NewMultiHandler(map[string]Handler{
+		"fake": definitiveFailHandler{},
+	}), store)
+
+	key := fmt.Sprintf("test-mut-deffail-%d", time.Now().UnixNano())
+	defer db.ExecContext(context.Background(),
+		`DELETE FROM execution_requests WHERE idempotency_key = $1`, key)
+
+	resp := exec.ExecuteWithIdempotency(context.Background(), Request{
+		Capability:     "github.issue.create",
+		Arguments:      json.RawMessage(`{"repo":"octo/repo","title":"t"}`),
+		Authority:      RequestAuthority{Principal: "alice@example.com", AuthorityRef: "grant_f"},
+		IdempotencyKey: key,
+	}, capability.ResolvedDescriptor{
+		ExecutionClass: capability.ClassMutation,
+		AdapterID:      "fake",
+	})
 	if resp.Status != StatusFailed {
-		t.Fatalf("definitive failure must terminate FAILED, got %s (%s)", resp.Status, resp.Error)
+		t.Fatalf("non-CRITICAL definitive failure must terminate FAILED, got %s (%s)", resp.Status, resp.Error)
 	}
 	rec, err := store.LookupByKey(context.Background(), "alice@example.com", "github.issue.create", key)
 	if err != nil {
@@ -295,12 +414,6 @@ func TestLiveCriticalDefinitiveFailureTerminatesFailed(t *testing.T) {
 	}
 	if rec.State != idempotency.StateFailed {
 		t.Errorf("record must be FAILED, got %s", rec.State)
-	}
-	if len(rec.EvidenceReceipt) == 0 {
-		t.Error("FAILED terminal record must carry a signed NO_EFFECT receipt")
-	}
-	if rec.EvidenceDigest == "" {
-		t.Error("synthesized failure artifact must produce an evidence digest")
 	}
 }
 

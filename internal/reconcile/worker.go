@@ -276,11 +276,14 @@ func (w *Worker) reconcileOne(ctx context.Context, rec *idempotency.Record) erro
 	rctx, cancel := context.WithTimeout(ctx, resolveTimeout)
 
 	// Claim heartbeat — renew while the resolver runs. The heartbeat
-	// has its own context: it must keep renewing across resolver
-	// deadline boundaries so the claim outlives the initial TTL. If
-	// renewal fails (claim lost or expired), cancel the resolver
-	// context: committing with a lost claim would race another worker.
-	hbCtx, hbCancel := context.WithCancel(ctx)
+	// is bounded by the resolver deadline (rctx): it keeps renewing
+	// across claim-TTL windows while the resolver works, but when the
+	// resolver's deadline is reached the claim stops being renewed so
+	// a wedged resolver cannot hold the record forever. If renewal
+	// fails (claim lost or expired), the heartbeat cancels the
+	// resolver context: committing with a lost claim would race
+	// another worker.
+	hbCtx, hbCancel := context.WithCancel(rctx)
 	heartbeatDone := make(chan struct{})
 	go w.claimHeartbeat(hbCtx, cancel, rec, heartbeatDone)
 	// Wait for the heartbeat goroutine AFTER stopping it — the
@@ -302,19 +305,15 @@ func (w *Worker) reconcileOne(ctx context.Context, rec *idempotency.Record) erro
 	// ARTIFACT bytes — a resolver-supplied digest is never signed.
 	// This is the same boundary the dispatch path enforces: what the
 	// trusted signer attests is a digest Crabedence itself computed.
-	// A RecoveryFailed decision without provider bytes is still
-	// attestable: the resolver's own observation record is the
-	// no-effect evidence (a success claim, by contrast, must carry
-	// the provider's actual artifact).
+	// A RecoveryFailed decision without provider artifact bytes is NOT
+	// attestable: the resolver's own result payload is a self-authored
+	// claim, not provider evidence, and promoting it into a signed
+	// NO_EFFECT receipt would fabricate proof that the provider was
+	// never reached. Resolver claims without artifacts stay UNKNOWN
+	// for CRITICAL records (the sign gate below rejects them) and
+	// resolve on the canonical result alone for non-CRITICAL records.
 	switch {
 	case len(result.EvidenceArtifact) > 0:
-		sum := sha256.Sum256(result.EvidenceArtifact)
-		result.EvidenceDigest = fmt.Sprintf("%x", sum)
-		if result.ReceiptVersion == 0 {
-			result.ReceiptVersion = 3
-		}
-	case result.Decision == idempotency.RecoveryFailed && len(result.Result) > 0:
-		result.EvidenceArtifact = result.Result
 		sum := sha256.Sum256(result.EvidenceArtifact)
 		result.EvidenceDigest = fmt.Sprintf("%x", sum)
 		if result.ReceiptVersion == 0 {

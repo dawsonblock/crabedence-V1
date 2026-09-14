@@ -249,7 +249,10 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 
 	// Startup check: the migrated schema must satisfy this build's
 	// required version. Fails closed on an incomplete schema.
-	version, err := s.SchemaVersion(ctx)
+	// Read through the already-held conn — querying the pool here would
+	// deadlock under MaxOpenConns(1), since the sole connection is
+	// checked out until ensureSchema returns.
+	version, err := schemaVersion(ctx, conn)
 	if err != nil {
 		return err
 	}
@@ -263,8 +266,18 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 // SchemaVersion returns the highest applied schema migration version
 // (0 when no migrations have been recorded).
 func (s *Store) SchemaVersion(ctx context.Context) (int, error) {
+	return schemaVersion(ctx, s.db)
+}
+
+// rowQuerier is satisfied by *sql.DB and *sql.Conn, letting the schema
+// version check run on either the pool or an already-held connection.
+type rowQuerier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+func schemaVersion(ctx context.Context, q rowQuerier) (int, error) {
 	var v *int
-	err := s.db.QueryRowContext(ctx,
+	err := q.QueryRowContext(ctx,
 		`SELECT MAX(version) FROM schema_migrations`).Scan(&v)
 	if err != nil {
 		return 0, fmt.Errorf("failed to read schema version: %w", err)
