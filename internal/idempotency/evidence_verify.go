@@ -68,14 +68,20 @@ func (v signedReceiptVerifier) Verify(_ context.Context, record *Record, receipt
 	if receipt.ReceiptVersion != 3 {
 		return nil, fmt.Errorf("unsupported receipt_version %d (must be 3)", receipt.ReceiptVersion)
 	}
-	if receipt.ProviderID == "" || receipt.ProviderRunID == "" {
-		return nil, fmt.Errorf("provider_id and provider_run_id are required")
-	}
 	outcome := evidence.OutcomeCompleted
 	verifiedOutcome := EvidenceOutcomeCompleted
 	if target == StateFailed {
 		outcome = evidence.OutcomeNoEffect
 		verifiedOutcome = EvidenceOutcomeNoEffect
+	}
+	if receipt.ProviderID == "" {
+		return nil, fmt.Errorf("provider_id is required")
+	}
+	// COMPLETED proof must name the provider operation that ran.
+	// NO_EFFECT has no operation identity — nothing ran — so a missing
+	// provider_run_id is correct rather than a defect.
+	if outcome == evidence.OutcomeCompleted && receipt.ProviderRunID == "" {
+		return nil, fmt.Errorf("provider_run_id is required for COMPLETED proof")
 	}
 	if err := evidence.VerifyReceipt(receipt.EvidenceReceipt, evidence.Binding{
 		ExecutionID:    record.ExecutionID,

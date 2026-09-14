@@ -75,7 +75,16 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	if githubToken == "" {
 		githubToken = os.Getenv("GITHUB_TOKEN")
 	}
-	githubEnabled := os.Getenv("CRABBOX_GITHUB_ENABLED") == "true" || githubToken != ""
+	// GITHUB_TOKEN is ambient in many dev shells and CI environments —
+	// an explicit CRABBOX_GITHUB_ENABLED=false/0/no must disable the
+	// capability even when a token is present.
+	githubEnabled := githubToken != ""
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("CRABBOX_GITHUB_ENABLED"))) {
+	case "true", "1", "yes":
+		githubEnabled = true
+	case "false", "0", "no":
+		githubEnabled = false
+	}
 	var githubHandler *GitHubIssueHandler
 	if githubEnabled {
 		if githubToken == "" {

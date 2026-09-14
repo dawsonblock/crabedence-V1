@@ -261,6 +261,22 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	// may rewrite resp to an UNKNOWN wire response, but the durable
 	// observation must always carry what the provider actually said.
 	providerResp := resp
+	// A definitive (provable no-effect) failure without provider bytes
+	// still yields attestable evidence: the failure record itself.
+	// Synthesizing the artifact lets CRITICAL executions that provably
+	// never ran terminate FAILED instead of stranding in UNKNOWN with
+	// nothing to attest.
+	if len(resp.EvidenceArtifact) == 0 && resp.DefinitiveFailure {
+		resp.EvidenceArtifact, _ = json.Marshal(map[string]string{
+			"definitive_failure": "true",
+			"failure_code":       resp.FailureCode,
+			"error":              resp.Error,
+		})
+		// classifyPostDispatch runs on providerResp — keep the
+		// artifact visible there too or the CRITICAL sign gate
+		// never sees it.
+		providerResp.EvidenceArtifact = resp.EvidenceArtifact
+	}
 	// Evidence authenticity boundary: the evidence digest is recomputed
 	// from the provider's evidence ARTIFACT bytes, never taken from a
 	// handler-supplied digest string. What the trusted signer attests
@@ -274,6 +290,12 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		}
 		resp.Evidence.Digest = recomputed
 		providerResp.Evidence = resp.Evidence
+	} else {
+		// A digest the executor cannot recompute from provider bytes is
+		// unverifiable — drop it rather than persist or attest a claim
+		// the ledger cannot prove.
+		resp.Evidence = nil
+		providerResp.Evidence = nil
 	}
 	if e.postDispatchHook != nil {
 		e.postDispatchHook()
@@ -480,11 +502,20 @@ func (e *DispatchExecutor) dispatch(ctx context.Context, req Request, desc capab
 		deadline, err := time.Parse(time.RFC3339, req.Deadline)
 		if err == nil {
 			remaining := time.Until(deadline)
-			if remaining > 0 {
-				var cancel context.CancelFunc
-				dispatchCtx, cancel = context.WithTimeout(ctx, remaining)
-				defer cancel()
+			if remaining <= 0 {
+				// The deadline already passed — do not invoke the
+				// handler at all. The provider was never called, so
+				// this is a provable no-effect failure.
+				return Response{
+					Status:            StatusFailed,
+					FailureCode:       string(capability.FailureInvalidRequest),
+					Error:             fmt.Sprintf("request deadline %s already passed", req.Deadline),
+					DefinitiveFailure: true,
+				}
 			}
+			var cancel context.CancelFunc
+			dispatchCtx, cancel = context.WithTimeout(ctx, remaining)
+			defer cancel()
 		}
 	}
 

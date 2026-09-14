@@ -54,10 +54,29 @@ func counterTokenKey(externalToken string) string {
 // original run ID. This allows Resolve() to prove "this specific
 // execution caused the effect" and to return the real provider run ID
 // rather than a fabricated one.
+// maxCounterTrackedExecutions bounds recovery-correlation memory per
+// counter. This is a test capability and its recovery data is
+// in-memory best-effort — beyond the bound, an arbitrary older entry
+// is evicted so a long-lived service cannot grow the map without
+// limit.
+const maxCounterTrackedExecutions = 4096
+
 type CounterHandler struct {
 	mu         sync.Mutex
 	counters   map[string]int64
 	executions map[string]map[string]CounterExecution // counter → correlation key → execution
+}
+
+// putCounterExecution inserts a correlation entry, evicting an entry
+// when the per-counter map is already at capacity.
+func putCounterExecution(m map[string]CounterExecution, key string, exec CounterExecution) {
+	if _, exists := m[key]; !exists && len(m) >= maxCounterTrackedExecutions {
+		for evict := range m {
+			delete(m, evict)
+			break
+		}
+	}
+	m[key] = exec
 }
 
 // NewCounterHandler creates a handler for test.counter.increment.
@@ -139,9 +158,9 @@ func (h *CounterHandler) Execute(ctx context.Context, req Request, desc capabili
 	}
 	if token := ExternalTokenFromContext(ctx); token != "" {
 		exec.ExecutionID = token // token encodes the execution identity
-		h.executions[args.Counter][counterTokenKey(token)] = exec
+		putCounterExecution(h.executions[args.Counter], counterTokenKey(token), exec)
 	}
-	h.executions[args.Counter][counterExecutionKey(req.Authority.Principal, req.Capability, req.IdempotencyKey)] = exec
+	putCounterExecution(h.executions[args.Counter], counterExecutionKey(req.Authority.Principal, req.Capability, req.IdempotencyKey), exec)
 	h.mu.Unlock()
 
 	result, _ := json.Marshal(map[string]any{

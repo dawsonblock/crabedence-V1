@@ -50,6 +50,11 @@ type Worker struct {
 	// it, the worker cannot produce the signed evidence receipt the
 	// store requires for CRITICAL — such records stay UNKNOWN.
 	signer *evidence.Signer
+	// maxAttempts bounds how many times an UNKNOWN record may be
+	// claimed for reconciliation. Past the ceiling the record is
+	// dead-lettered: it stays UNKNOWN and inspectable, but stops
+	// churning through the reconcile loop.
+	maxAttempts int
 }
 
 // NewWorker creates a reconciliation worker with a default resolver.
@@ -65,6 +70,7 @@ func NewWorker(store *idempotency.Store, defaultResolver idempotency.RecoveryRes
 		batchSize:        100,
 		claimDuration:    5 * time.Minute,
 		locatorRetention: 7 * 24 * time.Hour,
+		maxAttempts:      15,
 	}
 }
 
@@ -89,6 +95,12 @@ func (w *Worker) SetLocatorRetention(d time.Duration) { w.locatorRetention = d }
 // trusted evidence signer on the store (SetTrustedEvidenceSigners) or
 // the store will reject the receipts it produces.
 func (w *Worker) SetEvidenceSigner(s *evidence.Signer) { w.signer = s }
+
+// SetMaxAttempts overrides the reconcile-attempt ceiling (default 15).
+// Records that exhaust the ceiling are dead-lettered: they remain
+// UNKNOWN for operator inspection but are no longer claimed. A
+// non-positive value disables the ceiling.
+func (w *Worker) SetMaxAttempts(n int) { w.maxAttempts = n }
 
 // RegisterResolver registers a capability-specific recovery resolver.
 // When a UNKNOWN record's capability_id matches, this resolver is used
@@ -290,12 +302,30 @@ func (w *Worker) reconcileOne(ctx context.Context, rec *idempotency.Record) erro
 	// ARTIFACT bytes — a resolver-supplied digest is never signed.
 	// This is the same boundary the dispatch path enforces: what the
 	// trusted signer attests is a digest Crabedence itself computed.
-	if len(result.EvidenceArtifact) > 0 {
+	// A RecoveryFailed decision without provider bytes is still
+	// attestable: the resolver's own observation record is the
+	// no-effect evidence (a success claim, by contrast, must carry
+	// the provider's actual artifact).
+	switch {
+	case len(result.EvidenceArtifact) > 0:
 		sum := sha256.Sum256(result.EvidenceArtifact)
 		result.EvidenceDigest = fmt.Sprintf("%x", sum)
 		if result.ReceiptVersion == 0 {
 			result.ReceiptVersion = 3
 		}
+	case result.Decision == idempotency.RecoveryFailed && len(result.Result) > 0:
+		result.EvidenceArtifact = result.Result
+		sum := sha256.Sum256(result.EvidenceArtifact)
+		result.EvidenceDigest = fmt.Sprintf("%x", sum)
+		if result.ReceiptVersion == 0 {
+			result.ReceiptVersion = 3
+		}
+	default:
+		// A resolver-supplied digest without artifact bytes is
+		// unverifiable — drop it rather than persist or attest a
+		// claim the ledger cannot prove.
+		result.EvidenceDigest = ""
+		result.EvidenceReceipt = nil
 	}
 
 	// CRITICAL decisions require a signed evidence receipt attested by
@@ -327,6 +357,12 @@ func (w *Worker) reconcileOne(ctx context.Context, rec *idempotency.Record) erro
 			return w.releaseClaim(ctx, rec, fmt.Errorf("failed to sign recovery evidence receipt: %w", signErr))
 		}
 		result.EvidenceReceipt = signed
+	}
+	// A resolver-supplied receipt on a non-CRITICAL record was never
+	// verified — storing it would imply an attestation that did not
+	// happen. CRITICAL receipts above are signed by this worker.
+	if rec.ExecutionClass != "CRITICAL" {
+		result.EvidenceReceipt = nil
 	}
 
 	// Resolve with CAS — expected state is UNKNOWN, expected version
@@ -394,6 +430,20 @@ func (w *Worker) releaseClaim(ctx context.Context, rec *idempotency.Record, reso
 	effectiveAttempt := rec.ReconcileAttempt - 1
 	if effectiveAttempt < 0 {
 		effectiveAttempt = 0
+	}
+	// Dead-letter: a record that exhausts the attempt ceiling stops
+	// being claimed. It stays UNKNOWN — an unresolvable record must
+	// never be forced to a terminal state — but it also must not churn
+	// through the reconcile loop forever.
+	if w.maxAttempts > 0 && effectiveAttempt >= w.maxAttempts {
+		reason := "reconcile attempt ceiling reached"
+		if resolveErr != nil {
+			reason = fmt.Sprintf("%s (last error: %v)", reason, resolveErr)
+		}
+		if err := w.store.SuspendReconciliation(ctx, rec.ExecutionID, rec.Version, reason); err != nil {
+			return fmt.Errorf("failed to dead-letter reconcile claim: %w (original: %v)", err, resolveErr)
+		}
+		return resolveErr
 	}
 	backoff := reconcileBackoff(effectiveAttempt)
 	errMsg := ""

@@ -2064,6 +2064,80 @@ func TestLiveStoreCriticalRecoveryFailedRequiresProof(t *testing.T) {
 	}
 }
 
+// TestLiveStoreCriticalNoEffectWithoutRunID verifies that a CRITICAL
+// recovery to FAILED succeeds with a signed NO_EFFECT receipt even when
+// there is no provider run ID — nothing ran, so there is no operation
+// identity to bind. Requiring one made NO_EFFECT proof unproducible for
+// request-rejection failures, stranding CRITICAL records in UNKNOWN.
+func TestLiveStoreCriticalNoEffectWithoutRunID(t *testing.T) {
+	dbURL := os.Getenv("CRABBOX_TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live PostgreSQL test")
+	}
+	db, err := openTestDB(dbURL)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+	store, err := NewStore(db)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	ctx := context.Background()
+
+	key := "test-crit-noeffect-" + t.Name()
+	db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key = $1`, key)
+	acq, err := store.Acquire(ctx, key, "alice@example.com", "test.critical.deploy",
+		"digest-crit-noeffect", "grant_crit", "CRITICAL", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !acq.Acquired() {
+		t.Fatalf("expected lease acquired, got %s", acq.Kind)
+	}
+
+	execID := acq.Record.ExecutionID
+	if err := store.BeginExecution(ctx, execID, acq.LeaseToken, acq.Generation); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkInFlight(ctx, execID, acq.LeaseToken, acq.Generation, "deploy-adapter", nil); err != nil {
+		t.Fatal(err)
+	}
+	rec, _ := store.Lookup(ctx, execID)
+	if err := store.EnterRecovery(ctx, execID, StateInFlight, rec.Version); err != nil {
+		t.Fatal(err)
+	}
+
+	digest := "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+	signer := testEvidenceSigner(t, store)
+	rec, _ = store.Lookup(ctx, execID)
+	err = store.ResolveRecovery(ctx, execID, rec.Version, RecoveryResult{
+		Decision:       RecoveryFailed,
+		EvidenceDigest: digest,
+		ReceiptVersion: 3,
+		ProviderID:     "deploy-adapter",
+		// No ProviderRunID — nothing ran, so no operation identity exists.
+		EvidenceReceipt: signTestReceipt(t, signer, evidence.Binding{
+			ExecutionID:    execID,
+			Capability:     rec.CapabilityID,
+			Principal:      rec.PrincipalID,
+			RequestDigest:  rec.RequestDigest,
+			ProviderID:     "deploy-adapter",
+			Outcome:        evidence.OutcomeNoEffect,
+			EvidenceSHA256: digest,
+		}),
+	})
+	if err != nil {
+		t.Fatalf("CRITICAL RecoveryFailed with NO_EFFECT proof and no run ID should succeed: %v", err)
+	}
+	rec, _ = store.Lookup(ctx, execID)
+	if rec.State != StateFailed {
+		t.Errorf("expected FAILED, got %s", rec.State)
+	}
+
+	db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key = $1`, key)
+}
+
 // TestLiveStoreReplayProviderMetadata verifies that a terminal replay
 // returns the stored provider_id and provider_run_id, not the adapter
 // ID or internal execution ID.
@@ -3363,6 +3437,13 @@ func TestLiveRecoveryLocatorBounds(t *testing.T) {
 		`{"my_api_key":"mk"}`,
 		`{"aws_access_key_id":"AKIA..."}`,
 		`{"oauth":{"refreshToken":"rt"}}`,
+		// Key-spelling variants that only a broad "key" pattern catches.
+		`{"ssh_key":"-----BEGIN OPENSSH"}`,
+		`{"tls_key":"-----BEGIN EC"}`,
+		`{"hmac_key":"abc"}`,
+		// Non-token credential containers.
+		`{"pgpass":"localhost:5432:db:u:p"}`,
+		`{"session_cookie":"sid=xyz"}`,
 	} {
 		if err := store.MarkInFlight(ctx, execID, token, gen, "p", json.RawMessage(raw)); !errors.Is(err, LocatorContainsSecret) {
 			t.Errorf("locator %s: expected LocatorContainsSecret, got %v", raw, err)

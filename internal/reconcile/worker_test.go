@@ -196,6 +196,86 @@ func TestLiveWorkerReconciliation(t *testing.T) {
 	}
 }
 
+// TestLiveWorkerDeadLettersAfterAttemptCeiling verifies the reconcile
+// dead-letter path: a record that exhausts the attempt ceiling is
+// parked (next_reconcile_at far future), stays UNKNOWN, and is never
+// claimed again — it must not churn through the reconcile loop forever.
+func TestLiveWorkerDeadLettersAfterAttemptCeiling(t *testing.T) {
+	dbURL := os.Getenv("CRABBOX_TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live PostgreSQL test")
+	}
+	db, err := openTestDB(dbURL)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+	store, err := idempotency.NewStore(db)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	ctx := context.Background()
+
+	prefix := fmt.Sprintf("test-deadletter-%d", time.Now().UnixNano())
+	defer db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key = $1`, prefix)
+
+	acq, err := store.Acquire(ctx, prefix, "alice@example.com", "test.counter.increment",
+		"digest-deadletter", "grant_dl", "MUTATION", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !acq.Acquired() {
+		t.Fatalf("expected lease acquired, got %s", acq.Kind)
+	}
+	execID := acq.Record.ExecutionID
+	if err := store.BeginExecution(ctx, execID, acq.LeaseToken, acq.Generation); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkInFlight(ctx, execID, acq.LeaseToken, acq.Generation, "test-counter", nil); err != nil {
+		t.Fatal(err)
+	}
+	rec, _ := store.Lookup(ctx, execID)
+	if err := store.EnterRecovery(ctx, execID, idempotency.StateInFlight, rec.Version); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate a record that has already been claimed many times.
+	if _, err := db.ExecContext(ctx,
+		`UPDATE execution_requests SET reconcile_attempt = 10 WHERE execution_id = $1`, execID); err != nil {
+		t.Fatal(err)
+	}
+
+	w := NewWorker(store, NoopResolver{}, 0)
+	w.SetMaxAttempts(5) // effectiveAttempt (10-1) already exceeds the ceiling
+
+	rec, _ = store.Lookup(ctx, execID)
+	if err := w.reconcileOne(ctx, rec); err != nil {
+		t.Fatalf("dead-letter release should not error, got %v", err)
+	}
+
+	rec, _ = store.Lookup(ctx, execID)
+	if rec.State != idempotency.StateUnknown {
+		t.Errorf("dead-lettered record must stay UNKNOWN, got %s", rec.State)
+	}
+	if rec.NextReconcileAt == nil || rec.NextReconcileAt.Before(time.Now().Add(50*365*24*time.Hour)) {
+		t.Errorf("dead-lettered record must be parked ~100 years out, got %v", rec.NextReconcileAt)
+	}
+	if rec.ReconcileOwner != "" {
+		t.Error("dead-lettered record must not hold a reconcile claim")
+	}
+
+	// It is never claimed again.
+	claimed, err := store.ClaimUnknownBatch(ctx, "worker-x", 10, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range claimed {
+		if c.ExecutionID == execID {
+			t.Fatal("dead-lettered record was claimed again")
+		}
+	}
+}
+
 // TestLiveWorkerReconcileCriticalFailedWithoutProof verifies that
 // CRITICAL executions cannot be resolved to FAILED without evidence.
 func TestLiveWorkerReconcileCriticalFailedWithoutProof(t *testing.T) {

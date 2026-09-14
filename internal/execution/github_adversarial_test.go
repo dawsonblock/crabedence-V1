@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/openclaw/crabbox/internal/capability"
+	"github.com/openclaw/crabbox/internal/evidence"
 	"github.com/openclaw/crabbox/internal/idempotency"
 )
 
@@ -132,6 +133,45 @@ func TestGitHubResolverMarkerAbsentIsUnknown(t *testing.T) {
 	}
 }
 
+// TestGitHubResolverRefusesCrossOriginNext verifies pagination never
+// carries the Authorization bearer off the configured API origin — a
+// rel="next" pointing at a different host must not be followed, and the
+// truncated listing still resolves UNKNOWN (never a false no-effect).
+func TestGitHubResolverRefusesCrossOriginNext(t *testing.T) {
+	var foreignHits int32
+	foreign := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&foreignHits, 1)
+		if r.Header.Get("Authorization") != "" {
+			t.Error("Authorization header sent to cross-origin rel=next URL")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `[]`)
+	}))
+	defer foreign.Close()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Link", fmt.Sprintf(`<%s/page2>; rel="next"`, foreign.URL))
+		fmt.Fprint(w, `[{"number":1,"html_url":"https://github.test/issues/1","body":"unrelated"}]`)
+	}))
+	defer srv.Close()
+
+	h := NewGitHubIssueHandler(srv.URL, "secret-token")
+	res, err := h.Resolve(context.Background(), &idempotency.Record{
+		RecoveryLocator: json.RawMessage(
+			`{"external_token":"gh-issue-x","resource_ref":"repos/octo/repo/issues"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Decision != idempotency.RecoveryUnknown {
+		t.Errorf("cross-origin-truncated listing must resolve UNKNOWN, got %s", res.Decision)
+	}
+	if got := atomic.LoadInt32(&foreignHits); got != 0 {
+		t.Errorf("cross-origin rel=next was followed (%d request(s))", got)
+	}
+}
+
 // fakeEvidenceHandler supplies a FORGED evidence digest alongside a
 // real artifact — the audit's fabricated-digest probe. The dispatcher
 // must attest only the recomputed artifact digest.
@@ -191,6 +231,76 @@ func TestLiveEvidenceDigestRecomputedFromArtifact(t *testing.T) {
 	}
 	if strings.Contains(rec.EvidenceDigest, "aaaa") {
 		t.Error("forged handler digest was persisted")
+	}
+}
+
+// definitiveFailHandler provably never reaches the provider — a
+// definitive failure carrying no evidence artifact. The executor must
+// synthesize the artifact from the failure record so a CRITICAL
+// execution can attest NO_EFFECT and terminate FAILED instead of
+// stranding in UNKNOWN forever.
+type definitiveFailHandler struct{}
+
+func (definitiveFailHandler) Execute(_ context.Context, _ Request, _ capability.ResolvedDescriptor) Response {
+	return Response{
+		Status:            StatusFailed,
+		DefinitiveFailure: true,
+		FailureCode:       "unreachable",
+		Error:             "dial tcp: connection refused",
+		Execution:         &ExecutionMeta{Provider: "fake"},
+	}
+}
+
+// TestLiveCriticalDefinitiveFailureTerminatesFailed verifies the
+// synthesized-artifact path end to end: CRITICAL + DefinitiveFailure
+// with no provider bytes → evidence digest recomputed from the
+// synthesized failure record → signed NO_EFFECT receipt → FAILED.
+func TestLiveCriticalDefinitiveFailureTerminatesFailed(t *testing.T) {
+	if os.Getenv("CRABBOX_TEST_DATABASE_URL") == "" {
+		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live PostgreSQL test")
+	}
+	store, db := liveStore(t, 5*time.Second)
+	defer db.Close()
+
+	signer, err := evidence.GenerateSigner()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.SetTrustedEvidenceSigners(signer.Fingerprint())
+
+	exec := NewDispatchExecutor(NewMultiHandler(map[string]Handler{
+		"fake": definitiveFailHandler{},
+	}), store)
+	exec.SetEvidenceSigner(signer)
+
+	key := fmt.Sprintf("test-crit-deffail-%d", time.Now().UnixNano())
+	defer db.ExecContext(context.Background(),
+		`DELETE FROM execution_requests WHERE idempotency_key = $1`, key)
+
+	resp := exec.ExecuteWithIdempotency(context.Background(), Request{
+		Capability:     "github.issue.create",
+		Arguments:      json.RawMessage(`{"repo":"octo/repo","title":"t"}`),
+		Authority:      RequestAuthority{Principal: "alice@example.com", AuthorityRef: "grant_f"},
+		IdempotencyKey: key,
+	}, capability.ResolvedDescriptor{
+		ExecutionClass: capability.ClassCritical,
+		AdapterID:      "fake",
+	})
+	if resp.Status != StatusFailed {
+		t.Fatalf("definitive failure must terminate FAILED, got %s (%s)", resp.Status, resp.Error)
+	}
+	rec, err := store.LookupByKey(context.Background(), "alice@example.com", "github.issue.create", key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.State != idempotency.StateFailed {
+		t.Errorf("record must be FAILED, got %s", rec.State)
+	}
+	if len(rec.EvidenceReceipt) == 0 {
+		t.Error("FAILED terminal record must carry a signed NO_EFFECT receipt")
+	}
+	if rec.EvidenceDigest == "" {
+		t.Error("synthesized failure artifact must produce an evidence digest")
 	}
 }
 

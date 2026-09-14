@@ -36,6 +36,41 @@ func TestSignVerifyRoundtrip(t *testing.T) {
 	}
 }
 
+// TestNoEffectAllowsEmptyProviderRunID — a NO_EFFECT attestation has no
+// provider operation identity because nothing ran. Requiring a run ID
+// made NO_EFFECT receipts unproducible for request-rejection failures.
+func TestNoEffectAllowsEmptyProviderRunID(t *testing.T) {
+	signer, err := GenerateSigner()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := testBinding()
+	b.Outcome = OutcomeNoEffect
+	b.ProviderRunID = ""
+	raw, err := signer.Sign(b)
+	if err != nil {
+		t.Fatalf("sign NO_EFFECT with empty provider_run_id: %v", err)
+	}
+	trusted := map[string]bool{signer.Fingerprint(): true}
+	if err := VerifyReceipt(raw, b, trusted); err != nil {
+		t.Fatalf("verify NO_EFFECT without run id: %v", err)
+	}
+}
+
+// TestCompletedRequiresProviderRunID — a COMPLETED attestation must
+// still bind the provider operation that caused the effect.
+func TestCompletedRequiresProviderRunID(t *testing.T) {
+	signer, err := GenerateSigner()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := testBinding()
+	b.ProviderRunID = ""
+	if _, err := signer.Sign(b); err == nil {
+		t.Error("COMPLETED receipt without provider_run_id must be rejected")
+	}
+}
+
 func TestVerifyRejectsTamperedSignature(t *testing.T) {
 	signer, _ := GenerateSigner()
 	b := testBinding()

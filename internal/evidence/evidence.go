@@ -189,21 +189,29 @@ func validateFields(r ReceiptV3) error {
 		return fmt.Errorf("unsupported schema_version %d", r.SchemaVersion)
 	}
 	for name, value := range map[string]string{
-		"execution_id":    r.ExecutionID,
-		"capability":      r.Capability,
-		"principal":       r.Principal,
-		"request_digest":  r.RequestDigest,
-		"provider_id":     r.ProviderID,
-		"provider_run_id": r.ProviderRunID,
-		"public_key":      r.PublicKey,
-		"signer":          r.Signer,
+		"execution_id":   r.ExecutionID,
+		"capability":     r.Capability,
+		"principal":      r.Principal,
+		"request_digest": r.RequestDigest,
+		"provider_id":    r.ProviderID,
+		"public_key":     r.PublicKey,
+		"signer":         r.Signer,
 	} {
 		if strings.TrimSpace(value) == "" {
 			return fmt.Errorf("invalid %s", name)
 		}
 	}
 	switch r.Outcome {
-	case OutcomeCompleted, OutcomeNoEffect:
+	case OutcomeCompleted:
+		// A completed effect must bind the provider operation that
+		// caused it.
+		if strings.TrimSpace(r.ProviderRunID) == "" {
+			return fmt.Errorf("invalid provider_run_id")
+		}
+	case OutcomeNoEffect:
+		// Nothing ran — there is legitimately no provider operation
+		// identity to bind. Requiring one would make NO_EFFECT
+		// attestations impossible for request-rejection failures.
 	default:
 		return fmt.Errorf("invalid outcome %q", r.Outcome)
 	}

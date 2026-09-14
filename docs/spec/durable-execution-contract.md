@@ -32,16 +32,23 @@ that violates one is defective, regardless of test results.
     outcome `COMPLETED`; `FAILED` requires a signed receipt attesting
     `NO_EFFECT`. The receipt MUST be verified against trusted signer
     fingerprints and MUST bind execution ID, capability, principal,
-    request digest, provider ID, provider run ID, outcome, and
-    evidence SHA-256. A syntactically valid digest alone is not proof.
+    request digest, provider ID, outcome, and evidence SHA-256.
+    `COMPLETED` receipts MUST also bind the provider run ID of the
+    operation that ran; `NO_EFFECT` receipts have no operation
+    identity to bind (nothing ran), so provider run ID MAY be empty.
+    A syntactically valid digest alone is not proof.
     `DefinitiveFailure` is a routing hint for MUTATION; it is never
     sufficient proof for CRITICAL `FAILED`. The attested evidence
-    digest MUST be recomputed by the attestor from the provider's
-    evidence artifact bytes (e.g. the raw provider response or
-    operation record) — a handler- or resolver-supplied digest string
-    MUST NOT be signed. A CRITICAL terminal outcome without a
-    verifiable artifact cannot be attested and fails closed to
-    `UNKNOWN`.
+    digest MUST be recomputed by the attestor from evidence artifact
+    bytes (e.g. the raw provider response or operation record) — a
+    handler- or resolver-supplied digest string MUST NOT be signed.
+    For `NO_EFFECT` outcomes with no provider bytes, the artifact MAY
+    be the recorded claim itself: the dispatcher's synthesized
+    failure record for a provable pre-transmission failure, or the
+    resolver's own observation record for `RecoveryFailed`. A
+    `COMPLETED` claim always requires real provider bytes. A CRITICAL
+    terminal outcome without a verifiable artifact cannot be attested
+    and fails closed to `UNKNOWN`.
 
 4.  **One terminal policy.** `Finalize` and `ResolveRecovery` MUST
     enforce identical proof requirements through a single shared
@@ -421,6 +428,14 @@ fields. On failure or continued UNKNOWN, `ReleaseReconcileClaim` sets
 `next_reconcile_at` using `clock_timestamp() + backoff` (DB-owned time)
 and records `last_reconcile_error`. Backoff is exponential: 30s, 1m,
 2m, 4m, 8m, 16m, 30m cap — saturating, never overflowing.
+
+Retries are bounded: past the worker's attempt ceiling
+(`SetMaxAttempts`, default 15), `SuspendReconciliation` dead-letters
+the record — the claim is released and `next_reconcile_at` is parked
+far in the future so the record is never claimed again. A dead-lettered
+record remains `UNKNOWN` for operator inspection; an unresolvable
+record MUST NOT be forced to a terminal state, but it also MUST NOT
+churn through the reconcile loop forever.
 
 `RenewReconcileClaim` extends an active claim using
 `GREATEST(current, clock_timestamp() + duration)` — renewal cannot

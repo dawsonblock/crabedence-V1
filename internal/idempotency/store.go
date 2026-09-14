@@ -472,6 +472,17 @@ func migrationEnteredUnknownAt(ctx context.Context, conn *sql.Conn) error {
 		`ALTER TABLE execution_requests ADD COLUMN IF NOT EXISTS entered_unknown_at TIMESTAMPTZ`); err != nil {
 		return fmt.Errorf("column entered_unknown_at: %w", err)
 	}
+	// Backfill rows that entered UNKNOWN before the column existed.
+	// Their last update is the best proxy for when the recovery
+	// condition began — falling back to created_at would measure the
+	// execution's age, not the recovery's, and could scrub a locator
+	// that has only just become needed.
+	if _, err := conn.ExecContext(ctx, `
+		UPDATE execution_requests
+		SET entered_unknown_at = COALESCE(updated_at, created_at)
+		WHERE state = 'UNKNOWN' AND entered_unknown_at IS NULL`); err != nil {
+		return fmt.Errorf("backfill entered_unknown_at: %w", err)
+	}
 	return nil
 }
 
@@ -828,6 +839,7 @@ func (s *Store) markInFlightExpiredAsUnknown(ctx context.Context, rec *Record) (
 		SET state = 'UNKNOWN', version = version + 1,
 		    lease_owner = NULL, lease_token = NULL,
 		    lease_started_at = NULL, lease_expires_at = NULL,
+		    reconcile_owner = NULL, reconcile_lease_expires_at = NULL,
 		    entered_unknown_at = clock_timestamp(),
 		    updated_at = clock_timestamp()
 		WHERE execution_id = $1
@@ -924,7 +936,10 @@ var forbiddenLocatorKeyPatterns = []string{
 	"accesstoken", "refreshtoken", "bearertoken", "authtoken",
 	"idtoken", "sessiontoken", "csrftoken",
 	"authorization", "credential", "sessioncookie", "bearer",
-	"token", // broad: any *token* key is suspect unless allowlisted below
+	"token",  // broad: any *token* key is suspect unless allowlisted below
+	"key",    // broad: ssh_key, tls_key, hmac_key, client_key, …
+	"pgpass", // .pgpass-style fields carry no token/key substring
+	"cookie", // session cookies and other cookie-bearing fields
 }
 
 // allowedLocatorKeys are normalized keys that look credential-shaped
@@ -1881,6 +1896,39 @@ func (s *Store) ReleaseReconcileClaim(ctx context.Context, executionID string, e
 	}
 	if rows == 0 {
 		return fmt.Errorf("%w: execution %s release reconcile claim CAS failed (state/version mismatch)", LeaseStateConflict, executionID)
+	}
+	return nil
+}
+
+// SuspendReconciliation dead-letters an UNKNOWN record: the claim is
+// released and next_reconcile_at is parked a century out so the record
+// is never claimed again by the reconcile loop. The record remains
+// UNKNOWN — an unresolvable record must never be forced terminal —
+// but it stops churning through the worker. Used when reconcile_attempt
+// exceeds the worker's retry ceiling; operator intervention is
+// required to resume it.
+func (s *Store) SuspendReconciliation(ctx context.Context, executionID string, expectedVersion int, reason string) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE execution_requests
+		SET reconcile_owner = NULL,
+		    reconcile_lease_expires_at = NULL,
+		    next_reconcile_at = clock_timestamp() + interval '100 years',
+		    last_reconcile_error = $1,
+		    version = version + 1,
+		    updated_at = clock_timestamp()
+		WHERE execution_id = $2
+		  AND state = 'UNKNOWN'
+		  AND version = $3
+	`, nullableString(reason), executionID, expectedVersion)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return fmt.Errorf("%w: execution %s suspend reconciliation CAS failed (state/version mismatch)", LeaseStateConflict, executionID)
 	}
 	return nil
 }

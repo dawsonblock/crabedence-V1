@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"syscall"
 	"time"
@@ -263,6 +264,9 @@ func (h *GitHubIssueHandler) Resolve(ctx context.Context, rec *idempotency.Recor
 	// checking only page 1 would falsely conclude "no effect" when the
 	// marker sits on a later page. Follow Link rel="next" until the
 	// listing is exhausted (bounded to prevent pathological loops).
+	// A rel="next" URL is only followed when it stays on the API origin —
+	// the Authorization bearer must never leave the configured base URL.
+	truncated := false
 	nextURL := h.baseURL + "/repos/" + repo + "/issues?state=all&per_page=100"
 	for pages := 0; nextURL != "" && pages < 50; pages++ {
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, nextURL, nil)
@@ -314,7 +318,12 @@ func (h *GitHubIssueHandler) Resolve(ctx context.Context, rec *idempotency.Recor
 				}, nil
 			}
 		}
-		nextURL = nextLinkURL(linkHeader)
+		candidate := nextLinkURL(linkHeader)
+		if candidate != "" && !sameOrigin(h.baseURL, candidate) {
+			truncated = true
+			candidate = ""
+		}
+		nextURL = candidate
 	}
 
 	// The marker was not found in the complete listing. That is absence
@@ -323,11 +332,32 @@ func (h *GitHubIssueHandler) Resolve(ctx context.Context, rec *idempotency.Recor
 	// visible to a read-only scan. Without an authoritative provider
 	// operation-lookup API, a negative result stays UNKNOWN so the
 	// record remains reconcilable rather than terminally FAILED.
+	extra := ""
+	if truncated {
+		extra = `,"pagination_truncated":true`
+	}
 	return idempotency.RecoveryResult{
 		Decision:   idempotency.RecoveryUnknown,
 		ProviderID: "github",
-		Result:     json.RawMessage(fmt.Sprintf(`{"repo":%q,"marker_absent":true}`, repo)),
+		Result:     json.RawMessage(fmt.Sprintf(`{"repo":%q,"marker_absent":true%s}`, repo, extra)),
 	}, nil
+}
+
+// sameOrigin reports whether nextURL is on the same scheme+host as
+// baseURL. Pagination must not carry credentials to an unrelated host —
+// a hostile or compromised Link header could otherwise exfiltrate the
+// API token.
+func sameOrigin(baseURL, nextURL string) bool {
+	base, err := url.Parse(baseURL)
+	if err != nil {
+		return false
+	}
+	next, err := url.Parse(nextURL)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(base.Scheme, next.Scheme) &&
+		strings.EqualFold(base.Host, next.Host)
 }
 
 // nextLinkURL extracts the rel="next" URL from a GitHub Link header,
