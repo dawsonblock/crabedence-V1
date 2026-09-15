@@ -17,6 +17,7 @@ Keep core provider-neutral. Core may pass generic request/lease context and call
 - `go build -trimpath -o bin/crabbox ./cmd/crabbox`: build the local CLI.
 - `go vet ./...`: run Go static checks.
 - `go test -race -timeout=20m ./...`: run the Go test suite with the race detector and CI's race-test package timeout.
+- `scripts/test-live-postgres.sh [-- <cmd>]`: run tests needing `CRABBOX_TEST_DATABASE_URL` against an ephemeral local PostgreSQL — Docker `postgres:16` (the CI image) when a daemon answers, else a local `initdb`/`pg_ctl` instance on a free loopback port. Defaults to the live suites in `internal/idempotency`, `internal/reconcile`, `internal/execution`, and `internal/authority`.
 - `gofmt -w $(git ls-files '*.go')`: format Go files.
 - `npm ci --prefix worker`: install Worker dependencies.
 - `npm run format:check --prefix worker`: verify TypeScript formatting.
