@@ -455,11 +455,17 @@ var hotPathIndexes = []hotPathIndex{
 // CONCURRENTLY removes the invalid shell before rebuilding.
 func ensureValidIndex(ctx context.Context, conn *sql.Conn, idx hotPathIndex) error {
 	var valid bool
+	// Scope to the active schema: with per-schema test isolation (and any
+	// multi-tenant deployment) the same index name can exist in several
+	// schemas, and an unfiltered pg_class lookup could inspect another
+	// schema's healthy index while this schema's build is invalid.
 	err := conn.QueryRowContext(ctx, `
 		SELECT i.indisvalid
 		FROM pg_class c
 		JOIN pg_index i ON i.indexrelid = c.oid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
 		WHERE c.relname = $1 AND c.relkind = 'i'
+		  AND n.nspname = current_schema()
 	`, idx.name).Scan(&valid)
 	if err != nil && err != sql.ErrNoRows {
 		return fmt.Errorf("check index %s validity: %w", idx.name, err)
@@ -1736,16 +1742,32 @@ func (s *Store) ResolveRecovery(ctx context.Context, executionID string, expecte
 		return fmt.Errorf("failed to compute recovery receipt digest: %w", err)
 	}
 
+	// Monotonic provider-identity guard — the same contradiction
+	// rejection RecordProviderObservation enforces. A resolver result
+	// contradicting the durable provider identity (provider_id /
+	// provider_run_id) persisted for this execution must not silently
+	// overwrite it: the write is rejected and classified as
+	// PROVIDER_OBSERVATION_CONFLICT below. Result and evidence_digest
+	// are NOT guarded — recovery legitimately produces a different
+	// evidence capture than the dispatch-time observation (e.g. a
+	// listing object vs. the create response) and the resolver's
+	// canonical values are the terminal output.
 	result2, err := s.db.ExecContext(ctx, `
 		UPDATE execution_requests
-		SET state = $1, result = $2, evidence_digest = $3, receipt_version = $4,
-		    provider_id = $5, provider_run_id = $6,
+		SET state = $1,
+		    result = COALESCE($2::jsonb, result),
+		    evidence_digest = COALESCE($3::text, evidence_digest),
+		    receipt_version = $4,
+		    provider_id = COALESCE($5::text, provider_id),
+		    provider_run_id = COALESCE($6::text, provider_run_id),
 		    terminal_receipt_digest = $7, evidence_receipt = $10,
 		    reconcile_owner = NULL, reconcile_lease_expires_at = NULL,
 		    next_reconcile_at = NULL, last_reconcile_error = NULL,
 		    recovery_locator = NULL,
 		    version = version + 1, updated_at = clock_timestamp()
 		WHERE execution_id = $8 AND state = 'UNKNOWN' AND version = $9
+		  AND (provider_id IS NULL OR $5::text IS NULL OR provider_id = $5::text)
+		  AND (provider_run_id IS NULL OR $6::text IS NULL OR provider_run_id = $6::text)
 	`, string(newState),
 		nullableBytes(result.Result),
 		nullableString(result.EvidenceDigest),
@@ -1763,6 +1785,15 @@ func (s *Store) ResolveRecovery(ctx context.Context, executionID string, expecte
 		return err
 	}
 	if rows == 0 {
+		// Distinguish a state/version CAS failure from a provider-
+		// observation contradiction, which is a different failure class.
+		rec, lerr := s.Lookup(ctx, executionID)
+		if lerr != nil {
+			return fmt.Errorf("execution %s recovery resolution failed (lookup: %v)", executionID, lerr)
+		}
+		if rec.State == StateUnknown && rec.Version == expectedVersion {
+			return fmt.Errorf("%w: execution %s recovery result contradicts stored provider observation", ProviderObservationConflict, executionID)
+		}
 		return fmt.Errorf("%w: execution %s recovery resolution CAS failed (state/version mismatch)", LeaseStateConflict, executionID)
 	}
 	return nil

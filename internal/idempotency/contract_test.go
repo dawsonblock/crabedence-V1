@@ -513,3 +513,47 @@ func TestIsLegalTransitionNilFrom(t *testing.T) {
 		t.Error("empty state should not transition to COMMITTED")
 	}
 }
+
+// TestCanonicalizeJSONRejectsTrailingData verifies the strict
+// single-value rule: after the first JSON value the decoder must hit
+// io.EOF — a second value or a malformed trailing delimiter (which
+// Decoder.More treats as end-of-input) is invalid.
+func TestCanonicalizeJSONRejectsTrailingData(t *testing.T) {
+	valid := []struct{ name, in string }{
+		{"object", `{"a":1}`},
+		{"array", `[1,2,3]`},
+		{"scalar", `1`},
+		{"trailing_whitespace", "{\"a\":1}\n \t"},
+	}
+	for _, tc := range valid {
+		t.Run("valid/"+tc.name, func(t *testing.T) {
+			out, err := canonicalizeJSON(json.RawMessage(tc.in))
+			if err != nil {
+				t.Fatalf("canonicalizeJSON(%q) rejected valid input: %v", tc.in, err)
+			}
+			if len(out) == 0 {
+				t.Fatalf("canonicalizeJSON(%q) returned empty output", tc.in)
+			}
+		})
+	}
+
+	invalid := []struct{ name, in string }{
+		// These fooled Decoder.More(): it reports "no more elements"
+		// at ']' or '}', so trailing garbage after a value was accepted.
+		{"extra_closing_brace", `{"a":1}}`},
+		{"extra_closing_bracket", `1]`},
+		{"object_then_garbage_brace", `{"ok":true}}`},
+		// A second complete JSON value must also be rejected.
+		{"two_values", `{"a":1} {"b":2}`},
+		{"value_then_scalar", `{"a":1} 2`},
+		// Non-JSON trailing bytes.
+		{"trailing_garbage", `{"a":1} xyz`},
+	}
+	for _, tc := range invalid {
+		t.Run("invalid/"+tc.name, func(t *testing.T) {
+			if _, err := canonicalizeJSON(json.RawMessage(tc.in)); err == nil {
+				t.Fatalf("canonicalizeJSON(%q) accepted malformed input", tc.in)
+			}
+		})
+	}
+}

@@ -198,9 +198,31 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	leaseToken := acq.LeaseToken
 	leaseGen := acq.Generation
 
+	// Deadline preflight BEFORE the dispatch boundary: an already-expired
+	// deadline is a provable no-effect failure — the handler will never
+	// run. IN_FLIGHT must continue to mean "provider invocation may have
+	// begun"; marking it before this check would let a crash in the gap
+	// strand a record in UNKNOWN that provably never ran, which a
+	// negative provider lookup may never resolve. Abandon returns the
+	// record to claimable PREPARED so a retry with a valid deadline
+	// reacquires immediately — the expired deadline is not a durable
+	// terminal outcome. The check inside dispatch() remains for the
+	// residual window where the deadline expires between this preflight
+	// and handler invocation (the record is legitimately IN_FLIGHT then).
+	if expired := deadlineExpired(req.Deadline); expired {
+		e.abandonPreDispatch(ctx, executionID, leaseToken, leaseGen)
+		return Response{
+			Status:            StatusFailed,
+			FailureCode:       string(capability.FailureInvalidRequest),
+			Error:             fmt.Sprintf("request deadline %s already passed", req.Deadline),
+			DefinitiveFailure: true,
+		}
+	}
+
 	// Mark as EXECUTING using the typed API (fenced by token + generation).
 	// This is PRE_DISPATCH — if this fails, return FAILED (safe).
 	if err := e.store.BeginExecution(ctx, executionID, leaseToken, leaseGen); err != nil {
+		e.abandonPreDispatch(ctx, executionID, leaseToken, leaseGen)
 		return Response{
 			Status:      StatusFailed,
 			FailureCode: string(capability.FailureInternalError),
@@ -218,6 +240,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	recoveryLocator, err := e.prepareRecoveryLocator(ctx, req, desc, digest, executionID)
 	if err != nil {
 		// Pre-dispatch failure — no side effect could have occurred.
+		e.abandonPreDispatch(ctx, executionID, leaseToken, leaseGen)
 		return Response{
 			Status:      StatusFailed,
 			FailureCode: string(capability.FailureInternalError),
@@ -226,6 +249,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	}
 	locatorRaw, err := json.Marshal(recoveryLocator)
 	if err != nil {
+		e.abandonPreDispatch(ctx, executionID, leaseToken, leaseGen)
 		return Response{
 			Status:      StatusFailed,
 			FailureCode: string(capability.FailureInternalError),
@@ -233,6 +257,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		}
 	}
 	if len(locatorRaw) > idempotency.MaxRecoveryLocatorBytes {
+		e.abandonPreDispatch(ctx, executionID, leaseToken, leaseGen)
 		return Response{
 			Status:      StatusFailed,
 			FailureCode: string(capability.FailureInternalError),
@@ -241,6 +266,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		}
 	}
 	if err := e.store.MarkInFlight(ctx, executionID, leaseToken, leaseGen, desc.AdapterID, locatorRaw); err != nil {
+		e.abandonPreDispatch(ctx, executionID, leaseToken, leaseGen)
 		return Response{
 			Status:      StatusFailed,
 			FailureCode: string(capability.FailureInternalError),
@@ -538,6 +564,31 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	}
 
 	return resp
+}
+
+// deadlineExpired reports whether the request deadline is already past.
+// Malformed deadlines return false here — schema validation owns that
+// rejection; this check only guards timing.
+func deadlineExpired(deadline string) bool {
+	if deadline == "" {
+		return false
+	}
+	t, err := time.Parse(time.RFC3339, deadline)
+	if err != nil {
+		return false
+	}
+	return !time.Now().Before(t)
+}
+
+// abandonPreDispatch releases the execution lease after a pre-dispatch
+// failure so a retry reclaims immediately instead of waiting for lease
+// expiry. AbandonPreDispatch only touches PREPARED/EXECUTING records,
+// so it is safe even when the preceding transition may have applied
+// server-side (e.g. a dropped connection after MarkInFlight) — a record
+// that crossed the dispatch boundary is never unmarked. On failure the
+// lease expiry path is the backstop.
+func (e *DispatchExecutor) abandonPreDispatch(ctx context.Context, executionID, leaseToken string, leaseGen int) {
+	_ = e.store.AbandonPreDispatch(ctx, executionID, leaseToken, leaseGen)
 }
 
 // dispatch sends the request to the handler.

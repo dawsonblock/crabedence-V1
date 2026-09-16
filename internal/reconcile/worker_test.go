@@ -557,3 +557,226 @@ func TestLiveClaimExpiryRecovery(t *testing.T) {
 func openTestDB(dbURL string) (*sql.DB, error) {
 	return testutil.OpenLiveDB(dbURL, "crabbox_test_reconcile")
 }
+
+// countingResolver counts resolver invocations and returns a fixed
+// result — used to prove the attempt ceiling bounds provider lookups.
+type countingResolver struct {
+	calls  int32
+	result idempotency.RecoveryResult
+}
+
+func (r *countingResolver) Resolve(_ context.Context, _ *idempotency.Record) (idempotency.RecoveryResult, error) {
+	r.calls++
+	return r.result, nil
+}
+
+// TestLiveWorkerSuspendsPastClaimCeiling verifies the attempt ceiling is
+// enforced BEFORE the resolver runs: reconcile_attempt counts claims
+// (ClaimUnknownBatch increments it), so a record claimed beyond the
+// ceiling must be suspended without spending another provider lookup.
+func TestLiveWorkerSuspendsPastClaimCeiling(t *testing.T) {
+	dbURL := os.Getenv("CRABBOX_TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live PostgreSQL test")
+	}
+	db, err := openTestDB(dbURL)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+	store, err := idempotency.NewStore(db)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	ctx := context.Background()
+
+	key := fmt.Sprintf("test-ceiling-%d", time.Now().UnixNano())
+	execID := makeUnknownRecord(t, db, store, ctx, key, "test.counter.increment", "MUTATION")
+	defer db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key = $1`, key)
+
+	resolver := &countingResolver{result: idempotency.RecoveryResult{Decision: idempotency.RecoveryUnknown}}
+	w := NewWorker(store, NoopResolver{}, 0)
+	w.SetWorkerID("worker-ceiling")
+	w.SetMaxAttempts(5)
+	w.RegisterResolver("test.counter.increment", resolver)
+
+	// Seed at the ceiling: five claims have already run their lookups.
+	if _, err := db.ExecContext(ctx,
+		`UPDATE execution_requests SET reconcile_attempt = 5 WHERE execution_id = $1`, execID); err != nil {
+		t.Fatal(err)
+	}
+
+	// The sixth claim must NOT invoke the resolver.
+	claimed, err := store.ClaimUnknownBatch(ctx, "worker-ceiling", 10, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rec *idempotency.Record
+	for _, r := range claimed {
+		if r.ExecutionID == execID {
+			rec = r
+		}
+	}
+	if rec == nil {
+		t.Fatal("record was not claimed")
+	}
+	if rec.ReconcileAttempt != 6 {
+		t.Fatalf("expected reconcile_attempt=6 after claim, got %d", rec.ReconcileAttempt)
+	}
+	if err := w.reconcileOne(ctx, rec); err != nil {
+		t.Fatalf("ceiling suspend must not error, got %v", err)
+	}
+	if resolver.calls != 0 {
+		t.Errorf("resolver invoked %d times past the ceiling — must be 0", resolver.calls)
+	}
+	rec2, _ := store.Lookup(ctx, execID)
+	if rec2.State != idempotency.StateUnknown {
+		t.Errorf("suspended record must stay UNKNOWN, got %s", rec2.State)
+	}
+	if rec2.NextReconcileAt == nil || rec2.NextReconcileAt.Before(time.Now().Add(50*365*24*time.Hour)) {
+		t.Errorf("suspended record must be parked ~100 years out, got %v", rec2.NextReconcileAt)
+	}
+}
+
+// TestLiveWorkerResolverRunsAtLastAllowedClaim verifies the ceiling is
+// exact: the maxAttempts-th claim still runs its resolver (it is the
+// last permitted lookup), and the record is suspended afterwards —
+// the ceiling bounds resolver calls, not just claims.
+func TestLiveWorkerResolverRunsAtLastAllowedClaim(t *testing.T) {
+	dbURL := os.Getenv("CRABBOX_TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live PostgreSQL test")
+	}
+	db, err := openTestDB(dbURL)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+	store, err := idempotency.NewStore(db)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	ctx := context.Background()
+
+	key := fmt.Sprintf("test-ceiling-exact-%d", time.Now().UnixNano())
+	execID := makeUnknownRecord(t, db, store, ctx, key, "test.counter.increment", "MUTATION")
+	defer db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key = $1`, key)
+
+	resolver := &countingResolver{result: idempotency.RecoveryResult{Decision: idempotency.RecoveryUnknown}}
+	w := NewWorker(store, NoopResolver{}, 0)
+	w.SetWorkerID("worker-ceiling-exact")
+	w.SetMaxAttempts(5)
+	w.RegisterResolver("test.counter.increment", resolver)
+
+	// Four claims already ran; the fifth (last allowed) claim runs the
+	// resolver, then the record suspends — no sixth lookup is possible.
+	if _, err := db.ExecContext(ctx,
+		`UPDATE execution_requests SET reconcile_attempt = 4 WHERE execution_id = $1`, execID); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimUnknownBatch(ctx, "worker-ceiling-exact", 10, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rec *idempotency.Record
+	for _, r := range claimed {
+		if r.ExecutionID == execID {
+			rec = r
+		}
+	}
+	if rec == nil {
+		t.Fatal("record was not claimed")
+	}
+	if rec.ReconcileAttempt != 5 {
+		t.Fatalf("expected reconcile_attempt=5 after claim, got %d", rec.ReconcileAttempt)
+	}
+	if err := w.reconcileOne(ctx, rec); err != nil {
+		t.Fatalf("last allowed claim must not error, got %v", err)
+	}
+	if resolver.calls != 1 {
+		t.Errorf("fifth claim must invoke the resolver exactly once, got %d", resolver.calls)
+	}
+	rec2, _ := store.Lookup(ctx, execID)
+	if rec2.State != idempotency.StateUnknown {
+		t.Errorf("record must stay UNKNOWN after exhausting the ceiling, got %s", rec2.State)
+	}
+	if rec2.NextReconcileAt == nil || rec2.NextReconcileAt.Before(time.Now().Add(50*365*24*time.Hour)) {
+		t.Errorf("record that exhausted the ceiling must be parked, got %v", rec2.NextReconcileAt)
+	}
+}
+
+// TestLiveBatchClaimHeartbeatProtectsQueuedRecords verifies the batch-
+// wide claim heartbeat: while a slow resolver processes the first
+// claimed record, later records' claims must keep being renewed — a
+// second worker must not steal a queued record whose initial claim TTL
+// elapsed mid-batch.
+//
+// Timing: claim TTL = 400ms, slow resolver = 900ms. At t=600ms — past
+// the queued record's initial TTL — it must still be unclaimable.
+func TestLiveBatchClaimHeartbeatProtectsQueuedRecords(t *testing.T) {
+	dbURL := os.Getenv("CRABBOX_TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live PostgreSQL test")
+	}
+	db, err := openTestDB(dbURL)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+	store, err := idempotency.NewStore(db)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	ctx := context.Background()
+
+	prefix := fmt.Sprintf("test-batch-hb-%d", time.Now().UnixNano())
+	defer db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key LIKE $1`, prefix+"%")
+	// Claim scans all UNKNOWN rows — isolate exact assertions.
+	db.ExecContext(ctx, `DELETE FROM execution_requests WHERE state = 'UNKNOWN'`)
+
+	slowID := makeUnknownRecord(t, db, store, ctx, prefix+"-slow", "test.slow", "MUTATION")
+	queuedID := makeUnknownRecord(t, db, store, ctx, prefix+"-queued", "test.fast", "MUTATION")
+
+	fastResolver := &countingResolver{result: idempotency.RecoveryResult{Decision: idempotency.RecoveryUnknown}}
+	w := NewWorker(store, NoopResolver{}, 0)
+	w.SetWorkerID("worker-batch-1")
+	w.SetClaimDuration(400 * time.Millisecond)
+	w.RegisterResolver("test.slow", &slowResolver{
+		delay:  900 * time.Millisecond,
+		result: idempotency.RecoveryResult{Decision: idempotency.RecoveryUnknown},
+	})
+	w.RegisterResolver("test.fast", fastResolver)
+
+	done := make(chan error, 1)
+	go func() { done <- w.reconcileAll(ctx) }()
+
+	// At t=600ms the queued record's initial 400ms claim TTL has
+	// elapsed — but the batch heartbeat must have renewed it, so
+	// worker-batch-2 cannot claim it while the slow resolver runs.
+	time.Sleep(600 * time.Millisecond)
+	other, err := store.ClaimUnknownBatch(ctx, "worker-batch-2", 50, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range other {
+		if r.ExecutionID == queuedID {
+			t.Error("second worker stole a queued record whose claim the batch heartbeat should hold")
+		}
+	}
+	for _, r := range other {
+		_ = store.ReleaseReconcileClaim(ctx, r.ExecutionID, r.Version, 0, "")
+	}
+
+	if err := <-done; err != nil {
+		t.Fatalf("reconcileAll failed: %v", err)
+	}
+	if fastResolver.calls == 0 {
+		t.Error("queued record was never processed by its claiming worker")
+	}
+	for _, id := range []string{slowID, queuedID} {
+		rec, _ := store.Lookup(ctx, id)
+		if rec.ReconcileOwner != "" {
+			t.Errorf("record %s still claimed after batch drained (owner %q)", id, rec.ReconcileOwner)
+		}
+	}
+}

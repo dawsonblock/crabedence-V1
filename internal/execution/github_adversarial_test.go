@@ -262,24 +262,18 @@ func (h *invokedHandler) Execute(_ context.Context, _ Request, _ capability.Reso
 	return h.resp
 }
 
-// TestLiveCriticalDefinitiveFailureTerminatesFailed verifies the
-// synthesized-artifact path end to end for an executor-proven
-// pre-transmission failure: the deadline expires before dispatch, the
-// handler is never invoked, and the executor's own failure record
-// becomes the attested NO_EFFECT artifact — digest recomputed, signed
-// receipt, durable FAILED.
-func TestLiveCriticalDefinitiveFailureTerminatesFailed(t *testing.T) {
+// TestLiveExpiredDeadlineAbandonsPreDispatch verifies the deadline
+// preflight runs BEFORE the dispatch boundary: an already-expired
+// request never invokes the handler, returns a definitive FAILED
+// response, and abandons the record back to claimable PREPARED —
+// IN_FLIGHT must keep meaning "provider invocation may have begun".
+// A retry with a valid deadline re-acquires immediately and completes.
+func TestLiveExpiredDeadlineAbandonsPreDispatch(t *testing.T) {
 	if os.Getenv("CRABBOX_TEST_DATABASE_URL") == "" {
 		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live PostgreSQL test")
 	}
 	store, db := liveStore(t, 5*time.Second)
 	defer db.Close()
-
-	signer, err := evidence.GenerateSigner()
-	if err != nil {
-		t.Fatal(err)
-	}
-	store.SetTrustedEvidenceSigners(signer.Fingerprint())
 
 	// The handler would succeed if invoked — the expired deadline must
 	// stop dispatch before it runs.
@@ -291,41 +285,131 @@ func TestLiveCriticalDefinitiveFailureTerminatesFailed(t *testing.T) {
 	exec := NewDispatchExecutor(NewMultiHandler(map[string]Handler{
 		"fake": h,
 	}), store)
-	exec.SetEvidenceSigner(signer)
 
-	key := fmt.Sprintf("test-crit-deffail-%d", time.Now().UnixNano())
+	key := fmt.Sprintf("test-expired-deadline-%d", time.Now().UnixNano())
 	defer db.ExecContext(context.Background(),
 		`DELETE FROM execution_requests WHERE idempotency_key = $1`, key)
 
+	desc := capability.ResolvedDescriptor{
+		ExecutionClass: capability.ClassMutation,
+		AdapterID:      "fake",
+	}
 	resp := exec.ExecuteWithIdempotency(context.Background(), Request{
 		Capability:     "github.issue.create",
 		Arguments:      json.RawMessage(`{"repo":"octo/repo","title":"t"}`),
 		Authority:      RequestAuthority{Principal: "alice@example.com", AuthorityRef: "grant_f"},
 		IdempotencyKey: key,
 		Deadline:       time.Now().Add(-time.Minute).UTC().Format(time.RFC3339),
-	}, capability.ResolvedDescriptor{
-		ExecutionClass: capability.ClassCritical,
-		AdapterID:      "fake",
-	})
+	}, desc)
 	if h.called.Load() {
 		t.Fatal("handler must not be invoked after the deadline passed")
 	}
-	if resp.Status != StatusFailed {
-		t.Fatalf("executor-proven definitive failure must terminate FAILED, got %s (%s)", resp.Status, resp.Error)
+	if resp.Status != StatusFailed || !resp.DefinitiveFailure {
+		t.Fatalf("expired deadline must return definitive FAILED, got %s (%s)", resp.Status, resp.Error)
 	}
 	rec, err := store.LookupByKey(context.Background(), "alice@example.com", "github.issue.create", key)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rec.State != idempotency.StateFailed {
-		t.Errorf("record must be FAILED, got %s", rec.State)
+	// The record never crossed the dispatch boundary: it is abandoned
+	// to lease-less PREPARED — not IN_FLIGHT, not UNKNOWN, not FAILED.
+	if rec.State != idempotency.StatePrepared {
+		t.Fatalf("expired-deadline record must return to PREPARED, got %s", rec.State)
 	}
-	if len(rec.EvidenceReceipt) == 0 {
-		t.Error("FAILED terminal record must carry a signed NO_EFFECT receipt")
+	if rec.LeaseToken != "" {
+		t.Error("abandoned record must not retain a lease")
 	}
-	if rec.EvidenceDigest == "" {
-		t.Error("synthesized failure artifact must produce an evidence digest")
+
+	// A retry with a valid deadline re-acquires the abandoned record
+	// immediately and completes — no wait for lease expiry.
+	resp = exec.ExecuteWithIdempotency(context.Background(), Request{
+		Capability:     "github.issue.create",
+		Arguments:      json.RawMessage(`{"repo":"octo/repo","title":"t"}`),
+		Authority:      RequestAuthority{Principal: "alice@example.com", AuthorityRef: "grant_f"},
+		IdempotencyKey: key,
+		Deadline:       time.Now().Add(time.Minute).UTC().Format(time.RFC3339),
+	}, desc)
+	if resp.Status != StatusSucceeded {
+		t.Fatalf("retry with valid deadline must succeed on the reclaimed record, got %s (%s)", resp.Status, resp.Error)
 	}
+}
+
+// TestLivePreDispatchFailureAbandonsLease verifies that a failure in
+// pre-dispatch preparation (here: the provider's PrepareRecovery
+// errors) releases the execution lease instead of stranding the record
+// in EXECUTING until lease expiry — and that a retry re-acquires and
+// completes once the provider recovers.
+func TestLivePreDispatchFailureAbandonsLease(t *testing.T) {
+	if os.Getenv("CRABBOX_TEST_DATABASE_URL") == "" {
+		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live PostgreSQL test")
+	}
+	store, db := liveStore(t, 5*time.Second)
+	defer db.Close()
+
+	h := &flakyPreparer{invokedHandler: invokedHandler{resp: Response{
+		Status:    StatusSucceeded,
+		Result:    json.RawMessage(`{"ok":true}`),
+		Execution: &ExecutionMeta{Provider: "fake"},
+	}}}
+	h.failPrepare.Store(true)
+	exec := NewDispatchExecutor(NewMultiHandler(map[string]Handler{
+		"fake": h,
+	}), store)
+
+	key := fmt.Sprintf("test-predispatch-abandon-%d", time.Now().UnixNano())
+	defer db.ExecContext(context.Background(),
+		`DELETE FROM execution_requests WHERE idempotency_key = $1`, key)
+
+	desc := capability.ResolvedDescriptor{
+		ExecutionClass: capability.ClassMutation,
+		AdapterID:      "fake",
+	}
+	req := Request{
+		Capability:     "github.issue.create",
+		Arguments:      json.RawMessage(`{"repo":"octo/repo","title":"t"}`),
+		Authority:      RequestAuthority{Principal: "alice@example.com", AuthorityRef: "grant_f"},
+		IdempotencyKey: key,
+	}
+
+	resp := exec.ExecuteWithIdempotency(context.Background(), req, desc)
+	if resp.Status != StatusFailed {
+		t.Fatalf("locator-preparation failure must return FAILED, got %s (%s)", resp.Status, resp.Error)
+	}
+	if h.called.Load() {
+		t.Error("handler must not be invoked when pre-dispatch preparation fails")
+	}
+	rec, err := store.LookupByKey(context.Background(), "alice@example.com", "github.issue.create", key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.State != idempotency.StatePrepared {
+		t.Fatalf("pre-dispatch failure must abandon to PREPARED, got %s — a stranded EXECUTING lease blocks retries until expiry", rec.State)
+	}
+	if rec.LeaseToken != "" {
+		t.Error("abandoned record must not retain a lease")
+	}
+
+	// The provider recovers; a retry re-acquires the lease immediately.
+	h.failPrepare.Store(false)
+	resp = exec.ExecuteWithIdempotency(context.Background(), req, desc)
+	if resp.Status != StatusSucceeded {
+		t.Fatalf("retry after pre-dispatch failure must succeed, got %s (%s)", resp.Status, resp.Error)
+	}
+}
+
+// flakyPreparer is a handler implementing RecoveryLocatorProvider whose
+// PrepareRecovery fails while failPrepare is set — exercising the
+// pre-dispatch preparation error path.
+type flakyPreparer struct {
+	invokedHandler
+	failPrepare atomic.Bool
+}
+
+func (h *flakyPreparer) PrepareRecovery(_ context.Context, in idempotency.RecoveryLocatorInput) (*idempotency.RecoveryLocator, error) {
+	if h.failPrepare.Load() {
+		return nil, fmt.Errorf("provider locator backend unavailable")
+	}
+	return nil, nil
 }
 
 // TestLiveCriticalHandlerClaimedDefinitiveFailureFailsClosed verifies

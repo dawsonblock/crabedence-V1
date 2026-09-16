@@ -12,9 +12,10 @@ import (
 )
 
 // CounterExecution records one applied increment with its full durable
-// execution identity. The provider run ID is preserved so recovery can
-// return the real external operation identity instead of fabricating a
-// replacement.
+// execution identity. The provider run ID and the post-increment value
+// are preserved so recovery can return the real external operation
+// identity and THIS execution's result instead of the live aggregate —
+// which later executions may have moved.
 type CounterExecution struct {
 	ExecutionID    string
 	PrincipalID    string
@@ -22,6 +23,7 @@ type CounterExecution struct {
 	IdempotencyKey string
 	Counter        string
 	Amount         int64
+	Value          int64
 	ProviderRunID  string
 }
 
@@ -154,6 +156,7 @@ func (h *CounterHandler) Execute(ctx context.Context, req Request, desc capabili
 		IdempotencyKey: req.IdempotencyKey,
 		Counter:        args.Counter,
 		Amount:         args.By,
+		Value:          newValue,
 		ProviderRunID:  runID,
 	}
 	if token := ExternalTokenFromContext(ctx); token != "" {
@@ -305,7 +308,6 @@ func (h *CounterHandler) Resolve(ctx context.Context, rec *idempotency.Record) (
 	if !wasExecuted {
 		exec, wasExecuted = h.executions[counterName][counterExecutionKey(rec.PrincipalID, rec.CapabilityID, rec.IdempotencyKey)]
 	}
-	value := h.counters[counterName]
 	h.mu.Unlock()
 
 	if !wasExecuted {
@@ -327,9 +329,13 @@ func (h *CounterHandler) Resolve(ctx context.Context, rec *idempotency.Record) (
 		}, nil
 	}
 
+	// Return THIS execution's recorded post-increment value, not the
+	// live counter aggregate — later executions may have incremented
+	// the same counter, and the recovered result must replay what the
+	// original dispatch produced.
 	result, _ := json.Marshal(map[string]any{
 		"counter": counterName,
-		"value":   value,
+		"value":   exec.Value,
 		"by":      by,
 	})
 	// The evidence artifact is the stored execution record — the

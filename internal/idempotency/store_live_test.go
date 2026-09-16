@@ -3483,3 +3483,221 @@ func TestLiveRecoveryLocatorBounds(t *testing.T) {
 		t.Errorf("expected redacted payload in locator, got %s", rec.RecoveryLocator)
 	}
 }
+
+// TestLiveResolveRecoveryObservationMonotonic verifies the recovery-
+// resolution write is monotonic over the durable provider observation:
+// a resolver result contradicting a persisted provider identity or
+// result is rejected with PROVIDER_OBSERVATION_CONFLICT, while empty
+// or matching fields preserve the stored observation.
+func TestLiveResolveRecoveryObservationMonotonic(t *testing.T) {
+	dbURL := os.Getenv("CRABBOX_TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live PostgreSQL test")
+	}
+	db, err := openTestDB(dbURL)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+	store, err := NewStore(db)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	ctx := context.Background()
+
+	prefix := fmt.Sprintf("test-resolve-obs-%d", time.Now().UnixNano())
+	db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key LIKE $1`, prefix+"%")
+
+	// Record A: UNKNOWN with a persisted provider observation.
+	acq, err := store.Acquire(ctx, prefix+"-a", "alice@example.com", "test.counter.increment",
+		"digest-ro-a", "grant_ro", "MUTATION", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execA := acq.Record.ExecutionID
+	if err := store.BeginExecution(ctx, execA, acq.LeaseToken, acq.Generation); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkInFlight(ctx, execA, acq.LeaseToken, acq.Generation, "test-counter", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordProviderObservation(ctx, execA, acq.LeaseToken, acq.Generation, ProviderObservation{
+		ProviderID:     "test-counter",
+		ProviderRunID:  "run-a-1",
+		EvidenceDigest: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+		Result:         json.RawMessage(`{"value":1}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	recA, _ := store.Lookup(ctx, execA)
+	if err := store.EnterRecovery(ctx, execA, StateInFlight, recA.Version); err != nil {
+		t.Fatal(err)
+	}
+
+	// A resolver returning a DIFFERENT provider run ID must be rejected —
+	// recovery must never overwrite a contradictory durable observation.
+	recA, _ = store.Lookup(ctx, execA)
+	err = store.ResolveRecovery(ctx, execA, recA.Version, RecoveryResult{
+		Decision:       RecoveryCommitted,
+		Result:         []byte(`{"value":1}`),
+		EvidenceDigest: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+		ReceiptVersion: 3,
+		ProviderID:     "test-counter",
+		ProviderRunID:  "run-a-DIFFERENT",
+	})
+	if err == nil || !errors.Is(err, ProviderObservationConflict) {
+		t.Fatalf("contradictory recovery result must return PROVIDER_OBSERVATION_CONFLICT, got %v", err)
+	}
+	recA, _ = store.Lookup(ctx, execA)
+	if recA.State != StateUnknown {
+		t.Errorf("rejected recovery must leave record UNKNOWN, got %s", recA.State)
+	}
+	if recA.ProviderRunID != "run-a-1" {
+		t.Errorf("contradictory recovery must not overwrite provider_run_id, got %q", recA.ProviderRunID)
+	}
+
+	// A resolver result that AGREES with the stored observation resolves.
+	recA, _ = store.Lookup(ctx, execA)
+	err = store.ResolveRecovery(ctx, execA, recA.Version, RecoveryResult{
+		Decision:       RecoveryCommitted,
+		Result:         []byte(`{"value":1}`),
+		EvidenceDigest: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+		ReceiptVersion: 3,
+		ProviderID:     "test-counter",
+		ProviderRunID:  "run-a-1",
+	})
+	if err != nil {
+		t.Fatalf("matching recovery resolution failed: %v", err)
+	}
+	recA, _ = store.Lookup(ctx, execA)
+	if recA.State != StateCommitted {
+		t.Errorf("expected COMMITTED, got %s", recA.State)
+	}
+
+	// Record B: the resolver leaves provider identity fields EMPTY —
+	// the stored observation must be preserved, not nulled.
+	acqB, err := store.Acquire(ctx, prefix+"-b", "alice@example.com", "test.counter.increment",
+		"digest-ro-b", "grant_ro", "MUTATION", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execB := acqB.Record.ExecutionID
+	if err := store.BeginExecution(ctx, execB, acqB.LeaseToken, acqB.Generation); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkInFlight(ctx, execB, acqB.LeaseToken, acqB.Generation, "test-counter", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordProviderObservation(ctx, execB, acqB.LeaseToken, acqB.Generation, ProviderObservation{
+		ProviderID:     "test-counter",
+		ProviderRunID:  "run-b-1",
+		EvidenceDigest: "b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3",
+		Result:         json.RawMessage(`{"value":2}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	recB, _ := store.Lookup(ctx, execB)
+	if err := store.EnterRecovery(ctx, execB, StateInFlight, recB.Version); err != nil {
+		t.Fatal(err)
+	}
+
+	recB, _ = store.Lookup(ctx, execB)
+	err = store.ResolveRecovery(ctx, execB, recB.Version, RecoveryResult{
+		Decision:       RecoveryCommitted,
+		Result:         []byte(`{"value":2}`),
+		EvidenceDigest: "b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3",
+		ReceiptVersion: 3,
+		// ProviderID/ProviderRunID left empty — the resolver did not
+		// observe identity, but the durable record already has it.
+	})
+	if err != nil {
+		t.Fatalf("recovery resolution with empty provider identity failed: %v", err)
+	}
+	recB, _ = store.Lookup(ctx, execB)
+	if recB.State != StateCommitted {
+		t.Errorf("expected COMMITTED, got %s", recB.State)
+	}
+	if recB.ProviderID != "test-counter" || recB.ProviderRunID != "run-b-1" {
+		t.Errorf("stored provider identity must be preserved, got provider=%q run=%q",
+			recB.ProviderID, recB.ProviderRunID)
+	}
+}
+
+// TestLiveEnsureValidIndexScopedToActiveSchema verifies invalid-index
+// detection is scoped to the active schema: a VALID index of the same
+// name in another schema must not mask an INVALID index here — the
+// migration inspects pg_class filtered by the current namespace.
+// Requires superuser to mark pg_index.indisvalid; skips otherwise.
+func TestLiveEnsureValidIndexScopedToActiveSchema(t *testing.T) {
+	dbURL := os.Getenv("CRABBOX_TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live PostgreSQL test")
+	}
+	db, err := openTestDB(dbURL)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	otherSchema := "crabbox_idx_other_" + suffix
+	tbl := "idx_ns_tbl_" + suffix
+	idxName := "idx_ns_probe_" + suffix
+
+	// Other schema: same-named VALID index — the decoy an unscoped
+	// pg_class lookup could inspect instead of ours.
+	if _, err := db.ExecContext(ctx, `CREATE SCHEMA `+otherSchema); err != nil {
+		t.Fatalf("create other schema: %v", err)
+	}
+	defer db.ExecContext(ctx, `DROP SCHEMA `+otherSchema+` CASCADE`)
+	if _, err := db.ExecContext(ctx, fmt.Sprintf(
+		`CREATE TABLE %s.%s (a int); CREATE INDEX %s ON %s.%s(a)`,
+		otherSchema, tbl, idxName, otherSchema, tbl)); err != nil {
+		t.Fatalf("create decoy index: %v", err)
+	}
+
+	// Active schema: same-named index, then mark it INVALID to simulate
+	// an interrupted CREATE INDEX CONCURRENTLY.
+	if _, err := db.ExecContext(ctx, fmt.Sprintf(
+		`CREATE TABLE %s (a int); CREATE INDEX %s ON %s(a)`,
+		tbl, idxName, tbl)); err != nil {
+		t.Fatalf("create probe index: %v", err)
+	}
+	defer db.ExecContext(ctx, `DROP TABLE IF EXISTS `+tbl)
+	if _, err := db.ExecContext(ctx, fmt.Sprintf(
+		`UPDATE pg_index SET indisvalid = false
+		 WHERE indexrelid = '%s'::regclass`, idxName)); err != nil {
+		t.Skipf("cannot mark index invalid (needs superuser): %v", err)
+	}
+
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	err = ensureValidIndex(ctx, conn, hotPathIndex{
+		name: idxName,
+		ddl:  fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s ON %s(a)`, idxName, tbl),
+	})
+	if err != nil {
+		t.Fatalf("ensureValidIndex failed: %v", err)
+	}
+
+	// The ACTIVE schema's index must have been rebuilt valid — the
+	// decoy's validity must not have masked our invalid shell.
+	var valid bool
+	if err := conn.QueryRowContext(ctx, `
+		SELECT i.indisvalid
+		FROM pg_class c
+		JOIN pg_index i ON i.indexrelid = c.oid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE c.relname = $1 AND c.relkind = 'i'
+		  AND n.nspname = current_schema()
+	`, idxName).Scan(&valid); err != nil {
+		t.Fatalf("probe index lookup: %v", err)
+	}
+	if !valid {
+		t.Error("invalid index in the active schema was not repaired — another schema's same-named index masked it")
+	}
+}

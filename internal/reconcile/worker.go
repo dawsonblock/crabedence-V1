@@ -148,11 +148,23 @@ func (w *Worker) reconcileAll(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to claim unknown records: %w", err)
 	}
+	// The claim TTL for EVERY claimed record starts at claim time, but
+	// per-record heartbeats only begin when reconcileOne reaches them.
+	// A resolver may legitimately run for four claim durations, so a
+	// slow head record would let every later claim expire — another
+	// worker could then reclaim them, duplicating provider lookups and
+	// inflating reconcile_attempt until records suspend unprocessed.
+	// This batch heartbeat renews all outstanding claims for the
+	// duration of the batch; per-version CAS makes renewals for
+	// already-resolved records harmless no-ops.
+	batchHbCtx, batchHbCancel := context.WithCancel(ctx)
+	go w.batchClaimHeartbeat(batchHbCtx, claimed)
 	for _, rec := range claimed {
 		if err := w.reconcileOne(ctx, rec); err != nil {
 			fmt.Printf("reconciliation failed for %s: %v\n", rec.ExecutionID, err)
 		}
 	}
+	batchHbCancel()
 
 	// Category 2: crashed executions with expired leases.
 	// Uses ClaimExpiredBatch (FOR UPDATE SKIP LOCKED) so multiple
@@ -250,6 +262,32 @@ func (w *Worker) recoverCrashed(ctx context.Context, rec *idempotency.Record) er
 	}
 }
 
+// batchClaimHeartbeat renews every claimed record's reconcile claim
+// until the batch finishes draining. RenewReconcileClaim is a per-
+// version CAS: records already resolved or released (their versions
+// bumped) are skipped harmlessly.
+func (w *Worker) batchClaimHeartbeat(ctx context.Context, recs []*idempotency.Record) {
+	interval := w.claimDuration / 3
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	if interval < 50*time.Millisecond {
+		interval = 50 * time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			for _, rec := range recs {
+				_ = w.store.RenewReconcileClaim(ctx, rec.ExecutionID, rec.Version, w.claimDuration)
+			}
+		}
+	}
+}
+
 // reconcileOne attempts to reconcile a single UNKNOWN record.
 // Uses CAS with expected state=UNKNOWN to prevent overwriting a
 // state that changed after it was read.
@@ -263,6 +301,15 @@ func (w *Worker) recoverCrashed(ctx context.Context, rec *idempotency.Record) er
 // with exponential backoff so another worker (or this one later)
 // can retry.
 func (w *Worker) reconcileOne(ctx context.Context, rec *idempotency.Record) error {
+	// Attempt ceiling — enforced BEFORE invoking the resolver.
+	// reconcile_attempt counts claims (ClaimUnknownBatch increments it
+	// before returning the record), so a claim count above the ceiling
+	// means the record has already exhausted its allowed provider
+	// lookups: suspend it rather than spending one more resolver call.
+	if w.maxAttempts > 0 && rec.ReconcileAttempt > w.maxAttempts {
+		return w.store.SuspendReconciliation(ctx, rec.ExecutionID, rec.Version, "reconcile attempt ceiling reached")
+	}
+
 	// Resolver deadline: bounded at 4 claim TTLs — long enough for a
 	// legitimately slow resolver whose claim the heartbeat keeps
 	// renewing, short enough that a wedged resolver cannot hold the
@@ -423,9 +470,9 @@ func recoveryOutcome(d idempotency.RecoveryDecision) string {
 // The backoff duration is passed to the store which computes
 // next_reconcile_at using clock_timestamp() — DB-owned time.
 func (w *Worker) releaseClaim(ctx context.Context, rec *idempotency.Record, resolveErr error) error {
-	// reconcile_attempt is incremented by ClaimUnknownBatch before
-	// the record is returned, so attempt=1 is the first retry.
-	// Subtract 1 so the first retry gets base backoff (30s), not 1m.
+	// reconcile_attempt counts claims (ClaimUnknownBatch increments it
+	// before returning the record). The claim that just ran was the
+	// rec.ReconcileAttempt-th attempt; backoff indexes retries from 0.
 	effectiveAttempt := rec.ReconcileAttempt - 1
 	if effectiveAttempt < 0 {
 		effectiveAttempt = 0
@@ -433,8 +480,10 @@ func (w *Worker) releaseClaim(ctx context.Context, rec *idempotency.Record, reso
 	// Dead-letter: a record that exhausts the attempt ceiling stops
 	// being claimed. It stays UNKNOWN — an unresolvable record must
 	// never be forced to a terminal state — but it also must not churn
-	// through the reconcile loop forever.
-	if w.maxAttempts > 0 && effectiveAttempt >= w.maxAttempts {
+	// through the reconcile loop forever. The ceiling bounds resolver
+	// calls: once the last allowed attempt has run, suspend rather
+	// than scheduling a retry the pre-resolve ceiling would reject.
+	if w.maxAttempts > 0 && rec.ReconcileAttempt >= w.maxAttempts {
 		reason := "reconcile attempt ceiling reached"
 		if resolveErr != nil {
 			reason = fmt.Sprintf("%s (last error: %v)", reason, resolveErr)

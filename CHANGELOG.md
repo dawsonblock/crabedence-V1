@@ -105,6 +105,17 @@
 - Store: locator secret scanning adds broad `key`, `pgpass`, and `cookie` patterns — `ssh_key`, `tls_key`, `hmac_key`, `.pgpass`-style fields, and cookie-bearing keys are now caught alongside the existing token/secret/password patterns.
 - Reconciliation: a resolver-supplied evidence receipt on a non-CRITICAL record is dropped — it was never verified and persisting it would imply an attestation that did not happen. CRITICAL receipts remain signed by the worker itself.
 
+### RC9.1 — Pre-Dispatch Abandon and Observation-Monotonic Recovery
+
+- Store: `ResolveRecovery` is monotonic over the durable provider identity — a resolver result whose `provider_id`/`provider_run_id` contradicts a persisted observation is rejected with `PROVIDER_OBSERVATION_CONFLICT` instead of silently overwriting it, and empty resolver fields preserve (COALESCE) the stored observation rather than nulling it.
+- Execution: every pre-dispatch failure path (`BeginExecution`, locator preparation/marshal/size check, `MarkInFlight`) now calls `AbandonPreDispatch` — the record returns to lease-less PREPARED so a retry reacquires immediately instead of stranding an EXECUTING lease until expiry.
+- Execution: the expired-deadline check runs before `MarkInFlight` — an already-expired request is abandoned to PREPARED and answered with a definitive FAILED, so `IN_FLIGHT` keeps meaning "provider invocation may have begun" and a crash can no longer strand a provably-never-dispatched record in UNKNOWN.
+- Execution: `CounterHandler.Resolve` replays the post-increment value recorded at execution time (`CounterExecution.Value`) instead of the live counter aggregate — a later increment can no longer change an older execution's recovered result.
+- Store: `canonicalizeJSON` requires a clean `io.EOF` after the first JSON value — `Decoder.More()` reported end-of-input at `]`/`}`, accepting malformed trailing data like `{"a":1}}` or `1]`.
+- Store: `ensureValidIndex` scopes its `pg_class` validity lookup to `current_schema()` — a same-named index in another schema can no longer mask an invalid index in the active one.
+- Reconciliation: a batch-wide claim heartbeat renews every claimed record's `reconcile_lease_expires_at` for the duration of `reconcileAll` — a slow first resolver can no longer let later claims expire and be stolen mid-batch (renewal is per-version CAS, so resolved/released claims are skipped harmlessly).
+- Reconciliation: the attempt ceiling now bounds resolver calls exactly — `reconcileOne` suspends a record claimed past `maxAttempts` BEFORE invoking the resolver, and `releaseClaim` suspends once the last allowed attempt has run, so `maxAttempts=N` permits at most N provider lookups.
+
 ### RC8 — Effect Fabric Recovery Boundary Closure
 
 - Execution: `Store.RecordProviderObservation` durably persists provider response metadata (provider_id, provider_run_id, evidence_digest, result) immediately after the provider returns — before evidence validation and `Finalize`. The write is lease-fenced while `IN_FLIGHT` and accepted unconditionally once the record races into `UNKNOWN`, so the observation no longer depends on winning a state-transition race. `version` is not bumped, keeping reconciliation CAS valid.

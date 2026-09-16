@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"time"
 )
 
@@ -292,9 +293,16 @@ func canonicalizeJSON(raw json.RawMessage) (json.RawMessage, error) {
 		return nil, err
 	}
 	// Verify complete consumption — trailing data after the first
-	// JSON value means the input is malformed.
-	if dec.More() {
-		return nil, fmt.Errorf("invalid JSON: trailing data after first value")
+	// JSON value means the input is malformed. Decode once more and
+	// require io.EOF: Decoder.More is meant for array/object iteration
+	// and returns false at ']' or '}', so it accepts malformed inputs
+	// like {"a":1}} or 1].
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("invalid JSON: trailing data after first value")
+		}
+		return nil, fmt.Errorf("invalid JSON: %w", err)
 	}
 	return json.Marshal(v)
 }

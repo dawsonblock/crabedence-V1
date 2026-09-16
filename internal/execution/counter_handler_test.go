@@ -303,3 +303,65 @@ func TestGenericRecoveryLocatorMinimization(t *testing.T) {
 		t.Error("generic locator must carry principal")
 	}
 }
+
+// TestCounterResolverReturnsExecutionValue verifies the recovery result
+// replays THIS execution's post-increment value, not the live counter
+// aggregate: execution A increments shared to 1, execution B increments
+// it to 6, then A's UNKNOWN record must still resolve with value=1 —
+// the result its original dispatch produced.
+func TestCounterResolverReturnsExecutionValue(t *testing.T) {
+	h := NewCounterHandler()
+	desc := testCounterDescriptor()
+	ctx := context.Background()
+
+	// Execution A: shared counter 0 → 1.
+	respA := h.Execute(ctx, Request{
+		Capability:     "test.counter.increment",
+		Arguments:      json.RawMessage(`{"counter":"shared","by":1}`),
+		Authority:      RequestAuthority{Principal: "alice@example.com"},
+		IdempotencyKey: "k-exec-a",
+	}, desc)
+	if respA.Status != StatusSucceeded {
+		t.Fatalf("execute A failed: %s", respA.Status)
+	}
+
+	// Execution B moves the same counter to 6 — AFTER A's dispatch.
+	respB := h.Execute(ctx, Request{
+		Capability:     "test.counter.increment",
+		Arguments:      json.RawMessage(`{"counter":"shared","by":5}`),
+		Authority:      RequestAuthority{Principal: "alice@example.com"},
+		IdempotencyKey: "k-exec-b",
+	}, desc)
+	if respB.Status != StatusSucceeded {
+		t.Fatalf("execute B failed: %s", respB.Status)
+	}
+
+	// A's record goes UNKNOWN (post-dispatch ambiguity) and is resolved
+	// later — after B already advanced the counter.
+	res, err := h.Resolve(ctx, &idempotency.Record{
+		ExecutionID:    "exec-A",
+		PrincipalID:    "alice@example.com",
+		CapabilityID:   "test.counter.increment",
+		IdempotencyKey: "k-exec-a",
+		RecoveryLocator: json.RawMessage(
+			`{"counter":"shared","by":1}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Decision != idempotency.RecoveryCommitted {
+		t.Fatalf("A must resolve COMMITTED, got %s", res.Decision)
+	}
+	var out struct {
+		Value int64 `json:"value"`
+	}
+	if err := json.Unmarshal(res.Result, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Value != 1 {
+		t.Errorf("recovered result must replay A's post-increment value 1, got %d (live aggregate leaked)", out.Value)
+	}
+	if res.ProviderRunID != respA.Execution.RunID {
+		t.Errorf("resolver must return A's original run ID %q, got %q", respA.Execution.RunID, res.ProviderRunID)
+	}
+}
