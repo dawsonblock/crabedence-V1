@@ -278,6 +278,14 @@ export class NemoKernel {
     //   - evidence.digest matching ^[0-9a-f]{64}$
     //   - evidence.receiptVersion === 3
     //   - execution.runId
+    //
+    // A malformed SUCCEEDED is post-dispatch uncertainty, not failure:
+    // the provider claims the effect happened, so reporting FAILED
+    // could let an upstream planner treat the operation as definitively
+    // failed and construct a retry. UNKNOWN preserves the ambiguity for
+    // reconciliation. (The production Crabedence adapter normally
+    // converts this to UNKNOWN before NEMO ever sees it; this check is
+    // defense-in-depth for custom or buggy execution ports.)
     if (
       descriptor.executionClass === "CRITICAL" &&
       outcome.status === "SUCCEEDED"
@@ -285,7 +293,7 @@ export class NemoKernel {
       const evidenceError = validateCriticalEvidence(outcome);
       if (evidenceError) {
         return {
-          status: "FAILED",
+          status: "UNKNOWN",
           error: evidenceError,
           execution: outcome.execution,
         };

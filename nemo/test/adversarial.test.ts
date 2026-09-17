@@ -15,7 +15,8 @@
  *   - Oversized frame (rejected)
  *   - Expired deadline (DENIED)
  *   - Invalid authority (DENIED)
- *   - CRITICAL success without evidence (FAILED by kernel)
+ *   - CRITICAL success without evidence (UNKNOWN — post-dispatch
+ *     uncertainty, not failure)
  */
 
 import { mkdtempSync, rmSync } from "node:fs";
@@ -389,9 +390,11 @@ describe("Adversarial: Kernel admission", () => {
     expect(outcome.error).toContain("authority");
   });
 
-  it("rejects CRITICAL success without evidence digest", async () => {
+  it("CRITICAL success without evidence digest is UNKNOWN, not FAILED", async () => {
     const local = new MockPort({ status: "SUCCEEDED" });
-    // CRITICAL returns SUCCEEDED but no evidence
+    // CRITICAL returns SUCCEEDED but no evidence — post-dispatch
+    // uncertainty: the provider claims the effect happened, so FAILED
+    // would let a planner retry an already-executed side effect.
     const remote = new MockPort({
       status: "SUCCEEDED",
       result: { ok: true },
@@ -414,7 +417,7 @@ describe("Adversarial: Kernel admission", () => {
       idempotencyKey: "req_no_evidence",
     });
 
-    expect(outcome.status).toBe("FAILED");
+    expect(outcome.status).toBe("UNKNOWN");
     expect(outcome.error).toContain("evidence");
   });
 
@@ -663,7 +666,7 @@ describe("Adversarial: Kernel admission", () => {
     }
   });
 
-  it("CRITICAL with invalid receipt version is rejected by kernel", async () => {
+  it("CRITICAL with invalid receipt version is UNKNOWN, not FAILED", async () => {
     const local = new MockPort({ status: "SUCCEEDED" });
     const remote = new MockPort({
       status: "SUCCEEDED",
@@ -690,12 +693,12 @@ describe("Adversarial: Kernel admission", () => {
       idempotencyKey: "bad_receipt_v",
     });
 
-    expect(outcome.status).toBe("FAILED");
+    expect(outcome.status).toBe("UNKNOWN");
     expect(outcome.error).toContain("receiptVersion");
     expect(outcome.error).toContain("3");
   });
 
-  it("CRITICAL with short digest is rejected by kernel", async () => {
+  it("CRITICAL with short digest is UNKNOWN, not FAILED", async () => {
     const local = new MockPort({ status: "SUCCEEDED" });
     const remote = new MockPort({
       status: "SUCCEEDED",
@@ -722,7 +725,7 @@ describe("Adversarial: Kernel admission", () => {
       idempotencyKey: "bad_digest",
     });
 
-    expect(outcome.status).toBe("FAILED");
+    expect(outcome.status).toBe("UNKNOWN");
     expect(outcome.error).toContain("digest");
   });
 

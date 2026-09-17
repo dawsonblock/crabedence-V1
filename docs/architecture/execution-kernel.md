@@ -149,7 +149,7 @@ orthogonal dimensions pinned in the capability descriptor:
 PURE     → NONE           → LOCAL      (no socket hop, no durability)
 READ     → STANDARD       → DIRECT     (admission, no durable kernel)
 READ     → HIGH_ASSURANCE → CRABEDENCE (authority-verified read)
-MUTATION → DURABLE        → CRABEDENCE (PostgreSQL idempotency, exactly-once)
+MUTATION → DURABLE        → CRABEDENCE (PostgreSQL idempotency, at-most-once dispatch per idempotency identity + reconciliation)
 CRITICAL → HIGH_ASSURANCE → CRABEDENCE (durable + V3 evidence + receipts)
 ```
 

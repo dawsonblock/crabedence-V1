@@ -5,16 +5,21 @@ execution store. All code in `internal/idempotency` and
 `internal/reconcile` must satisfy these rules. Changes to this
 document require the same review as changes to the store itself.
 
-## 0. Revision-8 normative invariants
+## 0. Revision-9 normative invariants
 
 The following are requirements, not commentary. Any implementation
 that violates one is defective, regardless of test results.
 
 1.  **Frozen state graph.** The only legal transitions are:
-    `PREPARED → EXECUTING`, `EXECUTING → IN_FLIGHT`,
+    `PREPARED → EXECUTING`, `EXECUTING → PREPARED`,
+    `EXECUTING → IN_FLIGHT`,
     `IN_FLIGHT → COMMITTED | FAILED | UNKNOWN`, and
     `UNKNOWN → COMMITTED | FAILED`. `COMMITTED` and `FAILED` are
     immutable. `EnterRecovery` is legal only from `IN_FLIGHT`.
+    `EXECUTING → PREPARED` is `AbandonPreDispatch`: it is safe because
+    the dispatch boundary was not crossed, and it releases the lease
+    so the next caller reclaims immediately instead of waiting for
+    expiry.
 
 2.  **Provider observations are durable before classification.** The
     dispatcher MUST call `RecordProviderObservation` immediately after
@@ -100,8 +105,15 @@ that violates one is defective, regardless of test results.
     no longer required.** The execution heartbeat ends only after a
     durable terminal or recovery state is persisted, or another worker
     has definitively taken ownership. Provider return alone is not a
-    stopping condition. Reconcile claims are renewed while a resolver
-    runs, and resolver deadlines are enforced below the claim TTL.
+    stopping condition. The worker MUST synchronously revalidate its
+    reconcile claim before invoking a resolver (a record claimed
+    earlier in the batch may have been reclaimed while earlier records
+    processed — claiming bumps `version`, so a stale claim fails the
+    renewal CAS). Reconcile claims are renewed while a resolver runs;
+    the resolver deadline is a bounded multiple of the claim TTL (not
+    below it — the heartbeat exists precisely so resolution longer
+    than one claim window remains safe), and losing the claim cancels
+    the resolver context rather than committing under a lost claim.
 
 10. **Expired pre-dispatch work is normalized once.** Expired
     `PREPARED`/`EXECUTING` records are reset to lease-less `PREPARED`
@@ -141,6 +153,9 @@ BeginExecution (lease holder only)
    │
    ▼
 EXECUTING
+   │
+   ├── AbandonPreDispatch → PREPARED (dispatch boundary not crossed;
+   │    releases the lease so the next caller reclaims immediately)
    │
 MarkInFlight (dispatch boundary crossed)
    │  — persists provider_id + recovery_locator atomically
@@ -439,10 +454,15 @@ churn through the reconcile loop forever.
 
 `RenewReconcileClaim` extends an active claim using
 `GREATEST(current, clock_timestamp() + duration)` — renewal cannot
-shorten an existing claim. The reconciliation worker runs a claim
-heartbeat while the resolver executes and enforces a resolver
-deadline below the claim TTL; losing the claim cancels the resolver
-context rather than committing under a lost claim.
+shorten an existing claim. The reconciliation worker synchronously
+revalidates its claim before invoking a resolver (claims bump
+`version`, so a stale claim fails the CAS and the resolver is never
+invoked for a record the worker no longer owns), runs a claim
+heartbeat while the resolver executes, and bounds the resolver
+deadline at a fixed multiple of the claim TTL — the heartbeat keeps
+a legitimately slow resolver's claim alive across claim windows, and
+losing the claim cancels the resolver context rather than committing
+under a lost claim.
 
 `RecoveryResolver.Resolve` MUST be observational, side-effect-free,
 and idempotent. Claim renewal minimizes duplicate provider queries;
@@ -534,8 +554,10 @@ CRAB-V1-023: CRITICAL terminal transitions require authenticated
 CRAB-V1-024: Recovery resolvers are observational, side-effect-free,
              and execution-specific; they return the original provider
              operation identity.
-CRAB-V1-025: Reconciliation claims are renewed while resolvers run;
-             resolver deadlines stay below claim TTL.
+CRAB-V1-025: Reconciliation claims are revalidated before resolver
+             invocation and renewed while resolvers run; resolver
+             deadlines are a bounded multiple of claim TTL and claim
+             loss cancels the resolver.
 CRAB-V1-026: Expired pre-dispatch records normalize once; dormant
              work does not churn.
 CRAB-V1-027: Recovery locators are provider-specific, minimal,

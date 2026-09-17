@@ -92,7 +92,8 @@ type Store struct {
 	// locatorRedactor optionally rewrites a recovery locator before it
 	// is persisted — e.g. to encrypt or strip sensitive extension data
 	// for compatibility providers that still need raw arguments.
-	// Applied in MarkInFlight after the size bound and denylist check.
+	// Applied in MarkInFlight between the size bound and the denylist
+	// scan, which runs on the final persisted representation.
 	locatorRedactor func(json.RawMessage) (json.RawMessage, error)
 }
 
@@ -898,13 +899,15 @@ func (s *Store) BeginExecution(ctx context.Context, executionID, leaseToken stri
 // state transition so that a crashed execution carries the information
 // needed for provider-specific reconciliation.
 func (s *Store) MarkInFlight(ctx context.Context, executionID, leaseToken string, leaseGeneration int, providerID string, recoveryLocator json.RawMessage) error {
+	// Order matters: bound the caller-supplied size first, then let the
+	// redactor strip or encrypt sensitive fields, then scan the FINAL
+	// persisted representation for denied keys. Scanning before
+	// redaction would reject locators the redactor was installed to
+	// clean; scanning after redaction ensures the hook cannot smuggle
+	// credential-shaped fields into the ledger.
 	if len(recoveryLocator) > MaxRecoveryLocatorBytes {
 		return fmt.Errorf("%w: recovery locator exceeds %d bytes (got %d)",
 			LocatorTooLarge, MaxRecoveryLocatorBytes, len(recoveryLocator))
-	}
-	if field := forbiddenLocatorField(recoveryLocator); field != "" {
-		return fmt.Errorf("%w: recovery locator contains forbidden field %q",
-			LocatorContainsSecret, field)
 	}
 	if s.locatorRedactor != nil && len(recoveryLocator) > 0 {
 		redacted, err := s.locatorRedactor(recoveryLocator)
@@ -916,6 +919,10 @@ func (s *Store) MarkInFlight(ctx context.Context, executionID, leaseToken string
 				LocatorTooLarge, MaxRecoveryLocatorBytes, len(redacted))
 		}
 		recoveryLocator = redacted
+	}
+	if field := forbiddenLocatorField(recoveryLocator); field != "" {
+		return fmt.Errorf("%w: recovery locator contains forbidden field %q",
+			LocatorContainsSecret, field)
 	}
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE execution_requests
@@ -1186,9 +1193,33 @@ func (s *Store) AbandonPreDispatch(ctx context.Context, executionID, leaseToken 
 		return err
 	}
 	if rows == 0 {
-		return s.classifyTransitionFailure(ctx, executionID, leaseToken, leaseGeneration, StatePrepared)
+		return s.classifyAbandonFailure(ctx, executionID, leaseToken, leaseGeneration)
 	}
 	return nil
+}
+
+// classifyAbandonFailure determines the specific failure for a rejected
+// AbandonPreDispatch. Unlike a single-state transition, abandonment has
+// two legal source states (PREPARED and EXECUTING), so the failure must
+// be diagnosed against the record's actual state rather than assumed.
+func (s *Store) classifyAbandonFailure(ctx context.Context, executionID, leaseToken string, leaseGeneration int) error {
+	rec, err := s.Lookup(ctx, executionID)
+	if err != nil {
+		return fmt.Errorf("%w: execution %s abandon failed (lookup error: %v)", LeaseLost, executionID, err)
+	}
+	if rec.State != StatePrepared && rec.State != StateExecuting {
+		if rec.State.IsDurablyFinal() {
+			return fmt.Errorf("%w: execution %s is durably final (%s)", LeaseStateConflict, executionID, rec.State)
+		}
+		return fmt.Errorf("%w: execution %s cannot abandon from %s (dispatch boundary crossed)", LeaseStateConflict, executionID, rec.State)
+	}
+	if rec.LeaseToken != leaseToken {
+		return fmt.Errorf("%w: execution %s token mismatch", LeaseTokenMismatch, executionID)
+	}
+	if rec.LeaseGeneration != leaseGeneration {
+		return fmt.Errorf("%w: execution %s generation %d != %d", LeaseGenerationMismatch, executionID, rec.LeaseGeneration, leaseGeneration)
+	}
+	return fmt.Errorf("%w: execution %s lease expired", LeaseExpired, executionID)
 }
 
 // ─── Immutable finalization ─────────────────────────────────────────
@@ -1293,11 +1324,16 @@ func (s *Store) Finalize(ctx context.Context, executionID, leaseToken string, le
 		return err
 	}
 
-	// Not yet durably final — perform CAS transition.
+	// Not yet durably final — perform CAS transition. Provider identity
+	// is monotonic, matching RecordProviderObservation: the receipt may
+	// confirm the observed provider_id/provider_run_id or add identity
+	// the record lacks, but MUST NOT contradict or erase a stored
+	// observation. A contradiction rejects the whole write.
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE execution_requests
 		SET state = $1, result = $2, evidence_digest = $3, receipt_version = $4,
-		    provider_id = $5, provider_run_id = $6,
+		    provider_id = COALESCE($5::text, provider_id),
+		    provider_run_id = COALESCE($6::text, provider_run_id),
 		    terminal_receipt_digest = $7, evidence_receipt = $13,
 		    lease_owner = NULL, lease_token = NULL,
 		    lease_started_at = NULL, lease_expires_at = NULL,
@@ -1309,6 +1345,8 @@ func (s *Store) Finalize(ctx context.Context, executionID, leaseToken string, le
 		  AND lease_generation = $11
 		  AND lease_expires_at > clock_timestamp()
 		  AND version = $12
+		  AND (provider_id IS NULL OR $5::text IS NULL OR provider_id = $5::text)
+		  AND (provider_run_id IS NULL OR $6::text IS NULL OR provider_run_id = $6::text)
 	`, string(receipt.TerminalStatus),
 		nullableBytes(receipt.CanonicalResult),
 		nullableString(receipt.EvidenceDigest),
@@ -1331,12 +1369,37 @@ func (s *Store) Finalize(ctx context.Context, executionID, leaseToken string, le
 		// a conflict. Two workers finalizing with identical receipts
 		// must both succeed, not produce a false conflict.
 		current, lookupErr := s.Lookup(ctx, executionID)
-		if lookupErr == nil && current.State.IsDurablyFinal() && current.TerminalReceiptDigest == receiptDigest {
-			return nil // Concurrent identical finalization — idempotent.
+		if lookupErr == nil && current.State.IsDurablyFinal() {
+			if current.TerminalReceiptDigest == receiptDigest {
+				return nil // Concurrent identical finalization — idempotent.
+			}
+			return fmt.Errorf("FINALIZATION_CONFLICT: execution %s already finalized with different receipt (existing digest %s, new digest %s)",
+				executionID, current.TerminalReceiptDigest, receiptDigest)
+		}
+		// Only when fencing (state/token/generation) still matches can
+		// the provider-identity guard be the reason zero rows updated —
+		// otherwise classifyTransitionFailure reports the real cause.
+		if lookupErr == nil &&
+			current.State == expectedState &&
+			current.LeaseToken == leaseToken &&
+			current.LeaseGeneration == leaseGeneration &&
+			providerIdentityContradicts(
+				current.ProviderID, receipt.ProviderID,
+				current.ProviderRunID, receipt.ProviderRunID) {
+			return fmt.Errorf("%w: execution %s terminal receipt contradicts stored provider observation", ProviderObservationConflict, executionID)
 		}
 		return s.classifyTransitionFailure(ctx, executionID, leaseToken, leaseGeneration, expectedState)
 	}
 	return nil
+}
+
+// providerIdentityContradicts reports whether a write's provider
+// identity contradicts the identity already stored on the record.
+// Provider identity is monotonic: a write may confirm stored identity
+// or supply identity the record lacks, but never replace it.
+func providerIdentityContradicts(storedID, suppliedID, storedRunID, suppliedRunID string) bool {
+	return (storedID != "" && suppliedID != "" && storedID != suppliedID) ||
+		(storedRunID != "" && suppliedRunID != "" && storedRunID != suppliedRunID)
 }
 
 // ─── Recovery ────────────────────────────────────────────────────────

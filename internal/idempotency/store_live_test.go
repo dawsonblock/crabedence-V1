@@ -2172,11 +2172,13 @@ func TestLiveStoreReplayProviderMetadata(t *testing.T) {
 	if err := store.BeginExecution(ctx, execID, acq.LeaseToken, acq.Generation); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.MarkInFlight(ctx, execID, acq.LeaseToken, acq.Generation, "github-adapter", nil); err != nil {
+	if err := store.MarkInFlight(ctx, execID, acq.LeaseToken, acq.Generation, "github", nil); err != nil {
 		t.Fatal(err)
 	}
 
-	// Finalize with specific provider metadata.
+	// Finalize with specific provider metadata. The provider ID must be
+	// consistent with the identity persisted at IN_FLIGHT — terminal
+	// writes enforce provider-identity monotonicity.
 	receipt := TerminalReceipt{
 		ExecutionID:     execID,
 		Capability:      "test.counter.increment",
@@ -3481,6 +3483,317 @@ func TestLiveRecoveryLocatorBounds(t *testing.T) {
 	}
 	if !strings.Contains(string(rec.RecoveryLocator), "<redacted>") {
 		t.Errorf("expected redacted payload in locator, got %s", rec.RecoveryLocator)
+	}
+}
+
+// TestLiveTerminalWritesProviderIdentityMonotonic verifies that the
+// terminal write paths — Finalize and ResolveRecovery — enforce the
+// same provider-identity monotonicity as RecordProviderObservation:
+// a terminal receipt or recovery result may confirm the observed
+// provider_id/provider_run_id or add identity the record lacks, but
+// must never contradict or erase a stored observation.
+func TestLiveTerminalWritesProviderIdentityMonotonic(t *testing.T) {
+	dbURL := os.Getenv("CRABBOX_TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live PostgreSQL test")
+	}
+	db, err := openTestDB(dbURL)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+	store, err := NewStore(db)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	ctx := context.Background()
+
+	prefix := fmt.Sprintf("test-provmono-%d", time.Now().UnixNano())
+	defer db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key LIKE $1`, prefix+"%")
+
+	// inFlightWithObservation drives a record to IN_FLIGHT and records
+	// a provider observation carrying the given provider identity.
+	inFlightWithObservation := func(suffix, providerID, runID string) (string, string, int) {
+		t.Helper()
+		acq, err := store.Acquire(ctx, prefix+suffix, "alice@example.com", "test.counter.increment",
+			"digest-"+suffix, "grant_m", "MUTATION", time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !acq.Acquired() {
+			t.Fatalf("expected lease acquired, got %s", acq.Kind)
+		}
+		execID := acq.Record.ExecutionID
+		if err := store.BeginExecution(ctx, execID, acq.LeaseToken, acq.Generation); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.MarkInFlight(ctx, execID, acq.LeaseToken, acq.Generation, providerID, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.RecordProviderObservation(ctx, execID, acq.LeaseToken, acq.Generation, ProviderObservation{
+			ProviderID:    providerID,
+			ProviderRunID: runID,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return execID, acq.LeaseToken, acq.Generation
+	}
+
+	// Case 1: Finalize with a contradicting provider ID is rejected.
+	execID, token, gen := inFlightWithObservation("-fin-pid", "obs-provider", "run-obs-1")
+	err = store.Finalize(ctx, execID, token, gen, StateInFlight, TerminalReceipt{
+		ExecutionID:     execID,
+		TerminalStatus:  StateCommitted,
+		CanonicalResult: json.RawMessage(`{"value":1}`),
+		ProviderID:      "other-provider",
+		ProviderRunID:   "run-obs-1",
+	})
+	if !errors.Is(err, ProviderObservationConflict) {
+		t.Fatalf("Finalize with contradicting provider_id must return PROVIDER_OBSERVATION_CONFLICT, got %v", err)
+	}
+	rec, _ := store.Lookup(ctx, execID)
+	if rec.State != StateInFlight || rec.ProviderID != "obs-provider" {
+		t.Fatalf("contradicting finalize must not mutate the record, got state=%s provider=%q", rec.State, rec.ProviderID)
+	}
+
+	// Case 2: Finalize with a contradicting run ID is rejected.
+	err = store.Finalize(ctx, execID, token, gen, StateInFlight, TerminalReceipt{
+		ExecutionID:     execID,
+		TerminalStatus:  StateCommitted,
+		CanonicalResult: json.RawMessage(`{"value":1}`),
+		ProviderID:      "obs-provider",
+		ProviderRunID:   "run-DIFFERENT",
+	})
+	if !errors.Is(err, ProviderObservationConflict) {
+		t.Fatalf("Finalize with contradicting provider_run_id must return PROVIDER_OBSERVATION_CONFLICT, got %v", err)
+	}
+
+	// Case 3: Finalize with matching identity succeeds.
+	if err := store.Finalize(ctx, execID, token, gen, StateInFlight, TerminalReceipt{
+		ExecutionID:     execID,
+		TerminalStatus:  StateCommitted,
+		CanonicalResult: json.RawMessage(`{"value":1}`),
+		ProviderID:      "obs-provider",
+		ProviderRunID:   "run-obs-1",
+	}); err != nil {
+		t.Fatalf("Finalize with matching provider identity failed: %v", err)
+	}
+	rec, _ = store.Lookup(ctx, execID)
+	if rec.State != StateCommitted || rec.ProviderID != "obs-provider" || rec.ProviderRunID != "run-obs-1" {
+		t.Fatalf("expected COMMITTED with obs-provider/run-obs-1, got %s %s/%s", rec.State, rec.ProviderID, rec.ProviderRunID)
+	}
+
+	// Case 4: a receipt without provider identity must not erase the
+	// stored observation — COALESCE keeps the recorded values.
+	execID2, token2, gen2 := inFlightWithObservation("-fin-null", "obs-provider", "run-obs-2")
+	if err := store.Finalize(ctx, execID2, token2, gen2, StateInFlight, TerminalReceipt{
+		ExecutionID:     execID2,
+		TerminalStatus:  StateCommitted,
+		CanonicalResult: json.RawMessage(`{"value":2}`),
+	}); err != nil {
+		t.Fatalf("Finalize without provider identity failed: %v", err)
+	}
+	rec2, _ := store.Lookup(ctx, execID2)
+	if rec2.ProviderID != "obs-provider" || rec2.ProviderRunID != "run-obs-2" {
+		t.Fatalf("empty receipt identity must not erase the stored observation, got %s/%s", rec2.ProviderID, rec2.ProviderRunID)
+	}
+
+	// Case 5: ResolveRecovery with a contradicting provider ID is
+	// rejected; the record stays UNKNOWN for a correct resolution.
+	execID3, _, _ := inFlightWithObservation("-rec-pid", "obs-provider", "run-obs-3")
+	rec3, _ := store.Lookup(ctx, execID3)
+	if err := store.EnterRecovery(ctx, execID3, StateInFlight, rec3.Version); err != nil {
+		t.Fatal(err)
+	}
+	rec3, _ = store.Lookup(ctx, execID3)
+	err = store.ResolveRecovery(ctx, execID3, rec3.Version, RecoveryResult{
+		Decision:      RecoveryCommitted,
+		Result:        json.RawMessage(`{"found":true}`),
+		ProviderID:    "other-provider",
+		ProviderRunID: "run-obs-3",
+	})
+	if !errors.Is(err, ProviderObservationConflict) {
+		t.Fatalf("ResolveRecovery with contradicting provider_id must return PROVIDER_OBSERVATION_CONFLICT, got %v", err)
+	}
+	rec3, _ = store.Lookup(ctx, execID3)
+	if rec3.State != StateUnknown {
+		t.Fatalf("contradicting recovery must leave record UNKNOWN, got %s", rec3.State)
+	}
+
+	// Case 6: ResolveRecovery without provider identity keeps the
+	// stored observation.
+	err = store.ResolveRecovery(ctx, execID3, rec3.Version, RecoveryResult{
+		Decision: RecoveryCommitted,
+		Result:   json.RawMessage(`{"found":true}`),
+	})
+	if err != nil {
+		t.Fatalf("ResolveRecovery without provider identity failed: %v", err)
+	}
+	rec3, _ = store.Lookup(ctx, execID3)
+	if rec3.State != StateCommitted || rec3.ProviderID != "obs-provider" || rec3.ProviderRunID != "run-obs-3" {
+		t.Fatalf("expected COMMITTED preserving obs-provider/run-obs-3, got %s %s/%s", rec3.State, rec3.ProviderID, rec3.ProviderRunID)
+	}
+}
+
+// TestLiveAbandonPreDispatchFailureClassification verifies that a
+// rejected AbandonPreDispatch is diagnosed against the record's actual
+// state — not blindly classified against PREPARED. An EXECUTING record
+// with a wrong token is a token mismatch, not a state error, and an
+// IN_FLIGHT record reports that the dispatch boundary was crossed.
+func TestLiveAbandonPreDispatchFailureClassification(t *testing.T) {
+	dbURL := os.Getenv("CRABBOX_TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live PostgreSQL test")
+	}
+	db, err := openTestDB(dbURL)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+	store, err := NewStore(db)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	ctx := context.Background()
+
+	prefix := fmt.Sprintf("test-abandon-%d", time.Now().UnixNano())
+	defer db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key LIKE $1`, prefix+"%")
+
+	// EXECUTING record + wrong token → LEASE_TOKEN_MISMATCH, not a
+	// misleading "expected PREPARED but is EXECUTING" state conflict.
+	acq2, err := store.Acquire(ctx, prefix+"-exec2", "alice@example.com", "test.counter.increment",
+		"digest-exec2", "grant_a", "MUTATION", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !acq2.Acquired() {
+		t.Fatalf("expected lease acquired, got %s", acq2.Kind)
+	}
+	execID2 := acq2.Record.ExecutionID
+	if err := store.BeginExecution(ctx, execID2, acq2.LeaseToken, acq2.Generation); err != nil {
+		t.Fatal(err)
+	}
+	err = store.AbandonPreDispatch(ctx, execID2, "wrong-token", acq2.Generation)
+	if !errors.Is(err, LeaseTokenMismatch) {
+		t.Errorf("EXECUTING + wrong token must be LEASE_TOKEN_MISMATCH, got %v", err)
+	}
+
+	// EXECUTING record + correct token/generation → abandons cleanly.
+	if err := store.AbandonPreDispatch(ctx, execID2, acq2.LeaseToken, acq2.Generation); err != nil {
+		t.Fatalf("clean EXECUTING abandon failed: %v", err)
+	}
+	rec, _ := store.Lookup(ctx, execID2)
+	if rec.State != StatePrepared || rec.LeaseToken != "" {
+		t.Errorf("expected lease-less PREPARED after abandon, got %s token=%q", rec.State, rec.LeaseToken)
+	}
+
+	// IN_FLIGHT record → the dispatch boundary was crossed; abandon
+	// must report the boundary, not a generic state mismatch.
+	acq3, err := store.Acquire(ctx, prefix+"-flight", "alice@example.com", "test.counter.increment",
+		"digest-flight", "grant_a", "MUTATION", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execID3 := acq3.Record.ExecutionID
+	if err := store.BeginExecution(ctx, execID3, acq3.LeaseToken, acq3.Generation); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkInFlight(ctx, execID3, acq3.LeaseToken, acq3.Generation, "p", nil); err != nil {
+		t.Fatal(err)
+	}
+	err = store.AbandonPreDispatch(ctx, execID3, acq3.LeaseToken, acq3.Generation)
+	if !errors.Is(err, LeaseStateConflict) {
+		t.Errorf("IN_FLIGHT abandon must be STATE_CONFLICT, got %v", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "dispatch boundary") {
+		t.Errorf("IN_FLIGHT abandon should mention the dispatch boundary, got %v", err)
+	}
+}
+
+// TestLiveMarkInFlightRedactorRunsBeforeDenylist verifies the locator
+// pipeline order: the redactor rewrites first and the denylist scans
+// the FINAL persisted representation. A redactor that strips a
+// credential-shaped field must make an otherwise-rejected locator
+// persistable; a redactor that introduces one must still be rejected.
+func TestLiveMarkInFlightRedactorRunsBeforeDenylist(t *testing.T) {
+	dbURL := os.Getenv("CRABBOX_TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live PostgreSQL test")
+	}
+	db, err := openTestDB(dbURL)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+	store, err := NewStore(db)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	ctx := context.Background()
+
+	prefix := fmt.Sprintf("test-redorder-%d", time.Now().UnixNano())
+	defer db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key LIKE $1`, prefix+"%")
+
+	acquire := func(suffix string) (string, string, int) {
+		t.Helper()
+		acq, err := store.Acquire(ctx, prefix+suffix, "alice@example.com", "test.counter.increment",
+			"digest-"+suffix, "grant_r", "MUTATION", time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !acq.Acquired() {
+			t.Fatalf("expected lease acquired, got %s", acq.Kind)
+		}
+		execID := acq.Record.ExecutionID
+		if err := store.BeginExecution(ctx, execID, acq.LeaseToken, acq.Generation); err != nil {
+			t.Fatal(err)
+		}
+		return execID, acq.LeaseToken, acq.Generation
+	}
+
+	// A redactor that strips credential-shaped fields makes the
+	// locator persistable — under the old order (denylist before
+	// redactor) this was rejected before the hook ever ran.
+	stripSecrets := func(loc json.RawMessage) (json.RawMessage, error) {
+		var m map[string]any
+		if err := json.Unmarshal(loc, &m); err != nil {
+			return nil, err
+		}
+		delete(m, "client_secret")
+		return json.Marshal(m)
+	}
+	store.SetLocatorRedactor(stripSecrets)
+
+	execID, token, gen := acquire("-strip")
+	if err := store.MarkInFlight(ctx, execID, token, gen, "p",
+		json.RawMessage(`{"v":1,"provider_id":"p","strategy":"metadata","client_secret":"abc"}`)); err != nil {
+		t.Fatalf("redactor-cleaned locator must persist, got %v", err)
+	}
+	rec, _ := store.Lookup(ctx, execID)
+	if strings.Contains(string(rec.RecoveryLocator), "client_secret") {
+		t.Errorf("persisted locator still contains client_secret: %s", rec.RecoveryLocator)
+	}
+
+	// A redactor that INTRODUCES a denied field must still be caught —
+	// the denylist scans the final persisted representation.
+	injectSecret := func(loc json.RawMessage) (json.RawMessage, error) {
+		var m map[string]any
+		if err := json.Unmarshal(loc, &m); err != nil {
+			return nil, err
+		}
+		m["api_key"] = "smuggled"
+		return json.Marshal(m)
+	}
+	store.SetLocatorRedactor(injectSecret)
+
+	execID2, token2, gen2 := acquire("-inject")
+	if err := store.MarkInFlight(ctx, execID2, token2, gen2, "p",
+		json.RawMessage(`{"v":1,"provider_id":"p","strategy":"metadata"}`)); !errors.Is(err, LocatorContainsSecret) {
+		t.Errorf("redactor-injected denied field must be rejected, got %v", err)
+	}
+	rec2, _ := store.Lookup(ctx, execID2)
+	if rec2.State != StateExecuting {
+		t.Errorf("rejected MarkInFlight must leave record EXECUTING, got %s", rec2.State)
 	}
 }
 

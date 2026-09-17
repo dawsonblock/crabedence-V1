@@ -26,6 +26,16 @@ const (
 	DispatchPost DispatchState = "POST_DISPATCH"
 )
 
+// postDispatchPersistBudget bounds the mandatory post-dispatch
+// durability path — provider observation, recovery entry, and terminal
+// finalization. It runs on a context detached from the caller's
+// cancellation so that a client disconnect or service shutdown cannot
+// lose the provider's already-returned answer. Without this, root
+// context cancellation at teardown could fail RecordProviderObservation
+// and EnterRecoveryWithObservation, stranding the record IN_FLIGHT
+// until lease recovery with its provider metadata lost.
+const postDispatchPersistBudget = 5 * time.Second
+
 // DispatchExecutor wraps a Handler with dispatch-point tracking and
 // durable idempotency. It ensures:
 //   - Pre-dispatch failures return FAILED (safe)
@@ -294,6 +304,14 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	}
 	resp, provableNoEffect := e.dispatch(dispatchCtx, req, desc)
 
+	// The provider has answered. Everything from here until the terminal
+	// write is mandatory persistence — it must survive caller
+	// cancellation and service shutdown, so it runs on a bounded context
+	// detached from ctx's cancellation (values are preserved).
+	durabilityCtx, durabilityCancel := context.WithTimeout(
+		context.WithoutCancel(ctx), postDispatchPersistBudget)
+	defer durabilityCancel()
+
 	// ─── DURABLE PROVIDER OBSERVATION ────────────────────────────────────
 	// Persist the provider's response metadata BEFORE any terminal
 	// decision. If the record races into UNKNOWN (lease expiry claimed
@@ -350,7 +368,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	if e.postDispatchHook != nil {
 		e.postDispatchHook()
 	}
-	obsErr := e.recordObservation(ctx, executionID, leaseToken, leaseGen, providerResp, desc)
+	obsErr := e.recordObservation(durabilityCtx, executionID, leaseToken, leaseGen, providerResp, desc)
 
 	// The heartbeat stays alive through finalization — the lease must
 	// remain valid while we validate evidence, construct the receipt,
@@ -381,7 +399,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		// Post-dispatch uncertainty — enter recovery carrying the
 		// ORIGINAL provider observation (already persisted above; the
 		// atomic transition also writes it). Do not finalize.
-		recErr := e.enterRecoveryWithObservation(ctx, executionID, providerResp, desc)
+		recErr := e.enterRecoveryWithObservation(durabilityCtx, executionID, providerResp, desc)
 		errMsg := "post-dispatch ambiguity: entered recovery (side effect may have occurred)"
 		if recErr != nil {
 			errMsg = fmt.Sprintf("post-dispatch ambiguity: %v", recErr)
@@ -493,7 +511,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		if signErr != nil {
 			// Cannot produce the required proof — treat as post-dispatch
 			// uncertainty, not a terminal outcome.
-			recErr := e.enterRecoveryWithObservation(ctx, executionID, providerResp, desc)
+			recErr := e.enterRecoveryWithObservation(durabilityCtx, executionID, providerResp, desc)
 			errMsg := fmt.Sprintf("failed to sign CRITICAL evidence receipt: %v", signErr)
 			if recErr != nil {
 				errMsg += fmt.Sprintf("; %v", recErr)
@@ -512,7 +530,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	}
 
 	// Look up the lease generation for the fenced finalize.
-	rec, err := e.store.Lookup(ctx, executionID)
+	rec, err := e.store.Lookup(durabilityCtx, executionID)
 	if err != nil {
 		return Response{
 			Status:      StatusUnknown,
@@ -528,13 +546,13 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	if e.preFinalizeHook != nil {
 		e.preFinalizeHook()
 	}
-	if err := e.store.Finalize(ctx, executionID, leaseToken, rec.LeaseGeneration, idempotency.StateInFlight, receipt); err != nil {
+	if err := e.store.Finalize(durabilityCtx, executionID, leaseToken, rec.LeaseGeneration, idempotency.StateInFlight, receipt); err != nil {
 		// Finalization failed AFTER dispatch — the side effect may
 		// have occurred. The provider observation was already persisted
 		// durably right after the provider returned; the recovery
 		// transition below also writes it atomically. Report persistence
 		// honestly — never claim the observation was stored if it wasn't.
-		recErr := e.enterRecoveryWithObservation(ctx, executionID, providerResp, desc)
+		recErr := e.enterRecoveryWithObservation(durabilityCtx, executionID, providerResp, desc)
 		errMsg := fmt.Sprintf("failed to finalize execution after dispatch: %v", err)
 		if recErr == nil {
 			errMsg += " (provider observation persisted)"
@@ -716,15 +734,14 @@ func buildObservation(resp Response, desc capability.ResolvedDescriptor) idempot
 }
 
 // recordObservation durably records the provider's response metadata
-// via Store.RecordProviderObservation. Returns nil when nothing needs
-// recording (empty observation) or when the write succeeds; returns the
-// store error otherwise so callers can report persistence honestly.
+// via Store.RecordProviderObservation. Every provider response is
+// persisted — including status-only responses with no run ID, result,
+// or evidence — because provider_id/provider_status are themselves
+// observation data and provider_observed_at marks that the provider
+// answered at all. Returns the store error so callers can report
+// persistence honestly.
 func (e *DispatchExecutor) recordObservation(ctx context.Context, executionID, leaseToken string, leaseGen int, resp Response, desc capability.ResolvedDescriptor) error {
-	obs := buildObservation(resp, desc)
-	if obs.ProviderRunID == "" && obs.EvidenceDigest == "" && len(obs.Result) == 0 {
-		return nil // nothing worth persisting
-	}
-	return e.store.RecordProviderObservation(ctx, executionID, leaseToken, leaseGen, obs)
+	return e.store.RecordProviderObservation(ctx, executionID, leaseToken, leaseGen, buildObservation(resp, desc))
 }
 
 // enterRecoveryWithObservation transitions the record to UNKNOWN while

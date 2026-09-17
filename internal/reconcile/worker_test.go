@@ -780,3 +780,91 @@ func TestLiveBatchClaimHeartbeatProtectsQueuedRecords(t *testing.T) {
 		}
 	}
 }
+
+// claimRecord claims a single UNKNOWN record for the given worker and
+// returns the claimed record (carrying the post-claim version that
+// reconcileOne's claim revalidation requires).
+func claimRecord(t *testing.T, store *idempotency.Store, ctx context.Context, workerID, execID string) *idempotency.Record {
+	t.Helper()
+	claimed, err := store.ClaimUnknownBatch(ctx, workerID, 50, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range claimed {
+		if r.ExecutionID == execID {
+			return r
+		}
+	}
+	t.Fatalf("record %s was not claimed by %s", execID, workerID)
+	return nil
+}
+
+// TestLiveReconcileSkipsResolverOnStaleClaim verifies that a worker
+// which lost its claim before reaching a queued record never invokes
+// the resolver: reconcileOne synchronously revalidates the claim, and
+// the version CAS fails because the reclaiming worker bumped it.
+// Without this check a stale worker could spend a provider lookup on a
+// record another worker owns, so maxAttempts would no longer bound the
+// number of provider resolution calls.
+func TestLiveReconcileSkipsResolverOnStaleClaim(t *testing.T) {
+	dbURL := os.Getenv("CRABBOX_TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live PostgreSQL test")
+	}
+	db, err := openTestDB(dbURL)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+	store, err := idempotency.NewStore(db)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	ctx := context.Background()
+
+	key := fmt.Sprintf("test-stale-claim-%d", time.Now().UnixNano())
+	execID := makeUnknownRecord(t, db, store, ctx, key, "test.counter.increment", "MUTATION")
+	defer db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key = $1`, key)
+
+	resolver := &countingResolver{result: idempotency.RecoveryResult{Decision: idempotency.RecoveryUnknown}}
+	w := NewWorker(store, resolver, 0)
+	w.SetWorkerID("worker-stale")
+	w.SetClaimDuration(200 * time.Millisecond)
+
+	// Worker A claims the record with a short TTL.
+	claimed, err := store.ClaimUnknownBatch(ctx, "worker-stale", 50, 200*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stale *idempotency.Record
+	for _, r := range claimed {
+		if r.ExecutionID == execID {
+			stale = r
+		}
+	}
+	if stale == nil {
+		t.Fatal("worker-stale did not claim the record")
+	}
+
+	// The claim expires and worker B reclaims (bumping version) — the
+	// situation a queued record is in when a slow batch member delayed
+	// reconcileOne past the claim TTL.
+	time.Sleep(300 * time.Millisecond)
+	recB := claimRecord(t, store, ctx, "worker-fresh", execID)
+
+	// Worker A's stale record must not reach the resolver.
+	if err := w.reconcileOne(ctx, stale); err == nil {
+		t.Error("reconcileOne on a stale claim must fail")
+	}
+	if resolver.calls != 0 {
+		t.Errorf("resolver invoked %d times on a stale claim, want 0", resolver.calls)
+	}
+
+	// Worker B's fresh claim resolves normally.
+	if err := w.reconcileOne(ctx, recB); err != nil {
+		t.Fatalf("reconcileOne on a valid claim failed: %v", err)
+	}
+	if resolver.calls != 1 {
+		t.Errorf("resolver invoked %d times on a valid claim, want 1", resolver.calls)
+	}
+}
