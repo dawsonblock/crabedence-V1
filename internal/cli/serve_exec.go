@@ -10,9 +10,12 @@ import (
 // serveExecCommand implements `crabbox serve-execution`: starts the
 // persistent Go execution service on a Unix socket.
 //
-// The database URL for durable idempotency is read from the
-// CRABEDENCE_DATABASE_URL environment variable. If unset,
-// MUTATION/CRITICAL operations fail closed (no unguarded mutations).
+// The durable store backend is selected by CRABEDENCE_STORE_BACKEND
+// (sqlite|postgres|none|auto; default auto). SQLite — the default
+// local backend — stores at CRABEDENCE_STORE_PATH (or the platform
+// config dir). PostgreSQL uses CRABEDENCE_DATABASE_URL. With no store
+// configured, MUTATION/CRITICAL operations fail closed (no unguarded
+// mutations).
 func (a App) serveExecCommand(ctx context.Context, socketPath string) error {
 	return execution.Serve(ctx, execution.ServeOptions{
 		SocketPath:        socketPath,

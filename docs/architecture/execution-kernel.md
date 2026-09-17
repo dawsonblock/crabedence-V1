@@ -149,7 +149,7 @@ orthogonal dimensions pinned in the capability descriptor:
 PURE     → NONE           → LOCAL      (no socket hop, no durability)
 READ     → STANDARD       → DIRECT     (admission, no durable kernel)
 READ     → HIGH_ASSURANCE → CRABEDENCE (authority-verified read)
-MUTATION → DURABLE        → CRABEDENCE (PostgreSQL idempotency, at-most-once dispatch per idempotency identity + reconciliation)
+MUTATION → DURABLE        → CRABEDENCE (durable idempotency: at-most-once dispatch per idempotency identity + reconciliation)
 CRITICAL → HIGH_ASSURANCE → CRABEDENCE (durable + V3 evidence + receipts)
 ```
 
@@ -166,7 +166,7 @@ CRABEDENCE-routed operations require the durable path.
 - Capability registry (authoritative execution classes, assurance profiles, execution routes — frozen at registration)
 - Argument schema validation
 - Authority verification (grant resolution via `authority_ref`)
-- Durable idempotency (PostgreSQL)
+- Durable idempotency (embedded SQLite by default; PostgreSQL for clustered deployments — one `EffectStore` contract, two engines)
 - Provider dispatch (server-controlled adapter policy)
 - Terminal outcome determination
 - Evidence generation (RunEvidenceV1)
@@ -191,6 +191,38 @@ The planner may discover `email.send(to, subject, body)` but cannot
 redefine its effect, assurance, route, authority, or adapter. Function
 Hooks routes from the trusted admitted catalog, not from the
 planner's view.
+
+## Storage Backends
+
+Crabedence's durable store is one contract (`EffectStore` in
+`internal/idempotency`) with two engines:
+
+- **SQLite (default)** — embedded, `journal_mode=WAL` +
+  `synchronous=FULL` + `foreign_keys=ON` + `busy_timeout=5000`.
+  Write transactions use `BEGIN IMMEDIATE`. One process or several
+  processes on a single host; no database daemon, sockets, or
+  administration. This is the right engine for a local agent kernel,
+  a Mac mini, or an appliance.
+- **PostgreSQL** — for multi-machine replicas, HA clusters, and
+  write-heavy distributed control planes. SQLite WAL is host-local by
+  design; it does not span machines.
+
+Backend selection at service startup (`CRABEDENCE_STORE_BACKEND`):
+
+- `sqlite` — `CRABEDENCE_STORE_PATH` sets the file (default
+  `~/.config/crabbox/crabedence.db`, platform config dir elsewhere).
+- `postgres` — requires `CRABEDENCE_DATABASE_URL`.
+- `none` — durable store disabled; MUTATION/CRITICAL fail closed.
+- `auto`/unset — postgres when `CRABEDENCE_DATABASE_URL` is set
+  (backward compatible), sqlite otherwise.
+
+The execution semantics are identical on both engines: explicit
+conditional UPDATE/CAS fencing (token + generation + state + version),
+integer lease generations, cryptographically random lease tokens,
+database-owned time, durable provider observations, and UNKNOWN →
+reconciliation. `store_conformance_test.go` runs the same contract
+checks against every engine so the SQLite implementation cannot drift
+into weaker semantics.
 
 ## What Crabedence Does NOT Own
 
