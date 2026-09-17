@@ -263,6 +263,17 @@ func (w *Worker) recoverCrashed(ctx context.Context, rec *idempotency.Record) er
 // with exponential backoff so another worker (or this one later)
 // can retry.
 func (w *Worker) reconcileOne(ctx context.Context, rec *idempotency.Record) error {
+	// Synchronously revalidate claim ownership before invoking the
+	// resolver. A record claimed earlier in this batch may have lost
+	// its claim while earlier records were processing (claim expiry,
+	// then reclaim by another worker). Claiming bumps version, so a
+	// stale claim fails this CAS — the resolver must not spend a
+	// provider lookup on a record this worker no longer owns, or the
+	// maxAttempts ceiling would not bound provider resolution calls.
+	if err := w.store.RenewReconcileClaim(ctx, rec.ExecutionID, rec.Version, w.claimDuration); err != nil {
+		return fmt.Errorf("reconcile claim lost before resolver invocation: %w", err)
+	}
+
 	// Resolver deadline: bounded at 4 claim TTLs — long enough for a
 	// legitimately slow resolver whose claim the heartbeat keeps
 	// renewing, short enough that a wedged resolver cannot hold the
@@ -400,6 +411,7 @@ func (w *Worker) claimHeartbeat(ctx context.Context, cancel context.CancelFunc, 
 			if err := w.store.RenewReconcileClaim(ctx, rec.ExecutionID, rec.Version, w.claimDuration); err != nil {
 				// Claim lost — the resolver's result can no longer be
 				// committed under our claim. Cancel the resolver context.
+				fmt.Printf("reconcile claim lost for %s during resolution: %v\n", rec.ExecutionID, err)
 				cancel()
 				return
 			}

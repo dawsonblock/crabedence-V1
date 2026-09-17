@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### RC10 — Effect Fabric Contract Closure
+
+- Execution: every provider response is now persisted via `RecordProviderObservation` before classification — the previous status-only skip dropped observations carrying only `provider_id`/`provider_status` (no run ID, result, or evidence), violating the durable-observation invariant.
+- Store: `Finalize` and `ResolveRecovery` enforce provider-identity monotonicity — a terminal receipt or recovery result may confirm or extend the stored `provider_id`/`provider_run_id` but can never contradict or erase it; contradictions return `PROVIDER_OBSERVATION_CONFLICT` instead of silently overwriting the observation.
+- Reconciliation: `reconcileOne` synchronously revalidates the reconcile claim (`RenewReconcileClaim`) before invoking the resolver — a worker that lost a queued claim while processing earlier batch members can no longer spend a provider lookup on a record it no longer owns, keeping `maxAttempts` an exact bound on resolver calls. Claim-loss during resolution is now logged.
+- NEMO: a CRITICAL `SUCCEEDED` outcome with missing/invalid evidence now maps to `UNKNOWN`, not `FAILED` — the provider claims the effect happened, so a definitive failure signal could let a planner retry an already-executed side effect.
+- Execution: post-dispatch persistence (observation, recovery entry, finalization) runs on a bounded 5s context detached from caller cancellation — service shutdown can no longer discard the provider's already-returned answer mid-persistence.
+- Execution: multi-replica deployments (`CRABBOX_REPLICAS` > 1) now require an explicitly configured, existing `CRABBOX_EVIDENCE_KEY` — replicas can no longer each auto-generate a divergent host-local signing identity. Single-replica auto-creation warns on stderr.
+- Store: `MarkInFlight` applies the locator redactor before the denied-key scan, which now runs on the final persisted representation — a redactor can strip credential-shaped fields it was installed to clean, and cannot smuggle them back in.
+- Store: `AbandonPreDispatch` failure classification uses a dedicated classifier — an EXECUTING record with a wrong token now reports `LEASE_TOKEN_MISMATCH` (not a misleading expected-PREPARED state error), and post-dispatch records report the crossed dispatch boundary.
+- Docs: `durable-execution-contract.md` bumped to Revision-9 — the normative state graph now includes `EXECUTING → PREPARED` (AbandonPreDispatch), and the resolver deadline is specified as a bounded multiple of claim TTL with pre-invocation claim revalidation and claim-loss cancellation, matching the implementation. `execution-kernel.md` and `AssuranceDurable` no longer claim "exactly-once" — the actual guarantee is at-most-once blind dispatch per idempotency identity plus reconciliation.
+- Tests: live coverage for status-only observation persistence, terminal-write provider-identity monotonicity (Finalize + ResolveRecovery), stale-claim resolver skipping, redactor/denylist ordering, and abandon classification.
+
 ### RC7 — Effect Fabric Durable Store Contracts
 
 - Execution: durable store contract replaced with lease-fenced, conflict-aware lifecycle. New state vocabulary: PREPARED, EXECUTING, IN_FLIGHT, UNKNOWN, COMMITTED, FAILED, DENIED. PostgreSQL owns lease time via `clock_timestamp()`. Lease generation acts as a fencing epoch — stale workers cannot mutate state after takeover.

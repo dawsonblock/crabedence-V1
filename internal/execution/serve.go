@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -141,14 +142,30 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	//   CRABBOX_EVIDENCE_TRUSTED_SIGNERS — comma-separated additional
 	//     signer fingerprints the store trusts, for key rotation or
 	//     distinct signing identities across replicas.
+	//   CRABBOX_REPLICAS — declared replica count. When > 1 the service
+	//     refuses to start without an explicitly configured, existing
+	//     CRABBOX_EVIDENCE_KEY: auto-generating a host-local key per
+	//     replica would give each replica a distinct cluster identity
+	//     and produce evidence receipts its peers cannot verify.
 	var signer *evidence.Signer
 	if store != nil {
 		keyPath := os.Getenv("CRABBOX_EVIDENCE_KEY")
+		if replicatedDeployment() {
+			if keyPath == "" {
+				return fmt.Errorf("multi-replica deployment (CRABBOX_REPLICAS=%s) requires CRABBOX_EVIDENCE_KEY pointing to a provisioned key shared across replicas", os.Getenv("CRABBOX_REPLICAS"))
+			}
+			if _, err := os.Stat(keyPath); err != nil {
+				return fmt.Errorf("multi-replica deployment requires an existing evidence key at CRABBOX_EVIDENCE_KEY=%s (key auto-creation is disabled for replicas): %w", keyPath, err)
+			}
+		}
 		if keyPath == "" {
 			var err error
 			keyPath, err = evidenceKeyPath()
 			if err != nil {
 				return fmt.Errorf("failed to resolve evidence key path: %w", err)
+			}
+			if _, statErr := os.Stat(keyPath); os.IsNotExist(statErr) {
+				fmt.Fprintf(os.Stderr, "evidence signer: no key at %s — generating a host-local signing identity; for multi-replica deployments set CRABBOX_EVIDENCE_KEY to a provisioned shared key\n", keyPath)
 			}
 		}
 		var err error
@@ -264,6 +281,15 @@ func NewFailClosedHandler(inner Handler) *FailClosedHandler {
 // durationSeconds converts an int64 to a time.Duration.
 func durationSeconds(s int64) time.Duration {
 	return time.Duration(s) * time.Second
+}
+
+// replicatedDeployment reports whether the operator declared a
+// multi-replica topology via CRABBOX_REPLICAS > 1. Replicated mode
+// tightens evidence-key requirements — a cryptographic cluster
+// identity must never be accidentally host-local.
+func replicatedDeployment() bool {
+	n, err := strconv.Atoi(strings.TrimSpace(os.Getenv("CRABBOX_REPLICAS")))
+	return err == nil && n > 1
 }
 
 // evidenceKeyPath returns the shared attest key location

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -177,11 +178,14 @@ func TestLiveWorkerReconciliation(t *testing.T) {
 	}
 
 	w := NewWorker(store, NoopResolver{}, 0)
+	w.SetWorkerID("worker-reconcile")
 	w.RegisterResolver("test.counter.increment", proofResolver)
 
-	// Run one reconciliation cycle.
-	rec2, _ := store.Lookup(ctx, execID)
-	w.reconcileOne(ctx, rec2)
+	// Run one reconciliation cycle on a claimed record.
+	rec2 := claimRecord(t, store, ctx, "worker-reconcile", execID)
+	if err := w.reconcileOne(ctx, rec2); err != nil {
+		t.Fatalf("reconcileOne failed: %v", err)
+	}
 
 	// Verify the record is now COMMITTED.
 	rec, _ = store.Lookup(ctx, execID)
@@ -246,9 +250,11 @@ func TestLiveWorkerDeadLettersAfterAttemptCeiling(t *testing.T) {
 	}
 
 	w := NewWorker(store, NoopResolver{}, 0)
-	w.SetMaxAttempts(5) // effectiveAttempt (10-1) already exceeds the ceiling
+	w.SetWorkerID("worker-deadletter")
+	w.SetMaxAttempts(5) // effectiveAttempt already exceeds the ceiling
 
-	rec, _ = store.Lookup(ctx, execID)
+	// reconcileOne requires an active claim — claim the record first.
+	rec = claimRecord(t, store, ctx, "worker-deadletter", execID)
 	if err := w.reconcileOne(ctx, rec); err != nil {
 		t.Fatalf("dead-letter release should not error, got %v", err)
 	}
@@ -324,9 +330,12 @@ func TestLiveWorkerReconcileCriticalFailedWithoutProof(t *testing.T) {
 	}
 
 	w := NewWorker(store, NoopResolver{}, 0)
+	w.SetWorkerID("worker-crit")
 	w.RegisterResolver("test.critical.deploy", badResolver)
-	rec2, _ := store.Lookup(ctx, execID)
-	w.reconcileOne(ctx, rec2)
+	rec2 := claimRecord(t, store, ctx, "worker-crit", execID)
+	// The CRITICAL FAILED claim is rejected — reconcileOne releases the
+	// claim with an error, which this test intentionally ignores.
+	_ = w.reconcileOne(ctx, rec2)
 
 	// The record must remain UNKNOWN — the CRITICAL FAILED claim was rejected.
 	rec, _ = store.Lookup(ctx, execID)
@@ -546,4 +555,104 @@ func TestLiveClaimExpiryRecovery(t *testing.T) {
 // schema so parallel package test binaries cannot interfere.
 func openTestDB(dbURL string) (*sql.DB, error) {
 	return testutil.OpenLiveDB(dbURL, "crabbox_test_reconcile")
+}
+
+// claimRecord claims a single UNKNOWN record for the given worker and
+// returns the claimed record (carrying the post-claim version that
+// reconcileOne's claim revalidation requires).
+func claimRecord(t *testing.T, store *idempotency.Store, ctx context.Context, workerID, execID string) *idempotency.Record {
+	t.Helper()
+	claimed, err := store.ClaimUnknownBatch(ctx, workerID, 50, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range claimed {
+		if r.ExecutionID == execID {
+			return r
+		}
+	}
+	t.Fatalf("record %s was not claimed by %s", execID, workerID)
+	return nil
+}
+
+// countingResolver counts resolver invocations — used to prove the
+// resolver is never called on a record whose claim was lost.
+type countingResolver struct {
+	calls  int32
+	result idempotency.RecoveryResult
+}
+
+func (c *countingResolver) Resolve(_ context.Context, _ *idempotency.Record) (idempotency.RecoveryResult, error) {
+	atomic.AddInt32(&c.calls, 1)
+	return c.result, nil
+}
+
+// TestLiveReconcileSkipsResolverOnStaleClaim verifies that a worker
+// which lost its claim before reaching a queued record never invokes
+// the resolver: reconcileOne synchronously revalidates the claim, and
+// the version CAS fails because the reclaiming worker bumped it.
+// Without this check a stale worker could spend a provider lookup on a
+// record another worker owns, so maxAttempts would no longer bound the
+// number of provider resolution calls.
+func TestLiveReconcileSkipsResolverOnStaleClaim(t *testing.T) {
+	dbURL := os.Getenv("CRABBOX_TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live PostgreSQL test")
+	}
+	db, err := openTestDB(dbURL)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+	store, err := idempotency.NewStore(db)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	ctx := context.Background()
+
+	key := fmt.Sprintf("test-stale-claim-%d", time.Now().UnixNano())
+	execID := makeUnknownRecord(t, db, store, ctx, key, "test.counter.increment", "MUTATION")
+	defer db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key = $1`, key)
+
+	resolver := &countingResolver{result: idempotency.RecoveryResult{Decision: idempotency.RecoveryUnknown}}
+	w := NewWorker(store, resolver, 0)
+	w.SetWorkerID("worker-stale")
+	w.SetClaimDuration(200 * time.Millisecond)
+
+	// Worker A claims the record with a short TTL.
+	claimed, err := store.ClaimUnknownBatch(ctx, "worker-stale", 50, 200*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stale *idempotency.Record
+	for _, r := range claimed {
+		if r.ExecutionID == execID {
+			stale = r
+		}
+	}
+	if stale == nil {
+		t.Fatal("worker-stale did not claim the record")
+	}
+
+	// The claim expires and worker B reclaims (bumping version) — the
+	// situation a queued record is in when a slow batch member delayed
+	// reconcileOne past the claim TTL.
+	time.Sleep(300 * time.Millisecond)
+	recB := claimRecord(t, store, ctx, "worker-fresh", execID)
+
+	// Worker A's stale record must not reach the resolver.
+	if err := w.reconcileOne(ctx, stale); err == nil {
+		t.Error("reconcileOne on a stale claim must fail")
+	}
+	if got := atomic.LoadInt32(&resolver.calls); got != 0 {
+		t.Errorf("resolver invoked %d times on a stale claim, want 0", got)
+	}
+
+	// Worker B's fresh claim resolves normally.
+	if err := w.reconcileOne(ctx, recB); err != nil {
+		t.Fatalf("reconcileOne on a valid claim failed: %v", err)
+	}
+	if got := atomic.LoadInt32(&resolver.calls); got != 1 {
+		t.Errorf("resolver invoked %d times on a valid claim, want 1", got)
+	}
 }
