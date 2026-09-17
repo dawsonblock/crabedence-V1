@@ -24,7 +24,7 @@ import (
 // ServeOptions configures the execution service.
 type ServeOptions struct {
 	SocketPath        string
-	DatabaseURL       string // PostgreSQL connection string for durable idempotency
+	DatabaseURL       string // PostgreSQL DSN — used when the postgres store backend is selected (see CRABEDENCE_STORE_BACKEND)
 	ReconcileInterval int64  // Reconciliation interval in seconds (0 = disable)
 }
 
@@ -106,10 +106,38 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	counterHandler := NewCounterHandler()
 	infoHandler := NewSystemInfoHandler()
 
-	// Connect to PostgreSQL for durable idempotency and authority
-	var store *idempotency.Store
-	var authorityStore *authority.Store
-	if opts.DatabaseURL != "" {
+	// Durable store backend. Both engines implement the same
+	// idempotency.EffectStore contract — same state graph, fencing,
+	// monotonic observations, and terminal proof policy.
+	//
+	//   CRABEDENCE_STORE_BACKEND — "sqlite" (default for local/
+	//     single-host deployments), "postgres" (clustered/multi-host),
+	//     "none" (durable store explicitly disabled — MUTATION/CRITICAL
+	//     fail closed), or "auto"/unset (postgres when
+	//     CRABEDENCE_DATABASE_URL is configured, sqlite otherwise).
+	//   CRABEDENCE_STORE_PATH — SQLite file location.
+	//     Default: ~/.config/crabbox/crabedence.db
+	//   CRABEDENCE_DATABASE_URL — PostgreSQL DSN (postgres backend).
+	backend := strings.ToLower(strings.TrimSpace(os.Getenv("CRABEDENCE_STORE_BACKEND")))
+	switch backend {
+	case "", "auto":
+		if opts.DatabaseURL != "" {
+			backend = "postgres"
+		} else {
+			backend = "sqlite"
+		}
+	case "sqlite", "postgres", "none":
+	default:
+		return fmt.Errorf("unknown CRABEDENCE_STORE_BACKEND %q (want sqlite, postgres, none, or auto)", backend)
+	}
+
+	var store idempotency.EffectStore
+	var authorityStore capability.GrantResolver
+	switch backend {
+	case "postgres":
+		if opts.DatabaseURL == "" {
+			return fmt.Errorf("CRABEDENCE_STORE_BACKEND=postgres requires CRABEDENCE_DATABASE_URL")
+		}
 		db, err := sql.Open("pgx", opts.DatabaseURL)
 		if err != nil {
 			return fmt.Errorf("failed to open database: %w", err)
@@ -126,6 +154,37 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 		}
 
 		authorityStore, err = authority.NewStore(db)
+		if err != nil {
+			return fmt.Errorf("failed to create authority store: %w", err)
+		}
+	case "sqlite":
+		path := os.Getenv("CRABEDENCE_STORE_PATH")
+		if path == "" {
+			base, err := os.UserConfigDir()
+			if err != nil {
+				return fmt.Errorf("failed to resolve config dir for embedded store: %w", err)
+			}
+			path = filepath.Join(base, "crabbox", "crabedence.db")
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			return fmt.Errorf("failed to create store directory: %w", err)
+		}
+		db, err := idempotency.OpenSQLiteDB(path)
+		if err != nil {
+			return fmt.Errorf("failed to open embedded store %s: %w", path, err)
+		}
+		defer db.Close()
+
+		if err := db.PingContext(ctx); err != nil {
+			return fmt.Errorf("failed to connect to embedded store: %w", err)
+		}
+
+		store, err = idempotency.NewSQLiteStore(db)
+		if err != nil {
+			return fmt.Errorf("failed to create idempotency store: %w", err)
+		}
+
+		authorityStore, err = authority.NewSQLiteStore(db)
 		if err != nil {
 			return fmt.Errorf("failed to create authority store: %w", err)
 		}
@@ -249,7 +308,7 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	fmt.Fprintf(os.Stderr, "Crabedence execution service listening on %s\n", opts.SocketPath)
 	fmt.Fprintf(os.Stderr, "Registered capabilities: %v\n", registry.List())
 	if store != nil {
-		fmt.Fprintf(os.Stderr, "Durable idempotency: enabled (PostgreSQL)\n")
+		fmt.Fprintf(os.Stderr, "Durable idempotency: enabled (%s)\n", backend)
 	} else {
 		fmt.Fprintf(os.Stderr, "Durable idempotency: disabled (MUTATION/CRITICAL will fail closed)\n")
 	}

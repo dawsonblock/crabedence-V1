@@ -47,7 +47,7 @@ const postDispatchPersistBudget = 5 * time.Second
 //   - Only the reservation owner (lease holder) may dispatch
 type DispatchExecutor struct {
 	handler  Handler
-	store    *idempotency.Store
+	store    idempotency.EffectStore
 	signer   *evidence.Signer
 	mu       sync.Mutex
 	inFlight map[string]context.CancelFunc
@@ -62,7 +62,7 @@ type DispatchExecutor struct {
 }
 
 // NewDispatchExecutor creates a new dispatch executor with durable idempotency.
-func NewDispatchExecutor(handler Handler, store *idempotency.Store) *DispatchExecutor {
+func NewDispatchExecutor(handler Handler, store idempotency.EffectStore) *DispatchExecutor {
 	return &DispatchExecutor{
 		handler:  handler,
 		store:    store,

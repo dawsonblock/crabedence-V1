@@ -57,8 +57,10 @@ type EvidenceVerifier interface {
 // V3 Ed25519-signed effect receipt from a trusted signer, bound to the
 // record's execution/request identity, the receipt's provider identity
 // and evidence digest, and the required outcome for the target state.
+// It carries the trusted signer set directly so both storage engines
+// (PostgreSQL Store, embedded SQLiteStore) share one verifier.
 type signedReceiptVerifier struct {
-	store *Store
+	trustedSigners map[string]bool
 }
 
 func (v signedReceiptVerifier) Verify(_ context.Context, record *Record, receipt TerminalReceipt, target State) (*VerifiedEvidence, error) {
@@ -92,7 +94,7 @@ func (v signedReceiptVerifier) Verify(_ context.Context, record *Record, receipt
 		ProviderRunID:  receipt.ProviderRunID,
 		Outcome:        outcome,
 		EvidenceSHA256: receipt.EvidenceDigest,
-	}, v.store.trustedSigners); err != nil {
+	}, v.trustedSigners); err != nil {
 		return nil, err
 	}
 	return &VerifiedEvidence{

@@ -111,7 +111,7 @@ func (s *Store) evidenceVerifier() EvidenceVerifier {
 	if s.verifier != nil {
 		return s.verifier
 	}
-	return signedReceiptVerifier{store: s}
+	return signedReceiptVerifier{trustedSigners: s.trustedSigners}
 }
 
 // SetEvidenceVerifier installs a custom EvidenceVerifier for CRITICAL

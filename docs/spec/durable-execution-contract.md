@@ -5,6 +5,28 @@ execution store. All code in `internal/idempotency` and
 `internal/reconcile` must satisfy these rules. Changes to this
 document require the same review as changes to the store itself.
 
+## Storage engines
+
+The contract is storage-engine-agnostic. Two implementations satisfy
+it: `Store` (PostgreSQL, for multi-host/clustered deployments) and
+`SQLiteStore` (embedded, the default for local and single-host
+deployments). Both implement `EffectStore`, and the shared conformance
+suite (`store_conformance_test.go`) runs the same invariant checks
+against every engine — an engine-specific regression is a contract
+violation regardless of which backend exhibits it.
+
+Engine requirements:
+
+- Database-owned time for all lease/claim arithmetic (no application
+  clocks in expiry decisions).
+- Atomic conditional UPDATE/CAS fencing (token + generation + state +
+  version predicates inside the mutation).
+- Atomic multi-row claims (row locking via `FOR UPDATE SKIP LOCKED`,
+  or equivalent single-writer serialization).
+- Crash durability for committed writes (PostgreSQL `fsync`; SQLite
+  requires `journal_mode=WAL` + `synchronous=FULL` — `NORMAL` can lose
+  a committed transaction after power loss and is not permitted).
+
 ## 0. Revision-9 normative invariants
 
 The following are requirements, not commentary. Any implementation
@@ -84,7 +106,9 @@ that violates one is defective, regardless of test results.
 
 7.  **Database time is authoritative.** Lease timestamps, lease
     expiry, reconcile claim expiry, and reconcile backoff are computed
-    by PostgreSQL (`clock_timestamp()`), never by application clocks.
+    by the store's database (`clock_timestamp()` on PostgreSQL,
+    `unixepoch('subsec')` on the embedded SQLite engine), never by
+    application clocks.
 
 8.  **Recovery locators are provider-specific and minimal.** When a
     provider implements `RecoveryLocatorProvider`, the persisted
@@ -174,7 +198,9 @@ IN_FLIGHT
           ▼
       UNKNOWN
           │
-      ClaimUnknownBatch (FOR UPDATE SKIP LOCKED)
+      ClaimUnknownBatch (atomic claim: FOR UPDATE SKIP LOCKED on
+        PostgreSQL; single-statement UPDATE...RETURNING under SQLite's
+        single-writer serialization)
           │
           ▼
       ResolveRecovery
@@ -182,7 +208,7 @@ IN_FLIGHT
           ├── FAILED (claim fields cleared)
           └── UNKNOWN → ReleaseReconcileClaim (backoff)
 
-      Expired leases → ClaimExpiredBatch (FOR UPDATE SKIP LOCKED)
+      Expired leases → ClaimExpiredBatch (atomic claim, as above)
           │
           ├── PREPARED/EXECUTING → RecoverExpiredPreDispatch
           │    (normalize once to lease-less PREPARED)
@@ -214,13 +240,15 @@ durably-final (reconciliation may still resolve it).
 
 ## 3. Lease ownership invariants
 
-1.  **Lease time belongs to the store.** PostgreSQL computes
-    `lease_started_at` and `lease_expires_at` using `clock_timestamp()`.
+1.  **Lease time belongs to the store.** The database computes
+    `lease_started_at` and `lease_expires_at` (`clock_timestamp()` on
+    PostgreSQL; `unixepoch('subsec')` unix-milliseconds on SQLite).
     Callers may request a duration but never set timestamps directly.
 
 2.  **Expired leases cannot renew, transition, or finalize.** Every
-    authority-bearing mutation checks `lease_expires_at > clock_timestamp()`
-    inside the SQL statement. Expiry is not checked in Go alone.
+    authority-bearing mutation checks `lease_expires_at > now` inside
+    the SQL statement using database time. Expiry is not checked in
+    Go alone.
 
 3.  **Only the active lease token can mutate execution state.** Every
     transition, finalization, and renewal requires the current
@@ -415,13 +443,15 @@ It must never overwrite a state that changed after it was read.
 Multiple service replicas may run reconciliation workers concurrently.
 
 **UNKNOWN resolution**: `ClaimUnknownBatch` claims a batch of UNKNOWN
-records using `FOR UPDATE SKIP LOCKED`, setting `reconcile_owner` and
-`reconcile_lease_expires_at`. Each record is processed by exactly one
-worker per claim window.
+records atomically — `FOR UPDATE SKIP LOCKED` on PostgreSQL, or a
+single `UPDATE ... WHERE id IN (SELECT ... LIMIT n) RETURNING`
+statement under SQLite's single-writer serialization — setting
+`reconcile_owner` and `reconcile_lease_expires_at`. Each record is
+processed by exactly one worker per claim window.
 
 **Expired-lease crash recovery**: `ClaimExpiredBatch` claims a batch
-of PREPARED/EXECUTING/IN_FLIGHT records with expired leases using
-`FOR UPDATE SKIP LOCKED`. The caller inspects each record's state:
+of PREPARED/EXECUTING/IN_FLIGHT records with expired leases using the
+same atomic-claim mechanism. The caller inspects each record's state:
 IN_FLIGHT records enter recovery (`UNKNOWN`); expired
 PREPARED/EXECUTING records are normalized once to lease-less
 `PREPARED` via `RecoverExpiredPreDispatch` — the claim, lease, and
@@ -434,13 +464,12 @@ Claimable records must satisfy:
   `state IN ('PREPARED','EXECUTING','IN_FLIGHT')` with expired lease
   (for ClaimExpiredBatch)
 - No active reconcile claim (`reconcile_owner IS NULL` or
-  `reconcile_lease_expires_at < clock_timestamp()`)
-- Not waiting for backoff (`next_reconcile_at IS NULL` or
-  `next_reconcile_at <= clock_timestamp()`)
+  `reconcile_lease_expires_at` is in the past, by database time)
+- Not waiting for backoff (`next_reconcile_at IS NULL` or due)
 
 On successful resolution, `ResolveRecovery` clears all reconcile claim
 fields. On failure or continued UNKNOWN, `ReleaseReconcileClaim` sets
-`next_reconcile_at` using `clock_timestamp() + backoff` (DB-owned time)
+`next_reconcile_at` using database time + backoff (DB-owned time)
 and records `last_reconcile_error`. Backoff is exponential: 30s, 1m,
 2m, 4m, 8m, 16m, 30m cap — saturating, never overflowing.
 
@@ -452,9 +481,9 @@ record remains `UNKNOWN` for operator inspection; an unresolvable
 record MUST NOT be forced to a terminal state, but it also MUST NOT
 churn through the reconcile loop forever.
 
-`RenewReconcileClaim` extends an active claim using
-`GREATEST(current, clock_timestamp() + duration)` — renewal cannot
-shorten an existing claim. The reconciliation worker synchronously
+`RenewReconcileClaim` extends an active claim to
+`MAX(current, db_now + duration)` — renewal cannot shorten an existing
+claim. The reconciliation worker synchronously
 revalidates its claim before invoking a resolver (claims bump
 `version`, so a stale claim fails the CAS and the resolver is never
 invoked for a record the worker no longer owns), runs a claim

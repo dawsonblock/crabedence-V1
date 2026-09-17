@@ -30,12 +30,12 @@ import (
 // is propagated directly to ResolveRecovery, which requires evidence
 // for definitive conclusions.
 //
-// Work distribution: UNKNOWN records are claimed via ClaimUnknownBatch
-// (FOR UPDATE SKIP LOCKED), so multiple concurrent workers do not
-// process the same records. Failed or unresolved claims are released
-// with exponential backoff via ReleaseReconcileClaim.
+// Work distribution: UNKNOWN records are claimed via ClaimUnknownBatch,
+// so multiple concurrent workers do not process the same records.
+// Failed or unresolved claims are released with exponential backoff
+// via ReleaseReconcileClaim.
 type Worker struct {
-	store         *idempotency.Store
+	store         idempotency.EffectStore
 	resolvers     map[string]idempotency.RecoveryResolver // keyed by capability_id
 	default_      idempotency.RecoveryResolver
 	interval      time.Duration
@@ -60,7 +60,7 @@ type Worker struct {
 // NewWorker creates a reconciliation worker with a default resolver.
 // The default resolver is used when no capability-specific resolver
 // is registered.
-func NewWorker(store *idempotency.Store, defaultResolver idempotency.RecoveryResolver, interval time.Duration) *Worker {
+func NewWorker(store idempotency.EffectStore, defaultResolver idempotency.RecoveryResolver, interval time.Duration) *Worker {
 	return &Worker{
 		store:            store,
 		resolvers:        make(map[string]idempotency.RecoveryResolver),
