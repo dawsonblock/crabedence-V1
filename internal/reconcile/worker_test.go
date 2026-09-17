@@ -186,8 +186,9 @@ func TestLiveWorkerReconciliation(t *testing.T) {
 	w := NewWorker(store, NoopResolver{}, 0)
 	w.RegisterResolver("test.counter.increment", proofResolver)
 
-	// Run one reconciliation cycle.
-	rec2, _ := store.Lookup(ctx, execID)
+	// Run one reconciliation cycle — claim the record first, as the
+	// real loop does, so the pre-resolver claim revalidation passes.
+	rec2 := claimRecord(t, store, ctx, "worker-reconcile", execID)
 	w.reconcileOne(ctx, rec2)
 
 	// Verify the record is now COMMITTED.
@@ -335,7 +336,9 @@ func TestLiveWorkerReconcileCriticalFailedWithoutProof(t *testing.T) {
 
 	w := NewWorker(store, NoopResolver{}, 0)
 	w.RegisterResolver("test.critical.deploy", badResolver)
-	rec2, _ := store.Lookup(ctx, execID)
+	// Claim the record so the resolver is actually invoked — without a
+	// claim the pre-resolver revalidation would reject it vacuously.
+	rec2 := claimRecord(t, store, ctx, "worker-critical", execID)
 	w.reconcileOne(ctx, rec2)
 
 	// The record must remain UNKNOWN — the CRITICAL FAILED claim was rejected.
