@@ -131,3 +131,13 @@ editing; no finding was applied blindly.
 - `c147e35` — evidence-fabrication and reconciliation gaps (P2)
 - `c9a536c` — `scripts/test-live-postgres.sh` ephemeral live-test DB
 - `d439d57` — pre-dispatch, observation-monotonicity, claim-lifecycle (P3)
+- `0ff3538` — residual durable-contract gaps (spec Revision 9):
+  status-only provider observations persisted, `Finalize` provider
+  identity monotonicity, pre-resolver claim revalidation, NEMO
+  malformed-CRITICAL → UNKNOWN, bounded post-provider durability,
+  redactor-before-denylist, multi-replica evidence-key hardening
+- `380ebe3` — embedded SQLite durable store: shared `EffectStore`
+  interface, `SQLiteStore` (WAL + `synchronous=FULL` + `BEGIN
+  IMMEDIATE` + CAS fencing) as the default local backend, SQLite
+  authority store, `CRABEDENCE_STORE_BACKEND`/`CRABEDENCE_STORE_PATH`
+  selection, dual-engine conformance suite
