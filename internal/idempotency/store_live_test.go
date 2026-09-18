@@ -4021,3 +4021,100 @@ func TestLiveEnsureValidIndexScopedToActiveSchema(t *testing.T) {
 		t.Error("invalid index in the active schema was not repaired — another schema's same-named index masked it")
 	}
 }
+
+// TestLiveClusterRecoveryMode is the PostgreSQL leg of the
+// post-restore admission gate — same lifecycle as
+// TestSQLiteClusterRecoveryMode on the distributed engine: epoch
+// advance declares recovery, a restarted executor finds admission
+// closed while reconciliation stays open, and the epoch-guarded
+// completion reopens the world.
+func TestLiveClusterRecoveryMode(t *testing.T) {
+	dbURL := os.Getenv("CRABBOX_TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live PostgreSQL test")
+	}
+	db, err := openTestDB(dbURL)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	stale, err := NewStore(db)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	// Ensure the shared cluster_meta row is not mid-recovery from a
+	// prior test — a leftover gate would poison this test's setup.
+	if _, err := db.ExecContext(ctx,
+		`UPDATE cluster_meta SET recovery_required = FALSE WHERE id = 1`); err != nil {
+		t.Fatalf("reset recovery mode: %v", err)
+	}
+	base := stale.ClusterEpoch()
+
+	key := fmt.Sprintf("recovery-mode-%d", time.Now().UnixNano())
+	digest := confDigest("alice", "cap.recovery", `{"q":"x"}`)
+	pre, err := stale.Acquire(ctx, key, "alice", "cap.recovery", digest, "", "MUTATION", time.Minute)
+	if err != nil {
+		t.Fatalf("pre-restore acquire: %v", err)
+	}
+	if err := stale.BeginExecution(ctx, pre.Record.ExecutionID, pre.LeaseToken, pre.Generation); err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if err := stale.MarkInFlight(ctx, pre.Record.ExecutionID, pre.LeaseToken, pre.Generation, "prov", nil); err != nil {
+		t.Fatalf("mark in flight: %v", err)
+	}
+
+	next, err := stale.AdvanceClusterEpoch(ctx, base, "restore rehearsal")
+	if err != nil {
+		t.Fatalf("advance: %v", err)
+	}
+	t.Cleanup(func() {
+		// Never leave the shared test cluster in recovery mode.
+		db.ExecContext(context.Background(),
+			`UPDATE cluster_meta SET recovery_required = FALSE WHERE id = 1`)
+	})
+
+	// Restarted executor under the new epoch.
+	fresh, err := NewStore(db)
+	if err != nil {
+		t.Fatalf("fresh NewStore: %v", err)
+	}
+	if fresh.ClusterEpoch() != next {
+		t.Fatalf("fresh epoch = %d, want %d", fresh.ClusterEpoch(), next)
+	}
+	if required, err := fresh.ClusterRecoveryRequired(ctx); err != nil || !required {
+		t.Fatalf("post-advance recovery_required = %v, %v — want true", required, err)
+	}
+
+	// New-effect admission is closed with the typed error.
+	if _, err := fresh.Acquire(ctx, key+"-new", "alice", "cap.recovery", digest, "", "MUTATION", time.Minute); !errors.Is(err, ClusterRecoveryRequired) {
+		t.Fatalf("acquire during recovery: want ClusterRecoveryRequired, got %v", err)
+	}
+
+	// Reconciliation of inherited records stays open.
+	stored, err := fresh.Lookup(ctx, pre.Record.ExecutionID)
+	if err != nil {
+		t.Fatalf("lookup inherited record: %v", err)
+	}
+	if err := fresh.EnterRecovery(ctx, pre.Record.ExecutionID, StateInFlight, stored.Version); err != nil {
+		t.Fatalf("recovery-path mutation during recovery mode: %v", err)
+	}
+
+	// A stale-epoch operator cannot clear the mode.
+	if err := stale.CompleteClusterRecovery(ctx, base, "premature"); !errors.Is(err, ClusterEpochMismatch) {
+		t.Fatalf("stale complete: want ClusterEpochMismatch, got %v", err)
+	}
+
+	// Reconciliation gate met — admission reopens.
+	if err := fresh.CompleteClusterRecovery(ctx, next, "reconciliation complete"); err != nil {
+		t.Fatalf("complete recovery: %v", err)
+	}
+	acq, err := fresh.Acquire(ctx, key+"-post", "alice", "cap.recovery", confDigest("alice", "cap.recovery-post", `{"q":"x"}`), "", "MUTATION", time.Minute)
+	if err != nil {
+		t.Fatalf("post-recovery acquire: %v", err)
+	}
+	if !acq.Acquired() {
+		t.Fatalf("post-recovery acquire kind = %s", acq.Kind)
+	}
+}

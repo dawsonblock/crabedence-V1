@@ -128,6 +128,34 @@ admitted under the old epoch is permanently fenced afterward and must
 restart (a restarted executor admits under the new epoch). Epoch
 rejections are counted under `cluster_epoch_rejections_total`.
 
+**Recovery mode (implemented, schema v11):** an epoch advance also
+declares `RECOVERY_REQUIRED` — the cluster is a restored world whose
+inherited records must reconcile before new external effects may be
+admitted. While `cluster_meta.recovery_required` is set:
+
+- New-effect admission is closed: the acquire INSERT is fenced by the
+  same `cluster_meta` guard, and reclaiming an abandoned
+  `PREPARED`/`EXECUTING` record is likewise gated (reclaim IS
+  admission — it leads to a new external effect). Blocked attempts
+  return the typed `CLUSTER_RECOVERY_REQUIRED` error, counted under
+  `cluster_recovery_rejections_total` — never a lease-conflict
+  misclassification.
+- Reads, diagnostics, and reconciliation stay open: claims,
+  `EnterRecovery`, observations, and terminal resolutions on
+  inherited records proceed normally — they carry only the epoch
+  guard, not the admission gate.
+- `CompleteClusterRecovery(expected, resolution)` clears the mode
+  after the operator's reconciliation gate is met. The epoch guard
+  prevents clearing a mode declared by a newer restore — a stale
+  operator gets `CLUSTER_EPOCH_MISMATCH`, not a silent clear.
+
+The restore sequence is therefore: restore snapshot →
+`AdvanceClusterEpoch` → restart executors → reconcile inherited
+`IN_FLIGHT`/`UNKNOWN` records → `CompleteClusterRecovery` → normal
+admission resumes. Database rollback cannot roll back an external
+effect; this mode is what stops the restored world from blindly
+dispatching new ones first.
+
 ## 5. Threat model and controls
 
 | Threat | Control | Qualification |

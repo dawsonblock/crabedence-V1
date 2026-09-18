@@ -248,11 +248,15 @@ func (s *SQLiteStore) ClusterEpoch() int64 {
 }
 
 // AdvanceClusterEpoch is the embedded counterpart of
-// Store.AdvanceClusterEpoch — same CAS contract.
+// Store.AdvanceClusterEpoch — same CAS contract, and the same
+// post-restore recovery declaration: new-effect admission closes
+// until CompleteClusterRecovery.
 func (s *SQLiteStore) AdvanceClusterEpoch(ctx context.Context, expected int64, reason string) (int64, error) {
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE cluster_meta
-		SET epoch = epoch + 1, advanced_at = `+sqliteNow+`, advance_reason = ?2
+		SET epoch = epoch + 1, recovery_required = 1,
+		    recovery_completed_at = NULL, recovery_resolution = NULL,
+		    advanced_at = `+sqliteNow+`, advance_reason = ?2
 		WHERE id = 1 AND epoch = ?1`, expected, nullableString(reason))
 	if err != nil {
 		return 0, err
@@ -270,6 +274,63 @@ func (s *SQLiteStore) AdvanceClusterEpoch(ctx context.Context, expected int64, r
 		return 0, fmt.Errorf("%w: cluster epoch already at %d (expected %d)", ClusterEpochMismatch, cur, expected)
 	}
 	return expected + 1, nil
+}
+
+// ClusterRecoveryRequired is the embedded counterpart of
+// Store.ClusterRecoveryRequired.
+func (s *SQLiteStore) ClusterRecoveryRequired(ctx context.Context) (bool, error) {
+	var required int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT recovery_required FROM cluster_meta WHERE id = 1`).Scan(&required); err != nil {
+		return false, err
+	}
+	return required != 0, nil
+}
+
+// CompleteClusterRecovery is the embedded counterpart of
+// Store.CompleteClusterRecovery — same epoch-guarded clear.
+func (s *SQLiteStore) CompleteClusterRecovery(ctx context.Context, expected int64, resolution string) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE cluster_meta
+		SET recovery_required = 0,
+		    recovery_completed_at = `+sqliteNow+`,
+		    recovery_resolution = ?2
+		WHERE id = 1 AND epoch = ?1`, expected, nullableString(resolution))
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		var cur int64
+		if err := s.db.QueryRowContext(ctx,
+			`SELECT epoch FROM cluster_meta WHERE id = 1`).Scan(&cur); err != nil {
+			return err
+		}
+		return fmt.Errorf("%w: cluster epoch already at %d (expected %d) — cannot complete recovery for an older world",
+			ClusterEpochMismatch, cur, expected)
+	}
+	return nil
+}
+
+// checkRecoveryMode is the SQLite counterpart of
+// Store.checkRecoveryMode — recovery-blocked admission gets the
+// honest CLUSTER_RECOVERY_REQUIRED error, not a lease-conflict
+// misclassification.
+func (s *SQLiteStore) checkRecoveryMode(ctx context.Context) error {
+	var required int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT recovery_required FROM cluster_meta WHERE id = 1`).Scan(&required); err != nil {
+		return err
+	}
+	if required != 0 {
+		s.metrics.recoveryRejections.Add(1)
+		return fmt.Errorf("%w: cluster is in post-restore recovery mode — new-effect admission closed until CompleteClusterRecovery",
+			ClusterRecoveryRequired)
+	}
+	return nil
 }
 
 // epochGuardSQL is the SQLite counterpart of Store.epochGuardSQL.
@@ -322,6 +383,7 @@ var sqliteSchemaMigrations = []sqliteSchemaMigration{
 	{8, "forensic_record", sqliteMigrationForensic},
 	{9, "cluster_epoch_fencing", sqliteMigrationClusterEpoch},
 	{10, "result_byte_fidelity_already_text", nil},
+	{11, "cluster_recovery_mode", sqliteMigrationClusterRecoveryMode},
 }
 
 func (s *SQLiteStore) ensureSchema(ctx context.Context) error {
@@ -688,6 +750,45 @@ func sqliteMigrationClusterEpoch(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
+// sqliteMigrationClusterRecoveryMode adds the post-restore recovery
+// gate to cluster_meta — the embedded counterpart of
+// migrationClusterRecoveryMode.
+func sqliteMigrationClusterRecoveryMode(ctx context.Context, tx *sql.Tx) error {
+	existing := map[string]bool{}
+	rows, err := tx.QueryContext(ctx, `PRAGMA table_info(cluster_meta)`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		existing[name] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, col := range []struct{ name, ddl string }{
+		{"recovery_required", `ALTER TABLE cluster_meta ADD COLUMN recovery_required INTEGER NOT NULL DEFAULT 0`},
+		{"recovery_completed_at", `ALTER TABLE cluster_meta ADD COLUMN recovery_completed_at INTEGER`},
+		{"recovery_resolution", `ALTER TABLE cluster_meta ADD COLUMN recovery_resolution TEXT`},
+	} {
+		if existing[col.name] {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, col.ddl); err != nil {
+			return fmt.Errorf("column %s: %w", col.name, err)
+		}
+	}
+	return nil
+}
+
 // sqliteInsertEffectEvent mirrors insertEffectEvent for the embedded
 // backend: sequence is allocated with MAX+1 inside the mutation's
 // transaction (single-writer BEGIN IMMEDIATE serializes all writers),
@@ -791,6 +892,8 @@ func (s *SQLiteStore) AcquireWithAuthority(ctx context.Context, key, principal, 
 	// SELECT-guarded INSERT — mirrors Store.AcquireWithAuthority. The
 	// BEGIN IMMEDIATE write lock additionally freezes the epoch for
 	// this statement's duration, so the guard cannot be raced here.
+	// The recovery_required clause closes admission while the cluster
+	// reconciles a restored world (RECOVERY_REQUIRED mode).
 	err = tx.QueryRowContext(ctx, `
 		INSERT INTO execution_requests
 			(execution_id, idempotency_key, principal_id, capability_id, request_digest,
@@ -801,7 +904,7 @@ func (s *SQLiteStore) AcquireWithAuthority(ctx context.Context, key, principal, 
 				?7, ?8, `+sqliteNow+`, `+sqliteNow+` + ?9,
 				1, 0, 1, `+sqliteNow+`, `+sqliteNow+`, cm.epoch
 		FROM cluster_meta cm
-		WHERE cm.id = 1 AND cm.epoch = `+strconv.FormatInt(s.epoch, 10)+`
+		WHERE cm.id = 1 AND cm.epoch = `+strconv.FormatInt(s.epoch, 10)+` AND cm.recovery_required = 0
 		ON CONFLICT (principal_id, capability_id, idempotency_key) DO NOTHING
 		RETURNING execution_id, created_at
 	`, key, principal, capability, digest, nullableString(authority.Ref), class,
@@ -862,9 +965,13 @@ func (s *SQLiteStore) AcquireWithAuthority(ctx context.Context, key, principal, 
 
 	rec, err := s.lookupByKey(ctx, principal, capability, key)
 	if errors.Is(err, sql.ErrNoRows) {
-		// No record exists: the INSERT was fenced by the epoch guard.
+		// No record exists: the INSERT was fenced by the epoch or
+		// recovery guard, not the key conflict.
 		if epochErr := s.checkEpoch(ctx); epochErr != nil {
 			return nil, epochErr
+		}
+		if recErr := s.checkRecoveryMode(ctx); recErr != nil {
+			return nil, recErr
 		}
 		return nil, fmt.Errorf("%w: acquire raced — key vanished between insert and lookup",
 			LeaseStateConflict)
@@ -1027,6 +1134,7 @@ func (s *SQLiteStore) reclaimExpiredLease(ctx context.Context, rec *Record, newT
 		  AND version = ?5
 		  AND state IN ('PREPARED', 'EXECUTING')
 		  AND lease_expires_at < `+sqliteNow+`
+		  AND (SELECT recovery_required FROM cluster_meta WHERE id = 1) = 0
 		  `+s.epochGuardSQL(), newOwner, newToken, msDuration(duration),
 		rec.ExecutionID, rec.Version)
 	if err != nil {
@@ -1038,7 +1146,15 @@ func (s *SQLiteStore) reclaimExpiredLease(ctx context.Context, rec *Record, newT
 	}
 	if rows == 0 {
 		tx.Rollback()
-		return false, s.checkEpoch(ctx)
+		if epochErr := s.checkEpoch(ctx); epochErr != nil {
+			return false, epochErr
+		}
+		// Reclaiming a pre-dispatch record IS new-effect admission —
+		// it closes while the cluster reconciles a restored world.
+		if recErr := s.checkRecoveryMode(ctx); recErr != nil {
+			return false, recErr
+		}
+		return false, nil
 	}
 	if err := sqliteInsertEffectEvent(ctx, tx, rec.ExecutionID, effectEvent{
 		eventType:       EventLeaseAcquired,

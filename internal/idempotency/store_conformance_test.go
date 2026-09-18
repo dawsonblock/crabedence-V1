@@ -42,6 +42,13 @@ func eachEffectStore(t *testing.T, fn func(t *testing.T, s EffectStore)) {
 			`DELETE FROM execution_requests`); err != nil {
 			t.Fatalf("reset table: %v", err)
 		}
+		// Epoch-fencing tests leave the shared cluster_meta row in
+		// post-restore recovery mode — reset it so recovery gating
+		// cannot poison sibling tests.
+		if _, err := db.ExecContext(context.Background(),
+			`UPDATE cluster_meta SET recovery_required = FALSE WHERE id = 1`); err != nil {
+			t.Fatalf("reset recovery mode: %v", err)
+		}
 		fn(t, store)
 	})
 }

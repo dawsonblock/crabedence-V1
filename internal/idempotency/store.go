@@ -212,12 +212,16 @@ func (s *Store) ClusterEpoch() int64 {
 // current epoch still equals expected — the CAS guards against two
 // operators racing the bump. Call it as part of a restore/environment
 // rebuild, before restarting executors: any store admitted under the
-// old epoch is permanently fenced afterward. reason is audit text
-// recorded on the meta row.
+// old epoch is permanently fenced afterward, and the cluster enters
+// recovery mode — new-effect admission closes until
+// CompleteClusterRecovery clears it. reason is audit text recorded on
+// the meta row.
 func (s *Store) AdvanceClusterEpoch(ctx context.Context, expected int64, reason string) (int64, error) {
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE cluster_meta
-		SET epoch = epoch + 1, advanced_at = clock_timestamp(), advance_reason = $2
+		SET epoch = epoch + 1, recovery_required = TRUE,
+		    recovery_completed_at = NULL, recovery_resolution = NULL,
+		    advanced_at = clock_timestamp(), advance_reason = $2
 		WHERE id = 1 AND epoch = $1`, expected, nullableString(reason))
 	if err != nil {
 		return 0, err
@@ -235,6 +239,68 @@ func (s *Store) AdvanceClusterEpoch(ctx context.Context, expected int64, reason 
 		return 0, fmt.Errorf("%w: cluster epoch already at %d (expected %d)", ClusterEpochMismatch, cur, expected)
 	}
 	return expected + 1, nil
+}
+
+// ClusterRecoveryRequired reports whether the cluster is in
+// post-restore recovery mode — set by AdvanceClusterEpoch, cleared by
+// CompleteClusterRecovery.
+func (s *Store) ClusterRecoveryRequired(ctx context.Context) (bool, error) {
+	var required bool
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT recovery_required FROM cluster_meta WHERE id = 1`).Scan(&required); err != nil {
+		return false, err
+	}
+	return required, nil
+}
+
+// CompleteClusterRecovery clears recovery mode after the operator's
+// reconciliation gate is met. The epoch guard prevents clearing a mode
+// declared by a newer restore: if the epoch has since advanced, the
+// clear fails closed with ClusterEpochMismatch. resolution is audit
+// text recorded on the meta row.
+func (s *Store) CompleteClusterRecovery(ctx context.Context, expected int64, resolution string) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE cluster_meta
+		SET recovery_required = FALSE,
+		    recovery_completed_at = clock_timestamp(),
+		    recovery_resolution = $2
+		WHERE id = 1 AND epoch = $1`, expected, nullableString(resolution))
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		var cur int64
+		if err := s.db.QueryRowContext(ctx,
+			`SELECT epoch FROM cluster_meta WHERE id = 1`).Scan(&cur); err != nil {
+			return err
+		}
+		return fmt.Errorf("%w: cluster epoch already at %d (expected %d) — cannot complete recovery for an older world",
+			ClusterEpochMismatch, cur, expected)
+	}
+	return nil
+}
+
+// checkRecoveryMode verifies the cluster is not in post-restore
+// recovery mode — called by CAS-failure classifiers after checkEpoch
+// so a recovery-blocked admission gets the honest
+// CLUSTER_RECOVERY_REQUIRED error rather than a lease-conflict
+// misclassification.
+func (s *Store) checkRecoveryMode(ctx context.Context) error {
+	var required bool
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT recovery_required FROM cluster_meta WHERE id = 1`).Scan(&required); err != nil {
+		return err
+	}
+	if required {
+		s.metrics.recoveryRejections.Add(1)
+		return fmt.Errorf("%w: cluster is in post-restore recovery mode — new-effect admission closed until CompleteClusterRecovery",
+			ClusterRecoveryRequired)
+	}
+	return nil
 }
 
 // epochGuardSQL returns the WHERE fragment that fences a stale-epoch
@@ -270,7 +336,7 @@ func (s *Store) checkEpoch(ctx context.Context) error {
 // requires. Startup verifies the migrated schema reaches this version —
 // a database older than the code fails closed rather than running
 // against a partial schema.
-const RequiredSchemaVersion = 10
+const RequiredSchemaVersion = 11
 
 // schemaMigration is one versioned, idempotent schema change. Each
 // migration must be safe to re-run (IF NOT EXISTS / addColumnIfMissing)
@@ -295,6 +361,7 @@ var schemaMigrations = []schemaMigration{
 	{8, "forensic_record", migrationForensicRecord},
 	{9, "cluster_epoch", migrationClusterEpoch},
 	{10, "result_byte_fidelity", migrationResultByteFidelity},
+	{11, "cluster_recovery_mode", migrationClusterRecoveryMode},
 }
 
 func (s *Store) ensureSchema(ctx context.Context) error {
@@ -813,6 +880,23 @@ func migrationClusterEpoch(ctx context.Context, conn *sql.Conn) error {
 	return nil
 }
 
+// migrationClusterRecoveryMode adds the post-restore recovery gate to
+// cluster_meta: AdvanceClusterEpoch declares recovery mode (new-effect
+// admission closes) and CompleteClusterRecovery clears it after the
+// operator's reconciliation gate is met.
+func migrationClusterRecoveryMode(ctx context.Context, conn *sql.Conn) error {
+	for _, ddl := range []string{
+		`ALTER TABLE cluster_meta ADD COLUMN IF NOT EXISTS recovery_required BOOLEAN NOT NULL DEFAULT FALSE`,
+		`ALTER TABLE cluster_meta ADD COLUMN IF NOT EXISTS recovery_completed_at TIMESTAMPTZ`,
+		`ALTER TABLE cluster_meta ADD COLUMN IF NOT EXISTS recovery_resolution TEXT`,
+	} {
+		if _, err := conn.ExecContext(ctx, ddl); err != nil {
+			return fmt.Errorf("cluster recovery schema: %w", err)
+		}
+	}
+	return nil
+}
+
 // ─── Forensic write helpers ──────────────────────────────────────────
 
 // insertEffectEvent appends one event row inside the mutation's
@@ -968,13 +1052,15 @@ func (s *Store) AcquireWithAuthority(ctx context.Context, key, principal, capabi
 	if err != nil {
 		return nil, err
 	}
-	// The INSERT is SELECT-guarded on the cluster epoch: a concurrent
-	// AdvanceClusterEpoch turns the source SELECT empty and nothing is
-	// admitted — no row lock needed. The window where an advance
-	// commits between this statement's snapshot and its commit is
-	// bounded by the statement itself; a record that slips through is
-	// provenance-tagged admitted_epoch=old and can only be mutated by
-	// stores admitted under the live epoch.
+	// The INSERT is SELECT-guarded on the cluster epoch and recovery
+	// mode: a concurrent AdvanceClusterEpoch turns the source SELECT
+	// empty and nothing is admitted — no row lock needed. The window
+	// where an advance commits between this statement's snapshot and
+	// its commit is bounded by the statement itself; a record that
+	// slips through is provenance-tagged admitted_epoch=old and can
+	// only ever be mutated by stores admitted under the live epoch.
+	// The recovery_required clause closes admission while the cluster
+	// reconciles a restored world (Phase: RECOVERY_REQUIRED mode).
 	err = tx.QueryRowContext(ctx, `
 		INSERT INTO execution_requests
 			(execution_id, idempotency_key, principal_id, capability_id, request_digest,
@@ -985,7 +1071,7 @@ func (s *Store) AcquireWithAuthority(ctx context.Context, key, principal, capabi
 				$7, $8, clock_timestamp(), clock_timestamp() + make_interval(secs => $9),
 				1, 0, 1, cm.epoch
 		FROM cluster_meta cm
-		WHERE cm.id = 1 AND cm.epoch = `+strconv.FormatInt(s.epoch, 10)+`
+		WHERE cm.id = 1 AND cm.epoch = `+strconv.FormatInt(s.epoch, 10)+` AND NOT cm.recovery_required
 		ON CONFLICT (principal_id, capability_id, idempotency_key) DO NOTHING
 		RETURNING execution_id, created_at
 	`, key, principal, capability, digest, nullableString(authority.Ref), class,
@@ -1047,11 +1133,14 @@ func (s *Store) AcquireWithAuthority(ctx context.Context, key, principal, capabi
 	// ON CONFLICT DO NOTHING — the key already exists. Read it.
 	rec, err := s.lookupByKey(ctx, principal, capability, key)
 	if errors.Is(err, sql.ErrNoRows) {
-		// No record exists: the INSERT was fenced by the epoch guard,
-		// not the key conflict — unless a concurrent writer deleted the
-		// row (records are never deleted) this is a stale-epoch store.
+		// No record exists: the INSERT was fenced by the epoch or
+		// recovery guard, not the key conflict — unless a concurrent
+		// writer deleted the row (records are never deleted).
 		if epochErr := s.checkEpoch(ctx); epochErr != nil {
 			return nil, epochErr
+		}
+		if recErr := s.checkRecoveryMode(ctx); recErr != nil {
+			return nil, recErr
 		}
 		return nil, fmt.Errorf("%w: acquire raced — key vanished between insert and lookup",
 			LeaseStateConflict)
@@ -1264,6 +1353,7 @@ func (s *Store) reclaimExpiredLease(ctx context.Context, rec *Record, newToken, 
 		  AND version = $5
 		  AND state IN ('PREPARED', 'EXECUTING')
 		  AND lease_expires_at < clock_timestamp()
+		  AND NOT (SELECT recovery_required FROM cluster_meta WHERE id = 1)
 		  `+s.epochGuardSQL(), newOwner, newToken, pgInterval(duration),
 		rec.ExecutionID, rec.Version)
 	if err != nil {
@@ -1278,7 +1368,15 @@ func (s *Store) reclaimExpiredLease(ctx context.Context, rec *Record, newToken, 
 		// pool checkout while our tx is open deadlocks under
 		// MaxOpenConns pressure.
 		tx.Rollback()
-		return false, s.checkEpoch(ctx)
+		if epochErr := s.checkEpoch(ctx); epochErr != nil {
+			return false, epochErr
+		}
+		// Reclaiming a pre-dispatch record IS new-effect admission —
+		// it closes while the cluster reconciles a restored world.
+		if recErr := s.checkRecoveryMode(ctx); recErr != nil {
+			return false, recErr
+		}
+		return false, nil
 	}
 	if err := insertEffectEvent(ctx, tx, rec.ExecutionID, effectEvent{
 		eventType:       EventLeaseAcquired,

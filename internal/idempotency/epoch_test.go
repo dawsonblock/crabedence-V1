@@ -39,13 +39,20 @@ func TestSQLiteClusterEpochSeedAndFreshStore(t *testing.T) {
 		t.Fatalf("advance returned %d, want 2", next)
 	}
 
-	// A restarted executor admits under the new epoch.
+	// The advance declared post-restore recovery mode — the operator
+	// reconciles, then reopens admission for the restarted world.
 	fresh, err := NewSQLiteStore(db)
 	if err != nil {
 		t.Fatalf("fresh NewSQLiteStore: %v", err)
 	}
 	if fresh.ClusterEpoch() != 2 {
 		t.Fatalf("fresh store epoch = %d, want 2", fresh.ClusterEpoch())
+	}
+	if required, _ := fresh.ClusterRecoveryRequired(ctx); !required {
+		t.Fatal("epoch advance must declare recovery mode")
+	}
+	if err := fresh.CompleteClusterRecovery(ctx, 2, "reconciled"); err != nil {
+		t.Fatalf("complete recovery: %v", err)
 	}
 	acq, err := fresh.Acquire(ctx, "k1", "alice", "cap.mut", sqliteDigest("e"), "", "MUTATION", time.Minute)
 	if err != nil {
@@ -101,6 +108,93 @@ func TestSQLiteAdvanceClusterEpochConcurrency(t *testing.T) {
 	}
 	if wins != 1 || losses != racers-1 {
 		t.Fatalf("wins=%d losses=%d, want 1/%d", wins, losses, racers-1)
+	}
+}
+
+// TestSQLiteClusterRecoveryMode covers the post-restore admission
+// gate: an epoch advance declares recovery mode, a fresh store under
+// the new epoch finds new-effect admission closed (typed
+// CLUSTER_RECOVERY_REQUIRED) while reconciliation paths stay open,
+// and CompleteClusterRecovery reopens admission — epoch-guarded so a
+// stale operator cannot clear a newer world's mode.
+func TestSQLiteClusterRecoveryMode(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "db", "recovery.db")
+	db, err := OpenSQLiteDB(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	stale, err := NewSQLiteStore(db)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	if required, err := stale.ClusterRecoveryRequired(ctx); err != nil || required {
+		t.Fatalf("fresh cluster recovery_required = %v, %v — want false", required, err)
+	}
+
+	// An inherited IN_FLIGHT record exists before the restore.
+	pre, err := stale.Acquire(ctx, "pre-restore", "alice", "cap.mut", sqliteDigest("pre"), "", "MUTATION", time.Minute)
+	if err != nil {
+		t.Fatalf("pre-restore acquire: %v", err)
+	}
+	if err := stale.BeginExecution(ctx, pre.Record.ExecutionID, pre.LeaseToken, pre.Generation); err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if err := stale.MarkInFlight(ctx, pre.Record.ExecutionID, pre.LeaseToken, pre.Generation, "prov", nil); err != nil {
+		t.Fatalf("mark in flight: %v", err)
+	}
+
+	if _, err := stale.AdvanceClusterEpoch(ctx, 1, "restore"); err != nil {
+		t.Fatalf("advance: %v", err)
+	}
+
+	// Restarted executor under the new epoch.
+	fresh, err := NewSQLiteStore(db)
+	if err != nil {
+		t.Fatalf("fresh NewSQLiteStore: %v", err)
+	}
+	if required, err := fresh.ClusterRecoveryRequired(ctx); err != nil || !required {
+		t.Fatalf("post-advance recovery_required = %v, %v — want true", required, err)
+	}
+
+	// New-effect admission is closed with the typed error — never a
+	// lease-conflict misclassification.
+	if _, err := fresh.Acquire(ctx, "during-recovery", "alice", "cap.mut", sqliteDigest("new"), "", "MUTATION", time.Minute); !errors.Is(err, ClusterRecoveryRequired) {
+		t.Fatalf("acquire during recovery: want ClusterRecoveryRequired, got %v", err)
+	}
+
+	// Reconciliation of inherited records stays open.
+	stored, err := fresh.Lookup(ctx, pre.Record.ExecutionID)
+	if err != nil {
+		t.Fatalf("lookup inherited record: %v", err)
+	}
+	if err := fresh.EnterRecovery(ctx, pre.Record.ExecutionID, StateInFlight, stored.Version); err != nil {
+		t.Fatalf("recovery-path mutation during recovery mode: %v", err)
+	}
+
+	// A stale-epoch operator cannot clear the mode.
+	if err := stale.CompleteClusterRecovery(ctx, 1, "premature"); !errors.Is(err, ClusterEpochMismatch) {
+		t.Fatalf("stale complete: want ClusterEpochMismatch, got %v", err)
+	}
+	if required, _ := fresh.ClusterRecoveryRequired(ctx); !required {
+		t.Fatal("stale operator cleared recovery mode")
+	}
+
+	// The operator's reconciliation gate met — admission reopens.
+	if err := fresh.CompleteClusterRecovery(ctx, 2, "reconciliation complete"); err != nil {
+		t.Fatalf("complete recovery: %v", err)
+	}
+	if required, _ := fresh.ClusterRecoveryRequired(ctx); required {
+		t.Fatal("recovery mode still required after completion")
+	}
+	acq, err := fresh.Acquire(ctx, "post-recovery", "alice", "cap.mut", sqliteDigest("post"), "", "MUTATION", time.Minute)
+	if err != nil {
+		t.Fatalf("post-recovery acquire: %v", err)
+	}
+	if !acq.Acquired() {
+		t.Fatalf("post-recovery acquire kind = %s", acq.Kind)
 	}
 }
 

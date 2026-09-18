@@ -59,8 +59,20 @@ type EffectStore interface {
 	// AdvanceClusterEpoch CAS-bumps the cluster epoch by exactly one
 	// when it still equals expected. Call it as part of a
 	// restore/environment rebuild: every store admitted under the old
-	// epoch is permanently fenced from writes afterward.
+	// epoch is permanently fenced from writes afterward, and the
+	// cluster enters recovery mode — new-effect admission closes
+	// until CompleteClusterRecovery.
 	AdvanceClusterEpoch(ctx context.Context, expected int64, reason string) (int64, error)
+	// ClusterRecoveryRequired reports whether the cluster is in
+	// post-restore recovery mode: an epoch advance declares it, and
+	// only reconciliation (claims, UNKNOWN transitions, resolutions)
+	// may proceed until an operator clears it.
+	ClusterRecoveryRequired(ctx context.Context) (bool, error)
+	// CompleteClusterRecovery clears recovery mode when the cluster
+	// epoch still equals expected — epoch-guarded so the operator
+	// cannot clear a mode belonging to a newer restore. resolution is
+	// audit text recorded on the meta row.
+	CompleteClusterRecovery(ctx context.Context, expected int64, resolution string) error
 
 	// Configuration and schema introspection.
 	LeaseConfig() LeaseConfig

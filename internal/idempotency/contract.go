@@ -162,6 +162,12 @@ const (
 	// a restore/environment rebuild and the stale executor is fenced
 	// out of the restored ledger until it restarts.
 	ClusterEpochMismatch LeaseError = "CLUSTER_EPOCH_MISMATCH"
+	// ClusterRecoveryRequired is returned when new-effect admission is
+	// attempted while the cluster is in post-restore recovery mode —
+	// AdvanceClusterEpoch declares the mode and CompleteClusterRecovery
+	// clears it once reconciliation reaches the operator's safety gate.
+	// Reads and reconciliation remain open; only new admission closes.
+	ClusterRecoveryRequired LeaseError = "CLUSTER_RECOVERY_REQUIRED"
 )
 
 func (e LeaseError) Error() string { return string(e) }
