@@ -677,6 +677,15 @@ func TestStoreConformanceClusterEpochFencing(t *testing.T) {
 		if next != base+1 {
 			t.Fatalf("advance returned %d, want %d", next, base+1)
 		}
+		// The advance declared recovery mode — on a shared database
+		// (postgres leg) it must be cleared or every sibling test's
+		// acquire is fenced. CompleteClusterRecovery is epoch-guarded
+		// on the LIVE epoch, so the stale store can still clear it.
+		t.Cleanup(func() {
+			if err := s.CompleteClusterRecovery(context.Background(), next, "conformance cleanup"); err != nil {
+				t.Logf("recovery cleanup: %v", err)
+			}
+		})
 
 		wantFenced := func(name string, err error) {
 			t.Helper()
