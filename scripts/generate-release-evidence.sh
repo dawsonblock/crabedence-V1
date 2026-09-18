@@ -406,7 +406,7 @@ run_effect_fabric_postgres_gate() {
   fi
 
   {
-    echo "command=go test -json -count=1 -p 1 -timeout=300s -run TestLive ./internal/idempotency/ ./internal/reconcile/ ./internal/execution/"
+    echo "command=go test -json -count=1 -p 1 -timeout=300s -run 'TestLive|TestStoreConformance' ./internal/idempotency/ ./internal/reconcile/ ./internal/execution/"
     echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "---"
   } > "$log"
@@ -421,8 +421,13 @@ run_effect_fabric_postgres_gate() {
   # worker's table-wide claim batch would otherwise race another
   # package's live assertions. -json produces structured per-test
   # pass/fail/skip accounting for the evidence bundle.
+  # TestStoreConformance is included explicitly: the cross-engine
+  # conformance suite runs its PostgreSQL leg whenever the database URL
+  # is set (it is not TestLive-prefixed), so excluding it would drop
+  # engine-parity coverage — epoch fencing, observation fidelity, and
+  # lifecycle semantics — from the release evidence.
   go test -json -count=1 -p 1 -timeout=300s \
-    -run "TestLive" \
+    -run "TestLive|TestStoreConformance" \
     ./internal/idempotency/ ./internal/reconcile/ ./internal/execution/ \
     > "$json_out" 2>&1
   local rc=$?
