@@ -170,7 +170,7 @@ ANY PLANNER (Hermes, OpenAI SDK, custom)
             │
             ├─ capability registry (authoritative execution classes)
             ├─ authority verification (grant resolution)
-            ├─ durable idempotency (PostgreSQL)
+            ├─ durable idempotency (SQLite WAL local, PostgreSQL clustered)
             ├─ provider dispatch
             ├─ RunEvidenceV1 generation
             ├─ V3 receipt signing
@@ -198,7 +198,13 @@ crabbox serve-execution
 
 # The service listens on a Unix socket (XDG_RUNTIME_DIR/crabedence/execution.sock)
 # Any planner can connect and send capability invocations
-# Set CRABEDENCE_DATABASE_URL for durable idempotency (required for MUTATION/CRITICAL)
+# Durable idempotency defaults to an embedded SQLite store (WAL,
+# synchronous=FULL) at ~/.config/crabbox/crabedence.db — no database
+# daemon required. MUTATION/CRITICAL fail closed without durable storage.
+# CRABEDENCE_STORE_BACKEND=sqlite|postgres|none selects the backend;
+# CRABEDENCE_STORE_PATH overrides the SQLite file;
+# CRABEDENCE_DATABASE_URL selects/configures PostgreSQL for
+# multi-replica or clustered deployments.
 ```
 
 The `crabbox exec` command is a stdin/stdout bridge for testing and
@@ -519,7 +525,7 @@ and authoring guide.
   gates require a clean Git tree, record commit/tree provenance, generate
   Git blob and raw SHA-256 source manifests, run uncached Go tests + race
   tests + Worker typecheck/lint/tests/build + cross-language conformance +
-  PostgreSQL fencing + NeMo tests, and fail closed if any gate skips or
+  durable-store (PostgreSQL/SQLite) fencing + NeMo tests, and fail closed if any gate skips or
   fails. The artifact verifier detects extra files, validates each gate
   individually, and cross-checks `artifact_promotable` against
   `release_status`. See
@@ -813,7 +819,7 @@ Release candidates use a machine-verifiable qualification pipeline:
 `scripts/generate-release-evidence.sh` requires a clean Git working tree,
 records commit/tree SHA, generates Git blob and raw SHA-256 source manifests,
 runs all gates with uncached Go tests, captures race evidence, live PostgreSQL
-fencing/parity, Worker typecheck/lint/tests/build, cross-language conformance,
+fencing/parity plus the SQLite conformance leg, Worker typecheck/lint/tests/build, cross-language conformance,
 and NeMo typecheck/tests, then produces `qualification.json` with per-gate
 status. `scripts/check-release-admission.sh` fails closed if any gate is not
 PASS. `scripts/verify-release-artifact.sh` verifies SHA256SUMS, source manifest

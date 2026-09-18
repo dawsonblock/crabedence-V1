@@ -152,35 +152,26 @@ git -C "$REPO_ROOT" ls-files -z -- . ':(exclude)release-evidence/' ':(exclude)di
 done > "$EVIDENCE_DIR/source-tree-git-blobs.txt"
 
 # ─── Phase 7: Verify source manifest ────────────────────────────────────────
+# Use the canonical bidirectional verifier (scripts/verify-source-manifest.sh)
+# instead of inline logic. The canonical script checks both:
+#   1. manifest → source (every manifest entry exists and matches)
+#   2. source → manifest (no unexpected files added after generation)
 MANIFEST_VERIFY="$EVIDENCE_DIR/gate-results/source-manifest-verify.log"
 {
-  echo "command=verify source-tree-sha256.txt"
+  echo "command=bash $REPO_ROOT/scripts/verify-source-manifest.sh $EVIDENCE_DIR/source-tree-sha256.txt $REPO_ROOT"
   echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "---"
-  missing=0
-  mismatched=0
-  checked=0
-  while IFS= read -r line; do
-    [ -z "$line" ] && continue
-    expected_sha="$(echo "$line" | cut -d ' ' -f 1)"
-    file="$(echo "$line" | cut -d ' ' -f 3-)"
-    checked=$((checked + 1))
-    if [ ! -f "$REPO_ROOT/$file" ]; then
-      echo "MISSING: $file"
-      missing=$((missing + 1))
-      continue
-    fi
-    actual_sha="$(shasum -a 256 "$REPO_ROOT/$file" | cut -d ' ' -f 1)"
-    if [ "$actual_sha" != "$expected_sha" ]; then
-      echo "MISMATCH: $file (expected=$expected_sha actual=$actual_sha)"
-      mismatched=$((mismatched + 1))
-    fi
-  done < "$EVIDENCE_DIR/source-tree-sha256.txt"
+} > "$MANIFEST_VERIFY"
+
+set +e
+bash "$REPO_ROOT/scripts/verify-source-manifest.sh"   "$EVIDENCE_DIR/source-tree-sha256.txt" "$REPO_ROOT" >> "$MANIFEST_VERIFY" 2>&1
+manifest_rc=$?
+set -e
+
+{
   echo "---"
-  echo "files_checked=$checked"
-  echo "missing=$missing"
-  echo "mismatched=$mismatched"
-  if [ "$missing" -eq 0 ] && [ "$mismatched" -eq 0 ]; then
+  echo "exit=$manifest_rc"
+  if [ "$manifest_rc" -eq 0 ]; then
     echo "status=PASS"
     record_gate "source_manifest" "PASS" 0 "$MANIFEST_VERIFY"
   else
@@ -188,7 +179,7 @@ MANIFEST_VERIFY="$EVIDENCE_DIR/gate-results/source-manifest-verify.log"
     record_gate "source_manifest" "FAIL" 1 "$MANIFEST_VERIFY"
   fi
   echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-} > "$MANIFEST_VERIFY"
+} >> "$MANIFEST_VERIFY"
 echo "  $(grep 'status=' "$MANIFEST_VERIFY" | tail -1 | cut -d= -f2)  source_manifest"
 
 # ─── Phase 21: Toolchain identity ───────────────────────────────────────────
@@ -199,6 +190,18 @@ WORKER_PKG_VERSION="$(node -e "console.log(require('./worker/package.json').vers
 GIT_VERSION="$(git --version 2>/dev/null || echo 'unavailable')"
 PG_VERSION="$(psql --version 2>/dev/null || echo 'not-installed')"
 
+# Live-database qualification environment: capture the PostgreSQL
+# SERVER version and the Effect Fabric schema migration version so the
+# evidence records exactly what the live gates ran against.
+PG_SERVER_VERSION="unavailable"
+SCHEMA_VERSION="unavailable"
+if [ -n "${CRABBOX_TEST_DATABASE_URL:-}" ]; then
+  PG_SERVER_VERSION="$(psql "$CRABBOX_TEST_DATABASE_URL" -tAc 'SHOW server_version' 2>/dev/null | tr -d '[:space:]' || true)"
+  PG_SERVER_VERSION="${PG_SERVER_VERSION:-unavailable}"
+  SCHEMA_VERSION="$(psql "$CRABBOX_TEST_DATABASE_URL" -tAc 'SELECT COALESCE(MAX(version),0) FROM schema_migrations' 2>/dev/null | tr -d '[:space:]' || true)"
+  SCHEMA_VERSION="${SCHEMA_VERSION:-unavailable}"
+fi
+
 cat > "$EVIDENCE_DIR/toolchains.json" << EOF
 {
   "go": "$GO_VERSION",
@@ -206,6 +209,8 @@ cat > "$EVIDENCE_DIR/toolchains.json" << EOF
   "npm": "$NPM_VERSION",
   "git": "$GIT_VERSION",
   "postgres_client": "$PG_VERSION",
+  "postgres_server": "$PG_SERVER_VERSION",
+  "effect_fabric_schema_version": "$SCHEMA_VERSION",
   "worker_package_version": "$WORKER_PKG_VERSION",
   "go_os": "$(go env GOOS 2>/dev/null || echo 'unknown')",
   "go_arch": "$(go env GOARCH 2>/dev/null || echo 'unknown')"
@@ -225,19 +230,58 @@ EOF
 echo ""
 echo "=== Go gates ==="
 run_gate go-vet go vet ./...
-run_gate go-evidence-tests go test -count=1 -timeout=120s \
+run_gate go-evidence-tests go test -v -count=1 -timeout=120s \
   -run "TestTerminalReceipt|TestTerminalLog|TestRunEvidence|TestFinalizeRun|TestEvidence|TestCoordinatorFinish|TestCoordinatorRunReceipt|TestReceipt|TestRunRecorder|TestTiming" \
   ./internal/cli/
-run_gate go-tart-tests go test -count=1 -timeout=120s ./internal/providers/tart/
-run_gate go-lume-tests go test -count=1 -timeout=60s ./internal/providers/lume/
-run_gate go-shared-tests go test -count=1 -timeout=60s ./internal/providers/shared/
+run_gate go-tart-tests go test -v -count=1 -timeout=120s ./internal/providers/tart/
+run_gate go-lume-tests go test -v -count=1 -timeout=60s ./internal/providers/lume/
+run_gate go-shared-tests go test -v -count=1 -timeout=60s ./internal/providers/shared/
 
 # Phase 9: Go race evidence
-run_gate go-race-evidence go test -race -count=1 -timeout=120s \
+run_gate go-race-evidence go test -v -race -count=1 -timeout=120s \
   -run "TestTerminalReceipt|TestTerminalLog|TestRunEvidence|TestFinalizeRun|TestEvidence|TestReceiptContract" \
   ./internal/cli/
-run_gate go-race-providers go test -race -count=1 -timeout=120s \
+run_gate go-race-providers go test -v -race -count=1 -timeout=120s \
   ./internal/providers/tart/ ./internal/providers/lume/ ./internal/providers/shared/
+
+# ─── Effect Fabric contract gates ────────────────────────────────────────────
+# Dedicated gates for the durable execution contract. These are NOT
+# hidden inside the general Go test gates — they are first-class
+# release gates so that contract regressions are immediately visible.
+echo ""
+echo "=== Effect Fabric contract gates ==="
+
+# effect-fabric-contract: typed contract unit tests (no DB required).
+# Verifies state predicates, lease config validation, acquire result
+# kinds, terminal receipt digest, recovery decision types, receipt
+# identity fields, digest determinism, FinalizedAt exclusion, clock
+# interface, state aliases, and RecoveryRetryable rejection.
+run_gate effect-fabric-contract go test -v -count=1 -timeout=60s \
+  -run "TestState|TestLeaseConfig|TestAcquireResult|TestTerminalReceipt|TestRecovery|TestLeaseError|TestMigrateState|TestDefaultLeaseConfig|TestFixedClock|TestSystemClock" \
+  ./internal/idempotency/
+
+# effect-fabric-reconciliation: reconciliation worker unit tests.
+# Verifies NoopResolver, resolver registration, and fail-closed behavior.
+run_gate effect-fabric-reconciliation go test -v -count=1 -timeout=60s \
+  ./internal/reconcile/
+
+# effect-fabric-evidence: the signed-receipt trust boundary that gates
+# every CRITICAL terminal transition. Signature verification, trusted-
+# signer enforcement, binding checks, tamper rejection, and signer
+# persistence are mandatory release evidence — vet compiles the
+# package but does not execute its adversarial tests.
+run_gate effect-fabric-evidence go test -v -race -count=1 -timeout=60s \
+  ./internal/evidence/
+
+# effect-fabric-race: race-detector run over the execution + idempotency
+# + capability + reconcile packages. Closes concurrent-acquisition races
+# and stale-worker fencing violations.
+# Unset CRABBOX_TEST_DATABASE_URL so live tests skip — the race gate
+# should not run live PostgreSQL tests (they're too slow with -race
+# and are covered by effect-fabric-postgres separately).
+run_gate effect-fabric-race env -u CRABBOX_TEST_DATABASE_URL \
+  go test -v -race -count=1 -timeout=120s \
+  ./internal/capability/ ./internal/execution/ ./internal/evidence/ ./internal/idempotency/ ./internal/reconcile/
 
 # ─── Phase 10-12: Live PostgreSQL gates ────────────────────────────────────
 echo ""
@@ -334,11 +378,271 @@ run_live_postgres_gate() {
 run_live_postgres_gate postgres-fencing test/postgres-authority-fencing.live.test.ts
 run_live_postgres_gate postgres-parity test/coordinator-parity.live.test.ts
 
+# effect-fabric-postgres: live PostgreSQL contract tests for the
+# durable execution store. Runs the expired-lease matrix, stale-worker
+# fencing, finalization conflicts, and evidence recovery tests.
+# These require a real PostgreSQL instance (CRABBOX_TEST_DATABASE_URL).
+echo ""
+echo "=== Effect Fabric live PostgreSQL gates ==="
+
+# Live Go PostgreSQL gate for the effect fabric contract.
+# Uses the same fail-closed wrapper pattern as the Vitest live gates.
+run_effect_fabric_postgres_gate() {
+  local name="effect-fabric-postgres"
+  local log="$EVIDENCE_DIR/gate-results/${name}.log"
+
+  if [ -z "${CRABBOX_TEST_DATABASE_URL:-}" ]; then
+    {
+      echo "command=run_effect_fabric_postgres_gate"
+      echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      echo "---"
+      echo "SKIP: CRABBOX_TEST_DATABASE_URL not set"
+      echo "exit=1"
+      echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "$log"
+    record_gate "$name" "FAIL" 1 "$log"
+    echo "  FAIL  $name (CRABBOX_TEST_DATABASE_URL not set)"
+    return
+  fi
+
+  {
+    echo "command=go test -json -count=1 -p 1 -timeout=300s -run TestLive ./internal/idempotency/ ./internal/reconcile/ ./internal/execution/"
+    echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "---"
+  } > "$log"
+
+  local json_out="$EVIDENCE_DIR/effect-fabric-postgres.json"
+  set +e
+  # Run ALL live PostgreSQL tests in the effect-fabric packages — not a
+  # curated name pattern. A pattern that silently excludes new live
+  # tests (as "TestLiveEffectFabric|TestLiveStore" did) lets release
+  # evidence claim coverage that was never exercised. -p 1 serializes
+  # the packages: all three share one database, and the reconcile
+  # worker's table-wide claim batch would otherwise race another
+  # package's live assertions. -json produces structured per-test
+  # pass/fail/skip accounting for the evidence bundle.
+  go test -json -count=1 -p 1 -timeout=300s \
+    -run "TestLive" \
+    ./internal/idempotency/ ./internal/reconcile/ ./internal/execution/ \
+    > "$json_out" 2>&1
+  local rc=$?
+  set -e
+  cat "$json_out" >> "$log"
+
+  {
+    echo "---"
+    echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "exit=$rc"
+  } >> "$log"
+
+  # Structured accounting: count per-test actions from the -json
+  # stream (test events carry .Test; package events do not).
+  local discovered passed failed skipped
+  discovered=$(jq -r '[.[]? | select(.Test != null and (.Action == "pass" or .Action == "fail" or .Action == "skip"))] | length' \
+    < <(jq -s '.' "$json_out" 2>/dev/null || echo '[]') 2>/dev/null || echo 0)
+  passed=$(jq -r '[.[]? | select(.Test != null and .Action == "pass")] | length' \
+    < <(jq -s '.' "$json_out" 2>/dev/null || echo '[]') 2>/dev/null || echo 0)
+  failed=$(jq -r '[.[]? | select(.Test != null and .Action == "fail")] | length' \
+    < <(jq -s '.' "$json_out" 2>/dev/null || echo '[]') 2>/dev/null || echo 0)
+  skipped=$(jq -r '[.[]? | select(.Test != null and .Action == "skip")] | length' \
+    < <(jq -s '.' "$json_out" 2>/dev/null || echo '[]') 2>/dev/null || echo 0)
+
+  {
+    echo "tests_discovered=$discovered"
+    echo "tests_passed=$passed"
+    echo "tests_failed=$failed"
+    echo "tests_skipped=$skipped"
+  } >> "$log"
+
+  # Mandatory live gate: fail on any failure, on zero passes, and on
+  # any skip — a SKIP is not evidence of execution.
+  if [ "$rc" -ne 0 ] || [ "$failed" -gt 0 ] || [ "$passed" -le 0 ] || [ "$skipped" -gt 0 ]; then
+    {
+      echo ""
+      echo "FAIL: discovered=$discovered passed=$passed failed=$failed skipped=$skipped exit=$rc (mandatory live gate requires >0 passes, 0 failures, 0 skips)"
+      echo "exit=1"
+    } >> "$log"
+    record_gate "$name" "FAIL" 1 "$log"
+    echo "  FAIL  $name (discovered=$discovered passed=$passed failed=$failed skipped=$skipped)"
+    cat "$log"
+    return
+  fi
+
+  record_gate "$name" "PASS" 0 "$log"
+  echo "  PASS  $name (discovered=$discovered passed=$passed failed=$failed skipped=$skipped)"
+}
+
+run_effect_fabric_postgres_gate
+
+# provider-github-faults: dedicated evidence for the real external
+# provider qualification — github.issue.create fault injection at every
+# dispatch boundary, proving at-most-once external effect across crashes.
+# The tests also run inside effect-fabric-postgres; this gate emits their
+# own structured evidence file for the bundle.
+run_provider_github_faults_gate() {
+  local name="provider-github-faults"
+  local log="$EVIDENCE_DIR/gate-results/${name}.log"
+
+  if [ -z "${CRABBOX_TEST_DATABASE_URL:-}" ]; then
+    {
+      echo "command=run_provider_github_faults_gate"
+      echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      echo "---"
+      echo "SKIP: CRABBOX_TEST_DATABASE_URL not set"
+      echo "exit=1"
+      echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "$log"
+    record_gate "$name" "FAIL" 1 "$log"
+    echo "  FAIL  $name (CRABBOX_TEST_DATABASE_URL not set)"
+    return
+  fi
+
+  {
+    echo "command=go test -json -count=1 -timeout=120s -run TestLiveGitHub ./internal/execution/"
+    echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "---"
+  } > "$log"
+
+  local json_out="$EVIDENCE_DIR/provider-github-faults.json"
+  set +e
+  go test -json -count=1 -timeout=120s \
+    -run "TestLiveGitHub" \
+    ./internal/execution/ \
+    > "$json_out" 2>&1
+  local rc=$?
+  set -e
+  cat "$json_out" >> "$log"
+
+  {
+    echo "---"
+    echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "exit=$rc"
+  } >> "$log"
+
+  local discovered passed failed skipped
+  discovered=$(jq -r '[.[]? | select(.Test != null and (.Action == "pass" or .Action == "fail" or .Action == "skip"))] | length' \
+    < <(jq -s '.' "$json_out" 2>/dev/null || echo '[]') 2>/dev/null || echo 0)
+  passed=$(jq -r '[.[]? | select(.Test != null and .Action == "pass")] | length' \
+    < <(jq -s '.' "$json_out" 2>/dev/null || echo '[]') 2>/dev/null || echo 0)
+  failed=$(jq -r '[.[]? | select(.Test != null and .Action == "fail")] | length' \
+    < <(jq -s '.' "$json_out" 2>/dev/null || echo '[]') 2>/dev/null || echo 0)
+  skipped=$(jq -r '[.[]? | select(.Test != null and .Action == "skip")] | length' \
+    < <(jq -s '.' "$json_out" 2>/dev/null || echo '[]') 2>/dev/null || echo 0)
+
+  {
+    echo "tests_discovered=$discovered"
+    echo "tests_passed=$passed"
+    echo "tests_failed=$failed"
+    echo "tests_skipped=$skipped"
+  } >> "$log"
+
+  if [ "$rc" -ne 0 ] || [ "$failed" -gt 0 ] || [ "$passed" -le 0 ] || [ "$skipped" -gt 0 ]; then
+    {
+      echo ""
+      echo "FAIL: discovered=$discovered passed=$passed failed=$failed skipped=$skipped exit=$rc (provider fault gate requires >0 passes, 0 failures, 0 skips)"
+      echo "exit=1"
+    } >> "$log"
+    record_gate "$name" "FAIL" 1 "$log"
+    echo "  FAIL  $name (discovered=$discovered passed=$passed failed=$failed skipped=$skipped)"
+    cat "$log"
+    return
+  fi
+
+  record_gate "$name" "PASS" 0 "$log"
+  echo "  PASS  $name (discovered=$discovered passed=$passed failed=$failed skipped=$skipped)"
+}
+
+run_provider_github_faults_gate
+
+# provider-github-real-api: OPTIONAL real-provider qualification. The
+# httptest fault harness proves the adapter protocol deterministically;
+# this gate proves it against GitHub itself. Registered ONLY when a
+# test token and repo are configured — a missing gate is never recorded
+# as PASS, and a configured gate cannot pass by skipping.
+if [ -n "${CRABBOX_GITHUB_TEST_TOKEN:-}" ] && [ -n "${CRABBOX_GITHUB_TEST_REPO:-}" ]; then
+  run_gate provider-github-real-api env \
+    GITHUB_TOKEN="$CRABBOX_GITHUB_TEST_TOKEN" \
+    CRABBOX_GITHUB_TEST_REPO="$CRABBOX_GITHUB_TEST_REPO" \
+    go test -v -count=1 -timeout=120s \
+    -run "TestRealGitHubAPI" ./internal/execution/
+else
+  echo "  SKIP  provider-github-real-api (CRABBOX_GITHUB_TEST_TOKEN/CRABBOX_GITHUB_TEST_REPO not configured — gate not applicable)"
+fi
+
+# ─── Authority store live PostgreSQL gate ─────────────────────────────────────
+# Tests grant lookup, principal mismatch, capability mismatch, expiry,
+# revocation, and database error handling.
+echo ""
+echo "=== Authority store live PostgreSQL gate ==="
+
+run_authority_postgres_gate() {
+  local name="authority-postgres"
+  local log="$EVIDENCE_DIR/gate-results/${name}.log"
+
+  if [ -z "${CRABBOX_TEST_DATABASE_URL:-}" ]; then
+    {
+      echo "command=run_authority_postgres_gate"
+      echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      echo "---"
+      echo "SKIP: CRABBOX_TEST_DATABASE_URL not set"
+      echo "exit=1"
+      echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "$log"
+    record_gate "$name" "FAIL" 1 "$log"
+    echo "  FAIL  $name (CRABBOX_TEST_DATABASE_URL not set)"
+    return
+  fi
+
+  {
+    echo "command=go test -v -count=1 -timeout=120s -run TestLiveAuthority ./internal/authority/"
+    echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "---"
+  } > "$log"
+
+  set +e
+  go test -v -count=1 -timeout=120s \
+    -run "TestLiveAuthority" \
+    ./internal/authority/ >> "$log" 2>&1
+  local rc=$?
+  set -e
+
+  {
+    echo "---"
+    echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "exit=$rc"
+  } >> "$log"
+
+  if [ "$rc" -ne 0 ]; then
+    record_gate "$name" "FAIL" "$rc" "$log"
+    echo "  FAIL  $name (exit=$rc)"
+    cat "$log"
+    return
+  fi
+
+  local executed
+  executed=$(grep -cE '^\s*--- (PASS|FAIL):' "$log" 2>/dev/null || true)
+  if [ "$executed" -le 0 ]; then
+    {
+      echo ""
+      echo "FAIL: 0 tests executed (all skipped or no match)"
+      echo "exit=1"
+    } >> "$log"
+    record_gate "$name" "FAIL" 1 "$log"
+    echo "  FAIL  $name (0 tests executed)"
+    return
+  fi
+
+  record_gate "$name" "PASS" 0 "$log"
+  echo "  PASS  $name ($executed tests executed)"
+}
+
+run_authority_postgres_gate
+
 # ─── Phase 13: Cross-language conformance ───────────────────────────────────
 echo ""
 echo "=== Cross-language conformance ==="
 run_gate cross-language-conformance \
-  go test -count=1 -timeout=60s \
+  go test -v -count=1 -timeout=60s \
   -run "TestRunEvidenceConformanceCorpus|TestReceiptContractConformance" \
   ./internal/cli/
 
@@ -346,7 +650,7 @@ run_gate cross-language-conformance \
 echo ""
 echo "=== Worker gates ==="
 # Ensure Worker dependencies are installed.
-npm ci --prefix worker 2>/dev/null || true
+npm ci --prefix worker
 run_gate worker-typecheck npm run check --prefix worker
 run_gate worker-tests npm test --prefix worker
 run_gate worker-format npm run format:check --prefix worker
@@ -357,7 +661,7 @@ run_gate worker-build npm run build --prefix worker
 echo ""
 echo "=== NeMo gates ==="
 # Ensure NeMo dependencies are installed.
-npm ci --prefix nemo 2>/dev/null || npm install --prefix nemo 2>/dev/null || true
+npm ci --prefix nemo
 run_gate nemo-typecheck sh -c 'cd nemo && npx tsc --noEmit'
 run_gate nemo-tests sh -c 'cd nemo && npx vitest run'
 
@@ -416,15 +720,27 @@ extract_tests_executed() {
   local count=0
 
   case "$gate_name" in
-    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-cli)
-      # Go test without -v prints one line per package:
-      #   ok  \t<package>\t<duration>
-      #   FAIL\t<package>\t<duration>
-      # Count those lines as evidence tests ran.
-      # Also check for -v output (--- PASS/--- FAIL) in case verbose is used.
+    effect-fabric-postgres|provider-github-faults)
+      # -json gates write structured accounting lines into the log:
+      #   tests_discovered=N / tests_passed=N / tests_failed=N / tests_skipped=N
+      # (the -json event stream has no "--- PASS:" lines to grep).
+      local p f
+      p=$(grep -oE '^tests_passed=[0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$' || true)
+      f=$(grep -oE '^tests_failed=[0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$' || true)
+      count=$((${p:-0} + ${f:-0}))
+      ;;
+    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-cli|effect-fabric-contract|effect-fabric-reconciliation|effect-fabric-evidence|effect-fabric-race|authority-postgres|provider-github-real-api)
+      # Go test with -v prints one line per test:
+      #   --- PASS: TestName (0.00s)
+      #   --- FAIL: TestName (0.00s)
+      #   --- SKIP: TestName (0.00s)
+      # Count executed tests only — a SKIP is not evidence of execution.
+      # Per-test result lines, not package-level ok/FAIL lines.
+      # A go test -run expression matching zero tests produces "ok" but
+      # no --- PASS lines — the count correctly returns 0.
       # NOTE: grep -c outputs "0" and exits 1 when no matches. Using
       # `|| true` (not `|| echo 0`) avoids appending a second "0".
-      count=$(grep -cE '^(ok|FAIL|--- PASS|--- FAIL)' "$log" 2>/dev/null || true)
+      count=$(grep -cE '^\s*--- (PASS|FAIL):' "$log" 2>/dev/null || true)
       ;;
     worker-tests|nemo-tests)
       # Vitest prints a summary like:
@@ -433,21 +749,19 @@ extract_tests_executed() {
       local tests_line
       tests_line=$(sed 's/\x1b\[[0-9;]*m//g' "$log" 2>/dev/null | grep -E 'Tests[[:space:]]+[0-9]+' | tail -1 || true)
       if [ -n "$tests_line" ]; then
-        # Try to extract the number in parentheses first: "5 passed (5)"
-        local in_parens
-        in_parens=$(echo "$tests_line" | grep -oE '\([0-9]+\)' | grep -oE '[0-9]+' || true)
-        if [ -n "$in_parens" ]; then
-          count="$in_parens"
+        # Executed = passed + failed — a skip is not evidence of
+        # execution. The parenthesized total includes skips, so it is
+        # only a fallback when the per-status counts are absent.
+        local passed failed skipped
+        passed=$(echo "$tests_line" | grep -oE '[0-9]+ passed' | grep -oE '^[0-9]+' || true)
+        failed=$(echo "$tests_line" | grep -oE '[0-9]+ failed' | grep -oE '^[0-9]+' || true)
+        skipped=$(echo "$tests_line" | grep -oE '[0-9]+ skipped' | grep -oE '^[0-9]+' || true)
+        if [ -n "$passed" ] || [ -n "$failed" ]; then
+          count=$((${passed:-0} + ${failed:-0}))
         else
-          # Sum the individual counts: "5 passed | 2 failed | 1 skipped"
-          local passed failed skipped
-          passed=$(echo "$tests_line" | grep -oE '[0-9]+ passed' | grep -oE '^[0-9]+' || true)
-          failed=$(echo "$tests_line" | grep -oE '[0-9]+ failed' | grep -oE '^[0-9]+' || true)
-          skipped=$(echo "$tests_line" | grep -oE '[0-9]+ skipped' | grep -oE '^[0-9]+' || true)
-          passed="${passed:-0}"
-          failed="${failed:-0}"
-          skipped="${skipped:-0}"
-          count=$((passed + failed + skipped))
+          local in_parens
+          in_parens=$(echo "$tests_line" | grep -oE '\([0-9]+\)' | grep -oE '[0-9]+' || true)
+          count=$((${in_parens:-0} - ${skipped:-0}))
         fi
       fi
       ;;
@@ -462,13 +776,14 @@ extract_tests_executed() {
         fi
       done
       if [ -n "${json_summary:-}" ] && [ -f "$json_summary" ] && command -v jq >/dev/null 2>&1; then
-        # Count total assertion results across all test files.
-        count=$(jq '[.testResults[].assertionResults | length] | add // 0' "$json_summary" 2>/dev/null || true)
+        # Count executed assertion results — skipped/pending/todo are
+        # not evidence of execution.
+        count=$(jq '[.testResults[].assertionResults[] | select(.status == "passed" or .status == "failed")] | length' "$json_summary" 2>/dev/null || true)
       fi
       ;;
     cross-language-conformance)
-      # Conformance runner prints PASS/FAIL lines per case.
-      count=$(grep -cE '^(PASS|FAIL|ok|not ok)' "$log" 2>/dev/null || true)
+      # With -v, count executed per-test result lines (SKIP excluded).
+      count=$(grep -cE '^\s*--- (PASS|FAIL):' "$log" 2>/dev/null || true)
       ;;
     *)
       # Non-test gates (vet, typecheck, format, lint, build) have no test count.
@@ -477,6 +792,55 @@ extract_tests_executed() {
   esac
 
   # Ensure numeric and non-negative.
+  if ! [[ "$count" =~ ^[0-9]+$ ]]; then
+    count=0
+  fi
+  echo "$count"
+}
+
+# Extract tests_skipped from a gate log. Mirrors extract_tests_executed
+# so the release manifest reports real skip accounting instead of a
+# hardcoded 0.
+extract_tests_skipped() {
+  local gate_name="$1"
+  local log="$2"
+  local count=0
+
+  case "$gate_name" in
+    effect-fabric-postgres|provider-github-faults)
+      # -json gates write structured accounting lines into the log.
+      count=$(grep -oE '^tests_skipped=[0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$' || true)
+      count=${count:-0}
+      ;;
+    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-cli|effect-fabric-contract|effect-fabric-reconciliation|effect-fabric-evidence|effect-fabric-race|authority-postgres|provider-github-real-api|cross-language-conformance)
+      count=$(grep -cE '^\s*--- SKIP:' "$log" 2>/dev/null || true)
+      ;;
+    worker-tests|nemo-tests)
+      local tests_line
+      tests_line=$(sed 's/\x1b\[[0-9;]*m//g' "$log" 2>/dev/null | grep -E 'Tests[[:space:]]+[0-9]+' | tail -1 || true)
+      if [ -n "$tests_line" ]; then
+        local skipped
+        skipped=$(echo "$tests_line" | grep -oE '[0-9]+ skipped' | grep -oE '^[0-9]+' || true)
+        count=${skipped:-0}
+      fi
+      ;;
+    postgres-*)
+      local json_summary
+      for candidate in "${log%.log}.summary.json" "$EVIDENCE_DIR/${gate_name}.summary.json" "$EVIDENCE_DIR/${gate_name}.vitest.json"; do
+        if [ -f "$candidate" ]; then
+          json_summary="$candidate"
+          break
+        fi
+      done
+      if [ -n "${json_summary:-}" ] && [ -f "$json_summary" ] && command -v jq >/dev/null 2>&1; then
+        count=$(jq '[.testResults[].assertionResults[] | select(.status == "skipped" or .status == "pending" or .status == "todo")] | length' "$json_summary" 2>/dev/null || true)
+      fi
+      ;;
+    *)
+      count=0
+      ;;
+  esac
+
   if ! [[ "$count" =~ ^[0-9]+$ ]]; then
     count=0
   fi
@@ -549,7 +913,12 @@ cat > "$EVIDENCE_DIR/qualification.json" << EOF
     {"id": "CRAB-V1-013", "description": "Go capability registry is authoritative for execution class"},
     {"id": "CRAB-V1-014", "description": "durable idempotency prevents duplicate side effects"},
     {"id": "CRAB-V1-015", "description": "UNKNOWN is a first-class terminal state for post-dispatch ambiguity"},
-    {"id": "CRAB-V1-016", "description": "crabbox exec never returns fake success for undispatched operations"}
+    {"id": "CRAB-V1-016", "description": "crabbox exec never returns fake success for undispatched operations"},
+    {"id": "CRAB-V1-017", "description": "expired IN_FLIGHT work is never blindly redispatched"},
+    {"id": "CRAB-V1-018", "description": "only an unexpired active lease generation may mutate execution state"},
+    {"id": "CRAB-V1-019", "description": "terminal finalization is immutable and conflict-aware"},
+    {"id": "CRAB-V1-020", "description": "post-dispatch uncertainty cannot become retryable without evidence"},
+    {"id": "CRAB-V1-021", "description": "concurrent identical mutations cause at most one provider dispatch"}
   ],
   "provenance": {
     "commit": "$COMMIT",
@@ -563,6 +932,8 @@ cat > "$EVIDENCE_DIR/qualification.json" << EOF
     "npm": "$NPM_VERSION",
     "git": "$GIT_VERSION",
     "postgres_client": "$PG_VERSION",
+    "postgres_server": "$PG_SERVER_VERSION",
+    "effect_fabric_schema_version": "$SCHEMA_VERSION",
     "worker_package_version": "$WORKER_PKG_VERSION"
   },
   "environment": {
@@ -590,8 +961,32 @@ cp "$REPO_ROOT/schemas/qualification.schema.json" "$EVIDENCE_DIR/schemas/qualifi
 #
 # RELEASE_NAME / RELEASE_VERSION come from the environment (set by CI)
 # so that the same script works for any RC version without code changes.
-RELEASE_NAME="${RELEASE_NAME:-crabedence-v1.0.0-rc.2}"
-RELEASE_VERSION="${RELEASE_VERSION:-1.0.0-rc.2}"
+# Require explicit RELEASE_VERSION — fail closed if not set.
+if [ -z "${RELEASE_VERSION:-}" ]; then
+  echo "ERROR: RELEASE_VERSION must be set (e.g., 1.0.0-rc.7)" >&2
+  echo "       Refusing to use a hardcoded default." >&2
+  exit 1
+fi
+RELEASE_NAME="${RELEASE_NAME:-crabedence-v${RELEASE_VERSION}}"
+
+# Aggregate tests_executed and tests_skipped across all test gates for
+# the release manifest. The test-gate pattern must stay in sync with
+# check-release-admission.sh — a test gate missing from it is silently
+# excluded from the manifest's test accounting.
+TOTAL_TESTS_EXECUTED=0
+TOTAL_TESTS_SKIPPED=0
+for i in "${!GATE_NAMES[@]}"; do
+  gate_name="${GATE_NAMES[$i]}"
+  case "$gate_name" in
+    *tests|postgres-*|effect-fabric-*|cross-language-conformance|authority-*|provider-*|go-race-*)
+      te="$(extract_tests_executed "$gate_name" "${GATE_LOG[$i]}")"
+      ts="$(extract_tests_skipped "$gate_name" "${GATE_LOG[$i]}")"
+      TOTAL_TESTS_EXECUTED=$((TOTAL_TESTS_EXECUTED + te))
+      TOTAL_TESTS_SKIPPED=$((TOTAL_TESTS_SKIPPED + ts))
+      ;;
+  esac
+done
+
 cat > "$EVIDENCE_DIR/release-manifest.json" << EOF
 {
   "release_name": "$RELEASE_NAME",
@@ -608,6 +1003,8 @@ cat > "$EVIDENCE_DIR/release-manifest.json" << EOF
     "total_gates": $TOTAL_GATES,
     "passed_gates": $PASSED_GATES,
     "failed_gates": $FAILED_GATES,
+    "tests_executed": $TOTAL_TESTS_EXECUTED,
+    "tests_skipped": $TOTAL_TESTS_SKIPPED,
     "qualification_file": "qualification.json"
   },
   "evidence_bundle": {

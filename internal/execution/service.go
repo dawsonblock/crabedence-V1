@@ -49,6 +49,15 @@ type RequestAuthority struct {
 	AuthorityRef string `json:"authority_ref"`
 	// GrantID is accepted for backward compatibility and mapped to AuthorityRef.
 	GrantID string `json:"grant_id,omitempty"`
+	// AuthorityGeneration and AuthorityDigest bind the exact immutable
+	// authority material that admitted this request into the execution
+	// identity (request digest). They are SERVER-ASSIGNED after grant
+	// resolution — the service overwrites whatever the caller sent —
+	// so a caller can neither forge authority binding nor omit it.
+	// Zero values mean no grant-bound authority (in-memory resolvers,
+	// grant-free capabilities).
+	AuthorityGeneration int64  `json:"authority_generation,omitempty"`
+	AuthorityDigest     string `json:"authority_digest,omitempty"`
 }
 
 // Response is the wire-format execution response.
@@ -59,6 +68,31 @@ type Response struct {
 	Error       string          `json:"error,omitempty"`
 	Evidence    *EvidenceRef    `json:"evidence,omitempty"`
 	Execution   *ExecutionMeta  `json:"execution,omitempty"`
+
+	// DefinitiveFailure indicates that a FAILED response is a
+	// definitive failure — the handler asserts no external side
+	// effect occurred. This is required for a FAILED response after
+	// the dispatch boundary (IN_FLIGHT) to be persisted as StateFailed
+	// rather than StateUnknown. If false (the default), a FAILED
+	// response after dispatch is treated as UNKNOWN (post-dispatch
+	// uncertainty) per the durable execution contract §6.
+	//
+	// For CRITICAL operations, this flag alone is NOT sufficient —
+	// the Store enforces proof requirements (evidence digest,
+	// receipt_version 3, provider_id, provider_run_id) inside
+	// Finalize(). The flag is a routing signal; the proof is in
+	// the receipt fields.
+	DefinitiveFailure bool `json:"definitive_failure,omitempty"`
+
+	// EvidenceArtifact carries the provider evidence bytes the digest
+	// is computed FROM — e.g. the raw provider response body or the
+	// provider operation record. Crabedence recomputes
+	// sha256(EvidenceArtifact) itself before attesting or persisting
+	// an evidence digest; a handler-supplied digest string is never
+	// signed. For CRITICAL executions a terminal outcome without an
+	// artifact cannot be attested and fails closed to UNKNOWN.
+	// Transient: never serialized to the wire or the ledger.
+	EvidenceArtifact []byte `json:"-"`
 }
 
 // EvidenceRef is the evidence reference returned to the caller.
@@ -293,8 +327,9 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 	}
 
 	// Verify authority (grant resolution)
+	var resolvedGrant *capability.Grant
 	if decision.Descriptor.AuthorityPolicy.GrantRequired {
-		fc, reason := s.registry.VerifyAuthority(ctx, capability.AdmissionRequest{
+		grant, fc, reason := s.registry.VerifyAuthority(ctx, capability.AdmissionRequest{
 			Capability: req.Capability,
 			Principal:  req.Authority.Principal,
 			GrantID:    req.Authority.EffectiveAuthorityRef(),
@@ -307,42 +342,25 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 			})
 			return
 		}
+		resolvedGrant = grant
 	}
 
-	// Dispatch to handler
+	// Bind the verified authority material into the request before
+	// dispatch: grant generation + grant digest become part of the
+	// execution identity, so the durable record proves which immutable
+	// authority admitted it. Server-assigned — caller-supplied values
+	// are overwritten whether or not a grant was required.
+	req.Authority.AuthorityGeneration = 0
+	req.Authority.AuthorityDigest = ""
+	if resolvedGrant != nil {
+		req.Authority.AuthorityGeneration = resolvedGrant.Generation
+		req.Authority.AuthorityDigest = resolvedGrant.Digest
+	}
+
+	// Dispatch to handler. The DispatchExecutor handles CRITICAL evidence
+	// validation internally — post-dispatch evidence failures become
+	// UNKNOWN (not FAILED) per the durable execution contract.
 	response := s.handler.Execute(ctx, req, decision.Descriptor)
-
-	// Validate CRITICAL evidence
-	if decision.Descriptor.ExecutionClass.RequiresEvidence() && response.Status == StatusSucceeded {
-		if response.Evidence == nil || response.Evidence.Digest == "" {
-			response = Response{
-				Status:      StatusFailed,
-				FailureCode: string(capability.FailureExecutionFailed),
-				Error:       "CRITICAL capability returned SUCCEEDED without evidence digest",
-				Execution:   response.Execution,
-			}
-		} else if !isValidEvidenceDigest(response.Evidence.Digest) {
-			response = Response{
-				Status:      StatusFailed,
-				FailureCode: string(capability.FailureExecutionFailed),
-				Error:       "CRITICAL capability returned invalid evidence digest (must be 64-char lowercase hex)",
-				Execution:   response.Execution,
-			}
-		} else if response.Evidence.ReceiptVersion != 3 {
-			response = Response{
-				Status:      StatusFailed,
-				FailureCode: string(capability.FailureExecutionFailed),
-				Error:       fmt.Sprintf("CRITICAL capability returned receipt_version %d (must be 3)", response.Evidence.ReceiptVersion),
-				Execution:   response.Execution,
-			}
-		} else if response.Execution == nil || response.Execution.RunID == "" {
-			response = Response{
-				Status:      StatusFailed,
-				FailureCode: string(capability.FailureExecutionFailed),
-				Error:       "CRITICAL capability returned SUCCEEDED without run_id",
-			}
-		}
-	}
 
 	s.writeResponse(conn, response)
 }

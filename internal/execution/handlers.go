@@ -2,8 +2,10 @@ package execution
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/openclaw/crabbox/internal/capability"
+	"github.com/openclaw/crabbox/internal/idempotency"
 )
 
 // MultiHandler dispatches to different handlers based on the adapter ID
@@ -28,6 +30,40 @@ func (h *MultiHandler) Execute(ctx context.Context, req Request, desc capability
 		}
 	}
 	return handler.Execute(ctx, req, desc)
+}
+
+// PrepareRecovery routes recovery-locator preparation to the handler
+// registered for adapterID. Handlers implementing
+// idempotency.RecoveryLocatorProvider produce minimal provider-specific
+// locators; handlers that don't return (nil, nil) so DispatchExecutor
+// falls back to the generic metadata-only locator. An unregistered
+// adapter fails closed — the dispatch boundary must not be crossed
+// without recovery coordinates.
+func (h *MultiHandler) PrepareRecovery(ctx context.Context, adapterID string, in idempotency.RecoveryLocatorInput) (*idempotency.RecoveryLocator, error) {
+	handler, ok := h.handlers[adapterID]
+	if !ok {
+		return nil, fmt.Errorf("no handler registered for adapter: %s", adapterID)
+	}
+	provider, ok := handler.(idempotency.RecoveryLocatorProvider)
+	if !ok {
+		return nil, nil
+	}
+	return provider.PrepareRecovery(ctx, in)
+}
+
+// ProviderCapabilities routes capability declarations to the handler
+// registered for adapterID. An unregistered adapter or a handler with
+// no declaration reports zero capabilities — the CRITICAL admission
+// gate fails closed either way.
+func (h *MultiHandler) ProviderCapabilities(adapterID string) ProviderCapabilities {
+	handler, ok := h.handlers[adapterID]
+	if !ok {
+		return ProviderCapabilities{}
+	}
+	if d, ok := handler.(CapabilityDeclarer); ok {
+		return d.ProviderCapabilities(adapterID)
+	}
+	return ProviderCapabilities{}
 }
 
 // Execute implements Handler for DispatchExecutor.

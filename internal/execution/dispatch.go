@@ -2,11 +2,14 @@ package execution
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
 
 	"github.com/openclaw/crabbox/internal/capability"
+	"github.com/openclaw/crabbox/internal/evidence"
 	"github.com/openclaw/crabbox/internal/idempotency"
 )
 
@@ -23,6 +26,16 @@ const (
 	DispatchPost DispatchState = "POST_DISPATCH"
 )
 
+// postDispatchPersistBudget bounds the mandatory post-dispatch
+// durability path — provider observation, recovery entry, and terminal
+// finalization. It runs on a context detached from the caller's
+// cancellation so that a client disconnect or service shutdown cannot
+// lose the provider's already-returned answer. Without this, root
+// context cancellation at teardown could fail RecordProviderObservation
+// and EnterRecoveryWithObservation, stranding the record IN_FLIGHT
+// until lease recovery with its provider metadata lost.
+const postDispatchPersistBudget = 5 * time.Second
+
 // DispatchExecutor wraps a Handler with dispatch-point tracking and
 // durable idempotency. It ensures:
 //   - Pre-dispatch failures return FAILED (safe)
@@ -34,13 +47,83 @@ const (
 //   - Only the reservation owner (lease holder) may dispatch
 type DispatchExecutor struct {
 	handler  Handler
-	store    *idempotency.Store
+	store    idempotency.EffectStore
+	signer   *evidence.Signer
 	mu       sync.Mutex
 	inFlight map[string]context.CancelFunc
+	// preFinalizeHook, when set, runs after the terminal decision and
+	// before Finalize — a test seam for simulating slow evidence
+	// verification while the lease heartbeat must keep the lease alive.
+	preFinalizeHook func()
+	// postDispatchHook, when set, runs immediately after the provider
+	// returns and before the observation is persisted — a test seam for
+	// simulating a crash inside the observation window.
+	postDispatchHook func()
+	// crashHook, when set, is invoked at every CrashPoint in the
+	// execution path — a deterministic failure-injection seam for
+	// crash/qualification testing. The hook may do anything (close the
+	// database, panic, os.Exit); the executor makes no guarantees
+	// after it runs.
+	crashHook func(CrashPoint)
+}
+
+// CrashPoint names a deterministic boundary in the execution path at
+// which a crash can be injected. The set covers every durable
+// transition so qualification tests can kill the executor — or the
+// process — at each state boundary and assert the recovery contract:
+// pre-dispatch crash → safely abandoned or FAILED; post-dispatch
+// crash → UNKNOWN and reconcilable, never silently lost.
+type CrashPoint string
+
+const (
+	// CrashAfterAcquire — lease acquired, before any state transition.
+	CrashAfterAcquire CrashPoint = "after_acquire"
+	// CrashAfterBeginExecution — EXECUTING persisted, before the
+	// recovery locator / IN_FLIGHT transition.
+	CrashAfterBeginExecution CrashPoint = "after_begin_execution"
+	// CrashAfterMarkInFlight — IN_FLIGHT and the recovery locator are
+	// durable, but the provider has not been invoked.
+	CrashAfterMarkInFlight CrashPoint = "after_mark_in_flight"
+	// CrashBeforeProvider — heartbeat started, provider invocation
+	// about to begin.
+	CrashBeforeProvider CrashPoint = "before_provider"
+	// CrashAfterProvider — provider returned; no observation,
+	// recovery, or terminal state persisted yet.
+	CrashAfterProvider CrashPoint = "after_provider"
+	// CrashBeforeObservation — about to persist the provider
+	// observation.
+	CrashBeforeObservation CrashPoint = "before_observation"
+	// CrashAfterObservation — provider observation persisted (or
+	// attempted), before the terminal decision.
+	CrashAfterObservation CrashPoint = "after_observation"
+	// CrashBeforeFinalize — terminal receipt built and (for CRITICAL)
+	// signed, about to call Finalize.
+	CrashBeforeFinalize CrashPoint = "before_finalize"
+	// CrashAfterFinalize — terminal state durably committed.
+	CrashAfterFinalize CrashPoint = "after_finalize"
+	// CrashBeforeRecovery — about to persist the UNKNOWN recovery
+	// transition.
+	CrashBeforeRecovery CrashPoint = "before_recovery"
+	// CrashAfterRecovery — UNKNOWN durably persisted.
+	CrashAfterRecovery CrashPoint = "after_recovery"
+)
+
+// fireCrashPoint invokes the configured crash hook at p.
+func (e *DispatchExecutor) fireCrashPoint(p CrashPoint) {
+	if e.crashHook != nil {
+		e.crashHook(p)
+	}
+}
+
+// SetCrashHook installs a failure-injection hook invoked at every
+// CrashPoint. Passing nil disables it. Intended for crash and
+// adversarial qualification tests.
+func (e *DispatchExecutor) SetCrashHook(h func(CrashPoint)) {
+	e.crashHook = h
 }
 
 // NewDispatchExecutor creates a new dispatch executor with durable idempotency.
-func NewDispatchExecutor(handler Handler, store *idempotency.Store) *DispatchExecutor {
+func NewDispatchExecutor(handler Handler, store idempotency.EffectStore) *DispatchExecutor {
 	return &DispatchExecutor{
 		handler:  handler,
 		store:    store,
@@ -48,11 +131,20 @@ func NewDispatchExecutor(handler Handler, store *idempotency.Store) *DispatchExe
 	}
 }
 
+// SetEvidenceSigner configures the Ed25519 receipt signer used to attest
+// CRITICAL terminal outcomes. Without a signer, CRITICAL finalization
+// cannot produce the signed evidence receipt the store requires, so
+// CRITICAL executions fail closed into UNKNOWN recovery.
+func (e *DispatchExecutor) SetEvidenceSigner(s *evidence.Signer) {
+	e.signer = s
+}
+
 // ExecuteWithIdempotency executes a request with durable idempotency.
 func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Request, desc capability.ResolvedDescriptor) Response {
 	// For PURE and READ, skip idempotency (no side effects)
 	if desc.ExecutionClass == capability.ClassPure || desc.ExecutionClass == capability.ClassRead {
-		return e.dispatch(ctx, req, desc)
+		resp, _ := e.dispatch(ctx, req, desc)
+		return resp
 	}
 
 	// For MUTATION and CRITICAL, durable idempotency is REQUIRED.
@@ -65,14 +157,28 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		}
 	}
 
-	// Compute request digest
-	digest, err := idempotency.ComputeDigestFromRaw(
+	// Provider capability gate — a CRITICAL execution is admitted only
+	// when the provider declares it can prove both completion and
+	// non-effect; anything less could never be reconciled to a
+	// terminal state after post-dispatch ambiguity.
+	if denied := checkCriticalProviderCapability(e.handler, desc); denied != nil {
+		return *denied
+	}
+
+	// Compute request digest. The resolved authority generation and
+	// grant digest are bound into the execution identity so the same
+	// grant_id under different immutable authority material is a
+	// different request — reissuing or mutating a grant never silently
+	// reinterprets a durable execution or idempotency key.
+	digest, err := idempotency.ComputeDigestFromRawWithAuthority(
 		1, // protocol version
 		req.Authority.Principal,
 		req.Capability,
 		req.Arguments,
 		req.Authority.EffectiveAuthorityRef(),
 		string(desc.ExecutionClass),
+		req.Authority.AuthorityGeneration,
+		req.Authority.AuthorityDigest,
 	)
 	if err != nil {
 		return Response{
@@ -82,20 +188,29 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		}
 	}
 
-	// Reserve the request atomically.
-	// Acquired=true means THIS caller owns the reservation and may dispatch.
-	// Acquired=false means another caller owns it or the record is terminal.
-	reserve, err := e.store.Reserve(ctx, req.IdempotencyKey, req.Authority.Principal, req.Capability, digest, req.Authority.EffectiveAuthorityRef(), string(desc.ExecutionClass))
+	// Acquire the execution atomically using the typed API.
+	// The lease duration comes from the store's LeaseConfig.
+	leaseCfg := e.store.LeaseConfig()
+	leaseDuration := leaseCfg.DefaultDuration
+	if leaseDuration <= 0 {
+		leaseDuration = idempotency.DefaultLeaseDuration
+	}
+	acq, err := e.store.AcquireWithAuthority(ctx, req.IdempotencyKey, req.Authority.Principal, req.Capability, digest,
+		idempotency.AuthorityBinding{
+			Ref:        req.Authority.EffectiveAuthorityRef(),
+			Generation: req.Authority.AuthorityGeneration,
+			Digest:     req.Authority.AuthorityDigest,
+		}, string(desc.ExecutionClass), leaseDuration)
 	if err != nil {
 		return Response{
 			Status:      StatusFailed,
 			FailureCode: string(capability.FailureInternalError),
-			Error:       fmt.Sprintf("idempotency reserve failed: %v", err),
+			Error:       fmt.Sprintf("idempotency acquire failed: %v", err),
 		}
 	}
 
 	// Check for conflict — same key, different request
-	if reserve.Conflict {
+	if acq.Kind == idempotency.IdempotencyConflict {
 		return Response{
 			Status:      StatusDenied,
 			FailureCode: string(capability.FailureIdempotencyConflict),
@@ -104,113 +219,263 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	}
 
 	// Check for existing terminal result — replay the stored result.
-	// Acquired=false means we did NOT create this reservation.
-	if !reserve.Acquired && reserve.Record != nil && reserve.State.IsTerminal() {
+	// Terminal replay must use the STORED provider identity, not the
+	// current adapter. The stored provider_id/provider_run_id are part
+	// of the audit trail for CRITICAL operations.
+	if acq.Kind == idempotency.TerminalReplay && acq.Record != nil {
+		replayProvider := acq.Record.ProviderID
+		replayRunID := acq.Record.ProviderRunID
+		if replayProvider == "" {
+			replayProvider = desc.AdapterID
+		}
+		if replayRunID == "" {
+			replayRunID = acq.Record.ExecutionID
+		}
 		return Response{
-			Status:   string(reserve.State),
-			Result:   reserve.Record.Result,
-			Evidence: parseEvidence(reserve.Record.EvidenceDigest, reserve.Record.ReceiptVersion),
+			Status:   stateToStatus(acq.State),
+			Result:   acq.Record.Result,
+			Evidence: parseEvidence(acq.Record.EvidenceDigest, acq.Record.ReceiptVersion),
 			Execution: &ExecutionMeta{
-				Provider: desc.AdapterID,
-				RunID:    reserve.Record.ExecutionID,
+				Provider: replayProvider,
+				RunID:    replayRunID,
 			},
 		}
 	}
 
 	// Check for existing in-flight — another caller owns the reservation
 	// or the record is in a non-terminal state.
-	// Acquired=false means we do NOT own this execution.
-	if !reserve.Acquired {
+	if !acq.Acquired() {
+		replayProvider := desc.AdapterID
+		replayRunID := ""
+		if acq.Record != nil {
+			replayRunID = acq.Record.ExecutionID
+			if acq.Record.ProviderRunID != "" {
+				replayRunID = acq.Record.ProviderRunID
+			}
+			if acq.Record.ProviderID != "" {
+				replayProvider = acq.Record.ProviderID
+			}
+		}
+		if acq.Kind == idempotency.RecoveryRequired {
+			// The record is UNKNOWN — caller-terminal, not in-flight.
+			// The prior dispatch outcome could not be determined and
+			// reconciliation owns the record; reporting IN_FLIGHT
+			// would invite the caller to wait or retry an operation
+			// that may already have executed.
+			return Response{
+				Status:      StatusUnknown,
+				FailureCode: string(capability.FailureExecutionUnknown),
+				Error:       "prior execution outcome is unknown and under reconciliation — do not retry",
+				Execution: &ExecutionMeta{
+					Provider: replayProvider,
+					RunID:    replayRunID,
+				},
+			}
+		}
 		return Response{
 			Status:      StatusInFlight,
 			FailureCode: string(capability.FailureInFlight),
 			Execution: &ExecutionMeta{
-				Provider: desc.AdapterID,
-				RunID:    reserve.Record.ExecutionID,
+				Provider: replayProvider,
+				RunID:    replayRunID,
 			},
 		}
 	}
 
-	// Acquired=true — THIS caller owns the reservation and holds the lease.
+	// Acquired — THIS caller owns the reservation and holds the lease.
 	// Only now may we dispatch.
-	executionID := reserve.Record.ExecutionID
-	leaseToken := reserve.LeaseToken
+	executionID := acq.Record.ExecutionID
+	leaseToken := acq.LeaseToken
+	leaseGen := acq.Generation
+	e.fireCrashPoint(CrashAfterAcquire)
 
-	// Mark as DISPATCHING using CAS (only lease holder may transition).
-	// This is PRE_DISPATCH — if this fails, return FAILED (safe).
-	if err := e.store.TransitionState(ctx, executionID, leaseToken, idempotency.StateReserved, idempotency.StateDispatching); err != nil {
+	// Deadline preflight BEFORE the dispatch boundary: an already-expired
+	// deadline is a provable no-effect failure — the handler will never
+	// run. IN_FLIGHT must continue to mean "provider invocation may have
+	// begun"; marking it before this check would let a crash in the gap
+	// strand a record in UNKNOWN that provably never ran, which a
+	// negative provider lookup may never resolve. Abandon returns the
+	// record to claimable PREPARED so a retry with a valid deadline
+	// reacquires immediately — the expired deadline is not a durable
+	// terminal outcome. The check inside dispatch() remains for the
+	// residual window where the deadline expires between this preflight
+	// and handler invocation (the record is legitimately IN_FLIGHT then).
+	if expired := deadlineExpired(req.Deadline); expired {
+		e.abandonPreDispatch(ctx, executionID, leaseToken, leaseGen)
 		return Response{
-			Status:      StatusFailed,
-			FailureCode: string(capability.FailureInternalError),
-			Error:       fmt.Sprintf("failed to transition to DISPATCHING (lease lost or state changed): %v", err),
+			Status:            StatusFailed,
+			FailureCode:       string(capability.FailureInvalidRequest),
+			Error:             fmt.Sprintf("request deadline %s already passed", req.Deadline),
+			DefinitiveFailure: true,
 		}
 	}
 
+	// Mark as EXECUTING using the typed API (fenced by token + generation).
+	// This is PRE_DISPATCH — if this fails, return FAILED (safe).
+	if err := e.store.BeginExecution(ctx, executionID, leaseToken, leaseGen); err != nil {
+		e.abandonPreDispatch(ctx, executionID, leaseToken, leaseGen)
+		return Response{
+			Status:      StatusFailed,
+			FailureCode: string(capability.FailureInternalError),
+			Error:       fmt.Sprintf("failed to begin execution (lease lost or state changed): %v", err),
+		}
+	}
+	e.fireCrashPoint(CrashAfterBeginExecution)
+
 	// ─── IN_FLIGHT: the dispatch boundary ───────────────────────────────────
-	// Transition to IN_FLIGHT immediately before handler.Execute.
-	// IN_FLIGHT has precise semantics: the dispatch boundary has been
-	// crossed — the request is with the provider. A crash in DISPATCHING
-	// is pre-dispatch (safe to reclaim); a crash in IN_FLIGHT is
-	// post-dispatch (mark UNKNOWN for reconciliation, never blind-retry).
-	if err := e.store.TransitionState(ctx, executionID, leaseToken, idempotency.StateDispatching, idempotency.StateInFlight); err != nil {
+	// Persist the recovery locator BEFORE crossing IN_FLIGHT.
+	// The locator carries enough information for a RecoveryResolver to
+	// query the provider and determine whether the side effect occurred.
+	// Providers implementing RecoveryLocatorProvider supply a minimal
+	// provider-specific locator; anything else gets a metadata-only
+	// generic locator (never raw arguments).
+	recoveryLocator, err := e.prepareRecoveryLocator(ctx, req, desc, digest, executionID)
+	if err != nil {
+		// Pre-dispatch failure — no side effect could have occurred.
+		e.abandonPreDispatch(ctx, executionID, leaseToken, leaseGen)
+		return Response{
+			Status:      StatusFailed,
+			FailureCode: string(capability.FailureInternalError),
+			Error:       fmt.Sprintf("failed to prepare recovery locator: %v", err),
+		}
+	}
+	locatorRaw, err := json.Marshal(recoveryLocator)
+	if err != nil {
+		e.abandonPreDispatch(ctx, executionID, leaseToken, leaseGen)
+		return Response{
+			Status:      StatusFailed,
+			FailureCode: string(capability.FailureInternalError),
+			Error:       fmt.Sprintf("failed to marshal recovery locator: %v", err),
+		}
+	}
+	if len(locatorRaw) > idempotency.MaxRecoveryLocatorBytes {
+		e.abandonPreDispatch(ctx, executionID, leaseToken, leaseGen)
+		return Response{
+			Status:      StatusFailed,
+			FailureCode: string(capability.FailureInternalError),
+			Error: fmt.Sprintf("recovery locator exceeds %d bytes (got %d)",
+				idempotency.MaxRecoveryLocatorBytes, len(locatorRaw)),
+		}
+	}
+	if err := e.store.MarkInFlight(ctx, executionID, leaseToken, leaseGen, desc.AdapterID, locatorRaw); err != nil {
+		e.abandonPreDispatch(ctx, executionID, leaseToken, leaseGen)
 		return Response{
 			Status:      StatusFailed,
 			FailureCode: string(capability.FailureInternalError),
 			Error:       fmt.Sprintf("failed to transition to IN_FLIGHT (lease lost or state changed): %v", err),
 		}
 	}
+	e.fireCrashPoint(CrashAfterMarkInFlight)
+
+	// Lease heartbeat — renew the lease while the provider is
+	// executing. Without this, a long-running provider call can exceed
+	// the lease duration, causing the record to become UNKNOWN even
+	// though the provider eventually succeeds. The heartbeat uses the
+	// store's LeaseConfig for renewal interval and duration.
+	//
+	// The heartbeat is detached from the caller's cancellation: the
+	// dispatch boundary is already crossed (IN_FLIGHT is persisted),
+	// so the lease must stay valid while the provider call runs AND
+	// while mandatory post-dispatch persistence completes on the
+	// detached durability context below. Deriving the heartbeat from
+	// ctx would let a caller disconnect kill lease renewal mid-
+	// finalization, opening a window where another worker reclaims
+	// the record while this executor is still committing the outcome.
+	// The heartbeat stops only when Execute returns — after the
+	// terminal or recovery state is durably persisted.
+	heartbeatCtx, heartbeatCancel := context.WithCancel(context.WithoutCancel(ctx))
+	defer heartbeatCancel()
+	go e.leaseHeartbeat(heartbeatCtx, executionID, leaseToken, leaseGen)
 
 	// Dispatch — from this point, we are POST_DISPATCH.
 	// Any failure after this point is UNKNOWN (may have executed).
-	resp := e.dispatch(ctx, req, desc)
+	// The external token persisted in the recovery locator is injected
+	// into the dispatch context so the provider uses the SAME token in
+	// the external request — the stable external operation identity.
+	dispatchCtx := ctx
+	if recoveryLocator.ExternalToken != "" {
+		dispatchCtx = context.WithValue(ctx, externalTokenKey{}, recoveryLocator.ExternalToken)
+	}
+	e.fireCrashPoint(CrashBeforeProvider)
+	resp, provableNoEffect := e.dispatch(dispatchCtx, req, desc)
+	e.fireCrashPoint(CrashAfterProvider)
 
-	// ─── CRITICAL EVIDENCE VALIDATION BEFORE PERSISTENCE ──────────────────
-	// The evidence contract MUST be validated BEFORE the terminal state
-	// is persisted. Persisting SUCCEEDED with invalid evidence would
-	// create a poisoned record that replays invalid evidence on retry.
-	if desc.ExecutionClass.RequiresEvidence() && resp.Status == StatusSucceeded {
-		if resp.Evidence == nil || resp.Evidence.Digest == "" {
-			resp = Response{
-				Status:      StatusFailed,
-				FailureCode: string(capability.FailureExecutionFailed),
-				Error:       "CRITICAL capability returned SUCCEEDED without evidence digest",
-				Execution:   resp.Execution,
-			}
-		} else if !isValidEvidenceDigest(resp.Evidence.Digest) {
-			resp = Response{
-				Status:      StatusFailed,
-				FailureCode: string(capability.FailureExecutionFailed),
-				Error:       "CRITICAL capability returned invalid evidence digest (must be 64-char lowercase hex)",
-				Execution:   resp.Execution,
-			}
-		} else if resp.Evidence.ReceiptVersion != 3 {
-			resp = Response{
-				Status:      StatusFailed,
-				FailureCode: string(capability.FailureExecutionFailed),
-				Error:       fmt.Sprintf("CRITICAL capability returned receipt_version %d (must be 3)", resp.Evidence.ReceiptVersion),
-				Execution:   resp.Execution,
-			}
-		} else if resp.Execution == nil || resp.Execution.RunID == "" {
-			resp = Response{
-				Status:      StatusFailed,
-				FailureCode: string(capability.FailureExecutionFailed),
-				Error:       "CRITICAL capability returned SUCCEEDED without run_id",
-			}
+	// The provider has answered. Everything from here until the terminal
+	// write is mandatory persistence — it must survive caller
+	// cancellation and service shutdown, so it runs on a bounded context
+	// detached from ctx's cancellation (values are preserved).
+	durabilityCtx, durabilityCancel := context.WithTimeout(
+		context.WithoutCancel(ctx), postDispatchPersistBudget)
+	defer durabilityCancel()
+
+	// ─── DURABLE PROVIDER OBSERVATION ────────────────────────────────────
+	// Persist the provider's response metadata BEFORE any terminal
+	// decision. If the record races into UNKNOWN (lease expiry claimed
+	// by a reconciler) or Finalize fails, the observation — provider_id,
+	// provider_run_id, evidence digest, result — is already durable and
+	// does not depend on winning another state-transition race.
+	// RecordProviderObservation accepts both the fenced IN_FLIGHT write
+	// and the already-UNKNOWN update.
+	//
+	// providerResp preserves the raw provider response — the classifier
+	// may rewrite resp to an UNKNOWN wire response, but the durable
+	// observation must always carry what the provider actually said.
+	providerResp := resp
+	// A definitive failure the EXECUTOR itself proved pre-transmission
+	// (the handler was never invoked) still yields attestable evidence:
+	// the dispatcher's synthesized failure record. The handler's
+	// DefinitiveFailure flag is only a routing hint — a handler that
+	// performed the effect and then asserts the flag must not be able
+	// to conjure signed NO_EFFECT proof, so synthesis requires the
+	// executor's own provable-no-effect provenance. A handler-claimed
+	// definitive failure without a real artifact fails closed to
+	// UNKNOWN at the CRITICAL sign gate below.
+	if len(resp.EvidenceArtifact) == 0 && resp.DefinitiveFailure && provableNoEffect {
+		resp.EvidenceArtifact, _ = json.Marshal(map[string]string{
+			"definitive_failure": "true",
+			"failure_code":       resp.FailureCode,
+			"error":              resp.Error,
+		})
+		// classifyPostDispatch runs on providerResp — keep the
+		// artifact visible there too or the CRITICAL sign gate
+		// never sees it.
+		providerResp.EvidenceArtifact = resp.EvidenceArtifact
+	}
+	// Evidence authenticity boundary: the evidence digest is recomputed
+	// from the provider's evidence ARTIFACT bytes, never taken from a
+	// handler-supplied digest string. What the trusted signer attests
+	// is a digest Crabedence itself computed — a handler cannot invent
+	// a digest and have it blessed.
+	if len(resp.EvidenceArtifact) > 0 {
+		sum := sha256.Sum256(resp.EvidenceArtifact)
+		recomputed := fmt.Sprintf("%x", sum)
+		if resp.Evidence == nil {
+			resp.Evidence = &EvidenceRef{ReceiptVersion: 3}
 		}
+		resp.Evidence.Digest = recomputed
+		providerResp.Evidence = resp.Evidence
+	} else {
+		// A digest the executor cannot recompute from provider bytes is
+		// unverifiable — drop it rather than persist or attest a claim
+		// the ledger cannot prove.
+		resp.Evidence = nil
+		providerResp.Evidence = nil
 	}
+	if e.postDispatchHook != nil {
+		e.postDispatchHook()
+	}
+	e.fireCrashPoint(CrashBeforeObservation)
+	obsErr := e.recordObservation(durabilityCtx, executionID, leaseToken, leaseGen, providerResp, desc)
+	e.fireCrashPoint(CrashAfterObservation)
 
-	// ─── DETERMINE TERMINAL STATE ──────────────────────────────────────────
-	var state idempotency.State
-	switch resp.Status {
-	case StatusSucceeded:
-		state = idempotency.StateSucceeded
-	case StatusFailed:
-		state = idempotency.StateFailed
-	case StatusDenied:
-		state = idempotency.StateDenied
-	default:
-		state = idempotency.StateUnknown
-	}
+	// The heartbeat stays alive through finalization — the lease must
+	// remain valid while we validate evidence, construct the receipt,
+	// and commit the terminal state. Cancelling it here would create
+	// a window where the lease expires between provider return and
+	// Finalize.
+
+	// ─── TERMINAL DECISION — single post-dispatch decision table ─────────
+	state, resp := classifyPostDispatch(providerResp, desc)
 
 	evidenceDigest := ""
 	receiptVersion := 0
@@ -224,23 +489,189 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	// the expected state must match, and terminal states are immutable.
 	// A second identical finalize is idempotent; a conflicting receipt
 	// is rejected as FINALIZATION_CONFLICT.
-	if err := e.store.Finalize(ctx, executionID, leaseToken, idempotency.StateInFlight, state, resp.Result, evidenceDigest, receiptVersion); err != nil {
-		// Finalization failed AFTER dispatch — return UNKNOWN.
-		// The side effect may have occurred; we cannot claim FAILED.
-		// This could be because:
-		//   - we lost the lease (another worker took over)
-		//   - the state changed unexpectedly
-		//   - a conflicting finalization already occurred
+	//
+	// If the handler returned an ambiguous result after IN_FLIGHT
+	// (post-dispatch uncertainty), the state is UNKNOWN — we do NOT
+	// finalize as FAILED. The side effect may have occurred.
+	if state == idempotency.StateUnknown {
+		// Post-dispatch uncertainty — enter recovery carrying the
+		// ORIGINAL provider observation (already persisted above; the
+		// atomic transition also writes it). Do not finalize.
+		recErr := e.enterRecoveryWithObservation(durabilityCtx, executionID, providerResp, desc)
+		errMsg := "post-dispatch ambiguity: entered recovery (side effect may have occurred)"
+		if recErr != nil {
+			errMsg = fmt.Sprintf("post-dispatch ambiguity: %v", recErr)
+		}
+		if obsErr != nil {
+			errMsg += fmt.Sprintf("; provider observation NOT persisted: %v", obsErr)
+		}
 		return Response{
 			Status:      StatusUnknown,
 			FailureCode: string(capability.FailureExecutionUnknown),
-			Error:       fmt.Sprintf("failed to finalize execution after dispatch: %v", err),
+			Error:       errMsg,
 			Execution: &ExecutionMeta{
 				Provider: desc.AdapterID,
 				RunID:    executionID,
 			},
 		}
 	}
+
+	// The durable provider observation is part of the record the
+	// terminal receipt attests. If the write failed — including a
+	// monotonic conflict with a previously stored observation — the
+	// terminal outcome must not be committed over it: the receipt
+	// would contradict the durable observation. Route to UNKNOWN so
+	// reconciliation sees the record rather than sealing the
+	// contradiction into an immutable terminal state.
+	if obsErr != nil {
+		recErr := e.enterRecoveryWithObservation(durabilityCtx, executionID, providerResp, desc)
+		errMsg := fmt.Sprintf("provider observation not persisted: %v", obsErr)
+		if recErr != nil {
+			errMsg += fmt.Sprintf("; %v", recErr)
+		}
+		return Response{
+			Status:      StatusUnknown,
+			FailureCode: string(capability.FailureExecutionUnknown),
+			Error:       errMsg,
+			Execution: &ExecutionMeta{
+				Provider: desc.AdapterID,
+				RunID:    executionID,
+			},
+		}
+	}
+
+	providerID := ""
+	providerRunID := ""
+	if resp.Execution != nil {
+		providerID = resp.Execution.Provider
+		providerRunID = resp.Execution.RunID
+	}
+	if providerID == "" {
+		// The provider that performed the operation is always the
+		// resolved adapter — fall back to it rather than leaving the
+		// receipt's provider identity empty.
+		providerID = desc.AdapterID
+	}
+
+	// The unified terminal policy requires every definitive outcome to
+	// carry proof — an evidence digest or a result payload. A definitive
+	// failure without a provider result is recorded as an error payload
+	// so the receipt is never empty.
+	canonicalResult := resp.Result
+	if len(canonicalResult) == 0 && state == idempotency.StateFailed {
+		canonicalResult, _ = json.Marshal(map[string]string{
+			"error":        resp.Error,
+			"failure_code": resp.FailureCode,
+		})
+	}
+
+	receipt := idempotency.TerminalReceipt{
+		ExecutionID:     executionID,
+		Capability:      req.Capability,
+		Principal:       req.Authority.Principal,
+		RequestDigest:   digest,
+		TerminalStatus:  state,
+		CanonicalResult: canonicalResult,
+		ProviderID:      providerID,
+		ProviderRunID:   providerRunID,
+		EvidenceDigest:  evidenceDigest,
+		ReceiptVersion:  receiptVersion,
+	}
+
+	// CRITICAL proof authenticity: attest the terminal outcome with a
+	// signed effect receipt binding the evidence digest, provider/run
+	// identity, and execution/request identity. The store verifies the
+	// signature and binding against trusted signers — a well-formed but
+	// unsigned digest is not proof. Without a configured signer the
+	// receipt stays unsigned and the store fails closed below.
+	// A CRITICAL terminal outcome can only be attested when the
+	// handler supplied an evidence ARTIFACT — bytes the digest was
+	// recomputed from. Without an artifact there is nothing to prove;
+	// leave the receipt unsigned and the store fails closed below.
+	if desc.ExecutionClass == capability.ClassCritical && e.signer != nil && len(resp.EvidenceArtifact) > 0 {
+		// The signed outcome is the semantic attestation about the
+		// external world, not the state name: COMMITTED requires
+		// COMPLETED proof; FAILED requires NO_EFFECT proof.
+		outcome := evidence.OutcomeCompleted
+		if state == idempotency.StateFailed {
+			outcome = evidence.OutcomeNoEffect
+		}
+		signed, signErr := e.signer.Sign(evidence.Binding{
+			ExecutionID:    executionID,
+			Capability:     req.Capability,
+			Principal:      req.Authority.Principal,
+			RequestDigest:  digest,
+			ProviderID:     providerID,
+			ProviderRunID:  providerRunID,
+			Outcome:        outcome,
+			EvidenceSHA256: evidenceDigest,
+		})
+		if signErr != nil {
+			// Cannot produce the required proof — treat as post-dispatch
+			// uncertainty, not a terminal outcome.
+			recErr := e.enterRecoveryWithObservation(durabilityCtx, executionID, providerResp, desc)
+			errMsg := fmt.Sprintf("failed to sign CRITICAL evidence receipt: %v", signErr)
+			if recErr != nil {
+				errMsg += fmt.Sprintf("; %v", recErr)
+			}
+			return Response{
+				Status:      StatusUnknown,
+				FailureCode: string(capability.FailureExecutionUnknown),
+				Error:       errMsg,
+				Execution: &ExecutionMeta{
+					Provider: providerID,
+					RunID:    providerRunID,
+				},
+			}
+		}
+		receipt.EvidenceReceipt = signed
+	}
+
+	// Look up the lease generation for the fenced finalize.
+	rec, err := e.store.Lookup(durabilityCtx, executionID)
+	if err != nil {
+		return Response{
+			Status:      StatusUnknown,
+			FailureCode: string(capability.FailureExecutionUnknown),
+			Error:       fmt.Sprintf("failed to lookup execution for finalize: %v", err),
+			Execution: &ExecutionMeta{
+				Provider: desc.AdapterID,
+				RunID:    executionID,
+			},
+		}
+	}
+
+	if e.preFinalizeHook != nil {
+		e.preFinalizeHook()
+	}
+	e.fireCrashPoint(CrashBeforeFinalize)
+	if err := e.store.Finalize(durabilityCtx, executionID, leaseToken, rec.LeaseGeneration, idempotency.StateInFlight, receipt); err != nil {
+		// Finalization failed AFTER dispatch — the side effect may
+		// have occurred. The provider observation was already persisted
+		// durably right after the provider returned; the recovery
+		// transition below also writes it atomically. Report persistence
+		// honestly — never claim the observation was stored if it wasn't.
+		recErr := e.enterRecoveryWithObservation(durabilityCtx, executionID, providerResp, desc)
+		errMsg := fmt.Sprintf("failed to finalize execution after dispatch: %v", err)
+		if recErr == nil {
+			errMsg += " (provider observation persisted)"
+		} else {
+			errMsg += fmt.Sprintf(" (%v)", recErr)
+		}
+		if obsErr != nil {
+			errMsg += fmt.Sprintf("; earlier observation write failed: %v", obsErr)
+		}
+		return Response{
+			Status:      StatusUnknown,
+			FailureCode: string(capability.FailureExecutionUnknown),
+			Error:       errMsg,
+			Execution: &ExecutionMeta{
+				Provider: providerID,
+				RunID:    providerRunID,
+			},
+		}
+	}
+	e.fireCrashPoint(CrashAfterFinalize)
 
 	// Add execution metadata
 	if resp.Execution == nil {
@@ -253,27 +684,272 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	return resp
 }
 
+// deadlineExpired reports whether the request deadline is already past.
+// Malformed deadlines return false here — schema validation owns that
+// rejection; this check only guards timing.
+func deadlineExpired(deadline string) bool {
+	if deadline == "" {
+		return false
+	}
+	t, err := time.Parse(time.RFC3339, deadline)
+	if err != nil {
+		return false
+	}
+	return !time.Now().Before(t)
+}
+
+// abandonPreDispatch releases the execution lease after a pre-dispatch
+// failure so a retry reclaims immediately instead of waiting for lease
+// expiry. AbandonPreDispatch only touches PREPARED/EXECUTING records,
+// so it is safe even when the preceding transition may have applied
+// server-side (e.g. a dropped connection after MarkInFlight) — a record
+// that crossed the dispatch boundary is never unmarked. On failure the
+// lease expiry path is the backstop.
+func (e *DispatchExecutor) abandonPreDispatch(ctx context.Context, executionID, leaseToken string, leaseGen int) {
+	_ = e.store.AbandonPreDispatch(ctx, executionID, leaseToken, leaseGen)
+}
+
 // dispatch sends the request to the handler.
 // This crosses the dispatch boundary — any failure after this call
 // begins is POST_DISPATCH (may have executed).
-func (e *DispatchExecutor) dispatch(ctx context.Context, req Request, desc capability.ResolvedDescriptor) Response {
+//
+// The second return value reports executor-established pre-transmission
+// provenance: true only when the executor itself proved the provider was
+// never invoked (e.g. an already-expired deadline). A handler-set
+// DefinitiveFailure is a routing hint, not proof — only responses with
+// executor provenance may be synthesized into attestable no-effect
+// evidence upstream.
+func (e *DispatchExecutor) dispatch(ctx context.Context, req Request, desc capability.ResolvedDescriptor) (Response, bool) {
 	// Set a timeout if deadline is provided
 	dispatchCtx := ctx
 	if req.Deadline != "" {
 		deadline, err := time.Parse(time.RFC3339, req.Deadline)
 		if err == nil {
 			remaining := time.Until(deadline)
-			if remaining > 0 {
-				var cancel context.CancelFunc
-				dispatchCtx, cancel = context.WithTimeout(ctx, remaining)
-				defer cancel()
+			if remaining <= 0 {
+				// The deadline already passed — do not invoke the
+				// handler at all. The provider was never called, so
+				// this is a provable no-effect failure.
+				return Response{
+					Status:            StatusFailed,
+					FailureCode:       string(capability.FailureInvalidRequest),
+					Error:             fmt.Sprintf("request deadline %s already passed", req.Deadline),
+					DefinitiveFailure: true,
+				}, true
 			}
+			var cancel context.CancelFunc
+			dispatchCtx, cancel = context.WithTimeout(ctx, remaining)
+			defer cancel()
 		}
 	}
 
 	// The handler.Execute call crosses the dispatch boundary.
 	resp := e.handler.Execute(dispatchCtx, req, desc)
-	return resp
+	return resp, false
+}
+
+// classifyPostDispatch is the single post-dispatch decision table.
+// Every provider response maps to exactly one durable decision:
+//
+//	Provider result                    Durable decision
+//	───────────────────────────────    ───────────────
+//	SUCCEEDED (evidence valid)         COMMITTED
+//	SUCCEEDED, CRITICAL evidence
+//	  missing/invalid/mismatched       UNKNOWN
+//	FAILED + DefinitiveFailure         FAILED
+//	FAILED (not definitive)            UNKNOWN
+//	DENIED after dispatch              UNKNOWN
+//	anything else                      UNKNOWN
+//
+// DENIED is a pre-dispatch admission concept: after IN_FLIGHT has been
+// persisted the handler cannot prove no side effect occurred, so it maps
+// to UNKNOWN for reconciliation — never to a terminal failure that would
+// permit a blind retry.
+//
+// The returned Response may be rewritten to an UNKNOWN wire response
+// when the provider's answer cannot be trusted; the caller must keep the
+// original response for observation persistence.
+func classifyPostDispatch(resp Response, desc capability.ResolvedDescriptor) (idempotency.State, Response) {
+	unknown := func(reason string) (idempotency.State, Response) {
+		return idempotency.StateUnknown, Response{
+			Status:      StatusUnknown,
+			FailureCode: string(capability.FailureExecutionUnknown),
+			Error:       reason,
+			Execution:   resp.Execution,
+		}
+	}
+
+	// CRITICAL evidence contract — validated before the terminal state
+	// is persisted. Persisting SUCCEEDED with invalid evidence would
+	// create a poisoned record that replays invalid evidence on retry.
+	// Per the durable execution contract: "provider says success +
+	// required evidence invalid/missing → UNKNOWN → reconciliation."
+	if desc.ExecutionClass.RequiresEvidence() && resp.Status == StatusSucceeded {
+		switch {
+		case resp.Evidence == nil || resp.Evidence.Digest == "":
+			return unknown("CRITICAL capability returned SUCCEEDED without evidence digest (post-dispatch uncertainty)")
+		case !isValidEvidenceDigest(resp.Evidence.Digest):
+			return unknown("CRITICAL capability returned invalid evidence digest (post-dispatch uncertainty)")
+		case resp.Evidence.ReceiptVersion != 3:
+			return unknown(fmt.Sprintf("CRITICAL capability returned receipt_version %d (must be 3, post-dispatch uncertainty)", resp.Evidence.ReceiptVersion))
+		case resp.Execution == nil || resp.Execution.RunID == "":
+			return unknown("CRITICAL capability returned SUCCEEDED without run_id (post-dispatch uncertainty)")
+		}
+		return idempotency.StateCommitted, resp
+	}
+
+	switch resp.Status {
+	case StatusSucceeded:
+		return idempotency.StateCommitted, resp
+	case StatusFailed:
+		if resp.DefinitiveFailure {
+			return idempotency.StateFailed, resp
+		}
+		return idempotency.StateUnknown, resp
+	default:
+		return idempotency.StateUnknown, resp
+	}
+}
+
+// buildObservation constructs the provider observation from the
+// provider's response — the durable snapshot persisted before any
+// terminal decision.
+func buildObservation(resp Response, desc capability.ResolvedDescriptor) idempotency.ProviderObservation {
+	obs := idempotency.ProviderObservation{
+		ProviderID:     desc.AdapterID,
+		ProviderStatus: string(resp.Status),
+		Result:         resp.Result,
+	}
+	if resp.Execution != nil {
+		if resp.Execution.Provider != "" {
+			obs.ProviderID = resp.Execution.Provider
+		}
+		obs.ProviderRunID = resp.Execution.RunID
+	}
+	if resp.Evidence != nil {
+		obs.EvidenceDigest = resp.Evidence.Digest
+		obs.ReceiptVersion = resp.Evidence.ReceiptVersion
+	}
+	return obs
+}
+
+// recordObservation durably records the provider's response metadata
+// via Store.RecordProviderObservation. Every provider response is
+// persisted — including status-only responses with no run ID, result,
+// or evidence — because provider_id/provider_status are themselves
+// observation data and provider_observed_at marks that the provider
+// answered at all. Returns the store error so callers can report
+// persistence honestly.
+func (e *DispatchExecutor) recordObservation(ctx context.Context, executionID, leaseToken string, leaseGen int, resp Response, desc capability.ResolvedDescriptor) error {
+	return e.store.RecordProviderObservation(ctx, executionID, leaseToken, leaseGen, buildObservation(resp, desc))
+}
+
+// enterRecoveryWithObservation transitions the record to UNKNOWN while
+// carrying the provider observation atomically. If the record already
+// raced into UNKNOWN (reconciler claimed the expired lease first), it
+// falls back to a direct observation update — the observation is still
+// persisted rather than lost to the CAS race.
+func (e *DispatchExecutor) enterRecoveryWithObservation(ctx context.Context, executionID string, resp Response, desc capability.ResolvedDescriptor) error {
+	e.fireCrashPoint(CrashBeforeRecovery)
+	obs := buildObservation(resp, desc)
+	rec, lookupErr := e.store.Lookup(ctx, executionID)
+	if lookupErr != nil {
+		return fmt.Errorf("recovery entry failed (lookup error: %v); provider observation may not be persisted", lookupErr)
+	}
+	if rec.State == idempotency.StateInFlight {
+		if err := e.store.EnterRecoveryWithObservation(ctx, executionID,
+			idempotency.StateInFlight, rec.Version, obs); err != nil {
+			return fmt.Errorf("recovery entry failed: %v; provider observation may not be persisted", err)
+		}
+		e.fireCrashPoint(CrashAfterRecovery)
+		return nil
+	}
+	if rec.State == idempotency.StateUnknown {
+		// Already in recovery — persist the observation directly.
+		if err := e.store.RecordProviderObservation(ctx, executionID, "", 0, obs); err != nil {
+			return fmt.Errorf("execution already in recovery; observation update failed: %v", err)
+		}
+		e.fireCrashPoint(CrashAfterRecovery)
+		return nil
+	}
+	// Terminal or pre-dispatch state — no recovery needed. A terminal
+	// state here means a concurrent finalizer already committed.
+	if rec.State.IsDurablyFinal() {
+		return nil
+	}
+	return fmt.Errorf("cannot enter recovery from state %s", rec.State)
+}
+
+// recoveryPreparer is the explicit recovery-locator routing contract
+// DispatchExecutor requires of its handler. MultiHandler implements
+// it by delegating to the adapter's handler — the executor never
+// type-asserts into nested handler structure.
+type recoveryPreparer interface {
+	PrepareRecovery(ctx context.Context, adapterID string, in idempotency.RecoveryLocatorInput) (*idempotency.RecoveryLocator, error)
+}
+
+// prepareRecoveryLocator asks the provider for a minimal recovery
+// locator via the RecoveryLocatorProvider contract (delegated through
+// the handler's PrepareRecovery routing). Providers that do not
+// implement the contract get the generic metadata-only locator — raw
+// request arguments are never persisted for them.
+func (e *DispatchExecutor) prepareRecoveryLocator(ctx context.Context, req Request, desc capability.ResolvedDescriptor, digest, executionID string) (*idempotency.RecoveryLocator, error) {
+	in := idempotency.RecoveryLocatorInput{
+		ExecutionID:    executionID,
+		AdapterID:      desc.AdapterID,
+		CapabilityID:   req.Capability,
+		Principal:      req.Authority.Principal,
+		IdempotencyKey: req.IdempotencyKey,
+		RequestDigest:  digest,
+		Arguments:      req.Arguments,
+	}
+	var locator *idempotency.RecoveryLocator
+	if preparer, ok := e.handler.(recoveryPreparer); ok {
+		l, err := preparer.PrepareRecovery(ctx, desc.AdapterID, in)
+		if err != nil {
+			return nil, err
+		}
+		locator = l
+	}
+	if locator == nil {
+		// Generic fallback: metadata only, never raw arguments.
+		locator = genericRecoveryLocator(req, desc, digest, executionID)
+	}
+	return locator, nil
+}
+
+// genericRecoveryLocator is the fallback locator for providers that do
+// not implement RecoveryLocatorProvider. It carries request metadata
+// only — never raw arguments, which may contain sensitive operation
+// data that would otherwise sit in the ledger while UNKNOWN.
+func genericRecoveryLocator(req Request, desc capability.ResolvedDescriptor, digest, executionID string) *idempotency.RecoveryLocator {
+	return &idempotency.RecoveryLocator{
+		Version:        1,
+		ProviderID:     desc.AdapterID,
+		Strategy:       "metadata",
+		RequestDigest:  digest,
+		ExecutionID:    executionID,
+		PrincipalID:    req.Authority.Principal,
+		CapabilityID:   req.Capability,
+		IdempotencyKey: req.IdempotencyKey,
+	}
+}
+
+// externalTokenKey carries the provider external-operation token from
+// the persisted recovery locator to the provider's Execute call, so
+// the token recorded before IN_FLIGHT is the same token used in the
+// external request.
+type externalTokenKey struct{}
+
+// ExternalTokenFromContext returns the provider external-operation
+// token DispatchExecutor persisted in the recovery locator, if any.
+// Providers use it as their idempotency/operation token in the
+// external request.
+func ExternalTokenFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(externalTokenKey{}).(string); ok {
+		return v
+	}
+	return ""
 }
 
 // parseEvidence reconstructs an EvidenceRef from stored evidence data.
@@ -307,4 +983,81 @@ func isValidEvidenceDigest(digest string) bool {
 		}
 	}
 	return true
+}
+
+// stateToStatus maps a durable store state to a wire protocol status.
+// The store uses COMMITTED; the wire protocol uses SUCCEEDED.
+func stateToStatus(state idempotency.State) string {
+	switch state {
+	case idempotency.StateCommitted:
+		return StatusSucceeded
+	case idempotency.StateFailed:
+		return StatusFailed
+	case idempotency.StateDenied:
+		return StatusDenied
+	case idempotency.StateUnknown:
+		return StatusUnknown
+	default:
+		return string(state)
+	}
+}
+
+// leaseHeartbeat periodically renews the lease while a provider call is
+// active. This prevents long-running provider calls from exceeding the
+// lease duration and falling into UNKNOWN despite successful execution.
+//
+// The heartbeat derives its interval and renewal duration from the
+// store's LeaseConfig:
+//   - renewal duration = DefaultDuration (clamped to MaxDuration)
+//   - renewal interval = DefaultDuration - RenewalWindow
+//     (i.e., renew RenewalWindow before expiry)
+//
+// If RenewalWindow is zero or exceeds DefaultDuration, the interval
+// falls back to 80% of DefaultDuration.
+//
+// Renewal failures are logged but do not cancel the provider call —
+// the provider may still succeed, and finalization will fail-closed
+// if the lease was actually lost.
+func (e *DispatchExecutor) leaseHeartbeat(ctx context.Context, executionID, leaseToken string, leaseGeneration int) {
+	cfg := e.store.LeaseConfig()
+
+	// Renewal duration: use the configured default, clamped to max.
+	renewDuration := cfg.DefaultDuration
+	if renewDuration <= 0 {
+		renewDuration = 5 * time.Minute
+	}
+	if cfg.MaxDuration > 0 && renewDuration > cfg.MaxDuration {
+		renewDuration = cfg.MaxDuration
+	}
+
+	// Renewal interval: renew RenewalWindow before expiry.
+	renewalInterval := renewDuration - cfg.RenewalWindow
+	if cfg.RenewalWindow <= 0 || renewalInterval <= 0 {
+		// Fallback: renew at 80% of the lease duration.
+		renewalInterval = renewDuration * 4 / 5
+	}
+	// Floor at 50ms to prevent a degenerate tight loop while still
+	// supporting sub-second leases (used by qualification tests with
+	// deliberately tiny lease durations).
+	if renewalInterval < 50*time.Millisecond {
+		renewalInterval = 50 * time.Millisecond
+	}
+
+	ticker := time.NewTicker(renewalInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := e.store.RenewLease(ctx, executionID, leaseToken, leaseGeneration, renewDuration); err != nil {
+				// Lease renewal failed — the lease may have expired,
+				// been taken over, or the record advanced. Stop renewing.
+				// The provider call continues; if it succeeds, Finalize
+				// will fail-closed on the stale lease.
+				return
+			}
+		}
+	}
 }

@@ -2,6 +2,10 @@ package capability
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"sort"
 	"sync"
 	"time"
 )
@@ -13,6 +17,49 @@ type Grant struct {
 	Capabilities []string // capabilities this grant permits
 	ExpiresAt    time.Time
 	Revoked      bool
+	// Generation is the immutable version of this grant's material.
+	// Reissuing a grant_id produces a new generation row rather than
+	// mutating the already-issued grant, so a durable execution can
+	// prove exactly which authority material admitted it. Zero means
+	// generation tracking is absent (in-memory resolvers).
+	Generation int64
+	// Digest is ComputeGrantDigest's output over this generation's
+	// material, stored at issue time. Empty when generation tracking
+	// is absent.
+	Digest string
+}
+
+// ComputeGrantDigest returns the SHA-256 of the grant's canonical
+// material — grant_id, generation, principal, sorted capabilities, and
+// expiry — hex-encoded. It is deterministic: the same grant material
+// always produces the same digest, and any mutation produces a
+// different one. Execution request digests bind it so that the same
+// grant_id at a different generation is a different authority.
+func ComputeGrantDigest(g *Grant) string {
+	caps := append([]string(nil), g.Capabilities...)
+	sort.Strings(caps)
+	expires := ""
+	if !g.ExpiresAt.IsZero() {
+		expires = g.ExpiresAt.UTC().Format(time.RFC3339Nano)
+	}
+	canonical, err := json.Marshal(struct {
+		GrantID      string   `json:"grant_id"`
+		Generation   int64    `json:"generation"`
+		Principal    string   `json:"principal"`
+		Capabilities []string `json:"capabilities"`
+		ExpiresAt    string   `json:"expires_at"`
+	}{
+		GrantID:      g.ID,
+		Generation:   g.Generation,
+		Principal:    g.Principal,
+		Capabilities: caps,
+		ExpiresAt:    expires,
+	})
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(canonical)
+	return hex.EncodeToString(sum[:])
 }
 
 // IsValid checks whether the grant is valid for the given capability at the given time.
@@ -20,12 +67,21 @@ func (g *Grant) IsValid(capabilityID string, now time.Time) bool {
 	if g == nil {
 		return false
 	}
-	if g.Revoked {
-		return false
-	}
-	if !g.ExpiresAt.IsZero() && now.After(g.ExpiresAt) {
-		return false
-	}
+	return !g.Revoked && !g.Expired(now) && g.HasCapability(capabilityID)
+}
+
+// Expired reports whether the grant is expired at `now`. Resolvers that
+// evaluate expiry against their own database clock inside Resolve
+// already filter expired grants; VerifyAuthority skips this check for
+// them (see ExpiryIsAuthoritative) so the application clock can never
+// veto a grant the authority store's clock considers valid.
+func (g *Grant) Expired(now time.Time) bool {
+	return !g.ExpiresAt.IsZero() && !now.Before(g.ExpiresAt)
+}
+
+// HasCapability reports whether the grant's capability list permits the
+// requested capability. An empty list permits all capabilities.
+func (g *Grant) HasCapability(capabilityID string) bool {
 	if len(g.Capabilities) == 0 {
 		// Empty capabilities means all capabilities (wildcard)
 		return true

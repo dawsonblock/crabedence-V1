@@ -74,8 +74,10 @@ const (
 	// durable idempotency or evidence. Used for typical READ operations.
 	AssuranceStandard AssuranceProfile = "STANDARD"
 
-	// AssuranceDurable: PostgreSQL-backed idempotency, exactly-once
-	// semantics. Used for MUTATION operations.
+	// AssuranceDurable: PostgreSQL-backed idempotency — at-most-once
+	// blind dispatch per idempotency identity, with post-dispatch
+	// ambiguity preserved as UNKNOWN and resolved by provider-specific
+	// reconciliation. Used for MUTATION operations.
 	AssuranceDurable AssuranceProfile = "DURABLE"
 
 	// AssuranceHighAssurance: durable idempotency plus V3 evidence,

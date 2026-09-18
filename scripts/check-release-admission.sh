@@ -78,12 +78,17 @@ for i in $(seq 0 $((GATE_COUNT - 1))); do
   fi
 
   # Cross-check: test-suite gates claiming PASS must have executed tests.
-  # Gates whose names contain "tests" or start with "postgres-" are test
-  # suites; a PASS with tests_executed == 0 means no tests actually ran.
+  # Gates whose names contain "tests", start with "postgres-",
+  # "provider-", "authority-", "effect-fabric-", or "go-race-", or are
+  # the cross-language conformance suite are test suites; a PASS with
+  # tests_executed == 0 means no tests actually ran. This list must stay
+  # in sync with the aggregation pattern in
+  # generate-release-evidence.sh — a test gate missing from it can claim
+  # PASS without executing anything.
   tests_executed="$(jq -r ".gates[$i].tests_executed // \"\"" "$QUAL_FILE")"
   is_test_gate=false
   case "$name" in
-    *tests|postgres-*) is_test_gate=true ;;
+    *tests|postgres-*|effect-fabric-*|authority-*|provider-*|go-race-*|cross-language-conformance) is_test_gate=true ;;
   esac
   if [ "$is_test_gate" = true ] && [ "$status" = "PASS" ]; then
     if [ "$tests_executed" = "" ] || [ "$tests_executed" = "null" ] || [ "$tests_executed" = "0" ]; then

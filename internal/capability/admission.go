@@ -79,44 +79,57 @@ type AdmissionRequest struct {
 // capability for the given principal. This is the real authority
 // verification — not just presence checks.
 //
-// Returns nil if authorized, or a FailureCode + reason if not.
-func (r *Registry) VerifyAuthority(ctx context.Context, req AdmissionRequest, resolver GrantResolver) (FailureCode, string) {
+// On success it returns the resolved grant so the caller can bind the
+// exact immutable authority material (generation + digest) into the
+// execution identity. A nil grant is returned when no grant is
+// required or when authorization fails.
+func (r *Registry) VerifyAuthority(ctx context.Context, req AdmissionRequest, resolver GrantResolver) (*Grant, FailureCode, string) {
 	if req.Principal == "" {
-		return FailureUnauthorized, "missing principal"
+		return nil, FailureUnauthorized, "missing principal"
 	}
 
 	desc, ok := r.Lookup(req.Capability)
 	if !ok {
-		return FailureCapabilityNotFound, fmt.Sprintf("capability not registered: %s", req.Capability)
+		return nil, FailureCapabilityNotFound, fmt.Sprintf("capability not registered: %s", req.Capability)
 	}
 
 	if !desc.AuthorityPolicy.GrantRequired {
-		return "", ""
+		return nil, "", ""
 	}
 
 	if req.GrantID == "" {
-		return FailureUnauthorized, "missing grant_id"
+		return nil, FailureUnauthorized, "missing grant_id"
 	}
 
 	if resolver == nil {
 		// No resolver configured — fail closed for grant-required capabilities
-		return FailureUnauthorized, "no grant resolver configured"
+		return nil, FailureUnauthorized, "no grant resolver configured"
 	}
 
 	grant, err := resolver.Resolve(ctx, req.GrantID, req.Principal)
 	if err != nil {
-		return FailureUnauthorized, fmt.Sprintf("grant resolution failed: %v", err)
+		return nil, FailureUnauthorized, fmt.Sprintf("grant resolution failed: %v", err)
 	}
 
 	if grant == nil {
-		return FailureUnauthorized, fmt.Sprintf("grant not found or not issued to principal: %s", req.GrantID)
+		return nil, FailureUnauthorized, fmt.Sprintf("grant not found or not issued to principal: %s", req.GrantID)
 	}
 
-	if !grant.IsValid(req.Capability, time.Now()) {
-		return FailureUnauthorized, fmt.Sprintf("grant %s does not permit capability %s (expired, revoked, or not authorized)", req.GrantID, req.Capability)
+	// Expiry is evaluated by the resolver's own clock when it declares
+	// ExpiryIsAuthoritative (the PostgreSQL/SQLite authority stores
+	// filter on the database clock inside Resolve) — the application
+	// clock must not veto a grant the authority store's clock considers
+	// valid. Resolvers without a database clock keep the app-time
+	// expiry check here.
+	dbOwnedExpiry := false
+	if ar, ok := resolver.(interface{ ExpiryIsAuthoritative() bool }); ok {
+		dbOwnedExpiry = ar.ExpiryIsAuthoritative()
+	}
+	if grant.Revoked || !grant.HasCapability(req.Capability) || (!dbOwnedExpiry && grant.Expired(time.Now())) {
+		return nil, FailureUnauthorized, fmt.Sprintf("grant %s does not permit capability %s (expired, revoked, or not authorized)", req.GrantID, req.Capability)
 	}
 
-	return "", ""
+	return grant, "", ""
 }
 
 // Admit performs admission checks for an execution request.

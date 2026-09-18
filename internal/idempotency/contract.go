@@ -1,0 +1,504 @@
+// Package idempotency provides the durable execution contract types.
+//
+// This file freezes the contract vocabulary: states, lease errors,
+// acquire results, terminal receipts, and recovery decisions. The
+// Store implementation in store.go satisfies these types.
+package idempotency
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"time"
+)
+
+// ─── State vocabulary ─────────────────────────────────────────────────
+
+// State represents the lifecycle state of an execution request.
+type State string
+
+const (
+	// StatePrepared means no external dispatch has occurred.
+	StatePrepared State = "PREPARED"
+
+	// StateExecuting means an executor owns a lease and is preparing
+	// dispatch. The dispatch boundary has NOT been crossed.
+	StateExecuting State = "EXECUTING"
+
+	// StateInFlight means the dispatch boundary has been crossed and
+	// the effect may have occurred. Persisted before the provider call.
+	StateInFlight State = "IN_FLIGHT"
+
+	// StateUnknown means the durable store cannot currently determine
+	// the real-world result. Caller-terminal but not durably-final.
+	StateUnknown State = "UNKNOWN"
+
+	// StateCommitted means the operation durably succeeded.
+	StateCommitted State = "COMMITTED"
+
+	// StateFailed means the operation definitively failed.
+	StateFailed State = "FAILED"
+
+	// StateDenied means admission denied the request before dispatch.
+	StateDenied State = "DENIED"
+)
+
+// IsCallerTerminal returns true if the state is terminal from the
+// caller's perspective — callers must not retry.
+func (s State) IsCallerTerminal() bool {
+	switch s {
+	case StateCommitted, StateFailed, StateDenied, StateUnknown:
+		return true
+	}
+	return false
+}
+
+// IsDurablyFinal returns true if the state is durably final — no
+// further mutations are permitted, including by reconciliation.
+func (s State) IsDurablyFinal() bool {
+	switch s {
+	case StateCommitted, StateFailed, StateDenied:
+		return true
+	}
+	return false
+}
+
+// IsTerminal is retained for backward compatibility with code that
+// treats UNKNOWN as terminal. Prefer IsCallerTerminal or IsDurablyFinal.
+func (s State) IsTerminal() bool {
+	return s.IsCallerTerminal()
+}
+
+// ─── Lease configuration ──────────────────────────────────────────────
+
+// LeaseConfig defines the lease policy enforced by the store.
+//
+// DefaultDuration is used by the legacy Reserve() wrapper when no
+// explicit duration is provided. New code should use Acquire() with
+// an explicit duration.
+//
+// MaxDuration is the maximum allowed lease duration. Requests for
+// longer durations are rejected by Validate().
+//
+// RenewalWindow is the window before lease expiry during which a
+// lease holder should attempt renewal. It is consumed by the
+// DispatchExecutor lease heartbeat: the heartbeat computes its
+// renewal interval as (DefaultDuration - RenewalWindow), so the
+// first renewal fires RenewalWindow before the lease would expire.
+type LeaseConfig struct {
+	DefaultDuration time.Duration
+	MaxDuration     time.Duration
+	RenewalWindow   time.Duration
+}
+
+// DefaultLeaseConfig is the default lease policy.
+var DefaultLeaseConfig = LeaseConfig{
+	DefaultDuration: 5 * time.Minute,
+	MaxDuration:     30 * time.Minute,
+	RenewalWindow:   1 * time.Minute,
+}
+
+// Validate checks a requested lease duration against the policy.
+// Returns an error for zero, negative, or excessive durations.
+func (c LeaseConfig) Validate(requested time.Duration) error {
+	if requested <= 0 {
+		return LeaseErrorInvalidDuration
+	}
+	if c.MaxDuration > 0 && requested > c.MaxDuration {
+		return LeaseErrorInvalidDuration
+	}
+	return nil
+}
+
+// ─── Typed lease errors ──────────────────────────────────────────────
+
+// LeaseError is a typed error for lease failures.
+type LeaseError string
+
+const (
+	LeaseLost                 LeaseError = "LEASE_LOST"
+	LeaseExpired              LeaseError = "LEASE_EXPIRED"
+	LeaseTokenMismatch        LeaseError = "LEASE_TOKEN_MISMATCH"
+	LeaseGenerationMismatch   LeaseError = "LEASE_GENERATION_MISMATCH"
+	LeaseStateConflict        LeaseError = "STATE_CONFLICT"
+	LeaseRecoveryRequired     LeaseError = "RECOVERY_REQUIRED"
+	LeaseErrorInvalidDuration LeaseError = "INVALID_DURATION"
+	// ProviderObservationConflict is returned when a recorded provider
+	// observation contradicts the already-stored observation — e.g. a
+	// different provider run ID or evidence digest for the same
+	// execution. Provider observations are monotonic: identical
+	// re-observation is idempotent; conflicting observation is rejected.
+	ProviderObservationConflict LeaseError = "PROVIDER_OBSERVATION_CONFLICT"
+	// LocatorTooLarge is returned when a recovery locator exceeds
+	// MaxRecoveryLocatorBytes — locators carry lookup material, not
+	// request payloads.
+	LocatorTooLarge LeaseError = "RECOVERY_LOCATOR_TOO_LARGE"
+	// LocatorContainsSecret is returned when a recovery locator carries
+	// a field on the forbidden-secret denylist (passwords, API keys,
+	// private keys, authorization headers, ...). Locators are lookup
+	// coordinates, never a second copy of sensitive payloads.
+	LocatorContainsSecret LeaseError = "RECOVERY_LOCATOR_CONTAINS_SECRET"
+)
+
+func (e LeaseError) Error() string { return string(e) }
+
+// ─── Clock ────────────────────────────────────────────────────────────
+
+// Clock provides the current time. The store uses clock_timestamp()
+// in PostgreSQL for live deployments, but tests can inject a
+// deterministic clock to control lease expiry without sleeping.
+type Clock interface {
+	Now() time.Time
+}
+
+// SystemClock returns the real wall-clock time.
+type SystemClock struct{}
+
+// Now returns time.Now().
+func (SystemClock) Now() time.Time { return time.Now() }
+
+// FixedClock returns a fixed time. Useful for deterministic tests.
+type FixedClock struct {
+	T time.Time
+}
+
+// Now returns the fixed time.
+func (c FixedClock) Now() time.Time { return c.T }
+
+// ─── Acquire result ──────────────────────────────────────────────────
+
+// AcquireResultKind is the typed outcome of a lease acquisition attempt.
+type AcquireResultKind string
+
+const (
+	LeaseAcquired       AcquireResultKind = "ACQUIRED"
+	LeaseHeldByOther    AcquireResultKind = "HELD_BY_OTHER"
+	LeaseReclaimed      AcquireResultKind = "RECLAIMED"
+	TerminalReplay      AcquireResultKind = "TERMINAL_REPLAY"
+	RecoveryRequired    AcquireResultKind = "RECOVERY_REQUIRED"
+	IdempotencyConflict AcquireResultKind = "IDEMPOTENCY_CONFLICT"
+)
+
+// AcquireResult is the typed outcome of a reservation/acquisition.
+type AcquireResult struct {
+	Kind       AcquireResultKind `json:"kind"`
+	State      State             `json:"state"`
+	Record     *Record           `json:"record,omitempty"`
+	LeaseToken string            `json:"lease_token,omitempty"`
+	Generation int               `json:"generation,omitempty"`
+}
+
+// AuthorityBinding is the immutable authority snapshot bound into the
+// execution at admission: the authority reference plus the generation
+// and grant digest of the exact grant material that admitted the
+// request. It is persisted on the execution record so the ledger can
+// answer "which authority permitted this?" without re-resolving grants,
+// and it is bound into the request digest so the same grant_id under
+// different material is a different execution identity. Zero values
+// mean unversioned authority (in-memory resolvers, grant-free
+// capabilities).
+type AuthorityBinding struct {
+	Ref        string `json:"ref,omitempty"`
+	Generation int64  `json:"generation,omitempty"`
+	Digest     string `json:"digest,omitempty"`
+}
+
+// Acquired returns true if this caller acquired the lease and may
+// proceed to dispatch.
+func (r AcquireResult) Acquired() bool {
+	return r.Kind == LeaseAcquired || r.Kind == LeaseReclaimed
+}
+
+// ─── Terminal receipt ────────────────────────────────────────────────
+
+// TerminalReceipt is the canonical, immutable terminal record for an
+// execution. It is hashed to detect duplicate and conflicting
+// finalization.
+type TerminalReceipt struct {
+	ExecutionID     string          `json:"execution_id"`
+	Capability      string          `json:"capability"`
+	Principal       string          `json:"principal"`
+	RequestDigest   string          `json:"request_digest"`
+	TerminalStatus  State           `json:"terminal_status"`
+	CanonicalResult json.RawMessage `json:"canonical_result,omitempty"`
+	ProviderID      string          `json:"provider_id"`
+	ProviderRunID   string          `json:"provider_run_id"`
+	EvidenceDigest  string          `json:"evidence_digest,omitempty"`
+	ReceiptVersion  int             `json:"receipt_version,omitempty"`
+	// EvidenceReceipt carries the signed effect receipt
+	// (internal/evidence ReceiptV3) for CRITICAL executions. It is
+	// deliberately excluded from Digest(): two signers attesting the
+	// same terminal outcome produce different serialized receipts
+	// (distinct keys and issued_at), and including it would turn
+	// concurrent identical finalization into a false conflict. The
+	// digest still binds EvidenceDigest, which the signed receipt
+	// itself binds — the receipt authenticates the digest.
+	EvidenceReceipt json.RawMessage `json:"evidence_receipt,omitempty"`
+	FinalizedAt     time.Time       `json:"finalized_at"`
+}
+
+// Digest computes the SHA-256 digest of the canonical terminal receipt.
+// This provides a simple equality test for duplicate finalization and
+// makes conflict detection precise.
+//
+// FinalizedAt is excluded from the digest because the store assigns it
+// from clock_timestamp() inside the database transaction — the caller
+// cannot know it before computing the digest. Including a zero value
+// would make the digest meaningless. The digest binds the immutable
+// receipt content (identity, result, provider, evidence, version) but
+// not the transient finalization timestamp.
+func (r TerminalReceipt) Digest() (string, error) {
+	// P2 #8: Canonicalize the result JSON before hashing. A json.RawMessage
+	// preserves the original byte ordering of object keys, which means
+	// {"a":1,"b":2} and {"b":2,"a":1} produce different digests despite
+	// being semantically identical. Parse and re-marshal with sorted keys
+	// so the digest is canonical.
+	canonicalResult, err := canonicalizeJSON(r.CanonicalResult)
+	if err != nil {
+		return "", fmt.Errorf("failed to canonicalize result: %w", err)
+	}
+
+	// Marshal with FinalizedAt excluded.
+	canonical, err := json.Marshal(struct {
+		ExecutionID     string          `json:"execution_id"`
+		Capability      string          `json:"capability"`
+		Principal       string          `json:"principal"`
+		RequestDigest   string          `json:"request_digest"`
+		TerminalStatus  State           `json:"terminal_status"`
+		CanonicalResult json.RawMessage `json:"canonical_result,omitempty"`
+		ProviderID      string          `json:"provider_id"`
+		ProviderRunID   string          `json:"provider_run_id"`
+		EvidenceDigest  string          `json:"evidence_digest,omitempty"`
+		ReceiptVersion  int             `json:"receipt_version,omitempty"`
+	}{
+		ExecutionID:     r.ExecutionID,
+		Capability:      r.Capability,
+		Principal:       r.Principal,
+		RequestDigest:   r.RequestDigest,
+		TerminalStatus:  r.TerminalStatus,
+		CanonicalResult: canonicalResult,
+		ProviderID:      r.ProviderID,
+		ProviderRunID:   r.ProviderRunID,
+		EvidenceDigest:  r.EvidenceDigest,
+		ReceiptVersion:  r.ReceiptVersion,
+	})
+	if err != nil {
+		return "", err
+	}
+	hash := sha256.Sum256(canonical)
+	return hex.EncodeToString(hash[:]), nil
+}
+
+// canonicalizeJSON parses a json.RawMessage and re-marshals it with
+// sorted object keys. This ensures that semantically identical JSON
+// produces identical byte sequences for digest computation.
+// nil or empty input returns nil (which omits the field).
+func canonicalizeJSON(raw json.RawMessage) (json.RawMessage, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var v any
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(&v); err != nil {
+		return nil, err
+	}
+	// Verify complete consumption — trailing data after the first
+	// JSON value means the input is malformed. Decode once more and
+	// require io.EOF: Decoder.More is meant for array/object iteration
+	// and returns false at ']' or '}', so it accepts malformed inputs
+	// like {"a":1}} or 1].
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("invalid JSON: trailing data after first value")
+		}
+		return nil, fmt.Errorf("invalid JSON: %w", err)
+	}
+	return json.Marshal(normalizeNumbers(v))
+}
+
+// ─── Recovery ────────────────────────────────────────────────────────
+
+// RecoveryDecision is the typed outcome of a recovery resolution.
+type RecoveryDecision string
+
+const (
+	RecoveryCommitted RecoveryDecision = "COMMITTED"
+	RecoveryFailed    RecoveryDecision = "FAILED"
+	RecoveryUnknown   RecoveryDecision = "UNKNOWN"
+	RecoveryRetryable RecoveryDecision = "RETRYABLE"
+	RecoveryConflict  RecoveryDecision = "CONFLICT"
+)
+
+// RecoveryResult is the typed result of a recovery resolution.
+type RecoveryResult struct {
+	Decision       RecoveryDecision `json:"decision"`
+	Result         json.RawMessage  `json:"result,omitempty"`
+	EvidenceDigest string           `json:"evidence_digest,omitempty"`
+	ReceiptVersion int              `json:"receipt_version,omitempty"`
+	ProviderID     string           `json:"provider_id,omitempty"`
+	ProviderRunID  string           `json:"provider_run_id,omitempty"`
+	// EvidenceReceipt carries the signed effect receipt (internal/
+	// evidence ReceiptV3) required for CRITICAL recovery decisions.
+	EvidenceReceipt json.RawMessage `json:"evidence_receipt,omitempty"`
+	// EvidenceArtifact carries the provider evidence bytes — e.g. the
+	// raw provider object proving the outcome. The attestor recomputes
+	// sha256(EvidenceArtifact) itself; a resolver-supplied digest is
+	// never signed. For CRITICAL executions a definitive decision
+	// without an artifact cannot be attested and stays UNKNOWN.
+	// Transient: never persisted.
+	EvidenceArtifact []byte `json:"-"`
+}
+
+// RecoveryResolver queries a provider to determine if an operation
+// actually happened. Resolvers are registered per provider/capability.
+//
+// The returned RecoveryResult must contain VERIFIED evidence — not
+// merely a syntactically valid digest string. For CRITICAL executions,
+// the resolver must have actually queried the provider and confirmed
+// the outcome, and the result must carry an EvidenceReceipt signed by
+// a trusted signer binding the decision to this execution, provider,
+// and evidence digest. A well-formed but unsigned digest is NOT proof:
+// the store rejects definitive CRITICAL recovery without a verified
+// signed receipt.
+//
+// Implementations should be side-effect-free: Resolve() may be called
+// multiple times for the same record (retries, concurrent workers).
+// It must not itself perform mutations — it only queries.
+type RecoveryResolver interface {
+	Resolve(ctx context.Context, record *Record) (RecoveryResult, error)
+}
+
+// RecoveryLocator is the typed provider lookup material persisted
+// before the dispatch boundary is crossed. It contains only what a
+// RecoveryResolver needs to find the external operation: the provider
+// identity, the correlation strategy, the external token that was sent
+// with the request, the resource reference, and the durable execution
+// identity. Raw request arguments do not belong here.
+type RecoveryLocator struct {
+	Version    int    `json:"v"`
+	ProviderID string `json:"provider_id"`
+	// Strategy names the correlation approach the provider uses —
+	// e.g. "idempotency-token", "operation-id", "marker-scan", or
+	// "metadata" for the generic fallback.
+	Strategy string `json:"strategy"`
+	// ExternalToken is the provider idempotency or operation token
+	// sent with the external request. The token persisted here MUST
+	// be the same token used in the external call.
+	ExternalToken string `json:"external_token,omitempty"`
+	// ResourceRef is the provider-side resource identifier when known.
+	ResourceRef   string `json:"resource_ref,omitempty"`
+	RequestDigest string `json:"request_digest,omitempty"`
+	// Durable execution identity for execution-specific correlation.
+	ExecutionID    string `json:"execution_id,omitempty"`
+	PrincipalID    string `json:"principal_id,omitempty"`
+	CapabilityID   string `json:"capability_id,omitempty"`
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
+	// Extensions carries bounded provider-specific lookup data. It is
+	// deliberately not free-form request storage.
+	Extensions json.RawMessage `json:"extensions,omitempty"`
+}
+
+// MaxRecoveryLocatorBytes bounds the serialized recovery locator.
+// Locators carry lookup material, not payloads — anything larger is a
+// defect, not a legitimate locator.
+const MaxRecoveryLocatorBytes = 8192
+
+// RecoveryLocatorInput carries the dispatch context a provider needs
+// to build a recovery locator. Arguments is the raw request argument
+// blob — the provider is responsible for extracting only what it needs
+// and applying its own semantic normalization (defaults, derived
+// fields) before embedding anything in the locator.
+type RecoveryLocatorInput struct {
+	ExecutionID    string
+	AdapterID      string
+	CapabilityID   string
+	Principal      string
+	IdempotencyKey string
+	RequestDigest  string
+	Arguments      json.RawMessage
+}
+
+// RecoveryLocatorProvider generates a provider-specific recovery
+// locator before dispatch. The locator contains the minimum durable
+// information needed to determine whether the external side effect
+// occurred — typically a provider-side operation token, external
+// idempotency key, or lookup coordinates.
+//
+// This replaces the generic raw-argument snapshot with a provider-owned
+// minimal locator. The provider decides what it needs for recovery;
+// the store persists whatever it returns.
+//
+// If a provider does not implement this interface, DispatchExecutor
+// falls back to a minimal generic locator containing request metadata
+// only — never raw arguments.
+type RecoveryLocatorProvider interface {
+	// PrepareRecovery generates the recovery locator before dispatch.
+	// The locator is persisted atomically with the IN_FLIGHT transition.
+	// It should contain provider-specific lookup coordinates — NOT the
+	// raw request arguments (which may contain sensitive data).
+	//
+	// An error fails the dispatch pre-dispatch (safe FAILED): crossing
+	// the IN_FLIGHT boundary without a persistable recovery locator
+	// would leave a potential side effect undiscoverable.
+	PrepareRecovery(ctx context.Context, in RecoveryLocatorInput) (*RecoveryLocator, error)
+}
+
+// CanonicalizeArguments canonicalizes a JSON argument blob — parses and
+// re-marshals with sorted object keys so that byte-level differences in
+// key ordering produce identical output. This is purely a JSON-level
+// transform: it does NOT apply provider semantics such as default
+// values ({"by":0} and {"by":1} remain distinct even when a provider
+// treats 0 as "use the default"). Provider argument normalization is
+// the provider's job inside PrepareRecovery — the two operations must
+// not be conflated.
+//
+// Deprecated name retained for callers; CanonicalizeJSON is identical.
+func CanonicalizeArguments(raw json.RawMessage) (json.RawMessage, error) {
+	return CanonicalizeJSON(raw)
+}
+
+// CanonicalizeJSON canonicalizes a JSON blob: sorted object keys,
+// no semantic interpretation.
+func CanonicalizeJSON(raw json.RawMessage) (json.RawMessage, error) {
+	return canonicalizeJSON(raw)
+}
+
+// Ctx is an alias for context.Context to avoid importing context in
+// this types-only file. The interface is satisfied by context.Context.
+type Ctx interface {
+	Deadline() (time.Time, bool)
+	Done() <-chan struct{}
+	Err() error
+	Value(key any) any
+}
+
+// ─── Backward-compatible state aliases ───────────────────────────────
+//
+// These map old state names to new ones for any code that has not yet
+// been migrated. New code must use the canonical names above.
+
+// ProviderIdempotencyKey derives the deterministic provider-side
+// idempotency token for an execution: H(execution_id || request_digest
+// || provider_id). Providers that support native idempotency use it as
+// the operation/idempotency key in the external request — the same
+// durable execution always presents the same token, so a retry or a
+// re-sent request never mints a second provider operation identity.
+// It is also the ExternalToken persisted in the recovery locator.
+func ProviderIdempotencyKey(executionID, requestDigest, providerID string) string {
+	h := sha256.New()
+	// Length-prefixed fields — no delimiter ambiguity.
+	for _, s := range []string{executionID, requestDigest, providerID} {
+		var l [4]byte
+		binary.BigEndian.PutUint32(l[:], uint32(len(s)))
+		h.Write(l[:])
+		h.Write([]byte(s))
+	}
+	return "crabex-op-" + hex.EncodeToString(h.Sum(nil))[:32]
+}

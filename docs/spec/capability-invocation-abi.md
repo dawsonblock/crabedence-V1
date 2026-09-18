@@ -75,6 +75,9 @@ These are security-relevant properties pinned inside Crabedence's
 registry, not supplied by the planner:
 
 - `authority_policy` — resolved from the capability descriptor
+- `authority_generation` / `authority_digest` — assigned by Crabedence
+  from the resolved grant; they bind the exact immutable authority
+  material that admitted the request into the execution identity
 - `provider` / `adapter` — resolved via server-controlled adapter policy
 - `schema` — resolved from the capability descriptor
 - `receipt_version` — determined by Crabedence
@@ -83,6 +86,7 @@ registry, not supplied by the planner:
 
 If a planner sends these, they are ignored:
 - `authority_policy`
+- `authority_generation` / `authority_digest`
 - `provider` / `adapter`
 - `schema`
 - `receipt_version`
