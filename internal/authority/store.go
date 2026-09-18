@@ -32,7 +32,8 @@ var ErrAuthorityClosed = errors.New("authority reference is closed")
 
 // Store is a PostgreSQL-backed GrantResolver.
 type Store struct {
-	db *sql.DB
+	db      *sql.DB
+	metrics Metrics
 }
 
 // NewStore creates a new PostgreSQL-backed authority store.
@@ -319,6 +320,7 @@ func (s *Store) Resolve(ctx context.Context, grantID string, principal string) (
 	var capabilities []byte
 	var issuedAt, expiresAt sql.NullTime
 	var unexpired bool
+	s.metrics.resolves.Add(1)
 	err := s.db.QueryRowContext(ctx, `
 		SELECT grant_id, generation, principal, capabilities, grant_digest,
 		       issued_at, expires_at, revoked,
@@ -333,12 +335,14 @@ func (s *Store) Resolve(ctx context.Context, grantID string, principal string) (
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
+			s.metrics.resolveDenied.Add(1)
 			return nil, nil
 		}
 		return nil, fmt.Errorf("authority lookup failed: %w", err)
 	}
 
 	if g.Principal != principal || g.Revoked || !unexpired {
+		s.metrics.resolveDenied.Add(1)
 		return nil, nil
 	}
 	// Resolve normalizes to Unix milliseconds — the same integer the
@@ -428,6 +432,7 @@ func (s *Store) IssueGrant(ctx context.Context, grantID, principal string, capab
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
+	s.metrics.issued.Add(1)
 	return grant, nil
 }
 
@@ -462,7 +467,11 @@ func (s *Store) RevokeGeneration(ctx context.Context, grantID string, generation
 	if rows == 0 {
 		return fmt.Errorf("grant generation not found: %s#%d", grantID, generation)
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.metrics.generationsRevoked.Add(1)
+	return nil
 }
 
 // CloseAuthorityRef permanently prevents any future generations from
@@ -487,7 +496,11 @@ func (s *Store) CloseAuthorityRef(ctx context.Context, grantID string) error {
 	`, grantID); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.metrics.refsClosed.Add(1)
+	return nil
 }
 
 // RevokeGrant marks every generation of a grant_id as revoked, stamping
@@ -522,7 +535,11 @@ func (s *Store) RevokeGrant(ctx context.Context, grantID string) error {
 	if rows == 0 {
 		return fmt.Errorf("grant not found: %s", grantID)
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.metrics.grantsRevoked.Add(1)
+	return nil
 }
 
 // parsePostgresArray parses a PostgreSQL text[] representation like

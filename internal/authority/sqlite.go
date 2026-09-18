@@ -16,7 +16,8 @@ import (
 // text[]/TIMESTAMPTZ. Expiry decisions use SQLite's own clock so
 // authority validity never depends on the application clock.
 type SQLiteStore struct {
-	db *sql.DB
+	db      *sql.DB
+	metrics Metrics
 }
 
 // NewSQLiteStore creates an embedded authority store on db.
@@ -359,6 +360,7 @@ func (s *SQLiteStore) Resolve(ctx context.Context, grantID string, principal str
 	var capabilitiesJSON string
 	var issuedAt, expiresAt sql.NullInt64
 	var revoked, unexpired int
+	s.metrics.resolves.Add(1)
 	err := s.db.QueryRowContext(ctx, `
 		SELECT grant_id, generation, principal, capabilities, grant_digest,
 		       issued_at, expires_at, revoked,
@@ -373,6 +375,7 @@ func (s *SQLiteStore) Resolve(ctx context.Context, grantID string, principal str
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
+			s.metrics.resolveDenied.Add(1)
 			return nil, nil
 		}
 		return nil, fmt.Errorf("authority lookup failed: %w", err)
@@ -380,6 +383,7 @@ func (s *SQLiteStore) Resolve(ctx context.Context, grantID string, principal str
 
 	g.Revoked = revoked != 0
 	if g.Principal != principal || g.Revoked || unexpired == 0 {
+		s.metrics.resolveDenied.Add(1)
 		return nil, nil
 	}
 	// issued_at/expires_at are already Unix-millisecond integers — the
@@ -463,6 +467,7 @@ func (s *SQLiteStore) IssueGrant(ctx context.Context, grantID, principal string,
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
+	s.metrics.issued.Add(1)
 	return grant, nil
 }
 
@@ -496,7 +501,11 @@ func (s *SQLiteStore) RevokeGeneration(ctx context.Context, grantID string, gene
 	if rows == 0 {
 		return fmt.Errorf("grant generation not found: %s#%d", grantID, generation)
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.metrics.generationsRevoked.Add(1)
+	return nil
 }
 
 // CloseAuthorityRef permanently prevents future issuance under
@@ -519,7 +528,11 @@ func (s *SQLiteStore) CloseAuthorityRef(ctx context.Context, grantID string) err
 	`, grantID); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.metrics.refsClosed.Add(1)
+	return nil
 }
 
 // RevokeGrant marks every generation of a grant_id as revoked, stamping
@@ -554,5 +567,9 @@ func (s *SQLiteStore) RevokeGrant(ctx context.Context, grantID string) error {
 	if rows == 0 {
 		return fmt.Errorf("grant not found: %s", grantID)
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.metrics.grantsRevoked.Add(1)
+	return nil
 }

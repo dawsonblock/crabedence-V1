@@ -28,6 +28,7 @@
 - Store: `StoreMetrics` gains `effect_lease_lost_total` (every lease-lost event: fenced transitions, renewals, abandons, observations, expired-claim recoveries) and `reconciliation_suspended_total` — both engines, same names.
 - Tests: migration crash-consistency — an uncommitted migration leaves zero torn state and replays cleanly, and a `schema_migrations` row claiming a version whose DDL is absent fails honestly at first use rather than silently misreading the schema.
 - Store: `ReconciliationBacklog` gauge — pending UNKNOWN count plus oldest `entered_unknown_at` in one query on both engines, first-class surface for the "UNKNOWN accumulation or age" alert; stays readable under a fenced epoch and during recovery mode.
+- Authority: `Metrics().Snapshot()` on both engines — `authority_grants_issued_total`, `authority_generations_revoked_total`, `authority_grants_revoked_total`, `authority_refs_closed_total`, `authority_resolves_total`, `authority_resolve_denials_total` (missing, revoked, expired, or wrong-principal material consulted at admission).
 
 ### Effect Fabric hardening — backend, ABI, adversarial qualification
 

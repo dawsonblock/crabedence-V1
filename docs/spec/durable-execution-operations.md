@@ -199,3 +199,13 @@ stale executor can still see what it is fenced out of. High-value
 alerts are on these semantic signals — backlog depth or age,
 observation conflicts, fence rejections, CRITICAL evidence
 rejections — not raw request error rates.
+
+The authority stores expose the same contract through
+`Metrics().Snapshot()`: `authority_grants_issued_total`,
+`authority_generations_revoked_total`,
+`authority_grants_revoked_total`, `authority_refs_closed_total`,
+`authority_resolves_total`, and `authority_resolve_denials_total` —
+resolve denials cover missing, revoked, expired, and
+wrong-principal material, so a nonzero or growing value means
+admission is correctly consulting authority that refuses, or that
+grants are being retired faster than they are reissued.
