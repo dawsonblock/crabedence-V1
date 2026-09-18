@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -569,6 +570,56 @@ func TestStoreConformanceForensicRecord(t *testing.T) {
 		}
 		if !lostFound {
 			t.Fatal("no LEASE_LOST event recorded for fenced writer")
+		}
+	})
+}
+
+// TestStoreConformancePayloadBounds pins the fail-closed validation
+// contract on both engines: malformed provider results are rejected
+// rather than stored, a caller-supplied digest that contradicts the
+// bytes is never trusted, oversized payloads hit the storage bounds,
+// and negative receipt versions are invalid.
+func TestStoreConformancePayloadBounds(t *testing.T) {
+	eachEffectStore(t, func(t *testing.T, s EffectStore) {
+		ctx := context.Background()
+		rec, token, gen, digest := acquireFor(t, s, ctx, "bounds-k1", "alice", "cap.mut", "MUTATION", 5*time.Minute)
+
+		// Malformed provider result — never silently persisted.
+		err := s.RecordProviderObservation(ctx, rec.ExecutionID, token, gen,
+			ProviderObservation{ProviderID: "prov", Result: json.RawMessage(`{not json`)})
+		if err == nil {
+			t.Fatal("malformed provider result must be rejected")
+		}
+
+		// Caller digest contradicting the bytes — never trusted.
+		err = s.RecordProviderObservation(ctx, rec.ExecutionID, token, gen,
+			ProviderObservation{
+				ProviderID:   "prov",
+				Result:       json.RawMessage(`{"a":1}`),
+				ResultDigest: "0000000000000000000000000000000000000000000000000000000000000000",
+			})
+		if !errors.Is(err, ObservationDigestMismatch) {
+			t.Fatalf("want ObservationDigestMismatch, got %v", err)
+		}
+
+		// Oversize result payload.
+		oversize := json.RawMessage(`{"pad":"` + strings.Repeat("x", MaxResultBytes) + `"}`)
+		err = s.RecordProviderObservation(ctx, rec.ExecutionID, token, gen,
+			ProviderObservation{ProviderID: "prov", Result: oversize})
+		if !errors.Is(err, ResultTooLarge) {
+			t.Fatalf("want ResultTooLarge, got %v", err)
+		}
+
+		// Oversize evidence receipt and negative version on finalize.
+		receipt := confReceipt(rec.ExecutionID, "cap.mut", "alice", digest, "prov", "run-1", StateCommitted)
+		receipt.EvidenceReceipt = json.RawMessage(strings.Repeat("x", MaxEvidenceReceiptBytes+1))
+		if err := s.Finalize(ctx, rec.ExecutionID, token, gen, StateInFlight, receipt); !errors.Is(err, EvidenceReceiptTooLarge) {
+			t.Fatalf("want EvidenceReceiptTooLarge, got %v", err)
+		}
+		receipt.EvidenceReceipt = nil
+		receipt.ReceiptVersion = -1
+		if err := s.Finalize(ctx, rec.ExecutionID, token, gen, StateInFlight, receipt); err == nil {
+			t.Fatal("negative receipt_version must be rejected")
 		}
 	})
 }

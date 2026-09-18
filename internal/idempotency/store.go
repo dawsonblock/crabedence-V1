@@ -73,8 +73,10 @@ type Record struct {
 	// the latest-known-evidence projection for compatibility.
 	ProviderEvidenceDigest string `json:"provider_evidence_digest,omitempty"`
 	// TerminalResultDigest is the store-computed SHA-256 of the
-	// canonical terminal result — set once, at the terminal
-	// transition, and immutable thereafter.
+	// asserted terminal result bytes (the raw CanonicalResult /
+	// recovery result, matching the observation ledger's
+	// result_sha256) — set once, at the terminal transition, and
+	// immutable thereafter.
 	TerminalResultDigest string `json:"terminal_result_digest,omitempty"`
 	// TerminalEvidenceDigest is the evidence digest attested at the
 	// terminal transition (Finalize receipt or recovery resolution) —
@@ -1632,6 +1634,27 @@ func (s *Store) Finalize(ctx context.Context, executionID, leaseToken string, le
 		return fmt.Errorf("invalid terminal status %s: Finalize requires a durably-final state (COMMITTED, FAILED, or DENIED)", receipt.TerminalStatus)
 	}
 
+	// Validate receipt fields before any state work — a receipt that
+	// cannot be persisted honestly is rejected before the lookup.
+	if receipt.ReceiptVersion < 0 {
+		return fmt.Errorf("invalid receipt_version %d", receipt.ReceiptVersion)
+	}
+	if len(receipt.CanonicalResult) > MaxResultBytes {
+		return fmt.Errorf("%w: canonical result is %d bytes (max %d)",
+			ResultTooLarge, len(receipt.CanonicalResult), MaxResultBytes)
+	}
+	if len(receipt.EvidenceReceipt) > MaxEvidenceReceiptBytes {
+		return fmt.Errorf("%w: evidence receipt is %d bytes (max %d)",
+			EvidenceReceiptTooLarge, len(receipt.EvidenceReceipt), MaxEvidenceReceiptBytes)
+	}
+	// The result column stores the asserted bytes verbatim — replay
+	// fidelity requires the first terminal result to survive
+	// byte-for-byte. Canonicalization happens inside Digest(); the
+	// stored projection stays raw like provider_result.
+	if _, err := canonicalizeJSON(receipt.CanonicalResult); err != nil {
+		return fmt.Errorf("canonical result is not well-formed JSON: %w", err)
+	}
+
 	// Enforce the legal transition matrix for finalization:
 	//   COMMITTED, FAILED → only from IN_FLIGHT (post-dispatch)
 	// DENIED is not a reachable durable state — admission denial
@@ -1897,7 +1920,10 @@ func (s *Store) EnterRecoveryWithObservation(ctx context.Context, executionID st
 		return fmt.Errorf("%w: illegal recovery transition %s → UNKNOWN (only IN_FLIGHT may enter recovery)", LeaseStateConflict, expectedState)
 	}
 	rawResult := obs.Result
-	obs = canonicalizeObservation(obs)
+	obs, err := canonicalizeObservation(obs)
+	if err != nil {
+		return err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -1986,20 +2012,42 @@ func (s *Store) classifyEnterRecoveryFailure(ctx context.Context, executionID st
 	return fmt.Errorf("%w: execution %s observation contradicts stored provider data", ProviderObservationConflict, executionID)
 }
 
-// canonicalizeObservation canonicalizes the result payload and derives
-// its digest when omitted, so byte-level key ordering cannot create
-// false conflicts and stored digests are consistent.
-func canonicalizeObservation(obs ProviderObservation) ProviderObservation {
-	if len(obs.Result) > 0 {
-		if canonical, err := canonicalizeJSON(obs.Result); err == nil {
-			obs.Result = canonical
-		}
-		if obs.ResultDigest == "" {
-			sum := sha256.Sum256(obs.Result)
-			obs.ResultDigest = hex.EncodeToString(sum[:])
-		}
+// canonicalizeObservation validates and canonicalizes the result
+// payload so byte-level key ordering cannot create false conflicts and
+// stored digests are consistent. It fails closed: a result that is not
+// well-formed JSON, exceeds MaxResultBytes, or carries a negative
+// receipt version is a deterministic error, never a silently-stored
+// raw payload.
+//
+// The result digest is always computed from the canonical bytes — a
+// caller-supplied digest is checked against it, never trusted. A
+// supplied digest that contradicts the bytes means the caller is
+// describing a different result than the one it sent, which is
+// exactly the failure mode the forensic record exists to expose.
+func canonicalizeObservation(obs ProviderObservation) (ProviderObservation, error) {
+	if obs.ReceiptVersion < 0 {
+		return obs, fmt.Errorf("invalid observation receipt_version %d", obs.ReceiptVersion)
 	}
-	return obs
+	if len(obs.Result) == 0 {
+		return obs, nil
+	}
+	if len(obs.Result) > MaxResultBytes {
+		return obs, fmt.Errorf("%w: provider result is %d bytes (max %d)",
+			ResultTooLarge, len(obs.Result), MaxResultBytes)
+	}
+	canonical, err := canonicalizeJSON(obs.Result)
+	if err != nil {
+		return obs, fmt.Errorf("provider result is not well-formed JSON: %w", err)
+	}
+	obs.Result = canonical
+	sum := sha256.Sum256(obs.Result)
+	computed := hex.EncodeToString(sum[:])
+	if obs.ResultDigest != "" && obs.ResultDigest != computed {
+		return obs, fmt.Errorf("%w: supplied result digest does not match canonical result bytes",
+			ObservationDigestMismatch)
+	}
+	obs.ResultDigest = computed
+	return obs, nil
 }
 
 // ProviderObservation is the provider's durable response snapshot:
@@ -2013,10 +2061,12 @@ type ProviderObservation struct {
 	ProviderStatus string
 	// Result is the provider's result payload (canonicalized before
 	// storage so byte-level key ordering cannot create false
-	// conflicts).
+	// conflicts). It must be well-formed JSON — malformed results are
+	// rejected, never silently stored.
 	Result json.RawMessage
-	// ResultDigest is the SHA-256 of the canonical result. When Result
-	// is supplied without a digest, the store computes it.
+	// ResultDigest is the SHA-256 of the canonical result. The store
+	// always computes it; a supplied value must match the computed
+	// digest — a contradiction is OBSERVATION_DIGEST_MISMATCH.
 	ResultDigest   string
 	EvidenceDigest string
 	ReceiptVersion int
@@ -2052,7 +2102,10 @@ type ProviderObservation struct {
 // CAS token would invalidate reconciliation claims in flight.
 func (s *Store) RecordProviderObservation(ctx context.Context, executionID, leaseToken string, leaseGeneration int, obs ProviderObservation) error {
 	rawResult := obs.Result
-	obs = canonicalizeObservation(obs)
+	obs, err := canonicalizeObservation(obs)
+	if err != nil {
+		return err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -2283,6 +2336,26 @@ func (s *Store) ResolveRecovery(ctx context.Context, executionID string, expecte
 	// identity fields (capability, principal, request_digest) so
 	// recovery-finalized and normally-finalized receipts use the
 	// same complete schema.
+	// Validate the resolver's material before any state work. The
+	// resolver's result is itself a provider observation — the same
+	// fail-closed canonicalization and digest honesty rules apply, and
+	// the result column stores the canonical form.
+	if len(result.EvidenceReceipt) > MaxEvidenceReceiptBytes {
+		return fmt.Errorf("%w: evidence receipt is %d bytes (max %d)",
+			EvidenceReceiptTooLarge, len(result.EvidenceReceipt), MaxEvidenceReceiptBytes)
+	}
+	rawResolverResult := result.Result
+	robs, err := canonicalizeObservation(ProviderObservation{
+		ProviderID:     result.ProviderID,
+		ProviderRunID:  result.ProviderRunID,
+		Result:         result.Result,
+		EvidenceDigest: result.EvidenceDigest,
+		ReceiptVersion: result.ReceiptVersion,
+	})
+	if err != nil {
+		return err
+	}
+
 	existingRec, lookupErr := s.Lookup(ctx, executionID)
 	if lookupErr != nil {
 		return fmt.Errorf("recovery lookup failed: %w", lookupErr)
@@ -2393,18 +2466,11 @@ func (s *Store) ResolveRecovery(ctx context.Context, executionID string, expecte
 	// reconciler looked at the provider and reported what it saw.
 	// Ledger it when it carries provider material so the forensic
 	// record holds the observation that justified the terminal
-	// resolution.
+	// resolution. rawResolverResult preserves the exact asserted bytes.
 	if result.ProviderID != "" || result.ProviderRunID != "" ||
-		len(result.Result) > 0 || result.EvidenceDigest != "" {
-		obs := canonicalizeObservation(ProviderObservation{
-			ProviderID:     result.ProviderID,
-			ProviderRunID:  result.ProviderRunID,
-			Result:         result.Result,
-			EvidenceDigest: result.EvidenceDigest,
-			ReceiptVersion: result.ReceiptVersion,
-		})
+		len(rawResolverResult) > 0 || result.EvidenceDigest != "" {
 		if err := insertObservationRow(ctx, tx, executionID,
-			ObservationReconciliation, result.Result, obs); err != nil {
+			ObservationReconciliation, rawResolverResult, robs); err != nil {
 			return err
 		}
 	}

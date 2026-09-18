@@ -143,6 +143,20 @@ const (
 	// private keys, authorization headers, ...). Locators are lookup
 	// coordinates, never a second copy of sensitive payloads.
 	LocatorContainsSecret LeaseError = "RECOVERY_LOCATOR_CONTAINS_SECRET"
+	// ResultTooLarge is returned when a provider or terminal result
+	// payload exceeds MaxResultBytes — the durable record and forensic
+	// ledger are bounded storage, not a blob sink.
+	ResultTooLarge LeaseError = "RESULT_TOO_LARGE"
+	// EvidenceReceiptTooLarge is returned when a signed evidence
+	// receipt exceeds MaxEvidenceReceiptBytes — the store refuses to
+	// persist a receipt that could never verify.
+	EvidenceReceiptTooLarge LeaseError = "EVIDENCE_RECEIPT_TOO_LARGE"
+	// ObservationDigestMismatch is returned when a caller-supplied
+	// result digest contradicts the store-computed digest of the
+	// supplied result bytes — digests derive from bytes, not
+	// assertions, and a mismatch means the caller is describing a
+	// different result than the one it sent.
+	ObservationDigestMismatch LeaseError = "OBSERVATION_DIGEST_MISMATCH"
 )
 
 func (e LeaseError) Error() string { return string(e) }
@@ -413,6 +427,18 @@ type RecoveryLocator struct {
 // Locators carry lookup material, not payloads — anything larger is a
 // defect, not a legitimate locator.
 const MaxRecoveryLocatorBytes = 8192
+
+// MaxResultBytes bounds provider and terminal result payloads persisted
+// to the durable record and forensic ledger. Generous by design —
+// results are arbitrary provider JSON — but an unbounded payload is a
+// disk-growth vector, so the bound fails closed like the locator bound.
+const MaxResultBytes = 1 << 20 // 1 MiB
+
+// MaxEvidenceReceiptBytes bounds the serialized signed evidence receipt
+// persisted on terminal records. It matches the ReceiptV3 parse bound —
+// a larger receipt can never verify, so storing it would only bloat the
+// record.
+const MaxEvidenceReceiptBytes = 64 * 1024
 
 // RecoveryLocatorInput carries the dispatch context a provider needs
 // to build a recovery locator. Arguments is the raw request argument

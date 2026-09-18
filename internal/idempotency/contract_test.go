@@ -583,3 +583,34 @@ func TestCanonicalizeJSONRejectsTrailingData(t *testing.T) {
 		})
 	}
 }
+
+// TestTerminalReceiptDigestFrozenVector pins the terminal-receipt
+// digest ABI: the canonical serialization and the resulting SHA-256
+// are frozen — any change to field selection, ordering, or number
+// canonicalization inside Digest() changes this value and is a
+// deliberate ABI revision, not a silent edit. The fixture exercises
+// object-key ordering, number normalization (1.50 → canonical form),
+// and precision beyond float64 (9007199254740993).
+func TestTerminalReceiptDigestFrozenVector(t *testing.T) {
+	receipt := TerminalReceipt{
+		ExecutionID:     "exec-frozen-01",
+		Capability:      "test.counter.increment",
+		Principal:       "alice@example.com",
+		RequestDigest:   "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+		TerminalStatus:  StateCommitted,
+		CanonicalResult: json.RawMessage(`{"b":2,"a":1,"n":1.50,"big":9007199254740993}`),
+		ProviderID:      "local",
+		ProviderRunID:   "run-42",
+		EvidenceDigest:  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+		ReceiptVersion:  3,
+		FinalizedAt:     time.Date(2026, 9, 17, 0, 0, 0, 0, time.UTC),
+	}
+	const want = "11e3560760e61562234822ccc9e006e110e6a2211b3473b36a07ec1cf513c8e3"
+	got, err := receipt.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("terminal receipt digest = %s, frozen ABI vector wants %s — deliberate ABI change requires updating this vector and the repair ADR", got, want)
+	}
+}

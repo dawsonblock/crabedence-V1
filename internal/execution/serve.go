@@ -235,9 +235,17 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 		trusted := []string{signer.Fingerprint()}
 		if extra := os.Getenv("CRABBOX_EVIDENCE_TRUSTED_SIGNERS"); extra != "" {
 			for _, fp := range strings.Split(extra, ",") {
-				if fp = strings.TrimSpace(fp); fp != "" {
-					trusted = append(trusted, fp)
+				fp = strings.TrimSpace(fp)
+				if fp == "" {
+					continue
 				}
+				// A malformed fingerprint is never a plausible signer —
+				// silently dropping it would quietly shrink the trusted
+				// set, so refuse to start instead.
+				if !isSHA256Hex(fp) {
+					return fmt.Errorf("CRABBOX_EVIDENCE_TRUSTED_SIGNERS entry %q is not a SHA-256 fingerprint (64 lowercase hex chars)", fp)
+				}
+				trusted = append(trusted, fp)
 			}
 		}
 		store.SetTrustedEvidenceSigners(trusted...)
@@ -361,4 +369,18 @@ func evidenceKeyPath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(base, "crabbox", "attest", "id_ed25519.pem"), nil
+}
+
+// isSHA256Hex reports whether s is a 64-character lowercase hex
+// SHA-256 fingerprint — the only form the evidence-trust list accepts.
+func isSHA256Hex(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for _, c := range s {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
 }

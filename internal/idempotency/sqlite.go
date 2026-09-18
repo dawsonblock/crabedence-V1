@@ -1257,6 +1257,27 @@ func (s *SQLiteStore) Finalize(ctx context.Context, executionID, leaseToken stri
 	if !receipt.TerminalStatus.IsDurablyFinal() {
 		return fmt.Errorf("invalid terminal status %s: Finalize requires a durably-final state (COMMITTED, FAILED, or DENIED)", receipt.TerminalStatus)
 	}
+
+	// Validate receipt fields before any state work — identical
+	// fail-closed rules as Store.Finalize.
+	if receipt.ReceiptVersion < 0 {
+		return fmt.Errorf("invalid receipt_version %d", receipt.ReceiptVersion)
+	}
+	if len(receipt.CanonicalResult) > MaxResultBytes {
+		return fmt.Errorf("%w: canonical result is %d bytes (max %d)",
+			ResultTooLarge, len(receipt.CanonicalResult), MaxResultBytes)
+	}
+	if len(receipt.EvidenceReceipt) > MaxEvidenceReceiptBytes {
+		return fmt.Errorf("%w: evidence receipt is %d bytes (max %d)",
+			EvidenceReceiptTooLarge, len(receipt.EvidenceReceipt), MaxEvidenceReceiptBytes)
+	}
+	// Same convention as Store.Finalize: the result column keeps the
+	// asserted bytes verbatim (replay fidelity); canonicalization
+	// happens inside Digest().
+	if _, err := canonicalizeJSON(receipt.CanonicalResult); err != nil {
+		return fmt.Errorf("canonical result is not well-formed JSON: %w", err)
+	}
+
 	if !isLegalTransition(expectedState, receipt.TerminalStatus) {
 		return fmt.Errorf("%w: illegal finalization transition %s → %s", LeaseStateConflict, expectedState, receipt.TerminalStatus)
 	}
@@ -1454,7 +1475,10 @@ func (s *SQLiteStore) EnterRecoveryWithObservation(ctx context.Context, executio
 		return fmt.Errorf("%w: illegal recovery transition %s → UNKNOWN (only IN_FLIGHT may enter recovery)", LeaseStateConflict, expectedState)
 	}
 	rawResult := obs.Result
-	obs = canonicalizeObservation(obs)
+	obs, err := canonicalizeObservation(obs)
+	if err != nil {
+		return err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -1544,7 +1568,10 @@ func (s *SQLiteStore) classifyEnterRecoveryFailure(ctx context.Context, executio
 // Store.RecordProviderObservation.
 func (s *SQLiteStore) RecordProviderObservation(ctx context.Context, executionID, leaseToken string, leaseGeneration int, obs ProviderObservation) error {
 	rawResult := obs.Result
-	obs = canonicalizeObservation(obs)
+	obs, err := canonicalizeObservation(obs)
+	if err != nil {
+		return err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -1739,6 +1766,26 @@ func (s *SQLiteStore) ResolveRecovery(ctx context.Context, executionID string, e
 		return fmt.Errorf("unknown recovery decision: %s", decision)
 	}
 
+	// Validate the resolver's material before any state work — the
+	// same fail-closed canonicalization and digest honesty rules as
+	// the dispatch observation path. The result column stores the
+	// canonical form.
+	if len(result.EvidenceReceipt) > MaxEvidenceReceiptBytes {
+		return fmt.Errorf("%w: evidence receipt is %d bytes (max %d)",
+			EvidenceReceiptTooLarge, len(result.EvidenceReceipt), MaxEvidenceReceiptBytes)
+	}
+	rawResolverResult := result.Result
+	robs, err := canonicalizeObservation(ProviderObservation{
+		ProviderID:     result.ProviderID,
+		ProviderRunID:  result.ProviderRunID,
+		Result:         result.Result,
+		EvidenceDigest: result.EvidenceDigest,
+		ReceiptVersion: result.ReceiptVersion,
+	})
+	if err != nil {
+		return err
+	}
+
 	existingRec, lookupErr := s.Lookup(ctx, executionID)
 	if lookupErr != nil {
 		return fmt.Errorf("recovery lookup failed: %w", lookupErr)
@@ -1838,17 +1885,11 @@ func (s *SQLiteStore) ResolveRecovery(ctx context.Context, executionID string, e
 	}
 	// The resolver's result is itself a provider observation — ledger
 	// it when it carries provider material (see Store.ResolveRecovery).
+	// rawResolverResult preserves the exact asserted bytes.
 	if result.ProviderID != "" || result.ProviderRunID != "" ||
-		len(result.Result) > 0 || result.EvidenceDigest != "" {
-		obs := canonicalizeObservation(ProviderObservation{
-			ProviderID:     result.ProviderID,
-			ProviderRunID:  result.ProviderRunID,
-			Result:         result.Result,
-			EvidenceDigest: result.EvidenceDigest,
-			ReceiptVersion: result.ReceiptVersion,
-		})
+		len(rawResolverResult) > 0 || result.EvidenceDigest != "" {
 		if err := sqliteInsertObservationRow(ctx, tx, executionID,
-			ObservationReconciliation, result.Result, obs); err != nil {
+			ObservationReconciliation, rawResolverResult, robs); err != nil {
 			return err
 		}
 	}
