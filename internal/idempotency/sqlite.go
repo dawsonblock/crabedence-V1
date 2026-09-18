@@ -843,6 +843,9 @@ func sqliteInsertObservationRow(ctx context.Context, tx *sql.Tx, executionID, ki
 // SQLite needs no FOR UPDATE pre-lock: single-writer BEGIN IMMEDIATE
 // already serializes sequence allocation.
 func (s *SQLiteStore) noteContentionEvent(ctx context.Context, executionID, eventType, metadata string) {
+	if eventType == EventLeaseLost {
+		s.metrics.leaseLost.Add(1)
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return
@@ -1983,7 +1986,11 @@ func (s *SQLiteStore) RecoverExpiredPreDispatch(ctx context.Context, executionID
 	}); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.metrics.leaseLost.Add(1)
+	return nil
 }
 
 // ScrubStaleRecoveryLocators clears recovery_locator on UNKNOWN records
@@ -2341,6 +2348,7 @@ func (s *SQLiteStore) ClaimExpiredBatch(ctx context.Context, owner string, batch
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
+	s.metrics.leaseLost.Add(int64(len(recs)))
 	s.metrics.reconcileClaims.Add(int64(len(recs)))
 	return recs, nil
 }
@@ -2437,7 +2445,11 @@ func (s *SQLiteStore) SuspendReconciliation(ctx context.Context, executionID str
 	}); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.metrics.reconcileSuspended.Add(1)
+	return nil
 }
 
 // RenewReconcileClaim extends an active claim to

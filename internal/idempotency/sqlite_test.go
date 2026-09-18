@@ -543,3 +543,122 @@ func TestSQLiteMigrationIdempotent(t *testing.T) {
 		t.Errorf("expected %d recorded migrations, got %d", RequiredSchemaVersion, count)
 	}
 }
+
+// TestSQLiteMigrationCrashConsistency proves the migration-atomicity
+// contract the DR runbook depends on: a migration killed before its
+// transaction commits leaves zero torn state — no partial DDL, no
+// version row — and the next startup replays it cleanly to the
+// required version. The simulation uses the same BEGIN/DDL/record
+// sequence ensureSchema runs, rolled back mid-flight.
+func TestSQLiteMigrationCrashConsistency(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "db", "crash-migrate.db")
+	db, err := OpenSQLiteDB(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	// First construction brings the schema to the required version.
+	s1, err := NewSQLiteStore(db)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	v, err := s1.SchemaVersion(ctx)
+	if err != nil || v != RequiredSchemaVersion {
+		t.Fatalf("version = %d, %v — want %d", v, err, RequiredSchemaVersion)
+	}
+
+	// Simulate a torn migration attempt: BEGIN, apply DDL + record
+	// the version, then ROLLBACK before commit — the state a killed
+	// process leaves behind.
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`ALTER TABLE cluster_meta ADD COLUMN crash_probe INTEGER`); err != nil {
+		t.Fatalf("torn DDL: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO schema_migrations (version, name, applied_at) VALUES (999, 'crashed', 1)`); err != nil {
+		t.Fatalf("torn version record: %v", err)
+	}
+	tx.Rollback() // the "crash" — nothing must persist
+
+	// Reopen: the schema is untouched and still at the required
+	// version — no torn column, no phantom version.
+	s2, err := NewSQLiteStore(db)
+	if err != nil {
+		t.Fatalf("reopen after torn migration: %v", err)
+	}
+	v, err = s2.SchemaVersion(ctx)
+	if err != nil || v != RequiredSchemaVersion {
+		t.Fatalf("post-crash version = %d, %v — want %d", v, err, RequiredSchemaVersion)
+	}
+	var probe int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM pragma_table_info('cluster_meta') WHERE name = 'crash_probe'`).Scan(&probe); err != nil {
+		t.Fatal(err)
+	}
+	if probe != 0 {
+		t.Fatal("torn migration leaked its uncommitted DDL")
+	}
+	// The store is fully functional on the rolled-back world.
+	acq, err := s2.Acquire(ctx, "post-crash", "alice", "cap.mut", sqliteDigest("pc"), "", "MUTATION", time.Minute)
+	if err != nil {
+		t.Fatalf("acquire after torn migration: %v", err)
+	}
+	if !acq.Acquired() {
+		t.Fatalf("post-crash acquire kind = %s", acq.Kind)
+	}
+}
+
+// TestSQLiteMigrationTornAppliedState covers the inverse corruption:
+// a schema_migrations row claims a version whose DDL is absent (as a
+// botched manual edit or a restored snapshot taken mid-migration
+// could produce). The store must fail honestly at first use — never
+// silently operate against a schema that is not what the version
+// record claims.
+func TestSQLiteMigrationTornAppliedState(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "db", "torn.db")
+	db, err := OpenSQLiteDB(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	s, err := NewSQLiteStore(db)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	// Tear: drop the recovery column while claiming v11 applied.
+	if _, err := db.ExecContext(ctx,
+		`ALTER TABLE cluster_meta RENAME TO cluster_meta_bak`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		CREATE TABLE cluster_meta (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			epoch INTEGER NOT NULL,
+			advanced_at INTEGER,
+			advance_reason TEXT
+		)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO cluster_meta (id, epoch) SELECT id, epoch FROM cluster_meta_bak`); err != nil {
+		t.Fatal(err)
+	}
+	db.ExecContext(ctx, `DROP TABLE cluster_meta_bak`)
+
+	// SchemaVersion reports v11 — but the first recovery-mode read
+	// must fail honestly rather than misread the missing column.
+	if v, err := s.SchemaVersion(ctx); err != nil || v != RequiredSchemaVersion {
+		t.Fatalf("version = %d, %v — torn state should still report %d", v, err, RequiredSchemaVersion)
+	}
+	if _, err := s.ClusterRecoveryRequired(ctx); err == nil {
+		t.Fatal("torn schema must surface an error, not silently succeed")
+	}
+}

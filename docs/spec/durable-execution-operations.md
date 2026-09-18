@@ -180,10 +180,16 @@ dispatching new ones first.
 
 `StoreMetrics` exposes semantic counters (`Snapshot()`):
 acquire/execute/in-flight/committed/failed totals, UNKNOWN entries,
-lease renewals, fence rejections, observation writes and conflicts,
-reconcile claims and resolutions, CRITICAL evidence rejections, and
+lease renewals, fence rejections, lease losses
+(`effect_lease_lost_total`), observation writes and conflicts,
+reconcile claims and resolutions, reconciliation suspensions
+(`reconciliation_suspended_total`), CRITICAL evidence rejections,
 cluster-epoch write rejections (`cluster_epoch_rejections_total` —
-any nonzero value means a stale-epoch executor is still running).
-High-value alerts are on the semantic signals — UNKNOWN accumulation
-or age, observation conflicts, fence rejections, CRITICAL evidence
-rejections — not raw request error rates.
+any nonzero value means a stale-epoch executor is still running), and
+recovery-mode admission rejections
+(`cluster_recovery_rejections_total` — nonzero means admission was
+correctly refused during post-restore reconciliation, or an operator
+is dispatching into a still-recovering world). High-value alerts are
+on the semantic signals — UNKNOWN accumulation or age, observation
+conflicts, fence rejections, CRITICAL evidence rejections — not raw
+request error rates.

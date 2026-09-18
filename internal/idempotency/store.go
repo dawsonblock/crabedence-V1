@@ -958,6 +958,9 @@ func insertObservationRow(ctx context.Context, tx *sql.Tx, executionID, kind str
 // error already being returned to the caller, and a forensic annotation
 // must never change it.
 func (s *Store) noteContentionEvent(ctx context.Context, executionID, eventType, metadata string) {
+	if eventType == EventLeaseLost {
+		s.metrics.leaseLost.Add(1)
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return
@@ -2539,7 +2542,11 @@ func (s *Store) RecoverExpiredPreDispatch(ctx context.Context, executionID strin
 	}); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.metrics.leaseLost.Add(1)
+	return nil
 }
 
 // ScrubStaleRecoveryLocators clears recovery_locator on UNKNOWN records
@@ -3041,7 +3048,11 @@ func (s *Store) SuspendReconciliation(ctx context.Context, executionID string, e
 	}); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.metrics.reconcileSuspended.Add(1)
+	return nil
 }
 
 // RenewReconcileClaim extends an active reconciliation claim. This is
@@ -3173,6 +3184,7 @@ func (s *Store) ClaimExpiredBatch(ctx context.Context, owner string, batchSize i
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
+	s.metrics.leaseLost.Add(int64(len(recs)))
 	s.metrics.reconcileClaims.Add(int64(len(recs)))
 	return recs, nil
 }
