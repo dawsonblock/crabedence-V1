@@ -30,6 +30,7 @@ type StoreMetrics struct {
 	reconcileClaims        atomic.Int64
 	reconcileResolutions   atomic.Int64
 	criticalEvidenceDenied atomic.Int64
+	epochRejections        atomic.Int64
 }
 
 // Metrics returns the store's live counter set. Both store
@@ -54,5 +55,6 @@ func (m *StoreMetrics) Snapshot() map[string]int64 {
 		"reconciliation_claims_total":          m.reconcileClaims.Load(),
 		"reconciliation_resolutions_total":     m.reconcileResolutions.Load(),
 		"critical_evidence_rejected_total":     m.criticalEvidenceDenied.Load(),
+		"cluster_epoch_rejections_total":       m.epochRejections.Load(),
 	}
 }

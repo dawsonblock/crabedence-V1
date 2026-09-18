@@ -42,6 +42,15 @@ aborted after a provider result, and lease expiry during an outage.
 Application logic must not assume a connection survives a
 transaction boundary.
 
+Payload columns (`result`, `provider_result`, `evidence_receipt`,
+`recovery_locator`) are TEXT, not JSONB: jsonb rewrites whitespace
+and key order on write, which would silently alter asserted provider
+bytes and break signature verification over stored evidence receipts
+(schema v10). TEXT preserves the caller's exact bytes, matching
+SQLite fidelity; the monotonic write guards compare
+`column::jsonb` to the canonical parameter so semantic equality is
+unchanged.
+
 ## 2. Release classifications
 
 Production readiness is not one boolean. The durable execution stack
@@ -93,13 +102,31 @@ snapshot is therefore a recovery event, not a routine operation:
    reconciliation of inherited `IN_FLIGHT`/`UNKNOWN` records comes
    first.
 
-**Cluster epoch (deployment requirement):** the ledger should carry a
-persisted environment/cluster epoch, bumped after any restore or
-environment rebuild. Executors record the epoch they were admitted
-under; an epoch mismatch must fail writes closed so that an executor
-from a pre-restore world cannot keep mutating the restored ledger.
-This is a qualification requirement for PostgreSQL HA/backup-restore
-topologies — implementation work tracked separately.
+**Cluster epoch (implemented, schema v9):** the ledger carries a
+persisted environment/cluster epoch in the single-row `cluster_meta`
+table. Every `EffectStore` reads the epoch once at construction (its
+*admitted* epoch) and stamps it onto each new record's
+`admitted_epoch` column for forensic provenance. Every mutation
+carries the epoch as a WHERE fragment — after the epoch advances, a
+stale store's writes match zero rows, and the CAS-failure classifiers
+return the typed `CLUSTER_EPOCH_MISMATCH` error rather than a
+lease-conflict misclassification. New-record admission is fenced by
+an epoch-guarded INSERT: the row is admitted only while
+`cluster_meta.epoch` still equals the store's admitted epoch, so a
+stale store admits nothing. On SQLite the `BEGIN IMMEDIATE` write
+lock additionally freezes the epoch for the admission's duration,
+making the guard airtight; on PostgreSQL the guard is statement-
+snapshot consistent, and a record that commits in the microseconds
+around an advance is provenance-tagged `admitted_epoch=old` and can
+only ever be mutated by stores admitted under the live epoch.
+
+`AdvanceClusterEpoch(expected, reason)` CAS-bumps the epoch by exactly
+one when the current value still equals `expected` — two operators
+racing the bump cannot double-advance. Run it as part of any restore
+or environment rebuild, before restarting executors; every store
+admitted under the old epoch is permanently fenced afterward and must
+restart (a restarted executor admits under the new epoch). Epoch
+rejections are counted under `cluster_epoch_rejections_total`.
 
 ## 5. Threat model and controls
 
@@ -108,6 +135,7 @@ topologies — implementation work tracked separately.
 | Malicious provider adapter returns contradictory observations | Monotonic observation columns; `PROVIDER_OBSERVATION_CONFLICT` typed error; conflict never overwrites | Property + conflict tests |
 | Compromised worker forges terminal state | CRITICAL requires Ed25519 receipt verified against trusted signer fingerprints; digest recomputed from evidence bytes | Evidence golden vectors, CRITICAL gate tests |
 | Stale executor mutates a reclaimed record | Lease token + generation fencing on every transition; CAS on state+version | Property test stale-fence invariant |
+| Executor from a pre-restore world mutates the restored ledger | Persisted cluster epoch; every mutation carries the epoch WHERE fragment; `CLUSTER_EPOCH_MISMATCH` typed error | Stale-writer fencing conformance test (both engines) |
 | Caller disconnect erases post-dispatch work | Detached bounded durability context; heartbeat owned by durability lifetime | Adversarial cancellation suite |
 | Authority mutated after admission | Append-only authority generations; generation+digest bound into request digest and persisted on the record | Authority binding tests |
 | Tampered/forged evidence | Receipt binds execution, digest, provider identity, outcome; unsigned digests are not proof | Receipt golden vectors, untrusted-signer tests |
@@ -124,7 +152,9 @@ topologies — implementation work tracked separately.
 `StoreMetrics` exposes semantic counters (`Snapshot()`):
 acquire/execute/in-flight/committed/failed totals, UNKNOWN entries,
 lease renewals, fence rejections, observation writes and conflicts,
-reconcile claims and resolutions, and CRITICAL evidence rejections.
+reconcile claims and resolutions, CRITICAL evidence rejections, and
+cluster-epoch write rejections (`cluster_epoch_rejections_total` —
+any nonzero value means a stale-epoch executor is still running).
 High-value alerts are on the semantic signals — UNKNOWN accumulation
 or age, observation conflicts, fence rejections, CRITICAL evidence
 rejections — not raw request error rates.

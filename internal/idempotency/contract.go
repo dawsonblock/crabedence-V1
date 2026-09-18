@@ -157,6 +157,11 @@ const (
 	// assertions, and a mismatch means the caller is describing a
 	// different result than the one it sent.
 	ObservationDigestMismatch LeaseError = "OBSERVATION_DIGEST_MISMATCH"
+	// ClusterEpochMismatch is returned when a store admitted under an
+	// older cluster epoch attempts a write — the epoch advanced after
+	// a restore/environment rebuild and the stale executor is fenced
+	// out of the restored ledger until it restarts.
+	ClusterEpochMismatch LeaseError = "CLUSTER_EPOCH_MISMATCH"
 )
 
 func (e LeaseError) Error() string { return string(e) }

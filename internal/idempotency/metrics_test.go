@@ -105,7 +105,7 @@ func TestStoreMetricsSnapshotKeys(t *testing.T) {
 		"effect_lease_renewals_total", "effect_fence_rejections_total",
 		"effect_observation_writes_total", "provider_observation_conflicts_total",
 		"reconciliation_claims_total", "reconciliation_resolutions_total",
-		"critical_evidence_rejected_total",
+		"critical_evidence_rejected_total", "cluster_epoch_rejections_total",
 	}
 	got := m.Snapshot()
 	for _, k := range want {

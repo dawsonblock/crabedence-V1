@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -172,6 +173,10 @@ type SQLiteStore struct {
 	db       *sql.DB
 	leaseCfg LeaseConfig
 
+	// epoch is the cluster epoch this store was admitted under — the
+	// same DR-fencing contract as Store.epoch.
+	epoch int64
+
 	trustedSigners  map[string]bool
 	verifier        EvidenceVerifier
 	locatorRedactor func(json.RawMessage) (json.RawMessage, error)
@@ -222,12 +227,71 @@ func NewSQLiteStoreWithConfig(db *sql.DB, cfg LeaseConfig) (*SQLiteStore, error)
 	if err := s.ensureSchema(context.Background()); err != nil {
 		return nil, fmt.Errorf("failed to ensure schema: %w", err)
 	}
+	if err := s.db.QueryRowContext(context.Background(),
+		`SELECT epoch FROM cluster_meta WHERE id = 1`).Scan(&s.epoch); err != nil {
+		return nil, fmt.Errorf("failed to read cluster epoch: %w", err)
+	}
 	return s, nil
 }
 
 // LeaseConfig returns the store's lease configuration.
 func (s *SQLiteStore) LeaseConfig() LeaseConfig {
 	return s.leaseCfg
+}
+
+// ─── Cluster epoch (DR fencing) ─────────────────────────────────────
+
+// ClusterEpoch returns the epoch this store was admitted under — see
+// Store.ClusterEpoch.
+func (s *SQLiteStore) ClusterEpoch() int64 {
+	return s.epoch
+}
+
+// AdvanceClusterEpoch is the embedded counterpart of
+// Store.AdvanceClusterEpoch — same CAS contract.
+func (s *SQLiteStore) AdvanceClusterEpoch(ctx context.Context, expected int64, reason string) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE cluster_meta
+		SET epoch = epoch + 1, advanced_at = `+sqliteNow+`, advance_reason = ?2
+		WHERE id = 1 AND epoch = ?1`, expected, nullableString(reason))
+	if err != nil {
+		return 0, err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if rows == 0 {
+		var cur int64
+		if err := s.db.QueryRowContext(ctx,
+			`SELECT epoch FROM cluster_meta WHERE id = 1`).Scan(&cur); err != nil {
+			return 0, err
+		}
+		return 0, fmt.Errorf("%w: cluster epoch already at %d (expected %d)", ClusterEpochMismatch, cur, expected)
+	}
+	return expected + 1, nil
+}
+
+// epochGuardSQL is the SQLite counterpart of Store.epochGuardSQL.
+func (s *SQLiteStore) epochGuardSQL() string {
+	return fmt.Sprintf("AND (SELECT epoch FROM cluster_meta WHERE id = 1) = %d", s.epoch)
+}
+
+// checkEpoch is the SQLite counterpart of Store.checkEpoch. WAL-mode
+// readers do not block on the writer, so a pool query here is safe
+// even while the calling method holds its write transaction open.
+func (s *SQLiteStore) checkEpoch(ctx context.Context) error {
+	var cur int64
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT epoch FROM cluster_meta WHERE id = 1`).Scan(&cur); err != nil {
+		return err
+	}
+	if cur != s.epoch {
+		s.metrics.epochRejections.Add(1)
+		return fmt.Errorf("%w: store admitted under epoch %d, cluster now at %d — stale executor must restart",
+			ClusterEpochMismatch, s.epoch, cur)
+	}
+	return nil
 }
 
 // ─── Schema ──────────────────────────────────────────────────────────
@@ -256,6 +320,8 @@ var sqliteSchemaMigrations = []sqliteSchemaMigration{
 	{6, "provider_result_column", sqliteMigrationProviderResultColumn},
 	{7, "authority_snapshot_columns_and_audit_indexes", sqliteMigrationAuthoritySnapshot},
 	{8, "forensic_record", sqliteMigrationForensic},
+	{9, "cluster_epoch_fencing", sqliteMigrationClusterEpoch},
+	{10, "result_byte_fidelity_already_text", nil},
 }
 
 func (s *SQLiteStore) ensureSchema(ctx context.Context) error {
@@ -568,6 +634,60 @@ func sqliteMigrationForensic(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
+// sqliteMigrationClusterEpoch mirrors the PG migration 9: the
+// single-row cluster_meta table carrying the DR fence epoch, plus
+// admitted_epoch on execution_requests for forensic provenance.
+// Existing rows backfill to epoch 1 — they were admitted before
+// epochs existed, when the implicit epoch was the initial one.
+func sqliteMigrationClusterEpoch(ctx context.Context, tx *sql.Tx) error {
+	if _, err := tx.ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS cluster_meta (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			epoch INTEGER NOT NULL,
+			advanced_at INTEGER,
+			advance_reason TEXT
+		)`); err != nil {
+		return fmt.Errorf("cluster_meta table: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO cluster_meta (id, epoch, advanced_at, advance_reason)
+		VALUES (1, 1, `+sqliteNow+`, 'initial epoch')
+		ON CONFLICT (id) DO NOTHING`); err != nil {
+		return fmt.Errorf("cluster_meta seed: %w", err)
+	}
+	existing := map[string]bool{}
+	rows, err := tx.QueryContext(ctx, `PRAGMA table_info(execution_requests)`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		existing[name] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if !existing["admitted_epoch"] {
+		if _, err := tx.ExecContext(ctx,
+			`ALTER TABLE execution_requests ADD COLUMN admitted_epoch INTEGER`); err != nil {
+			return fmt.Errorf("column admitted_epoch: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE execution_requests SET admitted_epoch = 1 WHERE admitted_epoch IS NULL`); err != nil {
+		return fmt.Errorf("backfill admitted_epoch: %w", err)
+	}
+	return nil
+}
+
 // sqliteInsertEffectEvent mirrors insertEffectEvent for the embedded
 // backend: sequence is allocated with MAX+1 inside the mutation's
 // transaction (single-writer BEGIN IMMEDIATE serializes all writers),
@@ -668,15 +788,20 @@ func (s *SQLiteStore) AcquireWithAuthority(ctx context.Context, key, principal, 
 	if err != nil {
 		return nil, err
 	}
+	// SELECT-guarded INSERT — mirrors Store.AcquireWithAuthority. The
+	// BEGIN IMMEDIATE write lock additionally freezes the epoch for
+	// this statement's duration, so the guard cannot be raced here.
 	err = tx.QueryRowContext(ctx, `
 		INSERT INTO execution_requests
 			(execution_id, idempotency_key, principal_id, capability_id, request_digest,
 			 grant_id, authority_generation, authority_digest, execution_class, state,
 			 lease_owner, lease_token, lease_started_at, lease_expires_at,
-			 lease_generation, attempt, version, created_at, updated_at)
-		VALUES (?10, ?1, ?2, ?3, ?4, ?5, ?11, ?12, ?6, 'PREPARED',
+			 lease_generation, attempt, version, created_at, updated_at, admitted_epoch)
+		SELECT ?10, ?1, ?2, ?3, ?4, ?5, ?11, ?12, ?6, 'PREPARED',
 				?7, ?8, `+sqliteNow+`, `+sqliteNow+` + ?9,
-				1, 0, 1, `+sqliteNow+`, `+sqliteNow+`)
+				1, 0, 1, `+sqliteNow+`, `+sqliteNow+`, cm.epoch
+		FROM cluster_meta cm
+		WHERE cm.id = 1 AND cm.epoch = `+strconv.FormatInt(s.epoch, 10)+`
 		ON CONFLICT (principal_id, capability_id, idempotency_key) DO NOTHING
 		RETURNING execution_id, created_at
 	`, key, principal, capability, digest, nullableString(authority.Ref), class,
@@ -722,6 +847,7 @@ func (s *SQLiteStore) AcquireWithAuthority(ctx context.Context, key, principal, 
 				Version:             1,
 				CreatedAt:           createdAt,
 				UpdatedAt:           createdAt,
+				AdmittedEpoch:       s.epoch,
 			},
 		}, nil
 	}
@@ -735,6 +861,14 @@ func (s *SQLiteStore) AcquireWithAuthority(ctx context.Context, key, principal, 
 	}
 
 	rec, err := s.lookupByKey(ctx, principal, capability, key)
+	if errors.Is(err, sql.ErrNoRows) {
+		// No record exists: the INSERT was fenced by the epoch guard.
+		if epochErr := s.checkEpoch(ctx); epochErr != nil {
+			return nil, epochErr
+		}
+		return nil, fmt.Errorf("%w: acquire raced — key vanished between insert and lookup",
+			LeaseStateConflict)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -843,7 +977,7 @@ func (s *SQLiteStore) acquireUnleased(ctx context.Context, rec *Record, newToken
 		  AND lease_token IS NULL
 		  AND lease_expires_at IS NULL
 		  AND version = ?5
-	`, newOwner, newToken, msDuration(duration),
+		  `+s.epochGuardSQL(), newOwner, newToken, msDuration(duration),
 		rec.ExecutionID, rec.Version)
 	if err != nil {
 		return false, err
@@ -853,7 +987,8 @@ func (s *SQLiteStore) acquireUnleased(ctx context.Context, rec *Record, newToken
 		return false, err
 	}
 	if rows == 0 {
-		return false, nil
+		tx.Rollback()
+		return false, s.checkEpoch(ctx)
 	}
 	if err := sqliteInsertEffectEvent(ctx, tx, rec.ExecutionID, effectEvent{
 		eventType:       EventLeaseAcquired,
@@ -892,7 +1027,7 @@ func (s *SQLiteStore) reclaimExpiredLease(ctx context.Context, rec *Record, newT
 		  AND version = ?5
 		  AND state IN ('PREPARED', 'EXECUTING')
 		  AND lease_expires_at < `+sqliteNow+`
-	`, newOwner, newToken, msDuration(duration),
+		  `+s.epochGuardSQL(), newOwner, newToken, msDuration(duration),
 		rec.ExecutionID, rec.Version)
 	if err != nil {
 		return false, err
@@ -902,7 +1037,8 @@ func (s *SQLiteStore) reclaimExpiredLease(ctx context.Context, rec *Record, newT
 		return false, err
 	}
 	if rows == 0 {
-		return false, nil
+		tx.Rollback()
+		return false, s.checkEpoch(ctx)
 	}
 	if err := sqliteInsertEffectEvent(ctx, tx, rec.ExecutionID, effectEvent{
 		eventType:       EventLeaseAcquired,
@@ -944,7 +1080,7 @@ func (s *SQLiteStore) markInFlightExpiredAsUnknown(ctx context.Context, rec *Rec
 		  AND version = ?2
 		  AND state = 'IN_FLIGHT'
 		  AND lease_expires_at < `+sqliteNow+`
-	`, rec.ExecutionID, rec.Version)
+		  `+s.epochGuardSQL(), rec.ExecutionID, rec.Version)
 	if err != nil {
 		return false, err
 	}
@@ -953,7 +1089,8 @@ func (s *SQLiteStore) markInFlightExpiredAsUnknown(ctx context.Context, rec *Rec
 		return false, err
 	}
 	if rows == 0 {
-		return false, nil
+		tx.Rollback()
+		return false, s.checkEpoch(ctx)
 	}
 	if err := sqliteInsertEffectEvent(ctx, tx, rec.ExecutionID, effectEvent{
 		eventType:     EventEnteredUnknown,
@@ -1024,7 +1161,7 @@ func (s *SQLiteStore) MarkInFlight(ctx context.Context, executionID, leaseToken 
 		  AND lease_token = ?2
 		  AND lease_generation = ?3
 		  AND lease_expires_at > `+sqliteNow+`
-	`, executionID, leaseToken, leaseGeneration,
+		  `+s.epochGuardSQL(), executionID, leaseToken, leaseGeneration,
 		nullableString(providerID), nullableString(string(recoveryLocator)))
 	if err != nil {
 		return err
@@ -1069,7 +1206,7 @@ func (s *SQLiteStore) leaseFencedTransition(ctx context.Context, executionID, le
 		  AND lease_token = ?4
 		  AND lease_generation = ?5
 		  AND lease_expires_at > `+sqliteNow+`
-	`, string(newState), executionID, string(expectedState), leaseToken, leaseGeneration)
+		  `+s.epochGuardSQL(), string(newState), executionID, string(expectedState), leaseToken, leaseGeneration)
 	if err != nil {
 		return err
 	}
@@ -1095,6 +1232,9 @@ func (s *SQLiteStore) leaseFencedTransition(ctx context.Context, executionID, le
 }
 
 func (s *SQLiteStore) classifyTransitionFailure(ctx context.Context, executionID, leaseToken string, leaseGeneration int, expectedState State) error {
+	if err := s.checkEpoch(ctx); err != nil {
+		return err
+	}
 	s.metrics.fenceRejections.Add(1)
 	rec, err := s.Lookup(ctx, executionID)
 	if err != nil {
@@ -1138,7 +1278,7 @@ func (s *SQLiteStore) RenewLease(ctx context.Context, executionID, leaseToken st
 		  AND lease_generation = ?4
 		  AND lease_expires_at > `+sqliteNow+`
 		  AND state NOT IN ('COMMITTED', 'FAILED', 'DENIED', 'UNKNOWN')
-	`, msDuration(duration), executionID, leaseToken, leaseGeneration)
+		  `+s.epochGuardSQL(), msDuration(duration), executionID, leaseToken, leaseGeneration)
 	if err != nil {
 		return err
 	}
@@ -1164,6 +1304,9 @@ func (s *SQLiteStore) RenewLease(ctx context.Context, executionID, leaseToken st
 }
 
 func (s *SQLiteStore) classifyRenewalFailure(ctx context.Context, executionID, leaseToken string, leaseGeneration int) error {
+	if err := s.checkEpoch(ctx); err != nil {
+		return err
+	}
 	s.metrics.fenceRejections.Add(1)
 	rec, err := s.Lookup(ctx, executionID)
 	if err != nil {
@@ -1202,7 +1345,7 @@ func (s *SQLiteStore) AbandonPreDispatch(ctx context.Context, executionID, lease
 		  AND lease_token = ?2
 		  AND lease_generation = ?3
 		  AND lease_expires_at > `+sqliteNow+`
-	`, executionID, leaseToken, leaseGeneration)
+		  `+s.epochGuardSQL(), executionID, leaseToken, leaseGeneration)
 	if err != nil {
 		return err
 	}
@@ -1225,6 +1368,9 @@ func (s *SQLiteStore) AbandonPreDispatch(ctx context.Context, executionID, lease
 }
 
 func (s *SQLiteStore) classifyAbandonFailure(ctx context.Context, executionID, leaseToken string, leaseGeneration int) error {
+	if err := s.checkEpoch(ctx); err != nil {
+		return err
+	}
 	s.metrics.fenceRejections.Add(1)
 	rec, err := s.Lookup(ctx, executionID)
 	if err != nil {
@@ -1356,7 +1502,7 @@ func (s *SQLiteStore) Finalize(ctx context.Context, executionID, leaseToken stri
 		  AND version = ?12
 		  AND (provider_id IS NULL OR ?5 IS NULL OR provider_id = ?5)
 		  AND (provider_run_id IS NULL OR ?6 IS NULL OR provider_run_id = ?6)
-	`, string(receipt.TerminalStatus),
+		  `+s.epochGuardSQL(), string(receipt.TerminalStatus),
 		nullableString(string(receipt.CanonicalResult)),
 		nullableString(receipt.EvidenceDigest),
 		receipt.ReceiptVersion,
@@ -1441,7 +1587,7 @@ func (s *SQLiteStore) EnterRecovery(ctx context.Context, executionID string, exp
 		WHERE execution_id = ?1
 		  AND state = ?2
 		  AND version = ?3
-	`, executionID, string(expectedState), expectedVersion)
+		  `+s.epochGuardSQL(), executionID, string(expectedState), expectedVersion)
 	if err != nil {
 		return err
 	}
@@ -1450,6 +1596,10 @@ func (s *SQLiteStore) EnterRecovery(ctx context.Context, executionID string, exp
 		return err
 	}
 	if rows == 0 {
+		tx.Rollback()
+		if err := s.checkEpoch(ctx); err != nil {
+			return err
+		}
 		return fmt.Errorf("%w: execution %s enter recovery CAS failed (state/version mismatch)", LeaseStateConflict, executionID)
 	}
 	if err := sqliteInsertEffectEvent(ctx, tx, executionID, effectEvent{
@@ -1514,7 +1664,7 @@ func (s *SQLiteStore) EnterRecoveryWithObservation(ctx context.Context, executio
 		  AND (provider_receipt_version IS NULL OR provider_receipt_version = 0 OR NULLIF(?8, 0) IS NULL OR provider_receipt_version = ?8)
 		  AND (evidence_digest IS NULL OR ?9 IS NULL OR evidence_digest = ?9)
 		  AND (provider_evidence_digest IS NULL OR ?9 IS NULL OR provider_evidence_digest = ?9)
-	`, executionID, string(expectedState), expectedVersion,
+		  `+s.epochGuardSQL(), executionID, string(expectedState), expectedVersion,
 		nullableString(obs.ProviderID), nullableString(obs.ProviderRunID),
 		nullableString(obs.ProviderStatus), nullableString(obs.ResultDigest),
 		obs.ReceiptVersion,
@@ -1551,6 +1701,9 @@ func (s *SQLiteStore) EnterRecoveryWithObservation(ctx context.Context, executio
 }
 
 func (s *SQLiteStore) classifyEnterRecoveryFailure(ctx context.Context, executionID string, expectedState State, expectedVersion int) error {
+	if err := s.checkEpoch(ctx); err != nil {
+		return err
+	}
 	s.metrics.fenceRejections.Add(1)
 	rec, err := s.Lookup(ctx, executionID)
 	if err != nil {
@@ -1604,7 +1757,7 @@ func (s *SQLiteStore) RecordProviderObservation(ctx context.Context, executionID
 		  AND (evidence_digest IS NULL OR ?9 IS NULL OR evidence_digest = ?9)
 		  AND (provider_evidence_digest IS NULL OR ?9 IS NULL OR provider_evidence_digest = ?9)
 		  AND (provider_receipt_version IS NULL OR provider_receipt_version = 0 OR NULLIF(?10, 0) IS NULL OR provider_receipt_version = ?10)
-	`, executionID, nullableString(leaseToken), leaseGeneration,
+		  `+s.epochGuardSQL(), executionID, nullableString(leaseToken), leaseGeneration,
 		nullableString(obs.ProviderID), nullableString(obs.ProviderRunID),
 		nullableString(obs.ProviderStatus), nullableString(string(obs.Result)),
 		nullableString(obs.ResultDigest), nullableString(obs.EvidenceDigest),
@@ -1651,6 +1804,9 @@ func (s *SQLiteStore) RecordProviderObservation(ctx context.Context, executionID
 }
 
 func (s *SQLiteStore) classifyObservationFailure(ctx context.Context, executionID, leaseToken string, leaseGeneration int) error {
+	if err := s.checkEpoch(ctx); err != nil {
+		return err
+	}
 	s.metrics.fenceRejections.Add(1)
 	rec, err := s.Lookup(ctx, executionID)
 	if err != nil {
@@ -1689,7 +1845,7 @@ func (s *SQLiteStore) RecoverExpiredPreDispatch(ctx context.Context, executionID
 		  AND version = ?2
 		  AND lease_expires_at IS NOT NULL
 		  AND lease_expires_at < `+sqliteNow+`
-	`, executionID, expectedVersion)
+		  `+s.epochGuardSQL(), executionID, expectedVersion)
 	if err != nil {
 		return err
 	}
@@ -1698,6 +1854,10 @@ func (s *SQLiteStore) RecoverExpiredPreDispatch(ctx context.Context, executionID
 		return err
 	}
 	if rows == 0 {
+		tx.Rollback()
+		if err := s.checkEpoch(ctx); err != nil {
+			return err
+		}
 		return fmt.Errorf("%w: execution %s recover expired pre-dispatch CAS failed (state/version/expiry mismatch)", LeaseStateConflict, executionID)
 	}
 	if err := sqliteInsertEffectEvent(ctx, tx, executionID, effectEvent{
@@ -1717,13 +1877,16 @@ func (s *SQLiteStore) ScrubStaleRecoveryLocators(ctx context.Context, olderThan 
 	if olderThan <= 0 {
 		return 0, fmt.Errorf("locator retention must be positive")
 	}
+	if err := s.checkEpoch(ctx); err != nil {
+		return 0, err
+	}
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE execution_requests
 		SET recovery_locator = NULL
 		WHERE state = 'UNKNOWN'
 		  AND recovery_locator IS NOT NULL
 		  AND COALESCE(entered_unknown_at, created_at) < `+sqliteNow+` - ?1
-	`, msDuration(olderThan))
+		  `+s.epochGuardSQL(), msDuration(olderThan))
 	if err != nil {
 		return 0, err
 	}
@@ -1746,7 +1909,7 @@ func (s *SQLiteStore) ResolveRecovery(ctx context.Context, executionID string, e
 			UPDATE execution_requests
 			SET updated_at = `+sqliteNow+`
 			WHERE execution_id = ?1 AND state = 'UNKNOWN' AND version = ?2
-		`, executionID, expectedVersion)
+			  `+s.epochGuardSQL(), executionID, expectedVersion)
 		if err != nil {
 			return err
 		}
@@ -1755,6 +1918,9 @@ func (s *SQLiteStore) ResolveRecovery(ctx context.Context, executionID string, e
 			return err
 		}
 		if rows == 0 {
+			if err := s.checkEpoch(ctx); err != nil {
+				return err
+			}
 			return fmt.Errorf("%w: execution %s recovery-unknown CAS failed (state/version mismatch)", LeaseStateConflict, executionID)
 		}
 		return nil
@@ -1851,7 +2017,7 @@ func (s *SQLiteStore) ResolveRecovery(ctx context.Context, executionID string, e
 		WHERE execution_id = ?8 AND state = 'UNKNOWN' AND version = ?9
 		  AND (provider_id IS NULL OR ?5 IS NULL OR provider_id = ?5)
 		  AND (provider_run_id IS NULL OR ?6 IS NULL OR provider_run_id = ?6)
-	`, string(newState),
+		  `+s.epochGuardSQL(), string(newState),
 		nullableString(string(result.Result)),
 		nullableString(result.EvidenceDigest),
 		result.ReceiptVersion,
@@ -1869,6 +2035,10 @@ func (s *SQLiteStore) ResolveRecovery(ctx context.Context, executionID string, e
 		return err
 	}
 	if rows == 0 {
+		tx.Rollback()
+		if err := s.checkEpoch(ctx); err != nil {
+			return err
+		}
 		// Distinguish a state/version CAS failure from a provider-
 		// observation contradiction, which is a different failure class.
 		// When state and version still match, only the provider-identity
@@ -1952,6 +2122,7 @@ func (s *SQLiteStore) ClaimUnknownBatch(ctx context.Context, owner string, batch
 			ORDER BY updated_at
 			LIMIT ?3
 		)
+		`+s.epochGuardSQL()+`
 		RETURNING `+selectColumns,
 		owner,
 		msDuration(claimDuration),
@@ -1963,6 +2134,13 @@ func (s *SQLiteStore) ClaimUnknownBatch(ctx context.Context, owner string, batch
 	recs, err := scanSQLiteRecords(rows)
 	if err != nil {
 		return nil, err
+	}
+	if len(recs) == 0 {
+		tx.Rollback()
+		if err := s.checkEpoch(ctx); err != nil {
+			return nil, err
+		}
+		return recs, nil
 	}
 	for _, rec := range recs {
 		if err := sqliteInsertEffectEvent(ctx, tx, rec.ExecutionID, effectEvent{
@@ -2011,6 +2189,7 @@ func (s *SQLiteStore) ClaimExpiredBatch(ctx context.Context, owner string, batch
 			ORDER BY updated_at
 			LIMIT ?3
 		)
+		`+s.epochGuardSQL()+`
 		RETURNING `+selectColumns,
 		owner,
 		msDuration(claimDuration),
@@ -2022,6 +2201,13 @@ func (s *SQLiteStore) ClaimExpiredBatch(ctx context.Context, owner string, batch
 	recs, err := scanSQLiteRecords(rows)
 	if err != nil {
 		return nil, err
+	}
+	if len(recs) == 0 {
+		tx.Rollback()
+		if err := s.checkEpoch(ctx); err != nil {
+			return nil, err
+		}
+		return recs, nil
 	}
 	// Each claimed record's previous lease holder lost its lease to
 	// expiry — the claim is the forensic record of that loss.
@@ -2065,7 +2251,7 @@ func (s *SQLiteStore) ReleaseReconcileClaim(ctx context.Context, executionID str
 		    updated_at = `+sqliteNow+`
 		WHERE execution_id = ?3
 		  AND version = ?4
-	`, msDuration(backoffDuration),
+		  `+s.epochGuardSQL(), msDuration(backoffDuration),
 		nullableString(lastError), executionID, expectedVersion)
 	if err != nil {
 		return err
@@ -2078,6 +2264,9 @@ func (s *SQLiteStore) ReleaseReconcileClaim(ctx context.Context, executionID str
 		// Release our write lock before the standalone forensic
 		// insert — BEGIN IMMEDIATE would contend with our own tx.
 		tx.Rollback()
+		if err := s.checkEpoch(ctx); err != nil {
+			return err
+		}
 		s.noteContentionEvent(ctx, executionID, EventClaimLost, "release reconcile claim CAS failed")
 		return fmt.Errorf("%w: execution %s release reconcile claim CAS failed (state/version mismatch)", LeaseStateConflict, executionID)
 	}
@@ -2109,7 +2298,7 @@ func (s *SQLiteStore) SuspendReconciliation(ctx context.Context, executionID str
 		WHERE execution_id = ?2
 		  AND state = 'UNKNOWN'
 		  AND version = ?3
-	`, nullableString(reason), executionID, expectedVersion,
+		  `+s.epochGuardSQL(), nullableString(reason), executionID, expectedVersion,
 		msDuration(100*365*24*time.Hour))
 	if err != nil {
 		return err
@@ -2120,6 +2309,9 @@ func (s *SQLiteStore) SuspendReconciliation(ctx context.Context, executionID str
 	}
 	if rows == 0 {
 		tx.Rollback()
+		if err := s.checkEpoch(ctx); err != nil {
+			return err
+		}
 		s.noteContentionEvent(ctx, executionID, EventClaimLost, "suspend reconciliation CAS failed")
 		return fmt.Errorf("%w: execution %s suspend reconciliation CAS failed (state/version mismatch)", LeaseStateConflict, executionID)
 	}
@@ -2151,7 +2343,7 @@ func (s *SQLiteStore) RenewReconcileClaim(ctx context.Context, executionID strin
 		  AND state = 'UNKNOWN'
 		  AND version = ?3
 		  AND reconcile_lease_expires_at > `+sqliteNow+`
-	`, msDuration(duration), executionID, expectedVersion)
+		  `+s.epochGuardSQL(), msDuration(duration), executionID, expectedVersion)
 	if err != nil {
 		return err
 	}
@@ -2161,6 +2353,9 @@ func (s *SQLiteStore) RenewReconcileClaim(ctx context.Context, executionID strin
 	}
 	if rows == 0 {
 		tx.Rollback()
+		if err := s.checkEpoch(ctx); err != nil {
+			return err
+		}
 		s.noteContentionEvent(ctx, executionID, EventClaimLost, "renew reconcile claim failed")
 		return fmt.Errorf("%w: execution %s renew reconcile claim failed (expired or version mismatch)", LeaseStateConflict, executionID)
 	}
@@ -2301,7 +2496,7 @@ func scanSQLiteRecords(rows *sql.Rows) ([]*Record, error) {
 			&enteredUnknownAt, &providerResultJSON,
 			&rec.AuthorityGeneration, &rec.AuthorityDigest,
 			&rec.ProviderEvidenceDigest, &rec.TerminalResultDigest,
-			&rec.TerminalEvidenceDigest,
+			&rec.TerminalEvidenceDigest, &rec.AdmittedEpoch,
 		); err != nil {
 			return nil, err
 		}

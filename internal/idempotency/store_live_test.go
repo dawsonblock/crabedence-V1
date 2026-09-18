@@ -3481,7 +3481,14 @@ func TestLiveRecoveryLocatorBounds(t *testing.T) {
 	if strings.Contains(string(rec.RecoveryLocator), "sensitive-thing") {
 		t.Error("redaction hook was not applied before persistence")
 	}
-	if !strings.Contains(string(rec.RecoveryLocator), "<redacted>") {
+	// Byte fidelity is the contract — the redactor's exact output is
+	// stored verbatim (json.Marshal escapes '<' as <), so compare
+	// the decoded payload rather than the serialized bytes.
+	var loc map[string]any
+	if err := json.Unmarshal(rec.RecoveryLocator, &loc); err != nil {
+		t.Fatalf("stored locator is not valid JSON: %v", err)
+	}
+	if loc["raw_payload"] != "<redacted>" {
 		t.Errorf("expected redacted payload in locator, got %s", rec.RecoveryLocator)
 	}
 }

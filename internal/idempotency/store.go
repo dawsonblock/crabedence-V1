@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -104,6 +105,9 @@ type Record struct {
 	// UNKNOWN recently must keep its locator for the full retention
 	// window.
 	EnteredUnknownAt *time.Time `json:"entered_unknown_at,omitempty"`
+	// AdmittedEpoch is the cluster epoch the record was acquired under
+	// — forensic provenance for "which world admitted this execution".
+	AdmittedEpoch int64 `json:"admitted_epoch,omitempty"`
 }
 
 // ─── Store ───────────────────────────────────────────────────────────
@@ -131,6 +135,12 @@ type Store struct {
 	// Applied in MarkInFlight between the size bound and the denylist
 	// scan, which runs on the final persisted representation.
 	locatorRedactor func(json.RawMessage) (json.RawMessage, error)
+
+	// epoch is the cluster epoch this store was admitted under, read
+	// once at construction. Every mutation carries it as a WHERE
+	// fragment — after a DR epoch advance, a stale store's writes
+	// match zero rows and are fenced out of the restored ledger.
+	epoch int64
 
 	// metrics is the live semantic counter set — see StoreMetrics.
 	metrics StoreMetrics
@@ -183,7 +193,75 @@ func NewStoreWithConfig(db *sql.DB, cfg LeaseConfig) (*Store, error) {
 	if err := s.ensureSchema(context.Background()); err != nil {
 		return nil, fmt.Errorf("failed to ensure schema: %w", err)
 	}
+	if err := s.db.QueryRowContext(context.Background(),
+		`SELECT epoch FROM cluster_meta WHERE id = 1`).Scan(&s.epoch); err != nil {
+		return nil, fmt.Errorf("failed to read cluster epoch: %w", err)
+	}
 	return s, nil
+}
+
+// ─── Cluster epoch (DR fencing) ─────────────────────────────────────
+
+// ClusterEpoch returns the epoch this store was admitted under — the
+// value stamped on new acquisitions and required by every mutation.
+func (s *Store) ClusterEpoch() int64 {
+	return s.epoch
+}
+
+// AdvanceClusterEpoch bumps the cluster epoch by exactly one when the
+// current epoch still equals expected — the CAS guards against two
+// operators racing the bump. Call it as part of a restore/environment
+// rebuild, before restarting executors: any store admitted under the
+// old epoch is permanently fenced afterward. reason is audit text
+// recorded on the meta row.
+func (s *Store) AdvanceClusterEpoch(ctx context.Context, expected int64, reason string) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE cluster_meta
+		SET epoch = epoch + 1, advanced_at = clock_timestamp(), advance_reason = $2
+		WHERE id = 1 AND epoch = $1`, expected, nullableString(reason))
+	if err != nil {
+		return 0, err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if rows == 0 {
+		var cur int64
+		if err := s.db.QueryRowContext(ctx,
+			`SELECT epoch FROM cluster_meta WHERE id = 1`).Scan(&cur); err != nil {
+			return 0, err
+		}
+		return 0, fmt.Errorf("%w: cluster epoch already at %d (expected %d)", ClusterEpochMismatch, cur, expected)
+	}
+	return expected + 1, nil
+}
+
+// epochGuardSQL returns the WHERE fragment that fences a stale-epoch
+// writer: once the cluster epoch advances past this store's admitted
+// epoch, every guarded UPDATE matches zero rows. The epoch is an
+// int64 read at construction — interpolated as a literal so statement
+// parameter numbering is undisturbed.
+func (s *Store) epochGuardSQL() string {
+	return fmt.Sprintf("AND (SELECT epoch FROM cluster_meta WHERE id = 1) = %d", s.epoch)
+}
+
+// checkEpoch verifies the cluster epoch still equals this store's
+// admitted epoch — used by CAS-failure classifiers so an epoch-fenced
+// writer gets the honest CLUSTER_EPOCH_MISMATCH error instead of a
+// lease-conflict misclassification.
+func (s *Store) checkEpoch(ctx context.Context) error {
+	var cur int64
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT epoch FROM cluster_meta WHERE id = 1`).Scan(&cur); err != nil {
+		return err
+	}
+	if cur != s.epoch {
+		s.metrics.epochRejections.Add(1)
+		return fmt.Errorf("%w: store admitted under epoch %d, cluster now at %d — stale executor must restart",
+			ClusterEpochMismatch, s.epoch, cur)
+	}
+	return nil
 }
 
 // ─── Schema ──────────────────────────────────────────────────────────
@@ -192,7 +270,7 @@ func NewStoreWithConfig(db *sql.DB, cfg LeaseConfig) (*Store, error) {
 // requires. Startup verifies the migrated schema reaches this version —
 // a database older than the code fails closed rather than running
 // against a partial schema.
-const RequiredSchemaVersion = 8
+const RequiredSchemaVersion = 10
 
 // schemaMigration is one versioned, idempotent schema change. Each
 // migration must be safe to re-run (IF NOT EXISTS / addColumnIfMissing)
@@ -215,6 +293,8 @@ var schemaMigrations = []schemaMigration{
 	{6, "provider_result_column", migrationProviderResultColumn},
 	{7, "authority_snapshot_columns_and_audit_indexes", migrationAuthoritySnapshot},
 	{8, "forensic_record", migrationForensicRecord},
+	{9, "cluster_epoch", migrationClusterEpoch},
+	{10, "result_byte_fidelity", migrationResultByteFidelity},
 }
 
 func (s *Store) ensureSchema(ctx context.Context) error {
@@ -464,6 +544,22 @@ func migrationProviderResultColumn(ctx context.Context, conn *sql.Conn) error {
 	return err
 }
 
+// migrationResultByteFidelity converts the payload columns from JSONB
+// to TEXT. jsonb rewrites whitespace and key order on write, which
+// silently alters asserted provider bytes — breaking replay fidelity
+// and invalidating signatures over stored evidence receipts. TEXT
+// preserves the exact bytes; the monotonic guards keep semantic
+// equality by comparing column::jsonb to the canonical parameter.
+func migrationResultByteFidelity(ctx context.Context, conn *sql.Conn) error {
+	for _, col := range []string{"result", "provider_result", "evidence_receipt", "recovery_locator"} {
+		if _, err := conn.ExecContext(ctx,
+			fmt.Sprintf(`ALTER TABLE execution_requests ALTER COLUMN %s TYPE TEXT`, col)); err != nil {
+			return fmt.Errorf("column %s: %w", col, err)
+		}
+	}
+	return nil
+}
+
 // migrationAuthoritySnapshot adds the immutable authority-snapshot
 // columns (authority_generation, authority_digest) recorded at Acquire
 // time, plus partial audit indexes on provider_run_id and grant_id so
@@ -691,6 +787,32 @@ func migrationForensicRecord(ctx context.Context, conn *sql.Conn) error {
 	return nil
 }
 
+// migrationClusterEpoch creates the persisted cluster-epoch row and
+// the per-record admission stamp — the DR-fencing mechanism described
+// in docs/spec/durable-execution-operations.md §4. A ledger restored
+// from a stale snapshot gets its epoch bumped by the operator during
+// recovery; writers admitted under the old epoch then match zero rows
+// on every mutation and are fenced out of the restored world.
+func migrationClusterEpoch(ctx context.Context, conn *sql.Conn) error {
+	for _, ddl := range []string{
+		`CREATE TABLE IF NOT EXISTS cluster_meta (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			epoch BIGINT NOT NULL,
+			advanced_at TIMESTAMPTZ,
+			advance_reason TEXT
+		)`,
+		`INSERT INTO cluster_meta (id, epoch)
+		 SELECT 1, 1 WHERE NOT EXISTS (SELECT 1 FROM cluster_meta WHERE id = 1)`,
+		`ALTER TABLE execution_requests ADD COLUMN IF NOT EXISTS admitted_epoch BIGINT`,
+		`UPDATE execution_requests SET admitted_epoch = 1 WHERE admitted_epoch IS NULL`,
+	} {
+		if _, err := conn.ExecContext(ctx, ddl); err != nil {
+			return fmt.Errorf("cluster epoch schema: %w", err)
+		}
+	}
+	return nil
+}
+
 // ─── Forensic write helpers ──────────────────────────────────────────
 
 // insertEffectEvent appends one event row inside the mutation's
@@ -846,15 +968,24 @@ func (s *Store) AcquireWithAuthority(ctx context.Context, key, principal, capabi
 	if err != nil {
 		return nil, err
 	}
+	// The INSERT is SELECT-guarded on the cluster epoch: a concurrent
+	// AdvanceClusterEpoch turns the source SELECT empty and nothing is
+	// admitted — no row lock needed. The window where an advance
+	// commits between this statement's snapshot and its commit is
+	// bounded by the statement itself; a record that slips through is
+	// provenance-tagged admitted_epoch=old and can only be mutated by
+	// stores admitted under the live epoch.
 	err = tx.QueryRowContext(ctx, `
 		INSERT INTO execution_requests
 			(execution_id, idempotency_key, principal_id, capability_id, request_digest,
 			 grant_id, authority_generation, authority_digest, execution_class, state,
 			 lease_owner, lease_token, lease_started_at, lease_expires_at,
-			 lease_generation, attempt, version)
-		VALUES ($10, $1, $2, $3, $4, $5, $11, $12, $6, 'PREPARED',
+			 lease_generation, attempt, version, admitted_epoch)
+		SELECT $10, $1, $2, $3, $4, $5, $11, $12, $6, 'PREPARED',
 				$7, $8, clock_timestamp(), clock_timestamp() + make_interval(secs => $9),
-				1, 0, 1)
+				1, 0, 1, cm.epoch
+		FROM cluster_meta cm
+		WHERE cm.id = 1 AND cm.epoch = `+strconv.FormatInt(s.epoch, 10)+`
 		ON CONFLICT (principal_id, capability_id, idempotency_key) DO NOTHING
 		RETURNING execution_id, created_at
 	`, key, principal, capability, digest, nullableString(authority.Ref), class,
@@ -900,6 +1031,7 @@ func (s *Store) AcquireWithAuthority(ctx context.Context, key, principal, capabi
 				Version:             1,
 				CreatedAt:           createdAt,
 				UpdatedAt:           createdAt,
+				AdmittedEpoch:       s.epoch,
 			},
 		}, nil
 	}
@@ -914,6 +1046,16 @@ func (s *Store) AcquireWithAuthority(ctx context.Context, key, principal, capabi
 
 	// ON CONFLICT DO NOTHING — the key already exists. Read it.
 	rec, err := s.lookupByKey(ctx, principal, capability, key)
+	if errors.Is(err, sql.ErrNoRows) {
+		// No record exists: the INSERT was fenced by the epoch guard,
+		// not the key conflict — unless a concurrent writer deleted the
+		// row (records are never deleted) this is a stale-epoch store.
+		if epochErr := s.checkEpoch(ctx); epochErr != nil {
+			return nil, epochErr
+		}
+		return nil, fmt.Errorf("%w: acquire raced — key vanished between insert and lookup",
+			LeaseStateConflict)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1066,7 +1208,7 @@ func (s *Store) acquireUnleased(ctx context.Context, rec *Record, newToken, newO
 		  AND lease_token IS NULL
 		  AND lease_expires_at IS NULL
 		  AND version = $5
-	`, newOwner, newToken, pgInterval(duration),
+		  `+s.epochGuardSQL(), newOwner, newToken, pgInterval(duration),
 		rec.ExecutionID, rec.Version)
 	if err != nil {
 		return false, err
@@ -1076,7 +1218,11 @@ func (s *Store) acquireUnleased(ctx context.Context, rec *Record, newToken, newO
 		return false, err
 	}
 	if rows == 0 {
-		return false, nil
+		// Release this connection before the epoch read — a second
+		// pool checkout while our tx is open deadlocks under
+		// MaxOpenConns pressure.
+		tx.Rollback()
+		return false, s.checkEpoch(ctx)
 	}
 	if err := insertEffectEvent(ctx, tx, rec.ExecutionID, effectEvent{
 		eventType:       EventLeaseAcquired,
@@ -1118,7 +1264,7 @@ func (s *Store) reclaimExpiredLease(ctx context.Context, rec *Record, newToken, 
 		  AND version = $5
 		  AND state IN ('PREPARED', 'EXECUTING')
 		  AND lease_expires_at < clock_timestamp()
-	`, newOwner, newToken, pgInterval(duration),
+		  `+s.epochGuardSQL(), newOwner, newToken, pgInterval(duration),
 		rec.ExecutionID, rec.Version)
 	if err != nil {
 		return false, err
@@ -1128,7 +1274,11 @@ func (s *Store) reclaimExpiredLease(ctx context.Context, rec *Record, newToken, 
 		return false, err
 	}
 	if rows == 0 {
-		return false, nil
+		// Release this connection before the epoch read — a second
+		// pool checkout while our tx is open deadlocks under
+		// MaxOpenConns pressure.
+		tx.Rollback()
+		return false, s.checkEpoch(ctx)
 	}
 	if err := insertEffectEvent(ctx, tx, rec.ExecutionID, effectEvent{
 		eventType:       EventLeaseAcquired,
@@ -1173,7 +1323,7 @@ func (s *Store) markInFlightExpiredAsUnknown(ctx context.Context, rec *Record, a
 		  AND version = $2
 		  AND state = 'IN_FLIGHT'
 		  AND lease_expires_at < clock_timestamp()
-	`, rec.ExecutionID, rec.Version)
+		  `+s.epochGuardSQL(), rec.ExecutionID, rec.Version)
 	if err != nil {
 		return false, err
 	}
@@ -1182,7 +1332,11 @@ func (s *Store) markInFlightExpiredAsUnknown(ctx context.Context, rec *Record, a
 		return false, err
 	}
 	if rows == 0 {
-		return false, nil
+		// Release this connection before the epoch read — a second
+		// pool checkout while our tx is open deadlocks under
+		// MaxOpenConns pressure.
+		tx.Rollback()
+		return false, s.checkEpoch(ctx)
 	}
 	if err := insertEffectEvent(ctx, tx, rec.ExecutionID, effectEvent{
 		eventType:     EventEnteredUnknown,
@@ -1264,8 +1418,8 @@ func (s *Store) MarkInFlight(ctx context.Context, executionID, leaseToken string
 		  AND lease_token = $2
 		  AND lease_generation = $3
 		  AND lease_expires_at > clock_timestamp()
-	`, executionID, leaseToken, leaseGeneration,
-		nullableString(providerID), nullableBytes(recoveryLocator))
+		  `+s.epochGuardSQL(), executionID, leaseToken, leaseGeneration,
+		nullableString(providerID), nullableString(string(recoveryLocator)))
 	if err != nil {
 		return err
 	}
@@ -1274,6 +1428,9 @@ func (s *Store) MarkInFlight(ctx context.Context, executionID, leaseToken string
 		return err
 	}
 	if rows == 0 {
+		// Release our tx's connection before classifying — classify
+		// reads from the pool and would deadlock under MaxOpenConns.
+		tx.Rollback()
 		return s.classifyTransitionFailure(ctx, executionID, leaseToken, leaseGeneration, StateExecuting)
 	}
 	if err := insertEffectEvent(ctx, tx, executionID, effectEvent{
@@ -1426,7 +1583,7 @@ func (s *Store) leaseFencedTransition(ctx context.Context, executionID, leaseTok
 		  AND lease_token = $4
 		  AND lease_generation = $5
 		  AND lease_expires_at > clock_timestamp()
-	`, string(newState), executionID, string(expectedState), leaseToken, leaseGeneration)
+		  `+s.epochGuardSQL(), string(newState), executionID, string(expectedState), leaseToken, leaseGeneration)
 	if err != nil {
 		return err
 	}
@@ -1435,6 +1592,7 @@ func (s *Store) leaseFencedTransition(ctx context.Context, executionID, leaseTok
 		return err
 	}
 	if rows == 0 {
+		tx.Rollback()
 		return s.classifyTransitionFailure(ctx, executionID, leaseToken, leaseGeneration, expectedState)
 	}
 	if err := insertEffectEvent(ctx, tx, executionID, effectEvent{
@@ -1451,6 +1609,9 @@ func (s *Store) leaseFencedTransition(ctx context.Context, executionID, leaseTok
 // classifyTransitionFailure determines the specific lease error for a
 // failed transition by inspecting the current record state.
 func (s *Store) classifyTransitionFailure(ctx context.Context, executionID, leaseToken string, leaseGeneration int, expectedState State) error {
+	if err := s.checkEpoch(ctx); err != nil {
+		return err
+	}
 	s.metrics.fenceRejections.Add(1)
 	rec, err := s.Lookup(ctx, executionID)
 	if err != nil {
@@ -1497,7 +1658,7 @@ func (s *Store) RenewLease(ctx context.Context, executionID, leaseToken string, 
 		  AND lease_generation = $4
 		  AND lease_expires_at > clock_timestamp()
 		  AND state NOT IN ('COMMITTED', 'FAILED', 'DENIED', 'UNKNOWN')
-	`, pgInterval(duration),
+		  `+s.epochGuardSQL(), pgInterval(duration),
 		executionID, leaseToken, leaseGeneration)
 	if err != nil {
 		return err
@@ -1507,6 +1668,7 @@ func (s *Store) RenewLease(ctx context.Context, executionID, leaseToken string, 
 		return err
 	}
 	if rows == 0 {
+		tx.Rollback()
 		return s.classifyRenewalFailure(ctx, executionID, leaseToken, leaseGeneration)
 	}
 	if err := insertEffectEvent(ctx, tx, executionID, effectEvent{
@@ -1523,6 +1685,9 @@ func (s *Store) RenewLease(ctx context.Context, executionID, leaseToken string, 
 }
 
 func (s *Store) classifyRenewalFailure(ctx context.Context, executionID, leaseToken string, leaseGeneration int) error {
+	if err := s.checkEpoch(ctx); err != nil {
+		return err
+	}
 	s.metrics.fenceRejections.Add(1)
 	rec, err := s.Lookup(ctx, executionID)
 	if err != nil {
@@ -1565,7 +1730,7 @@ func (s *Store) AbandonPreDispatch(ctx context.Context, executionID, leaseToken 
 		  AND lease_token = $2
 		  AND lease_generation = $3
 		  AND lease_expires_at > clock_timestamp()
-	`, executionID, leaseToken, leaseGeneration)
+		  `+s.epochGuardSQL(), executionID, leaseToken, leaseGeneration)
 	if err != nil {
 		return err
 	}
@@ -1574,6 +1739,7 @@ func (s *Store) AbandonPreDispatch(ctx context.Context, executionID, leaseToken 
 		return err
 	}
 	if rows == 0 {
+		tx.Rollback()
 		return s.classifyAbandonFailure(ctx, executionID, leaseToken, leaseGeneration)
 	}
 	if err := insertEffectEvent(ctx, tx, executionID, effectEvent{
@@ -1591,6 +1757,9 @@ func (s *Store) AbandonPreDispatch(ctx context.Context, executionID, leaseToken 
 // two legal source states (PREPARED and EXECUTING), so the failure must
 // be diagnosed against the record's actual state rather than assumed.
 func (s *Store) classifyAbandonFailure(ctx context.Context, executionID, leaseToken string, leaseGeneration int) error {
+	if err := s.checkEpoch(ctx); err != nil {
+		return err
+	}
 	s.metrics.fenceRejections.Add(1)
 	rec, err := s.Lookup(ctx, executionID)
 	if err != nil {
@@ -1771,15 +1940,15 @@ func (s *Store) Finalize(ctx context.Context, executionID, leaseToken string, le
 		  AND version = $12
 		  AND (provider_id IS NULL OR $5::text IS NULL OR provider_id = $5::text)
 		  AND (provider_run_id IS NULL OR $6::text IS NULL OR provider_run_id = $6::text)
-	`, string(receipt.TerminalStatus),
-		nullableBytes(receipt.CanonicalResult),
+		  `+s.epochGuardSQL(), string(receipt.TerminalStatus),
+		nullableString(string(receipt.CanonicalResult)),
 		nullableString(receipt.EvidenceDigest),
 		receipt.ReceiptVersion,
 		nullableString(receipt.ProviderID),
 		nullableString(receipt.ProviderRunID),
 		receiptDigest,
 		executionID, string(expectedState), leaseToken, leaseGeneration, existing.Version,
-		nullableBytes(receipt.EvidenceReceipt),
+		nullableString(string(receipt.EvidenceReceipt)),
 		nullableString(terminalResultSHA), nullableString(receipt.EvidenceDigest))
 	if err != nil {
 		return err
@@ -1792,7 +1961,9 @@ func (s *Store) Finalize(ctx context.Context, executionID, leaseToken string, le
 		// CAS lost — another writer may have finalized concurrently.
 		// Re-read and check for idempotent replay before reporting
 		// a conflict. Two workers finalizing with identical receipts
-		// must both succeed, not produce a false conflict.
+		// must both succeed, not produce a false conflict. Release our
+		// tx's connection first — the reads below use the pool.
+		tx.Rollback()
 		current, lookupErr := s.Lookup(ctx, executionID)
 		if lookupErr == nil && current.State.IsDurablyFinal() {
 			if current.TerminalReceiptDigest == receiptDigest {
@@ -1880,7 +2051,7 @@ func (s *Store) EnterRecovery(ctx context.Context, executionID string, expectedS
 		WHERE execution_id = $1
 		  AND state = $2
 		  AND version = $3
-	`, executionID, string(expectedState), expectedVersion)
+		  `+s.epochGuardSQL(), executionID, string(expectedState), expectedVersion)
 	if err != nil {
 		return err
 	}
@@ -1889,6 +2060,11 @@ func (s *Store) EnterRecovery(ctx context.Context, executionID string, expectedS
 		return err
 	}
 	if rows == 0 {
+		// Release the tx's pool connection before the epoch read.
+		tx.Rollback()
+		if err := s.checkEpoch(ctx); err != nil {
+			return err
+		}
 		return fmt.Errorf("%w: execution %s enter recovery CAS failed (state/version mismatch)", LeaseStateConflict, executionID)
 	}
 	if err := insertEffectEvent(ctx, tx, executionID, effectEvent{
@@ -1939,8 +2115,8 @@ func (s *Store) EnterRecoveryWithObservation(ctx context.Context, executionID st
 		    provider_id = COALESCE($4::text, provider_id),
 		    provider_run_id = COALESCE($5::text, provider_run_id),
 		    provider_status = COALESCE($6::text, provider_status),
-		    result = COALESCE($10::jsonb, result),
-		    provider_result = COALESCE($11::jsonb, provider_result),
+		    result = COALESCE($10, result),
+		    provider_result = COALESCE($11, provider_result),
 		    provider_result_digest = COALESCE($7::text, provider_result_digest),
 		    provider_receipt_version = COALESCE(NULLIF($8::int, 0), provider_receipt_version),
 		    provider_observed_at = clock_timestamp(),
@@ -1955,13 +2131,13 @@ func (s *Store) EnterRecoveryWithObservation(ctx context.Context, executionID st
 		  AND (provider_id IS NULL OR $4::text IS NULL OR provider_id = $4::text)
 		  AND (provider_run_id IS NULL OR $5::text IS NULL OR provider_run_id = $5::text)
 		  AND (provider_status IS NULL OR $6::text IS NULL OR provider_status = $6::text)
-		  AND (result IS NULL OR $10::jsonb IS NULL OR result = $10::jsonb)
-		  AND (provider_result IS NULL OR $11::jsonb IS NULL OR provider_result = $11::jsonb)
+		  AND (result IS NULL OR $10::text IS NULL OR result::jsonb = ($10::text)::jsonb)
+		  AND (provider_result IS NULL OR $11::text IS NULL OR provider_result::jsonb = ($11::text)::jsonb)
 		  AND (provider_result_digest IS NULL OR $7::text IS NULL OR provider_result_digest = $7::text)
 		  AND (provider_receipt_version IS NULL OR provider_receipt_version = 0 OR NULLIF($8::int, 0) IS NULL OR provider_receipt_version = $8::int)
 		  AND (evidence_digest IS NULL OR $9::text IS NULL OR evidence_digest = $9::text)
 		  AND (provider_evidence_digest IS NULL OR $9::text IS NULL OR provider_evidence_digest = $9::text)
-	`, executionID, string(expectedState), expectedVersion,
+		  `+s.epochGuardSQL(), executionID, string(expectedState), expectedVersion,
 		nullableString(obs.ProviderID), nullableString(obs.ProviderRunID),
 		nullableString(obs.ProviderStatus), nullableString(obs.ResultDigest),
 		obs.ReceiptVersion,
@@ -1975,6 +2151,7 @@ func (s *Store) EnterRecoveryWithObservation(ctx context.Context, executionID st
 		return err
 	}
 	if rows == 0 {
+		tx.Rollback()
 		return s.classifyEnterRecoveryFailure(ctx, executionID, expectedState, expectedVersion)
 	}
 	if err := insertObservationRow(ctx, tx, executionID, ObservationRecovery, rawResult, obs); err != nil {
@@ -2000,6 +2177,9 @@ func (s *Store) EnterRecoveryWithObservation(ctx context.Context, executionID st
 // state/version) from a monotonic observation conflict so callers get
 // the correct typed error.
 func (s *Store) classifyEnterRecoveryFailure(ctx context.Context, executionID string, expectedState State, expectedVersion int) error {
+	if err := s.checkEpoch(ctx); err != nil {
+		return err
+	}
 	s.metrics.fenceRejections.Add(1)
 	rec, err := s.Lookup(ctx, executionID)
 	if err != nil {
@@ -2116,8 +2296,8 @@ func (s *Store) RecordProviderObservation(ctx context.Context, executionID, leas
 		SET provider_id = COALESCE($4::text, provider_id),
 		    provider_run_id = COALESCE($5::text, provider_run_id),
 		    provider_status = COALESCE($6::text, provider_status),
-		    result = COALESCE($7::jsonb, result),
-		    provider_result = COALESCE($11::jsonb, provider_result),
+		    result = COALESCE($7, result),
+		    provider_result = COALESCE($11, provider_result),
 		    provider_result_digest = COALESCE($8::text, provider_result_digest),
 		    evidence_digest = COALESCE($9::text, evidence_digest),
 		    provider_evidence_digest = COALESCE($9::text, provider_evidence_digest),
@@ -2134,13 +2314,13 @@ func (s *Store) RecordProviderObservation(ctx context.Context, executionID, leas
 		  AND (provider_id IS NULL OR $4::text IS NULL OR provider_id = $4::text)
 		  AND (provider_run_id IS NULL OR $5::text IS NULL OR provider_run_id = $5::text)
 		  AND (provider_status IS NULL OR $6::text IS NULL OR provider_status = $6::text)
-		  AND (result IS NULL OR $7::jsonb IS NULL OR result = $7::jsonb)
-		  AND (provider_result IS NULL OR $11::jsonb IS NULL OR provider_result = $11::jsonb)
+		  AND (result IS NULL OR $7::text IS NULL OR result::jsonb = ($7::text)::jsonb)
+		  AND (provider_result IS NULL OR $11::text IS NULL OR provider_result::jsonb = ($11::text)::jsonb)
 		  AND (provider_result_digest IS NULL OR $8::text IS NULL OR provider_result_digest = $8::text)
 		  AND (evidence_digest IS NULL OR $9::text IS NULL OR evidence_digest = $9::text)
 		  AND (provider_evidence_digest IS NULL OR $9::text IS NULL OR provider_evidence_digest = $9::text)
 		  AND (provider_receipt_version IS NULL OR provider_receipt_version = 0 OR NULLIF($10::int, 0) IS NULL OR provider_receipt_version = $10::int)
-	`, executionID, nullableString(leaseToken), leaseGeneration,
+		  `+s.epochGuardSQL(), executionID, nullableString(leaseToken), leaseGeneration,
 		nullableString(obs.ProviderID), nullableString(obs.ProviderRunID),
 		nullableString(obs.ProviderStatus), nullableString(string(obs.Result)),
 		nullableString(obs.ResultDigest), nullableString(obs.EvidenceDigest),
@@ -2153,6 +2333,7 @@ func (s *Store) RecordProviderObservation(ctx context.Context, executionID, leas
 		return err
 	}
 	if rows == 0 {
+		tx.Rollback()
 		return s.classifyObservationFailure(ctx, executionID, leaseToken, leaseGeneration)
 	}
 	// The UPDATE's WHERE admits exactly two states: a fenced IN_FLIGHT
@@ -2191,6 +2372,9 @@ func (s *Store) RecordProviderObservation(ctx context.Context, executionID, leas
 // conflicting stored observation data from one caused by a bad state
 // or stale lease, so callers get the correct typed error.
 func (s *Store) classifyObservationFailure(ctx context.Context, executionID, leaseToken string, leaseGeneration int) error {
+	if err := s.checkEpoch(ctx); err != nil {
+		return err
+	}
 	s.metrics.fenceRejections.Add(1)
 	rec, err := s.Lookup(ctx, executionID)
 	if err != nil {
@@ -2234,7 +2418,7 @@ func (s *Store) RecoverExpiredPreDispatch(ctx context.Context, executionID strin
 		  AND version = $2
 		  AND lease_expires_at IS NOT NULL
 		  AND lease_expires_at < clock_timestamp()
-	`, executionID, expectedVersion)
+		  `+s.epochGuardSQL(), executionID, expectedVersion)
 	if err != nil {
 		return err
 	}
@@ -2243,6 +2427,11 @@ func (s *Store) RecoverExpiredPreDispatch(ctx context.Context, executionID strin
 		return err
 	}
 	if rows == 0 {
+		// Release the tx's pool connection before the epoch read.
+		tx.Rollback()
+		if err := s.checkEpoch(ctx); err != nil {
+			return err
+		}
 		return fmt.Errorf("%w: execution %s recover expired pre-dispatch CAS failed (state/version/expiry mismatch)", LeaseStateConflict, executionID)
 	}
 	if err := insertEffectEvent(ctx, tx, executionID, effectEvent{
@@ -2267,13 +2456,18 @@ func (s *Store) ScrubStaleRecoveryLocators(ctx context.Context, olderThan time.D
 	if olderThan <= 0 {
 		return 0, fmt.Errorf("locator retention must be positive")
 	}
+	// A stale-epoch store must not silently no-op the sweep — fail
+	// closed so the operator notices the fenced executor.
+	if err := s.checkEpoch(ctx); err != nil {
+		return 0, err
+	}
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE execution_requests
 		SET recovery_locator = NULL
 		WHERE state = 'UNKNOWN'
 		  AND recovery_locator IS NOT NULL
 		  AND COALESCE(entered_unknown_at, created_at) < clock_timestamp() - make_interval(secs => $1)
-	`, pgInterval(olderThan))
+		  `+s.epochGuardSQL(), pgInterval(olderThan))
 	if err != nil {
 		return 0, err
 	}
@@ -2304,7 +2498,7 @@ func (s *Store) ResolveRecovery(ctx context.Context, executionID string, expecte
 			UPDATE execution_requests
 			SET updated_at = clock_timestamp()
 			WHERE execution_id = $1 AND state = 'UNKNOWN' AND version = $2
-		`, executionID, expectedVersion)
+			  `+s.epochGuardSQL(), executionID, expectedVersion)
 		if err != nil {
 			return err
 		}
@@ -2313,6 +2507,9 @@ func (s *Store) ResolveRecovery(ctx context.Context, executionID string, expecte
 			return err
 		}
 		if rows == 0 {
+			if err := s.checkEpoch(ctx); err != nil {
+				return err
+			}
 			return fmt.Errorf("%w: execution %s recovery-unknown CAS failed (state/version mismatch)", LeaseStateConflict, executionID)
 		}
 		return nil
@@ -2418,7 +2615,7 @@ func (s *Store) ResolveRecovery(ctx context.Context, executionID string, expecte
 	result2, err := tx.ExecContext(ctx, `
 		UPDATE execution_requests
 		SET state = $1,
-		    result = COALESCE($2::jsonb, result),
+		    result = COALESCE($2, result),
 		    evidence_digest = COALESCE($3::text, evidence_digest),
 		    receipt_version = $4,
 		    provider_id = COALESCE($5::text, provider_id),
@@ -2432,15 +2629,15 @@ func (s *Store) ResolveRecovery(ctx context.Context, executionID string, expecte
 		WHERE execution_id = $8 AND state = 'UNKNOWN' AND version = $9
 		  AND (provider_id IS NULL OR $5::text IS NULL OR provider_id = $5::text)
 		  AND (provider_run_id IS NULL OR $6::text IS NULL OR provider_run_id = $6::text)
-	`, string(newState),
-		nullableBytes(result.Result),
+		  `+s.epochGuardSQL(), string(newState),
+		nullableString(string(result.Result)),
 		nullableString(result.EvidenceDigest),
 		result.ReceiptVersion,
 		nullableString(result.ProviderID),
 		nullableString(result.ProviderRunID),
 		receiptDigest,
 		executionID, expectedVersion,
-		nullableBytes(result.EvidenceReceipt),
+		nullableString(string(result.EvidenceReceipt)),
 		nullableString(terminalResultSHA), nullableString(result.EvidenceDigest))
 	if err != nil {
 		return err
@@ -2450,6 +2647,11 @@ func (s *Store) ResolveRecovery(ctx context.Context, executionID string, expecte
 		return err
 	}
 	if rows == 0 {
+		// Release the tx's pool connection before the epoch read.
+		tx.Rollback()
+		if err := s.checkEpoch(ctx); err != nil {
+			return err
+		}
 		// Distinguish a state/version CAS failure from a provider-
 		// observation contradiction, which is a different failure class.
 		rec, lerr := s.Lookup(ctx, executionID)
@@ -2523,7 +2725,7 @@ const selectColumns = `execution_id, idempotency_key, principal_id, capability_i
 	entered_unknown_at, provider_result,
 	COALESCE(authority_generation, 0), COALESCE(authority_digest, ''),
 	COALESCE(provider_evidence_digest, ''), COALESCE(terminal_result_digest, ''),
-	COALESCE(terminal_evidence_digest, '')`
+	COALESCE(terminal_evidence_digest, ''), COALESCE(admitted_epoch, 0)`
 
 // selectColumnsER is selectColumns qualified with the `er` alias, for
 // use in UPDATE ... FROM ... RETURNING statements where the FROM clause
@@ -2542,7 +2744,7 @@ const selectColumnsER = `er.execution_id, er.idempotency_key, er.principal_id, e
 	er.entered_unknown_at, er.provider_result,
 	COALESCE(er.authority_generation, 0), COALESCE(er.authority_digest, ''),
 	COALESCE(er.provider_evidence_digest, ''), COALESCE(er.terminal_result_digest, ''),
-	COALESCE(er.terminal_evidence_digest, '')`
+	COALESCE(er.terminal_evidence_digest, ''), COALESCE(er.admitted_epoch, 0)`
 
 // pgInterval converts a Go duration into a PostgreSQL interval
 // expression argument. make_interval(secs => x) accepts arbitrary
@@ -2597,6 +2799,7 @@ func (s *Store) ClaimUnknownBatch(ctx context.Context, owner string, batchSize i
 		    updated_at = clock_timestamp()
 		FROM claimed
 		WHERE er.execution_id = claimed.execution_id
+		  `+s.epochGuardSQL()+`
 		RETURNING `+selectColumnsER,
 		owner,
 		pgInterval(claimDuration),
@@ -2608,6 +2811,13 @@ func (s *Store) ClaimUnknownBatch(ctx context.Context, owner string, batchSize i
 	recs, err := scanRecordsWithReconcile(rows)
 	if err != nil {
 		return nil, err
+	}
+	if len(recs) == 0 {
+		tx.Rollback()
+		if err := s.checkEpoch(ctx); err != nil {
+			return nil, err
+		}
+		return recs, nil
 	}
 	for _, rec := range recs {
 		if err := insertEffectEvent(ctx, tx, rec.ExecutionID, effectEvent{
@@ -2659,7 +2869,7 @@ func (s *Store) ReleaseReconcileClaim(ctx context.Context, executionID string, e
 		    updated_at = clock_timestamp()
 		WHERE execution_id = $3
 		  AND version = $4
-	`, pgInterval(backoffDuration),
+		  `+s.epochGuardSQL(), pgInterval(backoffDuration),
 		nullableString(lastError), executionID, expectedVersion)
 	if err != nil {
 		return err
@@ -2669,6 +2879,11 @@ func (s *Store) ReleaseReconcileClaim(ctx context.Context, executionID string, e
 		return err
 	}
 	if rows == 0 {
+		// Release the tx's pool connection before the epoch read.
+		tx.Rollback()
+		if err := s.checkEpoch(ctx); err != nil {
+			return err
+		}
 		s.noteContentionEvent(ctx, executionID, EventClaimLost, "release reconcile claim CAS failed")
 		return fmt.Errorf("%w: execution %s release reconcile claim CAS failed (state/version mismatch)", LeaseStateConflict, executionID)
 	}
@@ -2705,7 +2920,7 @@ func (s *Store) SuspendReconciliation(ctx context.Context, executionID string, e
 		WHERE execution_id = $2
 		  AND state = 'UNKNOWN'
 		  AND version = $3
-	`, nullableString(reason), executionID, expectedVersion)
+		  `+s.epochGuardSQL(), nullableString(reason), executionID, expectedVersion)
 	if err != nil {
 		return err
 	}
@@ -2714,6 +2929,11 @@ func (s *Store) SuspendReconciliation(ctx context.Context, executionID string, e
 		return err
 	}
 	if rows == 0 {
+		// Release the tx's pool connection before the epoch read.
+		tx.Rollback()
+		if err := s.checkEpoch(ctx); err != nil {
+			return err
+		}
 		s.noteContentionEvent(ctx, executionID, EventClaimLost, "suspend reconciliation CAS failed")
 		return fmt.Errorf("%w: execution %s suspend reconciliation CAS failed (state/version mismatch)", LeaseStateConflict, executionID)
 	}
@@ -2749,7 +2969,7 @@ func (s *Store) RenewReconcileClaim(ctx context.Context, executionID string, exp
 		  AND state = 'UNKNOWN'
 		  AND version = $3
 		  AND reconcile_lease_expires_at > clock_timestamp()
-	`, pgInterval(duration),
+		  `+s.epochGuardSQL(), pgInterval(duration),
 		executionID, expectedVersion)
 	if err != nil {
 		return err
@@ -2759,6 +2979,11 @@ func (s *Store) RenewReconcileClaim(ctx context.Context, executionID string, exp
 		return err
 	}
 	if rows == 0 {
+		// Release the tx's pool connection before the epoch read.
+		tx.Rollback()
+		if err := s.checkEpoch(ctx); err != nil {
+			return err
+		}
 		s.noteContentionEvent(ctx, executionID, EventClaimLost, "renew reconcile claim failed")
 		return fmt.Errorf("%w: execution %s renew reconcile claim failed (expired or version mismatch)", LeaseStateConflict, executionID)
 	}
@@ -2814,6 +3039,7 @@ func (s *Store) ClaimExpiredBatch(ctx context.Context, owner string, batchSize i
 		    updated_at = clock_timestamp()
 		FROM claimed
 		WHERE er.execution_id = claimed.execution_id
+		  `+s.epochGuardSQL()+`
 		RETURNING `+selectColumnsER,
 		owner,
 		pgInterval(claimDuration),
@@ -2825,6 +3051,13 @@ func (s *Store) ClaimExpiredBatch(ctx context.Context, owner string, batchSize i
 	recs, err := scanRecordsWithReconcile(rows)
 	if err != nil {
 		return nil, err
+	}
+	if len(recs) == 0 {
+		tx.Rollback()
+		if err := s.checkEpoch(ctx); err != nil {
+			return nil, err
+		}
+		return recs, nil
 	}
 	// Each claimed record's previous lease holder lost its lease to
 	// expiry — the claim is the forensic record of that loss.
@@ -3042,7 +3275,7 @@ func scanRecordsWithReconcile(rows *sql.Rows) ([]*Record, error) {
 			&enteredUnknownAt, &providerResultJSON,
 			&rec.AuthorityGeneration, &rec.AuthorityDigest,
 			&rec.ProviderEvidenceDigest, &rec.TerminalResultDigest,
-			&rec.TerminalEvidenceDigest,
+			&rec.TerminalEvidenceDigest, &rec.AdmittedEpoch,
 		); err != nil {
 			return nil, err
 		}

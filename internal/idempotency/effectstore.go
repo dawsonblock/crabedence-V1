@@ -53,6 +53,15 @@ type EffectStore interface {
 	// provider-observation ledger rows in commit order.
 	ListProviderObservations(ctx context.Context, executionID string) ([]ObservationRecord, error)
 
+	// Cluster-epoch disaster-recovery fencing.
+	// ClusterEpoch returns the epoch this store was admitted under.
+	ClusterEpoch() int64
+	// AdvanceClusterEpoch CAS-bumps the cluster epoch by exactly one
+	// when it still equals expected. Call it as part of a
+	// restore/environment rebuild: every store admitted under the old
+	// epoch is permanently fenced from writes afterward.
+	AdvanceClusterEpoch(ctx context.Context, expected int64, reason string) (int64, error)
+
 	// Configuration and schema introspection.
 	LeaseConfig() LeaseConfig
 	SchemaVersion(ctx context.Context) (int, error)

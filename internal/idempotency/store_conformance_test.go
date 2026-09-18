@@ -623,3 +623,94 @@ func TestStoreConformancePayloadBounds(t *testing.T) {
 		}
 	})
 }
+
+// TestStoreConformanceClusterEpochFencing covers the DR fence: a
+// store admitted under epoch N is permanently fenced from every
+// mutation path once the cluster epoch advances past N — the typed
+// CLUSTER_EPOCH_MISMATCH error must surface, never a lease-conflict
+// misclassification. The epoch persists per database, so this test
+// must not assume the epoch starts at 1.
+func TestStoreConformanceClusterEpochFencing(t *testing.T) {
+	eachEffectStore(t, func(t *testing.T, s EffectStore) {
+		ctx := context.Background()
+		base := s.ClusterEpoch()
+
+		// Records admitted before the advance carry the epoch stamp.
+		inFlight, token, gen, digest := acquireFor(t, s, ctx, "epoch-if", "epoch-p", "cap.epoch", "STANDARD", 5*time.Minute)
+		if inFlight.AdmittedEpoch != base {
+			t.Fatalf("admitted_epoch = %d, want %d", inFlight.AdmittedEpoch, base)
+		}
+		prepared, ptoken, pgen, _ := acquireFor(t, s, ctx, "epoch-pr", "epoch-p", "cap.epoch", "STANDARD", 5*time.Minute)
+
+		// UNKNOWN record for the recovery paths — enter recovery now,
+		// while the store is still epoch-valid.
+		rec3, _, _, _ := acquireFor(t, s, ctx, "epoch-un", "epoch-p", "cap.epoch", "STANDARD", 5*time.Minute)
+		stored3, err := s.Lookup(ctx, rec3.ExecutionID)
+		if err != nil {
+			t.Fatalf("lookup: %v", err)
+		}
+		if err := s.EnterRecovery(ctx, rec3.ExecutionID, StateInFlight, stored3.Version); err != nil {
+			t.Fatalf("enter recovery: %v", err)
+		}
+		unknown, err := s.Lookup(ctx, rec3.ExecutionID)
+		if err != nil {
+			t.Fatalf("lookup unknown: %v", err)
+		}
+
+		// CAS on the wrong expected epoch reports the typed error.
+		if _, err := s.AdvanceClusterEpoch(ctx, base+99, "bogus"); !errors.Is(err, ClusterEpochMismatch) {
+			t.Fatalf("advance with wrong expected: want ClusterEpochMismatch, got %v", err)
+		}
+
+		// The DR bump — everything after this is fenced for s.
+		next, err := s.AdvanceClusterEpoch(ctx, base, "restore rehearsal")
+		if err != nil {
+			t.Fatalf("advance: %v", err)
+		}
+		if next != base+1 {
+			t.Fatalf("advance returned %d, want %d", next, base+1)
+		}
+
+		wantFenced := func(name string, err error) {
+			t.Helper()
+			if !errors.Is(err, ClusterEpochMismatch) {
+				t.Fatalf("%s: want ClusterEpochMismatch, got %v", name, err)
+			}
+		}
+
+		// Fresh admission is fenced at the transaction boundary.
+		_, err = s.Acquire(ctx, "epoch-new", "epoch-p", "cap.epoch", digest, "", "STANDARD", time.Minute)
+		wantFenced("acquire", err)
+
+		// Every record mutation on the stale store is fenced — even
+		// writes that would otherwise succeed.
+		storedIF, _ := s.Lookup(ctx, inFlight.ExecutionID)
+		wantFenced("mark in flight obs", s.RecordProviderObservation(ctx, inFlight.ExecutionID, token, gen,
+			ProviderObservation{ProviderID: "prov", ProviderStatus: "SUCCEEDED"}))
+		wantFenced("renew lease", s.RenewLease(ctx, inFlight.ExecutionID, token, gen, time.Minute))
+		wantFenced("finalize", s.Finalize(ctx, inFlight.ExecutionID, token, gen, StateInFlight,
+			confReceipt(inFlight.ExecutionID, "cap.epoch", "epoch-p", digest, "prov", "run-1", StateCommitted)))
+		wantFenced("enter recovery", s.EnterRecovery(ctx, inFlight.ExecutionID, StateInFlight, storedIF.Version))
+		wantFenced("begin execution", s.BeginExecution(ctx, prepared.ExecutionID, ptoken, pgen))
+		wantFenced("abandon", s.AbandonPreDispatch(ctx, prepared.ExecutionID, ptoken, pgen))
+		wantFenced("resolve recovery", s.ResolveRecovery(ctx, unknown.ExecutionID, unknown.Version,
+			RecoveryResult{Decision: RecoveryCommitted, ProviderID: "prov", EvidenceDigest: "ev"}))
+		wantFenced("release claim", s.ReleaseReconcileClaim(ctx, unknown.ExecutionID, unknown.Version, time.Minute, "x"))
+		wantFenced("suspend", s.SuspendReconciliation(ctx, unknown.ExecutionID, unknown.Version, "x"))
+		wantFenced("renew claim", s.RenewReconcileClaim(ctx, unknown.ExecutionID, unknown.Version, time.Minute))
+		if _, err := s.ClaimUnknownBatch(ctx, "w", 10, time.Minute); err != nil {
+			wantFenced("claim unknown", err)
+		}
+		if _, err := s.ClaimExpiredBatch(ctx, "w", 10, time.Minute); err != nil {
+			wantFenced("claim expired", err)
+		}
+		if _, err := s.ScrubStaleRecoveryLocators(ctx, time.Hour); err != nil {
+			wantFenced("scrub", err)
+		}
+
+		// Reads are not fenced — a fenced executor can still look.
+		if _, err := s.Lookup(ctx, inFlight.ExecutionID); err != nil {
+			t.Fatalf("lookup after advance: %v", err)
+		}
+	})
+}
