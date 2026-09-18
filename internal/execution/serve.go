@@ -206,16 +206,15 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	//     CRABBOX_EVIDENCE_KEY: auto-generating a host-local key per
 	//     replica would give each replica a distinct cluster identity
 	//     and produce evidence receipts its peers cannot verify.
+	//   CRABBOX_MODE — set to "production" to forbid key
+	//     auto-generation on single-node deployments too: the trust
+	//     root must be provisioned (mounted key, KMS/HSM signer, or
+	//     an explicitly configured secret), never created silently.
 	var signer *evidence.Signer
 	if store != nil {
 		keyPath := os.Getenv("CRABBOX_EVIDENCE_KEY")
-		if replicatedDeployment() {
-			if keyPath == "" {
-				return fmt.Errorf("multi-replica deployment (CRABBOX_REPLICAS=%s) requires CRABBOX_EVIDENCE_KEY pointing to a provisioned key shared across replicas", os.Getenv("CRABBOX_REPLICAS"))
-			}
-			if _, err := os.Stat(keyPath); err != nil {
-				return fmt.Errorf("multi-replica deployment requires an existing evidence key at CRABBOX_EVIDENCE_KEY=%s (key auto-creation is disabled for replicas): %w", keyPath, err)
-			}
+		if err := validateEvidenceKeyPolicy(keyPath); err != nil {
+			return err
 		}
 		if keyPath == "" {
 			var err error
@@ -357,6 +356,42 @@ func durationSeconds(s int64) time.Duration {
 func replicatedDeployment() bool {
 	n, err := strconv.Atoi(strings.TrimSpace(os.Getenv("CRABBOX_REPLICAS")))
 	return err == nil && n > 1
+}
+
+// productionMode reports whether the operator declared production
+// via CRABBOX_MODE=production. Production forbids auto-generating a
+// signing identity — the trust root must be provisioned (mounted
+// Ed25519 key, KMS/HSM signer, or an explicitly configured secret),
+// never silently created per host.
+func productionMode() bool {
+	return strings.EqualFold(strings.TrimSpace(os.Getenv("CRABBOX_MODE")), "production")
+}
+
+// validateEvidenceKeyPolicy enforces the provisioned-key requirement
+// for deployment modes that must never auto-generate a signer:
+// multi-replica (CRABBOX_REPLICAS > 1) and production
+// (CRABBOX_MODE=production). Both require CRABBOX_EVIDENCE_KEY to
+// point at an existing provisioned key; auto-creation remains
+// available in single-node development mode.
+func validateEvidenceKeyPolicy(keyPath string) error {
+	if replicatedDeployment() {
+		if keyPath == "" {
+			return fmt.Errorf("multi-replica deployment (CRABBOX_REPLICAS=%s) requires CRABBOX_EVIDENCE_KEY pointing to a provisioned key shared across replicas", os.Getenv("CRABBOX_REPLICAS"))
+		}
+		if _, err := os.Stat(keyPath); err != nil {
+			return fmt.Errorf("multi-replica deployment requires an existing evidence key at CRABBOX_EVIDENCE_KEY=%s (key auto-creation is disabled for replicas): %w", keyPath, err)
+		}
+		return nil
+	}
+	if productionMode() {
+		if keyPath == "" {
+			return fmt.Errorf("production mode (CRABBOX_MODE=production) requires CRABBOX_EVIDENCE_KEY pointing to a provisioned signing key — key auto-generation is development-only")
+		}
+		if _, err := os.Stat(keyPath); err != nil {
+			return fmt.Errorf("production mode requires an existing evidence key at CRABBOX_EVIDENCE_KEY=%s: %w", keyPath, err)
+		}
+	}
+	return nil
 }
 
 // evidenceKeyPath returns the shared attest key location

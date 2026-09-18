@@ -1,11 +1,45 @@
 package capability
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"strings"
 	"unicode/utf8"
 )
+
+// decodeUseNumber parses JSON preserving exact numeric text — the
+// same numeric model as the request digest. Values like
+// 9007199254740993 must not be rounded through float64 before bounds
+// or integer checks.
+func decodeUseNumber(data []byte) (any, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return nil, err
+	}
+	return v, nil
+}
+
+// ratValue converts a JSON-decoded number to an exact rational for
+// comparison. It returns nil for non-numeric or malformed values.
+// float64 is accepted for programmatic callers — its value is taken
+// at face precision; the JSON path always produces json.Number.
+func ratValue(v any) *big.Rat {
+	switch num := v.(type) {
+	case json.Number:
+		r, ok := new(big.Rat).SetString(num.String())
+		if !ok {
+			return nil
+		}
+		return r
+	case float64:
+		return new(big.Rat).SetFloat64(num)
+	}
+	return nil
+}
 
 // ValidateArguments validates request arguments against a capability's
 // JSON Schema. It supports the common subset needed for capability
@@ -20,18 +54,26 @@ func ValidateArguments(schema json.RawMessage, args json.RawMessage) error {
 		return nil // no schema declared — no validation
 	}
 
-	var schemaMap map[string]any
-	if err := json.Unmarshal(schema, &schemaMap); err != nil {
+	decoded, err := decodeUseNumber(schema)
+	if err != nil {
 		return fmt.Errorf("invalid capability schema (registration error): %w", err)
+	}
+	schemaMap, ok := decoded.(map[string]any)
+	if !ok {
+		return fmt.Errorf("invalid capability schema (registration error): schema must be a JSON object")
 	}
 
 	if len(args) == 0 {
 		args = json.RawMessage(`{}`)
 	}
 
-	var argsMap map[string]any
-	if err := json.Unmarshal(args, &argsMap); err != nil {
+	decodedArgs, err := decodeUseNumber(args)
+	if err != nil {
 		return fmt.Errorf("arguments must be a JSON object: %w", err)
+	}
+	argsMap, ok := decodedArgs.(map[string]any)
+	if !ok {
+		return fmt.Errorf("arguments must be a JSON object")
 	}
 
 	return validateObject(schemaMap, argsMap, "")
@@ -113,10 +155,19 @@ func validateValue(schema map[string]any, val any, path string) error {
 		}
 	}
 
-	// Enum check
+	// Enum check — numbers compare by exact value so 1 and 1.0 match,
+	// and >2^53 integers compare without float64 rounding.
 	if enum, ok := schema["enum"].([]any); ok {
 		found := false
+		valRat := ratValue(val)
 		for _, e := range enum {
+			if eRat := ratValue(e); eRat != nil && valRat != nil {
+				if eRat.Cmp(valRat) == 0 {
+					found = true
+					break
+				}
+				continue
+			}
 			if fmt.Sprintf("%v", e) == fmt.Sprintf("%v", val) {
 				found = true
 				break
@@ -127,13 +178,18 @@ func validateValue(schema map[string]any, val any, path string) error {
 		}
 	}
 
-	// Number checks
-	if num, ok := val.(float64); ok {
-		if min, ok := schema["minimum"].(float64); ok && num < min {
-			return fmt.Errorf("%s: value %v is less than minimum %v", path, num, min)
+	// Number checks — exact rational comparison, never float64.
+	if num := ratValue(val); num != nil {
+		if min := ratValue(schema["minimum"]); min != nil && num.Cmp(min) < 0 {
+			return fmt.Errorf("%s: value %v is less than minimum %v", path, val, schema["minimum"])
 		}
-		if max, ok := schema["maximum"].(float64); ok && num > max {
-			return fmt.Errorf("%s: value %v is greater than maximum %v", path, num, max)
+		if max := ratValue(schema["maximum"]); max != nil && num.Cmp(max) > 0 {
+			return fmt.Errorf("%s: value %v is greater than maximum %v", path, val, schema["maximum"])
+		}
+		if mult := ratValue(schema["multipleOf"]); mult != nil && mult.Sign() != 0 {
+			if !new(big.Rat).Quo(num, mult).IsInt() {
+				return fmt.Errorf("%s: value %v is not a multiple of %v", path, val, schema["multipleOf"])
+			}
 		}
 	}
 
@@ -143,11 +199,12 @@ func validateValue(schema map[string]any, val any, path string) error {
 	// "日本語" has 9 UTF-8 bytes but 3 code points.
 	if s, ok := val.(string); ok {
 		runeCount := utf8.RuneCountInString(s)
-		if minLength, ok := schema["minLength"].(float64); ok && int(minLength) > 0 && runeCount < int(minLength) {
-			return fmt.Errorf("%s: string length %d is less than minLength %d", path, runeCount, int(minLength))
+		countRat := new(big.Rat).SetInt64(int64(runeCount))
+		if minLength := ratValue(schema["minLength"]); minLength != nil && countRat.Cmp(minLength) < 0 {
+			return fmt.Errorf("%s: string length %d is less than minLength %v", path, runeCount, schema["minLength"])
 		}
-		if maxLength, ok := schema["maxLength"].(float64); ok && int(maxLength) > 0 && runeCount > int(maxLength) {
-			return fmt.Errorf("%s: string length %d is greater than maxLength %d", path, runeCount, int(maxLength))
+		if maxLength := ratValue(schema["maxLength"]); maxLength != nil && countRat.Cmp(maxLength) > 0 {
+			return fmt.Errorf("%s: string length %d is greater than maxLength %v", path, runeCount, schema["maxLength"])
 		}
 	}
 
@@ -181,7 +238,7 @@ func checkType(expected string, val any, path string) error {
 		actual = "null"
 	case bool:
 		actual = "boolean"
-	case float64:
+	case json.Number, float64:
 		actual = "number"
 	case string:
 		actual = "string"
@@ -197,8 +254,13 @@ func checkType(expected string, val any, path string) error {
 		return nil
 	}
 	if expected == "integer" && actual == "number" {
-		// Check that it's a whole number
-		if n, ok := val.(float64); ok && n == float64(int64(n)) {
+		// Exact integer check — Rat.IsInt() works for values far
+		// beyond float64/int64 range (1e100, 2^63+1). A float64 that
+		// round-trips through int64 is also an integer.
+		if r := ratValue(val); r != nil && r.IsInt() {
+			return nil
+		}
+		if f, ok := val.(float64); ok && f == float64(int64(f)) {
 			return nil
 		}
 		return fmt.Errorf("%s: expected integer, got non-integer number %v", path, val)

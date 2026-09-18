@@ -427,9 +427,26 @@ func LoadOrCreateSigner(path string) (*Signer, error) {
 		return nil, err
 	}
 	// Commit the directory entry so the key survives a power loss.
-	if d, derr := os.Open(dir); derr == nil {
-		_ = d.Sync()
-		d.Close()
+	// This is a hard failure, not a best-effort sync: if the platform
+	// cannot commit the directory entry, the key may not survive a
+	// crash and startup must fail rather than silently weaken the
+	// durability guarantee. Unlink the just-linked name so a retry
+	// regenerates and republishes durably instead of finding a key
+	// that was never actually committed.
+	d, err := os.Open(dir)
+	if err != nil {
+		os.Remove(path)
+		return nil, fmt.Errorf("evidence signer: cannot open directory for durability commit: %w", err)
+	}
+	derr := d.Sync()
+	cerr := d.Close()
+	if derr != nil {
+		os.Remove(path)
+		return nil, fmt.Errorf("evidence signer: directory fsync failed — key durability not guaranteed: %w", derr)
+	}
+	if cerr != nil {
+		os.Remove(path)
+		return nil, fmt.Errorf("evidence signer: directory close failed after fsync: %w", cerr)
 	}
 	return signer, nil
 }
