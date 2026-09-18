@@ -2,6 +2,8 @@ package idempotency
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -467,6 +469,106 @@ func TestStoreConformanceLocatorPolicy(t *testing.T) {
 		s.BeginExecution(ctx, acq2.Record.ExecutionID, acq2.LeaseToken, acq2.Generation)
 		if err := s.MarkInFlight(ctx, acq2.Record.ExecutionID, acq2.LeaseToken, acq2.Generation, "prov", big); !errors.Is(err, LocatorTooLarge) {
 			t.Fatalf("want LocatorTooLarge, got %v", err)
+		}
+	})
+}
+
+// TestStoreConformanceForensicRecord pins the cross-engine forensic
+// contract: a full lifecycle produces the same ordered event history,
+// the observation ledger preserves exact asserted bytes with a
+// self-verifying digest, provider-time and terminal-time evidence are
+// split, and a fenced writer leaves a LEASE_LOST annotation.
+func TestStoreConformanceForensicRecord(t *testing.T) {
+	eachEffectStore(t, func(t *testing.T, s EffectStore) {
+		ctx := context.Background()
+		rec, token, gen, digest := acquireFor(t, s, ctx, "forensic-k1", "alice", "cap.mut", "MUTATION", 5*time.Minute)
+
+		// Non-canonical bytes: the ledger keeps the exact asserted form.
+		raw := json.RawMessage(`{  "b": 2, "a": 1 }`)
+		obs := ProviderObservation{
+			ProviderID:     "prov",
+			ProviderRunID:  "run-1",
+			ProviderStatus: "SUCCEEDED",
+			Result:         raw,
+			EvidenceDigest: "ev-provider",
+		}
+		if err := s.RecordProviderObservation(ctx, rec.ExecutionID, token, gen, obs); err != nil {
+			t.Fatalf("observe: %v", err)
+		}
+		receipt := confReceipt(rec.ExecutionID, "cap.mut", "alice", digest, "prov", "run-1", StateCommitted)
+		receipt.EvidenceDigest = "ev-terminal"
+		if err := s.Finalize(ctx, rec.ExecutionID, token, gen, StateInFlight, receipt); err != nil {
+			t.Fatalf("finalize: %v", err)
+		}
+
+		events, err := s.ListEffectEvents(ctx, rec.ExecutionID)
+		if err != nil {
+			t.Fatalf("list events: %v", err)
+		}
+		want := []string{
+			EventAcquired, EventExecutionBegun, EventDispatchStarted,
+			EventProviderObserved, EventTerminalResolved,
+		}
+		got := make([]string, len(events))
+		for i, e := range events {
+			got[i] = e.EventType
+			if e.Sequence != i+1 {
+				t.Fatalf("event %d sequence = %d", i, e.Sequence)
+			}
+		}
+		if fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Fatalf("event history = %v, want %v", got, want)
+		}
+
+		obsRows, err := s.ListProviderObservations(ctx, rec.ExecutionID)
+		if err != nil {
+			t.Fatalf("list observations: %v", err)
+		}
+		if len(obsRows) != 1 || obsRows[0].Kind != ObservationDispatch {
+			t.Fatalf("observation rows = %+v", obsRows)
+		}
+		if string(obsRows[0].ResultBytes) != string(raw) {
+			t.Errorf("result_bytes = %q, want exact asserted %q", obsRows[0].ResultBytes, raw)
+		}
+		sum := sha256.Sum256(raw)
+		if obsRows[0].ResultSHA256 != hex.EncodeToString(sum[:]) {
+			t.Errorf("result_sha256 = %q", obsRows[0].ResultSHA256)
+		}
+
+		final, err := s.Lookup(ctx, rec.ExecutionID)
+		if err != nil {
+			t.Fatalf("lookup: %v", err)
+		}
+		if final.ProviderEvidenceDigest != "ev-provider" {
+			t.Errorf("provider_evidence_digest = %q", final.ProviderEvidenceDigest)
+		}
+		if final.TerminalEvidenceDigest != "ev-terminal" {
+			t.Errorf("terminal_evidence_digest = %q", final.TerminalEvidenceDigest)
+		}
+		rsum := sha256.Sum256(receipt.CanonicalResult)
+		if final.TerminalResultDigest != hex.EncodeToString(rsum[:]) {
+			t.Errorf("terminal_result_digest = %q", final.TerminalResultDigest)
+		}
+
+		// A fenced writer on a live record leaves a LEASE_LOST event.
+		rec2, _, _, _ := acquireFor(t, s, ctx, "forensic-k2", "alice", "cap.mut", "MUTATION", 5*time.Minute)
+		err = s.RecordProviderObservation(ctx, rec2.ExecutionID, "stale-token", 99,
+			ProviderObservation{ProviderID: "prov", ProviderStatus: "X"})
+		if err == nil {
+			t.Fatal("stale observation must be rejected")
+		}
+		events2, err := s.ListEffectEvents(ctx, rec2.ExecutionID)
+		if err != nil {
+			t.Fatalf("list events 2: %v", err)
+		}
+		var lostFound bool
+		for _, e := range events2 {
+			if e.EventType == EventLeaseLost {
+				lostFound = true
+			}
+		}
+		if !lostFound {
+			t.Fatal("no LEASE_LOST event recorded for fenced writer")
 		}
 	})
 }

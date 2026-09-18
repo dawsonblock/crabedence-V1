@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Effect Fabric r13 repair — digest, authority, forensic record
+
+- Idempotency ABI: request-digest numeric canonicalization is fail-closed — exponents are parsed with `big.Int` (no `int64` wraparound, so `1e18446744073709551616` can no longer collide with `1`), all numbers normalize to canonical scientific form, malformed/trailing JSON returns `ErrTrailingJSON`, and `ComputeDigest` normalizes native Go arguments to the same canonical bytes as raw JSON. Frozen vectors regenerated; hostile vectors + three fuzz targets guard the boundary.
+- Idempotency ABI: the resolved `assurance_profile` and `execution_route` are bound into the request digest (server-assigned, never caller-supplied) — the same arguments under different assurance or routing are different execution identities.
+- Authority: grant issuance is serialized through a per-reference `authority_heads` row locked during issue — concurrent issuers produce strictly increasing generations instead of `MAX(generation)+1` races (PostgreSQL and SQLite).
+- Authority: `RevokeGeneration` revokes one immutable generation, `CloseAuthorityRef` permanently blocks future issuance, and `RevokeGrant` retains revoke-all semantics without closing the reference; revoking after admission never invalidates an already-admitted execution.
+- Authority: grant digests hash millisecond-normalized time fields so a resolved grant always reproduces its stored digest across both engines.
+- Store: schema v8 adds two append-only forensic ledgers — `effect_events` (ordered execution history: acquisition, lease lifecycle, dispatch boundary, observations, recovery, reconciliation claims, terminal resolution, lease loss) and `effect_provider_observations` (every accepted provider observation with exact asserted result bytes, store-computed SHA-256, and canonical digest). Rows are written transactionally with the mutation they describe; `ListEffectEvents`/`ListProviderObservations` expose them read-only.
+- Store: provider-time and terminal-time evidence are split — `provider_evidence_digest` preserves what the provider attested while `terminal_result_digest`/`terminal_evidence_digest` record the terminal resolution, so a resolved recovery can never overwrite observation-time evidence.
+- Execution: `enterRecoveryWithObservation` retries the `IN_FLIGHT → UNKNOWN` CAS a bounded number of times and falls back to a direct `RecordProviderObservation` when the reconciler wins the transition — a provider observation is never lost to the race, and persistence still runs on the detached durability context.
+
 ### Effect Fabric hardening — backend, ABI, adversarial qualification
 
 - Storage: `OpenSQLiteDB` enforces ledger file hygiene — database directory `0700`, DB file `0600`, symlinked paths rejected, existing world-accessible files refused rather than silently used (both new and existing paths).

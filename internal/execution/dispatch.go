@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -851,36 +852,65 @@ func (e *DispatchExecutor) recordObservation(ctx context.Context, executionID, l
 // raced into UNKNOWN (reconciler claimed the expired lease first), it
 // falls back to a direct observation update — the observation is still
 // persisted rather than lost to the CAS race.
+//
+// The IN_FLIGHT CAS is retried a bounded number of times: between our
+// Lookup and the EnterRecoveryWithObservation CAS another writer may
+// bump the record version (a lease-renewing loser, an observation, a
+// state transition). A version bump alone does not prove the lease is
+// lost — re-reading and retrying a small bounded number of times
+// resolves transient races without ever retrying indefinitely. A CAS
+// failure that persists past the bound means real contention, and the
+// error is returned rather than silently dropped.
 func (e *DispatchExecutor) enterRecoveryWithObservation(ctx context.Context, executionID string, resp Response, desc capability.ResolvedDescriptor) error {
 	e.fireCrashPoint(CrashBeforeRecovery)
 	obs := buildObservation(resp, desc)
-	rec, lookupErr := e.store.Lookup(ctx, executionID)
-	if lookupErr != nil {
-		return fmt.Errorf("recovery entry failed (lookup error: %v); provider observation may not be persisted", lookupErr)
-	}
-	if rec.State == idempotency.StateInFlight {
-		if err := e.store.EnterRecoveryWithObservation(ctx, executionID,
-			idempotency.StateInFlight, rec.Version, obs); err != nil {
-			return fmt.Errorf("recovery entry failed: %v; provider observation may not be persisted", err)
+	var lastErr error
+	for attempt := 0; attempt < recoveryCASMaxAttempts; attempt++ {
+		rec, lookupErr := e.store.Lookup(ctx, executionID)
+		if lookupErr != nil {
+			return fmt.Errorf("recovery entry failed (lookup error: %v); provider observation may not be persisted", lookupErr)
 		}
-		e.fireCrashPoint(CrashAfterRecovery)
-		return nil
-	}
-	if rec.State == idempotency.StateUnknown {
-		// Already in recovery — persist the observation directly.
-		if err := e.store.RecordProviderObservation(ctx, executionID, "", 0, obs); err != nil {
-			return fmt.Errorf("execution already in recovery; observation update failed: %v", err)
+		switch {
+		case rec.State == idempotency.StateInFlight:
+			err := e.store.EnterRecoveryWithObservation(ctx, executionID,
+				idempotency.StateInFlight, rec.Version, obs)
+			if err == nil {
+				e.fireCrashPoint(CrashAfterRecovery)
+				return nil
+			}
+			// A state/version CAS miss is retryable — the record moved
+			// under us but may still be IN_FLIGHT at a newer version.
+			// An observation contradiction is not: our provider truth
+			// conflicts with what is durably stored, which retrying
+			// cannot fix.
+			if !errors.Is(err, idempotency.LeaseStateConflict) {
+				return fmt.Errorf("recovery entry failed: %v; provider observation may not be persisted", err)
+			}
+			lastErr = err
+			continue
+		case rec.State == idempotency.StateUnknown:
+			// Already in recovery — persist the observation directly.
+			if err := e.store.RecordProviderObservation(ctx, executionID, "", 0, obs); err != nil {
+				return fmt.Errorf("execution already in recovery; observation update failed: %v", err)
+			}
+			e.fireCrashPoint(CrashAfterRecovery)
+			return nil
+		case rec.State.IsDurablyFinal():
+			// A concurrent finalizer already committed — no recovery
+			// needed and none permitted.
+			return nil
+		default:
+			return fmt.Errorf("cannot enter recovery from state %s", rec.State)
 		}
-		e.fireCrashPoint(CrashAfterRecovery)
-		return nil
 	}
-	// Terminal or pre-dispatch state — no recovery needed. A terminal
-	// state here means a concurrent finalizer already committed.
-	if rec.State.IsDurablyFinal() {
-		return nil
-	}
-	return fmt.Errorf("cannot enter recovery from state %s", rec.State)
+	return fmt.Errorf("recovery entry failed after %d CAS attempts: %v; provider observation may not be persisted", recoveryCASMaxAttempts, lastErr)
 }
+
+// recoveryCASMaxAttempts bounds the lookup→CAS retry loop in
+// enterRecoveryWithObservation. Two attempts handle the common
+// read-then-write version race; three gives margin for a second
+// concurrent writer without ever looping unboundedly.
+const recoveryCASMaxAttempts = 3
 
 // recoveryPreparer is the explicit recovery-locator routing contract
 // DispatchExecutor requires of its handler. MultiHandler implements

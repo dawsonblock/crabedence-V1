@@ -255,6 +255,7 @@ var sqliteSchemaMigrations = []sqliteSchemaMigration{
 	{5, "concurrent_index_repair_not_applicable", nil},
 	{6, "provider_result_column", sqliteMigrationProviderResultColumn},
 	{7, "authority_snapshot_columns_and_audit_indexes", sqliteMigrationAuthoritySnapshot},
+	{8, "forensic_record", sqliteMigrationForensic},
 }
 
 func (s *SQLiteStore) ensureSchema(ctx context.Context) error {
@@ -485,6 +486,156 @@ func sqliteMigrationAuthoritySnapshot(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
+// sqliteMigrationForensic mirrors the PG migration 8: the two
+// append-only forensic ledgers plus the provider/terminal evidence
+// split on the materialized row. Timestamps are INTEGER unix
+// milliseconds like the rest of the embedded schema; result_bytes is
+// BLOB so the exact asserted payload is preserved byte-for-byte.
+func sqliteMigrationForensic(ctx context.Context, tx *sql.Tx) error {
+	existing := map[string]bool{}
+	rows, err := tx.QueryContext(ctx, `PRAGMA table_info(execution_requests)`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		existing[name] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, c := range []string{
+		"provider_evidence_digest",
+		"terminal_result_digest",
+		"terminal_evidence_digest",
+	} {
+		if existing[c] {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx,
+			`ALTER TABLE execution_requests ADD COLUMN `+c+` TEXT`); err != nil {
+			return fmt.Errorf("column %s: %w", c, err)
+		}
+	}
+	for _, ddl := range []string{
+		`CREATE TABLE IF NOT EXISTS effect_provider_observations (
+			execution_id TEXT NOT NULL,
+			sequence INTEGER NOT NULL,
+			record_version INTEGER NOT NULL,
+			observation_kind TEXT NOT NULL,
+			provider_id TEXT,
+			provider_run_id TEXT,
+			provider_status TEXT,
+			result_bytes BLOB,
+			result_sha256 TEXT,
+			result_canonical_digest TEXT,
+			evidence_sha256 TEXT,
+			receipt_version INTEGER NOT NULL DEFAULT 0,
+			observed_at INTEGER NOT NULL,
+			PRIMARY KEY (execution_id, sequence)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_observations_run
+		 ON effect_provider_observations (provider_id, provider_run_id)
+		 WHERE provider_run_id IS NOT NULL`,
+		`CREATE TABLE IF NOT EXISTS effect_events (
+			execution_id TEXT NOT NULL,
+			sequence INTEGER NOT NULL,
+			record_version INTEGER NOT NULL,
+			event_type TEXT NOT NULL,
+			actor TEXT,
+			previous_state TEXT,
+			new_state TEXT,
+			result_digest TEXT,
+			evidence_digest TEXT,
+			claim_generation INTEGER,
+			occurred_at INTEGER NOT NULL,
+			metadata TEXT,
+			PRIMARY KEY (execution_id, sequence)
+		)`,
+	} {
+		if _, err := tx.ExecContext(ctx, ddl); err != nil {
+			return fmt.Errorf("forensic record schema: %w", err)
+		}
+	}
+	return nil
+}
+
+// sqliteInsertEffectEvent mirrors insertEffectEvent for the embedded
+// backend: sequence is allocated with MAX+1 inside the mutation's
+// transaction (single-writer BEGIN IMMEDIATE serializes all writers),
+// and record_version/actor fall back to the post-update row values.
+func sqliteInsertEffectEvent(ctx context.Context, tx *sql.Tx, executionID string, ev effectEvent) error {
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO effect_events
+			(execution_id, sequence, record_version, event_type, actor,
+			 previous_state, new_state, result_digest, evidence_digest,
+			 claim_generation, occurred_at, metadata)
+		SELECT er.execution_id,
+			COALESCE((SELECT MAX(e.sequence) FROM effect_events e
+			          WHERE e.execution_id = er.execution_id), 0) + 1,
+			er.version, ?2,
+			COALESCE(NULLIF(?3, ''), er.lease_owner, er.reconcile_owner),
+			NULLIF(?4, ''), COALESCE(NULLIF(?5, ''), er.state),
+			NULLIF(?6, ''), NULLIF(?7, ''), NULLIF(?8, 0),
+			`+sqliteNow+`, NULLIF(?9, '')
+		FROM execution_requests er
+		WHERE er.execution_id = ?1
+	`, executionID, ev.eventType, ev.actor, ev.previousState, ev.newState,
+		ev.resultDigest, ev.evidenceDigest, ev.claimGeneration, ev.metadata)
+	return err
+}
+
+// sqliteInsertObservationRow mirrors insertObservationRow for the
+// embedded backend — see insertObservationRow.
+func sqliteInsertObservationRow(ctx context.Context, tx *sql.Tx, executionID, kind string, rawResult []byte, obs ProviderObservation) error {
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO effect_provider_observations
+			(execution_id, sequence, record_version, observation_kind,
+			 provider_id, provider_run_id, provider_status,
+			 result_bytes, result_sha256, result_canonical_digest,
+			 evidence_sha256, receipt_version, observed_at)
+		SELECT er.execution_id,
+			COALESCE((SELECT MAX(o.sequence) FROM effect_provider_observations o
+			          WHERE o.execution_id = er.execution_id), 0) + 1,
+			er.version, ?2,
+			NULLIF(?3, ''), NULLIF(?4, ''), NULLIF(?5, ''),
+			?6, NULLIF(?7, ''), NULLIF(?8, ''), NULLIF(?9, ''), ?10,
+			`+sqliteNow+`
+		FROM execution_requests er
+		WHERE er.execution_id = ?1
+	`, executionID, kind, obs.ProviderID, obs.ProviderRunID, obs.ProviderStatus,
+		nullableBytes(rawResult), sha256Hex(rawResult), obs.ResultDigest,
+		obs.EvidenceDigest, obs.ReceiptVersion)
+	return err
+}
+
+// noteContentionEvent records a LEASE_LOST/CLAIM_LOST forensic hint
+// after a fenced write loses its CAS — see Store.noteContentionEvent.
+// SQLite needs no FOR UPDATE pre-lock: single-writer BEGIN IMMEDIATE
+// already serializes sequence allocation.
+func (s *SQLiteStore) noteContentionEvent(ctx context.Context, executionID, eventType, metadata string) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return
+	}
+	defer tx.Rollback()
+	if err := sqliteInsertEffectEvent(ctx, tx, executionID, effectEvent{
+		eventType: eventType,
+		metadata:  metadata,
+	}); err != nil {
+		return
+	}
+	_ = tx.Commit()
+}
+
 // ─── Acquire ─────────────────────────────────────────────────────────
 
 // Acquire attempts to acquire a lease for an execution. Identical
@@ -513,7 +664,11 @@ func (s *SQLiteStore) AcquireWithAuthority(ctx context.Context, key, principal, 
 	}
 	var executionID string
 	var createdAtMs int64
-	err = s.db.QueryRowContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	err = tx.QueryRowContext(ctx, `
 		INSERT INTO execution_requests
 			(execution_id, idempotency_key, principal_id, capability_id, request_digest,
 			 grant_id, authority_generation, authority_digest, execution_class, state,
@@ -530,6 +685,18 @@ func (s *SQLiteStore) AcquireWithAuthority(ctx context.Context, key, principal, 
 	).Scan(&executionID, &createdAtMs)
 
 	if err == nil {
+		if err := sqliteInsertEffectEvent(ctx, tx, executionID, effectEvent{
+			eventType:       EventAcquired,
+			actor:           leaseOwner,
+			newState:        string(StatePrepared),
+			claimGeneration: 1,
+		}); err != nil {
+			tx.Rollback()
+			return nil, err
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
 		s.metrics.acquires.Add(1)
 		createdAt := sqliteTime(createdAtMs)
 		return &AcquireResult{
@@ -558,6 +725,10 @@ func (s *SQLiteStore) AcquireWithAuthority(ctx context.Context, key, principal, 
 			},
 		}, nil
 	}
+
+	// Insert did not succeed — key conflict or driver error. Nothing
+	// below uses this transaction.
+	tx.Rollback()
 
 	if !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
@@ -606,7 +777,7 @@ func (s *SQLiteStore) AcquireWithAuthority(ctx context.Context, key, principal, 
 	}
 
 	if rec.State == StateInFlight && rec.LeaseExpiresAt != nil {
-		marked, err := s.markInFlightExpiredAsUnknown(ctx, rec)
+		marked, err := s.markInFlightExpiredAsUnknown(ctx, rec, leaseOwner)
 		if err != nil {
 			return nil, err
 		}
@@ -655,7 +826,12 @@ func (s *SQLiteStore) AcquireWithAuthority(ctx context.Context, key, principal, 
 }
 
 func (s *SQLiteStore) acquireUnleased(ctx context.Context, rec *Record, newToken, newOwner string, duration time.Duration) (bool, error) {
-	result, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `
 		UPDATE execution_requests
 		SET lease_owner = ?1, lease_token = ?2,
 		    lease_started_at = `+sqliteNow+`,
@@ -672,11 +848,39 @@ func (s *SQLiteStore) acquireUnleased(ctx context.Context, rec *Record, newToken
 	if err != nil {
 		return false, err
 	}
-	return applyLeaseCAS(result, rec, newOwner, newToken)
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if rows == 0 {
+		return false, nil
+	}
+	if err := sqliteInsertEffectEvent(ctx, tx, rec.ExecutionID, effectEvent{
+		eventType:       EventLeaseAcquired,
+		actor:           newOwner,
+		previousState:   string(StatePrepared),
+		newState:        string(StatePrepared),
+		claimGeneration: rec.LeaseGeneration + 1,
+	}); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	rec.LeaseOwner = newOwner
+	rec.LeaseToken = newToken
+	rec.LeaseGeneration++
+	rec.Version++
+	return true, nil
 }
 
 func (s *SQLiteStore) reclaimExpiredLease(ctx context.Context, rec *Record, newToken, newOwner string, duration time.Duration) (bool, error) {
-	result, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `
 		UPDATE execution_requests
 		SET lease_owner = ?1, lease_token = ?2,
 		    lease_started_at = `+sqliteNow+`,
@@ -700,6 +904,19 @@ func (s *SQLiteStore) reclaimExpiredLease(ctx context.Context, rec *Record, newT
 	if rows == 0 {
 		return false, nil
 	}
+	if err := sqliteInsertEffectEvent(ctx, tx, rec.ExecutionID, effectEvent{
+		eventType:       EventLeaseAcquired,
+		actor:           newOwner,
+		previousState:   string(rec.State),
+		newState:        string(StatePrepared),
+		claimGeneration: rec.LeaseGeneration + 1,
+		metadata:        "expired lease reclaimed",
+	}); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
 	rec.LeaseOwner = newOwner
 	rec.LeaseToken = newToken
 	rec.LeaseGeneration++
@@ -709,25 +926,13 @@ func (s *SQLiteStore) reclaimExpiredLease(ctx context.Context, rec *Record, newT
 	return true, nil
 }
 
-// applyLeaseCAS finishes the shared in-memory record update for a
-// successful lease CAS.
-func applyLeaseCAS(result sql.Result, rec *Record, newOwner, newToken string) (bool, error) {
-	rows, err := result.RowsAffected()
+func (s *SQLiteStore) markInFlightExpiredAsUnknown(ctx context.Context, rec *Record, actor string) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
 	}
-	if rows == 0 {
-		return false, nil
-	}
-	rec.LeaseOwner = newOwner
-	rec.LeaseToken = newToken
-	rec.LeaseGeneration++
-	rec.Version++
-	return true, nil
-}
-
-func (s *SQLiteStore) markInFlightExpiredAsUnknown(ctx context.Context, rec *Record) (bool, error) {
-	result, err := s.db.ExecContext(ctx, `
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `
 		UPDATE execution_requests
 		SET state = 'UNKNOWN', version = version + 1,
 		    lease_owner = NULL, lease_token = NULL,
@@ -749,6 +954,18 @@ func (s *SQLiteStore) markInFlightExpiredAsUnknown(ctx context.Context, rec *Rec
 	}
 	if rows == 0 {
 		return false, nil
+	}
+	if err := sqliteInsertEffectEvent(ctx, tx, rec.ExecutionID, effectEvent{
+		eventType:     EventEnteredUnknown,
+		actor:         actor,
+		previousState: string(StateInFlight),
+		newState:      string(StateUnknown),
+		metadata:      "lease expired in flight",
+	}); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
 	}
 	rec.State = StateUnknown
 	rec.Version++
@@ -792,7 +1009,12 @@ func (s *SQLiteStore) MarkInFlight(ctx context.Context, executionID, leaseToken 
 		return fmt.Errorf("%w: recovery locator contains forbidden field %q",
 			LocatorContainsSecret, field)
 	}
-	result, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `
 		UPDATE execution_requests
 		SET state = 'IN_FLIGHT', version = version + 1,
 		    provider_id = ?4, recovery_locator = ?5,
@@ -812,7 +1034,19 @@ func (s *SQLiteStore) MarkInFlight(ctx context.Context, executionID, leaseToken 
 		return err
 	}
 	if rows == 0 {
+		tx.Rollback()
 		return s.classifyTransitionFailure(ctx, executionID, leaseToken, leaseGeneration, StateExecuting)
+	}
+	if err := sqliteInsertEffectEvent(ctx, tx, executionID, effectEvent{
+		eventType:       EventDispatchStarted,
+		previousState:   string(StateExecuting),
+		newState:        string(StateInFlight),
+		claimGeneration: leaseGeneration,
+	}); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
 	}
 	s.metrics.inFlight.Add(1)
 	return nil
@@ -822,7 +1056,12 @@ func (s *SQLiteStore) leaseFencedTransition(ctx context.Context, executionID, le
 	if !isLegalTransition(expectedState, newState) {
 		return fmt.Errorf("%w: illegal transition %s → %s", LeaseStateConflict, expectedState, newState)
 	}
-	result, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `
 		UPDATE execution_requests
 		SET state = ?1, version = version + 1, updated_at = `+sqliteNow+`
 		WHERE execution_id = ?2
@@ -839,9 +1078,20 @@ func (s *SQLiteStore) leaseFencedTransition(ctx context.Context, executionID, le
 		return err
 	}
 	if rows == 0 {
+		// Release our write lock first — classification reads (and its
+		// contention annotation) must not contend with our own tx.
+		tx.Rollback()
 		return s.classifyTransitionFailure(ctx, executionID, leaseToken, leaseGeneration, expectedState)
 	}
-	return nil
+	if err := sqliteInsertEffectEvent(ctx, tx, executionID, effectEvent{
+		eventType:       EventExecutionBegun,
+		previousState:   string(expectedState),
+		newState:        string(newState),
+		claimGeneration: leaseGeneration,
+	}); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *SQLiteStore) classifyTransitionFailure(ctx context.Context, executionID, leaseToken string, leaseGeneration int, expectedState State) error {
@@ -857,9 +1107,11 @@ func (s *SQLiteStore) classifyTransitionFailure(ctx context.Context, executionID
 		return fmt.Errorf("%w: execution %s expected %s but is %s", LeaseStateConflict, executionID, expectedState, rec.State)
 	}
 	if rec.LeaseToken != leaseToken {
+		s.noteContentionEvent(ctx, executionID, EventLeaseLost, "transition fenced: lease token held by another owner")
 		return fmt.Errorf("%w: execution %s token mismatch", LeaseTokenMismatch, executionID)
 	}
 	if rec.LeaseGeneration != leaseGeneration {
+		s.noteContentionEvent(ctx, executionID, EventLeaseLost, "transition fenced: lease generation advanced")
 		return fmt.Errorf("%w: execution %s generation %d != %d", LeaseGenerationMismatch, executionID, rec.LeaseGeneration, leaseGeneration)
 	}
 	return fmt.Errorf("%w: execution %s lease expired", LeaseExpired, executionID)
@@ -872,7 +1124,12 @@ func (s *SQLiteStore) RenewLease(ctx context.Context, executionID, leaseToken st
 	if err := s.leaseCfg.Validate(duration); err != nil {
 		return err
 	}
-	result, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `
 		UPDATE execution_requests
 		SET lease_expires_at = MAX(lease_expires_at, `+sqliteNow+` + ?1),
 		    updated_at = `+sqliteNow+`
@@ -890,7 +1147,17 @@ func (s *SQLiteStore) RenewLease(ctx context.Context, executionID, leaseToken st
 		return err
 	}
 	if rows == 0 {
+		tx.Rollback()
 		return s.classifyRenewalFailure(ctx, executionID, leaseToken, leaseGeneration)
+	}
+	if err := sqliteInsertEffectEvent(ctx, tx, executionID, effectEvent{
+		eventType:       EventLeaseRenewed,
+		claimGeneration: leaseGeneration,
+	}); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
 	}
 	s.metrics.leaseRenewals.Add(1)
 	return nil
@@ -906,9 +1173,11 @@ func (s *SQLiteStore) classifyRenewalFailure(ctx context.Context, executionID, l
 		return fmt.Errorf("%w: execution %s is terminal (%s)", LeaseStateConflict, executionID, rec.State)
 	}
 	if rec.LeaseToken != leaseToken {
+		s.noteContentionEvent(ctx, executionID, EventLeaseLost, "renewal fenced: lease token held by another owner")
 		return fmt.Errorf("%w: execution %s token mismatch", LeaseTokenMismatch, executionID)
 	}
 	if rec.LeaseGeneration != leaseGeneration {
+		s.noteContentionEvent(ctx, executionID, EventLeaseLost, "renewal fenced: lease generation advanced")
 		return fmt.Errorf("%w: execution %s generation %d != %d", LeaseGenerationMismatch, executionID, rec.LeaseGeneration, leaseGeneration)
 	}
 	return fmt.Errorf("%w: execution %s lease expired", LeaseExpired, executionID)
@@ -917,7 +1186,12 @@ func (s *SQLiteStore) classifyRenewalFailure(ctx context.Context, executionID, l
 // AbandonPreDispatch transitions PREPARED or EXECUTING back to
 // lease-less PREPARED — see Store.AbandonPreDispatch.
 func (s *SQLiteStore) AbandonPreDispatch(ctx context.Context, executionID, leaseToken string, leaseGeneration int) error {
-	result, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `
 		UPDATE execution_requests
 		SET state = 'PREPARED', version = version + 1,
 		    lease_owner = NULL, lease_token = NULL,
@@ -937,9 +1211,17 @@ func (s *SQLiteStore) AbandonPreDispatch(ctx context.Context, executionID, lease
 		return err
 	}
 	if rows == 0 {
+		tx.Rollback()
 		return s.classifyAbandonFailure(ctx, executionID, leaseToken, leaseGeneration)
 	}
-	return nil
+	if err := sqliteInsertEffectEvent(ctx, tx, executionID, effectEvent{
+		eventType:       EventAbandonedPreDispatch,
+		newState:        string(StatePrepared),
+		claimGeneration: leaseGeneration,
+	}); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *SQLiteStore) classifyAbandonFailure(ctx context.Context, executionID, leaseToken string, leaseGeneration int) error {
@@ -955,9 +1237,11 @@ func (s *SQLiteStore) classifyAbandonFailure(ctx context.Context, executionID, l
 		return fmt.Errorf("%w: execution %s cannot abandon from %s (dispatch boundary crossed)", LeaseStateConflict, executionID, rec.State)
 	}
 	if rec.LeaseToken != leaseToken {
+		s.noteContentionEvent(ctx, executionID, EventLeaseLost, "abandon fenced: lease token held by another owner")
 		return fmt.Errorf("%w: execution %s token mismatch", LeaseTokenMismatch, executionID)
 	}
 	if rec.LeaseGeneration != leaseGeneration {
+		s.noteContentionEvent(ctx, executionID, EventLeaseLost, "abandon fenced: lease generation advanced")
 		return fmt.Errorf("%w: execution %s generation %d != %d", LeaseGenerationMismatch, executionID, rec.LeaseGeneration, leaseGeneration)
 	}
 	return fmt.Errorf("%w: execution %s lease expired", LeaseExpired, executionID)
@@ -1026,12 +1310,19 @@ func (s *SQLiteStore) Finalize(ctx context.Context, executionID, leaseToken stri
 		return err
 	}
 
-	result, err := s.db.ExecContext(ctx, `
+	terminalResultSHA := sha256Hex(receipt.CanonicalResult)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `
 		UPDATE execution_requests
 		SET state = ?1, result = ?2, evidence_digest = ?3, receipt_version = ?4,
 		    provider_id = COALESCE(?5, provider_id),
 		    provider_run_id = COALESCE(?6, provider_run_id),
 		    terminal_receipt_digest = ?7, evidence_receipt = ?13,
+		    terminal_result_digest = ?14, terminal_evidence_digest = ?15,
 		    lease_owner = NULL, lease_token = NULL,
 		    lease_started_at = NULL, lease_expires_at = NULL,
 		    recovery_locator = NULL,
@@ -1052,7 +1343,8 @@ func (s *SQLiteStore) Finalize(ctx context.Context, executionID, leaseToken stri
 		nullableString(receipt.ProviderRunID),
 		receiptDigest,
 		executionID, string(expectedState), leaseToken, leaseGeneration, existing.Version,
-		nullableString(string(receipt.EvidenceReceipt)))
+		nullableString(string(receipt.EvidenceReceipt)),
+		nullableString(terminalResultSHA), nullableString(receipt.EvidenceDigest))
 	if err != nil {
 		return err
 	}
@@ -1061,6 +1353,9 @@ func (s *SQLiteStore) Finalize(ctx context.Context, executionID, leaseToken stri
 		return err
 	}
 	if rows == 0 {
+		// Release our write lock — the classification lookups (and any
+		// contention annotation) must not contend with our own tx.
+		tx.Rollback()
 		current, lookupErr := s.Lookup(ctx, executionID)
 		if lookupErr == nil && current.State.IsDurablyFinal() {
 			if current.TerminalReceiptDigest == receiptDigest {
@@ -1081,6 +1376,19 @@ func (s *SQLiteStore) Finalize(ctx context.Context, executionID, leaseToken stri
 		}
 		return s.classifyTransitionFailure(ctx, executionID, leaseToken, leaseGeneration, expectedState)
 	}
+	if err := sqliteInsertEffectEvent(ctx, tx, executionID, effectEvent{
+		eventType:       EventTerminalResolved,
+		previousState:   string(expectedState),
+		newState:        string(receipt.TerminalStatus),
+		resultDigest:    terminalResultSHA,
+		evidenceDigest:  receipt.EvidenceDigest,
+		claimGeneration: leaseGeneration,
+	}); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
 	if receipt.TerminalStatus == StateCommitted {
 		s.metrics.committed.Add(1)
 	} else {
@@ -1096,7 +1404,12 @@ func (s *SQLiteStore) EnterRecovery(ctx context.Context, executionID string, exp
 	if !isLegalTransition(expectedState, StateUnknown) {
 		return fmt.Errorf("%w: illegal recovery transition %s → UNKNOWN (only IN_FLIGHT may enter recovery)", LeaseStateConflict, expectedState)
 	}
-	result, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `
 		UPDATE execution_requests
 		SET state = 'UNKNOWN', version = version + 1,
 		    lease_owner = NULL, lease_token = NULL,
@@ -1118,6 +1431,16 @@ func (s *SQLiteStore) EnterRecovery(ctx context.Context, executionID string, exp
 	if rows == 0 {
 		return fmt.Errorf("%w: execution %s enter recovery CAS failed (state/version mismatch)", LeaseStateConflict, executionID)
 	}
+	if err := sqliteInsertEffectEvent(ctx, tx, executionID, effectEvent{
+		eventType:     EventEnteredUnknown,
+		previousState: string(expectedState),
+		newState:      string(StateUnknown),
+	}); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
 	s.metrics.unknownEntered.Add(1)
 	return nil
 }
@@ -1130,8 +1453,14 @@ func (s *SQLiteStore) EnterRecoveryWithObservation(ctx context.Context, executio
 	if !isLegalTransition(expectedState, StateUnknown) {
 		return fmt.Errorf("%w: illegal recovery transition %s → UNKNOWN (only IN_FLIGHT may enter recovery)", LeaseStateConflict, expectedState)
 	}
+	rawResult := obs.Result
 	obs = canonicalizeObservation(obs)
-	res, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `
 		UPDATE execution_requests
 		SET state = 'UNKNOWN', version = version + 1,
 		    lease_owner = NULL, lease_token = NULL,
@@ -1147,6 +1476,7 @@ func (s *SQLiteStore) EnterRecoveryWithObservation(ctx context.Context, executio
 		    provider_receipt_version = COALESCE(NULLIF(?8, 0), provider_receipt_version),
 		    provider_observed_at = `+sqliteNow+`,
 		    evidence_digest = COALESCE(?9, evidence_digest),
+		    provider_evidence_digest = COALESCE(?9, provider_evidence_digest),
 		    updated_at = `+sqliteNow+`
 		WHERE execution_id = ?1
 		  AND state = ?2
@@ -1159,6 +1489,7 @@ func (s *SQLiteStore) EnterRecoveryWithObservation(ctx context.Context, executio
 		  AND (provider_result_digest IS NULL OR ?7 IS NULL OR provider_result_digest = ?7)
 		  AND (provider_receipt_version IS NULL OR provider_receipt_version = 0 OR NULLIF(?8, 0) IS NULL OR provider_receipt_version = ?8)
 		  AND (evidence_digest IS NULL OR ?9 IS NULL OR evidence_digest = ?9)
+		  AND (provider_evidence_digest IS NULL OR ?9 IS NULL OR provider_evidence_digest = ?9)
 	`, executionID, string(expectedState), expectedVersion,
 		nullableString(obs.ProviderID), nullableString(obs.ProviderRunID),
 		nullableString(obs.ProviderStatus), nullableString(obs.ResultDigest),
@@ -1173,7 +1504,23 @@ func (s *SQLiteStore) EnterRecoveryWithObservation(ctx context.Context, executio
 		return err
 	}
 	if rows == 0 {
+		tx.Rollback()
 		return s.classifyEnterRecoveryFailure(ctx, executionID, expectedState, expectedVersion)
+	}
+	if err := sqliteInsertObservationRow(ctx, tx, executionID, ObservationRecovery, rawResult, obs); err != nil {
+		return err
+	}
+	if err := sqliteInsertEffectEvent(ctx, tx, executionID, effectEvent{
+		eventType:      EventEnteredUnknown,
+		previousState:  string(expectedState),
+		newState:       string(StateUnknown),
+		resultDigest:   obs.ResultDigest,
+		evidenceDigest: obs.EvidenceDigest,
+	}); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
 	}
 	s.metrics.unknownEntered.Add(1)
 	return nil
@@ -1196,8 +1543,14 @@ func (s *SQLiteStore) classifyEnterRecoveryFailure(ctx context.Context, executio
 // — identical monotonic/lease-fenced semantics to
 // Store.RecordProviderObservation.
 func (s *SQLiteStore) RecordProviderObservation(ctx context.Context, executionID, leaseToken string, leaseGeneration int, obs ProviderObservation) error {
+	rawResult := obs.Result
 	obs = canonicalizeObservation(obs)
-	res, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `
 		UPDATE execution_requests
 		SET provider_id = COALESCE(?4, provider_id),
 		    provider_run_id = COALESCE(?5, provider_run_id),
@@ -1206,6 +1559,7 @@ func (s *SQLiteStore) RecordProviderObservation(ctx context.Context, executionID
 		    provider_result = COALESCE(?11, provider_result),
 		    provider_result_digest = COALESCE(?8, provider_result_digest),
 		    evidence_digest = COALESCE(?9, evidence_digest),
+		    provider_evidence_digest = COALESCE(?9, provider_evidence_digest),
 		    provider_receipt_version = COALESCE(NULLIF(?10, 0), provider_receipt_version),
 		    provider_observed_at = `+sqliteNow+`,
 		    updated_at = `+sqliteNow+`
@@ -1221,6 +1575,7 @@ func (s *SQLiteStore) RecordProviderObservation(ctx context.Context, executionID
 		  AND (provider_result IS NULL OR ?11 IS NULL OR provider_result = ?11)
 		  AND (provider_result_digest IS NULL OR ?8 IS NULL OR provider_result_digest = ?8)
 		  AND (evidence_digest IS NULL OR ?9 IS NULL OR evidence_digest = ?9)
+		  AND (provider_evidence_digest IS NULL OR ?9 IS NULL OR provider_evidence_digest = ?9)
 		  AND (provider_receipt_version IS NULL OR provider_receipt_version = 0 OR NULLIF(?10, 0) IS NULL OR provider_receipt_version = ?10)
 	`, executionID, nullableString(leaseToken), leaseGeneration,
 		nullableString(obs.ProviderID), nullableString(obs.ProviderRunID),
@@ -1235,7 +1590,34 @@ func (s *SQLiteStore) RecordProviderObservation(ctx context.Context, executionID
 		return err
 	}
 	if rows == 0 {
+		tx.Rollback()
 		return s.classifyObservationFailure(ctx, executionID, leaseToken, leaseGeneration)
+	}
+	// A fenced IN_FLIGHT write is a dispatch observation; an UNKNOWN
+	// write is recovery-side — see Store.RecordProviderObservation.
+	var state string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT state FROM execution_requests WHERE execution_id = ?1`,
+		executionID).Scan(&state); err != nil {
+		return err
+	}
+	kind, eventType := ObservationDispatch, EventProviderObserved
+	if state == string(StateUnknown) {
+		kind, eventType = ObservationReconciliation, EventReconciliationObserved
+	}
+	if err := sqliteInsertObservationRow(ctx, tx, executionID, kind, rawResult, obs); err != nil {
+		return err
+	}
+	if err := sqliteInsertEffectEvent(ctx, tx, executionID, effectEvent{
+		eventType:       eventType,
+		resultDigest:    obs.ResultDigest,
+		evidenceDigest:  obs.EvidenceDigest,
+		claimGeneration: leaseGeneration,
+	}); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
 	}
 	s.metrics.observationWrites.Add(1)
 	return nil
@@ -1249,6 +1631,7 @@ func (s *SQLiteStore) classifyObservationFailure(ctx context.Context, executionI
 	}
 	if rec.State == StateInFlight &&
 		(rec.LeaseToken != leaseToken || rec.LeaseGeneration != leaseGeneration) {
+		s.noteContentionEvent(ctx, executionID, EventLeaseLost, "observation fenced: lease held by another owner")
 		return fmt.Errorf("%w: execution %s observation rejected (lease token/generation mismatch)", LeaseStateConflict, executionID)
 	}
 	if rec.State != StateInFlight && rec.State != StateUnknown {
@@ -1261,7 +1644,12 @@ func (s *SQLiteStore) classifyObservationFailure(ctx context.Context, executionI
 // RecoverExpiredPreDispatch normalizes a crashed PREPARED/EXECUTING
 // record to lease-less PREPARED — see Store.RecoverExpiredPreDispatch.
 func (s *SQLiteStore) RecoverExpiredPreDispatch(ctx context.Context, executionID string, expectedVersion int) error {
-	res, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `
 		UPDATE execution_requests
 		SET state = 'PREPARED',
 		    lease_owner = NULL, lease_token = NULL,
@@ -1285,7 +1673,14 @@ func (s *SQLiteStore) RecoverExpiredPreDispatch(ctx context.Context, executionID
 	if rows == 0 {
 		return fmt.Errorf("%w: execution %s recover expired pre-dispatch CAS failed (state/version/expiry mismatch)", LeaseStateConflict, executionID)
 	}
-	return nil
+	if err := sqliteInsertEffectEvent(ctx, tx, executionID, effectEvent{
+		eventType: EventLeaseLost,
+		newState:  string(StatePrepared),
+		metadata:  "expired pre-dispatch lease recovered",
+	}); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // ScrubStaleRecoveryLocators clears recovery_locator on UNKNOWN records
@@ -1386,7 +1781,13 @@ func (s *SQLiteStore) ResolveRecovery(ctx context.Context, executionID string, e
 	// resolver's canonical values are the terminal output. COALESCE
 	// preserves the stored observation when the resolver sends an empty
 	// field rather than nulling it.
-	result2, err := s.db.ExecContext(ctx, `
+	terminalResultSHA := sha256Hex(result.Result)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result2, err := tx.ExecContext(ctx, `
 		UPDATE execution_requests
 		SET state = ?1,
 		    result = COALESCE(?2, result),
@@ -1395,6 +1796,7 @@ func (s *SQLiteStore) ResolveRecovery(ctx context.Context, executionID string, e
 		    provider_id = COALESCE(?5, provider_id),
 		    provider_run_id = COALESCE(?6, provider_run_id),
 		    terminal_receipt_digest = ?7, evidence_receipt = ?10,
+		    terminal_result_digest = ?11, terminal_evidence_digest = ?12,
 		    reconcile_owner = NULL, reconcile_lease_expires_at = NULL,
 		    next_reconcile_at = NULL, last_reconcile_error = NULL,
 		    recovery_locator = NULL,
@@ -1410,7 +1812,8 @@ func (s *SQLiteStore) ResolveRecovery(ctx context.Context, executionID string, e
 		nullableString(result.ProviderRunID),
 		receiptDigest,
 		executionID, expectedVersion,
-		nullableString(string(result.EvidenceReceipt)))
+		nullableString(string(result.EvidenceReceipt)),
+		nullableString(terminalResultSHA), nullableString(result.EvidenceDigest))
 	if err != nil {
 		return err
 	}
@@ -1432,6 +1835,34 @@ func (s *SQLiteStore) ResolveRecovery(ctx context.Context, executionID string, e
 			return fmt.Errorf("%w: execution %s recovery result contradicts stored provider observation", ProviderObservationConflict, executionID)
 		}
 		return fmt.Errorf("%w: execution %s recovery resolution CAS failed (state/version mismatch)", LeaseStateConflict, executionID)
+	}
+	// The resolver's result is itself a provider observation — ledger
+	// it when it carries provider material (see Store.ResolveRecovery).
+	if result.ProviderID != "" || result.ProviderRunID != "" ||
+		len(result.Result) > 0 || result.EvidenceDigest != "" {
+		obs := canonicalizeObservation(ProviderObservation{
+			ProviderID:     result.ProviderID,
+			ProviderRunID:  result.ProviderRunID,
+			Result:         result.Result,
+			EvidenceDigest: result.EvidenceDigest,
+			ReceiptVersion: result.ReceiptVersion,
+		})
+		if err := sqliteInsertObservationRow(ctx, tx, executionID,
+			ObservationReconciliation, result.Result, obs); err != nil {
+			return err
+		}
+	}
+	if err := sqliteInsertEffectEvent(ctx, tx, executionID, effectEvent{
+		eventType:      EventTerminalResolved,
+		previousState:  string(StateUnknown),
+		newState:       string(newState),
+		resultDigest:   terminalResultSHA,
+		evidenceDigest: result.EvidenceDigest,
+	}); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
 	}
 	s.metrics.reconcileResolutions.Add(1)
 	if newState == StateCommitted {
@@ -1458,7 +1889,12 @@ func (s *SQLiteStore) ClaimUnknownBatch(ctx context.Context, owner string, batch
 	if claimDuration <= 0 {
 		claimDuration = 5 * time.Minute
 	}
-	rows, err := s.db.QueryContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `
 		UPDATE execution_requests
 		SET reconcile_owner = ?1,
 		    reconcile_lease_expires_at = `+sqliteNow+` + ?2,
@@ -1484,10 +1920,24 @@ func (s *SQLiteStore) ClaimUnknownBatch(ctx context.Context, owner string, batch
 		return nil, fmt.Errorf("claim unknown batch failed: %w", err)
 	}
 	recs, err := scanSQLiteRecords(rows)
-	if err == nil {
-		s.metrics.reconcileClaims.Add(int64(len(recs)))
+	if err != nil {
+		return nil, err
 	}
-	return recs, err
+	for _, rec := range recs {
+		if err := sqliteInsertEffectEvent(ctx, tx, rec.ExecutionID, effectEvent{
+			eventType:       EventReconciliationClaimed,
+			actor:           owner,
+			previousState:   string(StateUnknown),
+			claimGeneration: rec.ReconcileAttempt,
+		}); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	s.metrics.reconcileClaims.Add(int64(len(recs)))
+	return recs, nil
 }
 
 // ClaimExpiredBatch atomically claims expired-lease records for crash
@@ -1499,7 +1949,12 @@ func (s *SQLiteStore) ClaimExpiredBatch(ctx context.Context, owner string, batch
 	if claimDuration <= 0 {
 		claimDuration = 5 * time.Minute
 	}
-	rows, err := s.db.QueryContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `
 		UPDATE execution_requests
 		SET reconcile_owner = ?1,
 		    reconcile_lease_expires_at = `+sqliteNow+` + ?2,
@@ -1524,16 +1979,38 @@ func (s *SQLiteStore) ClaimExpiredBatch(ctx context.Context, owner string, batch
 		return nil, fmt.Errorf("claim expired batch failed: %w", err)
 	}
 	recs, err := scanSQLiteRecords(rows)
-	if err == nil {
-		s.metrics.reconcileClaims.Add(int64(len(recs)))
+	if err != nil {
+		return nil, err
 	}
-	return recs, err
+	// Each claimed record's previous lease holder lost its lease to
+	// expiry — the claim is the forensic record of that loss.
+	for _, rec := range recs {
+		if err := sqliteInsertEffectEvent(ctx, tx, rec.ExecutionID, effectEvent{
+			eventType:       EventLeaseLost,
+			actor:           owner,
+			previousState:   string(rec.State),
+			claimGeneration: rec.LeaseGeneration,
+			metadata:        "lease expired; claimed for recovery",
+		}); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	s.metrics.reconcileClaims.Add(int64(len(recs)))
+	return recs, nil
 }
 
 // ReleaseReconcileClaim releases a claim with DB-computed backoff —
 // see Store.ReleaseReconcileClaim.
 func (s *SQLiteStore) ReleaseReconcileClaim(ctx context.Context, executionID string, expectedVersion int, backoffDuration time.Duration, lastError string) error {
-	result, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `
 		UPDATE execution_requests
 		SET reconcile_owner = NULL,
 		    reconcile_lease_expires_at = NULL,
@@ -1557,15 +2034,30 @@ func (s *SQLiteStore) ReleaseReconcileClaim(ctx context.Context, executionID str
 		return err
 	}
 	if rows == 0 {
+		// Release our write lock before the standalone forensic
+		// insert — BEGIN IMMEDIATE would contend with our own tx.
+		tx.Rollback()
+		s.noteContentionEvent(ctx, executionID, EventClaimLost, "release reconcile claim CAS failed")
 		return fmt.Errorf("%w: execution %s release reconcile claim CAS failed (state/version mismatch)", LeaseStateConflict, executionID)
 	}
-	return nil
+	if err := sqliteInsertEffectEvent(ctx, tx, executionID, effectEvent{
+		eventType: EventClaimReleased,
+		metadata:  lastError,
+	}); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // SuspendReconciliation dead-letters an UNKNOWN record — see
 // Store.SuspendReconciliation.
 func (s *SQLiteStore) SuspendReconciliation(ctx context.Context, executionID string, expectedVersion int, reason string) error {
-	result, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `
 		UPDATE execution_requests
 		SET reconcile_owner = NULL,
 		    reconcile_lease_expires_at = NULL,
@@ -1586,16 +2078,29 @@ func (s *SQLiteStore) SuspendReconciliation(ctx context.Context, executionID str
 		return err
 	}
 	if rows == 0 {
+		tx.Rollback()
+		s.noteContentionEvent(ctx, executionID, EventClaimLost, "suspend reconciliation CAS failed")
 		return fmt.Errorf("%w: execution %s suspend reconciliation CAS failed (state/version mismatch)", LeaseStateConflict, executionID)
 	}
-	return nil
+	if err := sqliteInsertEffectEvent(ctx, tx, executionID, effectEvent{
+		eventType: EventReconciliationSuspended,
+		metadata:  reason,
+	}); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // RenewReconcileClaim extends an active claim to
 // MAX(current, now + duration) — see Store.RenewReconcileClaim. The
 // WHERE clause requires a live claim, so MAX never sees NULL.
 func (s *SQLiteStore) RenewReconcileClaim(ctx context.Context, executionID string, expectedVersion int, duration time.Duration) error {
-	result, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `
 		UPDATE execution_requests
 		SET reconcile_lease_expires_at = MAX(
 		        reconcile_lease_expires_at,
@@ -1614,9 +2119,16 @@ func (s *SQLiteStore) RenewReconcileClaim(ctx context.Context, executionID strin
 		return err
 	}
 	if rows == 0 {
+		tx.Rollback()
+		s.noteContentionEvent(ctx, executionID, EventClaimLost, "renew reconcile claim failed")
 		return fmt.Errorf("%w: execution %s renew reconcile claim failed (expired or version mismatch)", LeaseStateConflict, executionID)
 	}
-	return nil
+	if err := sqliteInsertEffectEvent(ctx, tx, executionID, effectEvent{
+		eventType: EventClaimRenewed,
+	}); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // ─── Lookup ──────────────────────────────────────────────────────────
@@ -1747,6 +2259,8 @@ func scanSQLiteRecords(rows *sql.Rows) ([]*Record, error) {
 			&recOwner, &recLeaseExp, &rec.ReconcileAttempt, &nextRecAt, &lastRecErr,
 			&enteredUnknownAt, &providerResultJSON,
 			&rec.AuthorityGeneration, &rec.AuthorityDigest,
+			&rec.ProviderEvidenceDigest, &rec.TerminalResultDigest,
+			&rec.TerminalEvidenceDigest,
 		); err != nil {
 			return nil, err
 		}
@@ -1810,4 +2324,75 @@ func scanSQLiteRecords(rows *sql.Rows) ([]*Record, error) {
 		records = append(records, &rec)
 	}
 	return records, rows.Err()
+}
+
+// ─── Forensic reads ──────────────────────────────────────────────────
+
+// ListEffectEvents returns the execution's ordered forensic event
+// history — see Store.ListEffectEvents.
+func (s *SQLiteStore) ListEffectEvents(ctx context.Context, executionID string) ([]EffectEvent, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT execution_id, sequence, record_version, event_type,
+		       COALESCE(actor, ''), COALESCE(previous_state, ''),
+		       COALESCE(new_state, ''), COALESCE(result_digest, ''),
+		       COALESCE(evidence_digest, ''), COALESCE(claim_generation, 0),
+		       occurred_at, COALESCE(metadata, '')
+		FROM effect_events
+		WHERE execution_id = ?1
+		ORDER BY sequence`, executionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var events []EffectEvent
+	for rows.Next() {
+		var ev EffectEvent
+		var occurredAtMs int64
+		if err := rows.Scan(&ev.ExecutionID, &ev.Sequence, &ev.RecordVersion,
+			&ev.EventType, &ev.Actor, &ev.PreviousState, &ev.NewState,
+			&ev.ResultDigest, &ev.EvidenceDigest, &ev.ClaimGeneration,
+			&occurredAtMs, &ev.Metadata); err != nil {
+			return nil, err
+		}
+		ev.OccurredAt = sqliteTime(occurredAtMs)
+		events = append(events, ev)
+	}
+	return events, rows.Err()
+}
+
+// ListProviderObservations returns the execution's immutable provider-
+// observation ledger rows in commit order — see
+// Store.ListProviderObservations.
+func (s *SQLiteStore) ListProviderObservations(ctx context.Context, executionID string) ([]ObservationRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT execution_id, sequence, record_version, observation_kind,
+		       COALESCE(provider_id, ''), COALESCE(provider_run_id, ''),
+		       COALESCE(provider_status, ''), result_bytes,
+		       COALESCE(result_sha256, ''), COALESCE(result_canonical_digest, ''),
+		       COALESCE(evidence_sha256, ''), receipt_version, observed_at
+		FROM effect_provider_observations
+		WHERE execution_id = ?1
+		ORDER BY sequence`, executionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var recs []ObservationRecord
+	for rows.Next() {
+		var r ObservationRecord
+		var resultBytes *string
+		var observedAtMs int64
+		if err := rows.Scan(&r.ExecutionID, &r.Sequence, &r.RecordVersion,
+			&r.Kind, &r.ProviderID, &r.ProviderRunID, &r.ProviderStatus,
+			&resultBytes, &r.ResultSHA256, &r.ResultCanonicalDigest,
+			&r.EvidenceSHA256, &r.ReceiptVersion, &observedAtMs); err != nil {
+			return nil, err
+		}
+		if resultBytes != nil {
+			r.ResultBytes = json.RawMessage(*resultBytes)
+		}
+		r.ObservedAt = sqliteTime(observedAtMs)
+		recs = append(recs, r)
+	}
+	return recs, rows.Err()
 }

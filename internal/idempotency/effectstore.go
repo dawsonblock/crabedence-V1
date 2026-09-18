@@ -46,6 +46,12 @@ type EffectStore interface {
 	ListUnknown(ctx context.Context) ([]*Record, error)
 	ListExpiredLeases(ctx context.Context) ([]*Record, error)
 	ListStuck(ctx context.Context) ([]*Record, error)
+	// ListEffectEvents returns the execution's ordered forensic event
+	// history (sequence-ordered, append-only, read-only).
+	ListEffectEvents(ctx context.Context, executionID string) ([]EffectEvent, error)
+	// ListProviderObservations returns the execution's immutable
+	// provider-observation ledger rows in commit order.
+	ListProviderObservations(ctx context.Context, executionID string) ([]ObservationRecord, error)
 
 	// Configuration and schema introspection.
 	LeaseConfig() LeaseConfig
