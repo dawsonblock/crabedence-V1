@@ -2,6 +2,7 @@ package execution
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/openclaw/crabbox/internal/capability"
+	"github.com/openclaw/crabbox/internal/evidence"
 	"github.com/openclaw/crabbox/internal/idempotency"
 )
 
@@ -111,11 +113,26 @@ func TestExternalProviderHelperProcess(t *testing.T) {
 		}
 		mu.Lock()
 		defer mu.Unlock()
-		if e, ok := seen[body.Token]; ok {
-			// Idempotent replay — logged result, no new effect.
+		respond := func(e providerLogEntry) {
+			// Completion evidence: the durable log entry bytes ARE the
+			// artifact; the digest is SHA-256 over them — Crabedence
+			// recomputes it before attesting, never trusts the claim.
+			artifact, _ := json.Marshal(e)
+			sum := sha256.Sum256(artifact)
 			json.NewEncoder(w).Encode(map[string]any{
 				"status": "SUCCEEDED", "run_id": e.RunID, "result": e.Result,
+				"evidence": map[string]any{
+					// RawMessage embeds the entry bytes — a []byte
+					// would marshal as base64 and the executor would
+					// attest a digest of the wrong bytes.
+					"artifact": json.RawMessage(artifact),
+					"digest":   fmt.Sprintf("%x", sum),
+				},
 			})
+		}
+		if e, ok := seen[body.Token]; ok {
+			// Idempotent replay — logged result, no new effect.
+			respond(e)
 			return
 		}
 		effects++
@@ -131,9 +148,7 @@ func TestExternalProviderHelperProcess(t *testing.T) {
 			return
 		}
 		seen[body.Token] = e
-		json.NewEncoder(w).Encode(map[string]any{
-			"status": "SUCCEEDED", "run_id": e.RunID, "result": e.Result,
-		})
+		respond(e)
 	})
 	mux.HandleFunc("GET /effects/{token}", func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
@@ -202,10 +217,17 @@ func startExternalProvider(t *testing.T, dir string) (url string, logPath string
 // httpProvider is the executor-side Handler for the external provider:
 // the wire boundary the in-process simProvider cannot model. Transport
 // failure after the request may have been sent is ambiguous — FAILED
-// without DefinitiveFailure, so the executor enters UNKNOWN.
+// without DefinitiveFailure, so the executor enters UNKNOWN. caps, when
+// set, declares the provider's assurance for the CRITICAL admission
+// gate — the reference integration for the full CRITICAL walk.
 type httpProvider struct {
 	baseURL string
 	client  *http.Client
+	caps    ProviderCapabilities
+}
+
+func (p *httpProvider) ProviderCapabilities(string) ProviderCapabilities {
+	return p.caps
 }
 
 func (p *httpProvider) Execute(ctx context.Context, req Request, desc capability.ResolvedDescriptor) Response {
@@ -223,18 +245,27 @@ func (p *httpProvider) Execute(ctx context.Context, req Request, desc capability
 	}
 	defer resp.Body.Close()
 	var out struct {
-		Status string          `json:"status"`
-		RunID  string          `json:"run_id"`
-		Result json.RawMessage `json:"result"`
+		Status   string          `json:"status"`
+		RunID    string          `json:"run_id"`
+		Result   json.RawMessage `json:"result"`
+		Evidence *struct {
+			Artifact json.RawMessage `json:"artifact"`
+			Digest   string          `json:"digest"`
+		} `json:"evidence"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return Response{Status: StatusFailed, Error: "provider response decode: " + err.Error()}
 	}
-	return Response{
+	r := Response{
 		Status:    out.Status,
 		Result:    out.Result,
 		Execution: &ExecutionMeta{Provider: desc.AdapterID, RunID: out.RunID},
 	}
+	if out.Evidence != nil {
+		r.Evidence = &EvidenceRef{Digest: out.Evidence.Digest, ReceiptVersion: 3}
+		r.EvidenceArtifact = out.Evidence.Artifact
+	}
+	return r
 }
 
 // TestExternalProviderCrashMatrix kills the executor subprocess at
@@ -425,5 +456,109 @@ func TestExternalProviderStatusLookupReconciliation(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("provider applied %d effects, want exactly 1 — external effect count bounded", n)
+	}
+}
+
+// TestCriticalExternalProviderEndToEnd is the full CRITICAL reference
+// walk against the external provider process: capability-declared
+// admission → dispatch over the wire → provider evidence artifact →
+// signed Crabedence receipt → COMMITTED with the receipt persisted —
+// then the provider's own status lookup stands as independent
+// post-hoc evidence. Every leg the CRITICAL contract requires, on
+// the real process boundary.
+func TestCriticalExternalProviderEndToEnd(t *testing.T) {
+	dir := t.TempDir()
+	providerURL, logPath := startExternalProvider(t, dir)
+	dbPath := filepath.Join(dir, "db", "crit.db")
+
+	db, err := idempotency.OpenSQLiteDB(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	store, err := idempotency.NewSQLiteStore(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	signer, err := evidence.GenerateSigner()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.SetTrustedEvidenceSigners(signer.Fingerprint())
+
+	p := &httpProvider{
+		baseURL: providerURL,
+		client:  &http.Client{Timeout: 10 * time.Second},
+		caps: ProviderCapabilities{
+			SupportsProviderIdempotency: true,
+			SupportsStatusLookup:        true,
+			SupportsCompletionProof:     true,
+			SupportsNonexecutionProof:   true,
+			RecoveryLocatorType:         "provider_run_id",
+		},
+	}
+	exec := NewDispatchExecutor(p, store)
+	exec.SetEvidenceSigner(signer)
+
+	key := fmt.Sprintf("crit-ext-%d", time.Now().UnixNano())
+	resp := exec.ExecuteWithIdempotency(context.Background(), Request{
+		Capability:     "test.critical",
+		Arguments:      json.RawMessage(`{"x":1}`),
+		Authority:      RequestAuthority{Principal: "alice@example.com", AuthorityRef: "grant_c"},
+		IdempotencyKey: key,
+	}, capability.ResolvedDescriptor{
+		ExecutionClass: capability.ClassCritical,
+		AdapterID:      "test-adapter",
+	})
+	if resp.Status != StatusSucceeded {
+		t.Fatalf("CRITICAL walk failed: %s — %s", resp.Status, resp.Error)
+	}
+
+	rec, err := store.LookupByKey(context.Background(), "alice@example.com", "test.critical", key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.State != idempotency.StateCommitted {
+		t.Fatalf("state = %s, want COMMITTED", rec.State)
+	}
+	if len(rec.EvidenceReceipt) == 0 {
+		t.Fatal("CRITICAL commit without a persisted signed receipt")
+	}
+
+	// The provider's durable log is the independent evidence: exactly
+	// one effect, matching the committed execution's identity.
+	entries := readProviderLog(t, logPath)
+	var mine []providerLogEntry
+	for _, e := range entries {
+		if e.Token == key {
+			mine = append(mine, e)
+		}
+	}
+	if len(mine) != 1 {
+		t.Fatalf("provider effects = %d, want exactly 1", len(mine))
+	}
+	if mine[0].RunID != rec.ProviderRunID {
+		t.Fatalf("provider run %s != committed run %s — receipt binds a different execution",
+			mine[0].RunID, rec.ProviderRunID)
+	}
+
+	// The persisted receipt must verify against the trusted signer
+	// and the full execution binding — unsigned digests are not
+	// proof. The evidence digest is recomputed from the provider's
+	// own artifact bytes (the durable log entry).
+	artifact, _ := json.Marshal(mine[0])
+	artSum := sha256.Sum256(artifact)
+	if err := evidence.VerifyReceipt(rec.EvidenceReceipt, evidence.Binding{
+		ExecutionID:    rec.ExecutionID,
+		Capability:     "test.critical",
+		Principal:      "alice@example.com",
+		RequestDigest:  rec.RequestDigest,
+		ProviderID:     rec.ProviderID,
+		ProviderRunID:  rec.ProviderRunID,
+		Outcome:        evidence.OutcomeCompleted,
+		EvidenceSHA256: fmt.Sprintf("%x", artSum),
+	}, map[string]bool{signer.Fingerprint(): true}); err != nil {
+		t.Fatalf("persisted receipt failed verification: %v", err)
 	}
 }
