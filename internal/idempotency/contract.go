@@ -316,11 +316,15 @@ func canonicalizeJSON(raw json.RawMessage) (json.RawMessage, error) {
 	var extra any
 	if err := dec.Decode(&extra); err != io.EOF {
 		if err == nil {
-			return nil, fmt.Errorf("invalid JSON: trailing data after first value")
+			return nil, fmt.Errorf("invalid JSON: %w", ErrTrailingJSON)
 		}
 		return nil, fmt.Errorf("invalid JSON: %w", err)
 	}
-	return json.Marshal(normalizeNumbers(v))
+	normalized, err := normalizeNumbers(v)
+	if err != nil {
+		return nil, fmt.Errorf("invalid JSON: %w", err)
+	}
+	return json.Marshal(normalized)
 }
 
 // ─── Recovery ────────────────────────────────────────────────────────

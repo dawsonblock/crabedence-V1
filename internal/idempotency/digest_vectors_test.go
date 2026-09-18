@@ -122,7 +122,8 @@ func TestDigestVectors(t *testing.T) {
 		out := digestVectorFile{
 			Description: "Frozen cross-language conformance corpus for the idempotency request digest ABI. " +
 				"canonical_args is the deterministic re-marshal of raw_args after canonicalJSONNumber " +
-				"normalization (1, 1.0, 1e0 all → \"1\"; arbitrary precision preserved). " +
+				"normalization (1, 1.0, 1e0 all → \"1e0\"; normalized scientific form, " +
+				"arbitrary-precision exponent, never expanded). " +
 				"digest is hex(SHA-256(canonical DigestInput JSON)). Regenerate with " +
 				"-update-digest-vectors only for a deliberate ABI change.",
 			Vectors: digestVectorCases,

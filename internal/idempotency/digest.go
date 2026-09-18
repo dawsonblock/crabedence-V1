@@ -4,11 +4,19 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"strconv"
 	"strings"
 )
+
+// ErrTrailingJSON is returned when a document that must contain exactly
+// one JSON value carries additional data after the first value. It is a
+// deterministic validation error — never a panic — so callers can
+// distinguish malformed input from a canonicalization defect.
+var ErrTrailingJSON = errors.New("trailing data after first JSON value")
 
 // CanonicalJSON produces deterministic JSON for idempotency digests.
 //
@@ -21,7 +29,13 @@ import (
 // to their canonical form by callers before marshaling — see
 // canonicalJSONNumber. Semantically equal numbers produce identical
 // output regardless of lexical representation (1, 1.0, 1e0 all
-// canonicalize to "1"), and precision is never routed through float64.
+// canonicalize to "1e0"), and precision is never routed through
+// float64. The canonical form is normalized scientific notation —
+// it never expands zeros according to the exponent, so output size
+// stays proportional to input size even for hostile literals like
+// 1e-99999999999999999999, and exponent arithmetic is arbitrary
+// precision so 1e18446744073709551616 cannot wrap into collision
+// with a small value.
 //
 // RELATIONSHIP TO THE EVIDENCE CANONICALIZATION:
 // The RunEvidenceV1 canonicalization (internal/cli/run_evidence.go)
@@ -41,22 +55,32 @@ func CanonicalJSON(v any) (string, error) {
 }
 
 // canonicalJSONNumber normalizes a JSON numeric literal to its
-// canonical form — the minimal exact decimal representation of the
-// same mathematical value:
+// canonical form: a normalized scientific representation of the same
+// mathematical value that never expands according to the exponent:
 //
-//	1, 1.0, 1.00, 1e0, 1e+0  → "1"
-//	1.5e3                    → "1500"
-//	1.5e-3                   → "0.0015"
-//	-0, -0.0                 → "0"
+//	1, 1.0, 1.00, 1e0, 1e+0  → "1e0"
+//	10, 100.0                → "1e1", "1e2"
+//	0.01, 0.0100             → "1e-2"
+//	12.34                    → "1.234e1"
+//	1.5e3                    → "1.5e3"
+//	1.5e-3                   → "1.5e-3"
+//	-0, -0.0, 0e999999       → "0"
 //
 // The rewrite is purely lexical — digits are rearranged, never routed
 // through float64 — so arbitrary precision is preserved and the rule is
-// trivially implementable in any language. If the expanded plain
-// decimal form would exceed 4096 characters (absurd exponents like
-// 1e999999), the canonical form is scientific notation
-// "d[.digits]e<exp>" with the same trailing-zero-stripped mantissa.
-func canonicalJSONNumber(s string) string {
-	// Parse the JSON number grammar: -?digits(.digits)?([eE][+-]?digits)?
+// trivially implementable in any language. Exponent arithmetic uses
+// math/big: the exponent is never parsed into a fixed-width integer,
+// so literals like 1e18446744073709551616 cannot wrap into collision
+// with a small value, and a hostile negative exponent can never force
+// a multi-megabyte zero expansion. Output size stays proportional to
+// input size.
+//
+// The function fails closed: any input that is not a well-formed JSON
+// number literal (the only inputs a json.Decoder produces for
+// json.Number, but defensive for constructed values) returns a
+// deterministic error rather than a partially-canonicalized string.
+func canonicalJSONNumber(s string) (string, error) {
+	// Parse the JSON number grammar: -?(0|[1-9]digits)(.digits)?([eE][+-]?digits)?
 	i := 0
 	neg := false
 	if i < len(s) && s[i] == '-' {
@@ -64,104 +88,156 @@ func canonicalJSONNumber(s string) string {
 		i++
 	}
 	intStart := i
-	for i < len(s) && s[i] != '.' && s[i] != 'e' && s[i] != 'E' {
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
 		i++
 	}
 	intPart := s[intStart:i]
+	if intPart == "" {
+		return "", fmt.Errorf("invalid JSON number %q: missing integer digits", s)
+	}
+	if len(intPart) > 1 && intPart[0] == '0' {
+		return "", fmt.Errorf("invalid JSON number %q: leading zero", s)
+	}
 	fracPart := ""
 	if i < len(s) && s[i] == '.' {
 		i++
 		fs := i
-		for i < len(s) && s[i] != 'e' && s[i] != 'E' {
+		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
 			i++
 		}
 		fracPart = s[fs:i]
+		if fracPart == "" {
+			return "", fmt.Errorf("invalid JSON number %q: missing fraction digits", s)
+		}
 	}
-	var exp int64
+	exp := new(big.Int)
 	if i < len(s) && (s[i] == 'e' || s[i] == 'E') {
 		i++
-		esign := int64(1)
+		expNeg := false
 		if i < len(s) && (s[i] == '+' || s[i] == '-') {
-			if s[i] == '-' {
-				esign = -1
-			}
+			expNeg = s[i] == '-'
 			i++
 		}
+		es := i
 		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
-			exp = exp*10 + int64(s[i]-'0')
 			i++
 		}
-		exp *= esign
+		if es == i {
+			return "", fmt.Errorf("invalid JSON number %q: missing exponent digits", s)
+		}
+		// es:i is all digits, so SetString cannot fail.
+		exp.SetString(s[es:i], 10)
+		if expNeg {
+			exp.Neg(exp)
+		}
+	}
+	if i != len(s) {
+		return "", fmt.Errorf("invalid JSON number %q: trailing characters", s)
 	}
 
-	digits := intPart + fracPart
 	// value = digits × 10^decimalExp
-	decimalExp := exp - int64(len(fracPart))
+	digits := intPart + fracPart
+	decimalExp := new(big.Int).Sub(exp, big.NewInt(int64(len(fracPart))))
 	// Each trailing zero stripped moves one power of ten into the exponent.
 	trimmed := strings.TrimRight(digits, "0")
-	decimalExp += int64(len(digits) - len(trimmed))
+	decimalExp.Add(decimalExp, big.NewInt(int64(len(digits)-len(trimmed))))
 	digits = strings.TrimLeft(trimmed, "0")
 	if digits == "" {
-		return "0"
+		return "0", nil
 	}
 
-	// Expanded output length: plain decimal when decimalExp >= 0 is
-	// len(digits)+decimalExp; when negative it is at most
-	// len(digits)+2. Bound it to avoid absurd expansions like 1e999999999.
-	plainLen := len(digits) + 2
-	if decimalExp >= 0 {
-		plainLen = len(digits) + int(decimalExp)
-	}
-	if plainLen > 4096 {
-		// Canonical scientific form: mantissa digits with point after
-		// the first digit, exponent = decimalExp + len(digits) - 1.
-		mant := digits[:1]
-		if len(digits) > 1 {
-			mant += "." + digits[1:]
-		}
-		if neg {
-			mant = "-" + mant
-		}
-		return mant + "e" + strconv.FormatInt(decimalExp+int64(len(digits))-1, 10)
-	}
-
-	var out string
-	switch {
-	case decimalExp >= 0:
-		out = digits + strings.Repeat("0", int(decimalExp))
-	default:
-		point := len(digits) + int(decimalExp)
-		if point > 0 {
-			out = digits[:point] + "." + digits[point:]
-		} else {
-			out = "0." + strings.Repeat("0", -point) + digits
-		}
-	}
+	// Normalized scientific form: the decimal point sits after the
+	// first significant digit, so the printed exponent is
+	// decimalExp + len(digits) - 1, computed in arbitrary precision.
+	e := new(big.Int).Add(decimalExp, big.NewInt(int64(len(digits))-1))
+	var b strings.Builder
+	b.Grow(len(digits) + 8)
 	if neg {
-		return "-" + out
+		b.WriteByte('-')
 	}
-	return out
+	b.WriteByte(digits[0])
+	if len(digits) > 1 {
+		b.WriteByte('.')
+		b.WriteString(digits[1:])
+	}
+	b.WriteByte('e')
+	b.WriteString(e.String())
+	return b.String(), nil
 }
 
-// normalizeNumbers rewrites every json.Number in a decoded JSON tree
+// canonicalNumberLiteral converts a Go-native numeric value to its
+// shortest decimal literal and canonicalizes it, so a caller-supplied
+// int or float64 digests identically to the same number arriving as
+// raw JSON.
+func canonicalNumberLiteral(lit string) (json.Number, error) {
+	c, err := canonicalJSONNumber(lit)
+	if err != nil {
+		return "", err
+	}
+	return json.Number(c), nil
+}
+
+// normalizeNumbers rewrites every numeric value in a decoded JSON tree
 // to canonicalJSONNumber form, so semantically equal documents marshal
-// to identical bytes.
-func normalizeNumbers(v any) any {
+// to identical bytes regardless of lexical representation or the Go
+// type the caller happened to decode into. Any malformed numeric value
+// is a deterministic error — the digest path fails closed.
+func normalizeNumbers(v any) (any, error) {
 	switch t := v.(type) {
 	case map[string]any:
 		for k, e := range t {
-			t[k] = normalizeNumbers(e)
+			n, err := normalizeNumbers(e)
+			if err != nil {
+				return nil, err
+			}
+			t[k] = n
 		}
-		return t
+		return t, nil
 	case []any:
 		for i, e := range t {
-			t[i] = normalizeNumbers(e)
+			n, err := normalizeNumbers(e)
+			if err != nil {
+				return nil, err
+			}
+			t[i] = n
 		}
-		return t
+		return t, nil
 	case json.Number:
-		return json.Number(canonicalJSONNumber(t.String()))
+		return canonicalNumberLiteral(t.String())
+	case json.RawMessage:
+		// Raw JSON embedded in a decoded tree must canonicalize like
+		// any other numeric content, not pass through verbatim.
+		c, err := canonicalizeJSON(t)
+		if err != nil {
+			return nil, err
+		}
+		return json.RawMessage(c), nil
+	case float64:
+		return canonicalNumberLiteral(strconv.FormatFloat(t, 'g', -1, 64))
+	case float32:
+		return canonicalNumberLiteral(strconv.FormatFloat(float64(t), 'g', -1, 32))
+	case int:
+		return canonicalNumberLiteral(strconv.FormatInt(int64(t), 10))
+	case int8:
+		return canonicalNumberLiteral(strconv.FormatInt(int64(t), 10))
+	case int16:
+		return canonicalNumberLiteral(strconv.FormatInt(int64(t), 10))
+	case int32:
+		return canonicalNumberLiteral(strconv.FormatInt(int64(t), 10))
+	case int64:
+		return canonicalNumberLiteral(strconv.FormatInt(t, 10))
+	case uint:
+		return canonicalNumberLiteral(strconv.FormatUint(uint64(t), 10))
+	case uint8:
+		return canonicalNumberLiteral(strconv.FormatUint(uint64(t), 10))
+	case uint16:
+		return canonicalNumberLiteral(strconv.FormatUint(uint64(t), 10))
+	case uint32:
+		return canonicalNumberLiteral(strconv.FormatUint(uint64(t), 10))
+	case uint64:
+		return canonicalNumberLiteral(strconv.FormatUint(t, 10))
 	default:
-		return v
+		return v, nil
 	}
 }
 
@@ -198,11 +274,18 @@ type DigestInput struct {
 //
 // Same idempotency key + different digest = IDEMPOTENCY_CONFLICT.
 func ComputeDigest(input DigestInput) (string, error) {
+	// Normalize numbers on every entry path, not just raw-JSON
+	// decoding, so a Go-native int/float64/json.Number digests
+	// identically to the same value arriving as a raw JSON literal.
+	args, err := normalizeNumbers(input.Arguments)
+	if err != nil {
+		return "", fmt.Errorf("failed to canonicalize digest input: %w", err)
+	}
 	canonicalInput := map[string]any{
 		"protocol_version": input.ProtocolVersion,
 		"principal":        input.Principal,
 		"capability":       input.Capability,
-		"arguments":        input.Arguments,
+		"arguments":        args,
 		"grant_id":         input.GrantID,
 		"execution_class":  input.ExecutionClass,
 	}
@@ -256,15 +339,19 @@ func ComputeDigestFromRawWithAuthority(protocolVersion int, principal, capabilit
 	var extra any
 	if err := dec.Decode(&extra); err != io.EOF {
 		if err == nil {
-			return "", fmt.Errorf("failed to parse arguments: trailing data after first JSON value")
+			return "", fmt.Errorf("failed to parse arguments: %w", ErrTrailingJSON)
 		}
 		return "", fmt.Errorf("failed to parse arguments: %w", err)
+	}
+	normalized, err := normalizeNumbers(argsMap)
+	if err != nil {
+		return "", fmt.Errorf("failed to canonicalize arguments: %w", err)
 	}
 	return ComputeDigest(DigestInput{
 		ProtocolVersion:     protocolVersion,
 		Principal:           principal,
 		Capability:          capability,
-		Arguments:           normalizeNumbers(argsMap).(map[string]any),
+		Arguments:           normalized.(map[string]any),
 		GrantID:             grantID,
 		ExecutionClass:      class,
 		AuthorityGeneration: authorityGeneration,

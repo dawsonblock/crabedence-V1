@@ -127,7 +127,7 @@ func TestSQLiteRestartIntegrity(t *testing.T) {
 	if r2.State != StateInFlight {
 		t.Fatalf("k2 state = %s after restart, want IN_FLIGHT", r2.State)
 	}
-	if r2.ProviderStatus != "SUCCEEDED" || string(r2.ProviderResult) != `{"ok":2}` {
+	if r2.ProviderStatus != "SUCCEEDED" || string(r2.ProviderResult) != `{"ok":2e0}` {
 		t.Fatalf("k2 observation lost across restart: status=%q result=%s", r2.ProviderStatus, r2.ProviderResult)
 	}
 }

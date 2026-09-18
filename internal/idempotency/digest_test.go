@@ -257,32 +257,145 @@ func TestCanonicalJSONNumber(t *testing.T) {
 	tests := []struct {
 		in, want string
 	}{
-		{"1", "1"},
-		{"1.0", "1"},
-		{"1.00", "1"},
-		{"1e0", "1"},
-		{"1e+0", "1"},
-		{"1E0", "1"},
-		{"1e2", "100"},
-		{"1.5e3", "1500"},
-		{"1.5e-3", "0.0015"},
-		{"1.50", "1.5"},
-		{"0.010", "0.01"},
+		{"1", "1e0"},
+		{"1.0", "1e0"},
+		{"1.00", "1e0"},
+		{"1e0", "1e0"},
+		{"1e+0", "1e0"},
+		{"1E0", "1e0"},
+		{"1e2", "1e2"},
+		{"1.5e3", "1.5e3"},
+		{"1.5e-3", "1.5e-3"},
+		{"1.50", "1.5e0"},
+		{"0.010", "1e-2"},
 		{"-0", "0"},
 		{"-0.0", "0"},
 		{"0e5", "0"},
-		{"-1.5", "-1.5"},
-		{"-0.001", "-0.001"},
-		{"123456789012345678901234567890", "123456789012345678901234567890"},
-		{"9007199254740993", "9007199254740993"},
-		{"3.14159", "3.14159"},
-		{"1e-2", "0.01"},
-		{"2e+1", "20"},
+		{"-1.5", "-1.5e0"},
+		{"-0.001", "-1e-3"},
+		{"123456789012345678901234567890", "1.2345678901234567890123456789e29"},
+		{"9007199254740993", "9.007199254740993e15"},
+		{"3.14159", "3.14159e0"},
+		{"1e-2", "1e-2"},
+		{"2e+1", "2e1"},
+		{"10", "1e1"},
+		{"100.0", "1e2"},
+		{"0.01", "1e-2"},
+		{"0.0100", "1e-2"},
+		{"12.34", "1.234e1"},
+		{"15e-1", "1.5e0"},
 	}
 	for _, tt := range tests {
-		if got := canonicalJSONNumber(tt.in); got != tt.want {
+		got, err := canonicalJSONNumber(tt.in)
+		if err != nil {
+			t.Errorf("canonicalJSONNumber(%q) error: %v", tt.in, err)
+			continue
+		}
+		if got != tt.want {
 			t.Errorf("canonicalJSONNumber(%q) = %q, want %q", tt.in, got, tt.want)
 		}
+		// Canonical output must be a fixed point.
+		again, err := canonicalJSONNumber(got)
+		if err != nil || again != got {
+			t.Errorf("canonicalJSONNumber(%q) = %q is not idempotent (→ %q, %v)", tt.in, got, again, err)
+		}
+	}
+}
+
+// TestCanonicalJSONNumberHostileExponents pins the P0 repair: exponents
+// are arbitrary precision, never parsed into int64 (where they wrap
+// into collisions), and never expanded into memory. Every case must
+// produce a bounded, deterministic canonical form.
+func TestCanonicalJSONNumberHostileExponents(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		// Zero collapses before the exponent is ever materialized.
+		{"0e999999999999999999999999", "0"},
+		{"0e-999999999999999999999999", "0"},
+		{"-0e999999999999999999999999", "0"},
+		// Beyond int64 — the pre-repair parser wrapped these into
+		// arbitrary small exponents, colliding with real values.
+		{"1e9223372036854775807", "1e9223372036854775807"},
+		{"1e9223372036854775808", "1e9223372036854775808"},
+		{"1e18446744073709551615", "1e18446744073709551615"},
+		{"1e18446744073709551616", "1e18446744073709551616"},
+		{"1e18446744073709551617", "1e18446744073709551617"},
+		{"1e-9223372036854775808", "1e-9223372036854775808"},
+		{"1e-9223372036854775809", "1e-9223372036854775809"},
+		{"1e999999", "1e999999"},
+		{"1e-999999", "1e-999999"},
+		{"1e99999999999999999999999999", "1e99999999999999999999999999"},
+		// Large exponent combined with digit-shift arithmetic.
+		{"2.5e18446744073709551616", "2.5e18446744073709551616"},
+		{"1.5e-3", "1.5e-3"},
+	}
+	for _, tt := range tests {
+		got, err := canonicalJSONNumber(tt.in)
+		if err != nil {
+			t.Errorf("canonicalJSONNumber(%q) error: %v", tt.in, err)
+			continue
+		}
+		if got != tt.want {
+			t.Errorf("canonicalJSONNumber(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+		if len(got) > len(tt.in)+8 {
+			t.Errorf("canonicalJSONNumber(%q) expanded to %d bytes — output must stay proportional to input", tt.in, len(got))
+		}
+	}
+}
+
+// TestCanonicalJSONNumberRejectsInvalid verifies the fail-closed API:
+// malformed literals are deterministic errors, never panics or partial
+// output. json.Decoder only produces valid literals, but constructed
+// json.Number values must still fail safely.
+func TestCanonicalJSONNumberRejectsInvalid(t *testing.T) {
+	invalid := []string{
+		"", "-", "+1", ".", ".5", "1.", "1e", "1e+", "1e-", "e5",
+		"abc", "1.2.3", "--1", "1ee5", "0x10", "NaN", "Inf", "-Inf",
+		"01", "00", "1 ", " 1", "1e1.5",
+	}
+	for _, in := range invalid {
+		if got, err := canonicalJSONNumber(in); err == nil {
+			t.Errorf("canonicalJSONNumber(%q) = %q, want error", in, got)
+		}
+	}
+}
+
+// TestComputeDigestHostileNumberEquivalence pins the P0 gate
+// assertions: equivalent representations digest identically, and
+// exponent-wrapped values do not collide with small numbers.
+func TestComputeDigestHostileNumberEquivalence(t *testing.T) {
+	digest := func(args string) string {
+		d, err := ComputeDigestFromRaw(1, "alice", "cap", []byte(args), "g", "MUTATION")
+		if err != nil {
+			t.Fatalf("ComputeDigestFromRaw(%s): %v", args, err)
+		}
+		return d
+	}
+
+	one := digest(`{"n":1}`)
+	for _, equiv := range []string{`{"n":1.0}`, `{"n":1e0}`, `{"n":1.00}`, `{"n":1e+0}`, `{"n":10e-1}`, `{"n":0.1e1}`} {
+		if got := digest(equiv); got != one {
+			t.Errorf("args %s digest differs from {\"n\":1}", equiv)
+		}
+	}
+
+	// int64/uint64-overflowing exponents must not wrap into digest(1).
+	for _, hostile := range []string{
+		`{"n":1e18446744073709551616}`,
+		`{"n":1e9223372036854775808}`,
+		`{"n":1e-9223372036854775809}`,
+		`{"n":1e999999999999999999999999}`,
+	} {
+		if got := digest(hostile); got == one {
+			t.Errorf("args %s collided with digest({\"n\":1}) — exponent overflow", hostile)
+		}
+	}
+
+	// Values that differ only beyond int64 must remain distinct.
+	if digest(`{"n":1e18446744073709551615}`) == digest(`{"n":1e18446744073709551616}`) {
+		t.Error("1e18446744073709551615 and 1e18446744073709551616 produced identical digests")
 	}
 }
 

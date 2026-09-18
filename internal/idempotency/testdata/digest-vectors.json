@@ -1,5 +1,5 @@
 {
-  "description": "Frozen cross-language conformance corpus for the idempotency request digest ABI. canonical_args is the deterministic re-marshal of raw_args after canonicalJSONNumber normalization (1, 1.0, 1e0 all → \"1\"; arbitrary precision preserved). digest is hex(SHA-256(canonical DigestInput JSON)). Regenerate with -update-digest-vectors only for a deliberate ABI change.",
+  "description": "Frozen cross-language conformance corpus for the idempotency request digest ABI. canonical_args is the deterministic re-marshal of raw_args after canonicalJSONNumber normalization (1, 1.0, 1e0 all → \"1e0\"; normalized scientific form, arbitrary-precision exponent, never expanded). digest is hex(SHA-256(canonical DigestInput JSON)). Regenerate with -update-digest-vectors only for a deliberate ABI change.",
   "vectors": [
     {
       "name": "key-order",
@@ -9,8 +9,8 @@
       "raw_args": "{\"zebra\":1,\"apple\":2,\"mango\":{\"y\":true,\"a\":null}}",
       "grant_id": "grant-1",
       "execution_class": "MUTATION",
-      "canonical_args": "{\"apple\":2,\"mango\":{\"a\":null,\"y\":true},\"zebra\":1}",
-      "digest": "f925b054f8e9226444c31f55c5243ffb0acffcfcbf39178d98297c3ae9474d63"
+      "canonical_args": "{\"apple\":2e0,\"mango\":{\"a\":null,\"y\":true},\"zebra\":1e0}",
+      "digest": "db7804b950d8c3ca67b3816801c5d6f60c18dee41339d958df80398966a17e64"
     },
     {
       "name": "unicode",
@@ -42,8 +42,8 @@
       "raw_args": "{\"a\":1,\"b\":1.0,\"c\":1e0,\"d\":1.00e+0}",
       "grant_id": "grant-1",
       "execution_class": "MUTATION",
-      "canonical_args": "{\"a\":1,\"b\":1,\"c\":1,\"d\":1}",
-      "digest": "ba110310770eb4147104d30df01d593aee91184e3b9b53674bc45c5a66832f1d"
+      "canonical_args": "{\"a\":1e0,\"b\":1e0,\"c\":1e0,\"d\":1e0}",
+      "digest": "2f9ea4d50a1f18d5bd946c376cb52cc810a8d069c8f02e57b64ad1b9f1c488ae"
     },
     {
       "name": "number-decimals-and-exponents",
@@ -53,8 +53,8 @@
       "raw_args": "{\"x\":1.5e3,\"y\":1.5e-3,\"z\":-0,\"w\":0.010,\"v\":2e+1}",
       "grant_id": "grant-1",
       "execution_class": "MUTATION",
-      "canonical_args": "{\"v\":20,\"w\":0.01,\"x\":1500,\"y\":0.0015,\"z\":0}",
-      "digest": "604bffa4ac98a4d3835df5b03cb432032f156bf94f02ffdf4f1e115f63eb0263"
+      "canonical_args": "{\"v\":2e1,\"w\":1e-2,\"x\":1.5e3,\"y\":1.5e-3,\"z\":0}",
+      "digest": "7cf0ed9feffd1f57f0f628d1096e16a096706a5aefe1ed3ff0b8dfad2529c2b8"
     },
     {
       "name": "number-large-integers",
@@ -64,8 +64,8 @@
       "raw_args": "{\"big\":9007199254740993,\"bigger\":18446744073709551616,\"neg\":-9007199254740993}",
       "grant_id": "grant-1",
       "execution_class": "MUTATION",
-      "canonical_args": "{\"big\":9007199254740993,\"bigger\":18446744073709551616,\"neg\":-9007199254740993}",
-      "digest": "8a94253b7e3b990db12a5bc376ff7981386112761c384a095afdb4e557d64b6f"
+      "canonical_args": "{\"big\":9.007199254740993e15,\"bigger\":1.8446744073709551616e19,\"neg\":-9.007199254740993e15}",
+      "digest": "912b114da949788a834c011859355c5cb8307c4082635f0bd80d3f13607c6b02"
     },
     {
       "name": "containers-and-scalars",
@@ -75,8 +75,8 @@
       "raw_args": "{\"arr\":[3,1,2],\"empty_obj\":{},\"empty_arr\":[],\"t\":true,\"f\":false,\"n\":null}",
       "grant_id": "grant-1",
       "execution_class": "MUTATION",
-      "canonical_args": "{\"arr\":[3,1,2],\"empty_arr\":[],\"empty_obj\":{},\"f\":false,\"n\":null,\"t\":true}",
-      "digest": "5ed50212a96b5a384c256cc5810ae305369ad0a6f7b932b2018226242a5e81b0"
+      "canonical_args": "{\"arr\":[3e0,1e0,2e0],\"empty_arr\":[],\"empty_obj\":{},\"f\":false,\"n\":null,\"t\":true}",
+      "digest": "5e34ffa77ea21cc23cf51bfc6d41822acd45658a1f40b0f022c01e7445e9ba45"
     },
     {
       "name": "deep-nesting",
@@ -86,8 +86,8 @@
       "raw_args": "{\"l1\":{\"l2\":{\"l3\":[{\"z\":1.0,\"a\":[null,false,2e0]}]}}}",
       "grant_id": "grant-1",
       "execution_class": "MUTATION",
-      "canonical_args": "{\"l1\":{\"l2\":{\"l3\":[{\"a\":[null,false,2],\"z\":1}]}}}",
-      "digest": "3f603ad8f5c55ffb2a98b8b5b789f12eaab1b6b581607c5bf054fe4116ce2f5f"
+      "canonical_args": "{\"l1\":{\"l2\":{\"l3\":[{\"a\":[null,false,2e0],\"z\":1e0}]}}}",
+      "digest": "a6a5013cfbf9f1f1e5f140f33e8290113f4ef8ecdfde9d68d840340b45b420b9"
     },
     {
       "name": "authority-binding",
@@ -99,8 +99,8 @@
       "execution_class": "CRITICAL",
       "authority_generation": 3,
       "authority_digest": "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
-      "canonical_args": "{\"amount\":100,\"to\":\"bob@example.com\"}",
-      "digest": "745bf7019260dceea2548572905ea7bea954fc564328ba0dfaaae4a088ce1323"
+      "canonical_args": "{\"amount\":1e2,\"to\":\"bob@example.com\"}",
+      "digest": "b5a3909da7bbd9fce34e4681ac493bd93dcc1c02f83936764771d9bad583bc8b"
     }
   ]
 }
