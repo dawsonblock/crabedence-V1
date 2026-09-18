@@ -27,6 +27,7 @@
 - Tests: multi-process PostgreSQL EffectStore torture — 50 independent executor processes on one idempotency key produce exactly one acquire and one finalize; 20 distinct keys all commit; a SIGKILLed lease owner's orphaned IN_FLIGHT record is claimed by exactly one of 10 racing reconciler processes and driven to UNKNOWN.
 - Store: `StoreMetrics` gains `effect_lease_lost_total` (every lease-lost event: fenced transitions, renewals, abandons, observations, expired-claim recoveries) and `reconciliation_suspended_total` — both engines, same names.
 - Tests: migration crash-consistency — an uncommitted migration leaves zero torn state and replays cleanly, and a `schema_migrations` row claiming a version whose DDL is absent fails honestly at first use rather than silently misreading the schema.
+- Store: `ReconciliationBacklog` gauge — pending UNKNOWN count plus oldest `entered_unknown_at` in one query on both engines, first-class surface for the "UNKNOWN accumulation or age" alert; stays readable under a fenced epoch and during recovery mode.
 
 ### Effect Fabric hardening — backend, ABI, adversarial qualification
 

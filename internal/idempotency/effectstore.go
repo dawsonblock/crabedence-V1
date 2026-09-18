@@ -46,6 +46,14 @@ type EffectStore interface {
 	ListUnknown(ctx context.Context) ([]*Record, error)
 	ListExpiredLeases(ctx context.Context) ([]*Record, error)
 	ListStuck(ctx context.Context) ([]*Record, error)
+	// ReconciliationBacklog reports the current UNKNOWN backlog:
+	// pending is the number of records awaiting reconciliation and
+	// oldestEnteredUnknownAt is when the oldest of them entered
+	// UNKNOWN (nil when pending is zero) — the two operands of the
+	// "UNKNOWN accumulation or age" alert the operations spec calls
+	// out. It is a read like the other listers: open to stale-epoch
+	// stores and during cluster recovery mode.
+	ReconciliationBacklog(ctx context.Context) (pending int64, oldestEnteredUnknownAt *time.Time, err error)
 	// ListEffectEvents returns the execution's ordered forensic event
 	// history (sequence-ordered, append-only, read-only).
 	ListEffectEvents(ctx context.Context, executionID string) ([]EffectEvent, error)

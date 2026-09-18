@@ -3254,6 +3254,21 @@ func (s *Store) ListExpiredLeases(ctx context.Context) ([]*Record, error) {
 	return scanRecordsWithReconcile(rows)
 }
 
+// ReconciliationBacklog reports the UNKNOWN backlog aggregate —
+// count plus the oldest entered_unknown_at — in one query, so the
+// accumulation/age alert does not need to fetch every record.
+func (s *Store) ReconciliationBacklog(ctx context.Context) (int64, *time.Time, error) {
+	var pending int64
+	var oldest *time.Time
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*), MIN(entered_unknown_at)
+		 FROM execution_requests WHERE state = 'UNKNOWN'`).Scan(&pending, &oldest)
+	if err != nil {
+		return 0, nil, err
+	}
+	return pending, oldest, nil
+}
+
 // ListStuck returns all records needing attention: UNKNOWN or
 // expired-lease stuck in PREPARED/EXECUTING/IN_FLIGHT.
 func (s *Store) ListStuck(ctx context.Context) ([]*Record, error) {

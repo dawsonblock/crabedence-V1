@@ -189,7 +189,13 @@ any nonzero value means a stale-epoch executor is still running), and
 recovery-mode admission rejections
 (`cluster_recovery_rejections_total` — nonzero means admission was
 correctly refused during post-restore reconciliation, or an operator
-is dispatching into a still-recovering world). High-value alerts are
-on the semantic signals — UNKNOWN accumulation or age, observation
-conflicts, fence rejections, CRITICAL evidence rejections — not raw
-request error rates.
+is dispatching into a still-recovering world).
+
+The highest-value alert — UNKNOWN accumulation or age — is a gauge,
+not a counter: `ReconciliationBacklog` returns the pending count and
+the oldest `entered_unknown_at` in one query on both engines, and
+stays readable under a fenced epoch and during recovery mode so a
+stale executor can still see what it is fenced out of. High-value
+alerts are on these semantic signals — backlog depth or age,
+observation conflicts, fence rejections, CRITICAL evidence
+rejections — not raw request error rates.

@@ -728,5 +728,79 @@ func TestStoreConformanceClusterEpochFencing(t *testing.T) {
 		if _, err := s.Lookup(ctx, inFlight.ExecutionID); err != nil {
 			t.Fatalf("lookup after advance: %v", err)
 		}
+		if _, _, err := s.ReconciliationBacklog(ctx); err != nil {
+			t.Fatalf("backlog read after advance: %v", err)
+		}
+	})
+}
+
+// TestStoreConformanceReconciliationBacklog verifies the UNKNOWN
+// backlog gauge — pending count plus oldest entered_unknown_at —
+// tracks records entering and leaving UNKNOWN identically on both
+// engines: accumulation keeps the oldest, resolution drains it.
+func TestStoreConformanceReconciliationBacklog(t *testing.T) {
+	eachEffectStore(t, func(t *testing.T, s EffectStore) {
+		ctx := context.Background()
+
+		pending, oldest, err := s.ReconciliationBacklog(ctx)
+		if err != nil || pending != 0 || oldest != nil {
+			t.Fatalf("empty backlog: pending=%d oldest=%v err=%v", pending, oldest, err)
+		}
+
+		rec, _, _, _ := acquireFor(t, s, ctx, "k1", "alice", "cap.mut", "MUTATION", 5*time.Minute)
+		cur, _ := s.Lookup(ctx, rec.ExecutionID)
+		obs := ProviderObservation{ProviderID: "prov", ProviderRunID: "run-1", ProviderStatus: "UNKNOWN", Result: json.RawMessage(`{"amb":true}`)}
+		if err := s.EnterRecoveryWithObservation(ctx, rec.ExecutionID, StateInFlight, cur.Version, obs); err != nil {
+			t.Fatalf("enter recovery: %v", err)
+		}
+
+		pending, oldest, err = s.ReconciliationBacklog(ctx)
+		if err != nil {
+			t.Fatalf("backlog: %v", err)
+		}
+		stored, _ := s.Lookup(ctx, rec.ExecutionID)
+		if pending != 1 || oldest == nil || stored.EnteredUnknownAt == nil ||
+			!oldest.Equal(*stored.EnteredUnknownAt) {
+			t.Fatalf("backlog after UNKNOWN: pending=%d oldest=%v record=%v",
+				pending, oldest, stored.EnteredUnknownAt)
+		}
+
+		// A second UNKNOWN accumulates — the oldest stays the first
+		// record's entry time, not the latest.
+		rec2, _, _, _ := acquireFor(t, s, ctx, "k2", "alice", "cap.mut", "MUTATION", 5*time.Minute)
+		cur2, _ := s.Lookup(ctx, rec2.ExecutionID)
+		if err := s.EnterRecoveryWithObservation(ctx, rec2.ExecutionID, StateInFlight, cur2.Version, obs); err != nil {
+			t.Fatalf("enter recovery 2: %v", err)
+		}
+		pending, oldest, err = s.ReconciliationBacklog(ctx)
+		if err != nil || pending != 2 {
+			t.Fatalf("backlog 2: pending=%d err=%v", pending, err)
+		}
+		if oldest == nil || !oldest.Equal(*stored.EnteredUnknownAt) {
+			t.Fatalf("oldest after second UNKNOWN = %v, want first %v", oldest, stored.EnteredUnknownAt)
+		}
+
+		// Resolution drains the backlog to zero.
+		claimed, err := s.ClaimUnknownBatch(ctx, "w1", 10, time.Minute)
+		if err != nil || len(claimed) != 2 {
+			t.Fatalf("claim: %v n=%d", err, len(claimed))
+		}
+		for _, c := range claimed {
+			res := RecoveryResult{
+				Decision:       RecoveryCommitted,
+				EvidenceDigest: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+				ReceiptVersion: 3,
+				ProviderID:     "prov",
+				ProviderRunID:  "run-1",
+				Result:         json.RawMessage(`{"completed":true}`),
+			}
+			if err := s.ResolveRecovery(ctx, c.ExecutionID, c.Version, res); err != nil {
+				t.Fatalf("resolve %s: %v", c.ExecutionID, err)
+			}
+		}
+		pending, oldest, err = s.ReconciliationBacklog(ctx)
+		if err != nil || pending != 0 || oldest != nil {
+			t.Fatalf("drained backlog: pending=%d oldest=%v err=%v", pending, oldest, err)
+		}
 	})
 }
