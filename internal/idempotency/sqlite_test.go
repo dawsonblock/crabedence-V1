@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -14,7 +15,7 @@ import (
 // no CRABBOX_TEST_DATABASE_URL — the SQLite suite always runs.
 func openSQLiteStore(t *testing.T) *SQLiteStore {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "crabedence-test.db")
+	path := filepath.Join(t.TempDir(), "db", "crabedence-test.db")
 	db, err := OpenSQLiteDB(path)
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
@@ -336,5 +337,209 @@ func TestOpenSQLiteDBRejectsDSNMetachars(t *testing.T) {
 		if _, err := OpenSQLiteDB(filepath.Join(dir, name)); err == nil {
 			t.Fatalf("path %q: want rejection, got nil", name)
 		}
+	}
+}
+
+// The durable ledger carries execution authority and forensic history —
+// it must never be group/other-accessible. OpenSQLiteDB creates missing
+// directories at 0700, rejects group/other-accessible existing
+// directories and symlinked database paths, and tightens the database
+// file itself to 0600.
+func TestOpenSQLiteDBPermissionHardening(t *testing.T) {
+	base := t.TempDir()
+
+	// Missing directory is created at 0700; the DB file lands at 0600.
+	dbPath := filepath.Join(base, "ledger", "e.db")
+	db, err := OpenSQLiteDB(dbPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	dirInfo, err := os.Stat(filepath.Dir(dbPath))
+	if err != nil {
+		t.Fatalf("stat dir: %v", err)
+	}
+	if perm := dirInfo.Mode().Perm(); perm != 0o700 {
+		t.Errorf("created dir mode = %04o, want 0700", perm)
+	}
+	fileInfo, err := os.Lstat(dbPath)
+	if err != nil {
+		t.Fatalf("stat db: %v", err)
+	}
+	if perm := fileInfo.Mode().Perm(); perm != 0o600 {
+		t.Errorf("db file mode = %04o, want 0600", perm)
+	}
+	db.Close()
+
+	// A group/other-accessible existing directory is rejected.
+	loose := filepath.Join(base, "loose")
+	if err := os.MkdirAll(loose, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenSQLiteDB(filepath.Join(loose, "e.db")); err == nil {
+		t.Error("expected rejection of group/other-accessible directory")
+	}
+
+	// A symlinked database path is rejected — the ledger must never be
+	// written through a link to an unexpected target.
+	target := filepath.Join(base, "ledger", "real.db")
+	link := filepath.Join(base, "ledger", "link.db")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	if _, err := OpenSQLiteDB(link); err == nil {
+		t.Error("expected rejection of symlinked database path")
+	}
+
+	// A pre-existing loose-permission DB file is tightened to 0600.
+	preexisting := filepath.Join(base, "ledger", "old.db")
+	if err := os.WriteFile(preexisting, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	db2, err := OpenSQLiteDB(preexisting)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer db2.Close()
+	fi, err := os.Lstat(preexisting)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o600 {
+		t.Errorf("pre-existing db mode = %04o, want 0600 after tighten", perm)
+	}
+}
+
+// TestSQLiteMigrationForwardCompat simulates opening a pre-v6 embedded
+// database: a ledger shaped like the original v1 schema (no
+// provider_result, no authority columns) with schema_migrations
+// recorded through v5. NewSQLiteStore must apply migrations 6–7
+// atomically — BEGIN IMMEDIATE makes a crash mid-migration roll back
+// rather than half-apply — and the result must serve AcquireWithAuthority.
+func TestSQLiteMigrationForwardCompat(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "db", "legacy.db")
+	db, err := OpenSQLiteDB(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	// Build the pre-v6 table shape and record migrations 1–5.
+	if _, err := db.ExecContext(ctx, `
+		CREATE TABLE execution_requests (
+			execution_id TEXT PRIMARY KEY,
+			idempotency_key TEXT NOT NULL,
+			principal_id TEXT NOT NULL,
+			capability_id TEXT NOT NULL,
+			request_digest TEXT NOT NULL,
+			grant_id TEXT,
+			execution_class TEXT NOT NULL,
+			state TEXT NOT NULL,
+			result TEXT,
+			evidence_digest TEXT,
+			receipt_version INTEGER NOT NULL DEFAULT 0,
+			lease_owner TEXT,
+			lease_token TEXT,
+			lease_started_at INTEGER,
+			lease_expires_at INTEGER,
+			lease_generation INTEGER NOT NULL DEFAULT 1,
+			provider_id TEXT,
+			provider_run_id TEXT,
+			provider_status TEXT,
+			provider_result_digest TEXT,
+			provider_receipt_version INTEGER NOT NULL DEFAULT 0,
+			provider_observed_at INTEGER,
+			terminal_receipt_digest TEXT,
+			evidence_receipt TEXT,
+			recovery_locator TEXT,
+			attempt INTEGER NOT NULL DEFAULT 0,
+			version INTEGER NOT NULL DEFAULT 1,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			reconcile_owner TEXT,
+			reconcile_lease_expires_at INTEGER,
+			reconcile_attempt INTEGER NOT NULL DEFAULT 0,
+			next_reconcile_at INTEGER,
+			last_reconcile_error TEXT,
+			entered_unknown_at INTEGER,
+			UNIQUE(principal_id, capability_id, idempotency_key)
+		)
+	`); err != nil {
+		t.Fatalf("create legacy table: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		CREATE TABLE schema_migrations (
+			version INTEGER PRIMARY KEY,
+			name TEXT NOT NULL,
+			applied_at INTEGER NOT NULL
+		)
+	`); err != nil {
+		t.Fatalf("create schema_migrations: %v", err)
+	}
+	for v := 1; v <= 5; v++ {
+		if _, err := db.ExecContext(ctx,
+			`INSERT INTO schema_migrations (version, name, applied_at) VALUES (?1, 'legacy', 1)`, v); err != nil {
+			t.Fatalf("seed migration %d: %v", v, err)
+		}
+	}
+
+	store, err := NewSQLiteStore(db)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore on legacy schema: %v", err)
+	}
+	v, err := store.SchemaVersion(ctx)
+	if err != nil {
+		t.Fatalf("SchemaVersion: %v", err)
+	}
+	if v != RequiredSchemaVersion {
+		t.Fatalf("schema version = %d, want %d", v, RequiredSchemaVersion)
+	}
+
+	// The migrated store must serve the v7 contract: authority
+	// snapshot columns written at Acquire.
+	acq, err := store.AcquireWithAuthority(ctx, "k1", "alice", "cap.mut", "d1",
+		AuthorityBinding{Ref: "g1", Generation: 3, Digest: "deadbeef"},
+		"MUTATION", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("AcquireWithAuthority: %v", err)
+	}
+	if !acq.Acquired() {
+		t.Fatalf("expected acquisition, got %s", acq.Kind)
+	}
+	rec, err := store.LookupByKey(ctx, "alice", "cap.mut", "k1")
+	if err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+	if rec.AuthorityGeneration != 3 || rec.AuthorityDigest != "deadbeef" {
+		t.Errorf("authority snapshot not persisted: gen=%d digest=%q",
+			rec.AuthorityGeneration, rec.AuthorityDigest)
+	}
+}
+
+// TestSQLiteMigrationIdempotent verifies re-opening a migrated
+// database records no new versions and fails nothing — migrations are
+// idempotent, never half-applied.
+func TestSQLiteMigrationIdempotent(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "db", "e.db")
+	db, err := OpenSQLiteDB(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := NewSQLiteStore(db); err != nil {
+		t.Fatalf("first NewSQLiteStore: %v", err)
+	}
+	if _, err := NewSQLiteStore(db); err != nil {
+		t.Fatalf("second NewSQLiteStore: %v", err)
+	}
+	var count int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM schema_migrations`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != RequiredSchemaVersion {
+		t.Errorf("expected %d recorded migrations, got %d", RequiredSchemaVersion, count)
 	}
 }

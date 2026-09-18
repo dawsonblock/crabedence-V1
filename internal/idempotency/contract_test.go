@@ -467,6 +467,32 @@ func TestLegalTransitionMatrix(t *testing.T) {
 	}
 }
 
+// TestLegalTransitionMatrixExhaustive enumerates EVERY ordered pair of
+// states — no hand-picked subset. The legal edge set is the frozen
+// contract graph; every other pair must fail closed. A future change
+// that adds an edge (e.g. UNKNOWN → PREPARED for "retry") breaks this
+// test, which is the point.
+func TestLegalTransitionMatrixExhaustive(t *testing.T) {
+	states := []State{
+		StatePrepared, StateExecuting, StateInFlight,
+		StateUnknown, StateCommitted, StateFailed, StateDenied,
+	}
+	legal := map[State]map[State]bool{
+		StatePrepared:  {StateExecuting: true},
+		StateExecuting: {StateInFlight: true, StatePrepared: true},
+		StateInFlight:  {StateCommitted: true, StateFailed: true, StateUnknown: true},
+		StateUnknown:   {StateCommitted: true, StateFailed: true},
+	}
+	for _, from := range states {
+		for _, to := range states {
+			want := legal[from][to]
+			if got := isLegalTransition(from, to); got != want {
+				t.Errorf("isLegalTransition(%s, %s) = %v, want %v", from, to, got, want)
+			}
+		}
+	}
+}
+
 // TestGenerateExecutionID verifies that application-side UUID generation
 // produces valid UUID v4 format strings.
 func TestGenerateExecutionID(t *testing.T) {

@@ -14,6 +14,11 @@ import (
 type EffectStore interface {
 	// Acquisition and lease-fenced lifecycle.
 	Acquire(ctx context.Context, key, principal, capability, digest, grantID, class string, leaseDuration time.Duration) (*AcquireResult, error)
+	// AcquireWithAuthority is Acquire plus the immutable authority
+	// snapshot — the generation + digest of the grant material that
+	// admitted the request are persisted on the record so the ledger
+	// can prove which authority admitted each execution.
+	AcquireWithAuthority(ctx context.Context, key, principal, capability, digest string, authority AuthorityBinding, class string, leaseDuration time.Duration) (*AcquireResult, error)
 	BeginExecution(ctx context.Context, executionID, leaseToken string, leaseGeneration int) error
 	MarkInFlight(ctx context.Context, executionID, leaseToken string, leaseGeneration int, providerID string, recoveryLocator json.RawMessage) error
 	RenewLease(ctx context.Context, executionID, leaseToken string, leaseGeneration int, duration time.Duration) error

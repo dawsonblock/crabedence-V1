@@ -99,7 +99,7 @@ func (h *GitHubIssueHandler) PrepareRecovery(_ context.Context, in idempotency.R
 		Version:        1,
 		ProviderID:     "github",
 		Strategy:       "external-token",
-		ExternalToken:  "gh-issue-" + in.ExecutionID,
+		ExternalToken:  idempotency.ProviderIdempotencyKey(in.ExecutionID, in.RequestDigest, "github"),
 		ResourceRef:    "repos/" + args.Repo + "/issues",
 		RequestDigest:  in.RequestDigest,
 		ExecutionID:    in.ExecutionID,

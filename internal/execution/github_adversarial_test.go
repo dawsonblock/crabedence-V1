@@ -251,6 +251,16 @@ func (definitiveFailHandler) Execute(_ context.Context, _ Request, _ capability.
 	}
 }
 
+// ProviderCapabilities declares full evidence support so the CRITICAL
+// admission gate passes — these tests exercise what happens AFTER a
+// capable provider returns an unproven failure claim.
+func (definitiveFailHandler) ProviderCapabilities(string) ProviderCapabilities {
+	return ProviderCapabilities{
+		SupportsCompletionProof:   true,
+		SupportsNonexecutionProof: true,
+	}
+}
+
 // invokedHandler records whether Execute was called.
 type invokedHandler struct {
 	called atomic.Bool

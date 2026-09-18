@@ -301,6 +301,71 @@ func TestStoreConformanceObservationMonotonic(t *testing.T) {
 	})
 }
 
+// TestStoreConformanceObservationResultPreserved covers the forensic
+// invariant: the provider's original result bytes are durably stored
+// in provider_result at observation time and are NEVER overwritten by
+// reconciliation. `result` carries the canonical terminal result —
+// which a resolver legitimately replaces — while provider_result
+// preserves what the provider actually said.
+func TestStoreConformanceObservationResultPreserved(t *testing.T) {
+	eachEffectStore(t, func(t *testing.T, s EffectStore) {
+		ctx := context.Background()
+		rec, token, gen, _ := acquireFor(t, s, ctx, "k1", "alice", "cap.mut", "MUTATION", 5*time.Minute)
+
+		providerBytes := json.RawMessage(`{"amb":true,"provider":"raw"}`)
+		obs := ProviderObservation{
+			ProviderID: "prov", ProviderRunID: "run-1",
+			ProviderStatus: "SUCCEEDED", Result: providerBytes,
+		}
+		if err := s.RecordProviderObservation(ctx, rec.ExecutionID, token, gen, obs); err != nil {
+			t.Fatalf("observe: %v", err)
+		}
+		cur, err := s.Lookup(ctx, rec.ExecutionID)
+		if err != nil {
+			t.Fatalf("lookup: %v", err)
+		}
+		if string(cur.ProviderResult) != string(providerBytes) {
+			t.Fatalf("provider_result = %s, want observed bytes %s", cur.ProviderResult, providerBytes)
+		}
+		// A contradictory provider_result is a monotonic conflict.
+		bad := ProviderObservation{ProviderID: "prov", ProviderRunID: "run-1",
+			ProviderStatus: "SUCCEEDED", Result: json.RawMessage(`{"amb":false}`)}
+		if err := s.RecordProviderObservation(ctx, rec.ExecutionID, token, gen, bad); !errors.Is(err, ProviderObservationConflict) {
+			t.Fatalf("conflicting provider_result: want ProviderObservationConflict, got %v", err)
+		}
+
+		// Enter recovery carrying the same observation, then resolve
+		// with a DIFFERENT canonical result — provider_result must
+		// survive while result becomes the resolver's output.
+		if err := s.EnterRecoveryWithObservation(ctx, rec.ExecutionID, StateInFlight, cur.Version, obs); err != nil {
+			t.Fatalf("enter recovery: %v", err)
+		}
+		cur, _ = s.Lookup(ctx, rec.ExecutionID)
+		res := RecoveryResult{
+			Decision:       RecoveryCommitted,
+			EvidenceDigest: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+			ReceiptVersion: 3,
+			ProviderID:     "prov",
+			ProviderRunID:  "run-1",
+			Result:         json.RawMessage(`{"resolved":true}`),
+		}
+		if err := s.ResolveRecovery(ctx, rec.ExecutionID, cur.Version, res); err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		final, _ := s.Lookup(ctx, rec.ExecutionID)
+		if final.State != StateCommitted {
+			t.Fatalf("state = %s, want COMMITTED", final.State)
+		}
+		if string(final.ProviderResult) != string(providerBytes) {
+			t.Fatalf("provider_result overwritten by resolution: got %s, want %s",
+				final.ProviderResult, providerBytes)
+		}
+		if string(final.Result) != `{"resolved":true}` {
+			t.Fatalf("canonical result = %s, want resolver output", final.Result)
+		}
+	})
+}
+
 // TestStoreConformanceReconcile covers the UNKNOWN lifecycle: claim,
 // single ownership, renewal, resolution with proof, and the
 // RecoveryRetryable rejection.

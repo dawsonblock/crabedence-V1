@@ -45,8 +45,15 @@ func TestLiveAuthorityGrantLookup(t *testing.T) {
 
 	defer db.ExecContext(ctx, `DELETE FROM authority_grants WHERE grant_id = $1`, grantID)
 
-	if err := store.IssueGrant(ctx, grantID, principal, capabilities, expiresAt); err != nil {
+	issued, err := store.IssueGrant(ctx, grantID, principal, capabilities, expiresAt)
+	if err != nil {
 		t.Fatalf("failed to issue grant: %v", err)
+	}
+	if issued.Generation != 1 {
+		t.Errorf("expected first issue to be generation 1, got %d", issued.Generation)
+	}
+	if issued.Digest == "" {
+		t.Error("expected issued grant to carry a grant digest")
 	}
 
 	grant, err := store.Resolve(ctx, grantID, principal)
@@ -64,6 +71,10 @@ func TestLiveAuthorityGrantLookup(t *testing.T) {
 	}
 	if len(grant.Capabilities) != 1 || grant.Capabilities[0] != "test.counter.increment" {
 		t.Errorf("expected capabilities [test.counter.increment], got %v", grant.Capabilities)
+	}
+	if grant.Generation != 1 || grant.Digest != issued.Digest {
+		t.Errorf("expected resolved grant to be the issued snapshot (gen=%d digest=%s), got gen=%d digest=%s",
+			1, issued.Digest, grant.Generation, grant.Digest)
 	}
 }
 
@@ -95,7 +106,7 @@ func TestLiveAuthorityPrincipalMismatch(t *testing.T) {
 
 	defer db.ExecContext(ctx, `DELETE FROM authority_grants WHERE grant_id = $1`, grantID)
 
-	if err := store.IssueGrant(ctx, grantID, principal, capabilities, expiresAt); err != nil {
+	if _, err := store.IssueGrant(ctx, grantID, principal, capabilities, expiresAt); err != nil {
 		t.Fatalf("failed to issue grant: %v", err)
 	}
 
@@ -135,7 +146,7 @@ func TestLiveAuthorityCapabilityMismatch(t *testing.T) {
 
 	defer db.ExecContext(ctx, `DELETE FROM authority_grants WHERE grant_id = $1`, grantID)
 
-	if err := store.IssueGrant(ctx, grantID, principal, capabilities, expiresAt); err != nil {
+	if _, err := store.IssueGrant(ctx, grantID, principal, capabilities, expiresAt); err != nil {
 		t.Fatalf("failed to issue grant: %v", err)
 	}
 
@@ -155,7 +166,9 @@ func TestLiveAuthorityCapabilityMismatch(t *testing.T) {
 	}
 }
 
-// TestLiveAuthorityExpiry tests that an expired grant is not valid.
+// TestLiveAuthorityExpiry tests that an expired grant is not resolved:
+// expiry is evaluated against the database clock in Resolve, so an
+// already-expired grant is invisible to admission.
 func TestLiveAuthorityExpiry(t *testing.T) {
 	dbURL := os.Getenv("CRABBOX_TEST_DATABASE_URL")
 	if dbURL == "" {
@@ -181,7 +194,7 @@ func TestLiveAuthorityExpiry(t *testing.T) {
 
 	defer db.ExecContext(ctx, `DELETE FROM authority_grants WHERE grant_id = $1`, grantID)
 
-	if err := store.IssueGrant(ctx, grantID, principal, capabilities, expiresAt); err != nil {
+	if _, err := store.IssueGrant(ctx, grantID, principal, capabilities, expiresAt); err != nil {
 		t.Fatalf("failed to issue grant: %v", err)
 	}
 
@@ -189,12 +202,8 @@ func TestLiveAuthorityExpiry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve failed: %v", err)
 	}
-	if grant == nil {
-		t.Fatal("expected grant to be found (not revoked, just expired)")
-	}
-
-	if grant.IsValid("test.counter.increment", time.Now()) {
-		t.Error("expected expired grant to be INVALID")
+	if grant != nil {
+		t.Error("expected nil grant — database-time expiry filters it at Resolve")
 	}
 }
 
@@ -224,7 +233,7 @@ func TestLiveAuthorityRevocation(t *testing.T) {
 
 	defer db.ExecContext(ctx, `DELETE FROM authority_grants WHERE grant_id = $1`, grantID)
 
-	if err := store.IssueGrant(ctx, grantID, principal, capabilities, expiresAt); err != nil {
+	if _, err := store.IssueGrant(ctx, grantID, principal, capabilities, expiresAt); err != nil {
 		t.Fatalf("failed to issue grant: %v", err)
 	}
 

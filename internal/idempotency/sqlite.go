@@ -25,6 +25,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -58,12 +60,22 @@ func sqliteTime(ms int64) time.Time {
 // IMMEDIATE for every transaction so read-then-write sequences cannot
 // fail with SQLITE_BUSY on upgrade. All per-connection pragmas are
 // applied via DSN parameters so pooled connections behave identically.
+//
+// The ledger carries execution authority and forensic history, so the
+// path is hardened before SQLite touches it: the directory must be
+// owner-only (0700, created that way if missing), the database file
+// must be a regular file (never a symlink), and the DB/WAL/SHM files
+// are tightened to 0600. Unsafe locations are rejected rather than
+// silently hosting the execution ledger under weak permissions.
 func OpenSQLiteDB(path string) (*sql.DB, error) {
 	// The DSN carries the durability pragmas as query parameters — a
 	// path containing '?' or '#' would let the filename terminate the
 	// path early or inject parameters (e.g. weakening synchronous).
 	if strings.ContainsAny(path, "?#") {
 		return nil, fmt.Errorf("sqlite path must not contain '?' or '#': %q", path)
+	}
+	if err := secureSQLitePath(path); err != nil {
+		return nil, err
 	}
 	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)"+
 		"&_pragma=synchronous(FULL)&_pragma=foreign_keys(ON)"+
@@ -73,7 +85,83 @@ func OpenSQLiteDB(path string) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Ping forces the first connection — running the journal_mode(WAL)
+	// pragma — which creates the file so permissions can be enforced
+	// before the store accepts work.
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to open sqlite ledger %q: %w", path, err)
+	}
+	if err := secureSQLiteFiles(path); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return db, nil
+}
+
+// secureSQLitePath validates the ledger location before SQLite creates
+// anything: the parent directory must exist or be created at 0700, an
+// existing directory must not grant group/other access, and an existing
+// database file must be a regular file — never a symlink pointing the
+// ledger at an unexpected target.
+func secureSQLitePath(path string) error {
+	dir := filepath.Dir(path)
+	info, err := os.Stat(dir)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("failed to stat sqlite directory %q: %w", dir, err)
+		}
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return fmt.Errorf("failed to create sqlite directory %q: %w", dir, err)
+		}
+	} else {
+		if !info.IsDir() {
+			return fmt.Errorf("sqlite path parent is not a directory: %q", dir)
+		}
+		if perm := info.Mode().Perm(); perm&0o077 != 0 {
+			return fmt.Errorf("sqlite directory %q is accessible by group/other (mode %04o): the durable ledger must live under 0700", dir, perm)
+		}
+	}
+
+	fi, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to stat sqlite path %q: %w", path, err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("sqlite path %q is a symlink — refusing to write the durable ledger through a link", path)
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("sqlite path %q is not a regular file", path)
+	}
+	return nil
+}
+
+// secureSQLiteFiles tightens the database file and any WAL/SHM siblings
+// to 0600. SQLite creates files at umask-derived permissions (typically
+// 0644); the durable ledger must never be group/other-readable. WAL/SHM
+// files created later inherit the main file's permissions.
+func secureSQLiteFiles(path string) error {
+	for _, p := range []string{path, path + "-wal", path + "-shm"} {
+		fi, err := os.Lstat(p)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return fmt.Errorf("failed to stat %q: %w", p, err)
+		}
+		if fi.Mode()&os.ModeSymlink != 0 || !fi.Mode().IsRegular() {
+			return fmt.Errorf("sqlite ledger file %q is not a regular file", p)
+		}
+		if fi.Mode().Perm() != 0o600 {
+			if err := os.Chmod(p, 0o600); err != nil {
+				return fmt.Errorf("failed to tighten permissions on %q: %w", p, err)
+			}
+		}
+	}
+	return nil
 }
 
 // SQLiteStore is the embedded single-host implementation of
@@ -87,6 +175,7 @@ type SQLiteStore struct {
 	trustedSigners  map[string]bool
 	verifier        EvidenceVerifier
 	locatorRedactor func(json.RawMessage) (json.RawMessage, error)
+	metrics         StoreMetrics
 }
 
 // SetLocatorRedactor installs the locator rewrite hook — see
@@ -164,6 +253,8 @@ var sqliteSchemaMigrations = []sqliteSchemaMigration{
 	{3, "provider_observation_columns_folded_into_v1", nil},
 	{4, "entered_unknown_at_folded_into_v1", nil},
 	{5, "concurrent_index_repair_not_applicable", nil},
+	{6, "provider_result_column", sqliteMigrationProviderResultColumn},
+	{7, "authority_snapshot_columns_and_audit_indexes", sqliteMigrationAuthoritySnapshot},
 }
 
 func (s *SQLiteStore) ensureSchema(ctx context.Context) error {
@@ -269,6 +360,7 @@ func sqliteMigrationBaseTable(ctx context.Context, tx *sql.Tx) error {
 			provider_id TEXT,
 			provider_run_id TEXT,
 			provider_status TEXT,
+			provider_result TEXT,
 			provider_result_digest TEXT,
 			provider_receipt_version INTEGER NOT NULL DEFAULT 0,
 			provider_observed_at INTEGER,
@@ -285,9 +377,40 @@ func sqliteMigrationBaseTable(ctx context.Context, tx *sql.Tx) error {
 			next_reconcile_at INTEGER,
 			last_reconcile_error TEXT,
 			entered_unknown_at INTEGER,
+			authority_generation INTEGER,
+			authority_digest TEXT,
 			UNIQUE(principal_id, capability_id, idempotency_key)
 		)
 	`)
+	return err
+}
+
+// sqliteMigrationProviderResultColumn adds the immutable provider_result
+// column to existing embedded databases — SQLite has no
+// ADD COLUMN IF NOT EXISTS, so presence is checked via PRAGMA
+// table_info first. Fresh v1 schemas already carry the column.
+func sqliteMigrationProviderResultColumn(ctx context.Context, tx *sql.Tx) error {
+	rows, err := tx.QueryContext(ctx, `PRAGMA table_info(execution_requests)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == "provider_result" {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `ALTER TABLE execution_requests ADD COLUMN provider_result TEXT`)
 	return err
 }
 
@@ -308,11 +431,72 @@ func sqliteMigrationHotPathIndexes(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
+// sqliteMigrationAuthoritySnapshot mirrors the PG migration 7: the
+// immutable authority-snapshot columns plus the forensic audit indexes
+// on provider_run_id and grant_id. Fresh v1 schemas already carry the
+// columns; existing databases get them via PRAGMA-checked ALTERs.
+func sqliteMigrationAuthoritySnapshot(ctx context.Context, tx *sql.Tx) error {
+	existing := map[string]bool{}
+	rows, err := tx.QueryContext(ctx, `PRAGMA table_info(execution_requests)`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		existing[name] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	columns := []struct{ name, def string }{
+		{"authority_generation", "INTEGER"},
+		{"authority_digest", "TEXT"},
+	}
+	for _, c := range columns {
+		if existing[c.name] {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx,
+			`ALTER TABLE execution_requests ADD COLUMN `+c.name+` `+c.def); err != nil {
+			return fmt.Errorf("column %s: %w", c.name, err)
+		}
+	}
+	for _, ddl := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_exec_provider_run
+		 ON execution_requests (provider_id, provider_run_id)
+		 WHERE provider_run_id IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_exec_grant
+		 ON execution_requests (grant_id)
+		 WHERE grant_id IS NOT NULL`,
+	} {
+		if _, err := tx.ExecContext(ctx, ddl); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // ─── Acquire ─────────────────────────────────────────────────────────
 
 // Acquire attempts to acquire a lease for an execution. Identical
 // reclaim matrix to the PostgreSQL store — see Store.Acquire.
 func (s *SQLiteStore) Acquire(ctx context.Context, key, principal, capability, digest, grantID, class string, leaseDuration time.Duration) (*AcquireResult, error) {
+	return s.AcquireWithAuthority(ctx, key, principal, capability, digest,
+		AuthorityBinding{Ref: grantID}, class, leaseDuration)
+}
+
+// AcquireWithAuthority is Acquire plus the immutable authority
+// snapshot — see Store.AcquireWithAuthority.
+func (s *SQLiteStore) AcquireWithAuthority(ctx context.Context, key, principal, capability, digest string, authority AuthorityBinding, class string, leaseDuration time.Duration) (*AcquireResult, error) {
 	if err := s.leaseCfg.Validate(leaseDuration); err != nil {
 		return nil, err
 	}
@@ -332,20 +516,21 @@ func (s *SQLiteStore) Acquire(ctx context.Context, key, principal, capability, d
 	err = s.db.QueryRowContext(ctx, `
 		INSERT INTO execution_requests
 			(execution_id, idempotency_key, principal_id, capability_id, request_digest,
-			 grant_id, execution_class, state,
+			 grant_id, authority_generation, authority_digest, execution_class, state,
 			 lease_owner, lease_token, lease_started_at, lease_expires_at,
 			 lease_generation, attempt, version, created_at, updated_at)
-		VALUES (?10, ?1, ?2, ?3, ?4, ?5, ?6, 'PREPARED',
+		VALUES (?10, ?1, ?2, ?3, ?4, ?5, ?11, ?12, ?6, 'PREPARED',
 				?7, ?8, `+sqliteNow+`, `+sqliteNow+` + ?9,
 				1, 0, 1, `+sqliteNow+`, `+sqliteNow+`)
 		ON CONFLICT (principal_id, capability_id, idempotency_key) DO NOTHING
 		RETURNING execution_id, created_at
-	`, key, principal, capability, digest, nullableString(grantID), class,
+	`, key, principal, capability, digest, nullableString(authority.Ref), class,
 		leaseOwner, leaseToken, msDuration(leaseDuration),
-		genID,
+		genID, authority.Generation, nullableString(authority.Digest),
 	).Scan(&executionID, &createdAtMs)
 
 	if err == nil {
+		s.metrics.acquires.Add(1)
 		createdAt := sqliteTime(createdAtMs)
 		return &AcquireResult{
 			Kind:       LeaseAcquired,
@@ -353,21 +538,23 @@ func (s *SQLiteStore) Acquire(ctx context.Context, key, principal, capability, d
 			LeaseToken: leaseToken,
 			Generation: 1,
 			Record: &Record{
-				ExecutionID:     executionID,
-				IdempotencyKey:  key,
-				PrincipalID:     principal,
-				CapabilityID:    capability,
-				RequestDigest:   digest,
-				GrantID:         grantID,
-				ExecutionClass:  class,
-				State:           StatePrepared,
-				LeaseOwner:      leaseOwner,
-				LeaseToken:      leaseToken,
-				LeaseGeneration: 1,
-				Attempt:         0,
-				Version:         1,
-				CreatedAt:       createdAt,
-				UpdatedAt:       createdAt,
+				ExecutionID:         executionID,
+				IdempotencyKey:      key,
+				PrincipalID:         principal,
+				CapabilityID:        capability,
+				RequestDigest:       digest,
+				GrantID:             authority.Ref,
+				AuthorityGeneration: authority.Generation,
+				AuthorityDigest:     authority.Digest,
+				ExecutionClass:      class,
+				State:               StatePrepared,
+				LeaseOwner:          leaseOwner,
+				LeaseToken:          leaseToken,
+				LeaseGeneration:     1,
+				Attempt:             0,
+				Version:             1,
+				CreatedAt:           createdAt,
+				UpdatedAt:           createdAt,
 			},
 		}, nil
 	}
@@ -397,6 +584,7 @@ func (s *SQLiteStore) Acquire(ctx context.Context, key, principal, capability, d
 			return nil, err
 		}
 		if reclaimed {
+			s.metrics.acquires.Add(1)
 			return &AcquireResult{
 				Kind:       LeaseReclaimed,
 				State:      StatePrepared,
@@ -564,6 +752,7 @@ func (s *SQLiteStore) markInFlightExpiredAsUnknown(ctx context.Context, rec *Rec
 	}
 	rec.State = StateUnknown
 	rec.Version++
+	s.metrics.unknownEntered.Add(1)
 	return true, nil
 }
 
@@ -571,7 +760,12 @@ func (s *SQLiteStore) markInFlightExpiredAsUnknown(ctx context.Context, rec *Rec
 
 // BeginExecution transitions from PREPARED to EXECUTING.
 func (s *SQLiteStore) BeginExecution(ctx context.Context, executionID, leaseToken string, leaseGeneration int) error {
-	return s.leaseFencedTransition(ctx, executionID, leaseToken, leaseGeneration, StatePrepared, StateExecuting)
+	err := s.leaseFencedTransition(ctx, executionID, leaseToken, leaseGeneration, StatePrepared, StateExecuting)
+	if err != nil {
+		return err
+	}
+	s.metrics.executing.Add(1)
+	return nil
 }
 
 // MarkInFlight transitions from EXECUTING to IN_FLIGHT, persisting
@@ -620,6 +814,7 @@ func (s *SQLiteStore) MarkInFlight(ctx context.Context, executionID, leaseToken 
 	if rows == 0 {
 		return s.classifyTransitionFailure(ctx, executionID, leaseToken, leaseGeneration, StateExecuting)
 	}
+	s.metrics.inFlight.Add(1)
 	return nil
 }
 
@@ -650,6 +845,7 @@ func (s *SQLiteStore) leaseFencedTransition(ctx context.Context, executionID, le
 }
 
 func (s *SQLiteStore) classifyTransitionFailure(ctx context.Context, executionID, leaseToken string, leaseGeneration int, expectedState State) error {
+	s.metrics.fenceRejections.Add(1)
 	rec, err := s.Lookup(ctx, executionID)
 	if err != nil {
 		return fmt.Errorf("%w: execution %s transition failed (lookup error: %v)", LeaseLost, executionID, err)
@@ -696,10 +892,12 @@ func (s *SQLiteStore) RenewLease(ctx context.Context, executionID, leaseToken st
 	if rows == 0 {
 		return s.classifyRenewalFailure(ctx, executionID, leaseToken, leaseGeneration)
 	}
+	s.metrics.leaseRenewals.Add(1)
 	return nil
 }
 
 func (s *SQLiteStore) classifyRenewalFailure(ctx context.Context, executionID, leaseToken string, leaseGeneration int) error {
+	s.metrics.fenceRejections.Add(1)
 	rec, err := s.Lookup(ctx, executionID)
 	if err != nil {
 		return fmt.Errorf("%w: execution %s renewal failed (lookup error: %v)", LeaseLost, executionID, err)
@@ -745,6 +943,7 @@ func (s *SQLiteStore) AbandonPreDispatch(ctx context.Context, executionID, lease
 }
 
 func (s *SQLiteStore) classifyAbandonFailure(ctx context.Context, executionID, leaseToken string, leaseGeneration int) error {
+	s.metrics.fenceRejections.Add(1)
 	rec, err := s.Lookup(ctx, executionID)
 	if err != nil {
 		return fmt.Errorf("%w: execution %s abandon failed (lookup error: %v)", LeaseLost, executionID, err)
@@ -818,10 +1017,12 @@ func (s *SQLiteStore) Finalize(ctx context.Context, executionID, leaseToken stri
 	if existing.ExecutionClass == "CRITICAL" {
 		verified, err = s.evidenceVerifier().Verify(ctx, existing, receipt, receipt.TerminalStatus)
 		if err != nil {
+			s.metrics.criticalEvidenceDenied.Add(1)
 			return fmt.Errorf("CRITICAL finalization to %s requires a verified signed evidence receipt: %w", receipt.TerminalStatus, err)
 		}
 	}
 	if err := ValidateTerminalTransition(existing, receipt.TerminalStatus, receipt, verified); err != nil {
+		s.metrics.criticalEvidenceDenied.Add(1)
 		return err
 	}
 
@@ -875,9 +1076,15 @@ func (s *SQLiteStore) Finalize(ctx context.Context, executionID, leaseToken stri
 			providerIdentityContradicts(
 				current.ProviderID, receipt.ProviderID,
 				current.ProviderRunID, receipt.ProviderRunID) {
+			s.metrics.observationConflicts.Add(1)
 			return fmt.Errorf("%w: execution %s terminal receipt contradicts stored provider observation", ProviderObservationConflict, executionID)
 		}
 		return s.classifyTransitionFailure(ctx, executionID, leaseToken, leaseGeneration, expectedState)
+	}
+	if receipt.TerminalStatus == StateCommitted {
+		s.metrics.committed.Add(1)
+	} else {
+		s.metrics.failed.Add(1)
 	}
 	return nil
 }
@@ -911,6 +1118,7 @@ func (s *SQLiteStore) EnterRecovery(ctx context.Context, executionID string, exp
 	if rows == 0 {
 		return fmt.Errorf("%w: execution %s enter recovery CAS failed (state/version mismatch)", LeaseStateConflict, executionID)
 	}
+	s.metrics.unknownEntered.Add(1)
 	return nil
 }
 
@@ -934,6 +1142,7 @@ func (s *SQLiteStore) EnterRecoveryWithObservation(ctx context.Context, executio
 		    provider_run_id = COALESCE(?5, provider_run_id),
 		    provider_status = COALESCE(?6, provider_status),
 		    result = COALESCE(?10, result),
+		    provider_result = COALESCE(?11, provider_result),
 		    provider_result_digest = COALESCE(?7, provider_result_digest),
 		    provider_receipt_version = COALESCE(NULLIF(?8, 0), provider_receipt_version),
 		    provider_observed_at = `+sqliteNow+`,
@@ -946,6 +1155,7 @@ func (s *SQLiteStore) EnterRecoveryWithObservation(ctx context.Context, executio
 		  AND (provider_run_id IS NULL OR ?5 IS NULL OR provider_run_id = ?5)
 		  AND (provider_status IS NULL OR ?6 IS NULL OR provider_status = ?6)
 		  AND (result IS NULL OR ?10 IS NULL OR result = ?10)
+		  AND (provider_result IS NULL OR ?11 IS NULL OR provider_result = ?11)
 		  AND (provider_result_digest IS NULL OR ?7 IS NULL OR provider_result_digest = ?7)
 		  AND (provider_receipt_version IS NULL OR provider_receipt_version = 0 OR NULLIF(?8, 0) IS NULL OR provider_receipt_version = ?8)
 		  AND (evidence_digest IS NULL OR ?9 IS NULL OR evidence_digest = ?9)
@@ -953,7 +1163,8 @@ func (s *SQLiteStore) EnterRecoveryWithObservation(ctx context.Context, executio
 		nullableString(obs.ProviderID), nullableString(obs.ProviderRunID),
 		nullableString(obs.ProviderStatus), nullableString(obs.ResultDigest),
 		obs.ReceiptVersion,
-		nullableString(obs.EvidenceDigest), nullableString(string(obs.Result)))
+		nullableString(obs.EvidenceDigest), nullableString(string(obs.Result)),
+		nullableString(string(obs.Result)))
 	if err != nil {
 		return err
 	}
@@ -964,10 +1175,12 @@ func (s *SQLiteStore) EnterRecoveryWithObservation(ctx context.Context, executio
 	if rows == 0 {
 		return s.classifyEnterRecoveryFailure(ctx, executionID, expectedState, expectedVersion)
 	}
+	s.metrics.unknownEntered.Add(1)
 	return nil
 }
 
 func (s *SQLiteStore) classifyEnterRecoveryFailure(ctx context.Context, executionID string, expectedState State, expectedVersion int) error {
+	s.metrics.fenceRejections.Add(1)
 	rec, err := s.Lookup(ctx, executionID)
 	if err != nil {
 		return err
@@ -975,6 +1188,7 @@ func (s *SQLiteStore) classifyEnterRecoveryFailure(ctx context.Context, executio
 	if rec.State != expectedState || rec.Version != expectedVersion {
 		return fmt.Errorf("%w: execution %s enter recovery with observation CAS failed (state/version mismatch)", LeaseStateConflict, executionID)
 	}
+	s.metrics.observationConflicts.Add(1)
 	return fmt.Errorf("%w: execution %s observation contradicts stored provider data", ProviderObservationConflict, executionID)
 }
 
@@ -989,6 +1203,7 @@ func (s *SQLiteStore) RecordProviderObservation(ctx context.Context, executionID
 		    provider_run_id = COALESCE(?5, provider_run_id),
 		    provider_status = COALESCE(?6, provider_status),
 		    result = COALESCE(?7, result),
+		    provider_result = COALESCE(?11, provider_result),
 		    provider_result_digest = COALESCE(?8, provider_result_digest),
 		    evidence_digest = COALESCE(?9, evidence_digest),
 		    provider_receipt_version = COALESCE(NULLIF(?10, 0), provider_receipt_version),
@@ -1003,6 +1218,7 @@ func (s *SQLiteStore) RecordProviderObservation(ctx context.Context, executionID
 		  AND (provider_run_id IS NULL OR ?5 IS NULL OR provider_run_id = ?5)
 		  AND (provider_status IS NULL OR ?6 IS NULL OR provider_status = ?6)
 		  AND (result IS NULL OR ?7 IS NULL OR result = ?7)
+		  AND (provider_result IS NULL OR ?11 IS NULL OR provider_result = ?11)
 		  AND (provider_result_digest IS NULL OR ?8 IS NULL OR provider_result_digest = ?8)
 		  AND (evidence_digest IS NULL OR ?9 IS NULL OR evidence_digest = ?9)
 		  AND (provider_receipt_version IS NULL OR provider_receipt_version = 0 OR NULLIF(?10, 0) IS NULL OR provider_receipt_version = ?10)
@@ -1010,7 +1226,7 @@ func (s *SQLiteStore) RecordProviderObservation(ctx context.Context, executionID
 		nullableString(obs.ProviderID), nullableString(obs.ProviderRunID),
 		nullableString(obs.ProviderStatus), nullableString(string(obs.Result)),
 		nullableString(obs.ResultDigest), nullableString(obs.EvidenceDigest),
-		obs.ReceiptVersion)
+		obs.ReceiptVersion, nullableString(string(obs.Result)))
 	if err != nil {
 		return err
 	}
@@ -1021,10 +1237,12 @@ func (s *SQLiteStore) RecordProviderObservation(ctx context.Context, executionID
 	if rows == 0 {
 		return s.classifyObservationFailure(ctx, executionID, leaseToken, leaseGeneration)
 	}
+	s.metrics.observationWrites.Add(1)
 	return nil
 }
 
 func (s *SQLiteStore) classifyObservationFailure(ctx context.Context, executionID, leaseToken string, leaseGeneration int) error {
+	s.metrics.fenceRejections.Add(1)
 	rec, err := s.Lookup(ctx, executionID)
 	if err != nil {
 		return err
@@ -1036,6 +1254,7 @@ func (s *SQLiteStore) classifyObservationFailure(ctx context.Context, executionI
 	if rec.State != StateInFlight && rec.State != StateUnknown {
 		return fmt.Errorf("%w: execution %s observation rejected (state %s)", LeaseStateConflict, executionID, rec.State)
 	}
+	s.metrics.observationConflicts.Add(1)
 	return fmt.Errorf("%w: execution %s observation contradicts stored provider observation", ProviderObservationConflict, executionID)
 }
 
@@ -1152,6 +1371,7 @@ func (s *SQLiteStore) ResolveRecovery(ctx context.Context, executionID string, e
 		verified = v
 	}
 	if err := ValidateTerminalTransition(existingRec, newState, receipt, verified); err != nil {
+		s.metrics.criticalEvidenceDenied.Add(1)
 		return err
 	}
 
@@ -1208,9 +1428,16 @@ func (s *SQLiteStore) ResolveRecovery(ctx context.Context, executionID string, e
 			return fmt.Errorf("execution %s recovery resolution failed (lookup: %v)", executionID, lerr)
 		}
 		if rec.State == StateUnknown && rec.Version == expectedVersion {
+			s.metrics.observationConflicts.Add(1)
 			return fmt.Errorf("%w: execution %s recovery result contradicts stored provider observation", ProviderObservationConflict, executionID)
 		}
 		return fmt.Errorf("%w: execution %s recovery resolution CAS failed (state/version mismatch)", LeaseStateConflict, executionID)
+	}
+	s.metrics.reconcileResolutions.Add(1)
+	if newState == StateCommitted {
+		s.metrics.committed.Add(1)
+	} else {
+		s.metrics.failed.Add(1)
 	}
 	return nil
 }
@@ -1256,7 +1483,11 @@ func (s *SQLiteStore) ClaimUnknownBatch(ctx context.Context, owner string, batch
 	if err != nil {
 		return nil, fmt.Errorf("claim unknown batch failed: %w", err)
 	}
-	return scanSQLiteRecords(rows)
+	recs, err := scanSQLiteRecords(rows)
+	if err == nil {
+		s.metrics.reconcileClaims.Add(int64(len(recs)))
+	}
+	return recs, err
 }
 
 // ClaimExpiredBatch atomically claims expired-lease records for crash
@@ -1292,7 +1523,11 @@ func (s *SQLiteStore) ClaimExpiredBatch(ctx context.Context, owner string, batch
 	if err != nil {
 		return nil, fmt.Errorf("claim expired batch failed: %w", err)
 	}
-	return scanSQLiteRecords(rows)
+	recs, err := scanSQLiteRecords(rows)
+	if err == nil {
+		s.metrics.reconcileClaims.Add(int64(len(recs)))
+	}
+	return recs, err
 }
 
 // ReleaseReconcileClaim releases a claim with DB-computed backoff —
@@ -1489,7 +1724,7 @@ func scanSQLiteRecords(rows *sql.Rows) ([]*Record, error) {
 	var records []*Record
 	for rows.Next() {
 		var rec Record
-		var resultJSON []byte
+		var resultJSON, providerResultJSON []byte
 		var leaseOwner, leaseToken, providerID, providerRunID, terminalDigest sql.NullString
 		var providerStatus, providerResultDigest string
 		var providerObservedAt sql.NullInt64
@@ -1510,7 +1745,8 @@ func scanSQLiteRecords(rows *sql.Rows) ([]*Record, error) {
 			&terminalDigest, &evidenceReceipt, &recoveryLocator,
 			&rec.Attempt, &rec.Version, &createdAt, &updatedAt,
 			&recOwner, &recLeaseExp, &rec.ReconcileAttempt, &nextRecAt, &lastRecErr,
-			&enteredUnknownAt,
+			&enteredUnknownAt, &providerResultJSON,
+			&rec.AuthorityGeneration, &rec.AuthorityDigest,
 		); err != nil {
 			return nil, err
 		}
@@ -1527,6 +1763,7 @@ func scanSQLiteRecords(rows *sql.Rows) ([]*Record, error) {
 			rec.EnteredUnknownAt = &t
 		}
 		rec.Result = json.RawMessage(resultJSON)
+		rec.ProviderResult = json.RawMessage(providerResultJSON)
 		if leaseOwner.Valid {
 			rec.LeaseOwner = leaseOwner.String
 		}

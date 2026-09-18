@@ -15,7 +15,7 @@ import (
 // independent of storage engine.
 func sqliteStore(t *testing.T) *idempotency.SQLiteStore {
 	t.Helper()
-	db, err := idempotency.OpenSQLiteDB(filepath.Join(t.TempDir(), "w.db"))
+	db, err := idempotency.OpenSQLiteDB(filepath.Join(t.TempDir(), "db", "w.db"))
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}

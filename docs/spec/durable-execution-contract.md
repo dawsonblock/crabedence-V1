@@ -70,12 +70,33 @@ that violates one is defective, regardless of test results.
     bytes (e.g. the raw provider response or operation record) — a
     handler- or resolver-supplied digest string MUST NOT be signed.
     For `NO_EFFECT` outcomes with no provider bytes, the artifact MAY
-    be the recorded claim itself: the dispatcher's synthesized
-    failure record for a provable pre-transmission failure, or the
-    resolver's own observation record for `RecoveryFailed`. A
-    `COMPLETED` claim always requires real provider bytes. A CRITICAL
-    terminal outcome without a verifiable artifact cannot be attested
-    and fails closed to `UNKNOWN`.
+    be the dispatcher's synthesized failure record — and only when
+    the executor itself proved the failure was pre-transmission. A
+    resolver's own statement that the operation did not execute is a
+    recovery DECISION, not evidence: a resolver interprets evidence,
+    it does not manufacture it. A CRITICAL `FAILED` resolution
+    therefore requires an evidence artifact carrying provider-
+    authenticated material (e.g. the provider's operation-lookup
+    response establishing non-execution); `RecoveryFailed` without
+    artifact bytes cannot be attested and the record stays `UNKNOWN`.
+    A `COMPLETED` claim always requires real provider bytes. A
+    CRITICAL terminal outcome without a verifiable artifact cannot
+    be attested and fails closed to `UNKNOWN`.
+
+    **Signer key ring and rotation.** The trusted signer set is a
+    key ring, not a single key: each entry is the SHA-256 fingerprint
+    of an Ed25519 public key authorized to attest terminal receipts.
+    Rotation changes which key SIGNS new receipts; it MUST NOT make
+    historical receipts unverifiable. A retired signer's fingerprint
+    therefore remains in the ring for as long as receipts it attested
+    may still be verified, while only the active key produces new
+    signatures. Removing a fingerprint revokes that signer — its
+    receipts then fail closed. Deployments MUST provision signer keys
+    externally (mounted secret, KMS/HSM); automatic key generation is
+    a development convenience and MUST be disabled in any multi-
+    replica or production configuration, because each replica that
+    auto-generates a key silently mints an independent evidence
+    identity.
 
 4.  **One terminal policy.** `Finalize` and `ResolveRecovery` MUST
     enforce identical proof requirements through a single shared
@@ -144,6 +165,23 @@ that violates one is defective, regardless of test results.
     in a single CAS write. They leave the expired-lease claim set
     until a caller reacquires them — reconciliation must not
     claim/release dormant work every cycle.
+
+11. **Authority binding is immutable and generation-scoped.** Grants
+    are never updated in place: reissuing a `grant_id` appends a new
+    immutable generation row carrying a `grant_digest` over its
+    material (grant_id, generation, principal, sorted capabilities,
+    expiry), and the latest generation supersedes all earlier ones for
+    admission — an older still-valid generation MUST NOT resurface
+    after a reissue. Revocation applies to every generation while
+    preserving the rows as forensic snapshots. The execution service
+    binds the resolved generation and grant digest — server-assigned,
+    never caller-supplied — into the request digest, so the same
+    `grant_id` under different authority material is a different
+    execution identity and reissuing authority never silently
+    reinterprets a durable record or idempotency key. Authority
+    expiry is evaluated by the authority store's own database clock
+    (`expires_at > NOW()` in PostgreSQL, `unixepoch` in SQLite), not
+    the application clock.
 
 ## 1. State vocabulary
 
@@ -342,11 +380,14 @@ it returns success, not a conflict.
 
 The store enforces CRITICAL proof requirements inside `Finalize()`:
 both COMMITTED and FAILED require a valid SHA-256 evidence digest,
-receipt_version 3, provider_id, and provider_run_id — **plus** a
-signed `evidence_receipt` (ReceiptV3) verified against trusted signer
+receipt_version 3, and provider_id — **plus** a signed
+`evidence_receipt` (ReceiptV3) verified against trusted signer
 fingerprints and bound to the execution, request, provider identity,
-outcome, and evidence digest. COMMITTED requires outcome `COMPLETED`;
-FAILED requires outcome `NO_EFFECT`. A digest without a verified
+outcome, and evidence digest. COMMITTED requires outcome `COMPLETED`
+and MUST bind the `provider_run_id` of the operation that ran;
+FAILED requires outcome `NO_EFFECT`, for which `provider_run_id`
+MAY be empty — nothing ran, so there is no operation identity to
+bind (mirroring invariant 3 above). A digest without a verified
 signed receipt is rejected. This prevents a caller that bypasses
 DispatchExecutor from finalizing CRITICAL with weaker evidence than
 the recovery path requires — and both paths share the same policy

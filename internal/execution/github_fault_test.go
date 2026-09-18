@@ -223,12 +223,14 @@ func TestLiveGitHubIssueAtMostOnce(t *testing.T) {
 			t.Fatalf("expected 1 issue, got %d", fake.count())
 		}
 		// Same-token invariant: the operation token the provider saw
-		// must embed the durable execution ID — proving the token
+		// must be the deterministic provider idempotency key derived
+		// from the durable execution identity — proving the token
 		// persisted in the locator is the one sent externally. (The
 		// locator itself is cleared on terminal state, by design.)
 		rec, _ := store.LookupByKey(ctx, "alice@example.com", "github.issue.create", key)
-		if !strings.Contains(fake.lastOp(), rec.ExecutionID) {
-			t.Errorf("provider operation token %q does not embed execution_id %s", fake.lastOp(), rec.ExecutionID)
+		wantToken := idempotency.ProviderIdempotencyKey(rec.ExecutionID, rec.RequestDigest, "github")
+		if fake.lastOp() != wantToken {
+			t.Errorf("provider operation token %q != deterministic key %q", fake.lastOp(), wantToken)
 		}
 		// Replay: same key → terminal replay, no second issue.
 		resp2 := githubDispatch(t, exec, key)

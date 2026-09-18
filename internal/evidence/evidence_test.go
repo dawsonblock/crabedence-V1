@@ -190,3 +190,45 @@ func TestGenerateSignerProducesValidKey(t *testing.T) {
 		t.Error("public key has wrong size")
 	}
 }
+
+// TestVerifyReceiptKeyRingRotation — signer rotation must not make
+// historical receipts unverifiable. The trust set is a key ring: the
+// retired signer's fingerprint stays trusted for receipts it already
+// attested, while new receipts are signed by the active key. Removing
+// a fingerprint revokes that signer — its receipts then fail closed.
+func TestVerifyReceiptKeyRingRotation(t *testing.T) {
+	retired, _ := GenerateSigner()
+	active, _ := GenerateSigner()
+	b := testBinding()
+
+	// Historical receipt signed under the retired key.
+	oldRaw, err := retired.Sign(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// New receipt signed under the active key.
+	b2 := testBinding()
+	b2.ExecutionID = "exec-2"
+	newRaw, err := active.Sign(b2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Ring containing both: retired + active fingerprints.
+	ring := map[string]bool{retired.Fingerprint(): true, active.Fingerprint(): true}
+	if err := VerifyReceipt(oldRaw, b, ring); err != nil {
+		t.Errorf("retired-but-trusted signer receipt must still verify: %v", err)
+	}
+	if err := VerifyReceipt(newRaw, b2, ring); err != nil {
+		t.Errorf("active signer receipt must verify: %v", err)
+	}
+
+	// Revocation: drop the retired fingerprint — its receipts fail closed.
+	activeOnly := map[string]bool{active.Fingerprint(): true}
+	if err := VerifyReceipt(oldRaw, b, activeOnly); err == nil {
+		t.Error("receipt from revoked signer must be rejected")
+	}
+	if err := VerifyReceipt(newRaw, b2, activeOnly); err != nil {
+		t.Errorf("active signer receipt must still verify after rotation: %v", err)
+	}
+}

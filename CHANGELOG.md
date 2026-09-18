@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+### Effect Fabric hardening — backend, ABI, adversarial qualification
+
+- Storage: `OpenSQLiteDB` enforces ledger file hygiene — database directory `0700`, DB file `0600`, symlinked paths rejected, existing world-accessible files refused rather than silently used (both new and existing paths).
+- Storage: schema v7 adds `authority_generation`/`authority_digest` columns to the execution record (the immutable authority snapshot at admission time) plus audit indexes on `(provider_id, provider_run_id)` and `grant_id`; legacy SQLite/PostgreSQL schemas migrate forward without data loss.
+- Store: `AcquireWithAuthority` persists the resolved authority binding on the durable record — later grant reissues can never reinterpret which authority admitted an execution.
+- Idempotency ABI: canonical JSON now normalizes numbers semantically — `1`, `1.0`, `1e0`, `-0` hash identically — via a lexical rewrite that never routes through float64 (arbitrary precision preserved; huge exponents fall back to canonical scientific form). Frozen cross-language vectors in `internal/idempotency/testdata/digest-vectors.json` pin canonical bytes + digest per case; regenerate with `-update-digest-vectors` only for a deliberate ABI change.
+- Execution: `CrashPoint` failure-injection hooks at every durable boundary (`SetCrashHook`) — after acquire, begin-execution, mark-in-flight, before/after provider, before/after observation, before/after finalize, before/after recovery.
+- Execution: provider capability declarations (`ProviderCapabilities` + `CapabilityDeclarer`) — a CRITICAL execution is `ADMISSION_DENIED` at admission when the adapter cannot declare both completion and non-effect evidence support; `MultiHandler` delegates per-adapter.
+- Providers: `idempotency.ProviderIdempotencyKey` — deterministic provider-side idempotency token `H(execution_id ‖ request_digest ‖ provider_id)`; counter and GitHub adapters now derive it canonically instead of hand-rolled prefixes.
+- Store: `StoreMetrics` semantic counters on both engines (acquires, state entries, fence rejections, observation writes/conflicts, reconcile claims/resolutions, CRITICAL evidence rejections) via `Metrics().Snapshot()`.
+- Docs: `durable-execution-operations.md` — SQLite/PostgreSQL backend boundaries, release classifications, UNKNOWN-suspension semantics (never auto-fail), backup/restore + cluster-epoch requirement, threat model, and alertable invariants. Signer key-ring rotation documented in the contract spec with a retired-key verification test.
+- Tests: crash-point matrix (panic at each boundary → exact durable state), real-process SIGKILL matrix across all boundaries plus crash→restart→reconcile, adversarial cancellation at every boundary (post-provider cancel still commits; post-IN_FLIGHT cancel → UNKNOWN), concurrency torture (50 workers → provider dispatch = 1), seeded random-sequence store property test, adversarial provider simulator, SQLite restart + `integrity_check` + WAL verification, metrics lifecycle.
+
+### Effect Fabric hardening — caller-cancellation boundary, forensic observations, immutable authority
+
+- Execution: post-dispatch recovery persistence (`enterRecoveryWithObservation`) now runs on the detached durability context — a cancelled caller can no longer strand a record `IN_FLIGHT` by killing the mandatory recovery write.
+- Execution: the lease heartbeat is owned by the durability lifetime, not the caller context — caller cancellation after provider return no longer stops lease renewal mid-finalization (`LEASE_EXPIRED` → spurious `UNKNOWN`).
+- Store: provider observations are forensic — a new `provider_result` column preserves the original provider-returned bytes independently of the canonical `result`, so `ResolveRecovery` can never overwrite the observation the recovery was based on (both engines, schema v6).
+- Evidence: `LoadOrCreateSigner` creates key files crash-durably (temp file + fsync + atomic rename + parent-dir fsync) and never clobbers a concurrently created key.
+- Evidence: frozen ABI golden vectors pin the deterministic signing payload, signer fingerprint, signing-bytes hash, signature, and receipt round-trip.
+- Authority: grants are immutable — `IssueGrant` appends a new generation row (`PRIMARY KEY (grant_id, generation)`) carrying a `grant_digest` over its material instead of `ON CONFLICT DO UPDATE`; the latest generation supersedes all earlier ones for admission, and revocation marks every generation while preserving the rows. Legacy tables are migrated in place (existing rows become generation 1 with backfilled digests).
+- Authority: expiry is evaluated by the database clock inside `Resolve` (`expires_at > NOW()` / `unixepoch`), not `time.Now()` — stores declare `ExpiryIsAuthoritative` so `VerifyAuthority` skips the application-clock veto.
+- Execution: the resolved grant's generation + digest are bound into the request digest (server-assigned `authority_generation`/`authority_digest`, never caller-supplied) — the same `grant_id` under different authority material is a different execution identity, so reissuing authority can never silently reinterpret a durable record or idempotency key.
+- Docs: `durable-execution-contract.md` gains invariant 11 (immutable generation-scoped authority binding), resolves the resolver-observation-as-NO_EFFECT-evidence contradiction for CRITICAL recovery, and clarifies that `provider_run_id` is required for `COMPLETED` but optional for `NO_EFFECT`.
+
 ### RC10 — Effect Fabric Contract Closure
 
 - Storage: embedded SQLite is now the default durable-store backend for `crabbox serve-execution` — WAL + `synchronous=FULL` + `foreign_keys=ON` + `busy_timeout=5000`, write transactions via `BEGIN IMMEDIATE`, pure-Go `modernc.org/sqlite` driver (no cgo). PostgreSQL remains available for multi-host/clustered deployments via `CRABEDENCE_STORE_BACKEND=postgres` + `CRABEDENCE_DATABASE_URL`; `CRABEDENCE_STORE_PATH` sets the SQLite file (default `~/.config/crabbox/crabedence.db`). Unset `CRABEDENCE_STORE_BACKEND` auto-selects postgres when `CRABEDENCE_DATABASE_URL` is configured, sqlite otherwise. Execution semantics are identical across engines.

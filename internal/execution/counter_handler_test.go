@@ -221,8 +221,9 @@ func TestCounterPrepareRecovery(t *testing.T) {
 	if locator.PrincipalID != "alice@example.com" {
 		t.Errorf("expected principal in locator, got %q", locator.PrincipalID)
 	}
-	if locator.ExternalToken != "ctr-op-exec-1" {
-		t.Errorf("expected external token derived from execution_id, got %q", locator.ExternalToken)
+	wantToken := idempotency.ProviderIdempotencyKey("exec-1", "d1", "test-counter")
+	if locator.ExternalToken != wantToken {
+		t.Errorf("expected deterministic provider idempotency key %q, got %q", wantToken, locator.ExternalToken)
 	}
 	var ext struct {
 		Counter string `json:"counter"`

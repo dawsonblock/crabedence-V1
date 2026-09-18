@@ -206,7 +206,7 @@ func (h *CounterHandler) PrepareRecovery(_ context.Context, in idempotency.Recov
 		Version:        1,
 		ProviderID:     "test-counter",
 		Strategy:       "external-token",
-		ExternalToken:  "ctr-op-" + in.ExecutionID,
+		ExternalToken:  idempotency.ProviderIdempotencyKey(in.ExecutionID, in.RequestDigest, "test-counter"),
 		RequestDigest:  in.RequestDigest,
 		ExecutionID:    in.ExecutionID,
 		PrincipalID:    in.Principal,

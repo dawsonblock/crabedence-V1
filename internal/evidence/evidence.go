@@ -387,13 +387,37 @@ func LoadOrCreateSigner(path string) (*Signer, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	// O_EXCL avoids clobbering a key created concurrently.
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	// Crash-durable publish: the key is written to a sibling temp file,
+	// fsynced, then atomically linked into place and the directory is
+	// fsynced. A power loss mid-write can never leave a missing or
+	// truncated key under the final name, and os.Link fails with
+	// EEXIST rather than clobbering a key created concurrently — the
+	// same no-clobber guarantee O_EXCL provided, without the partial-
+	// file exposure window.
+	tmp, err := os.CreateTemp(dir, ".signer-*.tmp")
 	if err != nil {
+		return nil, err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op after a successful link
+	if _, err := tmp.Write(encoded); err != nil {
+		tmp.Close()
+		return nil, err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return nil, err
+	}
+	if err := tmp.Close(); err != nil {
+		return nil, err
+	}
+	if err := os.Link(tmpName, path); err != nil {
 		if errors.Is(err, os.ErrExist) {
+			os.Remove(tmpName)
 			data, rerr := os.ReadFile(path)
 			if rerr != nil {
 				return nil, rerr
@@ -402,12 +426,10 @@ func LoadOrCreateSigner(path string) (*Signer, error) {
 		}
 		return nil, err
 	}
-	if _, err := f.Write(encoded); err != nil {
-		f.Close()
-		return nil, err
-	}
-	if err := f.Close(); err != nil {
-		return nil, err
+	// Commit the directory entry so the key survives a power loss.
+	if d, derr := os.Open(dir); derr == nil {
+		_ = d.Sync()
+		d.Close()
 	}
 	return signer, nil
 }

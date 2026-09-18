@@ -145,6 +145,54 @@ func TestComputeDigestFromRaw(t *testing.T) {
 	}
 }
 
+// TestComputeDigestAuthorityBinding verifies that the immutable
+// authority material (generation + grant digest) is bound into the
+// request digest: the same grant_id under different authority material
+// is a different execution identity, while zero values preserve the
+// pre-binding digest bytes exactly.
+func TestComputeDigestAuthorityBinding(t *testing.T) {
+	args := json.RawMessage(`{"counter":"test","by":1}`)
+
+	base, err := ComputeDigestFromRaw(1, "alice@example.com", "test.counter.increment", args, "grant_123", "MUTATION")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Zero authority material is byte-identical to the unbound digest.
+	zero, err := ComputeDigestFromRawWithAuthority(1, "alice@example.com", "test.counter.increment", args, "grant_123", "MUTATION", 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if zero != base {
+		t.Error("zero authority material must preserve the unbound digest")
+	}
+
+	gen1, err := ComputeDigestFromRawWithAuthority(1, "alice@example.com", "test.counter.increment", args, "grant_123", "MUTATION", 1, "digest-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen2, err := ComputeDigestFromRawWithAuthority(1, "alice@example.com", "test.counter.increment", args, "grant_123", "MUTATION", 2, "digest-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if gen1 == base {
+		t.Error("bound authority material must change the digest")
+	}
+	if gen1 == gen2 {
+		t.Error("same grant_id at different generations/digests must produce different digests")
+	}
+
+	// Generation alone (digest empty) still binds.
+	genOnly, err := ComputeDigestFromRawWithAuthority(1, "alice@example.com", "test.counter.increment", args, "grant_123", "MUTATION", 7, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if genOnly == base || genOnly == gen1 {
+		t.Error("generation-only binding must change the digest")
+	}
+}
+
 func TestStateIsTerminal(t *testing.T) {
 	tests := []struct {
 		state    State
@@ -202,5 +250,82 @@ func TestStateDurablyFinal(t *testing.T) {
 		if got := tt.state.IsDurablyFinal(); got != tt.final {
 			t.Errorf("%s: IsDurablyFinal() = %v, want %v", tt.state, got, tt.final)
 		}
+	}
+}
+
+func TestCanonicalJSONNumber(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		{"1", "1"},
+		{"1.0", "1"},
+		{"1.00", "1"},
+		{"1e0", "1"},
+		{"1e+0", "1"},
+		{"1E0", "1"},
+		{"1e2", "100"},
+		{"1.5e3", "1500"},
+		{"1.5e-3", "0.0015"},
+		{"1.50", "1.5"},
+		{"0.010", "0.01"},
+		{"-0", "0"},
+		{"-0.0", "0"},
+		{"0e5", "0"},
+		{"-1.5", "-1.5"},
+		{"-0.001", "-0.001"},
+		{"123456789012345678901234567890", "123456789012345678901234567890"},
+		{"9007199254740993", "9007199254740993"},
+		{"3.14159", "3.14159"},
+		{"1e-2", "0.01"},
+		{"2e+1", "20"},
+	}
+	for _, tt := range tests {
+		if got := canonicalJSONNumber(tt.in); got != tt.want {
+			t.Errorf("canonicalJSONNumber(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestComputeDigestFromRawEquivalentNumbers(t *testing.T) {
+	// Semantically equal numbers must digest identically regardless of
+	// lexical representation.
+	base := func(args string) string {
+		d, err := ComputeDigestFromRaw(1, "alice", "cap", []byte(args), "g", "MUTATION")
+		if err != nil {
+			t.Fatalf("ComputeDigestFromRaw(%s): %v", args, err)
+		}
+		return d
+	}
+	variants := []string{
+		`{"n": 1}`,
+		`{"n": 1.0}`,
+		`{"n": 1e0}`,
+		`{"n": 1.00}`,
+		`{"n": 1e+0}`,
+	}
+	want := base(variants[0])
+	for _, v := range variants[1:] {
+		if got := base(v); got != want {
+			t.Errorf("args %s digest differs from %s", v, variants[0])
+		}
+	}
+	if base(`{"n": 1.5}`) == want {
+		t.Error("distinct values 1 and 1.5 produced identical digests")
+	}
+}
+
+func TestComputeDigestFromRawLargeIntegersDistinct(t *testing.T) {
+	// Integers beyond IEEE-754 precision must not collapse through
+	// float64 conversion.
+	d1, err := ComputeDigestFromRaw(1, "a", "c", []byte(`{"n":9007199254740992}`), "g", "MUTATION")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d2, err := ComputeDigestFromRaw(1, "a", "c", []byte(`{"n":9007199254740993}`), "g", "MUTATION")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d1 == d2 {
+		t.Error("9007199254740992 and 9007199254740993 produced identical digests")
 	}
 }

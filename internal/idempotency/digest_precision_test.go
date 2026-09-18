@@ -84,19 +84,17 @@ func TestComputeDigestFromRawFloatPreserved(t *testing.T) {
 		t.Error("distinct float values must produce distinct digests")
 	}
 
-	// Different lexical forms of the same numeric value produce
-	// different digests. This is intentional: UseNumber() preserves
-	// the exact lexical representation, so 1.5 and 1.50 are distinct.
-	// This is the conservative behavior for idempotency — the exact
-	// bytes the client sent determine the digest, not a normalized
-	// numeric value. This prevents accidental collisions from
-	// ambiguous normalization rules.
+	// Different lexical forms of the same numeric value produce the
+	// SAME digest. This is the semantic-identity ABI decision:
+	// canonicalJSONNumber normalizes 1.5, 1.50, 1.5e0, and 15e-1 to a
+	// single canonical literal, so a client reformatting an equivalent
+	// number does not mint a new idempotency identity.
 	args3 := json.RawMessage(`{"amount":1.50}`)
 	d3, err := ComputeDigestFromRaw(1, "test@example.com", "test.cap", args3, "", "MUTATION")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d1 == d3 {
-		t.Error("1.5 and 1.50 are different lexical forms and should produce different digests (UseNumber preserves lexical representation)")
+	if d1 != d3 {
+		t.Error("1.5 and 1.50 are the same value and must produce identical digests (canonical number normalization)")
 	}
 }

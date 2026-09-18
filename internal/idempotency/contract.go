@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -192,6 +193,21 @@ type AcquireResult struct {
 	Generation int               `json:"generation,omitempty"`
 }
 
+// AuthorityBinding is the immutable authority snapshot bound into the
+// execution at admission: the authority reference plus the generation
+// and grant digest of the exact grant material that admitted the
+// request. It is persisted on the execution record so the ledger can
+// answer "which authority permitted this?" without re-resolving grants,
+// and it is bound into the request digest so the same grant_id under
+// different material is a different execution identity. Zero values
+// mean unversioned authority (in-memory resolvers, grant-free
+// capabilities).
+type AuthorityBinding struct {
+	Ref        string `json:"ref,omitempty"`
+	Generation int64  `json:"generation,omitempty"`
+	Digest     string `json:"digest,omitempty"`
+}
+
 // Acquired returns true if this caller acquired the lease and may
 // proceed to dispatch.
 func (r AcquireResult) Acquired() bool {
@@ -304,7 +320,7 @@ func canonicalizeJSON(raw json.RawMessage) (json.RawMessage, error) {
 		}
 		return nil, fmt.Errorf("invalid JSON: %w", err)
 	}
-	return json.Marshal(v)
+	return json.Marshal(normalizeNumbers(v))
 }
 
 // ─── Recovery ────────────────────────────────────────────────────────
@@ -467,3 +483,22 @@ type Ctx interface {
 //
 // These map old state names to new ones for any code that has not yet
 // been migrated. New code must use the canonical names above.
+
+// ProviderIdempotencyKey derives the deterministic provider-side
+// idempotency token for an execution: H(execution_id || request_digest
+// || provider_id). Providers that support native idempotency use it as
+// the operation/idempotency key in the external request — the same
+// durable execution always presents the same token, so a retry or a
+// re-sent request never mints a second provider operation identity.
+// It is also the ExternalToken persisted in the recovery locator.
+func ProviderIdempotencyKey(executionID, requestDigest, providerID string) string {
+	h := sha256.New()
+	// Length-prefixed fields — no delimiter ambiguity.
+	for _, s := range []string{executionID, requestDigest, providerID} {
+		var l [4]byte
+		binary.BigEndian.PutUint32(l[:], uint32(len(s)))
+		h.Write(l[:])
+		h.Write([]byte(s))
+	}
+	return "crabex-op-" + hex.EncodeToString(h.Sum(nil))[:32]
+}

@@ -49,6 +49,15 @@ type RequestAuthority struct {
 	AuthorityRef string `json:"authority_ref"`
 	// GrantID is accepted for backward compatibility and mapped to AuthorityRef.
 	GrantID string `json:"grant_id,omitempty"`
+	// AuthorityGeneration and AuthorityDigest bind the exact immutable
+	// authority material that admitted this request into the execution
+	// identity (request digest). They are SERVER-ASSIGNED after grant
+	// resolution — the service overwrites whatever the caller sent —
+	// so a caller can neither forge authority binding nor omit it.
+	// Zero values mean no grant-bound authority (in-memory resolvers,
+	// grant-free capabilities).
+	AuthorityGeneration int64  `json:"authority_generation,omitempty"`
+	AuthorityDigest     string `json:"authority_digest,omitempty"`
 }
 
 // Response is the wire-format execution response.
@@ -318,8 +327,9 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 	}
 
 	// Verify authority (grant resolution)
+	var resolvedGrant *capability.Grant
 	if decision.Descriptor.AuthorityPolicy.GrantRequired {
-		fc, reason := s.registry.VerifyAuthority(ctx, capability.AdmissionRequest{
+		grant, fc, reason := s.registry.VerifyAuthority(ctx, capability.AdmissionRequest{
 			Capability: req.Capability,
 			Principal:  req.Authority.Principal,
 			GrantID:    req.Authority.EffectiveAuthorityRef(),
@@ -332,6 +342,19 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 			})
 			return
 		}
+		resolvedGrant = grant
+	}
+
+	// Bind the verified authority material into the request before
+	// dispatch: grant generation + grant digest become part of the
+	// execution identity, so the durable record proves which immutable
+	// authority admitted it. Server-assigned — caller-supplied values
+	// are overwritten whether or not a grant was required.
+	req.Authority.AuthorityGeneration = 0
+	req.Authority.AuthorityDigest = ""
+	if resolvedGrant != nil {
+		req.Authority.AuthorityGeneration = resolvedGrant.Generation
+		req.Authority.AuthorityDigest = resolvedGrant.Digest
 	}
 
 	// Dispatch to handler. The DispatchExecutor handles CRITICAL evidence

@@ -59,6 +59,67 @@ type DispatchExecutor struct {
 	// returns and before the observation is persisted — a test seam for
 	// simulating a crash inside the observation window.
 	postDispatchHook func()
+	// crashHook, when set, is invoked at every CrashPoint in the
+	// execution path — a deterministic failure-injection seam for
+	// crash/qualification testing. The hook may do anything (close the
+	// database, panic, os.Exit); the executor makes no guarantees
+	// after it runs.
+	crashHook func(CrashPoint)
+}
+
+// CrashPoint names a deterministic boundary in the execution path at
+// which a crash can be injected. The set covers every durable
+// transition so qualification tests can kill the executor — or the
+// process — at each state boundary and assert the recovery contract:
+// pre-dispatch crash → safely abandoned or FAILED; post-dispatch
+// crash → UNKNOWN and reconcilable, never silently lost.
+type CrashPoint string
+
+const (
+	// CrashAfterAcquire — lease acquired, before any state transition.
+	CrashAfterAcquire CrashPoint = "after_acquire"
+	// CrashAfterBeginExecution — EXECUTING persisted, before the
+	// recovery locator / IN_FLIGHT transition.
+	CrashAfterBeginExecution CrashPoint = "after_begin_execution"
+	// CrashAfterMarkInFlight — IN_FLIGHT and the recovery locator are
+	// durable, but the provider has not been invoked.
+	CrashAfterMarkInFlight CrashPoint = "after_mark_in_flight"
+	// CrashBeforeProvider — heartbeat started, provider invocation
+	// about to begin.
+	CrashBeforeProvider CrashPoint = "before_provider"
+	// CrashAfterProvider — provider returned; no observation,
+	// recovery, or terminal state persisted yet.
+	CrashAfterProvider CrashPoint = "after_provider"
+	// CrashBeforeObservation — about to persist the provider
+	// observation.
+	CrashBeforeObservation CrashPoint = "before_observation"
+	// CrashAfterObservation — provider observation persisted (or
+	// attempted), before the terminal decision.
+	CrashAfterObservation CrashPoint = "after_observation"
+	// CrashBeforeFinalize — terminal receipt built and (for CRITICAL)
+	// signed, about to call Finalize.
+	CrashBeforeFinalize CrashPoint = "before_finalize"
+	// CrashAfterFinalize — terminal state durably committed.
+	CrashAfterFinalize CrashPoint = "after_finalize"
+	// CrashBeforeRecovery — about to persist the UNKNOWN recovery
+	// transition.
+	CrashBeforeRecovery CrashPoint = "before_recovery"
+	// CrashAfterRecovery — UNKNOWN durably persisted.
+	CrashAfterRecovery CrashPoint = "after_recovery"
+)
+
+// fireCrashPoint invokes the configured crash hook at p.
+func (e *DispatchExecutor) fireCrashPoint(p CrashPoint) {
+	if e.crashHook != nil {
+		e.crashHook(p)
+	}
+}
+
+// SetCrashHook installs a failure-injection hook invoked at every
+// CrashPoint. Passing nil disables it. Intended for crash and
+// adversarial qualification tests.
+func (e *DispatchExecutor) SetCrashHook(h func(CrashPoint)) {
+	e.crashHook = h
 }
 
 // NewDispatchExecutor creates a new dispatch executor with durable idempotency.
@@ -96,14 +157,28 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		}
 	}
 
-	// Compute request digest
-	digest, err := idempotency.ComputeDigestFromRaw(
+	// Provider capability gate — a CRITICAL execution is admitted only
+	// when the provider declares it can prove both completion and
+	// non-effect; anything less could never be reconciled to a
+	// terminal state after post-dispatch ambiguity.
+	if denied := checkCriticalProviderCapability(e.handler, desc); denied != nil {
+		return *denied
+	}
+
+	// Compute request digest. The resolved authority generation and
+	// grant digest are bound into the execution identity so the same
+	// grant_id under different immutable authority material is a
+	// different request — reissuing or mutating a grant never silently
+	// reinterprets a durable execution or idempotency key.
+	digest, err := idempotency.ComputeDigestFromRawWithAuthority(
 		1, // protocol version
 		req.Authority.Principal,
 		req.Capability,
 		req.Arguments,
 		req.Authority.EffectiveAuthorityRef(),
 		string(desc.ExecutionClass),
+		req.Authority.AuthorityGeneration,
+		req.Authority.AuthorityDigest,
 	)
 	if err != nil {
 		return Response{
@@ -120,7 +195,12 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	if leaseDuration <= 0 {
 		leaseDuration = idempotency.DefaultLeaseDuration
 	}
-	acq, err := e.store.Acquire(ctx, req.IdempotencyKey, req.Authority.Principal, req.Capability, digest, req.Authority.EffectiveAuthorityRef(), string(desc.ExecutionClass), leaseDuration)
+	acq, err := e.store.AcquireWithAuthority(ctx, req.IdempotencyKey, req.Authority.Principal, req.Capability, digest,
+		idempotency.AuthorityBinding{
+			Ref:        req.Authority.EffectiveAuthorityRef(),
+			Generation: req.Authority.AuthorityGeneration,
+			Digest:     req.Authority.AuthorityDigest,
+		}, string(desc.ExecutionClass), leaseDuration)
 	if err != nil {
 		return Response{
 			Status:      StatusFailed,
@@ -207,6 +287,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	executionID := acq.Record.ExecutionID
 	leaseToken := acq.LeaseToken
 	leaseGen := acq.Generation
+	e.fireCrashPoint(CrashAfterAcquire)
 
 	// Deadline preflight BEFORE the dispatch boundary: an already-expired
 	// deadline is a provable no-effect failure — the handler will never
@@ -239,6 +320,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 			Error:       fmt.Sprintf("failed to begin execution (lease lost or state changed): %v", err),
 		}
 	}
+	e.fireCrashPoint(CrashAfterBeginExecution)
 
 	// ─── IN_FLIGHT: the dispatch boundary ───────────────────────────────────
 	// Persist the recovery locator BEFORE crossing IN_FLIGHT.
@@ -283,13 +365,25 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 			Error:       fmt.Sprintf("failed to transition to IN_FLIGHT (lease lost or state changed): %v", err),
 		}
 	}
+	e.fireCrashPoint(CrashAfterMarkInFlight)
 
 	// Lease heartbeat — renew the lease while the provider is
 	// executing. Without this, a long-running provider call can exceed
 	// the lease duration, causing the record to become UNKNOWN even
 	// though the provider eventually succeeds. The heartbeat uses the
 	// store's LeaseConfig for renewal interval and duration.
-	heartbeatCtx, heartbeatCancel := context.WithCancel(ctx)
+	//
+	// The heartbeat is detached from the caller's cancellation: the
+	// dispatch boundary is already crossed (IN_FLIGHT is persisted),
+	// so the lease must stay valid while the provider call runs AND
+	// while mandatory post-dispatch persistence completes on the
+	// detached durability context below. Deriving the heartbeat from
+	// ctx would let a caller disconnect kill lease renewal mid-
+	// finalization, opening a window where another worker reclaims
+	// the record while this executor is still committing the outcome.
+	// The heartbeat stops only when Execute returns — after the
+	// terminal or recovery state is durably persisted.
+	heartbeatCtx, heartbeatCancel := context.WithCancel(context.WithoutCancel(ctx))
 	defer heartbeatCancel()
 	go e.leaseHeartbeat(heartbeatCtx, executionID, leaseToken, leaseGen)
 
@@ -302,7 +396,9 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	if recoveryLocator.ExternalToken != "" {
 		dispatchCtx = context.WithValue(ctx, externalTokenKey{}, recoveryLocator.ExternalToken)
 	}
+	e.fireCrashPoint(CrashBeforeProvider)
 	resp, provableNoEffect := e.dispatch(dispatchCtx, req, desc)
+	e.fireCrashPoint(CrashAfterProvider)
 
 	// The provider has answered. Everything from here until the terminal
 	// write is mandatory persistence — it must survive caller
@@ -368,7 +464,9 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	if e.postDispatchHook != nil {
 		e.postDispatchHook()
 	}
+	e.fireCrashPoint(CrashBeforeObservation)
 	obsErr := e.recordObservation(durabilityCtx, executionID, leaseToken, leaseGen, providerResp, desc)
+	e.fireCrashPoint(CrashAfterObservation)
 
 	// The heartbeat stays alive through finalization — the lease must
 	// remain valid while we validate evidence, construct the receipt,
@@ -426,7 +524,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	// reconciliation sees the record rather than sealing the
 	// contradiction into an immutable terminal state.
 	if obsErr != nil {
-		recErr := e.enterRecoveryWithObservation(ctx, executionID, providerResp, desc)
+		recErr := e.enterRecoveryWithObservation(durabilityCtx, executionID, providerResp, desc)
 		errMsg := fmt.Sprintf("provider observation not persisted: %v", obsErr)
 		if recErr != nil {
 			errMsg += fmt.Sprintf("; %v", recErr)
@@ -546,6 +644,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	if e.preFinalizeHook != nil {
 		e.preFinalizeHook()
 	}
+	e.fireCrashPoint(CrashBeforeFinalize)
 	if err := e.store.Finalize(durabilityCtx, executionID, leaseToken, rec.LeaseGeneration, idempotency.StateInFlight, receipt); err != nil {
 		// Finalization failed AFTER dispatch — the side effect may
 		// have occurred. The provider observation was already persisted
@@ -572,6 +671,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 			},
 		}
 	}
+	e.fireCrashPoint(CrashAfterFinalize)
 
 	// Add execution metadata
 	if resp.Execution == nil {
@@ -750,6 +850,7 @@ func (e *DispatchExecutor) recordObservation(ctx context.Context, executionID, l
 // falls back to a direct observation update — the observation is still
 // persisted rather than lost to the CAS race.
 func (e *DispatchExecutor) enterRecoveryWithObservation(ctx context.Context, executionID string, resp Response, desc capability.ResolvedDescriptor) error {
+	e.fireCrashPoint(CrashBeforeRecovery)
 	obs := buildObservation(resp, desc)
 	rec, lookupErr := e.store.Lookup(ctx, executionID)
 	if lookupErr != nil {
@@ -760,6 +861,7 @@ func (e *DispatchExecutor) enterRecoveryWithObservation(ctx context.Context, exe
 			idempotency.StateInFlight, rec.Version, obs); err != nil {
 			return fmt.Errorf("recovery entry failed: %v; provider observation may not be persisted", err)
 		}
+		e.fireCrashPoint(CrashAfterRecovery)
 		return nil
 	}
 	if rec.State == idempotency.StateUnknown {
@@ -767,6 +869,7 @@ func (e *DispatchExecutor) enterRecoveryWithObservation(ctx context.Context, exe
 		if err := e.store.RecordProviderObservation(ctx, executionID, "", 0, obs); err != nil {
 			return fmt.Errorf("execution already in recovery; observation update failed: %v", err)
 		}
+		e.fireCrashPoint(CrashAfterRecovery)
 		return nil
 	}
 	// Terminal or pre-dispatch state — no recovery needed. A terminal

@@ -51,6 +51,21 @@ func (h *MultiHandler) PrepareRecovery(ctx context.Context, adapterID string, in
 	return provider.PrepareRecovery(ctx, in)
 }
 
+// ProviderCapabilities routes capability declarations to the handler
+// registered for adapterID. An unregistered adapter or a handler with
+// no declaration reports zero capabilities — the CRITICAL admission
+// gate fails closed either way.
+func (h *MultiHandler) ProviderCapabilities(adapterID string) ProviderCapabilities {
+	handler, ok := h.handlers[adapterID]
+	if !ok {
+		return ProviderCapabilities{}
+	}
+	if d, ok := handler.(CapabilityDeclarer); ok {
+		return d.ProviderCapabilities(adapterID)
+	}
+	return ProviderCapabilities{}
+}
+
 // Execute implements Handler for DispatchExecutor.
 // It delegates to ExecuteWithIdempotency which handles durable idempotency
 // and dispatch-point semantics.
