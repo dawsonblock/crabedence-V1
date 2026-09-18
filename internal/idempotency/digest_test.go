@@ -159,7 +159,7 @@ func TestComputeDigestAuthorityBinding(t *testing.T) {
 	}
 
 	// Zero authority material is byte-identical to the unbound digest.
-	zero, err := ComputeDigestFromRawWithAuthority(1, "alice@example.com", "test.counter.increment", args, "grant_123", "MUTATION", 0, "")
+	zero, err := ComputeDigestFromRawWithAuthority(1, "alice@example.com", "test.counter.increment", args, "grant_123", "MUTATION", 0, "", "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,11 +167,11 @@ func TestComputeDigestAuthorityBinding(t *testing.T) {
 		t.Error("zero authority material must preserve the unbound digest")
 	}
 
-	gen1, err := ComputeDigestFromRawWithAuthority(1, "alice@example.com", "test.counter.increment", args, "grant_123", "MUTATION", 1, "digest-a")
+	gen1, err := ComputeDigestFromRawWithAuthority(1, "alice@example.com", "test.counter.increment", args, "grant_123", "MUTATION", 1, "digest-a", "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	gen2, err := ComputeDigestFromRawWithAuthority(1, "alice@example.com", "test.counter.increment", args, "grant_123", "MUTATION", 2, "digest-b")
+	gen2, err := ComputeDigestFromRawWithAuthority(1, "alice@example.com", "test.counter.increment", args, "grant_123", "MUTATION", 2, "digest-b", "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,7 +184,7 @@ func TestComputeDigestAuthorityBinding(t *testing.T) {
 	}
 
 	// Generation alone (digest empty) still binds.
-	genOnly, err := ComputeDigestFromRawWithAuthority(1, "alice@example.com", "test.counter.increment", args, "grant_123", "MUTATION", 7, "")
+	genOnly, err := ComputeDigestFromRawWithAuthority(1, "alice@example.com", "test.counter.increment", args, "grant_123", "MUTATION", 7, "", "", "")
 	if err != nil {
 		t.Fatal(err)
 	}

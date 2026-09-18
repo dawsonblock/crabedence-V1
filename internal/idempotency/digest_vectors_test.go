@@ -138,7 +138,7 @@ func TestDigestVectors(t *testing.T) {
 			d, err := ComputeDigestFromRawWithAuthority(
 				v.ProtocolVersion, v.Principal, v.Capability,
 				json.RawMessage(v.RawArgs), v.GrantID, v.ExecutionClass,
-				v.AuthorityGeneration, v.AuthorityDigest,
+				v.AuthorityGeneration, v.AuthorityDigest, "", "",
 			)
 			if err != nil {
 				t.Fatalf("%s: digest: %v", v.Name, err)
@@ -184,7 +184,7 @@ func TestDigestVectors(t *testing.T) {
 			d, err := ComputeDigestFromRawWithAuthority(
 				v.ProtocolVersion, v.Principal, v.Capability,
 				json.RawMessage(v.RawArgs), v.GrantID, v.ExecutionClass,
-				v.AuthorityGeneration, v.AuthorityDigest,
+				v.AuthorityGeneration, v.AuthorityDigest, "", "",
 			)
 			if err != nil {
 				t.Fatalf("digest: %v", err)

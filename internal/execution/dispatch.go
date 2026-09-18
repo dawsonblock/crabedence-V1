@@ -179,6 +179,8 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		string(desc.ExecutionClass),
 		req.Authority.AuthorityGeneration,
 		req.Authority.AuthorityDigest,
+		string(desc.AssuranceProfile),
+		string(desc.ExecutionRoute),
 	)
 	if err != nil {
 		return Response{

@@ -84,9 +84,16 @@ func TestServiceBindsResolvedAuthorityIntoRequestDigest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lookup: %v", err)
 	}
+	desc := registry.Admit(capability.AdmissionRequest{
+		Capability:     "test.counter.increment",
+		Principal:      "alice@example.com",
+		GrantID:        "grant_x",
+		IdempotencyKey: "k",
+	}).Descriptor
 	want, err := idempotency.ComputeDigestFromRawWithAuthority(
 		1, "alice@example.com", "test.counter.increment", args,
-		"grant_x", "MUTATION", issued.Generation, issued.Digest)
+		"grant_x", "MUTATION", issued.Generation, issued.Digest,
+		string(desc.AssuranceProfile), string(desc.ExecutionRoute))
 	if err != nil {
 		t.Fatalf("compute digest: %v", err)
 	}
@@ -192,9 +199,16 @@ func TestCallerCannotForgeAuthorityBinding(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lookup: %v", err)
 	}
+	desc := registry.Admit(capability.AdmissionRequest{
+		Capability:     "test.counter.increment",
+		Principal:      "alice@example.com",
+		GrantID:        "grant_x",
+		IdempotencyKey: "k",
+	}).Descriptor
 	want, err := idempotency.ComputeDigestFromRawWithAuthority(
 		1, "alice@example.com", "test.counter.increment", args,
-		"grant_x", "MUTATION", issued.Generation, issued.Digest)
+		"grant_x", "MUTATION", issued.Generation, issued.Digest,
+		string(desc.AssuranceProfile), string(desc.ExecutionRoute))
 	if err != nil {
 		t.Fatalf("compute digest: %v", err)
 	}

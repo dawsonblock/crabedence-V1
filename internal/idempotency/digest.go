@@ -258,6 +258,14 @@ type DigestInput struct {
 	// unchanged (the binding is additive, not a format change).
 	AuthorityGeneration int64  `json:"authority_generation,omitempty"`
 	AuthorityDigest     string `json:"authority_digest,omitempty"`
+	// AssuranceProfile and ExecutionRoute bind the resolved admission
+	// decision into the execution identity — the same request admitted
+	// under a different assurance profile or route is a different
+	// durable execution. Empty values are omitted so callers that have
+	// no resolved profile/route produce unchanged digests (the binding
+	// is additive, not a format change).
+	AssuranceProfile string `json:"assurance_profile,omitempty"`
+	ExecutionRoute   string `json:"execution_route,omitempty"`
 }
 
 // ComputeDigest computes the SHA-256 digest of the canonical JSON
@@ -298,6 +306,12 @@ func ComputeDigest(input DigestInput) (string, error) {
 	if input.AuthorityDigest != "" {
 		canonicalInput["authority_digest"] = input.AuthorityDigest
 	}
+	if input.AssuranceProfile != "" {
+		canonicalInput["assurance_profile"] = input.AssuranceProfile
+	}
+	if input.ExecutionRoute != "" {
+		canonicalInput["execution_route"] = input.ExecutionRoute
+	}
 	canonical, err := CanonicalJSON(canonicalInput)
 	if err != nil {
 		return "", fmt.Errorf("failed to canonicalize digest input: %w", err)
@@ -318,15 +332,16 @@ func ComputeDigest(input DigestInput) (string, error) {
 // keeping the original lexical representation intact.
 func ComputeDigestFromRaw(protocolVersion int, principal, capability string, args json.RawMessage, grantID, class string) (string, error) {
 	return ComputeDigestFromRawWithAuthority(protocolVersion, principal, capability,
-		args, grantID, class, 0, "")
+		args, grantID, class, 0, "", "", "")
 }
 
 // ComputeDigestFromRawWithAuthority is ComputeDigestFromRaw plus the
-// immutable authority binding: the grant generation and grant digest
-// that admitted the request become part of the execution identity.
+// immutable admission binding: the grant generation, grant digest,
+// resolved assurance profile, and resolved execution route that
+// admitted the request become part of the execution identity.
 // Zero values bind nothing and produce byte-identical digests to
 // ComputeDigestFromRaw.
-func ComputeDigestFromRawWithAuthority(protocolVersion int, principal, capability string, args json.RawMessage, grantID, class string, authorityGeneration int64, authorityDigest string) (string, error) {
+func ComputeDigestFromRawWithAuthority(protocolVersion int, principal, capability string, args json.RawMessage, grantID, class string, authorityGeneration int64, authorityDigest, assuranceProfile, executionRoute string) (string, error) {
 	dec := json.NewDecoder(strings.NewReader(string(args)))
 	dec.UseNumber()
 	var argsMap map[string]any
@@ -356,6 +371,8 @@ func ComputeDigestFromRawWithAuthority(protocolVersion int, principal, capabilit
 		ExecutionClass:      class,
 		AuthorityGeneration: authorityGeneration,
 		AuthorityDigest:     authorityDigest,
+		AssuranceProfile:    assuranceProfile,
+		ExecutionRoute:      executionRoute,
 	})
 }
 

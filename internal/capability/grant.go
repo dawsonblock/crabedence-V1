@@ -17,6 +17,10 @@ type Grant struct {
 	Capabilities []string // capabilities this grant permits
 	ExpiresAt    time.Time
 	Revoked      bool
+	// IssuedAt is the issuance instant, part of the immutable grant
+	// material bound into Digest. Stores normalize it to Unix
+	// milliseconds before persisting.
+	IssuedAt time.Time
 	// Generation is the immutable version of this grant's material.
 	// Reissuing a grant_id produces a new generation row rather than
 	// mutating the already-issued grant, so a durable execution can
@@ -30,30 +34,41 @@ type Grant struct {
 }
 
 // ComputeGrantDigest returns the SHA-256 of the grant's canonical
-// material — grant_id, generation, principal, sorted capabilities, and
-// expiry — hex-encoded. It is deterministic: the same grant material
-// always produces the same digest, and any mutation produces a
-// different one. Execution request digests bind it so that the same
-// grant_id at a different generation is a different authority.
+// material — grant_id, generation, principal, sorted capabilities,
+// issuance time, and expiry — hex-encoded. It is deterministic: the
+// same grant material always produces the same digest, and any
+// mutation produces a different one. Execution request digests bind it
+// so that the same grant_id at a different generation is a different
+// authority.
+//
+// Time is bound as Unix-millisecond integers, never a formatted
+// timestamp string: SQLite stores expiry/issue as INTEGER ms and
+// PostgreSQL TIMESTAMPTZ round-trips ms-exact, so a resolved grant
+// always reproduces its stored digest identically on either backend.
 func ComputeGrantDigest(g *Grant) string {
 	caps := append([]string(nil), g.Capabilities...)
 	sort.Strings(caps)
-	expires := ""
+	var issuedAtMs, expiresAtMs int64
+	if !g.IssuedAt.IsZero() {
+		issuedAtMs = g.IssuedAt.UTC().UnixMilli()
+	}
 	if !g.ExpiresAt.IsZero() {
-		expires = g.ExpiresAt.UTC().Format(time.RFC3339Nano)
+		expiresAtMs = g.ExpiresAt.UTC().UnixMilli()
 	}
 	canonical, err := json.Marshal(struct {
 		GrantID      string   `json:"grant_id"`
 		Generation   int64    `json:"generation"`
 		Principal    string   `json:"principal"`
 		Capabilities []string `json:"capabilities"`
-		ExpiresAt    string   `json:"expires_at"`
+		IssuedAtMs   int64    `json:"issued_at_ms"`
+		ExpiresAtMs  int64    `json:"expires_at_ms"`
 	}{
 		GrantID:      g.ID,
 		Generation:   g.Generation,
 		Principal:    g.Principal,
 		Capabilities: caps,
-		ExpiresAt:    expires,
+		IssuedAtMs:   issuedAtMs,
+		ExpiresAtMs:  expiresAtMs,
 	})
 	if err != nil {
 		return ""

@@ -3,6 +3,10 @@ package authority
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -266,5 +270,202 @@ func TestGrantDigestDeterminism(t *testing.T) {
 	g4 := &capability.Grant{ID: "g", Generation: 3, Principal: "alice", Capabilities: []string{"cap.a"}, ExpiresAt: exp}
 	if capability.ComputeGrantDigest(g1) == capability.ComputeGrantDigest(g4) {
 		t.Error("expected capability change to alter digest")
+	}
+}
+
+// openSQLiteFile opens a file-backed SQLite database with the same
+// transaction semantics as the production store: WAL, busy timeout,
+// and BEGIN IMMEDIATE — required for real multi-connection concurrency.
+func openSQLiteFile(t *testing.T) *sql.DB {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "authority.db")
+	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)"+
+		"&_pragma=synchronous(FULL)&_pragma=busy_timeout(10000)"+
+		"&_txlock=immediate", path)
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("open sqlite file: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return db
+}
+
+// TestSQLiteIssueConcurrentSerialized hammers one grant_id with 50
+// concurrent IssueGrant calls. The authority-head lock must serialize
+// them into exactly generations 1..50 — no duplicates, no primary-key
+// failures, no skipped generations.
+func TestSQLiteIssueConcurrentSerialized(t *testing.T) {
+	db := openSQLiteFile(t)
+	store, err := NewSQLiteStore(db)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	ctx := context.Background()
+
+	const workers = 50
+	gens := make(chan int64, workers)
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			g, err := store.IssueGrant(ctx, "g-conc", "alice", []string{"cap.a"}, time.Now().Add(time.Hour))
+			if err != nil {
+				errs <- err
+				return
+			}
+			gens <- g.Generation
+		}()
+	}
+	wg.Wait()
+	close(gens)
+	close(errs)
+
+	for err := range errs {
+		t.Fatalf("concurrent issue failed: %v", err)
+	}
+	seen := map[int64]bool{}
+	for g := range gens {
+		if seen[g] {
+			t.Fatalf("duplicate generation issued: %d", g)
+		}
+		seen[g] = true
+	}
+	for want := int64(1); want <= workers; want++ {
+		if !seen[want] {
+			t.Fatalf("generation %d missing from issued set %v", want, seen)
+		}
+	}
+}
+
+// TestSQLiteRevokeGeneration verifies generation-scoped revocation:
+// only the named immutable generation is revoked, under the same
+// authority-head lock as issuance.
+func TestSQLiteRevokeGeneration(t *testing.T) {
+	db := openSQLite(t)
+	store, err := NewSQLiteStore(db)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	ctx := context.Background()
+
+	if _, err := store.IssueGrant(ctx, "g1", "alice", []string{"cap.a"}, time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("issue gen1: %v", err)
+	}
+	if _, err := store.IssueGrant(ctx, "g1", "alice", []string{"cap.a"}, time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("issue gen2: %v", err)
+	}
+
+	if err := store.RevokeGeneration(ctx, "g1", 1); err != nil {
+		t.Fatalf("revoke gen1: %v", err)
+	}
+	var g1Revoked, g2Revoked int
+	if err := db.QueryRowContext(ctx, `SELECT revoked FROM authority_grants WHERE grant_id='g1' AND generation=1`).Scan(&g1Revoked); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT revoked FROM authority_grants WHERE grant_id='g1' AND generation=2`).Scan(&g2Revoked); err != nil {
+		t.Fatal(err)
+	}
+	if g1Revoked != 1 {
+		t.Error("generation 1 was not revoked")
+	}
+	if g2Revoked != 0 {
+		t.Error("generation 2 must not be revoked by a generation-1 revocation")
+	}
+
+	// Latest generation still resolves; revoking it kills the grant.
+	if got, _ := store.Resolve(ctx, "g1", "alice"); got == nil {
+		t.Fatal("generation 2 should still resolve after gen1 revocation")
+	}
+	if err := store.RevokeGeneration(ctx, "g1", 2); err != nil {
+		t.Fatalf("revoke gen2: %v", err)
+	}
+	if got, _ := store.Resolve(ctx, "g1", "alice"); got != nil {
+		t.Fatal("latest generation revoked — grant must not resolve")
+	}
+
+	if err := store.RevokeGeneration(ctx, "g1", 99); err == nil {
+		t.Error("revoking a nonexistent generation must fail")
+	}
+}
+
+// TestSQLiteCloseAuthorityRef verifies closure blocks all future
+// issuance under the reference — including on an authority ref that
+// never existed — while leaving issued generations resolvable.
+func TestSQLiteCloseAuthorityRef(t *testing.T) {
+	db := openSQLite(t)
+	store, err := NewSQLiteStore(db)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	ctx := context.Background()
+
+	issued, err := store.IssueGrant(ctx, "g1", "alice", []string{"cap.a"}, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+	if err := store.CloseAuthorityRef(ctx, "g1"); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if _, err := store.IssueGrant(ctx, "g1", "alice", []string{"cap.a"}, time.Now().Add(time.Hour)); !errors.Is(err, ErrAuthorityClosed) {
+		t.Fatalf("issue under closed ref = %v, want ErrAuthorityClosed", err)
+	}
+	// Closure does not revoke the already-issued material.
+	got, err := store.Resolve(ctx, "g1", "alice")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if got == nil || got.Generation != issued.Generation || got.Digest != issued.Digest {
+		t.Fatalf("closed ref's issued grant must remain resolvable, got %+v", got)
+	}
+
+	// Closing a never-issued ref creates a closed head — no generation
+	// can ever be minted under it.
+	if err := store.CloseAuthorityRef(ctx, "never-issued"); err != nil {
+		t.Fatalf("close unknown ref: %v", err)
+	}
+	if _, err := store.IssueGrant(ctx, "never-issued", "alice", []string{"cap.a"}, time.Now().Add(time.Hour)); !errors.Is(err, ErrAuthorityClosed) {
+		t.Fatalf("issue under never-issued closed ref = %v, want ErrAuthorityClosed", err)
+	}
+}
+
+// TestSQLiteResolvedDigestRecomputable is the shared conformance
+// invariant: a resolved grant always reproduces its stored digest —
+// issued_at/expires_at are bound as the exact Unix-millisecond
+// integers the store persisted, so sub-millisecond input precision
+// cannot break the invariant on either backend.
+func TestSQLiteResolvedDigestRecomputable(t *testing.T) {
+	db := openSQLite(t)
+	store, err := NewSQLiteStore(db)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	ctx := context.Background()
+
+	// Nanosecond-precision expiry — the pre-repair digest bound
+	// RFC3339Nano while the store persisted milliseconds, so a
+	// resolved grant could never reproduce its stored digest.
+	expires := time.Date(2030, 6, 15, 10, 30, 0, 123456789, time.UTC)
+	issued, err := store.IssueGrant(ctx, "g1", "alice", []string{"cap.a"}, expires)
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+	if issued.IssuedAt.IsZero() {
+		t.Error("issued grant must carry issued_at material")
+	}
+
+	got, err := store.Resolve(ctx, "g1", "alice")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if got == nil {
+		t.Fatal("grant did not resolve")
+	}
+	if got.Digest != issued.Digest {
+		t.Errorf("resolved digest %s != issued digest %s", got.Digest, issued.Digest)
+	}
+	if want := capability.ComputeGrantDigest(got); got.Digest != want {
+		t.Errorf("resolved digest %s does not recompute to %s", got.Digest, want)
 	}
 }
