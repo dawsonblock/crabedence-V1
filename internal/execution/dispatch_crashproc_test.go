@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -49,8 +50,13 @@ func TestCrashHelperProcess(t *testing.T) {
 		os.Exit(2)
 	}
 	point := CrashPoint(os.Getenv("CRABBOX_CRASH_POINT"))
-	p := &simProvider{effect: true}
-	exec := NewDispatchExecutor(p, store)
+	var h Handler = &simProvider{effect: true}
+	if u := os.Getenv("CRABBOX_PROVIDER_URL"); u != "" {
+		// External provider subprocess — the side effect survives
+		// this process's death in the provider's own durable log.
+		h = &httpProvider{baseURL: u, client: &http.Client{Timeout: 10 * time.Second}}
+	}
+	exec := NewDispatchExecutor(h, store)
 	exec.SetCrashHook(func(cp CrashPoint) {
 		if cp == point {
 			// Die like a power loss — no defers, no cleanup.
