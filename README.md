@@ -7,98 +7,70 @@
 [![Release verification](https://github.com/openclaw/crabbox/actions/workflows/release-assets.yml/badge.svg)](https://github.com/openclaw/crabbox/actions/workflows/release-assets.yml)
 [![Latest release](https://badgen.net/github/release/openclaw/crabbox/stable)](https://github.com/openclaw/crabbox/releases/latest)
 
-**Warm a box, sync the diff, run the suite — with cryptographically attributable execution evidence.**
+**Warm a box, sync the diff, run the suite — with durable, cryptographically attributable execution evidence.**
 
-Crabbox is a generic remote software testing and execution control plane. It is
-for maintainers, contributors, and automation that need to run repository
-commands somewhere other than the laptop in front of them: on managed cloud
-capacity, an existing SSH host, or a delegated sandbox provider. Crabbox keeps
-the local edit-save-run workflow, but moves the expensive or evidence-producing
-work onto a remote runner.
+Crabbox is a remote software testing and execution control plane for
+maintainers, contributors, and automation that need to run repository commands
+somewhere other than the laptop in front of them: managed cloud capacity, an
+existing SSH host, or a delegated sandbox provider. It keeps the local
+edit-save-run workflow and moves the expensive or evidence-producing work onto
+a remote runner.
 
 ```sh
 crabbox run -- pnpm test
 ```
 
-Behind that one command, Crabbox leases or selects a runner, syncs the current
-working tree, runs the command remotely, streams output back, records
-evidence, and releases or unclaims the target. The system is a Go CLI on your machine, an
-optional coordinator that owns provider credentials and lease state, and a
-managed or delegated runner. Run the coordinator on Cloudflare Workers with a
-Durable Object, or as a Node.js service backed by PostgreSQL.
+Behind that one command, Crabbox leases or selects a runner, syncs the working
+tree, runs the command remotely, streams output back, records evidence, and
+releases the target. The system is a Go CLI on your machine, an optional
+coordinator that owns provider credentials and lease state, and a managed or
+delegated runner — plus **Crabedence**, a planner-agnostic execution kernel
+whose **Effect Fabric** gives every mutating invocation a durable, crash-safe,
+cryptographically provable outcome.
 
-Every run produces a `RunEvidenceV1` record — a portable, versioned, SHA-256
-digested execution outcome. The evidence digest is bound into an Ed25519-signed
-`TerminalRunReceiptV3`, so terminal execution results are independently
-verifiable in both Go and TypeScript. See
-[Run evidence spec](docs/spec/run-evidence.md).
+**Contents** — [Architecture](#architecture-at-a-glance) ·
+[The Effect Fabric](#the-effect-fabric) ·
+[Execution kernel](#execution-kernel) · [Install](#install) ·
+[Quick start](#quick-start) · [Providers](#providers) ·
+[Configuration](#configuration) · [Development](#development) ·
+[Docs](#docs)
 
-## Who Crabbox is for
-
-Crabbox fits teams and tools that need repeatable remote execution without
-turning every test run into a bespoke CI job:
-
-- maintainers who need faster or larger machines for test suites, builds,
-  browser checks, or platform-specific validation;
-- contributors who want a disposable environment that matches a repository's
-  setup scripts and can be released when the run finishes;
-- AI agents and other automation that need command output, logs, artifacts, and
-  run history from an auditable remote box — with cryptographically signed
-  execution evidence and a typed execution boundary for reasoning systems;
-- teams that want coordinator-owned cloud credentials, spend caps, cleanup, and
-  shared usage history instead of local long-lived provider keys.
-
-Use Crabbox when local compute is too slow, the target platform is somewhere
-else, a workflow needs a clean disposable runner, or a reviewer needs streamed
-evidence from the exact command that ran. Do not use it as a replacement for CI,
-a hostile multi-tenant sandbox, a secrets scrubber, or an isolation boundary
-between mutually untrusted users.
-
-## Trust model
-
-Crabbox is a developer execution tool, not a hostile multi-tenant platform or a
-uniform security sandbox. It assumes the local OS user, repository
-configuration, configured project tooling, and authenticated coordinator
-operators are trusted. Repository configuration is executable project
-automation: it can run local helpers, select runtimes, mount host resources,
-and control development infrastructure. Review unfamiliar repositories before
-running Crabbox.
-
-The optional coordinator is intended for a cooperative trusted team. Its
-authentication, ownership, and sharing controls prevent unauthorized access
-and accidental cross-owner operations, but do not provide isolation between
-mutually adversarial tenants. See the [Security Policy](SECURITY.md) for the
-supported boundary and [Operational security](docs/security.md) for deployment
-guidance.
-
-Within that boundary, credentialed HTTP redirects are confined to their
-configured origin, destructive provider recovery requires an exact local claim
-or stronger provider-side ownership metadata, and artifact publication accepts
-only regular files from the selected bundle. Provider diagnostics redact
-configured credentials on the documented clients, but captured output and
-failure bundles are not automatically scrubbed; review them before sharing. See
-[Operational security](docs/security.md) and [Artifacts](docs/features/artifacts.md).
-
-## How it works
+## Architecture at a glance
 
 ```text
-your laptop                 coordinator runtime              cloud provider
--------------               -------------------              --------------
-crabbox CLI    -- HTTPS --> Cloudflare + Durable Object  --> Hetzner / AWS / Azure / GCP / Daytona
-   |                      or Node.js + PostgreSQL              |
-   |                                                           |
-   +------------- SSH + rsync to leased runner <---------------+
+your laptop                    coordinator runtime               cloud provider
+-------------                  -------------------               --------------
+crabbox CLI     -- HTTPS -->   Cloudflare + Durable Object   -->  Hetzner / AWS / Azure /
+   |                         or Node.js + PostgreSQL              GCP / Daytona
+   |                                                                   |
+   +---------------- SSH + rsync to leased runner <-------------------+
+
+ANY PLANNER (Hermes, OpenAI Agents SDK, LangGraph, custom)
+      │  capability invocation ABI
+      ▼  (capability, arguments, principal, grant_id, idempotency_key)
+CRABEDENCE EXECUTION KERNEL  —  crabbox serve-execution (Unix socket)
+      │
+      ├─ capability registry        authoritative execution classes
+      ├─ authority verification     immutable, digest-bound grants
+      ├─ exact-number validation    arbitrary-precision schema checks
+      ├─ EFFECT FABRIC              durable EffectStore — SQLite or PostgreSQL
+      │     PREPARED → EXECUTING → IN_FLIGHT → COMMITTED | FAILED | UNKNOWN
+      │     fenced leases · cluster-epoch DR fencing · recovery mode
+      ├─ provider dispatch          detached post-dispatch durability
+      ├─ forensic observation ledger  immutable provider records
+      ├─ RunEvidenceV1 + Ed25519 TerminalRunReceiptV3 signing
+      └─ reconciliation             UNKNOWN resolved by independent evidence
 ```
 
 - **CLI** — Go binary. Loads config, mints a per-lease SSH key, asks the broker
   for a lease, waits for SSH, seeds remote Git, rsyncs the dirty checkout (with
   a fingerprint skip when nothing changed), runs the command, streams output,
   releases.
-- **Coordinator** — the same fleet control plane on either Cloudflare Workers
-  plus a Fleet Durable Object, or Node.js plus PostgreSQL and pg-boss. Owns
-  provider credentials, serializes lease state, enforces active-lease and
-  monthly spend caps, and expires stale leases. Auth is GitHub browser login, a
-  shared bearer token, or an explicitly trusted identity proxy.
+- **Coordinator** — the same fleet control plane on Cloudflare Workers plus a
+  Fleet Durable Object, or Node.js plus PostgreSQL and pg-boss. Owns provider
+  credentials, serializes lease state, enforces active-lease and monthly spend
+  caps, and expires stale leases. Auth is GitHub browser login, a shared
+  bearer token, or an explicitly trusted identity proxy.
 - **Runner** — a throwaway machine reachable over SSH on the primary port
   (default `2222`) plus configured fallback ports, prepared with Crabbox's
   sync/run prerequisites. Linux uses Ubuntu with cloud-init and `/work/crabbox`;
@@ -106,6 +78,11 @@ crabbox CLI    -- HTTPS --> Cloudflare + Durable Object  --> Hetzner / AWS / Azu
   credentials live on the box. Project runtimes (Go, Node, Docker, services,
   secrets) come from your repo's GitHub Actions hydration, devcontainer, Nix,
   mise/asdf, or setup scripts — not from Crabbox.
+- **Execution kernel** — a persistent Go service owning capability resolution,
+  authority verification, durable idempotency, provider dispatch, evidence
+  generation, receipt signing, and reconciliation. Planners connect over a
+  length-prefixed JSON Unix-socket ABI; the kernel — never the planner —
+  decides execution class, authority, and provider binding.
 
 The normal CLI data plane — SSH, rsync, command execution — runs directly from
 the CLI to the runner. A dedicated
@@ -113,77 +90,151 @@ the CLI to the runner. A dedicated
 separate SSM-only controller path for API-managed workspaces; it has no public
 instance address or SSH access.
 
-Only `aws`, `azure`, `daytona`, `gcp`, and `hetzner` can transfer provider lifecycle to the
-coordinator, and even those run direct from the CLI when no coordinator URL is
-configured. Every other provider runs direct or delegated. A direct-provider mode
-(`--provider hetzner|aws|azure|daytona|gcp|digitalocean|linode|proxmox` with local
-credentials) exists for debugging the coordinator itself or using private
-infrastructure.
+Only `aws`, `azure`, `daytona`, `gcp`, and `hetzner` can transfer provider
+lifecycle to the coordinator, and even those run direct from the CLI when no
+coordinator URL is configured. Every other provider runs direct or delegated.
+A direct-provider mode (`--provider hetzner|aws|azure|daytona|gcp|digitalocean|linode|proxmox`
+with local credentials) exists for debugging the coordinator itself or using
+private infrastructure.
 
 ### Coordinator deployment choices
 
-| Path                     | State and scheduling                                          | Best fit                                                                                                                     |
-| ------------------------ | ------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| **Cloudflare Workers**   | Fleet Durable Object, alarms, scheduled Worker trigger        | Managed edge deployment with minimal server operations and optional Cloudflare Access.                                       |
+| Path                     | State and scheduling                                          | Best fit                                                                                                                    |
+| ------------------------ | ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| **Cloudflare Workers**   | Fleet Durable Object, alarms, scheduled Worker trigger        | Managed edge deployment with minimal server operations and optional Cloudflare Access.                                      |
 | **Node.js + PostgreSQL** | PostgreSQL key/value state, pg-boss alarms and reconciliation | Initial runtime for containers, a VM, or Kubernetes with one replica; requires Node.js, PostgreSQL 13+, TLS, and WebSockets. |
-| **No coordinator**       | Local claims and provider-owned state                         | Personal/direct providers where shared credentials, history, budgets, and central cleanup are unnecessary.                   |
+| **No coordinator**       | Local claims and provider-owned state                         | Personal/direct providers where shared credentials, history, budgets, and central cleanup are unnecessary.                  |
 
 Both coordinator runtimes expose the same API, GitHub login, portal, provider
 adapters, cost controls, cleanup behavior, and live bridges. State is not
-automatically migrated between Durable Object storage and PostgreSQL.
-Cloudflare is the established deployment; validate the newly shipped Node
-runtime against the production proof checklist before cutover. See
+automatically migrated between Durable Object storage and PostgreSQL. See
 [Infrastructure](docs/infrastructure.md) for deployment and ingress details.
-For a dedicated Node/PostgreSQL service that owns small private AWS workspaces,
-use the fail-closed ECS Fargate deployment and canary in
-[Private AWS Workspaces](docs/features/aws-private-workspaces.md). Client-side
-labels do not select that service's AWS placement; its URL and server policy do.
 
-For the full mental model, see [How Crabbox Works](docs/how-it-works.md). For
-product scope and non-goals, see the [Crabbox Vision](VISION.md). For the
-doc-to-code map, see [Source Map](docs/source-map.md).
+## The Effect Fabric
 
-### Execution kernel
+The Effect Fabric is Crabedence's durable execution contract — a frozen state
+machine, forensic evidence model, and fencing protocol implemented identically
+by two storage engines: `SQLiteStore` (embedded WAL, `synchronous=FULL`, the
+single-host default) and `Store` (PostgreSQL, for clustered deployments). A
+shared conformance suite runs the same invariant checks against both engines —
+an engine-specific regression is a contract violation regardless of which
+backend exhibits it. The contract is pinned by
+[ADR-002](docs/adr/ADR-002-durable-effect-r13-contract-freeze.md) and specified
+in the [durable execution contract](docs/spec/durable-execution-contract.md).
+
+```text
+PREPARED ──▶ EXECUTING ──▶ IN_FLIGHT ──▶ COMMITTED | FAILED | UNKNOWN
+    ▲            │                            │                     │
+    └────────────┘ AbandonPreDispatch         │            reconciliation
+         (dispatch boundary                   │            (independent
+          not crossed)                        ▼            evidence only)
+                                    external provider          ▼
+                                    effect MAY have      COMMITTED | FAILED
+                                    occurred
+```
+
+The frozen invariants:
+
+- **`IN_FLIGHT` means the external effect may have occurred.** A crash after
+  dispatch can never be resolved as "definitely didn't run" — the record
+  becomes or stays `UNKNOWN`.
+- **`UNKNOWN` can never automatically redispatch.** It is a first-class
+  terminal-pending state resolved only by independent evidence — provider
+  operation lookup, signed receipts — never by blind retry.
+- **Caller cancellation cannot cancel mandatory post-dispatch persistence.**
+  Detached durability work completes even when the invoking context dies.
+- **Terminal states cannot regress.** `COMMITTED` and `FAILED` are immutable.
+- **Provider observations are durable before classification and immutable
+  forever.** The observation ledger preserves the provider's original result
+  bytes and digests; terminal resolution never overwrites them. Conflicting
+  observations on the same record are rejected with a typed
+  `PROVIDER_OBSERVATION_CONFLICT`.
+- **`CRITICAL COMMITTED` requires signed `COMPLETED` evidence; `CRITICAL
+  FAILED` requires signed `NO_EFFECT` evidence.** Receipts are Ed25519-signed
+  and verified against a trusted signer fingerprint ring; a resolver's own
+  assertion is never evidence. One terminal policy covers both `Finalize` and
+  `ResolveRecovery` — there is no weaker recovery path.
+- **Authority is immutable and digest-bound.** Grant generations are strictly
+  increasing under a serialized authority head; revocation and closure are
+  durable and explicit, and every admitted execution records the generation
+  and grant digest that permitted it.
+- **Every mutation is fenced.** Lease token + generation + state/version CAS
+  + cluster epoch — inside the mutation, on database-owned time.
+- **Request identity is exact.** Canonical digests use normalized
+  arbitrary-precision number representation and fail closed; schema
+  validation never routes JSON numbers through `float64`, so
+  `9007199254740993` is never silently rounded to `9007199254740992`.
+
+### Disaster-recovery fencing
+
+A persisted cluster epoch in `cluster_meta` fences stale executors after a
+snapshot restore or environment rebuild. Stores capture their admitted epoch
+at construction; every mutation requires it to still match, and stale writers
+fail with the typed `CLUSTER_EPOCH_MISMATCH`. `AdvanceClusterEpoch` is a
+compare-and-swap increment that also declares `RECOVERY_REQUIRED` — new-effect
+admission stays closed (`CLUSTER_RECOVERY_REQUIRED`) while reads and
+reconciliation of inherited `IN_FLIGHT`/`UNKNOWN` records remain open, until
+`CompleteClusterRecovery` reopens admission. Reads are never fenced: a fenced
+executor can still see the world it can no longer mutate.
+
+### Signer policy and forensic evidence
+
+CRITICAL evidence is signed by provisioned Ed25519 keys. Development mode may
+auto-generate a signer; production mode (`CRABBOX_MODE=production`) and any
+multi-replica deployment (`CRABBOX_REPLICAS > 1`) fail closed without an
+externally provisioned key (`CRABBOX_EVIDENCE_KEY`), because each replica that
+mints its own key silently creates an independent evidence identity. Signer
+publication is crash-durable — atomic no-clobber write, file sync, directory
+sync — and rotation keeps retired fingerprints in the trusted ring so
+historical receipts remain verifiable.
+
+### Observability
+
+`StoreMetrics().Snapshot()` exports semantic counters — acquires, terminal
+outcomes, UNKNOWN entries, lease renewals, fence rejections, lease losses,
+observation writes and conflicts, reconcile claims/resolutions/suspensions,
+CRITICAL evidence rejections, cluster-epoch and recovery-mode rejections.
+`ReconciliationBacklog` returns the pending UNKNOWN count and oldest entry age
+in one query — the top alert signal. The authority stores expose the same
+contract: issuance, revocation, closure, resolve, and resolve-denial counters.
+See the [operations spec](docs/spec/durable-execution-operations.md) for the
+alert table and qualification tiers (`QUALIFIED_LOCAL` →
+`QUALIFIED_SINGLE_NODE` → `QUALIFIED_POSTGRES` → `QUALIFIED_DISTRIBUTED`).
+
+### Adversarial qualification
+
+The contract is qualified, not just implemented: a deterministic crash-point
+matrix SIGKILLs real executor and external-provider processes at every durable
+boundary (post-acquire through post-recovery), asserts at-most-once external
+effect and reconcilable UNKNOWN, runs 50-process PostgreSQL dispatch torture
+(exactly one dispatch) and racing-reconciler claims (exactly one claim), and
+verifies migration crash-consistency and WAL integrity on SQLite. Cross-language
+conformance proves Go and TypeScript produce identical canonical evidence and
+accept/reject identical receipt domains.
+
+## Execution kernel
 
 Crabedence is a planner-agnostic trusted execution kernel. Any
-planning/reasoning runtime (Hermes, OpenAI Agents SDK, LangGraph,
-custom) can invoke capabilities through a stable ABI. Crabedence
-independently resolves execution class, authority, schema, and
-provider binding from its registry — the planner does not supply
-security-relevant properties.
+planning/reasoning runtime (Hermes, OpenAI Agents SDK, LangGraph, custom) can
+invoke capabilities through a stable ABI. Crabedence independently resolves
+execution class, authority, schema, and provider binding from its registry —
+the planner does not supply security-relevant properties.
 
-See [Architecture: Planner-Agnostic Execution Kernel](docs/architecture/execution-kernel.md)
+See
+[Architecture: Planner-Agnostic Execution Kernel](docs/architecture/execution-kernel.md)
 and [Capability Invocation ABI](docs/spec/capability-invocation-abi.md).
 
 ```text
-ANY PLANNER (Hermes, OpenAI SDK, custom)
-      │
-      ▼
-   capability invocation ABI
-   (capability, arguments, principal, grant_id, idempotency_key)
+capability invocation ABI
+(capability, arguments, principal, grant_id, idempotency_key)
       │
       ├─ PURE → local execution (no socket hop)
       └─ READ / MUTATION / CRITICAL → Crabedence
-            │
-            ▼ (Unix socket, length-prefixed JSON)
-         CRABEDENCE EXECUTION KERNEL
-            │
-            ├─ capability registry (authoritative execution classes)
-            ├─ authority verification (grant resolution)
-            ├─ durable idempotency (SQLite WAL local, PostgreSQL clustered)
-            ├─ provider dispatch
-            ├─ RunEvidenceV1 generation
-            ├─ V3 receipt signing
-            └─ reconciliation
-                  │
-                  ├─ MCP / APIs / Crabbox workers
 ```
 
-Execution classes are immutable once registered — a CRITICAL capability
-cannot be downgraded to READ at runtime. MUTATION and CRITICAL operations
-require idempotency keys. UNKNOWN is a first-class terminal state: a lost
-response after dispatch returns UNKNOWN (not FAILED), preventing duplicate
-side effects on retry.
+Execution classes are immutable once registered — a CRITICAL capability cannot
+be downgraded to READ at runtime. MUTATION and CRITICAL operations require
+idempotency keys.
 
 The `crabbox serve-execution` command starts the persistent Go execution
 service on a Unix socket. This is the production architecture: a long-lived
@@ -207,10 +258,10 @@ crabbox serve-execution
 # multi-replica or clustered deployments.
 ```
 
-The `crabbox exec` command is a stdin/stdout bridge for testing and
-ad-hoc execution. It validates requests through the same capability
-registry but cannot dispatch to providers — use `crabbox serve-execution`
-for real execution.
+The `crabbox exec` command is a stdin/stdout bridge for testing and ad-hoc
+execution. It validates requests through the same capability registry but
+cannot dispatch to providers — use `crabbox serve-execution` for real
+execution.
 
 ```sh
 # Validate a request (returns CAPABILITY_UNIMPLEMENTED for dispatch)
@@ -218,16 +269,17 @@ echo '{"capability":"system.echo","arguments":{},"authority":{"principal":"alice
 ```
 
 Built-in capabilities:
+
 - `system.echo` (PURE) — returns arguments as echo result
 - `system.info` (READ) — returns system information (goes through remote port)
 - `test.counter.increment` (MUTATION) — harmless mutation with idempotency
 
 ### NEMO
 
-NEMO (`nemo/`) is an optional specialized reasoning/research component,
-not the parent runtime. It provides a thin adapter to Crabedence's
-Unix socket and a test client for the execution service. Any planner
-can replace NEMO — the capability invocation ABI is the stable boundary.
+NEMO (`nemo/`) is an optional specialized reasoning/research component, not
+the parent runtime. It provides a thin adapter to Crabedence's Unix socket and
+a test client for the execution service. Any planner can replace NEMO — the
+capability invocation ABI is the stable boundary.
 
 See [Capability Invocation ABI](docs/spec/capability-invocation-abi.md),
 [NEMO contracts](nemo/contracts/execution.ts),
@@ -236,6 +288,53 @@ See [Capability Invocation ABI](docs/spec/capability-invocation-abi.md),
 [Go capability registry](internal/capability/registry.go),
 [Go execution service](internal/execution/service.go), and
 [Go idempotency store](internal/idempotency/store.go).
+
+## Who Crabbox is for
+
+Crabbox fits teams and tools that need repeatable remote execution without
+turning every test run into a bespoke CI job:
+
+- maintainers who need faster or larger machines for test suites, builds,
+  browser checks, or platform-specific validation;
+- contributors who want a disposable environment that matches a repository's
+  setup scripts and can be released when the run finishes;
+- AI agents and other automation that need command output, logs, artifacts,
+  and run history from an auditable remote box — with cryptographically signed
+  execution evidence and a typed execution boundary for reasoning systems;
+- teams that want coordinator-owned cloud credentials, spend caps, cleanup,
+  and shared usage history instead of local long-lived provider keys.
+
+Use Crabbox when local compute is too slow, the target platform is somewhere
+else, a workflow needs a clean disposable runner, or a reviewer needs streamed
+evidence from the exact command that ran. Do not use it as a replacement for
+CI, a hostile multi-tenant sandbox, a secrets scrubber, or an isolation
+boundary between mutually untrusted users.
+
+## Trust model
+
+Crabbox is a developer execution tool, not a hostile multi-tenant platform or
+a uniform security sandbox. It assumes the local OS user, repository
+configuration, configured project tooling, and authenticated coordinator
+operators are trusted. Repository configuration is executable project
+automation: it can run local helpers, select runtimes, mount host resources,
+and control development infrastructure. Review unfamiliar repositories before
+running Crabbox.
+
+The optional coordinator is intended for a cooperative trusted team. Its
+authentication, ownership, and sharing controls prevent unauthorized access
+and accidental cross-owner operations, but do not provide isolation between
+mutually adversarial tenants. See the [Security Policy](SECURITY.md) for the
+supported boundary and [Operational security](docs/security.md) for deployment
+guidance.
+
+Within that boundary, credentialed HTTP redirects are confined to their
+configured origin, destructive provider recovery requires an exact local
+claim or stronger provider-side ownership metadata, and artifact publication
+accepts only regular files from the selected bundle. Provider diagnostics
+redact configured credentials on the documented clients, but captured output
+and failure bundles are not automatically scrubbed; review them before
+sharing. See [Operational security](docs/security.md) and
+[Artifacts](docs/features/artifacts.md).
 
 ## Install
 
@@ -247,9 +346,10 @@ crabbox --version
 ```
 
 The [release archives](https://github.com/openclaw/crabbox/releases) are the
-other complete distribution for macOS, Linux, and Windows. Go users can instead
-compile and install only the CLI from an explicit release version (supported
-starting with v0.44.0; do not use `@latest` while older releases remain visible):
+other complete distribution for macOS, Linux, and Windows. Go users can
+instead compile and install only the CLI from an explicit release version
+(supported starting with v0.44.0; do not use `@latest` while older releases
+remain visible):
 
 ```sh
 go install github.com/openclaw/crabbox/cmd/crabbox@v0.44.0
@@ -260,28 +360,28 @@ use Go 1.26.5 or newer, or leave Go's automatic toolchain selection enabled.
 `go install` builds the Go CLI locally. It does not install release companion
 executables or assets, especially `crabbox-apple-vm-helper`, and it is not the
 signed/notarized prebuilt distribution. Use Homebrew or a release archive for
-complete platform capabilities, notably the Apple VM provider on Apple Silicon.
+complete platform capabilities, notably the Apple VM provider on Apple
+Silicon.
 
 The native Windows CLI requires Windows 10 version 1709+ or Windows Server
-2019+ for snapshot-preserving state replacement and cleanup.
-Supported WSL2 and x64 no-WSL Windows transfer selection requires a build from
-current `main` or Crabbox v0.42.1 and newer. Follow the
+2019+ for snapshot-preserving state replacement and cleanup. Supported WSL2
+and x64 no-WSL Windows transfer selection requires a build from current
+`main` or Crabbox v0.42.1 and newer. Follow the
 [Windows installation guide](docs/windows-install.md) for the supported setup.
 
-The Apple Silicon Homebrew install uses the release archive that also contains
-the native `crabbox-apple-vm-helper` for the local Apple VM provider.
+The Apple Silicon Homebrew install uses the release archive that also
+contains the native `crabbox-apple-vm-helper` for the local Apple VM provider.
 
 Laptop prerequisites: `git`, `ssh`, `ssh-keygen`, `rsync`, `curl`.
 
 ### Integrations
 
 `crabbox init --detect` generates a repo-local Agent Skill for compatible
-coding agents. The [Zed package](integrations/zed/README.md) adds checked tasks
-and YAML support; a separate core command, `crabbox open --editor=zed`, provides
-the Zed Remote Projects handoff. No Zed registry submission exists yet; it is
-tracked in https://github.com/openclaw/crabbox/issues/1157. See the [integration
-catalog](docs/integrations/README.md) for current support and lifecycle
-boundaries.
+coding agents. The [Zed package](integrations/zed/README.md) adds checked
+tasks and YAML support; a separate core command, `crabbox open --editor=zed`,
+provides the Zed Remote Projects handoff. See the
+[integration catalog](docs/integrations/README.md) for current support and
+lifecycle boundaries.
 
 Existing repositories that only need agent discovery can install the generic
 Skill with GitHub CLI:
@@ -307,31 +407,26 @@ Cross-vendor discovery services can index the same Skill through Crabbox's
 [draft-compatible AI Catalog](https://crabbox.sh/.well-known/ai-catalog.json).
 
 Herdr users can add Crabbox lease controls and repository workflows to the
-Herdr action palette. Use a Crabbox build that already contains this
-integration; the plugin installation rejects older binaries:
+Herdr action palette:
 
 ```sh
 herdr plugin install openclaw/crabbox/plugins/herdr
 ```
 
-Direct installation is available now; Herdr marketplace indexing is tracked in
-https://github.com/openclaw/crabbox/issues/1156.
-
-The plugin provides a live boxes overlay plus actions for `warmup`, `prewarm`,
-`connect`, repository jobs, and `doctor`. It does not add lifecycle hooks or
-keybindings; normal Crabbox job stop policies still apply. See
+The plugin provides a live boxes overlay plus actions for `warmup`,
+`prewarm`, `connect`, repository jobs, and `doctor`. See
 [Crabbox for Herdr](plugins/herdr/README.md) for action details and optional
 keybindings.
 
 ## Quick start
 
-Broker access is deployment-specific. Use a coordinator URL from your team, use
-direct-provider mode for a personal cloud account, or self-host the broker on
-Cloudflare or Node.js/PostgreSQL with your own provider credentials and spend
-caps. See
+Broker access is deployment-specific. Use a coordinator URL from your team,
+use direct-provider mode for a personal cloud account, or self-host the
+broker on Cloudflare or Node.js/PostgreSQL with your own provider credentials
+and spend caps. See
 [Getting started](docs/getting-started.md#choosing-an-access-path) and
-[Infrastructure](docs/infrastructure.md#self-hosted-broker-minimum-setup) for the
-setup paths.
+[Infrastructure](docs/infrastructure.md#self-hosted-broker-minimum-setup) for
+the setup paths.
 
 ```sh
 # log in once per machine (stores a broker token in user config)
@@ -364,11 +459,12 @@ human-readable name.
 
 ## Providers
 
-`Brokered` providers can run through either coordinator runtime (or direct when
-no coordinator is configured); every other provider runs direct or delegated
-from the CLI.
+`Brokered` providers can run through either coordinator runtime (or direct
+when no coordinator is configured); every other provider runs direct or
+delegated from the CLI.
 
-### SSH-lease providers (provision or connect a box, full lifecycle)
+<details>
+<summary><strong>SSH-lease providers</strong> — provision or connect a box, full lifecycle (27 providers)</summary>
 
 | Provider and aliases | Runs on / mode | Notes |
 | --- | --- | --- |
@@ -409,224 +505,99 @@ separate XCP-ng ISO E2E harness also covers Windows x86_64/x64 installers.
 macOS guests are out of scope on this path; use the Tart provider on Apple
 hardware for macOS VM workflows.
 
-### Delegated-run providers (sandbox/proof runners, no SSH lease)
+</details>
 
-| Provider and aliases                                                                                           | Runs on      | Notes                                                                           |
-| -------------------------------------------------------------------------------------------------------------- | ------------ | ------------------------------------------------------------------------------- |
-| [AWS Lambda MicroVM](docs/providers/aws-lambda-microvm.md) — `aws-lambda-microvm`                              | Linux ARM64  | Lambda Firecracker MicroVM with archive sync, retained reuse, and pause/resume. |
-| [Cloudflare](docs/providers/cloudflare.md) — `cloudflare` (`cf`)                                               | Linux        | Cloudflare Containers via the Worker runtime.                                   |
+<details>
+<summary><strong>Delegated-run providers</strong> — sandbox/proof runners, no SSH lease (20 providers)</summary>
+
+| Provider and aliases | Runs on | Notes |
+| --- | --- | --- |
+| [AWS Lambda MicroVM](docs/providers/aws-lambda-microvm.md) — `aws-lambda-microvm` | Linux ARM64 | Lambda Firecracker MicroVM with archive sync, retained reuse, and pause/resume. |
+| [Cloudflare](docs/providers/cloudflare.md) — `cloudflare` (`cf`) | Linux | Cloudflare Containers via the Worker runtime. |
 | [Cloud Run Sandbox](docs/providers/cloud-run-sandbox.md) — `cloud-run-sandbox` (`gcrun-sandbox`, `cloudrun-sandbox`) | Linux | Google Cloud Run sandboxes via gateway or in-container `sandbox` CLI. |
-| [Docker Sandbox](docs/providers/docker-sandbox.md) — `docker-sandbox`                                          | Linux        | Docker Sandboxes through the standalone `sbx` CLI.                              |
-| [E2B](docs/providers/e2b.md) — `e2b`                                                                           | Linux        | E2B Firecracker sandbox.                                                        |
-| [Freestyle](docs/providers/freestyle.md) — `freestyle`                                                         | Linux        | Freestyle VMs through the Freestyle REST API.                                   |
-| [Islo](docs/providers/islo.md) — `islo`                                                                        | Linux        | Islo sandbox.                                                                   |
-| [Modal](docs/providers/modal.md) — `modal`                                                                     | Linux        | Modal Sandbox through the local Python client.                                  |
-| [Microsoft Execution Containers](docs/providers/mxc.md) — `mxc` (`execution-container`)                        | Windows      | Policy-driven local Windows process containment.                                |
-| [OpenComputer](docs/providers/opencomputer.md) — `opencomputer` (`oc`, `open-computer`)                        | Linux        | OpenComputer Linux VMs through the OpenComputer REST API.                       |
-| [OpenSandbox](docs/providers/opensandbox.md) — `opensandbox`                                                   | Linux        | OpenSandbox delegated containers through the OpenSandbox Go SDK.                |
-| [Railway](docs/providers/railway.md) — `railway` (`rail`, `railwayapp`)                                        | Linux        | Inspect and stop an existing Railway service.                                   |
-| [Anthropic Sandbox Runtime](docs/providers/anthropic-sandbox-runtime.md) — `anthropic-sandbox-runtime` (`srt`) | macOS, Linux | Local one-shot sandboxing through Anthropic's `srt` CLI.                        |
-| [SmolVM](docs/providers/smolvm.md) — `smolvm` (`smol`, `smolmachines`, `smolfleet`)                            | Linux        | Smol Machines microVM sandboxes via the smolfleet API.                          |
-| [Tensorlake](docs/providers/tensorlake.md) — `tensorlake` (`tl`, `tensorlake-sbx`)                             | Linux        | Tensorlake Firecracker sandbox via the Tensorlake CLI.                          |
-| [Upstash Box](docs/providers/upstash-box.md) — `upstash-box` (`upstash`, `box`, `upstashbox`)                  | Linux        | Upstash Box through the Box REST API.                                           |
-| [Azure Dynamic Sessions](docs/providers/azure-dynamic-sessions.md) — `azure-dynamic-sessions`                  | Linux        | Azure Container Apps dynamic sessions.                                          |
-| [Blacksmith Testbox](docs/providers/blacksmith-testbox.md) — `blacksmith-testbox` (`blacksmith`)               | Linux        | Delegated Blacksmith CI Testbox lifecycle and execution.                        |
-| [W&B Sandboxes](docs/providers/wandb.md) — `wandb` (`weights-and-biases`)                                      | Linux        | Weights & Biases Sandboxes; reuses `wandb login` credentials.                   |
-| [Windows Sandbox](docs/providers/windows-sandbox.md) — `windows-sandbox` (`wsb`, `windows-sandbox-provider`)   | Windows      | Disposable Microsoft Windows Sandbox sessions through generated `.wsb` configs. |
+| [Docker Sandbox](docs/providers/docker-sandbox.md) — `docker-sandbox` | Linux | Docker Sandboxes through the standalone `sbx` CLI. |
+| [E2B](docs/providers/e2b.md) — `e2b` | Linux | E2B Firecracker sandbox. |
+| [Freestyle](docs/providers/freestyle.md) — `freestyle` | Linux | Freestyle VMs through the Freestyle REST API. |
+| [Islo](docs/providers/islo.md) — `islo` | Linux | Islo sandbox. |
+| [Modal](docs/providers/modal.md) — `modal` | Linux | Modal Sandbox through the local Python client. |
+| [Microsoft Execution Containers](docs/providers/mxc.md) — `mxc` (`execution-container`) | Windows | Policy-driven local Windows process containment. |
+| [OpenComputer](docs/providers/opencomputer.md) — `opencomputer` (`oc`, `open-computer`) | Linux | OpenComputer Linux VMs through the OpenComputer REST API. |
+| [OpenSandbox](docs/providers/opensandbox.md) — `opensandbox` | Linux | OpenSandbox delegated containers through the OpenSandbox Go SDK. |
+| [Railway](docs/providers/railway.md) — `railway` (`rail`, `railwayapp`) | Linux | Inspect and stop an existing Railway service. |
+| [Anthropic Sandbox Runtime](docs/providers/anthropic-sandbox-runtime.md) — `anthropic-sandbox-runtime` (`srt`) | macOS, Linux | Local one-shot sandboxing through Anthropic's `srt` CLI. |
+| [SmolVM](docs/providers/smolvm.md) — `smolvm` (`smol`, `smolmachines`, `smolfleet`) | Linux | Smol Machines microVM sandboxes via the smolfleet API. |
+| [Tensorlake](docs/providers/tensorlake.md) — `tensorlake` (`tl`, `tensorlake-sbx`) | Linux | Tensorlake Firecracker sandbox via the Tensorlake CLI. |
+| [Upstash Box](docs/providers/upstash-box.md) — `upstash-box` (`upstash`, `box`, `upstashbox`) | Linux | Upstash Box through the Box REST API. |
+| [Azure Dynamic Sessions](docs/providers/azure-dynamic-sessions.md) — `azure-dynamic-sessions` | Linux | Azure Container Apps dynamic sessions. |
+| [Blacksmith Testbox](docs/providers/blacksmith-testbox.md) — `blacksmith-testbox` (`blacksmith`) | Linux | Delegated Blacksmith CI Testbox lifecycle and execution. |
+| [W&B Sandboxes](docs/providers/wandb.md) — `wandb` (`weights-and-biases`) | Linux | Weights & Biases Sandboxes; reuses `wandb login` credentials. |
+| [Windows Sandbox](docs/providers/windows-sandbox.md) — `windows-sandbox` (`wsb`, `windows-sandbox-provider`) | Windows | Disposable Microsoft Windows Sandbox sessions through generated `.wsb` configs. |
 
-See [Providers](docs/providers/README.md) for the full reference, capabilities,
-and authoring guide.
+</details>
+
+See [Providers](docs/providers/README.md) for the full reference,
+capabilities, and authoring guide.
 
 ## Highlights
 
 - **One-shot or warm workspaces.** `crabbox run` for fire-and-forget;
-  `crabbox warmup` + `--id` for raw reusable leases, or `crabbox prewarm` when
-  the box should be hydrated before the first test command. See
-  [warmup](docs/commands/warmup.md), [prewarm](docs/commands/prewarm.md), and
-  [run](docs/commands/run.md).
-- **Named repo jobs.** `crabbox job run <name>` lets repos define warmup,
-  optional Actions hydration, run command, and cleanup policy in `.crabbox.yaml`.
-  See [Jobs](docs/features/jobs.md).
-- **Local-first workspace sync.** No clean-checkout requirement. Tracked and
-  nonignored files only, fingerprint skip on no-op runs, sanity checks against
-  suspicious mass deletions, optional shallow base-ref hydration for
-  changed-test workflows. See [Sync](docs/features/sync.md).
-- **Run observability.** Every coordinator-backed run gets an early `run_...`
-  handle. Use `crabbox attach <run-id>` while it is active,
-  `crabbox events <run-id>` for durable lifecycle/output events, and
-  `crabbox logs <run-id>` for retained output after completion. See
-  [History and logs](docs/features/history-logs.md) and
-  [Observability](docs/observability.md).
-- **GitHub Actions hydration.** `crabbox actions hydrate` runs supported setup
-  steps from the repo's workflow locally over SSH, so leased boxes get the same
-  runtimes and tooling without GitHub write access. Use `--github-runner` only
-  when setup needs full Actions semantics such as repository secrets, OIDC,
-  service containers, or unsupported `uses:` steps. See
-  [Actions hydration](docs/features/actions-hydration.md).
-- **Failure capsules.** `crabbox capsule from-actions <run-url>` captures a
-  failing CI run into a portable, replayable bundle; `capsule replay` reruns it.
-  See [Capsules](docs/features/capsules.md).
-- **Checkpoints.** Save VM-or-workspace state and `restore`/`fork` from it, via
-  workspace archives or provider-native snapshots/images. See
-  [Checkpoints](docs/features/checkpoints.md).
-- **Pond peer groups.** Leases that share a `--pond <name>` label form an
-  emergent peer group with discovery (`pond peers`), an SSH-mesh of
-  `ssh -L` forwards to members' `--expose` ports (`pond connect`), and bulk
-  `pond release`. See [Pond](docs/features/pond.md).
-- **Brokered cloud with cost guardrails.** Maintainers and agents share infra
-  without sharing provider tokens. Hetzner, AWS, Azure, Google Cloud, and
-  Daytona are the managed providers; per-lease and monthly spend caps reject over-budget
-  leases. Providers fall back across compatible instance families when capacity
-  or quota rejects a request. `crabbox usage` summarizes spend by user, org,
-  provider, and type. See [Coordinator](docs/features/coordinator.md),
-  [Capacity fallback](docs/features/capacity-fallback.md), and
-  [Cost and usage](docs/features/cost-usage.md).
-- **Interactive desktop, browser, and code leases.** `--browser` provisions
-  Chrome/Chromium for headless automation, `--desktop` provisions a visible UI
-  with tunnel-only VNC takeover, and `--code` provisions code-server on managed
-  Linux. `crabbox desktop click/paste/type/key` provide first-class input
-  helpers; `desktop proof` captures metadata, screenshot, diagnostics, MP4, and
-  a contact-sheet PNG in one publishable bundle. See
-  [Interactive desktop and VNC](docs/features/interactive-desktop-vnc.md).
-- **Authenticated web portal.** Browser login opens owner-scoped and shared
-  lease/run views with run logs/events, WebVNC, code-server, and telemetry
-  charts. `crabbox webvnc`/`crabbox code` bridge a lease into the portal;
-  `crabbox share` grants a lease to a user or the owning org. See
-  [Portal](docs/features/portal.md).
-- **Agent workspace evidence.** History, logs, events, telemetry, JUnit
-  summaries, screenshots, recordings, artifacts, and PR publishing make
-  autonomous work reviewable instead of only ephemeral terminal output. See
-  [Hermetic agent evidence](docs/features/hermetic-agent-evidence.md),
-  [Artifacts](docs/features/artifacts.md), and
-  [Telemetry](docs/features/telemetry.md).
-- **Stable timing records.** `--timing-json` on `run`, `warmup`, `prewarm`, and
-  `actions hydrate` gives scripts one machine-readable sync/command/total
-  timing schema across providers.
-- **Coordinator access controls.** GitHub browser login, owner-scoped leases,
-  admin-only routes, optional GitHub team allowlists, Cloudflare Access JWT
-  verification, and service-token support keep normal use and operator
-  automation separate. See [Auth and admin](docs/features/auth-admin.md) and
-  the [Security Policy](SECURITY.md).
-- **Cryptographically attributable execution evidence.** Every terminal run
-  produces a `RunEvidenceV1` record with a SHA-256 digest, bound into an
-  Ed25519-signed `TerminalRunReceiptV3`. Both Go and TypeScript implement the
-  same canonicalization, digest, and verification path. V3 receipts require
-  `evidence_sha256`; V2 receipts are legacy and cannot bind evidence. See
-  [Run evidence spec](docs/spec/run-evidence.md),
-  [Hermetic agent evidence](docs/features/hermetic-agent-evidence.md), and
-  [Receipts](docs/features/receipts.md).
-- **Provider startup confirmation evidence.** Providers advertise only the
-  lifecycle capabilities they actually possess (exit observation, reaping,
-  file handoff, detached execution). Startup confirmation strategies
-  (`TimeoutWindowConfirm`, `FileHandoffConfirm`, `ProcessExitConfirm`) are
-  recorded in `RunEvidenceV1.startup_confirm`, so evidence answers not just
-  "did it start?" but "what observation strategy was used?"
-- **Release qualification pipeline.** Machine-verifiable qualification
-  gates require a clean Git tree, record commit/tree provenance, generate
-  Git blob and raw SHA-256 source manifests, run uncached Go tests + race
-  tests + Worker typecheck/lint/tests/build + cross-language conformance +
-  durable-store (PostgreSQL/SQLite) fencing + NeMo tests, and fail closed if any gate skips or
-  fails. The artifact verifier detects extra files, validates each gate
-  individually, and cross-checks `artifact_promotable` against
-  `release_status`. See
-  [Release qualification](.github/workflows/release-qualification.yml),
-  [Release RC](.github/workflows/release-rc.yml), and
-  [VERIFY-RELEASE.md](VERIFY-RELEASE.md).
-- **NeMo execution kernel.** A typed execution boundary for reasoning/agent
-  systems. Capabilities are registered with immutable execution classes
-  (PURE/READ/MUTATION/CRITICAL). Idempotency keys required for mutations.
-  UNKNOWN preserved as first-class terminal state. See
-  [NeMo contracts](nemo/contracts/execution.ts) and
-  [NeMo kernel](nemo/kernel/kernel.ts).
+  `crabbox warmup` + `--id` for reusable named leases.
+- **Dirty-tree sync.** rsync of the working checkout; fingerprint short-circuit
+  when nothing changed; `--full-resync` for stale boxes.
+- **Durable execution fabric.** Frozen PREPARED→EXECUTING→IN_FLIGHT state
+  machine, fenced leases, first-class UNKNOWN reconciliation, cluster-epoch DR
+  fencing, and an immutable forensic observation ledger — identical on SQLite
+  and PostgreSQL.
+- **Signed evidence.** `RunEvidenceV1` digests bound into Ed25519
+  `TerminalRunReceiptV3`; production deployments require provisioned signer
+  keys, and rotation preserves historical verification.
+- **Jobs and capsule packaging.** Named workflows in `.crabbox.yaml`,
+  capsule/capsule-digest reproducibility, remote-digest pinning.
+- **Cost and capacity controls.** Spend caps, active-lease limits, spot market
+  strategy and fallback, idle/TTL expiry.
+- **Fleet portal and live bridges.** Web portal, WebVNC/desktop bridges,
+  Tailscale tailnet attachment, interactive SSH.
+- **Windows, macOS, and Linux runners.** Native Windows via OpenSSH or WSL2,
+  EC2 Mac, Parallels/Tart/Apple VZ on macOS.
+- **Provider breadth.** 27 SSH-lease providers and 20 delegated sandbox
+  providers behind one CLI and one coordinator API.
 
-## Machine classes
+## Server classes
 
-`beast` is the default for providers that expose class-based managed capacity.
-The providers below fall back across ordered instance-type lists unless `--type`
-pins a specific provider-native size.
+Most providers accept a size class (`tiny`, `small`, `standard`, `fast`,
+`large`, `beast`) that maps to provider-specific instance types. Override with
+`--type` or `CRABBOX_SERVER_TYPE` for a specific instance. Use `--arch arm64`
+/ `architecture: arm64` for Linux ARM capacity on Azure or AWS. The dedicated
+private AWS workspace API accepts only its server-configured instance
+allowlist.
+
+<details>
+<summary><strong>Class → instance type mapping</strong> (per provider)</summary>
 
 ```text
-Hetzner    tiny      ccx13, cpx22, cx23
-           small     ccx23, cpx32, cx33
-           standard  ccx33, cpx62, cx53
-           fast      ccx43, cpx62, cx53
-           large     ccx53, ccx43, cpx62, cx53
-           beast     ccx63, ccx53, ccx43, cpx62, cx53
+AWS        tiny      t3a.micro / t4g.micro (with --arch arm64)
+           small     t3a.small / t4g.small
+           standard  t3a.large / t4g.large
+           fast      c6i.xlarge / c7g.xlarge
+           large     c6i.2xlarge / c7g.2xlarge
+           beast     c6i.4xlarge / c7g.4xlarge
 
-AWS Linux  tiny      m7a.large, m7i.large, c7a.xlarge, c7i.xlarge
-           small     c7a.2xlarge, c7i.2xlarge, m7a.xlarge, m7i.xlarge, c7a.xlarge
-           standard  c7a/c7i/m7a/m7i.8xlarge family
-           fast      …16xlarge family
-           large     …24xlarge family
-           beast     …48xlarge family, falling back to 32x/24x/16x
-           arm64     c7g/m7g/r7g families with --arch arm64
+Azure      tiny      Standard_B2s_v2 …
+           small     Standard_D4ads_v6 …
+           standard  Standard_D2ads_v6 …
+           fast      Standard_D4ads_v6 …
+           large     Standard_D8ads_v6 …
+           beast     Standard_D16ads_v6 …
 
-AWS Win    tiny      m7a.large, m7i.large, t3.large
-           small     c7a.2xlarge, c7i.2xlarge, m7a.xlarge, m7i.xlarge, t3.xlarge
-           standard  m7i.large, m7a.large, t3.large
-           fast      m7i.xlarge, m7a.xlarge, t3.xlarge
-           large     m7i.2xlarge, m7a.2xlarge, t3.2xlarge
-           beast     m7i.4xlarge, m7a.4xlarge, m7i.2xlarge
+Namespace  tiny..large   S
+           beast         XL
 
-AWS WSL2   tiny      m8i.large, m8i-flex.large, c8i.xlarge, r8i.large
-           small     c8i.2xlarge, m8i.xlarge, m8i-flex.xlarge, r8i.large, c8i.xlarge
-           standard  m8i.large, m8i-flex.large, c8i.large, r8i.large
-           fast      m8i.xlarge, m8i-flex.xlarge, c8i.xlarge, r8i.xlarge
-           large     m8i.2xlarge, m8i-flex.2xlarge, c8i.2xlarge, r8i.2xlarge
-           beast     m8i.4xlarge, m8i-flex.4xlarge, c8i.4xlarge, r8i.4xlarge, m8i.2xlarge
+Namespace Compute    tiny 1x2 · small 2x4 · standard 4x8 · fast 8x16 · large 16x32 · beast 32x64
 
-AWS macOS  all       mac2.metal, then mac1.metal unless --type is set
-
-Azure      tiny      Standard_D2ads_v6, Standard_D2ds_v6, then v5/F2 fallbacks
-           small     Standard_D8ads_v6, Standard_D8ds_v6, then v5/F8/4-vCPU fallbacks
-           standard  Standard_D32ads_v6, Standard_D32ds_v6, Standard_F32s_v2, then 16-vCPU fallbacks
-           fast      Standard_D64ads_v6, Standard_D64ds_v6, Standard_F64s_v2, then 48/32-vCPU fallbacks
-           large     Standard_D96ads_v6, Standard_D96ds_v6, then 64/48-vCPU fallbacks
-           beast     Standard_D192ds_v6, Standard_D128ds_v6, then 96/64-vCPU fallbacks
-           arm64     Standard_D*ps_v6 / D*pds_v6 Cobalt families with --arch arm64
-
-Azure Win/
-WSL2       tiny      Standard_D2ads_v6, Standard_D2ds_v6, Standard_D2ads_v5, Standard_D2ds_v5, Standard_D2as_v6
-           small     Standard_D8ads_v6, Standard_D8ds_v6, Standard_D8ads_v5, Standard_D8ds_v5, Standard_D8as_v6
-           standard  Standard_D2ads_v6, Standard_D2ds_v6, Standard_D2ads_v5, Standard_D2ds_v5, Standard_D2as_v6
-           fast      Standard_D4ads_v6, Standard_D4ds_v6, Standard_D4ads_v5, Standard_D4ds_v5, Standard_D4as_v6
-           large     Standard_D8ads_v6, Standard_D8ds_v6, Standard_D8ads_v5, Standard_D8ds_v5, Standard_D8as_v6
-           beast     Standard_D16ads_v6, Standard_D16ds_v6, Standard_D16ads_v5, Standard_D16ds_v5, Standard_D8ads_v6
-
-Namespace  tiny      S
-           small     S
-           standard  S
-           fast      M
-           large     L
-           beast     XL
-
-Namespace
-Compute    tiny      1x2
-           small     2x4
-           standard  4x8
-           fast      8x16
-           large     16x32
-           beast     32x64
-
-Cloudflare tiny      standard-4
-           small     standard-4
-           standard  standard-4
-           fast      standard-4
-           large     standard-4
-           beast     standard-4
+Cloudflare all classes → standard-4 (lite, basic, standard-1..4 accepted as explicit --type)
 ```
 
-Override with `--type` or `CRABBOX_SERVER_TYPE` for a specific instance. Use
-`--arch arm64` / `architecture: arm64` for Linux ARM capacity on Azure or AWS;
-explicit ARM provider types also select ARM images when no custom image is set.
-Cloudflare also accepts `lite`, `basic`, `standard-1`, `standard-2`, and
-`standard-3` as smaller explicit `--type` values; `standard-4` is the default.
-Providers without a row either use provider-native capacity settings or reject
-class/type selection.
-
-The dedicated private AWS workspace API does not use these AWS class tables. It
-accepts only its server-configured instance allowlist; the recommended small
-policy starts with `t3a.small,t3.small` and a 20 GiB encrypted gp3 root volume.
+</details>
 
 ## Configuration
 
@@ -661,30 +632,32 @@ ssh:
 
 Set `broker.mode: registered` to keep provisioning and cleanup in any direct
 provider while registering lease metadata with the coordinator for inventory,
-sharing, and portal WebVNC. Kept desktop leases start the outbound WebVNC bridge
-automatically by default; set `broker.autoWebVNC: false` to opt out. The
-coordinator never receives provider credentials or directly calls a registered
-provider. By default it removes only registration metadata; an explicitly
-bound outbound runtime adapter can perform a user-confirmed workspace delete.
-API clients request the same generation-fenced delete with
+sharing, and portal WebVNC. Kept desktop leases start the outbound WebVNC
+bridge automatically by default; set `broker.autoWebVNC: false` to opt out.
+The coordinator never receives provider credentials or directly calls a
+registered provider. By default it removes only registration metadata; an
+explicitly bound outbound runtime adapter can perform a user-confirmed
+workspace delete. API clients request the same generation-fenced delete with
 `POST /v1/leases/{id}/release` and body `{"delete":true}`.
 
-Forwarded environment is intentionally narrow: `NODE_OPTIONS` and `CI`. Do not
-pass secrets as command-line arguments. For live-secret smoke tests, use
+Forwarded environment is intentionally narrow: `NODE_OPTIONS` and `CI`. Do
+not pass secrets as command-line arguments. For live-secret smoke tests, use
 `crabbox run --env-from-profile <file> --allow-env NAME` so Crabbox forwards
-only selected names and prints redacted presence/length metadata. For stale warm
-boxes, `--full-resync` (alias `--fresh-sync`) resets the remote workdir before
-syncing. For larger commands, use `--script <file>` or `--script-stdin` so the
-remote runner executes an uploaded file instead of a giant quoted shell string.
+only selected names and prints redacted presence/length metadata. For stale
+warm boxes, `--full-resync` (alias `--fresh-sync`) resets the remote workdir
+before syncing. For larger commands, use `--script <file>` or
+`--script-stdin` so the remote runner executes an uploaded file instead of a
+giant quoted shell string.
 
-For binary or terminal-hostile output, use `crabbox run --capture-stdout <path>`
-or `--capture-stderr <path>`. Add `--preflight` for a remote capability
-snapshot, `--keep-on-failure` to SSH into the exact failed one-shot lease, or
-`--download remote=local` to copy a successful-run artifact back. Failed
-SSH-backed and Blacksmith delegated runs save local `.crabbox/captures/*.tar.gz`
-bundles by default, falling back to the Crabbox user state directory when the
-project destination is unwritable. The reported `failure-bundle local=...`
-path identifies the saved bundle; see [local capture storage](docs/observability.md#capturing-run-output-locally).
+For binary or terminal-hostile output, use `crabbox run --capture-stdout
+<path>` or `--capture-stderr <path>`. Add `--preflight` for a remote
+capability snapshot, `--keep-on-failure` to SSH into the exact failed
+one-shot lease, or `--download remote=local` to copy a successful-run
+artifact back. Failed SSH-backed and Blacksmith delegated runs save local
+`.crabbox/captures/*.tar.gz` bundles by default, falling back to the Crabbox
+user state directory when the project destination is unwritable. The reported
+`failure-bundle local=...` path identifies the saved bundle; see
+[local capture storage](docs/observability.md#capturing-run-output-locally).
 Captured files are not redacted by Crabbox.
 
 Optional Tailscale reachability for managed Linux leases:
@@ -702,12 +675,13 @@ tailscale:
 ```
 
 Tailscale is a network plane, not a provider. `--tailscale` joins new managed
-Linux leases to the tailnet; `--network auto|tailscale|public` chooses how SSH
-and VNC tunnel commands resolve the host. Brokered mode uses Worker OAuth
-secrets to mint one-off keys; direct-provider mode reads the auth key from the
-configured env var. See [Tailscale](docs/features/tailscale.md).
+Linux leases to the tailnet; `--network auto|tailscale|public` chooses how
+SSH and VNC tunnel commands resolve the host. Brokered mode uses Worker OAuth
+secrets to mint one-off keys; direct-provider mode reads the auth key from
+the configured env var. See [Tailscale](docs/features/tailscale.md).
 
-A few provider-specific config snippets:
+<details>
+<summary><strong>Provider-specific config snippets</strong></summary>
 
 ```yaml
 # Static macOS or Windows target (existing machine, no provisioning)
@@ -742,13 +716,16 @@ blacksmith:
   idleTimeout: 90m
 ```
 
+</details>
+
 Keep provider tokens in environment variables, not repo config (for example
 `CRABBOX_SEMAPHORE_TOKEN`, `CRABBOX_SPRITES_TOKEN`, `RUNPOD_API_KEY`,
 `MORPH_API_KEY`, `ASCII_BOX_API_KEY`, `E2B_API_KEY`, `DAYTONA_API_KEY`,
 `CLOUD_RUN_SANDBOX_URL`/`CLOUD_RUN_SANDBOX_SECRET`). The full env-var
 reference, per-provider sections, and per-command flags are in
-[docs/cli.md](docs/cli.md), [Configuration](docs/features/configuration.md),
-and the [provider docs](docs/providers/README.md).
+[docs/cli.md](docs/cli.md),
+[Configuration](docs/features/configuration.md), and the
+[provider docs](docs/providers/README.md).
 
 ## Development
 
@@ -778,6 +755,9 @@ node --test scripts/*.test.js scripts/*.test.mjs
 # Docs
 scripts/check-docs.sh
 
+# Live PostgreSQL suites (ephemeral postgres:16 or local initdb)
+scripts/test-live-postgres.sh
+
 # Release qualification (requires clean Git tree)
 scripts/generate-release-evidence.sh
 scripts/check-release-admission.sh
@@ -791,69 +771,59 @@ CRABBOX_BIN=./bin/crabbox scripts/live-firecracker-smoke.sh
 ```
 
 CI runs the full gate (gofmt, vet, race tests, all Go modules, coverage
-threshold, repository script tests, docs link/build check, GoReleaser snapshot, Worker
-lint/typecheck/tests/build, and NeMo typecheck/tests) on every push and PR. The required `Go` check aggregates
-three independent 30-minute jobs: `Go test` (formatting, vet, deadcode, full race
-suite, Linux supervision proof, and build), `Go modules` (normal tests in every
-module, including the root), and `Go coverage` (90% core coverage threshold).
-The race suite, all-module normal tests, and coverage collection use a 15-minute
-package timeout.
-Use the explicit timeout locally too: the CLI race suite can exceed Go's default
-10-minute package deadline even when its individual tests pass.
-Production releases use a serialized, draft-first process: preserve and verify
-the signed tag, build and
-Developer ID sign/notarize the macOS candidates locally, verify the exact draft
-on native Apple Silicon and Intel runners from protected-default code, then
-publish those exact artifacts, dispatch the ordinary Homebrew tap update, and
-run independent public-download, public Go installation, and native Homebrew
-smokes. Publication establishes eligibility; retry a failed Homebrew update
-without rebuilding or republishing. The tap handoff is an explicit operator
-step, with generic tap reconciliation as an independent fallback. One explicit full release/publish request authorizes
-this complete normal sequence without renewed chat approval at each stage.
-Narrow requests stay narrow. The original request supplies authorization;
-GitHub events alone do not. Sequential technical gates, separate trust domains,
-and cancellation boundaries remain mandatory. See
+threshold, repository script tests, docs link/build check, GoReleaser
+snapshot, Worker lint/typecheck/tests/build, and NeMo typecheck/tests) on
+every push and PR. The required `Go` check aggregates three independent
+30-minute jobs: `Go test` (formatting, vet, deadcode, full race suite, Linux
+supervision proof, and build), `Go modules` (normal tests in every module,
+including the root), and `Go coverage` (90% core coverage threshold). The
+race suite, all-module normal tests, and coverage collection use a 15-minute
+package timeout. Use the explicit timeout locally too: the CLI race suite can
+exceed Go's default 10-minute package deadline even when its individual tests
+pass.
+
+Production releases use a serialized, draft-first process: preserve and
+verify the signed tag, build and Developer ID sign/notarize the macOS
+candidates locally, verify the exact draft on native Apple Silicon and Intel
+runners from protected-default code, then publish those exact artifacts,
+dispatch the ordinary Homebrew tap update, and run independent
+public-download, public Go installation, and native Homebrew smokes. See
 [Release engineering](docs/RELEASING.md).
 
 Release candidates use a machine-verifiable qualification pipeline:
 `scripts/generate-release-evidence.sh` requires a clean Git working tree,
 records commit/tree SHA, generates Git blob and raw SHA-256 source manifests,
-runs all gates with uncached Go tests, captures race evidence, live PostgreSQL
-fencing/parity plus the SQLite conformance leg, Worker typecheck/lint/tests/build, cross-language conformance,
-and NeMo typecheck/tests, then produces `qualification.json` with per-gate
-status. `scripts/check-release-admission.sh` fails closed if any gate is not
-PASS. `scripts/verify-release-artifact.sh` verifies SHA256SUMS, source manifest
-equality (no extra files), per-gate PASS, commit/tree consistency, and required
-evidence logs. The RC workflow builds the artifact from the exact qualified
-commit, generates provenance via GitHub SLSA attestation, and publishes as a
-GitHub prerelease. See [VERIFY-RELEASE.md](VERIFY-RELEASE.md) for consumer
-verification instructions.
+runs all gates with uncached Go tests, captures race evidence, live
+PostgreSQL fencing/parity plus the SQLite conformance leg, Worker
+typecheck/lint/tests/build, cross-language conformance, and NeMo
+typecheck/tests, then produces `qualification.json` with per-gate status.
+`scripts/check-release-admission.sh` fails closed if any gate is not PASS.
+`scripts/verify-release-artifact.sh` verifies SHA256SUMS, source manifest
+equality (no extra files), per-gate PASS, commit/tree consistency, and
+required evidence logs. The RC workflow builds the artifact from the exact
+qualified commit, generates provenance via GitHub SLSA attestation, and
+publishes as a GitHub prerelease. See
+[VERIFY-RELEASE.md](VERIFY-RELEASE.md) for consumer verification
+instructions.
 
 Git-overlay integration tests use real Git with task-owned local and loopback
 origins. Their local SSH stand-ins isolate Git authentication settings and
 disable interactive credential requests, including during ordinary seed
 fallback. A credential-helper/askpass canary guards this test-only boundary;
-the separate production overlay security tests still inject hostile Git config.
+the separate production overlay security tests still inject hostile Git
+config.
 
-CLI runtime optimizations retain the full normal, race, and coverage modes and
-their existing deadlines and observation windows. Synchronous POSIX test-executable
-helpers suppress only the race runtime's exit delay in their child environment,
-preserving inherited detection and reporting options; Windows keeps its existing
-execution path. HTTP deadline cases with
-explicit configuration and private servers overlap their real waits without
-changing timeout contracts. The shared immutable CLI and provider builds stay
-inside `M.Run`, with their existing fixture cleanup and rebuild ownership.
-
-Cloudflare, Node/PostgreSQL, container, ingress, secrets, and DNS deployment live
-in [docs/infrastructure.md](docs/infrastructure.md). The dedicated ECS Fargate
-path is documented in
+Cloudflare, Node/PostgreSQL, container, ingress, secrets, and DNS deployment
+live in [docs/infrastructure.md](docs/infrastructure.md). The dedicated ECS
+Fargate path is documented in
 [Private AWS Workspaces](docs/features/aws-private-workspaces.md).
 
 ## Docs
 
 - **Get the model:** [How Crabbox Works](docs/how-it-works.md), [Architecture](docs/architecture.md), [Concepts](docs/concepts.md), [Orchestrator](docs/orchestrator.md)
 - **Use the CLI:** [CLI](docs/cli.md), [Commands](docs/commands/README.md), [Features](docs/features/README.md), [Configuration](docs/features/configuration.md)
-- **Execution evidence:** [Run evidence spec](docs/spec/run-evidence.md), [Receipts](docs/features/receipts.md), [Hermetic agent evidence](docs/features/hermetic-agent-evidence.md), [Portable coordinator](docs/features/portable-coordinator.md)
+- **Effect Fabric:** [Durable execution contract](docs/spec/durable-execution-contract.md), [Operations & qualification](docs/spec/durable-execution-operations.md), [ADR-001 contract freeze](docs/adr/ADR-001-durable-effect-contract-frozen.md), [ADR-002 r13 freeze](docs/adr/ADR-002-durable-effect-r13-contract-freeze.md)
+- **Execution evidence:** [Run evidence spec](docs/spec/run-evidence.md), [Receipts](docs/commands/receipt.md), [Hermetic agent evidence](docs/features/hermetic-agent-evidence.md), [Portable coordinator](docs/features/portable-coordinator.md)
 - **NeMo execution kernel:** [Contracts](nemo/contracts/execution.ts), [Kernel](nemo/kernel/kernel.ts), [Crabedence adapter](nemo/adapters/crabedence/adapter.ts), [Bridge](nemo/adapters/crabedence/bridge.ts)
 - **Integrate editors and agents:** [Integrations](docs/integrations/README.md), [Editors](docs/integrations/editors.md), [AI agents and harnesses](docs/integrations/agents.md)
 - **Choose a provider:** [Providers](docs/providers/README.md), [AWS](docs/providers/aws.md), [Azure](docs/providers/azure.md), [GCP](docs/providers/gcp.md), [Hetzner](docs/providers/hetzner.md), [DigitalOcean](docs/providers/digitalocean.md), [Linode](docs/providers/linode.md), [Hostinger](docs/providers/hostinger.md)
@@ -865,8 +835,8 @@ path is documented in
 - **Set it up or audit it:** [Infrastructure](docs/infrastructure.md), [Security Policy](SECURITY.md), [Operational Security](docs/security.md), [Getting Started](docs/getting-started.md), [Source Map](docs/source-map.md)
 - **Changes:** [CHANGELOG.md](CHANGELOG.md)
 
-The documentation site at <https://crabbox.sh/> is generated from
-the `docs/` Markdown:
+The documentation site at <https://crabbox.sh/> is generated from the `docs/`
+Markdown:
 
 ```sh
 scripts/check-docs.sh

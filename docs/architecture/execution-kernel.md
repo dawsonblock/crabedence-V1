@@ -236,7 +236,7 @@ into weaker semantics.
 
 ## The Stable Boundary
 
-The capability invocation ABI (see [capability-invocation-abi.md](capability-invocation-abi.md))
+The capability invocation ABI (see [capability-invocation-abi.md](../spec/capability-invocation-abi.md))
 is the frozen boundary between any planner and Crabedence.
 
 It is intentionally minimal:
