@@ -171,6 +171,9 @@ func TestDirectRegistryEnforcesRouteAndClass(t *testing.T) {
 	if missing.FailureCode != string(capability.FailureCapabilityUnavailable) {
 		t.Fatalf("unregistered DIRECT capability must be unimplemented, got %s", missing.FailureCode)
 	}
+	if !strings.Contains(missing.Error, capability.FailureReasonAdapterNotConfigured) {
+		t.Fatalf("unregistered DIRECT capability must report %s, got %q", capability.FailureReasonAdapterNotConfigured, missing.Error)
+	}
 }
 
 func TestSystemInfoDirectReadThroughDispatcher(t *testing.T) {

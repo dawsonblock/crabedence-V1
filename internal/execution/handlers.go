@@ -23,10 +23,15 @@ func NewMultiHandler(handlers map[string]Handler) *MultiHandler {
 func (h *MultiHandler) Execute(ctx context.Context, req Request, desc capability.ResolvedDescriptor) Response {
 	handler, ok := h.handlers[desc.AdapterID]
 	if !ok {
+		// A registered capability whose adapter is not configured is
+		// CAPABILITY_UNAVAILABLE — known, but not executable in this
+		// deployment — never CAPABILITY_NOT_FOUND, and never a routing
+		// change or fallback.
 		return Response{
 			Status:      StatusFailed,
 			FailureCode: string(capability.FailureCapabilityUnavailable),
-			Error:       "no handler registered for adapter: " + desc.AdapterID,
+			Error: fmt.Sprintf("capability %s requires adapter %q, which is not configured in this deployment (reason=%s)",
+				desc.ID, desc.AdapterID, capability.FailureReasonAdapterNotConfigured),
 		}
 	}
 	return handler.Execute(ctx, req, desc)

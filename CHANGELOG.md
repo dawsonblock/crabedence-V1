@@ -4,6 +4,7 @@
 
 ### Capability — availability is distinct from existence
 
+- Capability: a registered capability whose adapter is not configured reports the machine-readable reason `ADAPTER_NOT_CONFIGURED` in the failure text, so an operator can distinguish "this deployment cannot execute it" from "the policy definition does not recognize it" without parsing prose. The failure code remains `CAPABILITY_UNAVAILABLE`.
 - Capability: the failure code for a registered capability whose adapter is not configured is now `CAPABILITY_UNAVAILABLE` (was `CAPABILITY_UNIMPLEMENTED`), matching the trust model's vocabulary: `CAPABILITY_NOT_FOUND` means the software/policy definition does not recognize the capability, while `CAPABILITY_UNAVAILABLE` means it is known but this runtime cannot currently execute it. Availability remains runtime state — it never changes registry membership, routing, or the registry digest.
 
 ### Trust-closure repair — verified registry envelope, structural trusted catalog, drift fixes

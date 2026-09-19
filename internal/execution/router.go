@@ -190,6 +190,17 @@ func (r *routeRuntime) execute(ctx context.Context, req Request, desc capability
 	timeout := r.timeout
 	r.mu.RUnlock()
 	if !ok {
+		if r.route == capability.RouteDirect {
+			// A DIRECT read with no registered handler is an adapter
+			// this deployment did not configure: a known capability
+			// that is currently unavailable, never an unknown one.
+			return Response{
+				Status:      StatusFailed,
+				FailureCode: string(capability.FailureCapabilityUnavailable),
+				Error: fmt.Sprintf("capability %s requires adapter %q, which is not configured in this deployment (reason=%s)",
+					req.Capability, desc.AdapterID, capability.FailureReasonAdapterNotConfigured),
+			}
+		}
 		return Response{
 			Status:      StatusFailed,
 			FailureCode: string(capability.FailureCapabilityUnavailable),

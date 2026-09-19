@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -135,6 +136,56 @@ func TestExecutionServiceUnknownCapability(t *testing.T) {
 	}
 	if resp.FailureCode != string(capability.FailureCapabilityNotFound) {
 		t.Fatalf("expected CAPABILITY_NOT_FOUND, got %s", resp.FailureCode)
+	}
+}
+
+// TestExecutionServiceUnconfiguredAdapterIsUnavailable pins the trust
+// model's vocabulary end to end: a registered capability whose adapter is
+// not configured in this deployment fails as CAPABILITY_UNAVAILABLE with
+// the ADAPTER_NOT_CONFIGURED reason — distinct from the unknown-capability
+// case above, which is CAPABILITY_NOT_FOUND. Availability is runtime
+// state; it never changes registry membership or routing.
+func TestExecutionServiceUnconfiguredAdapterIsUnavailable(t *testing.T) {
+	socketPath := testSocketPath(t)
+
+	registry := capability.NewRegistry()
+	if err := RegisterCounterCapability(registry); err != nil {
+		t.Fatal(err)
+	}
+
+	// The registry knows test.counter.increment; this deployment has no
+	// adapter wired for it.
+	handler := NewMultiHandler(map[string]Handler{})
+
+	service := setupServiceWithGrants(registry, handler, socketPath)
+	ctx := context.Background()
+	if err := service.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer service.Stop()
+
+	conn, err := net.Dial("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	req := Request{
+		Capability:     "test.counter.increment",
+		Arguments:      json.RawMessage(`{"counter":"test"}`),
+		Authority:      RequestAuthority{Principal: "alice@example.com", AuthorityRef: "grant_123"},
+		IdempotencyKey: "unconfigured-adapter-1",
+	}
+	resp := sendRequest(t, conn, req)
+
+	if resp.Status != StatusFailed {
+		t.Fatalf("expected FAILED, got %s", resp.Status)
+	}
+	if resp.FailureCode != string(capability.FailureCapabilityUnavailable) {
+		t.Fatalf("expected CAPABILITY_UNAVAILABLE, got %s", resp.FailureCode)
+	}
+	if !strings.Contains(resp.Error, capability.FailureReasonAdapterNotConfigured) {
+		t.Fatalf("expected reason %s, got %q", capability.FailureReasonAdapterNotConfigured, resp.Error)
 	}
 }
 

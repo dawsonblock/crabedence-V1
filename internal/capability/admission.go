@@ -26,6 +26,15 @@ const (
 	// but no adapter is wired to handle it.
 	FailureCapabilityUnavailable FailureCode = "CAPABILITY_UNAVAILABLE"
 
+	// FailureReasonAdapterNotConfigured is the machine-readable reason
+	// carried in the error text when a known, registered capability's
+	// adapter is not configured in this deployment. The failure code
+	// stays CAPABILITY_UNAVAILABLE — the capability exists, this runtime
+	// simply cannot currently execute it. It must never be reported as
+	// CAPABILITY_NOT_FOUND, which means the software/policy definition
+	// does not recognize the capability at all.
+	FailureReasonAdapterNotConfigured = "ADAPTER_NOT_CONFIGURED"
+
 	// FailureAdmissionDenied means admission checks failed (class mismatch,
 	// schema validation, authority policy, deadline).
 	FailureAdmissionDenied FailureCode = "ADMISSION_DENIED"
