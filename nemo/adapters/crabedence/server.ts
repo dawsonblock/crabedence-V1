@@ -70,6 +70,40 @@ export type ExecutionHandler = (
   request: ExecutionApiRequest,
 ) => Promise<ExecutionApiResponse>;
 
+// ─── Observation ──────────────────────────────────────────────────────
+
+/**
+ * Per-request observability record for the idempotency path.
+ *
+ * A concurrency failure has two very different shapes, and only
+ * observation can tell them apart:
+ *   - two external executions (two `dispatched` records for one key)
+ *   - one execution, but a caller observed the wrong state
+ *
+ * The record carries the request fingerprint (canonical digest), the
+ * admission outcome (reservation state), leader/follower status
+ * (`dispatched`), the wire status returned, and arrival order/timing.
+ * (Effect IDs, provider operation tokens, and terminal receipt IDs are
+ * owned by the durable Go kernel; this bridge is a transport-level test
+ * double and has no such identifiers to report.)
+ */
+export interface ExecutionObservation {
+  /** Idempotency key. */
+  readonly key: string;
+  /** Canonical request digest — the request fingerprint. */
+  readonly requestDigest: string;
+  /** Reservation outcome observed by this request. */
+  readonly reservation: "NEW" | "EXISTING" | "IN_FLIGHT" | "CONFLICT";
+  /** True only for the request that crossed into provider dispatch. */
+  dispatched: boolean;
+  /** Wire status returned to the caller, once sent. */
+  status?: string;
+  /** Monotonic arrival order on this server. */
+  readonly sequence: number;
+  /** Arrival time (ms since epoch). */
+  readonly at: number;
+}
+
 // ─── Protocol constants ────────────────────────────────────────────────
 
 const MAX_MESSAGE_BYTES = 4 * 1024 * 1024;
@@ -146,14 +180,16 @@ export interface IdempotencyStore {
 
 /**
  * In-memory idempotency store with atomic reservation.
- * Concurrent calls to reserve() with the same key are serialized.
+ *
+ * The reservation critical section is synchronous: JavaScript runs it to
+ * completion before any other request handler can observe the store, so
+ * two concurrent reservations for one key can never both see "absent" and
+ * both return NEW. A waiter must never inherit the leader's outcome —
+ * returning NEW to a second caller would dispatch the provider twice,
+ * which is exactly the invariant this store exists to protect.
  */
 class InMemoryIdempotencyStore implements IdempotencyStore {
   private readonly records = new Map<string, ExecutionRecord>();
-  private readonly pending = new Map<
-    string,
-    Promise<{ state: "NEW" | "EXISTING" | "IN_FLIGHT" | "CONFLICT"; response?: ExecutionApiResponse }>
-  >();
 
   async reserve(
     key: string,
@@ -162,45 +198,30 @@ class InMemoryIdempotencyStore implements IdempotencyStore {
     state: "NEW" | "EXISTING" | "IN_FLIGHT" | "CONFLICT";
     response?: ExecutionApiResponse;
   }> {
-    // If a reservation is already pending for this key, wait for it.
-    const existing = this.pending.get(key);
-    if (existing) {
-      return existing;
+    const record = this.records.get(key);
+    if (!record) {
+      // New reservation — the caller owns the dispatch.
+      this.records.set(key, {
+        key,
+        requestDigest,
+        state: "IN_FLIGHT",
+      });
+      return { state: "NEW" as const };
     }
 
-    const promise = (async () => {
-      const record = this.records.get(key);
-      if (!record) {
-        // New reservation
-        this.records.set(key, {
-          key,
-          requestDigest,
-          state: "IN_FLIGHT",
-        });
-        return { state: "NEW" as const };
-      }
-
-      // Key exists — check digest
-      if (record.requestDigest !== requestDigest) {
-        return { state: "CONFLICT" as const };
-      }
-
-      if (record.state === "IN_FLIGHT") {
-        return { state: "IN_FLIGHT" as const };
-      }
-
-      return {
-        state: "EXISTING" as const,
-        response: record.response,
-      };
-    })();
-
-    this.pending.set(key, promise);
-    try {
-      return await promise;
-    } finally {
-      this.pending.delete(key);
+    // Key exists — check digest
+    if (record.requestDigest !== requestDigest) {
+      return { state: "CONFLICT" as const };
     }
+
+    if (record.state === "IN_FLIGHT") {
+      return { state: "IN_FLIGHT" as const };
+    }
+
+    return {
+      state: "EXISTING" as const,
+      response: record.response,
+    };
   }
 
   async settle(
@@ -283,6 +304,8 @@ export class ExecutionApiServer {
   private server: Server | null = null;
   private readonly idempotency: IdempotencyStore;
   private readonly activeConnections = new Set<Socket>();
+  private readonly observationLog: ExecutionObservation[] = [];
+  private sequence = 0;
 
   constructor(
     private readonly handler: ExecutionHandler,
@@ -290,6 +313,33 @@ export class ExecutionApiServer {
     idempotency?: IdempotencyStore,
   ) {
     this.idempotency = idempotency ?? new InMemoryIdempotencyStore();
+  }
+
+  /**
+   * Per-request observation records for the idempotency path, in arrival
+   * order. Test/local diagnostics: the concurrency invariant is "exactly
+   * one dispatched record per key, and no caller observes a different
+   * terminal outcome".
+   */
+  observations(): ExecutionObservation[] {
+    return this.observationLog.map((observation) => ({ ...observation }));
+  }
+
+  private observe(
+    key: string,
+    requestDigest: string,
+    reservation: ExecutionObservation["reservation"],
+  ): ExecutionObservation {
+    const observation: ExecutionObservation = {
+      key,
+      requestDigest,
+      reservation,
+      dispatched: false,
+      sequence: this.sequence++,
+      at: Date.now(),
+    };
+    this.observationLog.push(observation);
+    return observation;
   }
 
   async start(): Promise<void> {
@@ -455,8 +505,14 @@ export class ExecutionApiServer {
           request.idempotency_key,
           digest,
         );
+        const observation = this.observe(
+          request.idempotency_key,
+          digest,
+          reservation.state,
+        );
 
         if (reservation.state === "CONFLICT") {
+          observation.status = "DENIED";
           this.sendResponse(socket, {
             status: "DENIED",
             error: "idempotency key bound to different request",
@@ -467,6 +523,7 @@ export class ExecutionApiServer {
         if (reservation.state === "IN_FLIGHT") {
           // Another request with this key is in progress.
           // Return UNKNOWN — the caller should retrieve the result later.
+          observation.status = "UNKNOWN";
           this.sendResponse(socket, {
             status: "UNKNOWN",
             error: "execution in flight for this idempotency key",
@@ -478,20 +535,20 @@ export class ExecutionApiServer {
           // Return the existing terminal response (including UNKNOWN).
           // This is the critical fix: UNKNOWN is persisted and returned
           // for the same key, NOT re-invoked.
-          if (reservation.response) {
-            this.sendResponse(socket, reservation.response);
-          } else {
+          const replay: ExecutionApiResponse = reservation.response ?? {
             // EXISTING but no response — inconsistent state. Fail closed
             // into UNKNOWN/reconciliation, never re-execute.
-            this.sendResponse(socket, {
-              status: "UNKNOWN",
-              error: "execution record exists but has no terminal response (reconciliation required)",
-            });
-          }
+            status: "UNKNOWN",
+            error: "execution record exists but has no terminal response (reconciliation required)",
+          };
+          observation.status = replay.status;
+          this.sendResponse(socket, replay);
           return;
         }
 
-        // state === "NEW" — proceed to execute
+        // state === "NEW" — this request owns the reservation and is the
+        // only request permitted to cross into provider dispatch.
+        observation.dispatched = true;
         let response: ExecutionApiResponse;
         try {
           response = await this.handler(request);
@@ -511,6 +568,7 @@ export class ExecutionApiServer {
         } catch (settleErr) {
           // Persistence failed. The side effect may have occurred.
           // Return UNKNOWN, not FAILED.
+          observation.status = "UNKNOWN";
           this.sendResponse(socket, {
             status: "UNKNOWN",
             error: `execution completed but persistence failed: ${(settleErr as Error).message}`,
@@ -518,6 +576,7 @@ export class ExecutionApiServer {
           return;
         }
 
+        observation.status = response.status;
         this.sendResponse(socket, response);
         return;
       }

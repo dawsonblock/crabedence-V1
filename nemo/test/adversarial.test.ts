@@ -51,6 +51,25 @@ function cleanupSocket(socketPath: string): void {
   rmSync(socketPath, { recursive: true, force: true });
 }
 
+/**
+ * Bounded wait for an observed condition. Concurrency tests must wait for
+ * a state to actually be observed instead of sleeping — a fixed sleep
+ * races the server under load and is how the concurrent-mutation test
+ * used to flake.
+ */
+async function waitFor(
+  predicate: () => boolean,
+  what: string,
+  timeoutMs = 2000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  throw new Error(`timed out waiting for ${what}`);
+}
+
 const auth = { principal: "alice@example.com", grantId: "grant_123" };
 const wireAuth = { principal: "alice@example.com", grant_id: "grant_123" };
 
@@ -241,7 +260,7 @@ describe("Adversarial: Idempotency races", () => {
     server = new ExecutionApiServer(async (req) => {
       callCount++;
       if (callCount === 1) {
-        // Block first call until second arrives
+        // Block the leader until the follower has demonstrably arrived.
         await firstCallBlocked;
       }
       return {
@@ -253,39 +272,50 @@ describe("Adversarial: Idempotency races", () => {
     await server.start();
 
     const client = new CrabedenceClient(socketPath);
-
-    // Start first request (will block)
-    const promise1 = client.execute({
+    const request = {
       capability: "email.send",
       arguments: { to: "bob@example.com" },
       authority: wireAuth,
       execution_class: "CRITICAL",
       idempotency_key: "concurrent_001",
-    });
+    };
 
-    // Start second request with same key (should see IN_FLIGHT)
-    const promise2 = client.execute({
-      capability: "email.send",
-      arguments: { to: "bob@example.com" },
-      authority: wireAuth,
-      execution_class: "CRITICAL",
-      idempotency_key: "concurrent_001",
-    });
+    // Either caller may win the reservation — which socket the server
+    // processes first is a scheduling property, not a contract. Assert
+    // the invariant, never a fixed leader.
+    const promise1 = client.execute(request);
+    const promise2 = client.execute(request);
 
-    // Give the second request time to arrive
-    await new Promise((r) => setTimeout(r, 50));
-
-    // Release the first call
+    // Deterministic rendezvous: release the leader only once the follower
+    // has actually been admitted while the leader is blocked in the
+    // handler.
+    await waitFor(
+      () =>
+        server.observations().filter((o) => o.reservation === "IN_FLIGHT")
+          .length === 1,
+      "the follower to be admitted while the leader is blocked",
+    );
     resolveFirst();
 
-    const [resp1, resp2] = await Promise.all([promise1, promise2]);
+    const responses = await Promise.all([promise1, promise2]);
 
-    // First succeeds; second sees IN_FLIGHT → UNKNOWN
-    expect(resp1.status).toBe("SUCCEEDED");
-    expect(resp2.status).toBe("UNKNOWN");
-    expect(resp2.error).toContain("in flight");
-    // Handler called only once
+    // Exactly one provider dispatch, exactly one terminal outcome; the
+    // other caller observed a truthful in-flight state, never a second
+    // execution and never a fabricated result.
     expect(callCount).toBe(1);
+    const succeeded = responses.filter((r) => r.status === "SUCCEEDED");
+    const inFlight = responses.filter((r) => r.status === "UNKNOWN");
+    expect(succeeded).toHaveLength(1);
+    expect(inFlight).toHaveLength(1);
+    expect(inFlight[0].error).toContain("in flight");
+    expect(succeeded[0].result).toEqual({ message_id: "msg_1" });
+
+    // The observation log proves the shape: one leader that dispatched,
+    // one follower that observed IN_FLIGHT.
+    const observations = server.observations();
+    expect(observations.filter((o) => o.dispatched)).toHaveLength(1);
+    expect(observations.filter((o) => o.reservation === "NEW")).toHaveLength(1);
+    expect(observations.filter((o) => o.reservation === "IN_FLIGHT")).toHaveLength(1);
   });
 
   it("same idempotency key with different arguments is CONFLICT", async () => {

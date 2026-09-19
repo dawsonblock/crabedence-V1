@@ -8,6 +8,10 @@
 - Release: the attestation terminates the evidence chain. Its subject is the final `evidence-manifest.json` and its predicate carries the manifest digest, in both the release and qualification workflows; an attestation of a superseded manifest fails closed.
 - Release: clean-room verification runs before publication. `release-rc.yml` now stages the archive and evidence, verifies them standalone in the clean room, and only then publishes — re-verifying the staged archive digest before tagging — so a bundle that cannot be independently verified can never become public.
 
+### NEMO — concurrent-mutation invariant
+
+- NEMO: the in-memory idempotency bridge can no longer hand a second concurrent caller the leader's `NEW` reservation outcome — the reservation critical section is explicitly synchronous and atomic, so one key always maps to one dispatch. The concurrent-mutation test no longer assumes which caller wins the reservation (it rendezvouses on the observed admission state instead of sleeping), and a new hammer test (100 iterations × 8 concurrent callers by default, `NEMO_HAMMER_ITERATIONS`/`NEMO_HAMMER_CONCURRENCY` to scale) asserts one durable identity, exactly one provider dispatch, exactly one terminal outcome, and terminal replay on retry under randomized scheduling.
+
 ### Capability — availability is distinct from existence
 
 - Capability: a registered capability whose adapter is not configured reports the machine-readable reason `ADAPTER_NOT_CONFIGURED` in the failure text, so an operator can distinguish "this deployment cannot execute it" from "the policy definition does not recognize it" without parsing prose. The failure code remains `CAPABILITY_UNAVAILABLE`.
