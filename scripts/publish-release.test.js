@@ -13,6 +13,35 @@ const runId = 9001;
 const workflowId = 77;
 const repository = "openclaw/crabbox";
 
+// The publication fixtures replay real signed release tags, which CI
+// provides (the scripts job checks out with fetch-depth: 0). A local
+// clone without those tags has no fixture to exercise: skip rather than
+// fail, so the suite reports the missing prerequisite instead of a
+// behavior regression.
+const fixtureTagsAvailable = (() => {
+  try {
+    execFileSync("git", ["-C", sourceRoot, "rev-parse", "--verify", `refs/tags/${tag}`], {
+      stdio: "ignore",
+    });
+    return true;
+  } catch {
+    return false;
+  }
+})();
+
+function testWithTags(name, optionsOrFn, maybeFn) {
+  const fn = typeof optionsOrFn === "function" ? optionsOrFn : maybeFn;
+  const options = typeof optionsOrFn === "function" ? undefined : optionsOrFn;
+  const wrapped = (t) => {
+    if (!fixtureTagsAvailable) {
+      t.skip(`signed release tag ${tag} is not present in this clone; CI fetches tags for these fixtures`);
+      return;
+    }
+    return fn(t);
+  };
+  return options === undefined ? test(name, wrapped) : test(name, options, wrapped);
+}
+
 function sha256(value) {
   return crypto.createHash("sha256").update(value).digest("hex");
 }
@@ -874,7 +903,7 @@ function withFixture(options, callback) {
   }
 }
 
-test("publication drift fails before any mutation", () => {
+testWithTags("publication drift fails before any mutation", () => {
   withFixture({}, ({ run, mutations }) => {
     const result = run("drift");
     assert.notEqual(result.status, 0);
@@ -883,7 +912,7 @@ test("publication drift fails before any mutation", () => {
   });
 });
 
-test("missing native proof fails before any mutation", () => {
+testWithTags("missing native proof fails before any mutation", () => {
   withFixture({}, ({ run, mutations }) => {
     const result = run("no-proof");
     assert.notEqual(result.status, 0);
@@ -892,7 +921,7 @@ test("missing native proof fails before any mutation", () => {
   });
 });
 
-test("tampered native proof asset record fails before any mutation", () => {
+testWithTags("tampered native proof asset record fails before any mutation", () => {
   withFixture({}, ({ run, mutations }) => {
     const result = run("proof-drift");
     assert.notEqual(result.status, 0);
@@ -901,7 +930,7 @@ test("tampered native proof asset record fails before any mutation", () => {
   });
 });
 
-test("tampered native proof draft metadata fails before any mutation", () => {
+testWithTags("tampered native proof draft metadata fails before any mutation", () => {
   withFixture({}, ({ run, mutations }) => {
     const result = run("proof-metadata-drift");
     assert.notEqual(result.status, 0);
@@ -910,7 +939,7 @@ test("tampered native proof draft metadata fails before any mutation", () => {
   });
 });
 
-test("tampered native proof workflow commit fails before any mutation", () => {
+testWithTags("tampered native proof workflow commit fails before any mutation", () => {
   withFixture({}, ({ run, mutations }) => {
     const result = run("proof-workflow-drift");
     assert.notEqual(result.status, 0);
@@ -919,7 +948,7 @@ test("tampered native proof workflow commit fails before any mutation", () => {
   });
 });
 
-test("optional approval rules do not constrain publication", () => {
+testWithTags("optional approval rules do not constrain publication", () => {
   withFixture({}, ({ run, mutations }) => {
     const result = run("optional-approvals");
     assert.equal(result.status, 0, result.stderr);
@@ -927,7 +956,7 @@ test("optional approval rules do not constrain publication", () => {
   });
 });
 
-test("missing no-bypass history rules fail before any mutation", () => {
+testWithTags("missing no-bypass history rules fail before any mutation", () => {
   withFixture({}, ({ run, mutations }) => {
     const result = run("missing-history-rules");
     assert.notEqual(result.status, 0);
@@ -936,7 +965,7 @@ test("missing no-bypass history rules fail before any mutation", () => {
   });
 });
 
-test("optional approval rules can share no-bypass history protection", () => {
+testWithTags("optional approval rules can share no-bypass history protection", () => {
   withFixture({}, ({ run, mutations }) => {
     const result = run("history-with-approval");
     assert.equal(result.status, 0, result.stderr);
@@ -944,7 +973,7 @@ test("optional approval rules can share no-bypass history protection", () => {
   });
 });
 
-test("overlapping bypassable history rules fail before any mutation", () => {
+testWithTags("overlapping bypassable history rules fail before any mutation", () => {
   withFixture({}, ({ run, mutations }) => {
     const result = run("other-actor-history-overlap");
     assert.notEqual(result.status, 0);
@@ -953,7 +982,7 @@ test("overlapping bypassable history rules fail before any mutation", () => {
   });
 });
 
-test("all-branch bypassable history rules fail before any mutation", () => {
+testWithTags("all-branch bypassable history rules fail before any mutation", () => {
   withFixture({}, ({ run, mutations }) => {
     const result = run("other-actor-history-overlap-all");
     assert.notEqual(result.status, 0);
@@ -962,7 +991,7 @@ test("all-branch bypassable history rules fail before any mutation", () => {
   });
 });
 
-test("globbed bypassable history rules fail before any mutation", () => {
+testWithTags("globbed bypassable history rules fail before any mutation", () => {
   withFixture({}, ({ run, mutations }) => {
     const result = run("other-actor-history-overlap-glob");
     assert.notEqual(result.status, 0);
@@ -971,7 +1000,7 @@ test("globbed bypassable history rules fail before any mutation", () => {
   });
 });
 
-test("excluded bypassable history rules do not block publication", () => {
+testWithTags("excluded bypassable history rules do not block publication", () => {
   withFixture({}, ({ run, mutations }) => {
     const result = run("other-actor-history-excluded");
     assert.equal(result.status, 0, result.stderr);
@@ -979,7 +1008,7 @@ test("excluded bypassable history rules do not block publication", () => {
   });
 });
 
-test("non-recursive double-star history rules do not match nested refs", () => {
+testWithTags("non-recursive double-star history rules do not match nested refs", () => {
   withFixture({}, ({ run, mutations }) => {
     const result = run("other-actor-history-double-star");
     assert.equal(result.status, 0, result.stderr);
@@ -987,7 +1016,7 @@ test("non-recursive double-star history rules do not match nested refs", () => {
   });
 });
 
-test("recursive double-star bypassable history rules fail before any mutation", () => {
+testWithTags("recursive double-star bypassable history rules fail before any mutation", () => {
   withFixture({}, ({ run, mutations }) => {
     const result = run("other-actor-history-recursive");
     assert.notEqual(result.status, 0);
@@ -996,7 +1025,7 @@ test("recursive double-star bypassable history rules fail before any mutation", 
   });
 });
 
-test("slash character classes do not match path separators", () => {
+testWithTags("slash character classes do not match path separators", () => {
   withFixture({}, ({ run, mutations }) => {
     const result = run("other-actor-history-slash-class");
     assert.equal(result.status, 0, result.stderr);
@@ -1004,7 +1033,7 @@ test("slash character classes do not match path separators", () => {
   });
 });
 
-test("bypassable history protection fails before any mutation", () => {
+testWithTags("bypassable history protection fails before any mutation", () => {
   withFixture({}, ({ run, mutations }) => {
     const result = run("history-bypassable");
     assert.notEqual(result.status, 0);
@@ -1013,7 +1042,7 @@ test("bypassable history protection fails before any mutation", () => {
   });
 });
 
-test("missing organization release workflow fails before any mutation", () => {
+testWithTags("missing organization release workflow fails before any mutation", () => {
   withFixture({}, ({ run, mutations }) => {
     const result = run("missing-workflow-rules");
     assert.notEqual(result.status, 0);
@@ -1022,7 +1051,7 @@ test("missing organization release workflow fails before any mutation", () => {
   });
 });
 
-test("bypassable organization release workflow fails before any mutation", () => {
+testWithTags("bypassable organization release workflow fails before any mutation", () => {
   withFixture({}, ({ run, mutations }) => {
     const result = run("workflow-bypassable");
     assert.notEqual(result.status, 0);
@@ -1037,7 +1066,7 @@ for (const mode of [
   "workflow-wrong-ref",
   "workflow-wrong-repository",
 ]) {
-  test(`${mode} fails before any mutation`, () => {
+  testWithTags(`${mode} fails before any mutation`, () => {
     withFixture({}, ({ run, mutations }) => {
       const result = run(mode);
       assert.notEqual(result.status, 0);
@@ -1047,7 +1076,7 @@ for (const mode of [
   });
 }
 
-test("exact organization release workflow permits publication", () => {
+testWithTags("exact organization release workflow permits publication", () => {
   withFixture({}, ({ run, mutations }) => {
     const result = run("workflow-exact");
     assert.equal(result.status, 0, result.stderr);
@@ -1055,7 +1084,7 @@ test("exact organization release workflow permits publication", () => {
   });
 });
 
-test("missing stable-tag update protection fails before any mutation", () => {
+testWithTags("missing stable-tag update protection fails before any mutation", () => {
   withFixture({}, ({ run, mutations }) => {
     const result = run("missing-tag-rules");
     assert.notEqual(result.status, 0);
@@ -1064,7 +1093,7 @@ test("missing stable-tag update protection fails before any mutation", () => {
   });
 });
 
-test("stable-tag ruleset exclusions fail before any mutation", () => {
+testWithTags("stable-tag ruleset exclusions fail before any mutation", () => {
   withFixture({}, ({ run, mutations }) => {
     const result = run("excluded-tag-rules");
     assert.notEqual(result.status, 0);
@@ -1073,7 +1102,7 @@ test("stable-tag ruleset exclusions fail before any mutation", () => {
   });
 });
 
-test("final immediately pre-PATCH draft drift fails before any mutation", () => {
+testWithTags("final immediately pre-PATCH draft drift fails before any mutation", () => {
   withFixture({}, ({ run, mutations }) => {
     const result = run("prepatch-drift");
     assert.notEqual(result.status, 0);
@@ -1083,7 +1112,7 @@ test("final immediately pre-PATCH draft drift fails before any mutation", () => 
 });
 
 for (const mode of ["patch-response-drift", "public-readback-drift"]) {
-  test(`${mode} reports an incident after one PATCH without corrective mutations`, () => {
+  testWithTags(`${mode} reports an incident after one PATCH without corrective mutations`, () => {
     withFixture({}, ({ run, mutations }) => {
       const result = run(mode);
       assert.notEqual(result.status, 0);
@@ -1094,7 +1123,7 @@ for (const mode of ["patch-response-drift", "public-readback-drift"]) {
   });
 }
 
-test("post-PATCH protected-main drift reports an incident without corrective mutations", () => {
+testWithTags("post-PATCH protected-main drift reports an incident without corrective mutations", () => {
   withFixture({}, ({ run, mutations }) => {
     const result = run("published-main-drift");
     assert.notEqual(result.status, 0);
@@ -1104,7 +1133,7 @@ test("post-PATCH protected-main drift reports an incident without corrective mut
   });
 });
 
-test("disabled release immutability fails before publication", () => {
+testWithTags("disabled release immutability fails before publication", () => {
   withFixture({}, ({ run, mutations }) => {
     const result = run("immutable-disabled");
     assert.notEqual(result.status, 0);
@@ -1113,7 +1142,7 @@ test("disabled release immutability fails before publication", () => {
   });
 });
 
-test("repository-only release immutability fails before publication", () => {
+testWithTags("repository-only release immutability fails before publication", () => {
   withFixture({}, ({ run, mutations }) => {
     const result = run("immutable-repository-only");
     assert.notEqual(result.status, 0);
@@ -1122,7 +1151,7 @@ test("repository-only release immutability fails before publication", () => {
   });
 });
 
-test("dirty protected publication tooling fails before any network call", () => {
+testWithTags("dirty protected publication tooling fails before any network call", () => {
   withFixture({}, ({ checkout, run, mutations }) => {
     fs.appendFileSync(path.join(checkout, "scripts", "validate-release-publication.mjs"), "\n// dirty\n");
     const result = run("success");
@@ -1132,7 +1161,7 @@ test("dirty protected publication tooling fails before any network call", () => 
   });
 });
 
-test("local HEAD drift fails before any network call", () => {
+testWithTags("local HEAD drift fails before any network call", () => {
   withFixture({}, ({ checkout, run, mutations }) => {
     fs.writeFileSync(path.join(checkout, "unrelated.txt"), "new commit\n");
     git(checkout, "add", "unrelated.txt");
@@ -1144,7 +1173,7 @@ test("local HEAD drift fails before any network call", () => {
   });
 });
 
-test("protected blocked record fails before any mutation", () => {
+testWithTags("protected blocked record fails before any mutation", () => {
   withFixture({ publishable: false }, ({ run, mutations }) => {
     const result = run("success");
     assert.notEqual(result.status, 0);
@@ -1153,7 +1182,7 @@ test("protected blocked record fails before any mutation", () => {
   });
 });
 
-test("exact proof publishes without approval rules or a serialization attestation using one PATCH", () => {
+testWithTags("exact proof publishes without approval rules or a serialization attestation using one PATCH", () => {
   withFixture({}, ({ run, mutations }) => {
     const result = run("success");
     assert.equal(result.status, 0, result.stderr || result.stdout);
@@ -1162,7 +1191,7 @@ test("exact proof publishes without approval rules or a serialization attestatio
   });
 });
 
-test("split verifier and workflow commits permit publication from exact protected main", () => {
+testWithTags("split verifier and workflow commits permit publication from exact protected main", () => {
   withFixture({ splitCommit: true }, ({ run, mutations, verifierCommit, workflowCommit }) => {
     assert.notEqual(workflowCommit, verifierCommit);
     const result = run("success");
@@ -1171,7 +1200,7 @@ test("split verifier and workflow commits permit publication from exact protecte
   });
 });
 
-test("mismatched supplied workflow commit fails before any network call", () => {
+testWithTags("mismatched supplied workflow commit fails before any network call", () => {
   withFixture({ splitCommit: true }, ({ run, mutations, verifierCommit }) => {
     const result = run("success", {
       explicitWorkflow: true,
@@ -1183,7 +1212,7 @@ test("mismatched supplied workflow commit fails before any network call", () => 
   });
 });
 
-test("selected verifier run with a different workflow head fails before publication", () => {
+testWithTags("selected verifier run with a different workflow head fails before publication", () => {
   withFixture({ splitCommit: true }, ({ run, mutations }) => {
     const result = run("run-head-drift");
     assert.notEqual(result.status, 0);
@@ -1192,7 +1221,7 @@ test("selected verifier run with a different workflow head fails before publicat
   });
 });
 
-test("divergent workflow commit fails before any network call", () => {
+testWithTags("divergent workflow commit fails before any network call", () => {
   withFixture({ divergentWorkflow: true }, ({ run, mutations }) => {
     const result = run("success");
     assert.notEqual(result.status, 0);
@@ -1201,7 +1230,7 @@ test("divergent workflow commit fails before any network call", () => {
   });
 });
 
-test("workflow commit that is not current protected main fails before publication", () => {
+testWithTags("workflow commit that is not current protected main fails before publication", () => {
   withFixture({ splitCommit: true }, ({ run, mutations }) => {
     const result = run("current-main-drift");
     assert.notEqual(result.status, 0);
@@ -1210,7 +1239,7 @@ test("workflow commit that is not current protected main fails before publicatio
   });
 });
 
-test("static workflow name remains accepted for compatible run metadata", () => {
+testWithTags("static workflow name remains accepted for compatible run metadata", () => {
   withFixture({ dynamicRunName: false }, ({ run, mutations }) => {
     const result = run("success");
     assert.equal(result.status, 0, result.stderr || result.stdout);
@@ -1218,7 +1247,7 @@ test("static workflow name remains accepted for compatible run metadata", () => 
   });
 });
 
-test("native verifier workflow prevents overlap for one numeric release without cross-release cancellation", () => {
+testWithTags("native verifier workflow prevents overlap for one numeric release without cross-release cancellation", () => {
   const workflow = fs.readFileSync(
     path.join(sourceRoot, ".github", "workflows", "release-assets.yml"),
     "utf8",
