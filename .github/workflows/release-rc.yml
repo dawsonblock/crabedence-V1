@@ -342,6 +342,15 @@ jobs:
       - name: Generate artifact.json
         shell: bash
         run: |
+          # Bind the capability-policy identity into the artifact: the
+          # registry digest is what the released service will serve, so
+          # the evidence answers "which policy was this qualified
+          # against?" without re-deriving it.
+          REGISTRY_SHA256="$(go run ./cmd/registry-digest)"
+          if [ -z "$REGISTRY_SHA256" ]; then
+            echo "ERROR: capability registry digest is empty" >&2
+            exit 1
+          fi
           cat > dist/release-evidence/artifact.json << EOF
           {
             "name": "crabedence-${RELEASE_VERSION}.tar.gz",
@@ -350,7 +359,8 @@ jobs:
             "zip_sha256": "${{ steps.artifact_hash.outputs.zip_sha256 }}",
             "source_commit": "$COMMIT",
             "source_tree": "$TREE",
-            "release_version": "$RELEASE_VERSION"
+            "release_version": "$RELEASE_VERSION",
+            "registry_sha256": "$REGISTRY_SHA256"
           }
           EOF
 

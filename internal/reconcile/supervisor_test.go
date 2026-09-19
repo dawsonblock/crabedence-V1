@@ -64,6 +64,41 @@ func (errorResolver) Resolve(context.Context, *idempotency.Record) (idempotency.
 	return idempotency.RecoveryResult{}, errors.New("provider lookup failed")
 }
 
+func TestSupervisorPublishesReadinessToStatusWriter(t *testing.T) {
+	store := &stubStore{}
+	worker := NewWorker(store, NoopResolver{}, time.Minute)
+	supervisor := NewSupervisor(worker, store, SupervisorConfig{Interval: time.Minute})
+
+	var published []Health
+	supervisor.SetStatusWriter(func(health Health) {
+		published = append(published, health)
+	})
+
+	supervisor.runCycle(context.Background())
+	if len(published) != 1 {
+		t.Fatalf("status writer calls = %d, want 1", len(published))
+	}
+	if published[0].State != HealthReady {
+		t.Fatalf("published state = %s, want READY", published[0].State)
+	}
+
+	// A failing cycle publishes NOT_READY — the degraded state escapes
+	// the object graph, not just the logs.
+	failing := &stubStore{claimErr: errors.New("injected claim failure")}
+	failingSupervisor := NewSupervisor(NewWorker(failing, NoopResolver{}, time.Minute), failing, SupervisorConfig{
+		Interval:               time.Minute,
+		MaxConsecutiveFailures: 1,
+	})
+	var failingPublished []Health
+	failingSupervisor.SetStatusWriter(func(health Health) {
+		failingPublished = append(failingPublished, health)
+	})
+	failingSupervisor.runCycle(context.Background())
+	if len(failingPublished) != 1 || failingPublished[0].State != HealthNotReady {
+		t.Fatalf("published failure state = %+v, want NOT_READY", failingPublished)
+	}
+}
+
 func TestSupervisorReadinessPolicy(t *testing.T) {
 	store := &stubStore{}
 	worker := NewWorker(store, NoopResolver{}, time.Minute)

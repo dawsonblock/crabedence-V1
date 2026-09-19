@@ -29,6 +29,7 @@ type Supervisor struct {
 	consecutiveFailures int64
 	lastError           string
 	state               string
+	statusWriter        func(Health)
 }
 
 // SupervisorConfig is the explicit readiness policy. Thresholds are
@@ -166,6 +167,33 @@ func (s *Supervisor) runCycle(ctx context.Context) {
 	if previous != string(health.State) {
 		log.Printf("reconciliation readiness: %s -> %s%s", previous, health.State, reasonSuffix(health.Reasons))
 	}
+	s.writeStatus(health)
+}
+
+// SetStatusWriter configures the readiness surface: the supervisor hands
+// its health snapshot to the writer on every cycle, so an orchestrator
+// (systemd, Kubernetes, a watchdog) can observe reconciliation health
+// without reading logs — the degraded state escapes the object graph.
+//
+// The writer is called synchronously and must be fast; it must never
+// panic, and it owns its own error handling (a missing observability
+// surface must not take the execution service down).
+func (s *Supervisor) SetStatusWriter(write func(Health)) {
+	s.mu.Lock()
+	s.statusWriter = write
+	s.mu.Unlock()
+}
+
+// writeStatus publishes the current health snapshot to the configured
+// readiness surface, if any.
+func (s *Supervisor) writeStatus(health Health) {
+	s.mu.Lock()
+	write := s.statusWriter
+	s.mu.Unlock()
+	if write == nil {
+		return
+	}
+	write(health)
 }
 
 func reasonSuffix(reasons []string) string {

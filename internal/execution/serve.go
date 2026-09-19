@@ -3,6 +3,7 @@ package execution
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
@@ -356,6 +357,21 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 			Interval:               durationSeconds(opts.ReconcileInterval),
 			MaxConsecutiveFailures: 5,
 			MaxUnknownAge:          time.Hour,
+		})
+		// Readiness surface: the supervisor's health escapes the Go
+		// object graph into a file next to the socket, so an
+		// orchestrator (systemd, Kubernetes, a watchdog) can observe
+		// reconciliation health without reading logs.
+		statusPath := filepath.Join(filepath.Dir(opts.SocketPath), "reconciler-status.json")
+		supervisor.SetStatusWriter(func(health reconcile.Health) {
+			payload, err := json.Marshal(health)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "reconciliation readiness: cannot marshal status: %v\n", err)
+				return
+			}
+			if err := writeFileAtomic(statusPath, append(payload, '\n'), 0o600); err != nil {
+				fmt.Fprintf(os.Stderr, "reconciliation readiness: cannot write status file %s: %v\n", statusPath, err)
+			}
 		})
 		go func() {
 			if err := supervisor.Run(ctx); err != nil && ctx.Err() == nil {
