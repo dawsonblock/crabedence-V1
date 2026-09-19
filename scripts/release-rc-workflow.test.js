@@ -76,3 +76,31 @@ test("the final evidence manifest is a published release asset", () => {
   assert.match(publish, /dist\/release-evidence\/evidence-manifest\.json/);
   assert.match(publish, /dist\/release-evidence\/artifact\.json/);
 });
+
+test("published bytes are reverified after publication", () => {
+  const reverify = job("public-reverify");
+  assert.match(reverify, /needs: \[build, publish\]/);
+  assert.match(reverify, /gh release download/);
+  assert.match(reverify, /needs\.build\.outputs\.tar_sha256/);
+  assert.match(reverify, /gh attestation verify/);
+  assert.match(reverify, /--mode release/);
+  // Distribution verification runs after publication; it never gates it.
+  assert.doesNotMatch(job("publish"), /public-reverify/);
+});
+
+test("the published evidence set is sufficient for consumer verification", () => {
+  const publish = job("publish");
+  for (const file of [
+    "artifact.json",
+    "evidence-manifest.json",
+    "registry.sha256",
+    "registry.json",
+    "attestation/attestation.json",
+    "SHA256SUMS",
+  ]) {
+    assert.ok(
+      publish.includes(`dist/release-evidence/${file}`),
+      `publish must include dist/release-evidence/${file}`,
+    );
+  }
+});

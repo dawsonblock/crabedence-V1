@@ -653,4 +653,90 @@ jobs:
             dist/release-evidence/provenance.json
             dist/release-evidence/artifact.json
             dist/release-evidence/evidence-manifest.json
+            dist/release-evidence/registry.sha256
+            dist/release-evidence/registry.json
+            dist/release-evidence/attestation/attestation.json
             dist/release-evidence/SHA256SUMS
+
+  # ─── Public reverify (distribution integrity) ────────────────────────
+  # After publication, download the PUBLIC bytes and verify them against
+  # the qualified evidence. This answers "did the distribution system
+  # publish the same bytes we qualified?" — it does not control whether
+  # the release exists (the pre-publication clean room made that
+  # decision), but a mismatch fails the workflow loudly.
+  public-reverify:
+    name: Public reverify (distribution integrity)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [build, publish]
+    env:
+      RELEASE_VERSION: ${{ needs.build.outputs.release_version }}
+    steps:
+      - name: Download published artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p public
+          gh release download "$RELEASE_VERSION" \
+            --repo ${{ github.repository }} \
+            --pattern "crabedence-${RELEASE_VERSION}.tar.gz" \
+            --pattern "crabedence-${RELEASE_VERSION}.tar.gz.sha256" \
+            --pattern "artifact.json" \
+            --pattern "evidence-manifest.json" \
+            --pattern "SHA256SUMS" \
+            --dir public
+
+      - name: Verify published archive matches the qualified digest
+        run: |
+          qualified="${{ needs.build.outputs.tar_sha256 }}"
+          actual="$(sha256sum "public/crabedence-${RELEASE_VERSION}.tar.gz" | cut -d ' ' -f1)"
+          published="$(cut -d ' ' -f1 < "public/crabedence-${RELEASE_VERSION}.tar.gz.sha256")"
+          if [ "$actual" != "$qualified" ] || [ "$published" != "$qualified" ]; then
+            echo "ERROR: published archive digest $actual / declared $published does not match the qualified $qualified" >&2
+            exit 1
+          fi
+          echo "Published archive matches the qualified digest: $actual"
+
+      - name: Download release evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-evidence
+          path: evidence
+
+      - name: Verify published evidence files match the qualified bundle
+        run: |
+          for file in artifact.json evidence-manifest.json SHA256SUMS; do
+            if ! cmp -s "public/$file" "evidence/$file"; then
+              echo "ERROR: published $file differs from the qualified evidence bundle" >&2
+              exit 1
+            fi
+          done
+
+      - name: Extract published archive
+        run: |
+          mkdir -p clean-room
+          tar xzf "public/crabedence-${RELEASE_VERSION}.tar.gz" -C clean-room
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24
+
+      - name: Install pinned verification dependencies
+        run: npm ci --prefix "clean-room/crabedence-${RELEASE_VERSION}/nemo"
+
+      - name: Verify published artifact (standalone, no .git)
+        run: |
+          cp -r evidence clean-room/qualification
+          bash clean-room/crabedence-${RELEASE_VERSION}/scripts/verify-release-artifact.sh \
+            --mode release \
+            --evidence clean-room/qualification \
+            --source clean-room/crabedence-${RELEASE_VERSION} \
+            --archive "public/crabedence-${RELEASE_VERSION}.tar.gz"
+
+      - name: Verify published attestation
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh attestation verify "public/crabedence-${RELEASE_VERSION}.tar.gz" \
+            --repo ${{ github.repository }}

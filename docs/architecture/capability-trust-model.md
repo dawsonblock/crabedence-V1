@@ -170,5 +170,10 @@ principal.
   builds and stages the archive and evidence, the clean room verifies the
   staged bytes standalone, and only then does the publish job tag and
   create the release — re-verifying the staged archive digest first.
+- Publication is followed by a distribution-integrity reverify: the
+  published archive digest must equal the qualified digest, the published
+  `artifact.json`/`evidence-manifest.json`/`SHA256SUMS` must be
+  byte-identical to the qualified bundle, and the published bytes must
+  pass the standalone `--mode release` verifier and attestation check.
 
 Typed release gates remain open; see the release-engineering findings.

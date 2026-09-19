@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Release engineering — distribution integrity reverify
+
+- Release: publication is followed by a distribution-integrity check. `release-rc.yml` now downloads the published release assets, requires the published archive digest to equal the qualified digest, requires the published `artifact.json`/`evidence-manifest.json`/`SHA256SUMS` to be byte-identical to the qualified bundle, re-runs the standalone verifier (`--mode release`) against the published bytes, and verifies the published attestation. A mismatch fails the workflow loudly; it never rewrites or unpublishes the release.
+- Release: the published evidence set now includes `registry.sha256`, `registry.json`, and the attestation reference, so consumers can verify the registry policy identity and the attestation binding from the release assets alone.
+
 ### Release engineering — explicit verifier contracts and registry policy identity
 
 - Release: the standalone verifier now runs under an explicit contract — `--mode qualification` (qualification evidence, source identity, registry policy identity, provenance metadata; archive optional) or `--mode release` (the same plus the archive, `artifact.json`, SBOM, and the final evidence manifest). A missing release-mode input is a hard contract violation instead of a pile of individual failures; the legacy positional form still works and announces the inferred mode.
