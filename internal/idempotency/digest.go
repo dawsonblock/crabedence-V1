@@ -54,6 +54,15 @@ func CanonicalJSON(v any) (string, error) {
 	return string(b), nil
 }
 
+// NormalizeNumbers returns v with every json.Number rewritten to its
+// canonical numeric form — the same normalization the request digest
+// applies. Exported for consumers that need canonical bytes over
+// structured data (e.g. the capability-registry digest) so the project
+// keeps exactly one numeric canonicalization.
+func NormalizeNumbers(v any) (any, error) {
+	return normalizeNumbers(v)
+}
+
 // canonicalJSONNumber normalizes a JSON numeric literal to its
 // canonical form: a normalized scientific representation of the same
 // mathematical value that never expands according to the exponent:

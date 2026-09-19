@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Capability registry — canonical identity and startup invariant scan
+
+- Capability: the registry exposes its canonical SHA-256 digest (`Registry.Digest`) — descriptors sorted by ID and canonicalized (sorted keys; schema numbers normalized through the request digest's numeric model) — so two registries with different policy always have different identities, and the same policy reproduces the same digest. `Registry.Report` renders the startup report (descriptor counts by class, assurance, and route, plus the digest), printed by `crabbox serve-execution`.
+- Capability: `Registry.Validate` re-checks the whole registry at startup and fails the registry rather than the request for invalid or incompatible dimension combinations, a missing adapter binding, a malformed argument schema, or any schema keyword the argument validator does not implement — unimplemented validation keywords fail closed instead of silently weakening validation (inert annotations such as `description` remain accepted). `Registry.ValidateAdapters` refuses capabilities whose adapter is not wired into the service, and a regression test pins the built-in registry against the scan.
+- Idempotency: `NormalizeNumbers` is exported so the registry digest and the request digest share exactly one numeric canonicalization.
+
 ### Release engineering — one version source and verified release documentation
 
 - `VERSION` is the single version source. `scripts/verify-version-consistency.mjs` fails CI and both release workflows when `worker/package.json`, either root entry in `worker/package-lock.json`, or `nemo/package.json` disagrees with it; when the latest finalized `CHANGELOG.md` section disagrees (a pre-release `VERSION` must instead be newer than the latest release); when the release pipeline's declared Go toolchain drifts between `scripts/release-config.sh` and `scripts/release-provenance.mjs`; and, with `--tag vX.Y.Z`, when the signed tag disagrees with `VERSION`. `nemo/package.json` had drifted at 0.1.0 and now tracks the release line; the release checklist and `AGENTS.md` name `VERSION` and `nemo/package.json` as version-carrying files.

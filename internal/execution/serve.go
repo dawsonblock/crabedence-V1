@@ -260,6 +260,28 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	}
 	multiHandler := NewMultiHandler(handlers)
 
+	// Registry invariant scan and startup report. The registry fails
+	// closed as a whole: a capability with an invalid dimension
+	// combination, no adapter binding, a malformed argument schema, or
+	// an unsupported schema keyword refuses service startup instead of
+	// surfacing at execution time. The registry digest is the stable
+	// identity of the exact capability policy set this process serves.
+	if err := registry.Validate(); err != nil {
+		return fmt.Errorf("capability registry invariant scan failed: %w", err)
+	}
+	knownAdapters := make(map[string]bool, len(handlers))
+	for adapterID := range handlers {
+		knownAdapters[adapterID] = true
+	}
+	if err := registry.ValidateAdapters(knownAdapters); err != nil {
+		return err
+	}
+	report, err := registry.Report()
+	if err != nil {
+		return fmt.Errorf("capability registry report failed: %w", err)
+	}
+	fmt.Fprint(os.Stderr, report.String())
+
 	if store != nil {
 		// Use DispatchExecutor for durable idempotency
 		executor := NewDispatchExecutor(multiHandler, store)
