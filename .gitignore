@@ -40,3 +40,6 @@ internal/applevmhelper/embedded/
 .claude/
 nemo/node_modules/
 release-evidence/
+
+# Vite/Vitest local cache (not source)
+.vite/
