@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Reconciliation — supervisor, readiness policy, and operational counters
+
+- Reconciliation: the worker now runs under a `Supervisor` with an explicit, configurable readiness policy (`SupervisorConfig`): `DEGRADED` when no cycle has succeeded within `DegradedAfterCycleAge` or the oldest pending UNKNOWN exceeds `MaxUnknownAge`; `NOT_READY` when the reconciler is stopped or never started, when `NotReadyAfterCycleAge` passes without a successful cycle, or after `MaxConsecutiveFailures` consecutive failed cycles. Readiness transitions are logged, so the subsystem's health change is visible without polling.
+- Reconciliation: `Supervisor.Health` reports the verdict with reasons plus operational observability — cycle counters (started/completed/failed), resolver failures, dead letters, UNKNOWN backlog pending count and oldest age, last cycle/start/success timestamps, and the last cycle error. `Worker.Metrics()` exposes the cumulative counters, and `Worker.RunCycle` lets a supervisor drive and observe cycles directly.
+- Execution: `crabbox serve-execution` runs reconciliation through the supervisor (production defaults: 5 consecutive failures, 1-hour UNKNOWN backlog age).
+
 ### Execution — real DIRECT provider (GitHub reads)
 
 - Execution: the `DIRECT` route is implemented. `DirectReadRegistry` executes observational reads under the same in-process contract as Function Hooks (route/class enforcement, argument validation, bounded runtime, bounded payload, well-formed JSON, audit record) with the `READ`/`DIRECT` pairing enforced: a failed read is a safe `FAILED`, never `UNKNOWN`, and never a durable ledger entry.

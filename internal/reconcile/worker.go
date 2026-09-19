@@ -16,6 +16,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/openclaw/crabbox/internal/evidence"
@@ -55,6 +56,12 @@ type Worker struct {
 	// dead-lettered: it stays UNKNOWN and inspectable, but stops
 	// churning through the reconcile loop.
 	maxAttempts int
+	// Operational counters — process-local, monotonic. See Metrics.
+	cyclesStarted    atomic.Int64
+	cyclesCompleted  atomic.Int64
+	cyclesFailed     atomic.Int64
+	resolverFailures atomic.Int64
+	deadLetters      atomic.Int64
 }
 
 // NewWorker creates a reconciliation worker with a default resolver.
@@ -121,6 +128,42 @@ func (w *Worker) resolve(ctx context.Context, rec *idempotency.Record) (idempote
 	return idempotency.RecoveryResult{Decision: idempotency.RecoveryUnknown}, nil
 }
 
+// WorkerMetrics is the worker's cumulative operational counters. They
+// are process-local and monotonic; the supervisor surfaces them for
+// readiness and alerting.
+type WorkerMetrics struct {
+	// CyclesStarted/Completed/Failed count reconciliation cycles.
+	CyclesStarted   int64
+	CyclesCompleted int64
+	CyclesFailed    int64
+	// ResolverFailures counts resolver errors (provider lookups that
+	// could not complete) — the conservative path that keeps a record
+	// UNKNOWN rather than guessing.
+	ResolverFailures int64
+	// DeadLetters counts records suspended after exhausting the
+	// attempt ceiling.
+	DeadLetters int64
+}
+
+// Metrics returns a snapshot of the worker's counters.
+func (w *Worker) Metrics() WorkerMetrics {
+	return WorkerMetrics{
+		CyclesStarted:    w.cyclesStarted.Load(),
+		CyclesCompleted:  w.cyclesCompleted.Load(),
+		CyclesFailed:     w.cyclesFailed.Load(),
+		ResolverFailures: w.resolverFailures.Load(),
+		DeadLetters:      w.deadLetters.Load(),
+	}
+}
+
+// RunCycle runs one reconciliation cycle: claim and resolve UNKNOWN
+// records, recover expired leases, and scrub stale locators. The
+// supervisor drives this directly so it can observe cycle timing and
+// failures.
+func (w *Worker) RunCycle(ctx context.Context) error {
+	return w.reconcileAll(ctx)
+}
+
 // Run starts the reconciliation loop. It runs until the context is cancelled.
 func (w *Worker) Run(ctx context.Context) error {
 	ticker := time.NewTicker(w.interval)
@@ -131,7 +174,7 @@ func (w *Worker) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			if err := w.reconcileAll(ctx); err != nil {
+			if err := w.RunCycle(ctx); err != nil {
 				// Log but continue
 				fmt.Printf("reconciliation error: %v\n", err)
 			}
@@ -143,6 +186,16 @@ func (w *Worker) Run(ctx context.Context) error {
 // ClaimUnknownBatch uses FOR UPDATE SKIP LOCKED so that multiple
 // concurrent workers do not process the same records.
 func (w *Worker) reconcileAll(ctx context.Context) error {
+	w.cyclesStarted.Add(1)
+	if err := w.reconcileAllOnce(ctx); err != nil {
+		w.cyclesFailed.Add(1)
+		return err
+	}
+	w.cyclesCompleted.Add(1)
+	return nil
+}
+
+func (w *Worker) reconcileAllOnce(ctx context.Context) error {
 	// Category 1: UNKNOWN records needing provider resolution.
 	claimed, err := w.store.ClaimUnknownBatch(ctx, w.workerID, w.batchSize, w.claimDuration)
 	if err != nil {
@@ -307,7 +360,11 @@ func (w *Worker) reconcileOne(ctx context.Context, rec *idempotency.Record) erro
 	// means the record has already exhausted its allowed provider
 	// lookups: suspend it rather than spending one more resolver call.
 	if w.maxAttempts > 0 && rec.ReconcileAttempt > w.maxAttempts {
-		return w.store.SuspendReconciliation(ctx, rec.ExecutionID, rec.Version, "reconcile attempt ceiling reached")
+		if err := w.store.SuspendReconciliation(ctx, rec.ExecutionID, rec.Version, "reconcile attempt ceiling reached"); err != nil {
+			return err
+		}
+		w.deadLetters.Add(1)
+		return nil
 	}
 
 	// Synchronously revalidate claim ownership before invoking the
@@ -351,6 +408,7 @@ func (w *Worker) reconcileOne(ctx context.Context, rec *idempotency.Record) erro
 	// Query the resolver for the actual outcome.
 	result, err := w.resolve(rctx, rec)
 	if err != nil {
+		w.resolverFailures.Add(1)
 		return w.releaseClaim(ctx, rec, fmt.Errorf("resolver error: %w", err))
 	}
 
@@ -503,6 +561,7 @@ func (w *Worker) releaseClaim(ctx context.Context, rec *idempotency.Record, reso
 		if err := w.store.SuspendReconciliation(ctx, rec.ExecutionID, rec.Version, reason); err != nil {
 			return fmt.Errorf("failed to dead-letter reconcile claim: %w (original: %v)", err, resolveErr)
 		}
+		w.deadLetters.Add(1)
 		return resolveErr
 	}
 	backoff := reconcileBackoff(effectiveAttempt)

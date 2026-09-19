@@ -348,7 +348,20 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 			worker.RegisterResolver("github.issue.create", githubHandler)
 		}
 		worker.SetEvidenceSigner(signer)
-		go worker.Run(ctx)
+		// Reconciliation runs under a supervisor with an explicit
+		// readiness policy: cycle timing, consecutive failures, and the
+		// UNKNOWN backlog age are observable, and readiness transitions
+		// are logged.
+		supervisor := reconcile.NewSupervisor(worker, store, reconcile.SupervisorConfig{
+			Interval:               durationSeconds(opts.ReconcileInterval),
+			MaxConsecutiveFailures: 5,
+			MaxUnknownAge:          time.Hour,
+		})
+		go func() {
+			if err := supervisor.Run(ctx); err != nil && ctx.Err() == nil {
+				fmt.Fprintf(os.Stderr, "reconciliation supervisor stopped: %v\n", err)
+			}
+		}()
 	}
 
 	// Start service

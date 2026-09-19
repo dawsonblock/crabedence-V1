@@ -98,10 +98,23 @@ the retention window (default 7 days), measured from
 - Store metrics: reconcile claims/resolutions, observation writes and
   conflicts, lease-fence rejections, `reconciliation_suspended_total`,
   `effect_lease_lost_total`, `cluster_epoch_rejections_total`.
-- A reconciliation **supervisor** with liveness/readiness reporting is
-  part of the v0.52 trust-closure work; until it lands, the worker is
-  a plain goroutine whose failures are logged but not surfaced as
-  process health.
+- Worker counters: cycles started/completed/failed, resolver failures,
+  dead letters (`Worker.Metrics`).
+- **Supervisor.** The worker runs under a `Supervisor` with an explicit
+  readiness policy (`SupervisorConfig`):
+
+  | Verdict | Rule |
+  |---|---|
+  | `NOT_READY` | reconciler stopped or never started; no successful cycle within `NotReadyAfterCycleAge`; `MaxConsecutiveFailures` consecutive failed cycles |
+  | `DEGRADED` | no successful cycle within `DegradedAfterCycleAge`; oldest pending UNKNOWN older than `MaxUnknownAge` |
+  | `READY` | otherwise |
+
+  `Supervisor.Health` reports the verdict, the violated rules, the
+  UNKNOWN backlog (pending + oldest age), and the worker counters.
+  Readiness transitions are logged, so the process knows its
+  reconciliation subsystem is unhealthy without an operator polling it.
+  The service runs reconciliation through the supervisor with
+  production defaults (5 consecutive failures, 1-hour UNKNOWN age).
 
 ## Invariants and their tests
 
