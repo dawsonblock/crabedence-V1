@@ -294,7 +294,17 @@ func ValidateDescriptorCompatibility(effect ExecutionClass, assurance AssuranceP
 
 	case RouteCrabedence:
 		// CRABEDENCE can satisfy STANDARD, DURABLE, and HIGH_ASSURANCE.
-		// It can handle all effect classes.
+		// It can handle all effect classes — but a CRITICAL effect
+		// requires the highest assurance: a CRITICAL operation that
+		// cannot produce signed evidence is not a CRITICAL operation,
+		// and registering one would silently downgrade the guarantee
+		// the class promises.
+		if effect == ClassCritical && assurance != AssuranceHighAssurance {
+			return fmt.Errorf("CRITICAL effect requires assurance HIGH_ASSURANCE, got %s", assurance)
+		}
+		if effect == ClassMutation && assurance != AssuranceDurable && assurance != AssuranceHighAssurance {
+			return fmt.Errorf("MUTATION effect requires durable assurance (DURABLE or HIGH_ASSURANCE), got %s", assurance)
+		}
 
 	default:
 		return fmt.Errorf("unknown execution route: %s", route)

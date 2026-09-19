@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Capability trust — route invariants tightened, architectural laws named
+
+- Capability: `CRITICAL` now requires `HIGH_ASSURANCE` and `MUTATION` requires durable assurance (`DURABLE` or `HIGH_ASSURANCE`) on the durable route — a CRITICAL operation that cannot produce signed evidence is not a CRITICAL operation, and registering one would silently downgrade the guarantee the class promises.
+- Tests: the trust model's laws are first-class named tests — INV-001 (`MUTATION` cannot use `LOCAL`/`DIRECT`), INV-002 (`CRITICAL` requires `HIGH_ASSURANCE`), INV-003 (unknown capability denied at admission), INV-004 (caller class assertion cannot downgrade; routing follows the registry), INV-006 (post-dispatch ambiguity is never `FAILED`), INV-007 (stale lease owner cannot finalize), INV-009 (terminal receipts immutable), INV-010 (evidence signature covers the artifact digest), INV-011 (policy change changes request identity). INV-005, INV-008, and INV-012 remain covered by the authority-binding, cluster-epoch, and release-workflow suites.
+
 ### Capability trust — descriptor identity in request identity, registry snapshot for planners
 
 - Capability: descriptors carry a declared `descriptor_version` (default 1) and an optional `policy_revision`; `DescriptorDigest()` returns the canonical SHA-256 of the full policy projection (schema, class, assurance, route, authority policy, adapter, version, revision). The registry digest and the new canonical `Registry.Snapshot()` cover the same bytes.

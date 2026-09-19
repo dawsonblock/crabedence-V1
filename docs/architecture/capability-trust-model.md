@@ -121,11 +121,18 @@ see [recovery-model.md](recovery-model.md) and
 
 ## Open items for v0.52 (tracked here as they land)
 
-- Canonical descriptor schema + descriptor digest (registry-versioned
-  capability identity bound into request identity).
 - Registry invariant scan at startup, registry SHA-256 digest, and a
-  startup report; the digest appears in runtime identity, qualification
-  evidence, and release artifacts.
-- NEMO consuming the authoritative registry (deleting its parallel
-  catalog and hand-rolled validator).
-- `LOCAL` Function Hooks and a real `DIRECT` read provider.
+  startup report — **landed**: the digest appears in the startup report
+  and in the canonical registry snapshot (`capabilities.json`) written
+  next to the socket.
+- NEMO consuming the authoritative registry — **landed**: the kernel
+  routes on the resolved `execution_route` and
+  `loadCatalogFromSnapshot` consumes the registry export (fail-closed
+  validation), so the planner no longer maintains a capability catalog.
+- Descriptor identity — **landed**: descriptors carry a declared
+  `descriptor_version` and a canonical `descriptor_digest`, both bound
+  into every request identity; a policy change is a new execution
+  identity, with a one-shot legacy-digest compatibility window for
+  records created before the binding.
+- Registry digest in release evidence (artifact.json / qualification)
+  remains open.
