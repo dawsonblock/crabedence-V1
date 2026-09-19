@@ -16,6 +16,10 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 EVIDENCE_DIR="$REPO_ROOT/dist/release-evidence"
 mkdir -p "$EVIDENCE_DIR/gate-results"
 
+# Gate semantics live in exactly one validator, shared with release
+# admission and the standalone artifact verifier.
+source "$REPO_ROOT/scripts/lib/qualification-gates.sh"
+
 # Clean previous generated artifacts.
 rm -f "$EVIDENCE_DIR"/*.json "$EVIDENCE_DIR"/SHA256SUMS \
   "$EVIDENCE_DIR"/source-tree-sha256.txt "$EVIDENCE_DIR"/source-tree-git-blobs.txt \
@@ -28,18 +32,39 @@ mkdir -p "$EVIDENCE_DIR/gate-results"
 # Each gate records: name, status (PASS/FAIL/NOT_RUN), exit code, log file,
 # and tests_executed (for test-suite gates; empty for non-test gates).
 declare -a GATE_NAMES=()
+declare -a GATE_TYPES=()
 declare -a GATE_STATUS=()
 declare -a GATE_EXIT=()
 declare -a GATE_LOG=()
 declare -a GATE_TESTS=()
+declare -a GATE_DURATION=()
+
+# now_ms prints the current epoch time in milliseconds. perl is already a
+# release dependency (shasum is perl); the date fallback is
+# second-granularity.
+now_ms() {
+  perl -MTime::HiRes=time -e 'printf "%d\n", time * 1000' 2>/dev/null \
+    || echo "$(( $(date +%s) * 1000 ))"
+}
+
+# GATE_START_MS marks the start of the gate currently running;
+# record_gate consumes it into duration_ms.
+GATE_START_MS=""
 
 record_gate() {
-  local name="$1" status="$2" exit_code="$3" log="$4" tests="${5:-}"
+  local name="$1" type="$2" status="$3" exit_code="$4" log="$5" tests="${6:-}"
+  local duration=0
+  if [ -n "${GATE_START_MS:-}" ]; then
+    duration=$(( $(now_ms) - GATE_START_MS ))
+    GATE_START_MS=""
+  fi
   GATE_NAMES+=("$name")
+  GATE_TYPES+=("$type")
   GATE_STATUS+=("$status")
   GATE_EXIT+=("$exit_code")
   GATE_LOG+=("$log")
   GATE_TESTS+=("$tests")
+  GATE_DURATION+=("$duration")
 }
 
 # ─── run_and_log (Phase 2) ──────────────────────────────────────────────────
@@ -49,6 +74,7 @@ run_and_log() {
   local name="$1"
   shift
   local log="$EVIDENCE_DIR/gate-results/${name}.log"
+  GATE_START_MS="$(now_ms)"
   {
     echo "command=$*"
     echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -66,19 +92,20 @@ run_and_log() {
   return "$rc"
 }
 
-# Run a mandatory gate. If it fails, record FAIL and continue (so all gates
-# run and evidence is preserved). The final qualification.json will mark the
-# release as not promotable.
+# Run a mandatory gate of the given type. If it fails, record FAIL and
+# continue (so all gates run and evidence is preserved). The final
+# qualification.json will mark the release as not promotable.
 run_gate() {
   local name="$1"
-  shift
+  local type="$2"
+  shift 2
   local log="$EVIDENCE_DIR/gate-results/${name}.log"
   if run_and_log "$name" "$@"; then
-    record_gate "$name" "PASS" 0 "$log"
+    record_gate "$name" "$type" "PASS" 0 "$log"
     echo "  PASS  $name"
   else
     local rc=$?
-    record_gate "$name" "FAIL" "$rc" "$log"
+    record_gate "$name" "$type" "FAIL" "$rc" "$log"
     echo "  FAIL  $name (exit=$rc)"
   fi
 }
@@ -157,6 +184,7 @@ done > "$EVIDENCE_DIR/source-tree-git-blobs.txt"
 #   1. manifest → source (every manifest entry exists and matches)
 #   2. source → manifest (no unexpected files added after generation)
 MANIFEST_VERIFY="$EVIDENCE_DIR/gate-results/source-manifest-verify.log"
+GATE_START_MS="$(now_ms)"
 {
   echo "command=bash $REPO_ROOT/scripts/verify-source-manifest.sh $EVIDENCE_DIR/source-tree-sha256.txt $REPO_ROOT"
   echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -173,10 +201,10 @@ set -e
   echo "exit=$manifest_rc"
   if [ "$manifest_rc" -eq 0 ]; then
     echo "status=PASS"
-    record_gate "source_manifest" "PASS" 0 "$MANIFEST_VERIFY"
+    record_gate "source_manifest" "PROVENANCE" "PASS" 0 "$MANIFEST_VERIFY"
   else
     echo "status=FAIL"
-    record_gate "source_manifest" "FAIL" 1 "$MANIFEST_VERIFY"
+    record_gate "source_manifest" "PROVENANCE" "FAIL" 1 "$MANIFEST_VERIFY"
   fi
   echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } >> "$MANIFEST_VERIFY"
@@ -229,19 +257,19 @@ EOF
 # ─── Phase 8-9: Go gates (uncached, -count=1) ───────────────────────────────
 echo ""
 echo "=== Go gates ==="
-run_gate go-vet go vet ./...
-run_gate go-evidence-tests go test -v -count=1 -timeout=120s \
+run_gate go-vet STATIC_ANALYSIS go vet ./...
+run_gate go-evidence-tests TEST go test -v -count=1 -timeout=120s \
   -run "TestTerminalReceipt|TestTerminalLog|TestRunEvidence|TestFinalizeRun|TestEvidence|TestCoordinatorFinish|TestCoordinatorRunReceipt|TestReceipt|TestRunRecorder|TestTiming" \
   ./internal/cli/
-run_gate go-tart-tests go test -v -count=1 -timeout=120s ./internal/providers/tart/
-run_gate go-lume-tests go test -v -count=1 -timeout=60s ./internal/providers/lume/
-run_gate go-shared-tests go test -v -count=1 -timeout=60s ./internal/providers/shared/
+run_gate go-tart-tests TEST go test -v -count=1 -timeout=120s ./internal/providers/tart/
+run_gate go-lume-tests TEST go test -v -count=1 -timeout=60s ./internal/providers/lume/
+run_gate go-shared-tests TEST go test -v -count=1 -timeout=60s ./internal/providers/shared/
 
 # Phase 9: Go race evidence
-run_gate go-race-evidence go test -v -race -count=1 -timeout=120s \
+run_gate go-race-evidence TEST go test -v -race -count=1 -timeout=120s \
   -run "TestTerminalReceipt|TestTerminalLog|TestRunEvidence|TestFinalizeRun|TestEvidence|TestReceiptContract" \
   ./internal/cli/
-run_gate go-race-providers go test -v -race -count=1 -timeout=120s \
+run_gate go-race-providers TEST go test -v -race -count=1 -timeout=120s \
   ./internal/providers/tart/ ./internal/providers/lume/ ./internal/providers/shared/
 
 # ─── Effect Fabric contract gates ────────────────────────────────────────────
@@ -256,13 +284,13 @@ echo "=== Effect Fabric contract gates ==="
 # kinds, terminal receipt digest, recovery decision types, receipt
 # identity fields, digest determinism, FinalizedAt exclusion, clock
 # interface, state aliases, and RecoveryRetryable rejection.
-run_gate effect-fabric-contract go test -v -count=1 -timeout=60s \
+run_gate effect-fabric-contract TEST go test -v -count=1 -timeout=60s \
   -run "TestState|TestLeaseConfig|TestAcquireResult|TestTerminalReceipt|TestRecovery|TestLeaseError|TestMigrateState|TestDefaultLeaseConfig|TestFixedClock|TestSystemClock" \
   ./internal/idempotency/
 
 # effect-fabric-reconciliation: reconciliation worker unit tests.
 # Verifies NoopResolver, resolver registration, and fail-closed behavior.
-run_gate effect-fabric-reconciliation go test -v -count=1 -timeout=60s \
+run_gate effect-fabric-reconciliation TEST go test -v -count=1 -timeout=60s \
   ./internal/reconcile/
 
 # effect-fabric-evidence: the signed-receipt trust boundary that gates
@@ -270,7 +298,7 @@ run_gate effect-fabric-reconciliation go test -v -count=1 -timeout=60s \
 # signer enforcement, binding checks, tamper rejection, and signer
 # persistence are mandatory release evidence — vet compiles the
 # package but does not execute its adversarial tests.
-run_gate effect-fabric-evidence go test -v -race -count=1 -timeout=60s \
+run_gate effect-fabric-evidence TEST go test -v -race -count=1 -timeout=60s \
   ./internal/evidence/
 
 # effect-fabric-race: race-detector run over the execution + idempotency
@@ -279,7 +307,7 @@ run_gate effect-fabric-evidence go test -v -race -count=1 -timeout=60s \
 # Unset CRABBOX_TEST_DATABASE_URL so live tests skip — the race gate
 # should not run live PostgreSQL tests (they're too slow with -race
 # and are covered by effect-fabric-postgres separately).
-run_gate effect-fabric-race env -u CRABBOX_TEST_DATABASE_URL \
+run_gate effect-fabric-race TEST env -u CRABBOX_TEST_DATABASE_URL \
   go test -v -race -count=1 -timeout=120s \
   ./internal/capability/ ./internal/execution/ ./internal/evidence/ ./internal/idempotency/ ./internal/reconcile/
 
@@ -291,7 +319,7 @@ run_gate effect-fabric-race env -u CRABBOX_TEST_DATABASE_URL \
 # was given without a Go toolchain. The release artifact binds this
 # value and the runtime serves it: qualified policy = released policy =
 # runtime policy.
-run_gate registry-digest go run ./cmd/registry-digest
+run_gate registry-digest PROVENANCE go run ./cmd/registry-digest
 REGISTRY_SHA256="$(sed -n 's/^\([0-9a-f]\{64\}\)$/\1/p' "$EVIDENCE_DIR/gate-results/registry-digest.log" | tail -1)"
 if [ -z "$REGISTRY_SHA256" ]; then
   echo "ERROR: registry-digest gate produced no digest — the release cannot bind its policy identity" >&2
@@ -315,6 +343,7 @@ echo "=== Live PostgreSQL gates ==="
 # SEPARATE pure JSON file (not the decorated log), and parses that file
 # to require a nonzero number of executed tests.
 run_live_postgres_gate() {
+  GATE_START_MS="$(now_ms)"
   local name="$1"
   local test_file="$2"
   local log="$EVIDENCE_DIR/gate-results/${name}.log"
@@ -329,7 +358,7 @@ run_live_postgres_gate() {
       echo "exit=1"
       echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     } > "$log"
-    record_gate "$name" "FAIL" 1 "$log"
+    record_gate "$name" "INTEGRATION" "FAIL" 1 "$log"
     echo "  FAIL  $name (CRABBOX_TEST_DATABASE_URL not set)"
     return
   fi
@@ -359,7 +388,7 @@ run_live_postgres_gate() {
   } >> "$log"
 
   if [ "$rc" -ne 0 ]; then
-    record_gate "$name" "FAIL" "$rc" "$log"
+    record_gate "$name" "INTEGRATION" "FAIL" "$rc" "$log"
     echo "  FAIL  $name (exit=$rc)"
     return
   fi
@@ -373,7 +402,7 @@ run_live_postgres_gate() {
       echo "FAIL: vitest JSON output missing or invalid"
       echo "exit=1"
     } >> "$log"
-    record_gate "$name" "FAIL" 1 "$log"
+    record_gate "$name" "INTEGRATION" "FAIL" 1 "$log"
     echo "  FAIL  $name (no valid JSON output)"
     return
   fi
@@ -388,12 +417,12 @@ run_live_postgres_gate() {
       echo "FAIL: 0 tests executed ($total_tests total, $skipped_tests skipped)"
       echo "exit=1"
     } >> "$log"
-    record_gate "$name" "FAIL" 1 "$log"
+    record_gate "$name" "INTEGRATION" "FAIL" 1 "$log"
     echo "  FAIL  $name (0 tests executed, all skipped)"
     return
   fi
 
-  record_gate "$name" "PASS" 0 "$log"
+  record_gate "$name" "INTEGRATION" "PASS" 0 "$log"
   echo "  PASS  $name ($executed_tests tests executed)"
 }
 
@@ -410,6 +439,7 @@ echo "=== Effect Fabric live PostgreSQL gates ==="
 # Live Go PostgreSQL gate for the effect fabric contract.
 # Uses the same fail-closed wrapper pattern as the Vitest live gates.
 run_effect_fabric_postgres_gate() {
+  GATE_START_MS="$(now_ms)"
   local name="effect-fabric-postgres"
   local log="$EVIDENCE_DIR/gate-results/${name}.log"
 
@@ -422,7 +452,7 @@ run_effect_fabric_postgres_gate() {
       echo "exit=1"
       echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     } > "$log"
-    record_gate "$name" "FAIL" 1 "$log"
+    record_gate "$name" "INTEGRATION" "FAIL" 1 "$log"
     echo "  FAIL  $name (CRABBOX_TEST_DATABASE_URL not set)"
     return
   fi
@@ -489,13 +519,13 @@ run_effect_fabric_postgres_gate() {
       echo "FAIL: discovered=$discovered passed=$passed failed=$failed skipped=$skipped exit=$rc (mandatory live gate requires >0 passes, 0 failures, 0 skips)"
       echo "exit=1"
     } >> "$log"
-    record_gate "$name" "FAIL" 1 "$log"
+    record_gate "$name" "INTEGRATION" "FAIL" 1 "$log"
     echo "  FAIL  $name (discovered=$discovered passed=$passed failed=$failed skipped=$skipped)"
     cat "$log"
     return
   fi
 
-  record_gate "$name" "PASS" 0 "$log"
+  record_gate "$name" "INTEGRATION" "PASS" 0 "$log"
   echo "  PASS  $name (discovered=$discovered passed=$passed failed=$failed skipped=$skipped)"
 }
 
@@ -507,6 +537,7 @@ run_effect_fabric_postgres_gate
 # The tests also run inside effect-fabric-postgres; this gate emits their
 # own structured evidence file for the bundle.
 run_provider_github_faults_gate() {
+  GATE_START_MS="$(now_ms)"
   local name="provider-github-faults"
   local log="$EVIDENCE_DIR/gate-results/${name}.log"
 
@@ -519,7 +550,7 @@ run_provider_github_faults_gate() {
       echo "exit=1"
       echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     } > "$log"
-    record_gate "$name" "FAIL" 1 "$log"
+    record_gate "$name" "FAULT_INJECTION" "FAIL" 1 "$log"
     echo "  FAIL  $name (CRABBOX_TEST_DATABASE_URL not set)"
     return
   fi
@@ -569,13 +600,13 @@ run_provider_github_faults_gate() {
       echo "FAIL: discovered=$discovered passed=$passed failed=$failed skipped=$skipped exit=$rc (provider fault gate requires >0 passes, 0 failures, 0 skips)"
       echo "exit=1"
     } >> "$log"
-    record_gate "$name" "FAIL" 1 "$log"
+    record_gate "$name" "FAULT_INJECTION" "FAIL" 1 "$log"
     echo "  FAIL  $name (discovered=$discovered passed=$passed failed=$failed skipped=$skipped)"
     cat "$log"
     return
   fi
 
-  record_gate "$name" "PASS" 0 "$log"
+  record_gate "$name" "FAULT_INJECTION" "PASS" 0 "$log"
   echo "  PASS  $name (discovered=$discovered passed=$passed failed=$failed skipped=$skipped)"
 }
 
@@ -587,7 +618,7 @@ run_provider_github_faults_gate
 # test token and repo are configured — a missing gate is never recorded
 # as PASS, and a configured gate cannot pass by skipping.
 if [ -n "${CRABBOX_GITHUB_TEST_TOKEN:-}" ] && [ -n "${CRABBOX_GITHUB_TEST_REPO:-}" ]; then
-  run_gate provider-github-real-api env \
+  run_gate provider-github-real-api INTEGRATION env \
     GITHUB_TOKEN="$CRABBOX_GITHUB_TEST_TOKEN" \
     CRABBOX_GITHUB_TEST_REPO="$CRABBOX_GITHUB_TEST_REPO" \
     go test -v -count=1 -timeout=120s \
@@ -603,6 +634,7 @@ echo ""
 echo "=== Authority store live PostgreSQL gate ==="
 
 run_authority_postgres_gate() {
+  GATE_START_MS="$(now_ms)"
   local name="authority-postgres"
   local log="$EVIDENCE_DIR/gate-results/${name}.log"
 
@@ -615,7 +647,7 @@ run_authority_postgres_gate() {
       echo "exit=1"
       echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     } > "$log"
-    record_gate "$name" "FAIL" 1 "$log"
+    record_gate "$name" "INTEGRATION" "FAIL" 1 "$log"
     echo "  FAIL  $name (CRABBOX_TEST_DATABASE_URL not set)"
     return
   fi
@@ -640,7 +672,7 @@ run_authority_postgres_gate() {
   } >> "$log"
 
   if [ "$rc" -ne 0 ]; then
-    record_gate "$name" "FAIL" "$rc" "$log"
+    record_gate "$name" "INTEGRATION" "FAIL" "$rc" "$log"
     echo "  FAIL  $name (exit=$rc)"
     cat "$log"
     return
@@ -654,12 +686,12 @@ run_authority_postgres_gate() {
       echo "FAIL: 0 tests executed (all skipped or no match)"
       echo "exit=1"
     } >> "$log"
-    record_gate "$name" "FAIL" 1 "$log"
+    record_gate "$name" "INTEGRATION" "FAIL" 1 "$log"
     echo "  FAIL  $name (0 tests executed)"
     return
   fi
 
-  record_gate "$name" "PASS" 0 "$log"
+  record_gate "$name" "INTEGRATION" "PASS" 0 "$log"
   echo "  PASS  $name ($executed tests executed)"
 }
 
@@ -668,7 +700,7 @@ run_authority_postgres_gate
 # ─── Phase 13: Cross-language conformance ───────────────────────────────────
 echo ""
 echo "=== Cross-language conformance ==="
-run_gate cross-language-conformance \
+run_gate cross-language-conformance TEST \
   go test -v -count=1 -timeout=60s \
   -run "TestRunEvidenceConformanceCorpus|TestReceiptContractConformance" \
   ./internal/cli/
@@ -678,19 +710,19 @@ echo ""
 echo "=== Worker gates ==="
 # Ensure Worker dependencies are installed.
 npm ci --prefix worker
-run_gate worker-typecheck npm run check --prefix worker
-run_gate worker-tests npm test --prefix worker
-run_gate worker-format npm run format:check --prefix worker
-run_gate worker-lint npm run lint --prefix worker
-run_gate worker-build npm run build --prefix worker
+run_gate worker-typecheck STATIC_ANALYSIS npm run check --prefix worker
+run_gate worker-tests TEST npm test --prefix worker
+run_gate worker-format STATIC_ANALYSIS npm run format:check --prefix worker
+run_gate worker-lint STATIC_ANALYSIS npm run lint --prefix worker
+run_gate worker-build BUILD npm run build --prefix worker
 
 # ─── Phase NEMO: NeMo kernel/adapter gates ────────────────────────────────
 echo ""
 echo "=== NeMo gates ==="
 # Ensure NeMo dependencies are installed.
 npm ci --prefix nemo
-run_gate nemo-typecheck sh -c 'cd nemo && npx tsc --noEmit'
-run_gate nemo-tests sh -c 'cd nemo && npx vitest run'
+run_gate nemo-typecheck STATIC_ANALYSIS sh -c 'cd nemo && npx tsc --noEmit'
+run_gate nemo-tests TEST sh -c 'cd nemo && npx vitest run'
 
 # ─── Phase 15: Worker structured summaries ─────────────────────────────────
 # Extract test counts from the worker test log.
@@ -874,12 +906,81 @@ extract_tests_skipped() {
   echo "$count"
 }
 
-# Build gates JSON array from tracked results, including tests_executed.
+# Extract tests_failed from a gate log. Log-format adapter, mirroring
+# extract_tests_executed: this dispatches on the log FORMAT a runner
+# produces, never on gate semantics — whether a gate must report counts
+# is decided solely by its declared gate_type.
+extract_tests_failed() {
+  local gate_name="$1"
+  local log="$2"
+  local count=0
+
+  case "$gate_name" in
+    effect-fabric-postgres|provider-github-faults)
+      # -json gates write structured accounting lines into the log.
+      count=$(grep -oE '^tests_failed=[0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$' || true)
+      count=${count:-0}
+      ;;
+    postgres-*)
+      # Live Postgres gates write a vitest JSON file alongside the log.
+      local json_summary
+      for candidate in "${log%.log}.summary.json" "$EVIDENCE_DIR/${gate_name}.summary.json" "$EVIDENCE_DIR/${gate_name}.vitest.json"; do
+        if [ -f "$candidate" ]; then
+          json_summary="$candidate"
+          break
+        fi
+      done
+      if [ -n "${json_summary:-}" ] && [ -f "$json_summary" ] && command -v jq >/dev/null 2>&1; then
+        count=$(jq '[.testResults[].assertionResults[] | select(.status == "failed")] | length' "$json_summary" 2>/dev/null || true)
+      fi
+      ;;
+    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-cli|effect-fabric-contract|effect-fabric-reconciliation|effect-fabric-evidence|effect-fabric-race|authority-postgres|provider-github-real-api|cross-language-conformance)
+      count=$(grep -cE '^\s*--- FAIL:' "$log" 2>/dev/null || true)
+      ;;
+    worker-tests|nemo-tests)
+      local tests_line
+      tests_line=$(sed 's/\x1b\[[0-9;]*m//g' "$log" 2>/dev/null | grep -E 'Tests[[:space:]]+[0-9]+' | tail -1 || true)
+      if [ -n "$tests_line" ]; then
+        count=$(echo "$tests_line" | grep -oE '[0-9]+ failed' | grep -oE '^[0-9]+' || true)
+        count=${count:-0}
+      fi
+      ;;
+    *)
+      count=0
+      ;;
+  esac
+
+  if ! [[ "$count" =~ ^[0-9]+$ ]]; then
+    count=0
+  fi
+  echo "$count"
+}
+
+# Build the schema-v2 gates JSON array: canonical gate records with the
+# declared type, timing, honest test accounting, and the evidence digest.
+# The validator in scripts/lib/qualification-gates.sh consumes these
+# records; no consumer re-derives gate semantics from names.
+for i in "${!GATE_NAMES[@]}"; do
+  if ! qualification_gate_type_valid "${GATE_TYPES[$i]}"; then
+    echo "ERROR: gate ${GATE_NAMES[$i]} declares unknown type ${GATE_TYPES[$i]}" >&2
+    exit 1
+  fi
+  if [ ! -f "${GATE_LOG[$i]}" ]; then
+    echo "ERROR: gate ${GATE_NAMES[$i]} has no evidence log" >&2
+    exit 1
+  fi
+done
+
 GATES_JSON="["
 for i in "${!GATE_NAMES[@]}"; do
   [ "$i" -gt 0 ] && GATES_JSON+=","
-  tests_executed="$(extract_tests_executed "${GATE_NAMES[$i]}" "${GATE_LOG[$i]}")"
-  GATES_JSON+="{\"id\":\"${GATE_NAMES[$i]}\",\"name\":\"${GATE_NAMES[$i]}\",\"mandatory\":true,\"status\":\"${GATE_STATUS[$i]}\",\"exit_code\":${GATE_EXIT[$i]},\"tests_executed\":${tests_executed},\"evidence_file\":\"gate-results/$(basename "${GATE_LOG[$i]}")\"}"
+  gate_name="${GATE_NAMES[$i]}"
+  gate_log="${GATE_LOG[$i]}"
+  gate_rel="${gate_log#"$EVIDENCE_DIR"/}"
+  tests_executed="$(extract_tests_executed "$gate_name" "$gate_log")"
+  tests_failed="$(extract_tests_failed "$gate_name" "$gate_log")"
+  evidence_sha="$(shasum -a 256 "$gate_log" | awk '{print $1}')"
+  GATES_JSON+="{\"gate_id\":\"${gate_name}\",\"gate_type\":\"${GATE_TYPES[$i]}\",\"mandatory\":true,\"status\":\"${GATE_STATUS[$i]}\",\"exit_code\":${GATE_EXIT[$i]},\"tests_executed\":${tests_executed},\"tests_failed\":${tests_failed},\"duration_ms\":${GATE_DURATION[$i]},\"evidence\":{\"file\":\"${gate_rel}\",\"sha256\":\"${evidence_sha}\"}}"
 done
 GATES_JSON+="]"
 
@@ -914,7 +1015,7 @@ done
 
 cat > "$EVIDENCE_DIR/qualification.json" << EOF
 {
-  "qualification_version": 1,
+  "schema_version": 2,
   "release_status": "$RELEASE_STATUS",
   "artifact_promotable": $ARTIFACT_PROMOTABLE,
   "gate_summary": {
@@ -972,6 +1073,19 @@ cat > "$EVIDENCE_DIR/qualification.json" << EOF
 }
 EOF
 
+# ─── Producer self-check: the record must satisfy its own semantics ─────────
+# The same validator release admission and the standalone verifier use. A
+# producer that emits a PASS record violating the gate schema must not
+# package it as evidence.
+if ! GATE_FINDINGS="$(validate_qualification_gates "$EVIDENCE_DIR/qualification.json")"; then
+  echo "WARNING: qualification record violates gate semantics:" >&2
+  echo "$GATE_FINDINGS" >&2
+  if [ "$RELEASE_STATUS" = "PASS" ]; then
+    echo "ERROR: producer emitted a PASS record that violates the gate schema — refusing to package it" >&2
+    exit 1
+  fi
+fi
+
 # ─── Phase 23: Generate qualification matrix from JSON ──────────────────────
 "$REPO_ROOT/scripts/generate-qualification-matrix.sh"
 
@@ -996,22 +1110,18 @@ if [ -z "${RELEASE_VERSION:-}" ]; then
 fi
 RELEASE_NAME="${RELEASE_NAME:-crabedence-v${RELEASE_VERSION}}"
 
-# Aggregate tests_executed and tests_skipped across all test gates for
-# the release manifest. The test-gate pattern must stay in sync with
-# check-release-admission.sh — a test gate missing from it is silently
-# excluded from the manifest's test accounting.
+# Aggregate tests_executed and tests_skipped across the test-bearing
+# gates for the release manifest. Test accounting follows the DECLARED
+# gate type — never a name pattern.
 TOTAL_TESTS_EXECUTED=0
 TOTAL_TESTS_SKIPPED=0
 for i in "${!GATE_NAMES[@]}"; do
-  gate_name="${GATE_NAMES[$i]}"
-  case "$gate_name" in
-    *tests|postgres-*|effect-fabric-*|cross-language-conformance|authority-*|provider-*|go-race-*)
-      te="$(extract_tests_executed "$gate_name" "${GATE_LOG[$i]}")"
-      ts="$(extract_tests_skipped "$gate_name" "${GATE_LOG[$i]}")"
-      TOTAL_TESTS_EXECUTED=$((TOTAL_TESTS_EXECUTED + te))
-      TOTAL_TESTS_SKIPPED=$((TOTAL_TESTS_SKIPPED + ts))
-      ;;
-  esac
+  if qualification_gate_type_test_bearing "${GATE_TYPES[$i]}"; then
+    te="$(extract_tests_executed "${GATE_NAMES[$i]}" "${GATE_LOG[$i]}")"
+    ts="$(extract_tests_skipped "${GATE_NAMES[$i]}" "${GATE_LOG[$i]}")"
+    TOTAL_TESTS_EXECUTED=$((TOTAL_TESTS_EXECUTED + te))
+    TOTAL_TESTS_SKIPPED=$((TOTAL_TESTS_SKIPPED + ts))
+  fi
 done
 
 cat > "$EVIDENCE_DIR/release-manifest.json" << EOF

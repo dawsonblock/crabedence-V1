@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Qualification — typed gates, one validator, and the artifact v2 release object
+
+- Release: qualification gates are now typed canonical records (qualification schema version 2): `gate_id`, `gate_type` from a closed enum (`TEST`, `BUILD`, `STATIC_ANALYSIS`, `INTEGRATION`, `SECURITY`, `FAULT_INJECTION`, `REPRODUCIBILITY`, `PROVENANCE`, `CLEAN_ROOM`), `mandatory`, `status`, `exit_code`, honest `tests_executed`/`tests_failed`, `duration_ms`, and a bound `evidence` file with its SHA-256.
+- Release: gate semantics live in exactly one validator (`scripts/lib/qualification-gates.sh`), consumed by release admission and the standalone verifier. It fails closed on unknown gate types, duplicate gate IDs, mandatory gates that are not PASS, PASS with a nonzero exit code, test-bearing gates without honest counts (or with failures), non-test gates claiming test counts, and malformed evidence digests. Every name-based rule (`name contains "tests"`, `id starts with "postgres"`, hardcoded gate lists) is gone from both consumers; test accounting in the release manifest follows the declared type.
+- Release: `artifact.json` is now the schema-v2 release object — release identity, source commit/tree/manifest digest, archive filename/size/SHA-256 (plus the zip), registry policy digest, qualification digest and schema version, SBOM digest, provenance digest, and toolchain identities. The verifier recomputes every digest from the bytes, requires the SBOM (`--sbom`), checks the archive size and filename, and fails closed on an unknown schema version.
+- Release: gate records are bound to their evidence logs by digest; admission and verification reject tampered or missing gate evidence.
+
 ### Execution — durable identity assertions in the 100-way concurrency test
 
 - Execution: `TestLiveConcurrentIdenticalMutationSingleDispatch` now proves one durable effect identity, not just one side effect: exactly one ledger row for the key, in a terminal `COMMITTED` state, carrying the execution identity, provider identity, provider operation identity, and request fingerprint. (`MUTATION` is `DURABLE`, not `HIGH_ASSURANCE`, so there is no signed terminal receipt — receipts are a `CRITICAL` artifact; the terminal-outcome identity is the single `COMMITTED` record.) Verified against ephemeral PostgreSQL: 100 concurrent callers, success=1, counter=1, one durable record.

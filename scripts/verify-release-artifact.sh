@@ -14,6 +14,9 @@
 #   --archive PATH                Release archive; its SHA-256 is recomputed
 #                                 from the bytes and required to equal
 #                                 artifact.json's binding
+#   --sbom PATH                   SBOM file; its digest must equal the
+#                                 binding in artifact.json (required in
+#                                 release mode)
 #
 # Legacy positional form: [evidence-dir] [source-dir] [archive]
 #   Without --mode the contract is derived from whether an archive was
@@ -36,10 +39,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# Gate semantics live in exactly one validator, shared with release
+# admission. The archive ships it next to this script.
+# shellcheck source=lib/qualification-gates.sh
+source "$SCRIPT_DIR/lib/qualification-gates.sh"
+
 MODE=""
 EVIDENCE_DIR=""
 SOURCE_DIR=""
 ARCHIVE_PATH=""
+SBOM_PATH=""
 POSITIONAL=()
 
 usage() {
@@ -56,6 +65,8 @@ while [ $# -gt 0 ]; do
     --source=*) SOURCE_DIR="${1#*=}"; shift ;;
     --archive) ARCHIVE_PATH="${2:-}"; shift 2 ;;
     --archive=*) ARCHIVE_PATH="${1#*=}"; shift ;;
+    --sbom) SBOM_PATH="${2:-}"; shift 2 ;;
+    --sbom=*) SBOM_PATH="${1#*=}"; shift ;;
     -h|--help) usage; exit 0 ;;
     --*) echo "ERROR: unknown option: $1" >&2; exit 2 ;;
     *) POSITIONAL+=("$1"); shift ;;
@@ -140,6 +151,7 @@ require_file "$EVIDENCE_DIR/registry.json" "the verifiable registry envelope"
 if [ "$MODE" = "release" ]; then
   require_file "$EVIDENCE_DIR/artifact.json" "artifact.json (the release artifact binding)"
   require_file "$ARCHIVE_PATH" "the release archive (--archive)"
+  require_file "$SBOM_PATH" "the SBOM (--sbom)"
 fi
 
 if [ "$CONTRACT_FAILURES" -gt 0 ]; then
@@ -149,22 +161,43 @@ if [ "$CONTRACT_FAILURES" -gt 0 ]; then
 fi
 
 # 0. artifact.json binding — the release archive must be the archive the
-# qualified evidence describes. Nothing here trusts a stored digest
-# string: the archive's SHA-256 is recomputed from its bytes, and the
-# binding is cross-checked against the qualified source identity.
+# qualified evidence describes, and the record must bind the exact
+# evidence objects it was qualified against. Nothing here trusts a stored
+# digest string: digests are recomputed from the bytes they claim to
+# cover. Schema version 2 is the final release object; an unknown version
+# fails closed rather than being interpreted with the wrong semantics.
 ARTIFACT_JSON="$EVIDENCE_DIR/artifact.json"
 if [ -f "$ARTIFACT_JSON" ]; then
-  ARTIFACT_SHA="$(jq -r '.sha256 // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
-  ARTIFACT_COMMIT="$(jq -r '.source_commit // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
-  ARTIFACT_TREE="$(jq -r '.source_tree // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
-  ARTIFACT_VERSION="$(jq -r '.release_version // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
-  ARTIFACT_REGISTRY="$(jq -r '.registry_sha256 // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
-
-  if [ -n "$ARTIFACT_SHA" ] && [ -n "$ARTIFACT_COMMIT" ] && [ -n "$ARTIFACT_TREE" ] && [ -n "$ARTIFACT_VERSION" ]; then
-    check "artifact.json complete" "PASS"
+  ARTIFACT_SCHEMA="$(jq -r '.schema_version // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
+  if [ "$ARTIFACT_SCHEMA" = "2" ]; then
+    check "artifact.json schema version" "PASS"
   else
-    check "artifact.json complete" "FAIL"
-    echo "  ERROR: artifact.json is missing sha256/source_commit/source_tree/release_version" >&2
+    check "artifact.json schema version" "FAIL"
+    echo "  ERROR: artifact.json schema_version=${ARTIFACT_SCHEMA:-missing} (want 2) — refusing to interpret an unknown release object" >&2
+    exit 1
+  fi
+
+  ARTIFACT_SHA="$(jq -r '.artifact.sha256 // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
+  ARTIFACT_NAME="$(jq -r '.artifact.filename // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
+  ARTIFACT_SIZE="$(jq -r '.artifact.size // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
+  ARTIFACT_COMMIT="$(jq -r '.source.commit // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
+  ARTIFACT_TREE="$(jq -r '.source.tree // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
+  ARTIFACT_MANIFEST_SHA="$(jq -r '.source.manifest_sha256 // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
+  ARTIFACT_RELEASE="$(jq -r '.release // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
+  ARTIFACT_REGISTRY="$(jq -r '.policy.registry_sha256 // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
+  ARTIFACT_QUAL_SHA="$(jq -r '.qualification.sha256 // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
+  ARTIFACT_QUAL_SCHEMA="$(jq -r '.qualification.schema_version // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
+  ARTIFACT_SBOM_SHA="$(jq -r '.sbom.sha256 // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
+  ARTIFACT_PROV_SHA="$(jq -r '.provenance.sha256 // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
+
+  if [ -n "$ARTIFACT_SHA" ] && [ -n "$ARTIFACT_NAME" ] && [ -n "$ARTIFACT_SIZE" ] && \
+     [ -n "$ARTIFACT_COMMIT" ] && [ -n "$ARTIFACT_TREE" ] && [ -n "$ARTIFACT_MANIFEST_SHA" ] && \
+     [ -n "$ARTIFACT_RELEASE" ] && [ -n "$ARTIFACT_REGISTRY" ] && [ -n "$ARTIFACT_QUAL_SHA" ] && \
+     [ -n "$ARTIFACT_SBOM_SHA" ] && [ -n "$ARTIFACT_PROV_SHA" ]; then
+    check "artifact.json complete (v2)" "PASS"
+  else
+    check "artifact.json complete (v2)" "FAIL"
+    echo "  ERROR: artifact.json v2 is missing one of: artifact.{filename,sha256,size}, source.{commit,tree,manifest_sha256}, release, policy.registry_sha256, qualification.sha256, sbom.sha256, provenance.sha256" >&2
   fi
 
   # The capability policy the release was qualified against must be bound.
@@ -172,7 +205,7 @@ if [ -f "$ARTIFACT_JSON" ]; then
     check "artifact.json binds the capability registry" "PASS"
   else
     check "artifact.json binds the capability registry" "FAIL"
-    echo "  ERROR: artifact.json has no registry_sha256 binding" >&2
+    echo "  ERROR: artifact.json has no policy.registry_sha256 binding" >&2
   fi
 
   # artifact.json must describe the qualified source, not a different one.
@@ -184,6 +217,51 @@ if [ -f "$ARTIFACT_JSON" ]; then
     else
       check "artifact.json binds the qualified source" "FAIL"
       echo "  ERROR: artifact.json source $ARTIFACT_COMMIT/$ARTIFACT_TREE does not match provenance $PROV_COMMIT/$PROV_TREE" >&2
+    fi
+  fi
+
+  # The evidence objects the record binds must be the objects present,
+  # recomputed from their bytes.
+  if [ -f "$EVIDENCE_DIR/source-tree-sha256.txt" ]; then
+    ACTUAL_MANIFEST_SHA="$(shasum -a 256 "$EVIDENCE_DIR/source-tree-sha256.txt" | awk '{print $1}')"
+    if [ -n "$ARTIFACT_MANIFEST_SHA" ] && [ "$ACTUAL_MANIFEST_SHA" = "$ARTIFACT_MANIFEST_SHA" ]; then
+      check "artifact.json binds the source manifest" "PASS"
+    else
+      check "artifact.json binds the source manifest" "FAIL"
+      echo "  ERROR: source manifest digest $ACTUAL_MANIFEST_SHA does not match artifact.json $ARTIFACT_MANIFEST_SHA" >&2
+    fi
+  fi
+  if [ -f "$EVIDENCE_DIR/provenance.json" ]; then
+    ACTUAL_PROV_SHA="$(shasum -a 256 "$EVIDENCE_DIR/provenance.json" | awk '{print $1}')"
+    if [ -n "$ARTIFACT_PROV_SHA" ] && [ "$ACTUAL_PROV_SHA" = "$ARTIFACT_PROV_SHA" ]; then
+      check "artifact.json binds provenance" "PASS"
+    else
+      check "artifact.json binds provenance" "FAIL"
+      echo "  ERROR: provenance digest $ACTUAL_PROV_SHA does not match artifact.json $ARTIFACT_PROV_SHA" >&2
+    fi
+  fi
+  if [ -f "$EVIDENCE_DIR/qualification.json" ]; then
+    ACTUAL_QUAL_SHA="$(shasum -a 256 "$EVIDENCE_DIR/qualification.json" | awk '{print $1}')"
+    ACTUAL_QUAL_SCHEMA="$(jq -r '.schema_version // empty' "$EVIDENCE_DIR/qualification.json" 2>/dev/null || true)"
+    if [ -n "$ARTIFACT_QUAL_SHA" ] && [ "$ACTUAL_QUAL_SHA" = "$ARTIFACT_QUAL_SHA" ] && [ "$ACTUAL_QUAL_SCHEMA" = "$ARTIFACT_QUAL_SCHEMA" ]; then
+      check "artifact.json binds the qualification record" "PASS"
+    else
+      check "artifact.json binds the qualification record" "FAIL"
+      echo "  ERROR: qualification digest/schema $ACTUAL_QUAL_SHA/$ACTUAL_QUAL_SCHEMA does not match artifact.json $ARTIFACT_QUAL_SHA/$ARTIFACT_QUAL_SCHEMA" >&2
+    fi
+  fi
+  if [ -n "$SBOM_PATH" ]; then
+    if [ ! -f "$SBOM_PATH" ]; then
+      check "SBOM present (--sbom)" "FAIL"
+      echo "  ERROR: SBOM not found: $SBOM_PATH" >&2
+    else
+      ACTUAL_SBOM_SHA="$(shasum -a 256 "$SBOM_PATH" | awk '{print $1}')"
+      if [ -n "$ARTIFACT_SBOM_SHA" ] && [ "$ACTUAL_SBOM_SHA" = "$ARTIFACT_SBOM_SHA" ]; then
+        check "artifact.json binds the SBOM" "PASS"
+      else
+        check "artifact.json binds the SBOM" "FAIL"
+        echo "  ERROR: SBOM digest $ACTUAL_SBOM_SHA does not match artifact.json $ARTIFACT_SBOM_SHA" >&2
+      fi
     fi
   fi
 
@@ -200,11 +278,18 @@ if [ -f "$ARTIFACT_JSON" ]; then
         check "Archive matches artifact.json (recomputed)" "FAIL"
         echo "  ERROR: archive SHA-256 $ACTUAL_ARCHIVE_SHA does not equal artifact.json $ARTIFACT_SHA" >&2
       fi
-      if [ "$(basename "$ARCHIVE_PATH")" = "crabedence-${ARTIFACT_VERSION}.tar.gz" ]; then
-        check "Archive filename matches release version" "PASS"
+      ACTUAL_ARCHIVE_SIZE="$(wc -c < "$ARCHIVE_PATH" | tr -d ' ')"
+      if [ -n "$ARTIFACT_SIZE" ] && [ "$ACTUAL_ARCHIVE_SIZE" = "$ARTIFACT_SIZE" ]; then
+        check "Archive size matches artifact.json" "PASS"
       else
-        check "Archive filename matches release version" "FAIL"
-        echo "  ERROR: archive name does not carry release_version $ARTIFACT_VERSION" >&2
+        check "Archive size matches artifact.json" "FAIL"
+        echo "  ERROR: archive size $ACTUAL_ARCHIVE_SIZE does not equal artifact.json $ARTIFACT_SIZE" >&2
+      fi
+      if [ "$(basename "$ARCHIVE_PATH")" = "$ARTIFACT_NAME" ]; then
+        check "Archive filename matches artifact.json" "PASS"
+      else
+        check "Archive filename matches artifact.json" "FAIL"
+        echo "  ERROR: archive name does not match artifact.json filename $ARTIFACT_NAME" >&2
       fi
     fi
   fi
@@ -275,7 +360,7 @@ else
 fi
 
 if [ -f "$ARTIFACT_JSON" ]; then
-  ARTIFACT_REGISTRY="$(jq -r '.registry_sha256 // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
+  ARTIFACT_REGISTRY="$(jq -r '.policy.registry_sha256 // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
   if [ -n "$ARTIFACT_REGISTRY" ] && [ "$ARTIFACT_REGISTRY" = "$REGISTRY_SHA" ]; then
     check "artifact.json binds the qualified registry" "PASS"
   else
@@ -374,20 +459,19 @@ if [ -f "$EVIDENCE_DIR/qualification.json" ]; then
     exit 1
   fi
 
-  # 4b. Independently recompute gate summary from individual gates.
+  # 4b. Gate semantics — the shared validator, the same rules release
+  # admission consumes. No gate semantics are re-derived here from gate
+  # IDs or names.
   GATE_COUNT="$(jq '.gates | length' "$EVIDENCE_DIR/qualification.json" 2>/dev/null || echo 0)"
   DERIVED_PASS="$(jq '[.gates[] | select(.status == "PASS")] | length' "$EVIDENCE_DIR/qualification.json" 2>/dev/null || echo 0)"
   DERIVED_FAIL="$(jq '[.gates[] | select(.status == "FAIL")] | length' "$EVIDENCE_DIR/qualification.json" 2>/dev/null || echo 0)"
-  DERIVED_SKIP="$(jq '[.gates[] | select(.status == "SKIP")] | length' "$EVIDENCE_DIR/qualification.json" 2>/dev/null || echo 0)"
 
-  # Check every mandatory gate is PASS
-  FAILED_MANDATORY="$(jq -r '.gates[] | select(.mandatory == true and .status != "PASS") | .id' "$EVIDENCE_DIR/qualification.json" 2>/dev/null || echo "")"
-
-  if [ "$GATE_COUNT" -gt 0 ] && [ -z "$FAILED_MANDATORY" ]; then
-    check "All mandatory gates PASS ($GATE_COUNT)" "PASS"
+  SEMANTIC_FINDINGS=""
+  if ! SEMANTIC_FINDINGS="$(validate_qualification_gates "$EVIDENCE_DIR/qualification.json")"; then
+    check "Gate semantics ($GATE_COUNT gates)" "FAIL"
+    echo "$SEMANTIC_FINDINGS" | sed 's/^/    /' >&2
   else
-    echo "  Failed mandatory gates: $FAILED_MANDATORY" >&2
-    check "All mandatory gates PASS" "FAIL"
+    check "Gate semantics ($GATE_COUNT gates)" "PASS"
   fi
 
   # 4c. Cross-check declared vs derived summary.
@@ -405,7 +489,7 @@ if [ -f "$EVIDENCE_DIR/qualification.json" ]; then
 
   # 4d. Cross-check release_status matches derived.
   RELEASE_STATUS="$(jq -r '.release_status' "$EVIDENCE_DIR/qualification.json" 2>/dev/null || echo "")"
-  if [ "$DERIVED_FAIL" -eq 0 ]; then
+  if [ "$DERIVED_FAIL" -eq 0 ] && [ -z "$SEMANTIC_FINDINGS" ]; then
     DERIVED_STATUS="PASS"
   else
     DERIVED_STATUS="FAIL"
@@ -426,38 +510,27 @@ if [ -f "$EVIDENCE_DIR/qualification.json" ]; then
     check "Artifact promotable (mismatch)" "FAIL"
   fi
 
-  # 4f. Cross-check: mandatory gate with exit_code != 0 must not be PASS.
-  INCONSISTENT_GATES="$(jq -r '.gates[] | select(.status == "PASS" and .exit_code != 0) | .id' "$EVIDENCE_DIR/qualification.json" 2>/dev/null || echo "")"
-  if [ -z "$INCONSISTENT_GATES" ]; then
-    check "Gate exit-code consistency" "PASS"
-  else
-    echo "  PASS gates with nonzero exit: $INCONSISTENT_GATES" >&2
-    check "Gate exit-code consistency" "FAIL"
-  fi
-
-  # 4g. Cross-check: mandatory test gate with tests_executed == 0 must not be PASS.
-  # Only applies to gates whose names contain "tests" or start with "postgres-".
-  # Non-test gates (vet, typecheck, format, lint, build) legitimately have tests_executed == 0.
-  ZERO_EXECUTION_GATES="$(jq -r '.gates[] | select(.mandatory == true and .status == "PASS" and ((.name | test("tests")) or (.name | startswith("postgres-")))) | select(.tests_executed == 0 or .tests_executed == null) | .id' "$EVIDENCE_DIR/qualification.json" 2>/dev/null || echo "")"
-  if [ -z "$ZERO_EXECUTION_GATES" ]; then
-    check "Gate execution consistency" "PASS"
-  else
-    echo "  PASS gates with 0 executed tests: $ZERO_EXECUTION_GATES" >&2
-    check "Gate execution consistency" "FAIL"
-  fi
-
-  # 4h. Verify each gate's evidence file exists.
-  GATE_LOG_MISSING=false
-  for log in $(jq -r '.gates[].evidence_file' "$EVIDENCE_DIR/qualification.json" 2>/dev/null || echo ""); do
-    if [ ! -f "$EVIDENCE_DIR/$log" ]; then
-      GATE_LOG_MISSING=true
-      echo "  Missing evidence file: $log" >&2
+  # 4f. Every gate's evidence file must exist and match the digest the
+  # record binds. A gate claiming PASS without intact proof is not
+  # admissible evidence.
+  GATE_EVIDENCE_FAILED=false
+  while IFS=$'\t' read -r gate_id evidence_file evidence_sha; do
+    [ -z "$gate_id" ] && continue
+    if [ -z "$evidence_file" ] || [ ! -f "$EVIDENCE_DIR/$evidence_file" ]; then
+      GATE_EVIDENCE_FAILED=true
+      echo "  Missing evidence file for gate $gate_id: ${evidence_file:-<none>}" >&2
+      continue
     fi
-  done
-  if [ "$GATE_LOG_MISSING" = false ]; then
-    check "Gate evidence files present" "PASS"
+    actual_sha="$(shasum -a 256 "$EVIDENCE_DIR/$evidence_file" | awk '{print $1}')"
+    if [ "$actual_sha" != "$evidence_sha" ]; then
+      GATE_EVIDENCE_FAILED=true
+      echo "  Gate $gate_id evidence digest $actual_sha does not match the recorded $evidence_sha" >&2
+    fi
+  done < <(jq -r '.gates[]? | [(.gate_id // ""), (.evidence.file // ""), (.evidence.sha256 // "")] | @tsv' "$EVIDENCE_DIR/qualification.json" 2>/dev/null || true)
+  if [ "$GATE_EVIDENCE_FAILED" = false ]; then
+    check "Gate evidence bound (file + digest)" "PASS"
   else
-    check "Gate evidence files present" "FAIL"
+    check "Gate evidence bound (file + digest)" "FAIL"
   fi
 else
   check "Qualification JSON (missing)" "FAIL"

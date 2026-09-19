@@ -48,6 +48,7 @@ test("artifact attestations are created only after clean-room verification", () 
 test("release evidence finalization precedes the final-manifest attestation", () => {
   const build = job("build");
   const order = [
+    "Generate SBOM",
     "Generate artifact.json",
     "Finalize release evidence",
     "Create GitHub artifact attestation",
@@ -63,6 +64,21 @@ test("release evidence finalization precedes the final-manifest attestation", ()
   assert.match(build, /subject-path: dist\/release-evidence\/evidence-manifest\.json/);
   assert.match(build, /"evidence_sha256": "\$\{\{ steps\.qual_summary\.outputs\.evidence_sha256 \}\}"/);
   assert.match(build, /finalize-release-evidence\.sh dist\/release-evidence/);
+  // The SBOM is generated before artifact.json so the release object can
+  // bind its digest.
+  assert.match(build, /"schema_version": 2|schema_version: 2/);
+});
+
+test("release-mode verification binds the archive and the SBOM", () => {
+  const build = job("build");
+  assert.match(build, /--mode release/);
+  assert.match(build, /--archive "dist\/crabedence-\$\{RELEASE_VERSION\}\.tar\.gz"/);
+  assert.match(build, /--sbom "dist\/crabedence-\$\{RELEASE_VERSION\}\.bom\.json"/);
+  const cleanRoom = job("clean-room-verify");
+  assert.match(cleanRoom, /--sbom "archive\/crabedence-\$\{RELEASE_VERSION\}\.bom\.json"/);
+  const reverify = job("public-reverify");
+  assert.match(reverify, /--sbom "public\/crabedence-\$\{RELEASE_VERSION\}\.bom\.json"/);
+  assert.match(reverify, /--pattern "crabedence-\$\{RELEASE_VERSION\}\.bom\.json"/);
 });
 
 test("publication re-verifies the staged archive against the build digest", () => {

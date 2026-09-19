@@ -48,15 +48,17 @@ FAILED="$(jq -r '.gate_summary.failed' "$QUAL_FILE")"
   echo ""
   echo "## Gate Results"
   echo ""
-  echo "| Gate | Status | Log |"
-  echo "|------|--------|-----|"
+  echo "| Gate | Type | Status | Tests | Log |"
+  echo "|------|------|--------|-------|-----|"
 
   GATE_COUNT="$(jq '.gates | length' "$QUAL_FILE")"
   for i in $(seq 0 $((GATE_COUNT - 1))); do
-    name="$(jq -r ".gates[$i].name" "$QUAL_FILE")"
+    gate_id="$(jq -r ".gates[$i].gate_id" "$QUAL_FILE")"
+    gate_type="$(jq -r ".gates[$i].gate_type" "$QUAL_FILE")"
     status="$(jq -r ".gates[$i].status" "$QUAL_FILE")"
-    log="$(jq -r ".gates[$i].evidence_file" "$QUAL_FILE")"
-    echo "| \`$name\` | $status | \`$log\` |"
+    executed="$(jq -r ".gates[$i].tests_executed // 0" "$QUAL_FILE")"
+    log="$(jq -r ".gates[$i].evidence.file // \"\"" "$QUAL_FILE")"
+    echo "| \`$gate_id\` | $gate_type | $status | $executed | \`$log\` |"
   done
 
   echo ""

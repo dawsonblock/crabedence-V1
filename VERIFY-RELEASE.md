@@ -45,6 +45,31 @@ sha256sum -c crabedence-v1.0.0-rc.2.zip.sha256
 
 The checksum must match the hash recorded in `release-evidence/artifact.json`.
 
+### The release object (artifact.json v2)
+
+`artifact.json` is the final release object and binds, by digest, every
+object this artifact was qualified against:
+
+```json
+{
+  "schema_version": 2,
+  "release": "1.0.0-rc.7",
+  "source": { "commit": "...", "tree": "...", "manifest_sha256": "..." },
+  "artifact": { "filename": "...tar.gz", "sha256": "...", "size": 12345,
+                "zip_filename": "...zip", "zip_sha256": "..." },
+  "policy": { "registry_sha256": "..." },
+  "qualification": { "sha256": "...", "schema_version": 2 },
+  "sbom": { "sha256": "..." },
+  "provenance": { "sha256": "..." },
+  "toolchain": { "go": "go1.26.5", "node": "...", "npm": "..." }
+}
+```
+
+Every digest is recomputed from the bytes it claims to cover — the
+archive, the source manifest, `provenance.json`, `qualification.json`,
+and the SBOM — never trusted as a string. An unknown `schema_version`
+fails closed rather than being interpreted with the wrong semantics.
+
 ## Step 2: Verify the GitHub artifact attestation
 
 GitHub attests that the artifact was built from a specific repository,

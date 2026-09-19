@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
 # Check release admission from qualification.json.
+#
 # Derives admission independently — does NOT trust release_status or
-# artifact_promotable fields. Recomputes gate status from individual
-# gate records and cross-checks consistency.
-# Returns 0 if all mandatory gates PASS, 1 otherwise.
+# artifact_promotable. Gate semantics live in exactly one validator
+# (scripts/lib/qualification-gates.sh), shared with the standalone
+# artifact verifier: no consumer re-derives them from gate names or IDs.
+#
+# Returns 0 if the record satisfies admission, 1 otherwise.
 # Usage: ./scripts/check-release-admission.sh [qualification.json]
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 QUAL_FILE="${1:-$REPO_ROOT/dist/release-evidence/qualification.json}"
+
+# shellcheck source=lib/qualification-gates.sh
+source "$REPO_ROOT/scripts/lib/qualification-gates.sh"
 
 if [ ! -f "$QUAL_FILE" ]; then
   echo "ERROR: qualification.json not found at $QUAL_FILE" >&2
@@ -25,85 +31,61 @@ echo ""
 echo "=== Release Admission Check ==="
 echo ""
 
-# ─── Derive gate status independently ───────────────────────────────────
-# Instead of trusting release_status, recompute from individual gates.
-
 GATE_COUNT="$(jq '.gates | length' "$QUAL_FILE" 2>/dev/null || echo 0)"
 if [ "$GATE_COUNT" -eq 0 ]; then
   echo "ERROR: no gates found in qualification.json" >&2
   exit 1
 fi
 
+# ─── Gate semantics: the shared validator ────────────────────────────────
+# mandatory && status != PASS, unknown gate_type, duplicate gate_id,
+# test-bearing gates without honest counts, non-test gates claiming test
+# counts, PASS with a nonzero exit code, malformed evidence digests.
+SEMANTIC_FAILURES=0
+if ! FINDINGS="$(validate_qualification_gates "$QUAL_FILE")"; then
+  while IFS= read -r finding; do
+    [ -z "$finding" ] && continue
+    echo "  INCONSISTENCY: $finding" >&2
+    SEMANTIC_FAILURES=$((SEMANTIC_FAILURES + 1))
+  done <<< "$FINDINGS"
+fi
+
+# ─── Per-gate presentation + evidence binding ────────────────────────────
+EVIDENCE_DIR="$(dirname "$QUAL_FILE")"
 DERIVED_PASS=0
 DERIVED_FAIL=0
 DERIVED_FAIL_NAMES=""
 
 for i in $(seq 0 $((GATE_COUNT - 1))); do
-  name="$(jq -r ".gates[$i].name" "$QUAL_FILE")"
-  status="$(jq -r ".gates[$i].status" "$QUAL_FILE")"
-  exit_code="$(jq -r ".gates[$i].exit_code" "$QUAL_FILE")"
-  evidence_file="$(jq -r ".gates[$i].evidence_file" "$QUAL_FILE")"
-  mandatory="$(jq -r ".gates[$i].mandatory" "$QUAL_FILE")"
+  gate_id="$(jq -r ".gates[$i].gate_id // \"\"" "$QUAL_FILE")"
+  gate_type="$(jq -r ".gates[$i].gate_type // \"\"" "$QUAL_FILE")"
+  status="$(jq -r ".gates[$i].status // \"\"" "$QUAL_FILE")"
+  exit_code="$(jq -r ".gates[$i].exit_code // 0" "$QUAL_FILE")"
+  evidence_file="$(jq -r ".gates[$i].evidence.file // empty" "$QUAL_FILE")"
+  evidence_sha="$(jq -r ".gates[$i].evidence.sha256 // empty" "$QUAL_FILE")"
 
-  # Derive status from exit code if status field is missing
-  if [ "$status" = "null" ] || [ -z "$status" ]; then
-    if [ "$exit_code" = "0" ]; then
-      status="PASS"
-    else
-      status="FAIL"
-    fi
-  fi
-
-  # Cross-check: PASS status must have exit code 0
-  if [ "$status" = "PASS" ] && [ "$exit_code" != "0" ]; then
-    status="FAIL"
-    echo "  INCONSISTENCY: $name claims PASS but exit_code=$exit_code" >&2
-  fi
-
-  # Cross-check: FAIL status must have non-zero exit code
-  if [ "$status" = "FAIL" ] && [ "$exit_code" = "0" ]; then
-    echo "  WARNING: $name claims FAIL but exit_code=0" >&2
-  fi
-
-  # Cross-check: evidence file must exist (if evidence dir is alongside).
-  # A mandatory gate claiming PASS without proof is a FAIL — not a warning.
-  EVIDENCE_DIR="$(dirname "$QUAL_FILE")"
-  if [ -n "$evidence_file" ] && [ "$evidence_file" != "null" ] && [ ! -f "$EVIDENCE_DIR/$evidence_file" ]; then
-    if [ "$status" = "PASS" ]; then
-      status="FAIL"
-      echo "  INCONSISTENCY: $name claims PASS but evidence file missing: $evidence_file" >&2
-    else
-      echo "  WARNING: $name references missing evidence: $evidence_file" >&2
-    fi
-  fi
-
-  # Cross-check: test-suite gates claiming PASS must have executed tests.
-  # Gates whose names contain "tests", start with "postgres-",
-  # "provider-", "authority-", "effect-fabric-", or "go-race-", or are
-  # the cross-language conformance suite are test suites; a PASS with
-  # tests_executed == 0 means no tests actually ran. This list must stay
-  # in sync with the aggregation pattern in
-  # generate-release-evidence.sh — a test gate missing from it can claim
-  # PASS without executing anything.
-  tests_executed="$(jq -r ".gates[$i].tests_executed // \"\"" "$QUAL_FILE")"
-  is_test_gate=false
-  case "$name" in
-    *tests|postgres-*|effect-fabric-*|authority-*|provider-*|go-race-*|cross-language-conformance) is_test_gate=true ;;
-  esac
-  if [ "$is_test_gate" = true ] && [ "$status" = "PASS" ]; then
-    if [ "$tests_executed" = "" ] || [ "$tests_executed" = "null" ] || [ "$tests_executed" = "0" ]; then
-      status="FAIL"
-      echo "  INCONSISTENCY: $name claims PASS but tests_executed=$tests_executed (test gate must execute >0 tests)" >&2
-    fi
-  fi
+  printf "  %-28s %-16s %s (exit=%s)\n" "$gate_id" "$gate_type" "$status" "$exit_code"
 
   if [ "$status" = "PASS" ]; then
-    printf "  %-30s PASS (exit=%s)\n" "$name" "$exit_code"
     DERIVED_PASS=$((DERIVED_PASS + 1))
   else
-    printf "  %-30s FAIL (exit=%s)\n" "$name" "$exit_code"
     DERIVED_FAIL=$((DERIVED_FAIL + 1))
-    DERIVED_FAIL_NAMES="$DERIVED_FAIL_NAMES $name"
+    DERIVED_FAIL_NAMES="$DERIVED_FAIL_NAMES $gate_id"
+  fi
+
+  # A gate claiming PASS without intact proof is not admissible: the
+  # evidence file must exist and match the digest the record binds.
+  if [ -n "$evidence_file" ]; then
+    if [ ! -f "$EVIDENCE_DIR/$evidence_file" ]; then
+      echo "  INCONSISTENCY: $gate_id references missing evidence: $evidence_file" >&2
+      SEMANTIC_FAILURES=$((SEMANTIC_FAILURES + 1))
+    elif [ -n "$evidence_sha" ]; then
+      actual_sha="$(shasum -a 256 "$EVIDENCE_DIR/$evidence_file" | awk '{print $1}')"
+      if [ "$actual_sha" != "$evidence_sha" ]; then
+        echo "  INCONSISTENCY: $gate_id evidence digest $actual_sha does not match the recorded $evidence_sha" >&2
+        SEMANTIC_FAILURES=$((SEMANTIC_FAILURES + 1))
+      fi
+    fi
   fi
 done
 
@@ -121,7 +103,6 @@ echo "  Declared: $DECLARED_PASSED passed, $DECLARED_FAILED failed, $DECLARED_TO
 echo "  Declared release_status: $DECLARED_STATUS"
 echo "  Declared artifact_promotable: $DECLARED_PROMOTABLE"
 
-# Check consistency between declared and derived
 CONSISTENT=true
 if [ "$DECLARED_TOTAL" != "$GATE_COUNT" ]; then
   echo "  INCONSISTENCY: declared total ($DECLARED_TOTAL) != actual gate count ($GATE_COUNT)" >&2
@@ -137,7 +118,7 @@ if [ "$DECLARED_FAILED" != "$DERIVED_FAIL" ]; then
 fi
 
 # Derived release status
-if [ "$DERIVED_FAIL" -eq 0 ]; then
+if [ "$DERIVED_FAIL" -eq 0 ] && [ "$SEMANTIC_FAILURES" -eq 0 ]; then
   DERIVED_STATUS="PASS"
   DERIVED_PROMOTABLE="true"
 else
@@ -145,7 +126,6 @@ else
   DERIVED_PROMOTABLE="false"
 fi
 
-# Check declared status matches derived
 if [ "$DECLARED_STATUS" != "$DERIVED_STATUS" ]; then
   echo "  INCONSISTENCY: declared release_status ($DECLARED_STATUS) != derived ($DERIVED_STATUS)" >&2
   CONSISTENT=false
@@ -170,8 +150,8 @@ fi
 # ─── Admission decision ────────────────────────────────────────────────
 echo ""
 
-if [ "$CONSISTENT" = false ]; then
-  echo "RELEASE ADMISSION: REJECTED (qualification.json inconsistent)" >&2
+if [ "$CONSISTENT" = false ] || [ "$SEMANTIC_FAILURES" -gt 0 ]; then
+  echo "RELEASE ADMISSION: REJECTED (qualification record violates its own contract)" >&2
   exit 1
 fi
 

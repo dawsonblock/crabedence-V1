@@ -343,6 +343,30 @@ jobs:
           echo "tar_sha256=$(cut -d ' ' -f1 < "crabedence-${RELEASE_VERSION}.tar.gz.sha256")" >> "$GITHUB_OUTPUT"
           echo "zip_sha256=$(cut -d ' ' -f1 < "crabedence-${RELEASE_VERSION}.zip.sha256")" >> "$GITHUB_OUTPUT"
 
+      # ─── Generate SBOM (fail-closed, pinned version) ──────────────────
+      # The SBOM is generated BEFORE artifact.json so the release object
+      # can bind its digest.
+      - name: Generate SBOM
+        shell: bash
+        run: |
+          mkdir -p dist
+          # Pin the cyclonedx-gomod version for reproducibility.
+          # If installation or generation fails, the release FAILS —
+          # we never attest a placeholder as a component inventory.
+          go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.4.1
+          cyclonedx-gomod mod -json -output "dist/crabedence-${RELEASE_VERSION}.bom.json" .
+          if [ ! -s "dist/crabedence-${RELEASE_VERSION}.bom.json" ]; then
+            echo "ERROR: cyclonedx-gomod produced empty SBOM" >&2
+            exit 1
+          fi
+          echo "SBOM generated: $(jq '.components | length' dist/crabedence-${RELEASE_VERSION}.bom.json) components"
+
+      # ─── Generate artifact.json (schema version 2) ────────────────────
+      # The final release object: release identity, source identity (with
+      # the manifest digest), the archive binding (filename/size/SHA-256),
+      # and the digests of every evidence object the artifact was
+      # qualified against. Every digest here is recomputed from the bytes
+      # at verification time; none of them is trusted as a string.
       - name: Generate artifact.json
         shell: bash
         run: |
@@ -355,18 +379,44 @@ jobs:
             echo "ERROR: capability registry digest is empty" >&2
             exit 1
           fi
-          cat > dist/release-evidence/artifact.json << EOF
-          {
-            "name": "crabedence-${RELEASE_VERSION}.tar.gz",
-            "sha256": "${{ steps.artifact_hash.outputs.tar_sha256 }}",
-            "zip_name": "crabedence-${RELEASE_VERSION}.zip",
-            "zip_sha256": "${{ steps.artifact_hash.outputs.zip_sha256 }}",
-            "source_commit": "$COMMIT",
-            "source_tree": "$TREE",
-            "release_version": "$RELEASE_VERSION",
-            "registry_sha256": "$REGISTRY_SHA256"
-          }
-          EOF
+          QUAL_SHA="$(sha256sum dist/release-evidence/qualification.json | cut -d ' ' -f1)"
+          QUAL_SCHEMA="$(jq -r '.schema_version' dist/release-evidence/qualification.json)"
+          MANIFEST_SHA="$(sha256sum dist/release-evidence/source-tree-sha256.txt | cut -d ' ' -f1)"
+          PROV_SHA="$(sha256sum dist/release-evidence/provenance.json | cut -d ' ' -f1)"
+          SBOM_SHA="$(sha256sum "dist/crabedence-${RELEASE_VERSION}.bom.json" | cut -d ' ' -f1)"
+          ARCHIVE_SIZE="$(wc -c < "dist/crabedence-${RELEASE_VERSION}.tar.gz" | tr -d ' ')"
+          jq -n \
+            --arg release "$RELEASE_VERSION" \
+            --arg commit "$COMMIT" \
+            --arg tree "$TREE" \
+            --arg manifest_sha "$MANIFEST_SHA" \
+            --arg tar_name "crabedence-${RELEASE_VERSION}.tar.gz" \
+            --arg tar_sha "${{ steps.artifact_hash.outputs.tar_sha256 }}" \
+            --argjson tar_size "$ARCHIVE_SIZE" \
+            --arg zip_name "crabedence-${RELEASE_VERSION}.zip" \
+            --arg zip_sha "${{ steps.artifact_hash.outputs.zip_sha256 }}" \
+            --arg registry_sha "$REGISTRY_SHA256" \
+            --arg qual_sha "$QUAL_SHA" \
+            --argjson qual_schema "$QUAL_SCHEMA" \
+            --arg sbom_sha "$SBOM_SHA" \
+            --arg prov_sha "$PROV_SHA" \
+            --arg go_version "$(go version | awk '{print $3}')" \
+            --arg node_version "$(node --version)" \
+            --arg npm_version "$(npm --version)" \
+            '{
+              schema_version: 2,
+              release: $release,
+              source: { commit: $commit, tree: $tree, manifest_sha256: $manifest_sha },
+              artifact: {
+                filename: $tar_name, sha256: $tar_sha, size: $tar_size,
+                zip_filename: $zip_name, zip_sha256: $zip_sha
+              },
+              policy: { registry_sha256: $registry_sha },
+              qualification: { sha256: $qual_sha, schema_version: $qual_schema },
+              sbom: { sha256: $sbom_sha },
+              provenance: { sha256: $prov_sha },
+              toolchain: { go: $go_version, node: $node_version, npm: $npm_version }
+            }' > dist/release-evidence/artifact.json
 
       # ─── Finalize the evidence bundle: artifact.json -> manifest ─────
       # artifact.json is written AFTER generate-release-evidence.sh ran,
@@ -390,7 +440,7 @@ jobs:
           echo "status=$(jq -r '.status // "UNKNOWN"' dist/release-evidence/release-manifest.json)" >> "$GITHUB_OUTPUT"
           echo "promotable=$(jq -r '.artifact_promotable // false' dist/release-evidence/release-manifest.json)" >> "$GITHUB_OUTPUT"
           echo "evidence_sha256=$(jq -r '.sha256' dist/release-evidence/evidence-manifest.json)" >> "$GITHUB_OUTPUT"
-          echo "artifact_sha256=$(jq -r '.sha256' dist/release-evidence/artifact.json)" >> "$GITHUB_OUTPUT"
+          echo "artifact_sha256=$(jq -r '.artifact.sha256' dist/release-evidence/artifact.json)" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub artifact attestation
         id: attestation
@@ -433,23 +483,8 @@ jobs:
             --mode release \
             --evidence dist/release-evidence \
             --source . \
-            --archive "dist/crabedence-${RELEASE_VERSION}.tar.gz"
-
-      # ─── Generate SBOM (fail-closed, pinned version) ──────────────────
-      - name: Generate SBOM
-        shell: bash
-        run: |
-          mkdir -p dist
-          # Pin the cyclonedx-gomod version for reproducibility.
-          # If installation or generation fails, the release FAILS —
-          # we never attest a placeholder as a component inventory.
-          go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.4.1
-          cyclonedx-gomod mod -json -output "dist/crabedence-${RELEASE_VERSION}.bom.json" .
-          if [ ! -s "dist/crabedence-${RELEASE_VERSION}.bom.json" ]; then
-            echo "ERROR: cyclonedx-gomod produced empty SBOM" >&2
-            exit 1
-          fi
-          echo "SBOM generated: $(jq '.components | length' dist/crabedence-${RELEASE_VERSION}.bom.json) components"
+            --archive "dist/crabedence-${RELEASE_VERSION}.tar.gz" \
+            --sbom "dist/crabedence-${RELEASE_VERSION}.bom.json"
 
       # Artifact attestations are created only AFTER the clean-room job
       # has verified the staged bytes (see the attest job), so nothing is
@@ -542,7 +577,8 @@ jobs:
             --mode release \
             --evidence clean-room/qualification \
             --source clean-room/crabedence-${RELEASE_VERSION} \
-            --archive "archive/crabedence-${RELEASE_VERSION}.tar.gz"
+            --archive "archive/crabedence-${RELEASE_VERSION}.tar.gz" \
+            --sbom "archive/crabedence-${RELEASE_VERSION}.bom.json"
 
   # ─── Attest (only after clean-room verification passed) ──────────────
   # Artifact attestations are signatures over the exact bytes the clean
@@ -703,6 +739,7 @@ jobs:
             --repo ${{ github.repository }} \
             --pattern "crabedence-${RELEASE_VERSION}.tar.gz" \
             --pattern "crabedence-${RELEASE_VERSION}.tar.gz.sha256" \
+            --pattern "crabedence-${RELEASE_VERSION}.bom.json" \
             --pattern "artifact.json" \
             --pattern "evidence-manifest.json" \
             --pattern "SHA256SUMS" \
@@ -754,7 +791,8 @@ jobs:
             --mode release \
             --evidence clean-room/qualification \
             --source clean-room/crabedence-${RELEASE_VERSION} \
-            --archive "public/crabedence-${RELEASE_VERSION}.tar.gz"
+            --archive "public/crabedence-${RELEASE_VERSION}.tar.gz" \
+            --sbom "public/crabedence-${RELEASE_VERSION}.bom.json"
 
       - name: Verify published attestation
         env:

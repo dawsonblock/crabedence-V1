@@ -2,10 +2,10 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://crabedence.dev/schemas/qualification.schema.json",
   "title": "Crabedence Release Qualification",
-  "description": "Canonical machine-readable qualification record. All release admission decisions derive from this file.",
+  "description": "Canonical machine-readable qualification record (schema version 2). All release admission decisions derive from this file; gate semantics are enforced by scripts/lib/qualification-gates.sh, which both admission and the standalone verifier consume.",
   "type": "object",
   "required": [
-    "qualification_version",
+    "schema_version",
     "release_status",
     "artifact_promotable",
     "gate_summary",
@@ -16,9 +16,9 @@
     "environment"
   ],
   "properties": {
-    "qualification_version": {
+    "schema_version": {
       "type": "integer",
-      "enum": [1]
+      "enum": [2]
     },
     "release_status": {
       "type": "string",
@@ -41,19 +41,39 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["id", "name", "mandatory", "status", "exit_code", "evidence_file"],
+        "additionalProperties": false,
+        "required": ["gate_id", "gate_type", "mandatory", "status", "exit_code", "evidence"],
         "properties": {
-          "id": { "type": "string" },
-          "name": { "type": "string" },
+          "gate_id": { "type": "string", "minLength": 1 },
+          "gate_type": {
+            "type": "string",
+            "enum": [
+              "TEST",
+              "BUILD",
+              "STATIC_ANALYSIS",
+              "INTEGRATION",
+              "SECURITY",
+              "FAULT_INJECTION",
+              "REPRODUCIBILITY",
+              "PROVENANCE",
+              "CLEAN_ROOM"
+            ]
+          },
           "mandatory": { "type": "boolean" },
           "status": { "type": "string", "enum": ["PASS", "FAIL", "SKIP"] },
           "exit_code": { "type": "integer" },
-          "tests_discovered": { "type": "integer", "minimum": 0 },
           "tests_executed": { "type": "integer", "minimum": 0 },
-          "tests_passed": { "type": "integer", "minimum": 0 },
           "tests_failed": { "type": "integer", "minimum": 0 },
-          "tests_skipped": { "type": "integer", "minimum": 0 },
-          "evidence_file": { "type": "string" }
+          "duration_ms": { "type": "integer", "minimum": 0 },
+          "evidence": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["file", "sha256"],
+            "properties": {
+              "file": { "type": "string", "minLength": 1 },
+              "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+            }
+          }
         }
       }
     },
