@@ -10,6 +10,8 @@ import {
   CapabilityCatalog,
   NemoKernel,
   SnapshotError,
+  SnapshotVerificationError,
+  VerifiedCapabilityCatalog,
   loadCatalogFromSnapshot,
   parseRegistryEnvelope,
 } from "../kernel/index";
@@ -144,6 +146,20 @@ describe("registry envelope verification", () => {
     expect(catalog.routeOf("math.add")).toBe("LOCAL");
     expect(catalog.routeOf("math.add.durable")).toBe("CRABEDENCE");
     expect(catalog.lookup("math.add").executionClass).toBe("PURE");
+  });
+
+  it("cannot mint a verified catalog without a passing digest comparison", () => {
+    const payload = Buffer.from(JSON.stringify([pureLocal]), "utf-8");
+    const good = createHash("sha256").update(payload).digest("hex");
+    // The factory itself verifies: a caller cannot mark a hand-built
+    // catalog as verified by calling it with arbitrary bytes.
+    expect(() => VerifiedCapabilityCatalog.fromVerifiedPayload(payload, good)).not.toThrow();
+    expect(() => VerifiedCapabilityCatalog.fromVerifiedPayload(payload, "c".repeat(64))).toThrow(
+      SnapshotVerificationError,
+    );
+    expect(() =>
+      VerifiedCapabilityCatalog.fromVerifiedPayload(Buffer.from("[]", "utf-8"), good),
+    ).toThrow(/does not match its digest/);
   });
 
   it("routes on the resolved route, not the execution class", async () => {

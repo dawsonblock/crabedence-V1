@@ -32,7 +32,10 @@ export function createTestCatalog(descriptors: CapabilityDescriptor[] = []): Cap
  * schema compilation) on the way in.
  */
 export function createTestKernel(catalog: CapabilityCatalog, ports: KernelPorts): NemoKernel {
-  const verified = VerifiedCapabilityCatalog.forVerifiedEnvelope();
+  // forTestOnly is the deliberately-named, greppable escape hatch: the
+  // production path (loadCatalogFromSnapshot) can only produce a
+  // verified catalog by passing a real digest comparison.
+  const verified = VerifiedCapabilityCatalog.forTestOnly();
   for (const descriptor of catalog.list()) {
     verified.register(descriptor);
   }

@@ -1,4 +1,4 @@
-export { CapabilityCatalog, NemoKernel, VerifiedCapabilityCatalog, defaultExecutionRoute } from "./kernel";
+export { CapabilityCatalog, NemoKernel, SnapshotVerificationError, VerifiedCapabilityCatalog, defaultExecutionRoute } from "./kernel";
 export type { KernelPorts } from "./kernel";
 export { createTestCatalog, createTestKernel } from "./testing";
 export { SchemaCompilationError, SchemaValidator } from "./schema";

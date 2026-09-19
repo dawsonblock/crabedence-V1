@@ -23,6 +23,8 @@
  * Those are Crabedence's responsibilities below the port.
  */
 
+import { createHash, timingSafeEqual } from "node:crypto";
+
 import type {
   CapabilityDescriptor,
   ExecutionClass,
@@ -165,13 +167,41 @@ export class VerifiedCapabilityCatalog extends CapabilityCatalog {
   }
 
   /**
-   * @internal Verified catalogs are produced by
-   * loadCatalogFromSnapshot after the envelope digest is verified.
-   * This factory exists so the loader (a different module) can
-   * construct one; production code should never call it directly.
+   * fromVerifiedPayload verifies the canonical registry bytes against
+   * the expected digest and returns a catalog only when they match.
+   *
+   * This is the ONLY way a verified catalog is produced on the
+   * production path: there is no factory that mints one without a
+   * passing verification, so a caller cannot "mark" a hand-built
+   * catalog as verified — it would have to supply bytes whose SHA-256
+   * actually equals the expected digest.
    */
-  static forVerifiedEnvelope(): VerifiedCapabilityCatalog {
+  static fromVerifiedPayload(payload: Buffer, expectedSha256: string): VerifiedCapabilityCatalog {
+    const computed = createHash("sha256").update(payload).digest("hex");
+    if (computed.length !== expectedSha256.length) {
+      throw new SnapshotVerificationError("registry payload does not match its digest");
+    }
+    if (!timingSafeEqual(Buffer.from(computed, "utf-8"), Buffer.from(expectedSha256, "utf-8"))) {
+      throw new SnapshotVerificationError("registry payload does not match its digest");
+    }
     return new VerifiedCapabilityCatalog();
+  }
+
+  /**
+   * @internal forTestOnly exists solely for nemo/kernel/testing.ts, so
+   * test harnesses can build a kernel around a fixture catalog. No
+   * production module imports it; the name is deliberately greppable.
+   */
+  static forTestOnly(): VerifiedCapabilityCatalog {
+    return new VerifiedCapabilityCatalog();
+  }
+}
+
+/** SnapshotVerificationError is thrown when registry bytes fail verification. */
+export class SnapshotVerificationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SnapshotVerificationError";
   }
 }
 

@@ -153,7 +153,9 @@ export function loadCatalogFromSnapshot(raw: unknown): {
   }
 
   const descriptors = parseDescriptors(parsed);
-  const catalog = VerifiedCapabilityCatalog.forVerifiedEnvelope();
+  // Verification happens inside the catalog factory: no code path
+  // produces a verified catalog without a passing digest comparison.
+  const catalog = VerifiedCapabilityCatalog.fromVerifiedPayload(payload, envelope.registry_sha256);
   for (const descriptor of descriptors) {
     const kernelDescriptor: CapabilityDescriptor = {
       id: descriptor.id,
