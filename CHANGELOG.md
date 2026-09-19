@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Release engineering — one version source and verified release documentation
+
+- `VERSION` is the single version source. `scripts/verify-version-consistency.mjs` fails CI and both release workflows when `worker/package.json`, either root entry in `worker/package-lock.json`, or `nemo/package.json` disagrees with it; when the latest finalized `CHANGELOG.md` section disagrees (a pre-release `VERSION` must instead be newer than the latest release); when the release pipeline's declared Go toolchain drifts between `scripts/release-config.sh` and `scripts/release-provenance.mjs`; and, with `--tag vX.Y.Z`, when the signed tag disagrees with `VERSION`. `nemo/package.json` had drifted at 0.1.0 and now tracks the release line; the release checklist and `AGENTS.md` name `VERSION` and `nemo/package.json` as version-carrying files.
+- Docs: `README.md` restores the release-authorization contract prose (one explicit full request authorizes the normal sequence; narrow requests stay narrow; GitHub events alone never authorize) that the modernized README had dropped — the release-documentation test asserts it in every release document.
+- Tests: the Go build-info release test now compares against the toolchain that actually built the fixture, so it passes on maintainer machines whose local Go is older than the repository's `go.mod` toolchain.
+
 ### Effect Fabric hardening — per-stage durability budgets, fail-closed socket startup, pinned CI dependencies
 
 - Execution: the post-dispatch durability path now uses per-stage budgets (`ExecutorTimeouts`: observation persistence, terminalization, emergency recovery, lease operation) instead of one shared 5-second context. Each stage derives its own bounded, caller-detached context when the stage starts, so a database operation that exhausts its budget can never consume the budget of the stage that follows — emergency recovery in particular no longer inherits a context already exhausted by the observation or terminalization write that failed, which is the difference between a record reaching UNKNOWN with its provider observation persisted and one stranded IN_FLIGHT. Lease heartbeat renewals and pre-dispatch abandons run under the bounded lease-operation budget.
