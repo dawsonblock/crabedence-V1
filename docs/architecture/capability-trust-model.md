@@ -68,7 +68,7 @@ identities. A policy change is never invisible to idempotency.
 | Route | Intended semantics | Status |
 |---|---|---|
 | `LOCAL` | Deterministic / contained functions in the caller's process — no socket hop, no durability, no admission. Bound to `PURE` + `NONE`. | Implemented: `FunctionHookRegistry` executes hooks in-process under the LOCAL contract (PURE-only, input validation, bounded runtime, bounded payload, well-formed JSON results, audit record). Hooks receive data only — no store, dispatcher, or effect-fabric client — so `PURE` is an execution boundary, not an assertion. |
-| `DIRECT` | Observational external operations with admission, schema validation, authority, timeouts, and audit — but without the durable mutation ledger. Bound to `READ` + `STANDARD`. | Declared and validated; **no DIRECT provider yet** (v0.52 work) |
+| `DIRECT` | Observational external operations with admission, schema validation, authority, timeouts, and audit — but without the durable mutation ledger. Bound to `READ` + `STANDARD`. | Implemented: `DirectReadRegistry` executes reads under the in-process contract (READ-only, argument validation, bounded runtime, bounded payload, projected results, audit record). First real capability: `github.issue.get`. A failed read is a safe `FAILED`, never `UNKNOWN`. |
 | `CRABEDENCE` | The durable execution kernel: authority, idempotency, dispatch, evidence, reconciliation. Required for `MUTATION`/`CRITICAL` and for `DURABLE`/`HIGH_ASSURANCE`. | Implemented (`crabbox serve-execution`) |
 
 `RouteDispatcher` is the single dispatch point: it reads
