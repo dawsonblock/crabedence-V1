@@ -3,15 +3,19 @@
 #
 # Works standalone on an extracted archive — does NOT require .git.
 #
-# Usage: ./scripts/verify-release-artifact.sh [evidence-dir] [source-dir]
+# Usage: ./scripts/verify-release-artifact.sh [evidence-dir] [source-dir] [archive]
 #   evidence-dir: directory containing qualification bundle (default: dist/release-evidence/)
 #   source-dir:    directory containing the source tree to verify (default: repo root)
+#   archive:       optional release archive; its SHA-256 is recomputed and
+#                  required to equal artifact.json's binding, closing the
+#                  qualification → source → artifact chain
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 EVIDENCE_DIR="${1:-$REPO_ROOT/dist/release-evidence}"
 SOURCE_DIR="${2:-$REPO_ROOT}"
+ARCHIVE_PATH="${3:-}"
 
 if [ ! -d "$EVIDENCE_DIR" ]; then
   echo "ERROR: evidence directory not found: $EVIDENCE_DIR" >&2
@@ -40,7 +44,75 @@ echo ""
 echo "=== Release Artifact Verification ==="
 echo "  evidence: $EVIDENCE_DIR"
 echo "  source:   $SOURCE_DIR"
+if [ -n "$ARCHIVE_PATH" ]; then
+  echo "  archive:  $ARCHIVE_PATH"
+fi
 echo ""
+
+# 0. artifact.json binding — the release archive must be the archive the
+# qualified evidence describes. Nothing here trusts a stored digest
+# string: the archive's SHA-256 is recomputed from its bytes, and the
+# binding is cross-checked against the qualified source identity.
+ARTIFACT_JSON="$EVIDENCE_DIR/artifact.json"
+if [ -f "$ARTIFACT_JSON" ]; then
+  ARTIFACT_SHA="$(jq -r '.sha256 // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
+  ARTIFACT_COMMIT="$(jq -r '.source_commit // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
+  ARTIFACT_TREE="$(jq -r '.source_tree // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
+  ARTIFACT_VERSION="$(jq -r '.release_version // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
+  ARTIFACT_REGISTRY="$(jq -r '.registry_sha256 // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
+
+  if [ -n "$ARTIFACT_SHA" ] && [ -n "$ARTIFACT_COMMIT" ] && [ -n "$ARTIFACT_TREE" ] && [ -n "$ARTIFACT_VERSION" ]; then
+    check "artifact.json complete" "PASS"
+  else
+    check "artifact.json complete" "FAIL"
+    echo "  ERROR: artifact.json is missing sha256/source_commit/source_tree/release_version" >&2
+  fi
+
+  # The capability policy the release was qualified against must be bound.
+  if [ -n "$ARTIFACT_REGISTRY" ]; then
+    check "artifact.json binds the capability registry" "PASS"
+  else
+    check "artifact.json binds the capability registry" "FAIL"
+    echo "  ERROR: artifact.json has no registry_sha256 binding" >&2
+  fi
+
+  # artifact.json must describe the qualified source, not a different one.
+  if [ -f "$EVIDENCE_DIR/provenance.json" ]; then
+    PROV_COMMIT="$(jq -r '.commit // empty' "$EVIDENCE_DIR/provenance.json" 2>/dev/null || true)"
+    PROV_TREE="$(jq -r '.tree // empty' "$EVIDENCE_DIR/provenance.json" 2>/dev/null || true)"
+    if [ -n "$PROV_COMMIT" ] && [ "$ARTIFACT_COMMIT" = "$PROV_COMMIT" ] && [ "$ARTIFACT_TREE" = "$PROV_TREE" ]; then
+      check "artifact.json binds the qualified source" "PASS"
+    else
+      check "artifact.json binds the qualified source" "FAIL"
+      echo "  ERROR: artifact.json source $ARTIFACT_COMMIT/$ARTIFACT_TREE does not match provenance $PROV_COMMIT/$PROV_TREE" >&2
+    fi
+  fi
+
+  # Recompute the archive digest — never trust the stored string.
+  if [ -n "$ARCHIVE_PATH" ]; then
+    if [ ! -f "$ARCHIVE_PATH" ]; then
+      check "Release archive present" "FAIL"
+      echo "  ERROR: archive not found: $ARCHIVE_PATH" >&2
+    else
+      ACTUAL_ARCHIVE_SHA="$(shasum -a 256 "$ARCHIVE_PATH" | cut -d ' ' -f1)"
+      if [ -n "$ARTIFACT_SHA" ] && [ "$ACTUAL_ARCHIVE_SHA" = "$ARTIFACT_SHA" ]; then
+        check "Archive matches artifact.json (recomputed)" "PASS"
+      else
+        check "Archive matches artifact.json (recomputed)" "FAIL"
+        echo "  ERROR: archive SHA-256 $ACTUAL_ARCHIVE_SHA does not equal artifact.json $ARTIFACT_SHA" >&2
+      fi
+      if [ "$(basename "$ARCHIVE_PATH")" = "crabedence-${ARTIFACT_VERSION}.tar.gz" ]; then
+        check "Archive filename matches release version" "PASS"
+      else
+        check "Archive filename matches release version" "FAIL"
+        echo "  ERROR: archive name does not carry release_version $ARTIFACT_VERSION" >&2
+      fi
+    fi
+  fi
+else
+  check "artifact.json (missing)" "FAIL"
+  echo "  ERROR: artifact.json is not part of the evidence bundle" >&2
+fi
 
 # 1. SHA256SUMS verification.
 if [ -f "$EVIDENCE_DIR/SHA256SUMS" ]; then

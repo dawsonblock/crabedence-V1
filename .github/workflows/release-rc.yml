@@ -528,8 +528,11 @@ jobs:
         run: |
           # Copy evidence bundle alongside extracted source
           cp -r evidence clean-room/qualification
-          # Run the verifier against the extracted source
+          # Run the verifier against the extracted source, with the
+          # downloaded archive: the verifier recomputes the archive
+          # SHA-256 and requires it to equal artifact.json's binding.
           # The verifier uses find (not git) so it works without .git
           bash clean-room/crabedence-${RELEASE_VERSION}/scripts/verify-release-artifact.sh \
             clean-room/qualification \
-            clean-room/crabedence-${RELEASE_VERSION}
+            clean-room/crabedence-${RELEASE_VERSION} \
+            "crabedence-${RELEASE_VERSION}.tar.gz"
