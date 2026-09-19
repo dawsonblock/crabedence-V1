@@ -700,6 +700,21 @@ run_authority_postgres_gate
 # ─── Phase 13: Cross-language conformance ───────────────────────────────────
 echo ""
 echo "=== Cross-language conformance ==="
+# ─── External CRITICAL qualification gates ──────────────────────────────
+# The external qualification provider runs in its own process with a
+# durable ledger; the harness skips without CRABBOX_TEST_DATABASE_URL, so
+# these gates fail closed when the database is absent (0 executed tests).
+run_gate critical-external INTEGRATION env \
+  CRABBOX_TEST_DATABASE_URL="$CRABBOX_TEST_DATABASE_URL" \
+  go test -v -count=1 -timeout=300s \
+  -run "TestLiveCriticalQualification(Commit|AmbiguityThenReconcile|DefinitiveRejection|EvidenceIntegrity|AuthorityMatrix|ClosedAuthoritySemantics)$" \
+  ./internal/execution/
+run_gate critical-faults FAULT_INJECTION env \
+  CRABBOX_TEST_DATABASE_URL="$CRABBOX_TEST_DATABASE_URL" \
+  go test -v -count=1 -timeout=300s \
+  -run "TestLiveCriticalQualification(FailBeforeAccept)$" \
+  ./internal/execution/
+
 run_gate cross-language-conformance TEST \
   go test -v -count=1 -timeout=60s \
   -run "TestRunEvidenceConformanceCorpus|TestReceiptContractConformance" \
@@ -788,7 +803,7 @@ extract_tests_executed() {
       f=$(grep -oE '^tests_failed=[0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$' || true)
       count=$((${p:-0} + ${f:-0}))
       ;;
-    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-cli|effect-fabric-contract|effect-fabric-reconciliation|effect-fabric-evidence|effect-fabric-race|authority-postgres|provider-github-real-api)
+    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-cli|effect-fabric-contract|effect-fabric-reconciliation|effect-fabric-evidence|effect-fabric-race|authority-postgres|provider-github-real-api|critical-external|critical-faults)
       # Go test with -v prints one line per test:
       #   --- PASS: TestName (0.00s)
       #   --- FAIL: TestName (0.00s)
@@ -871,7 +886,7 @@ extract_tests_skipped() {
       count=$(grep -oE '^tests_skipped=[0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$' || true)
       count=${count:-0}
       ;;
-    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-cli|effect-fabric-contract|effect-fabric-reconciliation|effect-fabric-evidence|effect-fabric-race|authority-postgres|provider-github-real-api|cross-language-conformance)
+    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-cli|effect-fabric-contract|effect-fabric-reconciliation|effect-fabric-evidence|effect-fabric-race|authority-postgres|provider-github-real-api|critical-external|critical-faults|cross-language-conformance)
       count=$(grep -cE '^\s*--- SKIP:' "$log" 2>/dev/null || true)
       ;;
     worker-tests|nemo-tests)
@@ -934,7 +949,7 @@ extract_tests_failed() {
         count=$(jq '[.testResults[].assertionResults[] | select(.status == "failed")] | length' "$json_summary" 2>/dev/null || true)
       fi
       ;;
-    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-cli|effect-fabric-contract|effect-fabric-reconciliation|effect-fabric-evidence|effect-fabric-race|authority-postgres|provider-github-real-api|cross-language-conformance)
+    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-cli|effect-fabric-contract|effect-fabric-reconciliation|effect-fabric-evidence|effect-fabric-race|authority-postgres|provider-github-real-api|critical-external|critical-faults|cross-language-conformance)
       count=$(grep -cE '^\s*--- FAIL:' "$log" 2>/dev/null || true)
       ;;
     worker-tests|nemo-tests)

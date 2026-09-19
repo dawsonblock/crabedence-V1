@@ -64,6 +64,33 @@ func readProviderLog(t *testing.T, path string) []providerLogEntry {
 	return entries
 }
 
+// qualificationOperation is one durable record in the provider's
+// operation ledger (JSON-lines, fsynced before the response is sent).
+// The ledger is the provider's independent knowledge of whether the
+// external operation happened: killing Crabedence cannot erase it.
+type qualificationOperation struct {
+	Token          string          `json:"token"`
+	PayloadDigest  string          `json:"payload_digest"`
+	OperationID    string          `json:"operation_id"`
+	ArtifactID     string          `json:"artifact_id"`
+	ArtifactDigest string          `json:"artifact_digest"`
+	Status         string          `json:"status"` // COMMITTED | REJECTED
+	Result         json.RawMessage `json:"result,omitempty"`
+	Executions     int             `json:"executions"`
+	Timestamp      time.Time       `json:"timestamp"`
+}
+
+// Qualification fault names, injected deterministically per request via
+// the X-Qualification-Fault header (or ?fault= for lookups).
+const (
+	faultFailBeforeAccept  = "FAIL_BEFORE_ACCEPT"
+	faultCommitThenTimeout = "COMMIT_THEN_TIMEOUT"
+	faultCommitThenReset   = "COMMIT_THEN_RESET"
+	faultLookupUnavailable = "LOOKUP_TEMPORARILY_UNAVAILABLE"
+	faultDefinitiveReject  = "DEFINITIVE_REJECTION"
+	faultWrongArtifactDig  = "WRONG_ARTIFACT_DIGEST"
+)
+
 // TestExternalProviderHelperProcess is the provider subprocess. It
 // serves POST /effects (idempotent on token — a second request with
 // the same token replays the logged result without a new effect) and
@@ -71,16 +98,33 @@ func readProviderLog(t *testing.T, path string) []providerLogEntry {
 // appended to a fsynced JSON-lines log BEFORE the response is sent:
 // the provider never acknowledges an effect it cannot prove later.
 //
+// It also serves the qualification operation API used by the CRITICAL
+// walk: POST /operations (durable ledger + immutable artifact, with
+// deterministic fault injection), GET /operations/{token} (completion
+// / non-effect proof for reconciliation), GET /artifacts/{id}
+// (immutable artifact bytes), and GET /stats.
+//
 // Env:
 //
 //	CRABBOX_PROVIDER_HELPER=1      — run as helper
 //	CRABBOX_PROVIDER_LOG=<path>    — durable log path
 //	CRABBOX_PROVIDER_ADDR=<path>   — file to publish the bound addr
+//	CRABBOX_PROVIDER_DIR=<path>    — directory for the operation ledger
+//	                                 and immutable artifacts
 func TestExternalProviderHelperProcess(t *testing.T) {
 	if os.Getenv("CRABBOX_PROVIDER_HELPER") != "1" {
 		return
 	}
 	logPath := os.Getenv("CRABBOX_PROVIDER_LOG")
+	providerDir := os.Getenv("CRABBOX_PROVIDER_DIR")
+	if providerDir == "" {
+		providerDir = filepath.Dir(logPath)
+	}
+	artifactDir := filepath.Join(providerDir, "artifacts")
+	if err := os.MkdirAll(artifactDir, 0o700); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
 	var mu sync.Mutex
 	effects := 0
 	seen := map[string]providerLogEntry{}
@@ -171,6 +215,202 @@ func TestExternalProviderHelperProcess(t *testing.T) {
 		json.NewEncoder(w).Encode(e)
 	})
 
+	// ─── Qualification operation ledger + immutable artifacts ──────────
+	// A second durable file (operations.jsonl) plus artifact files under
+	// artifacts/. Everything is fsynced before a response is sent: the
+	// provider never acknowledges an operation it cannot prove later,
+	// and killing Crabedence cannot erase this state.
+	opLedgerPath := filepath.Join(providerDir, "operations.jsonl")
+	opsByToken := map[string]qualificationOperation{}
+	opSeq := 0
+	totalExecutions := 0
+	if data, err := os.ReadFile(opLedgerPath); err == nil {
+		for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+			var op qualificationOperation
+			if json.Unmarshal([]byte(line), &op) == nil && op.Token != "" {
+				opsByToken[op.Token] = op
+				opSeq++
+				totalExecutions += op.Executions
+			}
+		}
+	}
+	appendOperation := func(op qualificationOperation) error {
+		f, err := os.OpenFile(opLedgerPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+		if err != nil {
+			return err
+		}
+		b, _ := json.Marshal(op)
+		if _, err := f.Write(append(b, '\n')); err != nil {
+			f.Close()
+			return err
+		}
+		if err := f.Sync(); err != nil {
+			f.Close()
+			return err
+		}
+		return f.Close()
+	}
+	writeArtifact := func(id string, data []byte) error {
+		path := filepath.Join(artifactDir, id)
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+		if err != nil {
+			return err
+		}
+		if _, err := f.Write(data); err != nil {
+			f.Close()
+			return err
+		}
+		if err := f.Sync(); err != nil {
+			f.Close()
+			return err
+		}
+		return f.Close()
+	}
+	readArtifact := func(id string) ([]byte, error) {
+		return os.ReadFile(filepath.Join(artifactDir, id))
+	}
+	respondOperation := func(w http.ResponseWriter, op qualificationOperation, fault string) {
+		artifact, err := readArtifact(op.ArtifactID)
+		if err != nil {
+			http.Error(w, `{"error":"artifact missing"}`, http.StatusInternalServerError)
+			return
+		}
+		declared := op.ArtifactDigest
+		if fault == faultWrongArtifactDig {
+			// Claim a valid-looking digest that does not cover the bytes.
+			declared = strings.Repeat("0", 64)
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"status":       op.Status,
+			"operation_id": op.OperationID,
+			"run_id":       op.OperationID,
+			"artifact_id":  op.ArtifactID,
+			"digest":       declared,
+			"result":       op.Result,
+			"artifact":     json.RawMessage(artifact),
+		})
+	}
+
+	mux.HandleFunc("POST /operations", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Token   string          `json:"token"`
+			Payload json.RawMessage `json:"payload"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Token == "" {
+			http.Error(w, `{"error":"bad request"}`, http.StatusBadRequest)
+			return
+		}
+		fault := r.Header.Get("X-Qualification-Fault")
+		payloadSum := sha256.Sum256(body.Payload)
+		payloadDigest := fmt.Sprintf("%x", payloadSum)
+
+		mu.Lock()
+		defer mu.Unlock()
+
+		if existing, ok := opsByToken[body.Token]; ok {
+			if existing.PayloadDigest != payloadDigest {
+				// Same token, different payload: an idempotency collision,
+				// never a second effect.
+				http.Error(w, `{"error":"operation token bound to a different payload"}`, http.StatusConflict)
+				return
+			}
+			// Duplicate token with the same payload: replay the original
+			// operation. No new effect.
+			respondOperation(w, existing, fault)
+			return
+		}
+
+		if fault == faultFailBeforeAccept {
+			http.Error(w, `{"error":"rejected before accept"}`, http.StatusInternalServerError)
+			return
+		}
+
+		opSeq++
+		op := qualificationOperation{
+			Token:         body.Token,
+			PayloadDigest: payloadDigest,
+			OperationID:   fmt.Sprintf("op-%d", opSeq),
+			ArtifactID:    fmt.Sprintf("art-%d", opSeq),
+			Status:        "COMMITTED",
+			Executions:    1,
+			Result:        json.RawMessage(fmt.Sprintf(`{"operation_id":"op-%d"}`, opSeq)),
+			Timestamp:     time.Now().UTC(),
+		}
+		var artifact []byte
+		if fault == faultDefinitiveReject {
+			// A definitive rejection: no external effect occurred, and the
+			// provider can prove it with an artifact.
+			op.Status = "REJECTED"
+			op.Executions = 0
+			op.Result = nil
+			artifact = []byte(fmt.Sprintf(`{"operation_id":%q,"outcome":"REJECTED","reason":"deterministic rejection"}`, op.OperationID))
+		} else {
+			artifact = []byte(fmt.Sprintf(`{"operation_id":%q,"token":%q,"outcome":"COMMITTED"}`, op.OperationID, op.Token))
+		}
+		artifactSum := sha256.Sum256(artifact)
+		op.ArtifactDigest = fmt.Sprintf("%x", artifactSum)
+		if err := appendOperation(op); err != nil {
+			http.Error(w, `{"error":"ledger failed"}`, http.StatusInternalServerError)
+			return
+		}
+		if err := writeArtifact(op.ArtifactID, artifact); err != nil {
+			http.Error(w, `{"error":"artifact failed"}`, http.StatusInternalServerError)
+			return
+		}
+		opsByToken[op.Token] = op
+		totalExecutions += op.Executions
+
+		switch fault {
+		case faultCommitThenTimeout:
+			// The operation is durable; the response never arrives.
+			time.Sleep(30 * time.Second)
+		case faultCommitThenReset:
+			// The operation is durable; the connection dies without a
+			// response (a reset, not a clean close).
+			if hj, ok := w.(http.Hijacker); ok {
+				if conn, _, err := hj.Hijack(); err == nil {
+					conn.Close()
+					return
+				}
+			}
+			return
+		}
+		respondOperation(w, op, fault)
+	})
+	mux.HandleFunc("GET /operations/{token}", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("fault") == faultLookupUnavailable {
+			http.Error(w, `{"error":"temporarily unavailable"}`, http.StatusServiceUnavailable)
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		op, ok := opsByToken[r.PathValue("token")]
+		if !ok {
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+			return
+		}
+		json.NewEncoder(w).Encode(op)
+	})
+	mux.HandleFunc("GET /artifacts/{id}", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		data, err := readArtifact(r.PathValue("id"))
+		if err != nil {
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Write(data)
+	})
+	mux.HandleFunc("GET /stats", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		json.NewEncoder(w).Encode(map[string]int{
+			"operations": len(opsByToken),
+			"executions": totalExecutions,
+		})
+	})
+
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -194,6 +434,7 @@ func startExternalProvider(t *testing.T, dir string) (url string, logPath string
 		"CRABBOX_PROVIDER_HELPER=1",
 		"CRABBOX_PROVIDER_LOG="+logPath,
 		"CRABBOX_PROVIDER_ADDR="+addrPath,
+		"CRABBOX_PROVIDER_DIR="+dir,
 	)
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start provider: %v", err)

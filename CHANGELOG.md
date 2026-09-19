@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### CRITICAL — external qualification provider and the adversarial walk
+
+- Execution: the external provider process now serves a qualification operation API with its own durable ledger and immutable artifacts: `POST /operations` (stable Crabedence operation token, deterministic payload, idempotent on the token, 409 on a token/payload collision), `GET /operations/{token}` (completion/non-effect proof for reconciliation), `GET /artifacts/{id}` (immutable bytes), and `GET /stats`. Faults are injected deterministically per request (`FAIL_BEFORE_ACCEPT`, `COMMIT_THEN_TIMEOUT`, `COMMIT_THEN_RESET`, `LOOKUP_TEMPORARILY_UNAVAILABLE`, `DEFINITIVE_REJECTION`, `WRONG_ARTIFACT_DIGEST`), never by timing.
+- Execution: the full CRITICAL stack is now qualified end to end against a real external process with no mocks in the path: Unix socket → Service → verified descriptor → PostgreSQL authority resolution → CRITICAL/HIGH_ASSURANCE admission → PostgreSQL EffectStore (`PREPARED` → `IN_FLIGHT`) → external provider process → provider observation → Crabedence recomputes SHA-256 over the artifact bytes → signed receipt → `COMMITTED`/`FAILED`/`UNKNOWN`, with reconciliation where required. Covered: the happy-path commit with independent receipt verification; post-dispatch ambiguity (`COMMIT_THEN_RESET`) → `UNKNOWN` → reconciliation proves `COMMITTED` with exactly one external execution; definitive rejection → `FAILED` with zero executions; a provider that claims a valid-looking digest over different bytes (the receipt binds the digest Crabedence computed, and a mutated receipt fails signature verification); fail-before-accept → `UNKNOWN` with zero operations and no fabricated commit; and an authority matrix (expired, revoked, unknown, wrong-principal, wrong-capability) where invalid authority produces zero provider operations and no durable record.
+- Execution: the authority store's closed-reference continuity contract is now a tested expectation: closing a reference prevents new generations while its existing generation resolves until revoked or expired.
+- Release: two new typed gates qualify the CRITICAL path — `critical-external` (`INTEGRATION`) and `critical-faults` (`FAULT_INJECTION`) — failing closed when no test database is configured.
+
 ### Qualification — typed gates, one validator, and the artifact v2 release object
 
 - Release: qualification gates are now typed canonical records (qualification schema version 2): `gate_id`, `gate_type` from a closed enum (`TEST`, `BUILD`, `STATIC_ANALYSIS`, `INTEGRATION`, `SECURITY`, `FAULT_INJECTION`, `REPRODUCIBILITY`, `PROVENANCE`, `CLEAN_ROOM`), `mandatory`, `status`, `exit_code`, honest `tests_executed`/`tests_failed`, `duration_ms`, and a bound `evidence` file with its SHA-256.
