@@ -89,6 +89,7 @@ const (
 	faultLookupUnavailable = "LOOKUP_TEMPORARILY_UNAVAILABLE"
 	faultDefinitiveReject  = "DEFINITIVE_REJECTION"
 	faultWrongArtifactDig  = "WRONG_ARTIFACT_DIGEST"
+	faultCorruptArtifact   = "CORRUPT_ARTIFACT"
 )
 
 // TestExternalProviderHelperProcess is the provider subprocess. It
@@ -280,6 +281,13 @@ func TestExternalProviderHelperProcess(t *testing.T) {
 			// Claim a valid-looking digest that does not cover the bytes.
 			declared = strings.Repeat("0", 64)
 		}
+		if fault == faultCorruptArtifact {
+			// Corrupt the bytes in transit; the durable artifact file is
+			// untouched, so the provider's ledger remains the truth.
+			corrupted := append([]byte(nil), artifact...)
+			corrupted[len(corrupted)-1] ^= 0x01
+			artifact = corrupted
+		}
 		json.NewEncoder(w).Encode(map[string]any{
 			"status":       op.Status,
 			"operation_id": op.OperationID,
@@ -362,8 +370,13 @@ func TestExternalProviderHelperProcess(t *testing.T) {
 
 		switch fault {
 		case faultCommitThenTimeout:
-			// The operation is durable; the response never arrives.
+			// The operation is durable; the response never arrives. The
+			// state mutex is released first so the lookup endpoint keeps
+			// serving while this connection hangs.
+			mu.Unlock()
 			time.Sleep(30 * time.Second)
+			mu.Lock()
+			return
 		case faultCommitThenReset:
 			// The operation is durable; the connection dies without a
 			// response (a reset, not a clean close).

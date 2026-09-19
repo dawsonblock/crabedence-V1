@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### CRITICAL — the remaining adversarial rows
+
+- Execution: `COMMIT_THEN_TIMEOUT` (provider commits, the response never arrives) reaches the same invariant as the reset case: `UNKNOWN` → reconciliation by stable token → signed `COMMITTED` with exactly one external execution.
+- Execution: a lookup outage (`LOOKUP_TEMPORARILY_UNAVAILABLE`) can never degrade into `FAILED` — the record stays `UNKNOWN` while external reality is unknowable, the attempt advances, no redispatch occurs, and the same stable token resolves the ambiguity once the lookup is restored (the first reconciliation backoff is waited out rather than bypassed).
+- Execution: the provider boundary itself rejects a token rebound to a different payload (409, original artifact unchanged, one ledger entry, one execution) — independent of EffectStore deduplication.
+- Execution: corrupted artifact bytes in transit cannot produce a `COMMITTED` CRITICAL receipt — the adapter requires the response bytes to match the provider's durable artifact; the outcome stays `UNKNOWN` and the eventual commit, resolved by reconciliation, binds the durable artifact.
+- Execution: the qualification registry is now constructed under the explicit extension rule — exact release registry plus qualification descriptors, with the base and qualification digests and each extension's descriptor digest recorded. The harness refuses to proceed if an extension replaces or modifies a release descriptor, and `qualification.critical.commit` stays out of the shipped registry. `RegisterBuiltinCapabilities` is the single source of truth for release registry membership (service, `cmd/registry-digest`, and the harness).
+- Release: the `critical-external`/`critical-faults` gate patterns cover the new rows.
+
 ### CRITICAL — external qualification provider and the adversarial walk
 
 - Execution: the external provider process now serves a qualification operation API with its own durable ledger and immutable artifacts: `POST /operations` (stable Crabedence operation token, deterministic payload, idempotent on the token, 409 on a token/payload collision), `GET /operations/{token}` (completion/non-effect proof for reconciliation), `GET /artifacts/{id}` (immutable bytes), and `GET /stats`. Faults are injected deterministically per request (`FAIL_BEFORE_ACCEPT`, `COMMIT_THEN_TIMEOUT`, `COMMIT_THEN_RESET`, `LOOKUP_TEMPORARILY_UNAVAILABLE`, `DEFINITIVE_REJECTION`, `WRONG_ARTIFACT_DIGEST`), never by timing.

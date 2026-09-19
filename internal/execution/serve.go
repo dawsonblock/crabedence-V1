@@ -56,29 +56,17 @@ func defaultSocketPath() string {
 func Serve(ctx context.Context, opts ServeOptions) error {
 	registry := capability.NewRegistry()
 
-	// Register built-in capabilities
-	if err := RegisterEchoCapability(registry); err != nil {
-		return fmt.Errorf("failed to register system.echo: %w", err)
-	}
-	if err := RegisterCounterCapability(registry); err != nil {
-		return fmt.Errorf("failed to register test.counter.increment: %w", err)
-	}
-	if err := RegisterSystemInfoCapability(registry); err != nil {
-		return fmt.Errorf("failed to register system.info: %w", err)
-	}
-
 	// The capability registry is STATIC for a release: every built-in
 	// capability is registered regardless of deployment configuration,
 	// so the registry digest identifies the security policy this build
-	// ships rather than the environment it runs in. Adapter
-	// availability is a runtime property — an unwired adapter fails
-	// closed at dispatch (known capability, unavailable adapter), never
-	// as an unknown capability and never as a routing change.
-	if err := RegisterGitHubIssueCapability(registry); err != nil {
-		return fmt.Errorf("failed to register github.issue.create: %w", err)
-	}
-	if err := RegisterGitHubReadCapabilities(registry); err != nil {
-		return fmt.Errorf("failed to register github.issue.get: %w", err)
+	// ships rather than the environment it runs in. Adapter availability
+	// is a runtime property — an unwired adapter fails closed at dispatch
+	// (known capability, unavailable adapter), never as an unknown
+	// capability and never as a routing change. Registration goes through
+	// the single built-in catalog (RegisterBuiltinCapabilities), the same
+	// one cmd/registry-digest and the qualification harness use.
+	if err := RegisterBuiltinCapabilities(registry); err != nil {
+		return err
 	}
 
 	// Adapter wiring is deployment configuration: CRABBOX_GITHUB_ENABLED

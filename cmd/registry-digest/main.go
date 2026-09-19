@@ -32,17 +32,9 @@ func main() {
 	flag.Parse()
 
 	registry := capability.NewRegistry()
-	for name, register := range map[string]func(*capability.Registry) error{
-		"system.echo":            execution.RegisterEchoCapability,
-		"test.counter.increment": execution.RegisterCounterCapability,
-		"system.info":            execution.RegisterSystemInfoCapability,
-		"github.issue.create":    execution.RegisterGitHubIssueCapability,
-		"github.issue.get":       execution.RegisterGitHubReadCapabilities,
-	} {
-		if err := register(registry); err != nil {
-			fmt.Fprintf(os.Stderr, "register %s: %v\n", name, err)
-			os.Exit(1)
-		}
+	if err := execution.RegisterBuiltinCapabilities(registry); err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
 	}
 	if err := registry.Validate(); err != nil {
 		fmt.Fprintf(os.Stderr, "capability registry invariant scan failed: %v\n", err)

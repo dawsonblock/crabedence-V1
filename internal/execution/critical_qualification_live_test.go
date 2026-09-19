@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -52,6 +54,10 @@ const qualificationCapabilityID = "qualification.critical.commit"
 type qualificationAdapter struct {
 	baseURL string
 	client  *http.Client
+	// lookupFault, when set, injects a deterministic lookup outage into
+	// reconciliation (the test clears it to restore the lookup). It is
+	// harness state, never part of the provider contract.
+	lookupFault string
 }
 
 func (a *qualificationAdapter) ProviderCapabilities(string) ProviderCapabilities {
@@ -175,6 +181,20 @@ func (a *qualificationAdapter) Execute(ctx context.Context, req Request, desc ca
 	}
 	switch out.Status {
 	case "COMMITTED":
+		// The artifact identity must match the provider's durable
+		// artifact: a response whose bytes differ from the ledger's copy
+		// is transport corruption, and committing it would attest bytes
+		// the provider cannot prove. Ambiguous → UNKNOWN.
+		if durable, err := a.fetchArtifact(ctx, out.ArtifactID); err == nil {
+			if !bytes.Equal(durable, out.Artifact) {
+				return Response{
+					Status:      StatusUnknown,
+					FailureCode: string(capability.FailureExecutionUnknown),
+					Error:       "qualification provider artifact does not match its durable artifact",
+					Execution:   &ExecutionMeta{Provider: "qualification", RunID: out.OperationID},
+				}
+			}
+		}
 		result, _ := json.Marshal(map[string]any{"operation_id": out.OperationID})
 		return Response{
 			Status:           StatusSucceeded,
@@ -217,7 +237,11 @@ func (a *qualificationAdapter) Resolve(ctx context.Context, rec *idempotency.Rec
 	if loc.ExternalToken == "" {
 		return idempotency.RecoveryResult{Decision: idempotency.RecoveryUnknown}, nil
 	}
-	resp, err := a.client.Get(a.baseURL + "/operations/" + url.PathEscape(loc.ExternalToken))
+	lookupURL := a.baseURL + "/operations/" + url.PathEscape(loc.ExternalToken)
+	if a.lookupFault != "" {
+		lookupURL += "?fault=" + url.QueryEscape(a.lookupFault)
+	}
+	resp, err := a.client.Get(lookupURL)
 	if err != nil {
 		return idempotency.RecoveryResult{Decision: idempotency.RecoveryUnknown}, nil
 	}
@@ -291,6 +315,89 @@ type criticalStack struct {
 	service     *Service
 	worker      *reconcile.Worker
 	adapter     *qualificationAdapter
+	binding     qualificationRegistryBinding
+}
+
+// qualificationRegistryBinding is the explicit extension record: the
+// release registry identity, the qualification registry identity, and
+// the exact descriptors the qualification harness added. It is what
+// Batch G binds into the release evidence.
+type qualificationRegistryBinding struct {
+	BaseRegistrySHA256          string              `json:"base_registry_sha256"`
+	QualificationRegistrySHA256 string              `json:"qualification_registry_sha256"`
+	QualificationExtensions     []registryExtension `json:"qualification_extensions"`
+}
+
+type registryExtension struct {
+	CapabilityID     string `json:"capability_id"`
+	DescriptorSHA256 string `json:"descriptor_sha256"`
+}
+
+// buildQualificationRegistry constructs the qualification registry under
+// the extension rule:
+//
+//	exact release registry + explicit qualification descriptors
+//	  = qualification registry
+//
+// It refuses to proceed if adding the extension replaced or modified any
+// release descriptor, so the harness can never silently alter production
+// policy while exercising test-only capabilities.
+func buildQualificationRegistry(t *testing.T) (*capability.Registry, qualificationRegistryBinding) {
+	t.Helper()
+	registry := capability.NewRegistry()
+	if err := RegisterBuiltinCapabilities(registry); err != nil {
+		t.Fatalf("register release registry: %v", err)
+	}
+	baseSHA, err := registry.Digest()
+	if err != nil {
+		t.Fatalf("base registry digest: %v", err)
+	}
+	baseDescriptors := map[string]string{}
+	for _, id := range registry.List() {
+		desc, ok := registry.Lookup(id)
+		if !ok {
+			t.Fatalf("release capability %s vanished", id)
+		}
+		digest, err := desc.DescriptorDigest()
+		if err != nil {
+			t.Fatalf("descriptor digest for %s: %v", id, err)
+		}
+		baseDescriptors[id] = digest
+	}
+
+	extension := registerQualificationCapability(t, registry)
+	extensionDigest, err := extension.DescriptorDigest()
+	if err != nil {
+		t.Fatalf("extension descriptor digest: %v", err)
+	}
+
+	for id, want := range baseDescriptors {
+		desc, ok := registry.Lookup(id)
+		if !ok {
+			t.Fatalf("qualification extension replaced release capability %s", id)
+		}
+		got, err := desc.DescriptorDigest()
+		if err != nil {
+			t.Fatalf("descriptor digest for %s: %v", id, err)
+		}
+		if got != want {
+			t.Fatalf("qualification extension modified release descriptor %s", id)
+		}
+	}
+	qualificationSHA, err := registry.Digest()
+	if err != nil {
+		t.Fatalf("qualification registry digest: %v", err)
+	}
+	if qualificationSHA == baseSHA {
+		t.Fatal("the qualification extension did not change the registry identity")
+	}
+	return registry, qualificationRegistryBinding{
+		BaseRegistrySHA256:          baseSHA,
+		QualificationRegistrySHA256: qualificationSHA,
+		QualificationExtensions: []registryExtension{
+			{CapabilityID: qualificationCapabilityID, DescriptorSHA256: extensionDigest},
+		},
+	}
 }
 
 func registerQualificationCapability(t *testing.T, registry *capability.Registry) capability.ResolvedDescriptor {
@@ -347,8 +454,7 @@ func newCriticalStack(t *testing.T) *criticalStack {
 		client:  &http.Client{Timeout: 2 * time.Second},
 	}
 
-	registry := capability.NewRegistry()
-	registerQualificationCapability(t, registry)
+	registry, binding := buildQualificationRegistry(t)
 
 	exec := NewDispatchExecutor(adapter, store)
 	exec.SetEvidenceSigner(signer)
@@ -377,6 +483,7 @@ func newCriticalStack(t *testing.T) *criticalStack {
 		service:     service,
 		worker:      worker,
 		adapter:     adapter,
+		binding:     binding,
 	}
 }
 
@@ -790,4 +897,259 @@ func fetchProviderArtifact(t *testing.T, stack *criticalStack, opID string) []by
 		t.Fatalf("read artifact: %v", err)
 	}
 	return data
+}
+
+// TestLiveCriticalQualificationTimeoutThenReconcile is the timeout
+// variant of the ambiguity case: the provider commits the operation and
+// the response never arrives. Same invariant: UNKNOWN, reconciliation by
+// stable token, signed COMMITTED, exactly one external execution.
+func TestLiveCriticalQualificationTimeoutThenReconcile(t *testing.T) {
+	stack := newCriticalStack(t)
+	grant := "grant-valid-" + qualificationKey("g")
+	stack.issueGrant(t, grant, "alice@example.com", []string{qualificationCapabilityID}, time.Now().Add(time.Hour))
+
+	key := qualificationKey("crit-timeout")
+	resp := stack.request(t, key, grant, "alice@example.com", map[string]string{
+		"operation": "commit-timeout",
+		"fault":     faultCommitThenTimeout,
+	})
+	if resp.Status != StatusUnknown {
+		t.Fatalf("post-dispatch timeout must be UNKNOWN, got %s (%s)", resp.Status, resp.Error)
+	}
+	if operations, executions := stack.providerStats(t); operations != 1 || executions != 1 {
+		t.Fatalf("provider operations/executions = %d/%d, want 1/1 (the commit happened)", operations, executions)
+	}
+
+	if err := stack.worker.RunCycle(context.Background()); err != nil {
+		t.Fatalf("reconcile cycle: %v", err)
+	}
+	rec := stack.lookup(t, key)
+	if rec.State != idempotency.StateCommitted {
+		t.Fatalf("post-reconciliation state = %s, want COMMITTED", rec.State)
+	}
+	if len(rec.EvidenceReceipt) == 0 {
+		t.Fatal("reconciled CRITICAL commit without a signed receipt")
+	}
+	if operations, executions := stack.providerStats(t); operations != 1 || executions != 1 {
+		t.Fatalf("reconciliation re-dispatched: %d/%d, want 1/1", operations, executions)
+	}
+}
+
+// TestLiveCriticalQualificationLookupOutageThenRecovery proves that a
+// temporary inability to establish external reality can never degrade
+// into FAILED: the record stays UNKNOWN while the lookup is down, no
+// redispatch occurs, and the same stable token resolves once the lookup
+// is restored.
+func TestLiveCriticalQualificationLookupOutageThenRecovery(t *testing.T) {
+	stack := newCriticalStack(t)
+	grant := "grant-valid-" + qualificationKey("g")
+	stack.issueGrant(t, grant, "alice@example.com", []string{qualificationCapabilityID}, time.Now().Add(time.Hour))
+
+	key := qualificationKey("crit-outage")
+	resp := stack.request(t, key, grant, "alice@example.com", map[string]string{
+		"operation": "commit-outage",
+		"fault":     faultCommitThenReset,
+	})
+	if resp.Status != StatusUnknown {
+		t.Fatalf("expected UNKNOWN, got %s (%s)", resp.Status, resp.Error)
+	}
+
+	// Lookup outage: reconciliation cannot establish external reality.
+	stack.adapter.lookupFault = faultLookupUnavailable
+	if err := stack.worker.RunCycle(context.Background()); err != nil {
+		t.Fatalf("reconcile cycle during outage: %v", err)
+	}
+	rec := stack.lookup(t, key)
+	if rec.State != idempotency.StateUnknown {
+		t.Fatalf("state during lookup outage = %s, want UNKNOWN (never FAILED)", rec.State)
+	}
+	if rec.ReconcileAttempt < 1 {
+		t.Fatalf("reconcile attempt = %d, want >= 1 (the outage consumed an attempt)", rec.ReconcileAttempt)
+	}
+	if operations, executions := stack.providerStats(t); operations != 1 || executions != 1 {
+		t.Fatalf("outage caused a redispatch: %d/%d, want 1/1", operations, executions)
+	}
+
+	// Lookup restored: the same stable token resolves the ambiguity. The
+	// unresolved attempt released the claim with the first reconciliation
+	// backoff (30s by design), so wait it out rather than bypassing the
+	// scheduler — the backoff is part of what is being qualified.
+	stack.adapter.lookupFault = ""
+	time.Sleep(31 * time.Second)
+	if err := stack.worker.RunCycle(context.Background()); err != nil {
+		t.Fatalf("reconcile cycle after recovery: %v", err)
+	}
+	rec = stack.lookup(t, key)
+	if rec.State != idempotency.StateCommitted {
+		t.Fatalf("post-recovery state = %s, want COMMITTED", rec.State)
+	}
+	if len(rec.EvidenceReceipt) == 0 {
+		t.Fatal("post-recovery commit without a signed receipt")
+	}
+	if operations, executions := stack.providerStats(t); operations != 1 || executions != 1 {
+		t.Fatalf("recovery re-dispatched: %d/%d, want 1/1", operations, executions)
+	}
+}
+
+// TestLiveCriticalQualificationTokenPayloadCollision proves the external
+// boundary itself rejects a token rebound to a different payload —
+// independently of EffectStore deduplication. The original operation and
+// its artifact must be untouched.
+func TestLiveCriticalQualificationTokenPayloadCollision(t *testing.T) {
+	dir := t.TempDir()
+	providerURL, logPath := startExternalProvider(t, dir)
+	post := func(payload string) (int, []byte) {
+		body := fmt.Sprintf(`{"token":"collision-token","payload":{"operation":%q}}`, payload)
+		resp, err := http.Post(providerURL+"/operations", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		defer resp.Body.Close()
+		data, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, data
+	}
+
+	status, first := post("payload-A")
+	if status != http.StatusOK {
+		t.Fatalf("first operation status = %d, want 200 (%s)", status, first)
+	}
+	var op qualificationOperationResponse
+	if err := json.Unmarshal(first, &op); err != nil {
+		t.Fatalf("decode first operation: %v", err)
+	}
+	originalArtifact, err := os.ReadFile(filepath.Join(dir, "artifacts", op.ArtifactID))
+	if err != nil {
+		t.Fatalf("read durable artifact: %v", err)
+	}
+
+	status, second := post("payload-B")
+	if status != http.StatusConflict {
+		t.Fatalf("token rebound to a different payload: status = %d, want 409 (%s)", status, second)
+	}
+
+	// The original operation, its artifact, and the execution count are
+	// unchanged; no second ledger entry exists.
+	after, err := os.ReadFile(filepath.Join(dir, "artifacts", op.ArtifactID))
+	if err != nil {
+		t.Fatalf("re-read durable artifact: %v", err)
+	}
+	if !bytes.Equal(originalArtifact, after) {
+		t.Fatal("the rejected collision mutated the original artifact")
+	}
+	statsResp, err := http.Get(providerURL + "/stats")
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	defer statsResp.Body.Close()
+	var stats struct {
+		Operations int `json:"operations"`
+		Executions int `json:"executions"`
+	}
+	if err := json.NewDecoder(statsResp.Body).Decode(&stats); err != nil {
+		t.Fatal(err)
+	}
+	if stats.Operations != 1 || stats.Executions != 1 {
+		t.Fatalf("operations/executions = %d/%d, want 1/1", stats.Operations, stats.Executions)
+	}
+	ledger, err := os.ReadFile(filepath.Join(filepath.Dir(logPath), "operations.jsonl"))
+	if err != nil {
+		t.Fatalf("read ledger: %v", err)
+	}
+	if lines := strings.Count(strings.TrimSpace(string(ledger)), "\n") + 1; lines != 1 {
+		t.Fatalf("ledger entries = %d, want 1", lines)
+	}
+}
+
+// TestLiveCriticalQualificationCorruptedArtifact proves corrupted
+// transport bytes cannot produce a COMMITTED CRITICAL receipt: the
+// adapter refuses the response, the outcome stays UNKNOWN, and the
+// eventual commit — resolved by reconciliation — binds the provider's
+// durable artifact, never the corrupted copy.
+func TestLiveCriticalQualificationCorruptedArtifact(t *testing.T) {
+	stack := newCriticalStack(t)
+	grant := "grant-valid-" + qualificationKey("g")
+	stack.issueGrant(t, grant, "alice@example.com", []string{qualificationCapabilityID}, time.Now().Add(time.Hour))
+
+	key := qualificationKey("crit-corrupt")
+	resp := stack.request(t, key, grant, "alice@example.com", map[string]string{
+		"operation": "corrupt",
+		"fault":     faultCorruptArtifact,
+	})
+	if resp.Status != StatusUnknown {
+		t.Fatalf("corrupted artifact bytes must not commit: got %s (%s)", resp.Status, resp.Error)
+	}
+	rec := stack.lookup(t, key)
+	if rec.State == idempotency.StateCommitted {
+		t.Fatal("corrupted artifact bytes produced a COMMITTED record")
+	}
+	if operations, executions := stack.providerStats(t); operations != 1 || executions != 1 {
+		t.Fatalf("provider operations/executions = %d/%d, want 1/1", operations, executions)
+	}
+
+	// Reconciliation fetches the durable artifact: the eventual receipt
+	// binds the true bytes, not the corrupted copy.
+	if err := stack.worker.RunCycle(context.Background()); err != nil {
+		t.Fatalf("reconcile cycle: %v", err)
+	}
+	rec = stack.lookup(t, key)
+	if rec.State != idempotency.StateCommitted {
+		t.Fatalf("post-reconciliation state = %s, want COMMITTED", rec.State)
+	}
+	durable := fetchProviderArtifact(t, stack, rec.ProviderRunID)
+	sum := sha256.Sum256(durable)
+	if err := evidence.VerifyReceipt(rec.EvidenceReceipt, evidence.Binding{
+		ExecutionID:    rec.ExecutionID,
+		Capability:     qualificationCapabilityID,
+		Principal:      "alice@example.com",
+		RequestDigest:  rec.RequestDigest,
+		ProviderID:     rec.ProviderID,
+		ProviderRunID:  rec.ProviderRunID,
+		Outcome:        evidence.OutcomeCompleted,
+		EvidenceSHA256: fmt.Sprintf("%x", sum),
+	}, map[string]bool{stack.signer.Fingerprint(): true}); err != nil {
+		t.Fatalf("receipt must bind the durable artifact: %v", err)
+	}
+}
+
+// TestLiveCriticalQualificationRegistryExtensionBinding proves the
+// qualification registry is the release registry plus explicit
+// extensions, and that the harness records both identities — test-only
+// capabilities never enter the shipped policy surface, and no release
+// descriptor can be silently replaced or modified.
+func TestLiveCriticalQualificationRegistryExtensionBinding(t *testing.T) {
+	stack := newCriticalStack(t)
+	binding := stack.binding
+
+	if len(binding.QualificationExtensions) != 1 {
+		t.Fatalf("extensions = %d, want exactly 1", len(binding.QualificationExtensions))
+	}
+	extension := binding.QualificationExtensions[0]
+	if extension.CapabilityID != qualificationCapabilityID {
+		t.Fatalf("extension capability = %s, want %s", extension.CapabilityID, qualificationCapabilityID)
+	}
+	if !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(extension.DescriptorSHA256) {
+		t.Fatalf("extension descriptor digest = %q, want a SHA-256", extension.DescriptorSHA256)
+	}
+	if binding.BaseRegistrySHA256 == binding.QualificationRegistrySHA256 {
+		t.Fatal("qualification registry identity equals the release registry identity")
+	}
+
+	// The base identity is reproducible and extension-free: a fresh
+	// release registry digests to exactly the recorded base.
+	release := capability.NewRegistry()
+	if err := RegisterBuiltinCapabilities(release); err != nil {
+		t.Fatalf("release registry: %v", err)
+	}
+	releaseSHA, err := release.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if releaseSHA != binding.BaseRegistrySHA256 {
+		t.Fatalf("release registry digest = %s, recorded base = %s", releaseSHA, binding.BaseRegistrySHA256)
+	}
+	for _, id := range release.List() {
+		if id == qualificationCapabilityID {
+			t.Fatal("the qualification capability is in the release registry — it must be qualification-only")
+		}
+	}
 }
