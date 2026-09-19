@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Release engineering — attestations follow clean-room verification
+
+- Release: artifact attestations (source archive, zip, SBOM) are now created in a dedicated `attest` job that requires the clean-room verification to have passed — nothing is signed before the staged bytes have been independently verified. The publish job requires `attest`; the release DAG is now build → clean-room → attest → publish → public reverify. The evidence-manifest attestation remains the final step of evidence finalization (the verifier requires the binding it creates).
+
 ### Capability — adapter availability is deployment state consulted at the boundary
 
 - Capability: `AdapterAvailability` now answers the admission-path question directly (`Available(adapterID)`, `StatusOf(adapterID)`), and `Registry.CheckAdapterAvailability` returns a structured report (`AdapterAvailabilityReport`) instead of an error — an unwired adapter is legitimate deployment state, not a registry defect, so `ValidateAdapters` is deleted rather than left as a stale, contradictory scan.

@@ -24,7 +24,7 @@ test("clean-room verification gates publication", () => {
   assert.match(cleanRoom, /name: release-source-archive/);
 
   const publish = job("publish");
-  assert.match(publish, /needs: \[provenance, build, clean-room-verify\]/);
+  assert.match(publish, /needs: \[provenance, build, clean-room-verify, attest\]/);
 
   // Publication actions (tag push, release creation) exist only in the
   // publish job, so a failed clean-room verification cannot publish.
@@ -32,6 +32,17 @@ test("clean-room verification gates publication", () => {
   assert.doesNotMatch(cleanRoom, /git push origin|softprops\/action-gh-release/);
   assert.match(publish, /git push origin "\$RELEASE_VERSION"/);
   assert.match(publish, /softprops\/action-gh-release@/);
+});
+
+test("artifact attestations are created only after clean-room verification", () => {
+  const attest = job("attest");
+  assert.match(attest, /needs: \[build, clean-room-verify\]/);
+  assert.match(attest, /- name: Attest source archive/);
+  assert.match(attest, /- name: Attest zip archive/);
+  assert.match(attest, /- name: Attest SBOM/);
+  // The build job must not attest the archives before they are verified.
+  assert.doesNotMatch(job("build"), /- name: Attest source archive/);
+  assert.doesNotMatch(job("build"), /- name: Attest zip archive/);
 });
 
 test("release evidence finalization precedes the final-manifest attestation", () => {

@@ -451,21 +451,9 @@ jobs:
           fi
           echo "SBOM generated: $(jq '.components | length' dist/crabedence-${RELEASE_VERSION}.bom.json) components"
 
-      # ─── GitHub artifact attestation (SLSA provenance) ────────────────
-      - name: Attest source archive
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        with:
-          subject-path: dist/crabedence-${{ env.RELEASE_VERSION }}.tar.gz
-
-      - name: Attest zip archive
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        with:
-          subject-path: dist/crabedence-${{ env.RELEASE_VERSION }}.zip
-
-      - name: Attest SBOM
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        with:
-          subject-path: dist/crabedence-${{ env.RELEASE_VERSION }}.bom.json
+      # Artifact attestations are created only AFTER the clean-room job
+      # has verified the staged bytes (see the attest job), so nothing is
+      # signed before it has been independently verified.
 
       # ─── Stage the verified bytes for clean-room verify and publish ──
       # Publication uploads exactly these staged files, so the bytes the
@@ -556,12 +544,46 @@ jobs:
             --source clean-room/crabedence-${RELEASE_VERSION} \
             --archive "archive/crabedence-${RELEASE_VERSION}.tar.gz"
 
+  # ─── Attest (only after clean-room verification passed) ──────────────
+  # Artifact attestations are signatures over the exact bytes the clean
+  # room verified: nothing is attested before the staged artifact has
+  # been independently verified.
+  attest:
+    name: Attest
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [build, clean-room-verify]
+    env:
+      RELEASE_VERSION: ${{ needs.build.outputs.release_version }}
+    steps:
+      - name: Download source archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-source-archive
+          path: dist
+
+      # ─── GitHub artifact attestation (SLSA provenance) ────────────────
+      - name: Attest source archive
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/crabedence-${{ env.RELEASE_VERSION }}.tar.gz
+
+      - name: Attest zip archive
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/crabedence-${{ env.RELEASE_VERSION }}.zip
+
+      - name: Attest SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/crabedence-${{ env.RELEASE_VERSION }}.bom.json
+
   # ─── Publish (only after clean-room verification passed) ─────────────
   publish:
     name: Publish
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: [provenance, build, clean-room-verify]
+    needs: [provenance, build, clean-room-verify, attest]
     env:
       RELEASE_VERSION: ${{ needs.build.outputs.release_version }}
       COMMIT: ${{ needs.provenance.outputs.commit }}
