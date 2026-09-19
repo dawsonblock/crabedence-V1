@@ -290,24 +290,6 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	}
 	fmt.Fprint(os.Stderr, report.String())
 
-	// Export the canonical registry snapshot next to the socket so
-	// planner-side runtimes (NEMO) route on trusted descriptors instead
-	// of maintaining their own capability catalog. The snapshot carries
-	// the registry digest and the exact bytes it covers.
-	snapshot, err := registry.Snapshot()
-	if err != nil {
-		return fmt.Errorf("capability registry snapshot failed: %w", err)
-	}
-	payload, err := snapshot.JSON()
-	if err != nil {
-		return fmt.Errorf("capability registry snapshot failed: %w", err)
-	}
-	catalogPath := filepath.Join(filepath.Dir(opts.SocketPath), "capabilities.json")
-	if err := writeFileAtomic(catalogPath, payload, 0o600); err != nil {
-		return fmt.Errorf("failed to write capability registry snapshot: %w", err)
-	}
-	fmt.Fprintf(os.Stderr, "Capability registry snapshot: %s\n", catalogPath)
-
 	if store != nil {
 		// Use DispatchExecutor for durable idempotency
 		executor := NewDispatchExecutor(multiHandler, store)
@@ -387,6 +369,27 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 		return fmt.Errorf("failed to start execution service: %w", err)
 	}
 	defer service.Stop()
+
+	// Export the canonical registry snapshot next to the socket so
+	// planner-side runtimes (NEMO) route on trusted descriptors instead
+	// of maintaining their own capability catalog. The snapshot carries
+	// the registry digest and the exact bytes it covers. It is written
+	// AFTER the service starts: Service.Start creates and verifies the
+	// socket directory, so the snapshot lands in a secured directory
+	// (and startup fails closed rather than writing somewhere else).
+	snapshot, err := registry.Snapshot()
+	if err != nil {
+		return fmt.Errorf("capability registry snapshot failed: %w", err)
+	}
+	payload, err := snapshot.JSON()
+	if err != nil {
+		return fmt.Errorf("capability registry snapshot failed: %w", err)
+	}
+	catalogPath := filepath.Join(filepath.Dir(opts.SocketPath), "capabilities.json")
+	if err := writeFileAtomic(catalogPath, payload, 0o600); err != nil {
+		return fmt.Errorf("failed to write capability registry snapshot: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "Capability registry snapshot: %s\n", catalogPath)
 
 	fmt.Fprintf(os.Stderr, "Crabedence execution service listening on %s\n", opts.SocketPath)
 	fmt.Fprintf(os.Stderr, "Registered capabilities: %v\n", registry.List())
