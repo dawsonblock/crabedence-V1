@@ -701,7 +701,12 @@ test("Go binary proof checks clean exact VCS and target build info", () => {
       cwd: root,
       env: { ...process.env, CGO_ENABLED: "0", GOOS: process.platform === "darwin" ? "darwin" : "linux", GOARCH: process.arch === "arm64" ? "arm64" : "amd64" },
     });
-    const goVersion = execFileSync("go", ["env", "GOVERSION"], { encoding: "utf8" }).trim();
+    // Query GOVERSION in the fixture directory: the binary was built by
+    // the fixture's toolchain (its go.mod selects no newer one), not by
+    // the repository's toolchain — asking from the repository root would
+    // compare against a different Go version whenever the local Go is
+    // older than the repository's go.mod toolchain.
+    const goVersion = execFileSync("go", ["env", "GOVERSION"], { cwd: root, encoding: "utf8" }).trim();
     const goos = process.platform === "darwin" ? "darwin" : "linux";
     const goarch = process.arch === "arm64" ? "arm64" : "amd64";
     assert.doesNotThrow(() =>

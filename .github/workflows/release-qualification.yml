@@ -51,6 +51,10 @@ jobs:
           echo "tree=$(git rev-parse HEAD^{tree})" >> "$GITHUB_OUTPUT"
           echo "branch=$(git rev-parse --abbrev-ref HEAD)" >> "$GITHUB_OUTPUT"
 
+      - name: Verify version consistency
+        shell: bash
+        run: node scripts/verify-version-consistency.mjs
+
   # ─── Go tests (no race) ───────────────────────────────────────────────
   go-tests:
     name: Go tests

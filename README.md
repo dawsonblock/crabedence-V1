@@ -336,6 +336,19 @@ and failure bundles are not automatically scrubbed; review them before
 sharing. See [Operational security](docs/security.md) and
 [Artifacts](docs/features/artifacts.md).
 
+### Release authorization
+
+Releases follow [Release engineering](docs/RELEASING.md) exactly. One explicit
+full release/publish request authorizes the complete normal sequence —
+preparation, tagging, build and signing, private draft, native proof,
+publication, the ordinary Homebrew tap update, independent public installation
+smokes, and closeout — without renewed chat approval at each stage. Narrow
+requests stay narrow: a request to build or verify a candidate does not
+authorize publication. The original request is the authorization; GitHub
+events alone never are. Sequential technical gates, identity binding,
+credential isolation, and immutability requirements remain mandatory at every
+stage.
+
 ## Install
 
 Homebrew installs the complete release distribution:

@@ -46,6 +46,10 @@ jobs:
           echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "tree=$(git rev-parse HEAD^{tree})" >> "$GITHUB_OUTPUT"
 
+      - name: Verify version consistency
+        shell: bash
+        run: node scripts/verify-version-consistency.mjs --tag "${{ inputs.version }}"
+
   # ─── Go tests (no race) ───────────────────────────────────────────────
   go-tests:
     name: Go tests
