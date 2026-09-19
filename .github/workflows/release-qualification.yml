@@ -331,6 +331,9 @@ jobs:
           echo "gates=$(jq -r '.qualification.total_gates // 0' dist/release-evidence/release-manifest.json)" >> "$GITHUB_OUTPUT"
           echo "status=$(jq -r '.status // "UNKNOWN"' dist/release-evidence/release-manifest.json)" >> "$GITHUB_OUTPUT"
           echo "promotable=$(jq -r '.artifact_promotable // false' dist/release-evidence/release-manifest.json)" >> "$GITHUB_OUTPUT"
+          # Bind the exact evidence-manifest digest into the attestation:
+          # the signature then covers the bundle the predicate describes.
+          echo "evidence_sha256=$(jq -r '.sha256' dist/release-evidence/evidence-manifest.json)" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub artifact attestation
         id: attestation
@@ -343,7 +346,8 @@ jobs:
               "release_name": "${{ steps.qual_summary.outputs.release_name }}",
               "qualification_gates": ${{ steps.qual_summary.outputs.gates }},
               "qualification_status": "${{ steps.qual_summary.outputs.status }}",
-              "artifact_promotable": ${{ steps.qual_summary.outputs.promotable }}
+              "artifact_promotable": ${{ steps.qual_summary.outputs.promotable }},
+              "evidence_sha256": "${{ steps.qual_summary.outputs.evidence_sha256 }}"
             }
 
       - name: Save attestation reference
@@ -358,6 +362,7 @@ jobs:
             "attestation_url": "${{ steps.attestation.outputs.attestation-url }}",
             "subject": "dist/release-evidence/evidence-manifest.json",
             "predicate_type": "https://crabedence.dev/attestation/release-qualification/v1",
+            "evidence_sha256": "${{ steps.qual_summary.outputs.evidence_sha256 }}",
             "workflow_run": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
             "commit": "${{ github.sha }}"
           }

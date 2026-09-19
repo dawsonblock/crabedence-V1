@@ -22,6 +22,8 @@ GitHub artifact attestation (SLSA provenance)
     ↓
 workflow + repository + commit
     ↓
+final evidence manifest (covers artifact.json and every evidence file)
+    ↓
 qualification.json
     ↓
 source manifest
@@ -136,14 +138,38 @@ release proves:
 ## Step 7: Verify evidence bundle integrity
 
 The `release-evidence/SHA256SUMS` file contains checksums for every evidence
-file. Verify the bundle:
+file — including `artifact.json`, the binding between the release archive,
+the qualified source, and the capability registry digest. Verify the bundle:
 
 ```bash
 cd release-evidence
 sha256sum -c SHA256SUMS
 ```
 
-All files must verify.
+All files must verify, and `artifact.json` must be listed — a bundle whose
+checksum manifest does not cover the artifact binding is rejected by
+`scripts/verify-release-artifact.sh`.
+
+`evidence-manifest.json` is the bundle's identity: its `sha256` is the
+SHA-256 of `SHA256SUMS`, and its `file_count` must equal the number of
+entries. Verify it independently:
+
+```bash
+shasum -a 256 SHA256SUMS
+jq -r '.sha256' evidence-manifest.json
+```
+
+The release qualification attestation has `evidence-manifest.json` as its
+subject and records the manifest digest in its predicate. Verify the
+attestation and that the digest it binds is the manifest you hold:
+
+```bash
+gh attestation verify release-evidence/evidence-manifest.json \
+  --repo dawsonblock/crabedence-V1
+jq -r '.evidence_sha256' release-evidence/attestation/attestation.json
+```
+
+The attested digest must equal `jq -r '.sha256' evidence-manifest.json`.
 
 ## Summary
 
@@ -152,7 +178,8 @@ specific Git commit, built through a specific GitHub Actions workflow, and
 qualified against the full release matrix. The proof chain is:
 
 ```
-Git commit → clean qualification → artifact → SHA-256 → GitHub attestation → release
+Git commit → clean qualification → artifact → SHA-256 → GitHub attestation
+    → final evidence manifest → published release
 ```
 
 No step in this chain is self-asserted. Each is independently verifiable.

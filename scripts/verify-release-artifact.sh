@@ -133,6 +133,20 @@ else
   check "Artifact checksums (missing)" "FAIL"
 fi
 
+# 1b. artifact.json must be COVERED by the checksum manifest, not merely
+# present next to it. The artifact binding is what ties the release
+# archive to the qualified source and the capability registry; a bundle
+# whose digest does not cover it could ship a swapped binding that every
+# later cross-check would still accept.
+if [ -f "$ARTIFACT_JSON" ]; then
+  if [ -f "$EVIDENCE_DIR/SHA256SUMS" ] && grep -qE '[[:space:]]\./artifact\.json$' "$EVIDENCE_DIR/SHA256SUMS"; then
+    check "artifact.json covered by checksums" "PASS"
+  else
+    check "artifact.json covered by checksums" "FAIL"
+    echo "  ERROR: artifact.json is not listed in SHA256SUMS — the evidence bundle does not bind the release artifact" >&2
+  fi
+fi
+
 # 2. Source manifest present.
 if [ -f "$EVIDENCE_DIR/source-tree-sha256.txt" ]; then
   check "Source SHA-256 manifest present" "PASS"
@@ -328,6 +342,16 @@ if [ -f "$EVIDENCE_DIR/evidence-manifest.json" ]; then
         check "Evidence manifest digest verified" "FAIL"
         echo "  ERROR: evidence-manifest.json claims sha256=$EVIDENCE_SHA but actual SHA256(SHA256SUMS)=$ACTUAL_SHA" >&2
       fi
+      # The declared file count must equal the checksum manifest length —
+      # a count that disagrees with the manifest is a stale or edited claim.
+      MANIFEST_FILE_COUNT="$(jq -r '.file_count // empty' "$EVIDENCE_DIR/evidence-manifest.json" 2>/dev/null || true)"
+      ACTUAL_FILE_COUNT="$(wc -l < "$EVIDENCE_DIR/SHA256SUMS" | tr -d ' ')"
+      if [ -n "$MANIFEST_FILE_COUNT" ] && [ "$MANIFEST_FILE_COUNT" = "$ACTUAL_FILE_COUNT" ]; then
+        check "Evidence manifest file count" "PASS"
+      else
+        check "Evidence manifest file count" "FAIL"
+        echo "  ERROR: evidence-manifest.json file_count=$MANIFEST_FILE_COUNT but SHA256SUMS has $ACTUAL_FILE_COUNT entries" >&2
+      fi
     fi
   else
     check "Evidence manifest digest format" "FAIL"
@@ -362,13 +386,33 @@ else
   check "SBOM (missing)" "FAIL"
 fi
 
-# 5d. Attestation — verify attestation reference is present.
+# 5d. Attestation — verify the attestation reference binds the FINAL
+# evidence manifest. The reference alone (a URL) is not closure: an
+# attestation of a superseded manifest would still carry a URL, so the
+# recorded subject and the manifest digest it attested must match the
+# bundle being verified.
 if [ -f "$EVIDENCE_DIR/attestation/attestation.json" ]; then
   ATT_URL="$(jq -r '.attestation_url // empty' "$EVIDENCE_DIR/attestation/attestation.json" 2>/dev/null)"
   if [ -n "$ATT_URL" ]; then
     check "GitHub attestation" "PASS"
   else
     check "GitHub attestation (no URL)" "FAIL"
+  fi
+
+  if [ -f "$EVIDENCE_DIR/evidence-manifest.json" ]; then
+    ATT_SUBJECT="$(jq -r '.subject // empty' "$EVIDENCE_DIR/attestation/attestation.json" 2>/dev/null || true)"
+    ATT_EVIDENCE_SHA="$(jq -r '.evidence_sha256 // empty' "$EVIDENCE_DIR/attestation/attestation.json" 2>/dev/null || true)"
+    FINAL_MANIFEST_SHA="$(jq -r '.sha256 // empty' "$EVIDENCE_DIR/evidence-manifest.json" 2>/dev/null || true)"
+    SUBJECT_MATCHES=false
+    case "$ATT_SUBJECT" in
+      *evidence-manifest.json) SUBJECT_MATCHES=true ;;
+    esac
+    if [ "$SUBJECT_MATCHES" = true ] && [ -n "$ATT_EVIDENCE_SHA" ] && [ "$ATT_EVIDENCE_SHA" = "$FINAL_MANIFEST_SHA" ]; then
+      check "Attestation binds the final evidence manifest" "PASS"
+    else
+      check "Attestation binds the final evidence manifest" "FAIL"
+      echo "  ERROR: attestation subject=$ATT_SUBJECT evidence_sha256=$ATT_EVIDENCE_SHA does not bind evidence-manifest.json ($FINAL_MANIFEST_SHA)" >&2
+    fi
   fi
 else
   check "GitHub attestation (missing)" "FAIL"

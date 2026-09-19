@@ -148,12 +148,24 @@ a 0700 directory owned by the service user); signing the envelope
 becomes relevant only if it is ever transported or read by a different
 principal.
 
-## Open items for v0.52 (tracked here as they land)
+## Release evidence closure (v0.52)
 
-- Registry digest in release evidence (artifact.json / qualification)
-  remains open — the digest is exposed by the startup report and the
-  envelope, but is not yet inside the authenticated release evidence.
-- Release artifact integrity closure (`artifact.json` inside the final
-  evidence manifest and verified by the standalone verifier),
-  clean-room verification ordering, and typed release gates remain
-  open; see the release-engineering findings.
+- The registry digest is bound into the authenticated release evidence:
+  `artifact.json` carries `registry_sha256` (produced by
+  `cmd/registry-digest`) and the standalone verifier refuses a bundle
+  without it.
+- `artifact.json` is inside the final evidence manifest. The release
+  workflow runs `scripts/finalize-release-evidence.sh` after the archive
+  and artifact binding exist, regenerating `SHA256SUMS` (which now covers
+  `artifact.json`) and `evidence-manifest.json`; the verifier fails a
+  bundle whose checksum manifest does not cover the artifact binding.
+- The attestation terminates the chain: its subject is the final
+  `evidence-manifest.json` and its predicate carries the manifest digest
+  (`evidence_sha256`), which the verifier cross-checks. An attestation of
+  a superseded manifest fails closed.
+- Clean-room verification runs BEFORE publication: `release-rc.yml`
+  builds and stages the archive and evidence, the clean room verifies the
+  staged bytes standalone, and only then does the publish job tag and
+  create the release — re-verifying the staged archive digest first.
+
+Typed release gates remain open; see the release-engineering findings.

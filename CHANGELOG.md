@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Release engineering — artifact binding inside the final evidence manifest, pre-publication clean room
+
+- Release: `artifact.json` is now covered by the final evidence manifest. `scripts/finalize-release-evidence.sh` regenerates `SHA256SUMS` (including the artifact binding) and `evidence-manifest.json` after the archive exists; the standalone verifier fails a release bundle whose checksum manifest does not cover `artifact.json`, whose manifest `file_count` disagrees with the checksum manifest, or whose attestation does not bind the final manifest digest (`evidence_sha256`).
+- Release: the attestation terminates the evidence chain. Its subject is the final `evidence-manifest.json` and its predicate carries the manifest digest, in both the release and qualification workflows; an attestation of a superseded manifest fails closed.
+- Release: clean-room verification runs before publication. `release-rc.yml` now stages the archive and evidence, verifies them standalone in the clean room, and only then publishes — re-verifying the staged archive digest before tagging — so a bundle that cannot be independently verified can never become public.
+
 ### Capability — availability is distinct from existence
 
 - Capability: a registered capability whose adapter is not configured reports the machine-readable reason `ADAPTER_NOT_CONFIGURED` in the failure text, so an operator can distinguish "this deployment cannot execute it" from "the policy definition does not recognize it" without parsing prose. The failure code remains `CAPABILITY_UNAVAILABLE`.
