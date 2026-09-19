@@ -29,6 +29,12 @@ import (
 // the actual service socket, authority verification, dispatch executor,
 // and handler — proving the entire chain enforces idempotency.
 //
+// This is the durable single-dispatch qualification. The NEMO concurrency
+// tests (nemo/test/concurrency_invariant.test.ts and the adversarial
+// idempotency race) exercise transport convergence against an in-memory
+// bridge; they establish client behavior and IN_FLIGHT mapping, not
+// durable identity.
+//
 // Requires CRABBOX_TEST_DATABASE_URL. Skipped when absent.
 func TestLiveConcurrentIdenticalMutationSingleDispatch(t *testing.T) {
 	dbURL := os.Getenv("CRABBOX_TEST_DATABASE_URL")

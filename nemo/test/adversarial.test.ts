@@ -250,7 +250,7 @@ describe("Adversarial: Idempotency races", () => {
     cleanupSocket(socketPath);
   });
 
-  it("two concurrent identical mutations converge on one execution", async () => {
+  it("two concurrent identical mutations: one dispatch, convergent transport outcome", async () => {
     let callCount = 0;
     let resolveFirst!: () => void;
     const firstCallBlocked = new Promise<void>((resolve) => {

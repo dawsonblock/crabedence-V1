@@ -1,24 +1,29 @@
 /**
- * Durable idempotency invariant, hammered.
+ * Concurrent transport convergence, hammered.
  *
- * The invariant — a correctness property, not "the test usually passes":
+ * Scope: this exercises the NEMO transport path against the in-memory
+ * bridge — client behavior, IN_FLIGHT mapping, reservation convergence,
+ * and the observation log that classifies a failure as "two executions"
+ * vs. "one execution, wrong observed state". The bridge is a test
+ * double: it has no durable ledger, no leases, and no receipts.
+ *
+ * The DURABLE single-dispatch qualification is the Go/PostgreSQL test
+ * `TestLiveConcurrentIdenticalMutationSingleDispatch`
+ * (internal/execution/concurrent_live_test.go), which proves one
+ * durable effect identity and at most one provider dispatch through the
+ * real store. Do not overclaim what this file establishes.
+ *
+ * The invariant under test here:
  *
  *   N identical concurrent requests
- *     -> exactly 1 durable effect identity
- *     -> at most 1 provider dispatch
+ *     -> exactly 1 reservation owner
+ *     -> at most 1 handler dispatch
  *     -> exactly 1 terminal outcome
- *     -> all callers converge on that outcome (terminal replay on retry)
+ *     -> all callers observe that outcome or a truthful in-flight state
  *
  * Every iteration randomizes arrival order and provider timing, because
  * the failure modes this guards against only appear under particular
- * interleavings:
- *   - two external executions (a second reservation inheriting the
- *     leader's NEW outcome, or a duplicate dispatch)
- *   - one execution, but a caller observing a wrong or fabricated state
- *
- * The observation log distinguishes them: `dispatched` marks the single
- * request that crossed into provider dispatch, and every response must
- * be either that terminal outcome or a truthful in-flight indication.
+ * interleavings.
  */
 
 import { mkdtempSync, rmSync } from "node:fs";
@@ -44,7 +49,7 @@ interface IterationDiagnostics {
   readonly observations: unknown[];
 }
 
-describe("Durable idempotency invariant (hammer)", () => {
+describe("Concurrent transport convergence (hammer)", () => {
   const directories: string[] = [];
 
   afterEach(() => {
