@@ -333,6 +333,28 @@ if ! grep -q "$REGISTRY_SHA256" "$EVIDENCE_DIR/registry.json"; then
   exit 1
 fi
 
+# Qualification registry identity: the release registry plus the explicit
+# qualification extensions. The extension record binds both identities,
+# so the evidence shows exactly which descriptors separate the qualified
+# policy from the shipped policy — and that no release descriptor was
+# replaced or modified.
+go run ./cmd/registry-digest -qualification -envelope > "$EVIDENCE_DIR/qualification-registry.json"
+go run ./cmd/registry-digest -extensions > "$EVIDENCE_DIR/qualification-registry-extensions.json"
+QUALIFICATION_REGISTRY_SHA256="$(jq -r '.registry_sha256' "$EVIDENCE_DIR/qualification-registry.json")"
+if [ -z "$QUALIFICATION_REGISTRY_SHA256" ] || [ "$QUALIFICATION_REGISTRY_SHA256" = "null" ]; then
+  echo "ERROR: qualification registry envelope carries no digest" >&2
+  exit 1
+fi
+echo "$QUALIFICATION_REGISTRY_SHA256" > "$EVIDENCE_DIR/qualification-registry.sha256"
+if [ "$(jq -r '.base_registry_sha256' "$EVIDENCE_DIR/qualification-registry-extensions.json")" != "$REGISTRY_SHA256" ]; then
+  echo "ERROR: qualification extension record does not bind the release registry digest" >&2
+  exit 1
+fi
+if [ "$(jq -r '.qualification_registry_sha256' "$EVIDENCE_DIR/qualification-registry-extensions.json")" != "$QUALIFICATION_REGISTRY_SHA256" ]; then
+  echo "ERROR: qualification extension record does not bind the qualification registry digest" >&2
+  exit 1
+fi
+
 # ─── Phase 10-12: Live PostgreSQL gates ────────────────────────────────────
 echo ""
 echo "=== Live PostgreSQL gates ==="

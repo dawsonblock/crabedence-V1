@@ -369,6 +369,50 @@ if [ -f "$ARTIFACT_JSON" ]; then
   fi
 fi
 
+# 1d. Qualification registry extension — the qualification registry must
+# be the release registry plus explicit extensions, with every release
+# descriptor byte-identical and only the declared descriptors added. The
+# record binds both identities, so a harness can never silently replace
+# or modify production policy while exercising test-only capabilities.
+QUAL_REGISTRY_SHA_FILE="$EVIDENCE_DIR/qualification-registry.sha256"
+QUAL_REGISTRY_ENVELOPE="$EVIDENCE_DIR/qualification-registry.json"
+EXTENSIONS_FILE="$EVIDENCE_DIR/qualification-registry-extensions.json"
+if [ -f "$QUAL_REGISTRY_SHA_FILE" ] && [ -f "$QUAL_REGISTRY_ENVELOPE" ] && [ -f "$EXTENSIONS_FILE" ]; then
+  QUAL_REGISTRY_SHA="$(tr -d '[:space:]' < "$QUAL_REGISTRY_SHA_FILE")"
+  QUAL_ENVELOPE_SHA="$(jq -r '.registry_sha256 // empty' "$QUAL_REGISTRY_ENVELOPE" 2>/dev/null || true)"
+  QUAL_PAYLOAD="$(jq -r '.canonical_payload // empty' "$QUAL_REGISTRY_ENVELOPE" 2>/dev/null || true)"
+  RECOMPUTED_QUAL=""
+  if [ -n "$QUAL_PAYLOAD" ]; then
+    RECOMPUTED_QUAL="$(printf '%s' "$QUAL_PAYLOAD" | base64 --decode 2>/dev/null | shasum -a 256 | awk '{print $1}')"
+  fi
+  if [ -n "$RECOMPUTED_QUAL" ] && [ "$RECOMPUTED_QUAL" = "$QUAL_ENVELOPE_SHA" ] && [ "$QUAL_ENVELOPE_SHA" = "$QUAL_REGISTRY_SHA" ]; then
+    check "Qualification registry digest recomputed" "PASS"
+  else
+    check "Qualification registry digest recomputed" "FAIL"
+    echo "  ERROR: qualification registry envelope digest=$QUAL_ENVELOPE_SHA recomputed=$RECOMPUTED_QUAL does not match qualification-registry.sha256=$QUAL_REGISTRY_SHA" >&2
+  fi
+
+  EXTENSION_BASE="$(jq -r '.base_registry_sha256 // empty' "$EXTENSIONS_FILE" 2>/dev/null || true)"
+  if [ -n "$EXTENSION_BASE" ] && [ "$EXTENSION_BASE" = "$REGISTRY_SHA" ]; then
+    check "Extension record binds the release registry" "PASS"
+  else
+    check "Extension record binds the release registry" "FAIL"
+    echo "  ERROR: extension record base_registry_sha256=$EXTENSION_BASE does not match the release registry $REGISTRY_SHA" >&2
+  fi
+
+  if [ -n "$QUAL_PAYLOAD" ] && [ -n "$ENVELOPE_PAYLOAD" ]; then
+    EXTENSION_IDS="$(jq -c '[.qualification_extensions[]?.capability_id]' "$EXTENSIONS_FILE" 2>/dev/null || echo '[]')"
+    RELEASE_DESCRIPTORS="$(printf '%s' "$ENVELOPE_PAYLOAD" | base64 --decode 2>/dev/null | jq -cS 'sort_by(.id)' 2>/dev/null || true)"
+    QUALIFIED_DESCRIPTORS="$(printf '%s' "$QUAL_PAYLOAD" | base64 --decode 2>/dev/null | jq -cS --argjson ids "$EXTENSION_IDS" '[.[] | select((.id as $id | $ids | index($id)) | not)] | sort_by(.id)' 2>/dev/null || true)"
+    if [ -n "$RELEASE_DESCRIPTORS" ] && [ "$QUALIFIED_DESCRIPTORS" = "$RELEASE_DESCRIPTORS" ]; then
+      check "Extensions add without replacing release policy" "PASS"
+    else
+      check "Extensions add without replacing release policy" "FAIL"
+      echo "  ERROR: the qualification registry is not the release registry plus the declared extensions" >&2
+    fi
+  fi
+fi
+
 # 2. Source manifest present.
 if [ -f "$EVIDENCE_DIR/source-tree-sha256.txt" ]; then
   check "Source SHA-256 manifest present" "PASS"

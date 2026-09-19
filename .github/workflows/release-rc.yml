@@ -713,6 +713,9 @@ jobs:
             dist/release-evidence/evidence-manifest.json
             dist/release-evidence/registry.sha256
             dist/release-evidence/registry.json
+            dist/release-evidence/qualification-registry.sha256
+            dist/release-evidence/qualification-registry.json
+            dist/release-evidence/qualification-registry-extensions.json
             dist/release-evidence/attestation/attestation.json
             dist/release-evidence/SHA256SUMS
 

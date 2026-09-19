@@ -27,6 +27,7 @@ function bundle(
     attestation = {},
     artifactSchema = 2,
     sbomBound = true,
+    qualificationReplacedRelease = false,
   } = {},
 ) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cbx-verify-artifact-")));
@@ -49,6 +50,29 @@ function bundle(
         canonical_payload: canonicalPayload.toString("base64"),
       },
     ),
+  );
+
+  // Qualification registry: the release registry plus one explicit
+  // extension descriptor, bound by the extension record.
+  const releaseDescriptors = JSON.parse(canonicalPayload.toString());
+  const extensionDescriptor = { id: "qualification.critical.commit", execution_class: "CRITICAL" };
+  const qualificationDescriptors = qualificationReplacedRelease
+    ? [{ ...releaseDescriptors[0], execution_class: "MUTATION" }, extensionDescriptor]
+    : [...releaseDescriptors, extensionDescriptor];
+  const qualificationPayload = Buffer.from(JSON.stringify(qualificationDescriptors));
+  const qualificationSha = sha256(qualificationPayload);
+  fs.writeFileSync(path.join(root, "qualification-registry.sha256"), qualificationSha + "\n");
+  fs.writeFileSync(
+    path.join(root, "qualification-registry.json"),
+    JSON.stringify({ registry_sha256: qualificationSha, canonical_payload: qualificationPayload.toString("base64") }),
+  );
+  fs.writeFileSync(
+    path.join(root, "qualification-registry-extensions.json"),
+    JSON.stringify({
+      base_registry_sha256: registrySha,
+      qualification_registry_sha256: qualificationSha,
+      qualification_extensions: [{ capability_id: "qualification.critical.commit", descriptor_sha256: "a".repeat(64) }],
+    }),
   );
 
   const sbomPath = path.join(root, "crabedence-1.0.0-rc.7.bom.json");
@@ -298,4 +322,19 @@ test("legacy positional form still works and announces the inferred mode", (t) =
   const { output } = verify(root, [root, root]);
   assert.match(output, /mode was inferred from the supplied arguments/);
   assert.match(output, /Registry digest recomputed \(envelope\)\s+PASS/);
+});
+
+test("the qualification registry extension is bound to the release registry", (t) => {
+  const { root } = bundle(t);
+  const { output } = verify(root, qualificationArgs(root));
+  assert.match(output, /Qualification registry digest recomputed\s+PASS/);
+  assert.match(output, /Extension record binds the release registry\s+PASS/);
+  assert.match(output, /Extensions add without replacing release policy\s+PASS/);
+});
+
+test("a qualification registry that replaces release policy fails closed", (t) => {
+  const { root } = bundle(t, { qualificationReplacedRelease: true });
+  const { output } = verify(root, qualificationArgs(root));
+  assert.match(output, /Extensions add without replacing release policy\s+FAIL/);
+  assert.match(output, /not the release registry plus the declared extensions/);
 });

@@ -19,6 +19,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -29,6 +30,8 @@ import (
 
 func main() {
 	envelopeOnly := flag.Bool("envelope", false, "print the verifiable registry envelope (digest + canonical payload) instead of the bare digest")
+	qualification := flag.Bool("qualification", false, "build the qualification registry: the exact release registry plus the explicit qualification extensions")
+	extensionsOnly := flag.Bool("extensions", false, "print the qualification extension record (release digest, qualification digest, extension descriptors) as JSON")
 	flag.Parse()
 
 	registry := capability.NewRegistry()
@@ -36,9 +39,45 @@ func main() {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
+	baseSHA256 := ""
+	if *qualification || *extensionsOnly {
+		var err error
+		baseSHA256, err = registry.Digest()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "release registry digest failed: %v\n", err)
+			os.Exit(1)
+		}
+		if err := execution.RegisterQualificationCapabilities(registry); err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
+	}
 	if err := registry.Validate(); err != nil {
 		fmt.Fprintf(os.Stderr, "capability registry invariant scan failed: %v\n", err)
 		os.Exit(1)
+	}
+	if *extensionsOnly {
+		extensions, err := execution.QualificationRegistryExtensions(registry)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "qualification extensions failed: %v\n", err)
+			os.Exit(1)
+		}
+		qualificationSHA256, err := registry.Digest()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "qualification registry digest failed: %v\n", err)
+			os.Exit(1)
+		}
+		record, err := json.Marshal(execution.RegistryExtensionRecord{
+			BaseRegistrySHA256:          baseSHA256,
+			QualificationRegistrySHA256: qualificationSHA256,
+			QualificationExtensions:     extensions,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "qualification extension record failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(string(record))
+		return
 	}
 	envelope, err := registry.Envelope()
 	if err != nil {
