@@ -707,7 +707,7 @@ echo "=== Cross-language conformance ==="
 run_gate critical-external INTEGRATION env \
   CRABBOX_TEST_DATABASE_URL="$CRABBOX_TEST_DATABASE_URL" \
   go test -v -count=1 -timeout=300s \
-  -run "TestLiveCriticalQualification(Commit|AmbiguityThenReconcile|DefinitiveRejection|EvidenceIntegrity|AuthorityMatrix|ClosedAuthoritySemantics|TimeoutThenReconcile|LookupOutageThenRecovery|CorruptedArtifact|RegistryExtensionBinding)$" \
+  -run "TestLiveCriticalQualification(Commit|AmbiguityThenReconcile|DefinitiveRejection|EvidenceIntegrity|AuthorityMatrix|ClosedAuthoritySemantics|TimeoutThenReconcile|LookupOutageThenRecovery|CorruptedArtifact|RegistryExtensionBinding|CrashThenRecover)$" \
   ./internal/execution/
 run_gate critical-faults FAULT_INJECTION env \
   CRABBOX_TEST_DATABASE_URL="$CRABBOX_TEST_DATABASE_URL" \

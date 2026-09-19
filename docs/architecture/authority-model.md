@@ -35,9 +35,18 @@ The planner supplies an identity (`principal`) and an opaque reference
   reissue.
 - Revocation marks every generation while preserving the rows as
   forensic snapshots. `RevokeGeneration` revokes one immutable
-  generation; `CloseAuthorityRef` permanently blocks future issuance;
-  revoking after admission never invalidates an already-admitted
-  execution.
+  generation; revoking after admission never invalidates an
+  already-admitted execution.
+- **CLOSE and REVOKE are different lifecycle operations, deliberately.**
+  `CloseAuthorityRef` retires the reference: no new generation may ever
+  be issued for that `grant_id`, while the existing generation keeps
+  resolving until it is revoked or expires — closing is not revocation,
+  so continuity of already-issued authority is preserved. `RevokeGrant`
+  (or `RevokeGeneration`) invalidates existing authority: the latest
+  generation stops admitting anyone at admission. An operator who needs
+  an atomic "close and revoke everything" performs both operations; the
+  distinction is exercised by the live qualification test
+  `TestLiveCriticalQualificationClosedAuthoritySemantics`.
 - Expiry is evaluated by the authority store's own database clock
   (`expires_at > NOW()` / `unixepoch`), never the application clock.
   Resolvers that own the clock declare `ExpiryIsAuthoritative`, and

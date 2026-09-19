@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### CRITICAL — SIGKILL survival and the CLOSE/REVOKE distinction
+
+- Execution: the SIGKILL row now qualifies: the provider's durable commit completes, Crabedence is destroyed at the exact post-dispatch boundary (SIGKILL in the helper process at `CrashAfterProvider`), the orphaned `IN_FLIGHT` record is recovered on restart against the same PostgreSQL, and reconciliation resolves external reality through the persisted operation token to a signed `COMMITTED` receipt — with exactly one provider operation and one execution before and after the crash, and the receipt verified against the durable artifact bytes.
+- Authority: the CLOSE vs REVOKE distinction is now explicit in the authority model — `CloseAuthorityRef` retires a reference (no new generations; the existing generation keeps resolving until revoked or expired) while `RevokeGrant`/`RevokeGeneration` invalidate existing authority at admission; an atomic "close and revoke" is two operations, and the distinction is exercised by the live qualification test.
+
 ### CRITICAL — the remaining adversarial rows
 
 - Execution: `COMMIT_THEN_TIMEOUT` (provider commits, the response never arrives) reaches the same invariant as the reset case: `UNKNOWN` → reconciliation by stable token → signed `COMMITTED` with exactly one external execution.

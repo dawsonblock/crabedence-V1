@@ -11,9 +11,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1151,5 +1153,177 @@ func TestLiveCriticalQualificationRegistryExtensionBinding(t *testing.T) {
 		if id == qualificationCapabilityID {
 			t.Fatal("the qualification capability is in the release registry — it must be qualification-only")
 		}
+	}
+}
+
+// TestCriticalCrashHelperProcess is the pre-restart half of the SIGKILL
+// row: it dispatches one CRITICAL operation against PostgreSQL and the
+// qualification provider, and SIGKILLs itself at CrashAfterProvider —
+// the provider's durable commit is complete, but Crabedence has not
+// persisted its observation or terminal receipt.
+func TestCriticalCrashHelperProcess(t *testing.T) {
+	if os.Getenv("CRABBOX_CRIT_CRASH_HELPER") != "1" {
+		return
+	}
+	db, err := openTestDB(os.Getenv("CRABBOX_TEST_DATABASE_URL"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer db.Close()
+	store, err := idempotency.NewStoreWithConfig(db, idempotency.LeaseConfig{
+		DefaultDuration: 200 * time.Millisecond,
+		MaxDuration:     time.Second,
+		RenewalWindow:   50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	adapter := &qualificationAdapter{
+		baseURL: os.Getenv("CRABBOX_PROVIDER_URL"),
+		client:  &http.Client{Timeout: 2 * time.Second},
+	}
+	exec := NewDispatchExecutor(adapter, store)
+	exec.SetCrashHook(func(p CrashPoint) {
+		if p == CrashAfterProvider {
+			// Provider committed; Crabedence must not have persisted the
+			// observation or terminal receipt yet. Die here.
+			_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
+		}
+	})
+	desc, err := capability.Resolve(capability.CapabilityDescriptor{
+		ID:              qualificationCapabilityID,
+		ExecutionClass:  capability.ClassCritical,
+		AdapterID:       "qualification",
+		AuthorityPolicy: capability.AuthorityPolicy{ID: qualificationCapabilityID, GrantRequired: true},
+	})
+	if err != nil {
+		t.Fatalf("resolve descriptor: %v", err)
+	}
+	resp := exec.ExecuteWithIdempotency(context.Background(), Request{
+		Capability: qualificationCapabilityID,
+		Arguments:  json.RawMessage(`{"operation":"crash"}`),
+		Authority: RequestAuthority{
+			Principal:    "alice@example.com",
+			AuthorityRef: os.Getenv("CRABBOX_CRIT_CRASH_GRANT"),
+		},
+		IdempotencyKey: os.Getenv("CRABBOX_CRIT_CRASH_KEY"),
+	}, desc)
+	// Reaching this line means the crash hook never fired — the test
+	// harness is broken, not the runtime.
+	fmt.Fprintf(os.Stderr, "helper survived the crash point: %s %s\n", resp.Status, resp.Error)
+	os.Exit(3)
+}
+
+// TestLiveCriticalQualificationCrashThenRecover is the SIGKILL row: the
+// provider's durable commit completes, Crabedence is destroyed before it
+// persists the observation, and correctness survives process death —
+// restart against the same PostgreSQL, recover the orphaned record, and
+// resolve external reality through the persisted operation token to a
+// signed COMMITTED receipt with exactly one external execution.
+func TestLiveCriticalQualificationCrashThenRecover(t *testing.T) {
+	dbURL := os.Getenv("CRABBOX_TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live CRITICAL crash qualification")
+	}
+	ctx := context.Background()
+	providerURL, _ := startExternalProvider(t, t.TempDir())
+
+	db, err := openTestDB(dbURL)
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer db.Close()
+	authorityStore, err := authority.NewStore(db)
+	if err != nil {
+		t.Fatalf("authority store: %v", err)
+	}
+	grant := "grant-crash-" + qualificationKey("g")
+	if _, err := authorityStore.IssueGrant(ctx, grant, "alice@example.com", []string{qualificationCapabilityID}, time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("issue grant: %v", err)
+	}
+
+	key := qualificationKey("crit-crash")
+	cmd := exec.Command(os.Args[0], "-test.run=TestCriticalCrashHelperProcess")
+	cmd.Env = append(os.Environ(),
+		"CRABBOX_CRIT_CRASH_HELPER=1",
+		"CRABBOX_TEST_DATABASE_URL="+dbURL,
+		"CRABBOX_PROVIDER_URL="+providerURL,
+		"CRABBOX_CRIT_CRASH_KEY="+key,
+		"CRABBOX_CRIT_CRASH_GRANT="+grant,
+	)
+	if out, err := cmd.CombinedOutput(); err == nil {
+		t.Fatalf("Crabedence should have been killed at the crash point\n%s", out)
+	}
+
+	stack := &criticalStack{providerURL: providerURL}
+	if operations, executions := stack.providerStats(t); operations != 1 || executions != 1 {
+		t.Fatalf("provider operations/executions before restart = %d/%d, want 1/1", operations, executions)
+	}
+
+	// Restart against the same PostgreSQL with a short lease.
+	store, err := idempotency.NewStoreWithConfig(db, idempotency.LeaseConfig{
+		DefaultDuration: 200 * time.Millisecond,
+		MaxDuration:     time.Second,
+		RenewalWindow:   50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	rec, err := store.LookupByKey(ctx, "alice@example.com", qualificationCapabilityID, key)
+	if err != nil {
+		t.Fatalf("lookup after crash: %v", err)
+	}
+	if rec.State.IsDurablyFinal() {
+		t.Fatalf("crash produced terminal %s without finalization", rec.State)
+	}
+
+	signer, err := evidence.GenerateSigner()
+	if err != nil {
+		t.Fatalf("signer: %v", err)
+	}
+	store.SetTrustedEvidenceSigners(signer.Fingerprint())
+	adapter := &qualificationAdapter{baseURL: providerURL, client: &http.Client{Timeout: 2 * time.Second}}
+	worker := reconcile.NewWorker(store, reconcile.NoopResolver{}, 30*time.Second)
+	worker.RegisterResolver(qualificationCapabilityID, adapter)
+	worker.SetEvidenceSigner(signer)
+
+	// Let the orphaned lease expire, then reconcile external reality.
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		time.Sleep(300 * time.Millisecond)
+		if err := worker.RunCycle(ctx); err != nil {
+			t.Fatalf("reconcile cycle: %v", err)
+		}
+		rec, err = store.LookupByKey(ctx, "alice@example.com", qualificationCapabilityID, key)
+		if err != nil {
+			t.Fatalf("lookup during recovery: %v", err)
+		}
+		if rec.State == idempotency.StateCommitted {
+			break
+		}
+	}
+	if rec.State != idempotency.StateCommitted {
+		t.Fatalf("post-restart state = %s, want COMMITTED", rec.State)
+	}
+	if len(rec.EvidenceReceipt) == 0 {
+		t.Fatal("post-restart COMMITTED without a signed receipt")
+	}
+	// Exactly one external execution, before and after the restart.
+	if operations, executions := stack.providerStats(t); operations != 1 || executions != 1 {
+		t.Fatalf("provider operations/executions after restart = %d/%d, want 1/1", operations, executions)
+	}
+	durable := fetchProviderArtifact(t, stack, rec.ProviderRunID)
+	sum := sha256.Sum256(durable)
+	if err := evidence.VerifyReceipt(rec.EvidenceReceipt, evidence.Binding{
+		ExecutionID:    rec.ExecutionID,
+		Capability:     qualificationCapabilityID,
+		Principal:      "alice@example.com",
+		RequestDigest:  rec.RequestDigest,
+		ProviderID:     rec.ProviderID,
+		ProviderRunID:  rec.ProviderRunID,
+		Outcome:        evidence.OutcomeCompleted,
+		EvidenceSHA256: fmt.Sprintf("%x", sum),
+	}, map[string]bool{signer.Fingerprint(): true}); err != nil {
+		t.Fatalf("post-restart receipt failed verification: %v", err)
 	}
 }
