@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Registry semantics — frozen policy, typed availability, runtime configuration identity
+
+- Capability: the registry's semantics are documented and frozen (`docs/architecture/capability-registry-semantics.md`): `registry_sha256` identifies the complete policy-defined catalog a release ships — KNOWN / AVAILABLE / AUTHORIZED / EXECUTABLE are four different states, and deployment configuration never enters the registry or its digest. The frozen runtime architecture is recorded in `docs/architecture/v0.52-runtime-freeze.md`.
+- Capability: runtime availability is now a typed, derived view (`AvailabilityStatus`, `CapabilityAvailability`, `Registry.Availability`) with `AVAILABLE`, `ADAPTER_NOT_CONFIGURED`, `ADAPTER_UNHEALTHY`, and `FEATURE_DISABLED`. Availability is never written into a descriptor; INV-014 pins that provider availability cannot modify classification, routing, or any digest, and INV-015 pins that no model-generated field may determine trusted classification.
+- Execution: startup now reports exactly which registered capabilities this deployment cannot execute, with the policy each still carries (KNOWN / POLICY / ADAPTER / AVAILABLE / REASON), instead of a prose adapter list.
+- Execution: runtime identity is a second, distinct digest — `runtime_configuration_sha256` over safe normalized deployment state (release, registry digest, effect-store backend, enabled adapters) — exported as a verifiable envelope (`runtime-identity.json`, 0600, crash-durable) next to the socket. Credentials are excluded by construction: the structure has no field for them.
+
 ### Release engineering — artifact binding inside the final evidence manifest, pre-publication clean room
 
 - Release: `artifact.json` is now covered by the final evidence manifest. `scripts/finalize-release-evidence.sh` regenerates `SHA256SUMS` (including the artifact binding) and `evidence-manifest.json` after the archive exists; the standalone verifier fails a release bundle whose checksum manifest does not cover `artifact.json`, whose manifest `file_count` disagrees with the checksum manifest, or whose attestation does not bind the final manifest digest (`evidence_sha256`).

@@ -114,6 +114,9 @@ separately maintained classification.
 | INV-005 | Caller-supplied authority generation is ignored/rejected. | Service overwrite; `authority_binding_test.go` |
 | INV-011 | A registry-policy change changes request identity. | Resolved class/assurance/route bound into the request digest |
 | INV-012 | A failed qualification cannot publish an RC. | Release workflows (see `docs/RELEASING.md`) |
+| INV-013 | A `LOCAL` capability can never require a grant. | `Resolve`; whole-registry scan; NEMO envelope loader |
+| INV-014 | Provider availability cannot modify capability security classification. | `Availability` is derived and never written into descriptors; `invariants_test.go` |
+| INV-015 | No model-generated field may determine trusted execution classification. | Wire request carries no policy fields; registry is authoritative; `invariants_test.go` |
 
 Additional laws (INV-006…INV-010) are enforced in the effect fabric:
 see [recovery-model.md](recovery-model.md) and

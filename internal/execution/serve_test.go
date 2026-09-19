@@ -99,3 +99,94 @@ func TestServeWritesRegistrySnapshotOnAFreshDirectory(t *testing.T) {
 		t.Fatalf("snapshot mode = %04o, want 0600", perm)
 	}
 }
+
+// TestServeWritesVerifiableRuntimeIdentity proves the deployment
+// identity export: a runtime configuration digest that is separate from
+// the registry digest, covers the exact canonical bytes it ships with,
+// and records only normalized, non-secret configuration.
+func TestServeWritesVerifiableRuntimeIdentity(t *testing.T) {
+	t.Setenv("CRABEDENCE_STORE_BACKEND", "none")
+	t.Setenv("CRABBOX_GITHUB_ENABLED", "false")
+	t.Setenv("CRABBOX_GITHUB_TOKEN", "")
+	t.Setenv("GITHUB_TOKEN", "")
+
+	parent := shortSocketDir(t)
+	dir := filepath.Join(parent, "crabedence")
+	socketPath := filepath.Join(dir, "execution.sock")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- Serve(ctx, ServeOptions{SocketPath: socketPath, Release: "0.52.0-rc.1"})
+	}()
+
+	identityPath := filepath.Join(dir, "runtime-identity.json")
+	deadline := time.Now().Add(10 * time.Second)
+	var identityData []byte
+	for time.Now().Before(deadline) {
+		if payload, err := os.ReadFile(identityPath); err == nil {
+			identityData = payload
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("serve returned an error: %v", err)
+	}
+	if identityData == nil {
+		t.Fatal("serve must export the runtime identity next to its socket")
+	}
+
+	var envelope RuntimeIdentityEnvelope
+	if err := json.Unmarshal(identityData, &envelope); err != nil {
+		t.Fatalf("runtime identity is not valid JSON: %v", err)
+	}
+	payload, err := base64.StdEncoding.DecodeString(envelope.CanonicalPayload)
+	if err != nil {
+		t.Fatalf("runtime identity payload is not valid base64: %v", err)
+	}
+	sum := sha256.Sum256(payload)
+	if hex.EncodeToString(sum[:]) != envelope.RuntimeConfigurationSHA256 {
+		t.Fatal("runtime configuration digest does not cover the canonical payload it ships with")
+	}
+
+	var config RuntimeConfiguration
+	if err := json.Unmarshal(payload, &config); err != nil {
+		t.Fatalf("runtime identity payload is not a configuration: %v", err)
+	}
+	if config.Release != "0.52.0-rc.1" {
+		t.Fatalf("release identity = %q, want 0.52.0-rc.1", config.Release)
+	}
+	if config.EffectStore != "none" {
+		t.Fatalf("effect store = %q, want none", config.EffectStore)
+	}
+	// GitHub is disabled in this deployment: it must not appear as an
+	// enabled adapter, and the registry digest must still be the static
+	// release registry (registry membership is independent of adapter
+	// configuration).
+	for _, adapter := range config.EnabledAdapters {
+		if adapter == "github" {
+			t.Fatal("a disabled adapter must not appear in the runtime configuration")
+		}
+	}
+	if len(config.RegistrySHA256) != 64 {
+		t.Fatalf("registry digest = %q, want a 64-character hex digest", config.RegistrySHA256)
+	}
+
+	var snapshot capability.SnapshotEnvelope
+	snapshotData, err := os.ReadFile(filepath.Join(dir, "capabilities.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(snapshotData, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if config.RegistrySHA256 != snapshot.RegistrySHA256 {
+		t.Fatalf("runtime identity registry digest %s does not match the served registry %s",
+			config.RegistrySHA256, snapshot.RegistrySHA256)
+	}
+	if envelope.RuntimeConfigurationSHA256 == snapshot.RegistrySHA256 {
+		t.Fatal("runtime configuration identity must be distinct from the registry identity")
+	}
+}

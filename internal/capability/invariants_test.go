@@ -1,6 +1,7 @@
 package capability
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -38,6 +39,72 @@ func TestINV013LocalCannotRequireAGrant(t *testing.T) {
 	}
 	if err := registry.Validate(); err == nil {
 		t.Fatal("INV-013 violated: the registry scan accepted LOCAL + grant-required")
+	}
+}
+
+// INV-014: Provider availability cannot modify capability security
+// classification. Availability is runtime state: it never changes a
+// descriptor, its digest, or the registry digest, and an unavailable
+// adapter never becomes a routing or class fallback.
+func TestINV014AvailabilityCannotModifyPolicy(t *testing.T) {
+	registry := NewRegistry()
+	registerForTest(t, registry, CapabilityDescriptor{ID: "inv.github", ExecutionClass: ClassMutation, AdapterID: "github"})
+	registerForTest(t, registry, CapabilityDescriptor{ID: "inv.echo", ExecutionClass: ClassPure, AdapterID: "system"})
+
+	before, ok := registry.Lookup("inv.github")
+	if !ok {
+		t.Fatal("inv.github must be registered")
+	}
+	digestBefore, err := registry.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// GitHub is not configured in this deployment; system is.
+	availability := registry.Availability(AdapterAvailability{
+		"system": {Status: AvailabilityAvailable},
+	})
+	byID := make(map[string]CapabilityAvailability, len(availability))
+	for _, entry := range availability {
+		byID[entry.CapabilityID] = entry
+	}
+	if got := byID["inv.github"].Status; got != AvailabilityAdapterNotConfigured {
+		t.Fatalf("unconfigured adapter must be ADAPTER_NOT_CONFIGURED, got %s", got)
+	}
+	if got := byID["inv.echo"].Status; got != AvailabilityAvailable {
+		t.Fatalf("wired adapter must be AVAILABLE, got %s", got)
+	}
+
+	// The policy is untouched: same descriptor, same digests, same route.
+	after, ok := registry.Lookup("inv.github")
+	if !ok {
+		t.Fatal("inv.github disappeared from the registry")
+	}
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("INV-014 violated: availability changed the descriptor:\nbefore=%+v\nafter=%+v", before, after)
+	}
+	if after.ExecutionClass != ClassMutation || after.AssuranceProfile != AssuranceDurable || after.ExecutionRoute != RouteCrabedence {
+		t.Fatalf("INV-014 violated: classification changed to %s/%s/%s",
+			after.ExecutionClass, after.AssuranceProfile, after.ExecutionRoute)
+	}
+	digestAfter, err := registry.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if digestBefore != digestAfter {
+		t.Fatalf("INV-014 violated: availability changed the registry digest (%s -> %s)", digestBefore, digestAfter)
+	}
+
+	// Admission is policy and does not consult availability: the request
+	// is admitted, then fails closed at dispatch as CAPABILITY_UNAVAILABLE
+	// (covered end to end in the execution package). It never becomes an
+	// unknown capability.
+	decision := registry.Admit(AdmissionRequest{Capability: "inv.github", Principal: "alice@example.com", GrantID: "g", IdempotencyKey: "k"})
+	if !decision.Allowed {
+		t.Fatalf("admission must not consult availability: %+v", decision)
+	}
+	if decision.Descriptor.ExecutionRoute != RouteCrabedence {
+		t.Fatalf("INV-014 violated: routing changed to %s", decision.Descriptor.ExecutionRoute)
 	}
 }
 

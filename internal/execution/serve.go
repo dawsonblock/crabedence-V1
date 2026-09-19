@@ -27,6 +27,7 @@ type ServeOptions struct {
 	SocketPath        string
 	DatabaseURL       string // PostgreSQL DSN — used when the postgres store backend is selected (see CRABEDENCE_STORE_BACKEND)
 	ReconcileInterval int64  // Reconciliation interval in seconds (0 = disable)
+	Release           string // Release identity for the runtime configuration digest (e.g. "0.52.0-rc.1"); empty for dev builds
 }
 
 // DefaultServeOptions returns sensible defaults.
@@ -285,17 +286,15 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	if err := registry.Validate(); err != nil {
 		return fmt.Errorf("capability registry invariant scan failed: %w", err)
 	}
-	knownAdapters := make(map[string]bool, len(handlers))
-	for adapterID := range handlers {
-		knownAdapters[adapterID] = true
-	}
 	// Unwired adapters are legitimate deployment state, not a registry
 	// defect: the capability stays registered (static policy) and fails
-	// closed at dispatch (dynamic availability). Report them so an
-	// operator can see exactly what this deployment cannot execute.
-	if err := registry.ValidateAdapters(knownAdapters); err != nil {
-		fmt.Fprintf(os.Stderr, "capability adapters not configured (registered but unavailable): %v\n", err)
+	// closed at dispatch (dynamic availability). Report exactly what
+	// this deployment cannot execute, with the policy it still carries.
+	adapterStates := make(capability.AdapterAvailability, len(handlers))
+	for adapterID := range handlers {
+		adapterStates[adapterID] = capability.AdapterState{Status: capability.AvailabilityAvailable}
 	}
+	reportCapabilityAvailability(registry, adapterStates)
 	report, err := registry.Report()
 	if err != nil {
 		return fmt.Errorf("capability registry report failed: %w", err)
@@ -421,6 +420,29 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	}
 	fmt.Fprintf(os.Stderr, "Capability registry snapshot: %s (sha256 %s)\n", catalogPath, envelope.RegistrySHA256)
 
+	// Runtime configuration identity: the deployment state this process
+	// runs in — deliberately separate from the registry digest, and
+	// built only from normalized, non-secret configuration.
+	runtimeCfg := RuntimeConfiguration{
+		Release:         opts.Release,
+		RegistrySHA256:  report.Digest,
+		EffectStore:     backend,
+		EnabledAdapters: adapterIDs(handlers),
+	}
+	runtimeEnvelope, err := RuntimeIdentityEnvelopeFor(runtimeCfg)
+	if err != nil {
+		return fmt.Errorf("runtime configuration identity failed: %w", err)
+	}
+	runtimePayload, err := runtimeEnvelope.JSON()
+	if err != nil {
+		return fmt.Errorf("runtime configuration identity failed: %w", err)
+	}
+	identityPath := filepath.Join(filepath.Dir(opts.SocketPath), "runtime-identity.json")
+	if err := writeFileAtomic(identityPath, runtimePayload, 0o600); err != nil {
+		return fmt.Errorf("failed to write runtime identity envelope: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "Runtime configuration digest: %s (%s)\n", runtimeEnvelope.RuntimeConfigurationSHA256, identityPath)
+
 	fmt.Fprintf(os.Stderr, "Crabedence execution service listening on %s\n", opts.SocketPath)
 	fmt.Fprintf(os.Stderr, "Registered capabilities: %v\n", registry.List())
 	if store != nil {
@@ -437,6 +459,38 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	}
 
 	return nil
+}
+
+// adapterIDs returns the adapter IDs wired into this deployment.
+func adapterIDs(handlers map[string]Handler) []string {
+	ids := make([]string, 0, len(handlers))
+	for id := range handlers {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// reportCapabilityAvailability prints the deployment's runtime
+// availability view: which registered capabilities this deployment
+// cannot currently execute, and why. Availability is derived state — it
+// never modifies the registry, its descriptors, or its digest (INV-014).
+func reportCapabilityAvailability(registry *capability.Registry, adapters capability.AdapterAvailability) {
+	unavailable := registry.Unavailable(adapters)
+	if len(unavailable) == 0 {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "Capability availability: %d of %d registered capabilities are not executable in this deployment\n",
+		len(unavailable), registry.Count())
+	for _, entry := range unavailable {
+		fmt.Fprintf(os.Stderr, "  %s\n", entry.CapabilityID)
+		fmt.Fprintln(os.Stderr, "    KNOWN:     yes")
+		if desc, ok := registry.Lookup(entry.CapabilityID); ok {
+			fmt.Fprintf(os.Stderr, "    POLICY:    %s / %s / %s\n", desc.ExecutionClass, desc.AssuranceProfile, desc.ExecutionRoute)
+		}
+		fmt.Fprintf(os.Stderr, "    ADAPTER:   %s\n", entry.AdapterID)
+		fmt.Fprintln(os.Stderr, "    AVAILABLE: no")
+		fmt.Fprintf(os.Stderr, "    REASON:    %s (%s)\n", entry.Status, entry.Reason)
+	}
 }
 
 // FailClosedHandler wraps a handler and rejects MUTATION/CRITICAL

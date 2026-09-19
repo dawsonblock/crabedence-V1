@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/openclaw/crabbox/internal/capability"
 	"github.com/openclaw/crabbox/internal/evidence"
 	"github.com/openclaw/crabbox/internal/idempotency"
 )
@@ -165,5 +166,77 @@ func TestINV011PolicyChangeChangesRequestIdentity(t *testing.T) {
 	}
 	if base == changed {
 		t.Fatal("INV-011 violated: a policy change did not change the request identity")
+	}
+}
+
+// INV-015: No model-generated field may determine trusted execution
+// classification. The planner chooses what to invoke; class, route,
+// assurance, provider, schemas, and policy identity come from the
+// registry. A hostile wire payload carrying every trusted field it can
+// imagine is ignored, and the resolved descriptor is a pure function of
+// the registry.
+func TestINV015PlannerFieldsCannotDetermineClassification(t *testing.T) {
+	registry := capability.NewRegistry()
+	if err := registry.RegisterResolved(mutationDurableDescriptor("inv.planner")); err != nil {
+		t.Fatal(err)
+	}
+	trusted, ok := registry.Lookup("inv.planner")
+	if !ok {
+		t.Fatal("inv.planner must be registered")
+	}
+	trustedDigest, err := trusted.DescriptorDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	payload := []byte(`{
+		"capability": "inv.planner",
+		"arguments": {},
+		"authority": {"principal": "mallory@example.com", "authority_ref": "grant_m"},
+		"execution_class": "READ",
+		"assurance_profile": "NONE",
+		"execution_route": "LOCAL",
+		"provider": "local",
+		"descriptor_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+		"registry_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+		"authority_policy": {"id": "attacker", "grant_required": false},
+		"schema": {"type": "string"},
+		"idempotency_key": "inv015-key"
+	}`)
+	var req Request
+	if err := json.Unmarshal(payload, &req); err != nil {
+		t.Fatalf("the wire request must ignore unknown planner fields: %v", err)
+	}
+
+	// Nothing the planner sent can change the trusted descriptor.
+	again, ok := registry.Lookup("inv.planner")
+	if !ok {
+		t.Fatal("inv.planner disappeared from the registry")
+	}
+	againDigest, err := again.DescriptorDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if againDigest != trustedDigest ||
+		again.ExecutionClass != capability.ClassMutation ||
+		again.AssuranceProfile != capability.AssuranceDurable ||
+		again.ExecutionRoute != capability.RouteCrabedence ||
+		again.AdapterID != "test-adapter" {
+		t.Fatalf("INV-015 violated: planner fields changed the trusted descriptor: %+v", again)
+	}
+
+	// A planner class assertion is advisory at most; a downgrade is denied.
+	decision := registry.Admit(capability.AdmissionRequest{
+		Capability:     req.Capability,
+		Principal:      req.Authority.Principal,
+		GrantID:        req.Authority.EffectiveAuthorityRef(),
+		IdempotencyKey: req.IdempotencyKey,
+		ExecutionClass: req.ExecutionClass,
+	})
+	if decision.Allowed {
+		t.Fatal("INV-015 violated: a planner-supplied class assertion was accepted")
+	}
+	if decision.FailureCode != capability.FailureAdmissionDenied {
+		t.Fatalf("expected ADMISSION_DENIED, got %s", decision.FailureCode)
 	}
 }

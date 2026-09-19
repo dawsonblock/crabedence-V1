@@ -410,26 +410,17 @@ func validateSchemaKeywords(schema map[string]any, path string) error {
 // ValidateAdapters checks that every registered capability is bound to
 // an adapter the service can actually dispatch. A capability whose
 // adapter is not wired could only ever produce
-// CAPABILITY_UNAVAILABLE at execution time — refuse it at startup
-// instead.
+// CAPABILITY_UNAVAILABLE at execution time. It is a thin scan over
+// Availability — one source of truth for the availability rule.
 func (r *Registry) ValidateAdapters(known map[string]bool) error {
-	r.mu.RLock()
-	ids := make([]string, 0, len(r.entries))
-	for id := range r.entries {
-		ids = append(ids, id)
+	adapters := make(AdapterAvailability, len(known))
+	for id := range known {
+		adapters[id] = AdapterState{Status: AvailabilityAvailable}
 	}
-	sort.Strings(ids)
-	descriptors := make([]ResolvedDescriptor, 0, len(ids))
-	for _, id := range ids {
-		descriptors = append(descriptors, r.entries[id])
-	}
-	r.mu.RUnlock()
 
 	var findings []error
-	for _, descriptor := range descriptors {
-		if descriptor.AdapterID == "" || !known[descriptor.AdapterID] {
-			findings = append(findings, fmt.Errorf("capability %s: adapter %q is not wired into the service", descriptor.ID, descriptor.AdapterID))
-		}
+	for _, entry := range r.Unavailable(adapters) {
+		findings = append(findings, fmt.Errorf("capability %s: adapter %q is not wired into the service", entry.CapabilityID, entry.AdapterID))
 	}
 	return errors.Join(findings...)
 }

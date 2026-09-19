@@ -21,5 +21,6 @@ func (a App) serveExecCommand(ctx context.Context, socketPath string) error {
 		SocketPath:        socketPath,
 		DatabaseURL:       os.Getenv("CRABEDENCE_DATABASE_URL"),
 		ReconcileInterval: 30,
+		Release:           currentVersion(),
 	})
 }
