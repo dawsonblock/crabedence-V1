@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Execution — durable identity assertions in the 100-way concurrency test
+
+- Execution: `TestLiveConcurrentIdenticalMutationSingleDispatch` now proves one durable effect identity, not just one side effect: exactly one ledger row for the key, in a terminal `COMMITTED` state, carrying the execution identity, provider identity, provider operation identity, and request fingerprint. (`MUTATION` is `DURABLE`, not `HIGH_ASSURANCE`, so there is no signed terminal receipt — receipts are a `CRITICAL` artifact; the terminal-outcome identity is the single `COMMITTED` record.) Verified against ephemeral PostgreSQL: 100 concurrent callers, success=1, counter=1, one durable record.
+
 ### Release engineering — attestations follow clean-room verification
 
 - Release: artifact attestations (source archive, zip, SBOM) are now created in a dedicated `attest` job that requires the clean-room verification to have passed — nothing is signed before the staged bytes have been independently verified. The publish job requires `attest`; the release DAG is now build → clean-room → attest → publish → public reverify. The evidence-manifest attestation remains the final step of evidence finalization (the verifier requires the binding it creates).

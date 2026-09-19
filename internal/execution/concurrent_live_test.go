@@ -139,6 +139,43 @@ func TestLiveConcurrentIdenticalMutationSingleDispatch(t *testing.T) {
 		t.Errorf("CRAB-V1-021 violation: expected counter=1 (exactly one dispatch), got counter=%d", finalCount)
 	}
 
+	// One durable effect identity: exactly one ledger row for this key,
+	// in a terminal state, carrying the execution and provider-operation
+	// identity the dispatch actually used. The counter proves one side
+	// effect; these prove one durable identity behind it. (MUTATION is
+	// DURABLE, not HIGH_ASSURANCE, so there is no signed terminal
+	// receipt here — receipts are a CRITICAL artifact; the terminal
+	// outcome identity is the single COMMITTED record.)
+	var durableRows int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM execution_requests WHERE principal_id = $1 AND capability_id = $2 AND idempotency_key = $3`,
+		"alice@example.com", "test.counter.increment", key).Scan(&durableRows); err != nil {
+		t.Fatalf("count durable records: %v", err)
+	}
+	if durableRows != 1 {
+		t.Errorf("CRAB-V1-021 violation: %d durable execution records for one key, want exactly 1", durableRows)
+	}
+
+	rec, err := store.LookupByKey(ctx, "alice@example.com", "test.counter.increment", key)
+	if err != nil {
+		t.Fatalf("lookup durable record: %v", err)
+	}
+	if rec.State != idempotency.StateCommitted {
+		t.Errorf("durable state = %s, want COMMITTED (one terminal outcome)", rec.State)
+	}
+	if rec.ExecutionID == "" {
+		t.Error("durable record carries no execution identity")
+	}
+	if rec.ProviderID == "" {
+		t.Error("durable record carries no provider identity")
+	}
+	if rec.ProviderRunID == "" {
+		t.Error("durable record carries no provider operation identity")
+	}
+	if rec.RequestDigest == "" {
+		t.Error("durable record carries no request fingerprint")
+	}
+
 	// At least one caller should succeed.
 	if successCount < 1 {
 		t.Errorf("expected at least 1 success, got 0 (fail=%d, in-flight/unknown=%d)",
