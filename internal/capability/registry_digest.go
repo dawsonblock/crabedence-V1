@@ -407,20 +407,7 @@ func validateSchemaKeywords(schema map[string]any, path string) error {
 	return errors.Join(findings...)
 }
 
-// ValidateAdapters checks that every registered capability is bound to
-// an adapter the service can actually dispatch. A capability whose
-// adapter is not wired could only ever produce
-// CAPABILITY_UNAVAILABLE at execution time. It is a thin scan over
-// Availability — one source of truth for the availability rule.
-func (r *Registry) ValidateAdapters(known map[string]bool) error {
-	adapters := make(AdapterAvailability, len(known))
-	for id := range known {
-		adapters[id] = AdapterState{Status: AvailabilityAvailable}
-	}
-
-	var findings []error
-	for _, entry := range r.Unavailable(adapters) {
-		findings = append(findings, fmt.Errorf("capability %s: adapter %q is not wired into the service", entry.CapabilityID, entry.AdapterID))
-	}
-	return errors.Join(findings...)
-}
+// Adapter availability moved to availability.go: CheckAdapterAvailability
+// reports it as structured deployment state. It is deliberately NOT an
+// error-returning scan — under the static-registry model an unwired
+// adapter is legitimate deployment state, not a registry defect.

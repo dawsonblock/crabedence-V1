@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Capability — adapter availability is deployment state consulted at the boundary
+
+- Capability: `AdapterAvailability` now answers the admission-path question directly (`Available(adapterID)`, `StatusOf(adapterID)`), and `Registry.CheckAdapterAvailability` returns a structured report (`AdapterAvailabilityReport`) instead of an error — an unwired adapter is legitimate deployment state, not a registry defect, so `ValidateAdapters` is deleted rather than left as a stale, contradictory scan.
+- Execution: the service consults runtime adapter availability at the deployment boundary, before dispatch. A known capability whose adapter is not AVAILABLE fails as `CAPABILITY_UNAVAILABLE` with the availability status as the machine-readable reason (`ADAPTER_NOT_CONFIGURED`, `ADAPTER_UNHEALTHY`, `FEATURE_DISABLED`) — decided by the wired adapter state, never by the descriptor's adapter binding alone, and never a routing or class fallback.
+
 ### Release engineering — distribution integrity reverify
 
 - Release: publication is followed by a distribution-integrity check. `release-rc.yml` now downloads the published release assets, requires the published archive digest to equal the qualified digest, requires the published `artifact.json`/`evidence-manifest.json`/`SHA256SUMS` to be byte-identical to the qualified bundle, re-runs the standalone verifier (`--mode release`) against the published bytes, and verifies the published attestation. A mismatch fails the workflow loudly; it never rewrites or unpublishes the release.

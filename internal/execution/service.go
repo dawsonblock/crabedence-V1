@@ -140,6 +140,10 @@ type Service struct {
 	mu            sync.Mutex
 	running       bool
 	grantResolver capability.GrantResolver
+	// adapterAvailability is the deployment's runtime adapter state. It
+	// is nil when the caller did not declare one (tests that construct
+	// the service directly); production always sets it.
+	adapterAvailability capability.AdapterAvailability
 }
 
 // NewService creates a new execution service.
@@ -150,6 +154,13 @@ func NewService(registry *capability.Registry, handler Handler, socketPath strin
 		socketPath:    socketPath,
 		grantResolver: capability.NoopGrantResolver{},
 	}
+}
+
+// SetAdapterAvailability declares which adapters this deployment wired.
+// A known capability whose adapter is not AVAILABLE fails as
+// CAPABILITY_UNAVAILABLE at the deployment boundary, before dispatch.
+func (s *Service) SetAdapterAvailability(availability capability.AdapterAvailability) {
+	s.adapterAvailability = availability
 }
 
 // SetGrantResolver sets the grant resolver for authority verification.
@@ -298,6 +309,26 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 			Error:       decision.Reason,
 		})
 		return
+	}
+
+	// ─── Availability: deployment state, checked before dispatch ──────
+	// The capability is KNOWN (admission succeeded), but this deployment
+	// may not have the adapter wired. That is CAPABILITY_UNAVAILABLE with
+	// the adapter's availability status as the machine-readable reason —
+	// never CAPABILITY_NOT_FOUND, never a routing or class fallback, and
+	// never a dispatch attempt. The dispatch layer re-checks as defense
+	// in depth.
+	if s.adapterAvailability != nil {
+		desc := decision.Descriptor
+		if status, reason := s.adapterAvailability.StatusOf(desc.AdapterID); status != capability.AvailabilityAvailable {
+			s.writeResponse(conn, Response{
+				Status:      StatusFailed,
+				FailureCode: string(capability.FailureCapabilityUnavailable),
+				Error: fmt.Sprintf("capability %s requires adapter %q, which is not available in this deployment (reason=%s: %s)",
+					req.Capability, desc.AdapterID, status, reason),
+			})
+			return
+		}
 	}
 
 	// Check deadline before any further validation. An expired deadline

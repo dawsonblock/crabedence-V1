@@ -189,6 +189,60 @@ func TestExecutionServiceUnconfiguredAdapterIsUnavailable(t *testing.T) {
 	}
 }
 
+// TestExecutionServiceConsultsAdapterAvailability pins the deployment
+// boundary: availability is decided by the runtime adapter state, not by
+// the descriptor's adapter binding. An adapter that is wired but not
+// AVAILABLE (here: unhealthy) fails as CAPABILITY_UNAVAILABLE before
+// dispatch — and never dispatches.
+func TestExecutionServiceConsultsAdapterAvailability(t *testing.T) {
+	socketPath := testSocketPath(t)
+
+	registry := capability.NewRegistry()
+	if err := RegisterCounterCapability(registry); err != nil {
+		t.Fatal(err)
+	}
+
+	counter := NewCounterHandler()
+	handler := NewMultiHandler(map[string]Handler{"test-counter": counter})
+
+	service := setupServiceWithGrants(registry, handler, socketPath)
+	service.SetAdapterAvailability(capability.AdapterAvailability{
+		"test-counter": {Status: capability.AvailabilityAdapterUnhealthy, Reason: "provider unreachable"},
+	})
+	ctx := context.Background()
+	if err := service.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer service.Stop()
+
+	conn, err := net.Dial("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	req := Request{
+		Capability:     "test.counter.increment",
+		Arguments:      json.RawMessage(`{"counter":"unhealthy","by":1}`),
+		Authority:      RequestAuthority{Principal: "alice@example.com", AuthorityRef: "grant_123"},
+		IdempotencyKey: "availability-unhealthy-1",
+	}
+	resp := sendRequest(t, conn, req)
+
+	if resp.Status != StatusFailed {
+		t.Fatalf("expected FAILED, got %s", resp.Status)
+	}
+	if resp.FailureCode != string(capability.FailureCapabilityUnavailable) {
+		t.Fatalf("expected CAPABILITY_UNAVAILABLE, got %s", resp.FailureCode)
+	}
+	if !strings.Contains(resp.Error, string(capability.AvailabilityAdapterUnhealthy)) {
+		t.Fatalf("expected the availability status as the reason, got %q", resp.Error)
+	}
+	if counter.GetCount("unhealthy") != 0 {
+		t.Fatal("an unavailable adapter must never dispatch")
+	}
+}
+
 func TestExecutionServiceMissingIdempotencyKey(t *testing.T) {
 	socketPath := testSocketPath(t)
 

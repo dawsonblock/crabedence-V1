@@ -26,10 +26,14 @@ func TestBuiltInRegistryPassesStartupScan(t *testing.T) {
 	if err := registry.Validate(); err != nil {
 		t.Fatalf("built-in registry must pass the invariant scan: %v", err)
 	}
-	if err := registry.ValidateAdapters(map[string]bool{
-		"system": true, "test-counter": true, "system-info": true, "github": true,
-	}); err != nil {
-		t.Fatalf("built-in adapters must be wired: %v", err)
+	availability := capability.AdapterAvailability{
+		"system":       {Status: capability.AvailabilityAvailable},
+		"test-counter": {Status: capability.AvailabilityAvailable},
+		"system-info":  {Status: capability.AvailabilityAvailable},
+		"github":       {Status: capability.AvailabilityAvailable},
+	}
+	if report := registry.CheckAdapterAvailability(availability); len(report.Unavailable) != 0 {
+		t.Fatalf("built-in adapters must be wired: %+v", report.Unavailable)
 	}
 
 	report, err := registry.Report()

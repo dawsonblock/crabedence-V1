@@ -58,8 +58,63 @@ type AdapterState struct {
 
 // AdapterAvailability maps adapter IDs to their deployment state. An
 // adapter absent from the map is ADAPTER_NOT_CONFIGURED: the deployment
-// did not wire it.
+// did not wire it. The type itself is the availability source the
+// service consults — Available reports whether an adapter is usable
+// without exposing how the deployment learned that.
 type AdapterAvailability map[string]AdapterState
+
+// Available reports whether adapterID is wired and usable in this
+// deployment. An empty or unknown adapter ID is never available.
+func (a AdapterAvailability) Available(adapterID string) bool {
+	state, ok := a[adapterID]
+	return ok && state.Status == AvailabilityAvailable
+}
+
+// StatusOf returns the availability status and reason for adapterID.
+// An adapter absent from the map is ADAPTER_NOT_CONFIGURED.
+func (a AdapterAvailability) StatusOf(adapterID string) (AvailabilityStatus, string) {
+	if adapterID == "" {
+		return AvailabilityAdapterNotConfigured, "capability has no adapter binding"
+	}
+	state, ok := a[adapterID]
+	if !ok {
+		return AvailabilityAdapterNotConfigured, "adapter is not wired in this deployment"
+	}
+	if !state.Status.Valid() {
+		return AvailabilityAdapterUnhealthy, "adapter reported an unknown availability status"
+	}
+	return state.Status, state.Reason
+}
+
+// AdapterAvailabilityReport is the deployment's structured availability
+// view. Legitimate deployment state is not an error object: an unwired
+// adapter is a fact to report, not a failure to return.
+type AdapterAvailabilityReport struct {
+	// Total is the number of registered capabilities.
+	Total int `json:"total"`
+	// Available lists the capability IDs this deployment can execute.
+	Available []string `json:"available"`
+	// Unavailable lists the capabilities this deployment cannot execute,
+	// with the policy each still carries.
+	Unavailable []CapabilityAvailability `json:"unavailable"`
+}
+
+// CheckAdapterAvailability reports which registered capabilities this
+// deployment can and cannot currently execute. It replaces the old
+// error-returning scan: under the static-registry model an unwired
+// adapter is deployment state, not a registry defect.
+func (r *Registry) CheckAdapterAvailability(adapters AdapterAvailability) AdapterAvailabilityReport {
+	entries := r.Availability(adapters)
+	report := AdapterAvailabilityReport{Total: len(entries)}
+	for _, entry := range entries {
+		if entry.Available() {
+			report.Available = append(report.Available, entry.CapabilityID)
+			continue
+		}
+		report.Unavailable = append(report.Unavailable, entry)
+	}
+	return report
+}
 
 // CapabilityAvailability is the runtime availability of one registered
 // capability. It is a derived view — never persisted into the registry
@@ -122,13 +177,8 @@ func (r *Registry) Availability(adapters AdapterAvailability) []CapabilityAvaila
 }
 
 // Unavailable returns the registered capabilities this deployment
-// cannot currently execute, in ID order.
+// cannot currently execute, in ID order. It is a convenience view over
+// CheckAdapterAvailability.
 func (r *Registry) Unavailable(adapters AdapterAvailability) []CapabilityAvailability {
-	var unavailable []CapabilityAvailability
-	for _, entry := range r.Availability(adapters) {
-		if !entry.Available() {
-			unavailable = append(unavailable, entry)
-		}
-	}
-	return unavailable
+	return r.CheckAdapterAvailability(adapters).Unavailable
 }

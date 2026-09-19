@@ -165,17 +165,49 @@ func TestRegistryValidateAcceptsSupportedSchemaShapes(t *testing.T) {
 	}
 }
 
-func TestValidateAdaptersRejectsUnwiredAdapter(t *testing.T) {
+func TestCheckAdapterAvailabilityReportsUnwiredAdapter(t *testing.T) {
 	registry := NewRegistry()
 	registerForTest(t, registry, CapabilityDescriptor{ID: "a.read", ExecutionClass: ClassRead, AdapterID: "wired"})
 	registerForTest(t, registry, CapabilityDescriptor{ID: "b.read", ExecutionClass: ClassRead, AdapterID: "orphan"})
 
-	if err := registry.ValidateAdapters(map[string]bool{"wired": true}); err == nil {
-		t.Fatal("ValidateAdapters must reject a capability whose adapter is not wired")
-	} else if !strings.Contains(err.Error(), `adapter "orphan" is not wired`) {
-		t.Fatalf("unexpected error: %v", err)
+	// An unwired adapter is deployment state, reported — not an error.
+	report := registry.CheckAdapterAvailability(AdapterAvailability{
+		"wired": {Status: AvailabilityAvailable},
+	})
+	if report.Total != 2 {
+		t.Fatalf("report total = %d, want 2", report.Total)
 	}
-	if err := registry.ValidateAdapters(map[string]bool{"wired": true, "orphan": true}); err != nil {
-		t.Fatalf("wired adapters must pass: %v", err)
+	if len(report.Available) != 1 || report.Available[0] != "a.read" {
+		t.Fatalf("available = %v, want [a.read]", report.Available)
+	}
+	if len(report.Unavailable) != 1 || report.Unavailable[0].CapabilityID != "b.read" {
+		t.Fatalf("unavailable = %+v, want [b.read]", report.Unavailable)
+	}
+	if report.Unavailable[0].Status != AvailabilityAdapterNotConfigured {
+		t.Fatalf("unavailable status = %s, want ADAPTER_NOT_CONFIGURED", report.Unavailable[0].Status)
+	}
+
+	// The availability source itself answers the admission-path question.
+	adapters := AdapterAvailability{"wired": {Status: AvailabilityAvailable}}
+	if !adapters.Available("wired") {
+		t.Fatal("wired adapter must be available")
+	}
+	if adapters.Available("orphan") {
+		t.Fatal("unwired adapter must not be available")
+	}
+	if adapters.Available("") {
+		t.Fatal("an empty adapter ID must never be available")
+	}
+	if status, _ := adapters.StatusOf("orphan"); status != AvailabilityAdapterNotConfigured {
+		t.Fatalf("unwired adapter status = %s, want ADAPTER_NOT_CONFIGURED", status)
+	}
+
+	// With every adapter wired, nothing is unavailable.
+	all := AdapterAvailability{
+		"wired":  {Status: AvailabilityAvailable},
+		"orphan": {Status: AvailabilityAvailable},
+	}
+	if report := registry.CheckAdapterAvailability(all); len(report.Unavailable) != 0 {
+		t.Fatalf("fully wired deployment reported unavailable: %+v", report.Unavailable)
 	}
 }

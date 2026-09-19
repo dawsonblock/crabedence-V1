@@ -288,13 +288,14 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	}
 	// Unwired adapters are legitimate deployment state, not a registry
 	// defect: the capability stays registered (static policy) and fails
-	// closed at dispatch (dynamic availability). Report exactly what
-	// this deployment cannot execute, with the policy it still carries.
+	// closed as CAPABILITY_UNAVAILABLE at the deployment boundary
+	// (dynamic availability). Report exactly what this deployment cannot
+	// execute, with the policy it still carries.
 	adapterStates := make(capability.AdapterAvailability, len(handlers))
 	for adapterID := range handlers {
 		adapterStates[adapterID] = capability.AdapterState{Status: capability.AvailabilityAvailable}
 	}
-	reportCapabilityAvailability(registry, adapterStates)
+	reportCapabilityAvailability(registry, registry.CheckAdapterAvailability(adapterStates))
 	report, err := registry.Report()
 	if err != nil {
 		return fmt.Errorf("capability registry report failed: %w", err)
@@ -336,6 +337,11 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	handler = dispatcher
 
 	service := NewService(registry, handler, opts.SocketPath)
+	// The deployment boundary owns availability: the service refuses a
+	// known capability whose adapter this deployment did not wire, with
+	// CAPABILITY_UNAVAILABLE (never CAPABILITY_NOT_FOUND, never a
+	// routing change).
+	service.SetAdapterAvailability(adapterStates)
 
 	// Wire production authority: PostgreSQL-backed grant resolution.
 	// Without this, the service defaults to NoopGrantResolver which
@@ -474,14 +480,13 @@ func adapterIDs(handlers map[string]Handler) []string {
 // availability view: which registered capabilities this deployment
 // cannot currently execute, and why. Availability is derived state — it
 // never modifies the registry, its descriptors, or its digest (INV-014).
-func reportCapabilityAvailability(registry *capability.Registry, adapters capability.AdapterAvailability) {
-	unavailable := registry.Unavailable(adapters)
-	if len(unavailable) == 0 {
+func reportCapabilityAvailability(registry *capability.Registry, report capability.AdapterAvailabilityReport) {
+	if len(report.Unavailable) == 0 {
 		return
 	}
 	fmt.Fprintf(os.Stderr, "Capability availability: %d of %d registered capabilities are not executable in this deployment\n",
-		len(unavailable), registry.Count())
-	for _, entry := range unavailable {
+		len(report.Unavailable), report.Total)
+	for _, entry := range report.Unavailable {
 		fmt.Fprintf(os.Stderr, "  %s\n", entry.CapabilityID)
 		fmt.Fprintln(os.Stderr, "    KNOWN:     yes")
 		if desc, ok := registry.Lookup(entry.CapabilityID); ok {
