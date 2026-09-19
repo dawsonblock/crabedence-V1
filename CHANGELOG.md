@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Execution — framed transport hardening
+
+- Execution: the service's response writer now uses a `writeFull` helper — a Unix stream write may accept fewer bytes than requested, and a truncated frame would corrupt the protocol. Short writes are continued, a zero-byte write is a hard error rather than a silent stall, and frame writes are error-checked instead of ignored. The length prefix uses `binary.BigEndian`, a response that cannot be framed (over the 4 MiB bound) is replaced by a parseable error frame instead of being written truncated, and every connection carries a 60-second whole-connection deadline in addition to the read/write deadlines.
+- CI: the CI PostgreSQL service is pinned by digest (`postgres:16@sha256:f1c3376c…`) — every workflow now pins both actions and qualification container images.
+
 ### Reconciliation — supervisor, readiness policy, and operational counters
 
 - Reconciliation: the worker now runs under a `Supervisor` with an explicit, configurable readiness policy (`SupervisorConfig`): `DEGRADED` when no cycle has succeeded within `DegradedAfterCycleAge` or the oldest pending UNKNOWN exceeds `MaxUnknownAge`; `NOT_READY` when the reconciler is stopped or never started, when `NotReadyAfterCycleAge` passes without a successful cycle, or after `MaxConsecutiveFailures` consecutive failed cycles. Readiness transitions are logged, so the subsystem's health change is visible without polling.

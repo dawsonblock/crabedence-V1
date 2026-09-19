@@ -15,6 +15,7 @@ package execution
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -242,8 +243,9 @@ func (s *Service) acceptLoop(ctx context.Context) {
 func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 
-	// Set read deadline
-	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	// Bound the whole connection: one request, one response, no
+	// indefinite holds.
+	_ = conn.SetDeadline(time.Now().Add(connectionLifetime))
 
 	// Read 4-byte big-endian length prefix
 	lenBuf := make([]byte, 4)
@@ -251,8 +253,8 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 		return
 	}
 
-	msgLen := uint32(lenBuf[0])<<24 | uint32(lenBuf[1])<<16 | uint32(lenBuf[2])<<8 | uint32(lenBuf[3])
-	if msgLen > 4*1024*1024 {
+	msgLen := binary.BigEndian.Uint32(lenBuf)
+	if msgLen > maxMessageBytes {
 		s.writeResponse(conn, Response{
 			Status:      StatusFailed,
 			FailureCode: string(capability.FailureInvalidRequest),
@@ -383,15 +385,60 @@ func (s *Service) writeResponse(conn net.Conn, resp Response) {
 		return
 	}
 
+	// A response that cannot be framed must never be written as a
+	// truncated frame: replace it with an error response the caller can
+	// parse.
+	if len(payload) > maxMessageBytes {
+		payload, err = json.Marshal(Response{
+			Status:      StatusFailed,
+			FailureCode: string(capability.FailureInternalError),
+			Error:       fmt.Sprintf("response exceeds the %d-byte frame bound", maxMessageBytes),
+		})
+		if err != nil {
+			log.Printf("execution service: marshal error: %v", err)
+			return
+		}
+	}
+
 	// Set write deadline to prevent blocking on hung clients
-	conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+	if err := conn.SetWriteDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		log.Printf("execution service: set write deadline: %v", err)
+		return
+	}
 
 	lenBuf := make([]byte, 4)
-	lenBuf[0] = byte(len(payload) >> 24)
-	lenBuf[1] = byte(len(payload) >> 16)
-	lenBuf[2] = byte(len(payload) >> 8)
-	lenBuf[3] = byte(len(payload))
+	binary.BigEndian.PutUint32(lenBuf, uint32(len(payload)))
+	if err := writeFull(conn, lenBuf); err != nil {
+		log.Printf("execution service: write frame header: %v", err)
+		return
+	}
+	if err := writeFull(conn, payload); err != nil {
+		log.Printf("execution service: write frame payload: %v", err)
+	}
+}
 
-	conn.Write(lenBuf)
-	conn.Write(payload)
+// maxMessageBytes bounds a single framed message in either direction —
+// the ABI's declared maximum.
+const maxMessageBytes = 4 * 1024 * 1024
+
+// connectionLifetime bounds a whole client connection: one request, one
+// response, no indefinite holds.
+const connectionLifetime = 60 * time.Second
+
+// writeFull writes the entire buffer. A Unix stream write may accept
+// fewer bytes than requested, and a truncated frame would corrupt the
+// protocol — short writes are continued, and a zero-byte write is a
+// hard error rather than a silent stall.
+func writeFull(w io.Writer, p []byte) error {
+	for len(p) > 0 {
+		n, err := w.Write(p)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrUnexpectedEOF
+		}
+		p = p[n:]
+	}
+	return nil
 }
