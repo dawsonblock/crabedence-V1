@@ -38,6 +38,11 @@ if [ ! -d "$EVIDENCE_DIR" ]; then
   exit 1
 fi
 
+# Resolve to an absolute path before anything else: later stages cd into
+# the evidence directory, so a relative argument would silently re-anchor
+# every path derived from it.
+EVIDENCE_DIR="$(cd "$EVIDENCE_DIR" && pwd)"
+
 if ! command -v jq >/dev/null 2>&1; then
   echo "ERROR: jq is required to finalize release evidence" >&2
   exit 1

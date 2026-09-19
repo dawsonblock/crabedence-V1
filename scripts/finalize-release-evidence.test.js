@@ -115,6 +115,20 @@ test("source identity is preserved, never re-derived", (t) => {
   assert.equal(manifest.branch, "release/crabedence-v1-rc6-qualified-execution");
 });
 
+test("a relative evidence path is resolved before any cd", (t) => {
+  const root = fixture(t);
+  // The release workflow passes a relative path; the script cd's into the
+  // evidence directory, so a relative argument must be anchored first.
+  const parent = path.dirname(root);
+  const relative = path.relative(parent, root);
+  const result = spawnSync("bash", [FINALIZER, relative], { cwd: parent, encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+
+  const manifest = JSON.parse(fs.readFileSync(path.join(root, "evidence-manifest.json"), "utf8"));
+  assert.equal(manifest.sha256, sha256File(path.join(root, "SHA256SUMS")));
+  assert.equal(fs.existsSync(path.join(root, "evidence-manifest.json")), true);
+});
+
 test("fails closed without artifact.json (qualification-only bundle)", (t) => {
   const root = fixture(t, { artifact: false });
   const result = finalize(root);
