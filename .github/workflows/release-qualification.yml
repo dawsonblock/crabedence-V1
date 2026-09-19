@@ -369,7 +369,7 @@ jobs:
           EOF
 
       - name: Verify release artifact
-        run: bash scripts/verify-release-artifact.sh
+        run: bash scripts/verify-release-artifact.sh --mode qualification
 
       - name: Upload release evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

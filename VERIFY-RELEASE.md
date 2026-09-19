@@ -24,6 +24,8 @@ workflow + repository + commit
     ↓
 final evidence manifest (covers artifact.json and every evidence file)
     ↓
+registry policy identity (recomputed from the canonical envelope)
+    ↓
 qualification.json
     ↓
 source manifest
@@ -170,6 +172,25 @@ jq -r '.evidence_sha256' release-evidence/attestation/attestation.json
 ```
 
 The attested digest must equal `jq -r '.sha256' evidence-manifest.json`.
+
+### Registry policy identity
+
+The release binds the exact capability policy it was qualified against.
+`release-evidence/registry.json` is the verifiable envelope (the digest
+plus the canonical descriptor bytes it covers), and `registry.sha256` is
+the digest the artifact binds:
+
+```bash
+# Recompute the registry digest from the canonical bytes
+jq -r '.canonical_payload' release-evidence/registry.json | base64 --decode | shasum -a 256
+jq -r '.registry_sha256' release-evidence/registry.json
+jq -r '.registry_sha256' release-evidence/artifact.json
+```
+
+All three values must be equal — qualified policy = released policy. The
+running service prints the same digest in its startup report and exports
+it in `capabilities.json` next to its socket, completing the chain:
+qualified = released = runtime.
 
 ## Summary
 

@@ -3,19 +3,85 @@
 #
 # Works standalone on an extracted archive — does NOT require .git.
 #
-# Usage: ./scripts/verify-release-artifact.sh [evidence-dir] [source-dir] [archive]
-#   evidence-dir: directory containing qualification bundle (default: dist/release-evidence/)
-#   source-dir:    directory containing the source tree to verify (default: repo root)
-#   archive:       optional release archive; its SHA-256 is recomputed and
-#                  required to equal artifact.json's binding, closing the
-#                  qualification → source → artifact chain
+# Usage:
+#   ./scripts/verify-release-artifact.sh --mode qualification [options]
+#   ./scripts/verify-release-artifact.sh --mode release --archive PATH [options]
+#
+# Options:
+#   --mode qualification|release  Explicit verification contract (see below).
+#   --evidence DIR                Evidence bundle (default: dist/release-evidence/)
+#   --source DIR                  Source tree to verify (default: repo root)
+#   --archive PATH                Release archive; its SHA-256 is recomputed
+#                                 from the bytes and required to equal
+#                                 artifact.json's binding
+#
+# Legacy positional form: [evidence-dir] [source-dir] [archive]
+#   Without --mode the contract is derived from whether an archive was
+#   supplied, and a notice is printed. Pass --mode explicitly.
+#
+# Contracts:
+#   qualification  Requires qualification evidence, source identity, the
+#                  registry policy identity, and provenance metadata. An
+#                  archive and artifact.json are optional — no distributable
+#                  artifact exists yet; whatever is present is validated,
+#                  but no archive digest is claimed to have been recomputed.
+#   release        Requires the archive, artifact.json, source manifest,
+#                  qualification, SBOM, registry policy identity,
+#                  provenance, and the final evidence manifest. The archive
+#                  digest is recomputed from its bytes — never read from a
+#                  supplied checksum file — and must equal artifact.json's
+#                  binding.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-EVIDENCE_DIR="${1:-$REPO_ROOT/dist/release-evidence}"
-SOURCE_DIR="${2:-$REPO_ROOT}"
-ARCHIVE_PATH="${3:-}"
+
+MODE=""
+EVIDENCE_DIR=""
+SOURCE_DIR=""
+ARCHIVE_PATH=""
+POSITIONAL=()
+
+usage() {
+  sed -n '2,32p' "$0"
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --mode) MODE="${2:-}"; shift 2 ;;
+    --mode=*) MODE="${1#*=}"; shift ;;
+    --evidence) EVIDENCE_DIR="${2:-}"; shift 2 ;;
+    --evidence=*) EVIDENCE_DIR="${1#*=}"; shift ;;
+    --source) SOURCE_DIR="${2:-}"; shift 2 ;;
+    --source=*) SOURCE_DIR="${1#*=}"; shift ;;
+    --archive) ARCHIVE_PATH="${2:-}"; shift 2 ;;
+    --archive=*) ARCHIVE_PATH="${1#*=}"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --*) echo "ERROR: unknown option: $1" >&2; exit 2 ;;
+    *) POSITIONAL+=("$1"); shift ;;
+  esac
+done
+
+if [ "${#POSITIONAL[@]}" -gt 0 ]; then EVIDENCE_DIR="${POSITIONAL[0]}"; fi
+if [ "${#POSITIONAL[@]}" -gt 1 ]; then SOURCE_DIR="${POSITIONAL[1]}"; fi
+if [ "${#POSITIONAL[@]}" -gt 2 ]; then ARCHIVE_PATH="${POSITIONAL[2]}"; fi
+
+EVIDENCE_DIR="${EVIDENCE_DIR:-$REPO_ROOT/dist/release-evidence}"
+SOURCE_DIR="${SOURCE_DIR:-$REPO_ROOT}"
+
+MODE_INFERRED=false
+if [ -n "$MODE" ]; then
+  case "$MODE" in
+    qualification|release) ;;
+    *)
+      echo "ERROR: --mode must be qualification or release, got: $MODE" >&2
+      exit 2
+      ;;
+  esac
+else
+  if [ -n "$ARCHIVE_PATH" ]; then MODE="release"; else MODE="qualification"; fi
+  MODE_INFERRED=true
+fi
 
 if [ ! -d "$EVIDENCE_DIR" ]; then
   echo "ERROR: evidence directory not found: $EVIDENCE_DIR" >&2
@@ -42,12 +108,45 @@ check() {
 
 echo ""
 echo "=== Release Artifact Verification ==="
+echo "  mode:     $MODE"
 echo "  evidence: $EVIDENCE_DIR"
 echo "  source:   $SOURCE_DIR"
 if [ -n "$ARCHIVE_PATH" ]; then
   echo "  archive:  $ARCHIVE_PATH"
 fi
+if [ "$MODE_INFERRED" = true ]; then
+  echo "  note: mode was inferred from the supplied arguments; pass --mode qualification|release explicitly"
+fi
 echo ""
+
+# ─── Mode contract ──────────────────────────────────────────────────────────
+# A mode is a contract, not a hint: a required input that is missing is a
+# hard error, so a release verification can never silently degrade into a
+# qualification run (or the reverse). qualification.json is required in
+# both modes; its absence is reported as its own FAIL below, and a
+# present record must validate against the schema.
+CONTRACT_FAILURES=0
+require_file() {
+  if [ ! -f "$1" ]; then
+    echo "  ERROR: $MODE mode requires $2 ($1)" >&2
+    CONTRACT_FAILURES=$((CONTRACT_FAILURES + 1))
+  fi
+}
+
+require_file "$EVIDENCE_DIR/provenance.json" "provenance metadata"
+require_file "$EVIDENCE_DIR/source-tree-sha256.txt" "the source manifest"
+require_file "$EVIDENCE_DIR/registry.sha256" "the registry policy identity"
+require_file "$EVIDENCE_DIR/registry.json" "the verifiable registry envelope"
+if [ "$MODE" = "release" ]; then
+  require_file "$EVIDENCE_DIR/artifact.json" "artifact.json (the release artifact binding)"
+  require_file "$ARCHIVE_PATH" "the release archive (--archive)"
+fi
+
+if [ "$CONTRACT_FAILURES" -gt 0 ]; then
+  echo ""
+  echo "MODE CONTRACT VIOLATED: $CONTRACT_FAILURES missing requirement(s)" >&2
+  exit 1
+fi
 
 # 0. artifact.json binding — the release archive must be the archive the
 # qualified evidence describes. Nothing here trusts a stored digest
@@ -144,6 +243,44 @@ if [ -f "$ARTIFACT_JSON" ]; then
   else
     check "artifact.json covered by checksums" "FAIL"
     echo "  ERROR: artifact.json is not listed in SHA256SUMS — the evidence bundle does not bind the release artifact" >&2
+  fi
+fi
+
+# 1c. Registry policy identity — the capability catalog the release was
+# qualified against. The envelope carries the exact canonical descriptor
+# bytes, so the digest is recomputed HERE from the bytes; a stored digest
+# string is never trusted on its own. artifact.json must bind exactly
+# this value: qualified policy = released policy.
+REGISTRY_SHA_FILE="$EVIDENCE_DIR/registry.sha256"
+REGISTRY_ENVELOPE="$EVIDENCE_DIR/registry.json"
+REGISTRY_SHA="$(tr -d '[:space:]' < "$REGISTRY_SHA_FILE")"
+if [[ "$REGISTRY_SHA" =~ ^[0-9a-f]{64}$ ]]; then
+  check "Registry digest format" "PASS"
+else
+  check "Registry digest format" "FAIL"
+  echo "  ERROR: registry.sha256 is not a SHA-256 digest: $REGISTRY_SHA" >&2
+fi
+
+ENVELOPE_SHA="$(jq -r '.registry_sha256 // empty' "$REGISTRY_ENVELOPE" 2>/dev/null || true)"
+ENVELOPE_PAYLOAD="$(jq -r '.canonical_payload // empty' "$REGISTRY_ENVELOPE" 2>/dev/null || true)"
+RECOMPUTED_REGISTRY=""
+if [ -n "$ENVELOPE_PAYLOAD" ]; then
+  RECOMPUTED_REGISTRY="$(printf '%s' "$ENVELOPE_PAYLOAD" | base64 --decode 2>/dev/null | shasum -a 256 | awk '{print $1}')"
+fi
+if [ -n "$RECOMPUTED_REGISTRY" ] && [ "$RECOMPUTED_REGISTRY" = "$ENVELOPE_SHA" ] && [ "$ENVELOPE_SHA" = "$REGISTRY_SHA" ]; then
+  check "Registry digest recomputed (envelope)" "PASS"
+else
+  check "Registry digest recomputed (envelope)" "FAIL"
+  echo "  ERROR: registry envelope digest=$ENVELOPE_SHA recomputed=$RECOMPUTED_REGISTRY does not match registry.sha256=$REGISTRY_SHA" >&2
+fi
+
+if [ -f "$ARTIFACT_JSON" ]; then
+  ARTIFACT_REGISTRY="$(jq -r '.registry_sha256 // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
+  if [ -n "$ARTIFACT_REGISTRY" ] && [ "$ARTIFACT_REGISTRY" = "$REGISTRY_SHA" ]; then
+    check "artifact.json binds the qualified registry" "PASS"
+  else
+    check "artifact.json binds the qualified registry" "FAIL"
+    echo "  ERROR: artifact.json registry_sha256=$ARTIFACT_REGISTRY does not match the qualified registry $REGISTRY_SHA" >&2
   fi
 fi
 

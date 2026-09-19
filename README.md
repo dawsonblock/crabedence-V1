@@ -774,7 +774,7 @@ scripts/test-live-postgres.sh
 # Release qualification (requires clean Git tree)
 scripts/generate-release-evidence.sh
 scripts/check-release-admission.sh
-scripts/verify-release-artifact.sh
+scripts/verify-release-artifact.sh --mode qualification
 
 # Optional live smoke, when broker/provider credentials are available
 CRABBOX_LIVE=1 CRABBOX_LIVE_REPO=/path/to/my-app scripts/live-smoke.sh
@@ -811,9 +811,15 @@ PostgreSQL fencing/parity plus the SQLite conformance leg, Worker
 typecheck/lint/tests/build, cross-language conformance, and NeMo
 typecheck/tests, then produces `qualification.json` with per-gate status.
 `scripts/check-release-admission.sh` fails closed if any gate is not PASS.
-`scripts/verify-release-artifact.sh` verifies SHA256SUMS, source manifest
-equality (no extra files), per-gate PASS, commit/tree consistency, and
-required evidence logs. The RC workflow builds the artifact from the exact
+`scripts/verify-release-artifact.sh` runs under an explicit contract —
+`--mode qualification` (evidence, source identity, registry policy
+identity, provenance; archive optional) or `--mode release` (the same
+plus the archive, `artifact.json`, SBOM, and the final evidence manifest,
+with the archive digest recomputed from its bytes and the registry digest
+recomputed from the envelope). It verifies SHA256SUMS, source manifest
+equality (no extra files), per-gate PASS, commit/tree consistency,
+registry-policy binding, and required evidence logs. The RC workflow
+builds the artifact from the exact
 qualified commit, generates provenance via GitHub SLSA attestation, and
 publishes as a GitHub prerelease. See
 [VERIFY-RELEASE.md](VERIFY-RELEASE.md) for consumer verification

@@ -283,6 +283,28 @@ run_gate effect-fabric-race env -u CRABBOX_TEST_DATABASE_URL \
   go test -v -race -count=1 -timeout=120s \
   ./internal/capability/ ./internal/execution/ ./internal/evidence/ ./internal/idempotency/ ./internal/reconcile/
 
+# ─── Registry policy identity ───────────────────────────────────────────────
+# The qualified policy identity: the digest of the exact built-in
+# capability registry this source ships, plus the verifiable envelope
+# (digest + the canonical descriptor bytes it covers) so any consumer —
+# the standalone verifier included — recomputes SHA-256 over the bytes it
+# was given without a Go toolchain. The release artifact binds this
+# value and the runtime serves it: qualified policy = released policy =
+# runtime policy.
+run_gate registry-digest go run ./cmd/registry-digest
+REGISTRY_SHA256="$(sed -n 's/^\([0-9a-f]\{64\}\)$/\1/p' "$EVIDENCE_DIR/gate-results/registry-digest.log" | tail -1)"
+if [ -z "$REGISTRY_SHA256" ]; then
+  echo "ERROR: registry-digest gate produced no digest — the release cannot bind its policy identity" >&2
+  tail -5 "$EVIDENCE_DIR/gate-results/registry-digest.log" >&2 || true
+  exit 1
+fi
+echo "$REGISTRY_SHA256" > "$EVIDENCE_DIR/registry.sha256"
+go run ./cmd/registry-digest -envelope > "$EVIDENCE_DIR/registry.json"
+if ! grep -q "$REGISTRY_SHA256" "$EVIDENCE_DIR/registry.json"; then
+  echo "ERROR: registry envelope does not carry the qualified digest" >&2
+  exit 1
+fi
+
 # ─── Phase 10-12: Live PostgreSQL gates ────────────────────────────────────
 echo ""
 echo "=== Live PostgreSQL gates ==="

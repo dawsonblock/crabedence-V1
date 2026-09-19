@@ -428,7 +428,12 @@ jobs:
 
       # ─── Verify release artifact (after finalization + attestation) ──
       - name: Verify release artifact
-        run: bash scripts/verify-release-artifact.sh dist/release-evidence . "dist/crabedence-${RELEASE_VERSION}.tar.gz"
+        run: |
+          bash scripts/verify-release-artifact.sh \
+            --mode release \
+            --evidence dist/release-evidence \
+            --source . \
+            --archive "dist/crabedence-${RELEASE_VERSION}.tar.gz"
 
       # ─── Generate SBOM (fail-closed, pinned version) ──────────────────
       - name: Generate SBOM
@@ -539,15 +544,17 @@ jobs:
         run: |
           # Copy evidence bundle alongside extracted source
           cp -r evidence clean-room/qualification
-          # Run the verifier against the extracted source, with the
-          # staged archive: the verifier recomputes the archive
-          # SHA-256, requires it to equal artifact.json's binding, and
-          # requires artifact.json to be covered by the final manifest.
-          # The verifier uses find (not git) so it works without .git
+          # Run the verifier against the extracted source with the
+          # explicit release contract: the archive digest is recomputed
+          # from the staged bytes, artifact.json must bind it, the final
+          # manifest must cover it, and the registry digest is recomputed
+          # from the envelope. The verifier uses find (not git) so it
+          # works without .git
           bash clean-room/crabedence-${RELEASE_VERSION}/scripts/verify-release-artifact.sh \
-            clean-room/qualification \
-            clean-room/crabedence-${RELEASE_VERSION} \
-            "archive/crabedence-${RELEASE_VERSION}.tar.gz"
+            --mode release \
+            --evidence clean-room/qualification \
+            --source clean-room/crabedence-${RELEASE_VERSION} \
+            --archive "archive/crabedence-${RELEASE_VERSION}.tar.gz"
 
   # ─── Publish (only after clean-room verification passed) ─────────────
   publish:

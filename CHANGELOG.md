@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Release engineering — explicit verifier contracts and registry policy identity
+
+- Release: the standalone verifier now runs under an explicit contract — `--mode qualification` (qualification evidence, source identity, registry policy identity, provenance metadata; archive optional) or `--mode release` (the same plus the archive, `artifact.json`, SBOM, and the final evidence manifest). A missing release-mode input is a hard contract violation instead of a pile of individual failures; the legacy positional form still works and announces the inferred mode.
+- Release: the qualified registry policy identity is now part of the evidence bundle. `cmd/registry-digest -envelope` emits the verifiable envelope (digest plus the canonical descriptor bytes it covers), the generator records `registry.sha256` and `registry.json` under a `registry-digest` gate, and the verifier recomputes the digest from the envelope bytes and requires `artifact.json` to bind exactly that value — qualified policy = released policy, with the runtime serving the same digest.
+
 ### Registry semantics — frozen policy, typed availability, runtime configuration identity
 
 - Capability: the registry's semantics are documented and frozen (`docs/architecture/capability-registry-semantics.md`): `registry_sha256` identifies the complete policy-defined catalog a release ships — KNOWN / AVAILABLE / AUTHORIZED / EXECUTABLE are four different states, and deployment configuration never enters the registry or its digest. The frozen runtime architecture is recorded in `docs/architecture/v0.52-runtime-freeze.md`.

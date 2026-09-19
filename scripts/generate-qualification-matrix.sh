@@ -83,7 +83,7 @@ FAILED="$(jq -r '.gate_summary.failed' "$QUAL_FILE")"
   echo "To verify this release artifact:"
   echo ""
   echo '```bash'
-  echo "./scripts/verify-release-artifact.sh"
+  echo "./scripts/verify-release-artifact.sh --mode qualification"
   echo '```'
   echo ""
   echo "To check release admission:"
