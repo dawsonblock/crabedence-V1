@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### NEMO — real schema validation and optional authority
+
+- NEMO: the hand-written `typeof` schema checker is deleted. Capability schemas are compiled by Ajv (strict mode) when the catalog loads — a schema that does not compile, or that uses a construct strict mode does not recognize, fails registry loading instead of silently weakening validation. Arguments are validated before routing, and declared result schemas are validated on `SUCCEEDED` outcomes: a `PURE` result that violates its contract is `FAILED` (no external effect), a dispatched result that violates it is `UNKNOWN` (post-dispatch uncertainty, never retryable). Compiled validators are built from the frozen descriptor copy, so mutating the caller's schema object after registration cannot weaken enforcement.
+- NEMO: authority is no longer mandatory in the kernel. The kernel requires only `principal`; `authority_ref` (with the deprecated `grantId` alias) is optional and passed through, because whether authority material is required is the capability's policy — owned by Crabedence's authoritative registry, never invented by the kernel. The Crabedence adapter maps `authorityRef ?? grantId` into `authority_ref` and omits the field when neither is present.
+- Tests: a validation matrix (null vs object, array vs object, integer vs number, required, additionalProperties, enum, nested arrays/objects, length and size bounds, malformed schema, unsupported keyword, 500-level nesting, `__proto__` input, oversized input) plus kernel trust-boundary tests (grant-free invocation, principal required, pre-routing argument rejection, `PURE` result contract violation → `FAILED`, dispatched result contract violation → `UNKNOWN`).
+
 ### Capability registry — canonical identity and startup invariant scan
 
 - Capability: the registry exposes its canonical SHA-256 digest (`Registry.Digest`) — descriptors sorted by ID and canonicalized (sorted keys; schema numbers normalized through the request digest's numeric model) — so two registries with different policy always have different identities, and the same policy reproduces the same digest. `Registry.Report` renders the startup report (descriptor counts by class, assurance, and route, plus the digest), printed by `crabbox serve-execution`.

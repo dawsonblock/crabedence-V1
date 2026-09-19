@@ -39,12 +39,22 @@ export type ExecutionClass = "PURE" | "READ" | "MUTATION" | "CRITICAL";
 /**
  * Authority reference. NeMo requests authority; it does not invent it.
  * Crabedence verifies that the grant is valid before executing.
+ *
+ * The kernel requires only the principal. Whether an authority
+ * reference is required is the capability's policy, owned by
+ * Crabedence's authoritative registry — never by the kernel or the
+ * planner.
  */
 export interface AuthorityRef {
   /** Principal requesting execution (e.g. "user:alice@example.com"). */
   readonly principal: string;
-  /** Grant identifier issued by the authority service. */
-  readonly grantId: string;
+  /**
+   * Opaque reference to authority material (a grant ID today, a
+   * capability token or workload identity tomorrow).
+   */
+  readonly authorityRef?: string;
+  /** @deprecated Use authorityRef — accepted for backward compatibility. */
+  readonly grantId?: string;
 }
 
 // ─── Execution request ────────────────────────────────────────────────
@@ -151,6 +161,13 @@ export interface CapabilityDescriptor {
   readonly id: string;
   /** JSON schema for arguments validation. */
   readonly schema: unknown;
+  /**
+   * Optional JSON schema for the result. When declared, a SUCCEEDED
+   * outcome whose result violates it is a contract violation: FAILED
+   * for PURE capabilities (no external effect occurred), UNKNOWN for
+   * dispatched capabilities (post-dispatch uncertainty).
+   */
+  readonly resultSchema?: unknown;
   /** Pinned execution class. Cannot be changed after registration. */
   readonly executionClass: ExecutionClass;
   /** Adapter that handles this capability (e.g. "local", "crabedence"). */

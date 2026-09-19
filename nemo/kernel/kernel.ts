@@ -30,6 +30,7 @@ import type {
   KernelExecutionOutcome,
   KernelExecutionRequest,
 } from "../contracts/index";
+import { SchemaValidator, type CompiledSchemas } from "./schema";
 
 // ─── Capability registry ──────────────────────────────────────────────
 
@@ -37,16 +38,32 @@ import type {
  * Immutable capability catalog. Once a capability is registered, its
  * execution class cannot be changed. This prevents runtime downgrades
  * (e.g. a model prompt cannot downgrade CRITICAL to READ for speed).
+ *
+ * Schemas are compiled by a real JSON Schema validator at registration
+ * time: a capability whose declared schema does not compile never
+ * enters the active catalog.
  */
 export class CapabilityCatalog {
   private readonly capabilities = new Map<string, CapabilityDescriptor>();
+  private readonly schemas = new Map<string, CompiledSchemas>();
+  private readonly validator = new SchemaValidator();
 
   register(descriptor: CapabilityDescriptor): void {
     if (this.capabilities.has(descriptor.id)) {
       throw new Error(`capability already registered: ${descriptor.id}`);
     }
-    // Deep freeze the descriptor and its schema to prevent mutation
-    this.capabilities.set(descriptor.id, deepFreeze(structuredClone(descriptor)));
+    // Deep freeze the descriptor and its schema to prevent mutation,
+    // and compile the schemas FROM THE FROZEN COPY so a caller that
+    // keeps a reference to the original object cannot alter what the
+    // compiled validator enforces.
+    const frozen = deepFreeze(structuredClone(descriptor));
+    const compiled = this.validator.compile(
+      frozen.id,
+      frozen.schema,
+      frozen.resultSchema,
+    );
+    this.capabilities.set(frozen.id, frozen);
+    this.schemas.set(frozen.id, compiled);
   }
 
   lookup(capabilityId: string): CapabilityDescriptor {
@@ -64,6 +81,34 @@ export class CapabilityCatalog {
   list(): CapabilityDescriptor[] {
     return [...this.capabilities.values()];
   }
+
+  /** validateArguments validates a request's arguments against the
+   * capability's compiled input schema. Returns null when valid. */
+  validateArguments(capabilityId: string, value: unknown): string | null {
+    return this.validator.validate(
+      this.compiled(capabilityId).input,
+      value,
+      "argument",
+    );
+  }
+
+  /** validateResult validates a SUCCEEDED outcome against the
+   * capability's compiled result schema. Returns null when valid. */
+  validateResult(capabilityId: string, value: unknown): string | null {
+    return this.validator.validate(
+      this.compiled(capabilityId).result,
+      value,
+      "result",
+    );
+  }
+
+  private compiled(capabilityId: string): CompiledSchemas {
+    const compiled = this.schemas.get(capabilityId);
+    if (!compiled) {
+      throw new Error(`unknown capability: ${capabilityId}`);
+    }
+    return compiled;
+  }
 }
 
 /** Deep freeze an object and all nested properties. */
@@ -75,49 +120,6 @@ function deepFreeze<T>(value: T): T {
     }
   }
   return value;
-}
-
-// ─── Schema validation ────────────────────────────────────────────────
-
-/**
- * Minimal JSON schema validation for the subset of JSON schema used in
- * capability descriptors. This is NOT a full JSON schema implementation —
- * it validates type, required properties, and basic constraints. For
- * full schema validation, Crabedence's core should validate at execution
- * time. The kernel validates enough to reject obviously malformed
- * requests before they reach the execution port.
- */
-function validateSchema(value: unknown, schema: unknown): string | null {
-  if (!schema || typeof schema !== "object") {
-    return null; // No schema = no validation
-  }
-  const s = schema as Record<string, unknown>;
-
-  if (s.type === "object" && typeof value !== "object") {
-    return `expected object, got ${typeof value}`;
-  }
-  if (s.type === "string" && typeof value !== "string") {
-    return `expected string, got ${typeof value}`;
-  }
-  if (s.type === "number" && typeof value !== "number") {
-    return `expected number, got ${typeof value}`;
-  }
-  if (s.type === "boolean" && typeof value !== "boolean") {
-    return `expected boolean, got ${typeof value}`;
-  }
-  if (s.type === "array" && !Array.isArray(value)) {
-    return `expected array, got ${typeof value}`;
-  }
-
-  if (s.required && Array.isArray(s.required) && typeof value === "object" && value) {
-    for (const prop of s.required as string[]) {
-      if (!(prop in value)) {
-        return `missing required property: ${prop}`;
-      }
-    }
-  }
-
-  return null;
 }
 
 // ─── Deadline validation ──────────────────────────────────────────────
@@ -233,14 +235,15 @@ export class NemoKernel {
       };
     }
 
-    // Validate authority is present and non-empty.
-    if (
-      !request.authority?.principal ||
-      !request.authority?.grantId
-    ) {
+    // The kernel requires an identity, not an authority reference.
+    // Whether authorization material is required is the capability's
+    // policy, owned by Crabedence's authoritative registry — the
+    // kernel must not invent a grant requirement the policy does not
+    // have, and must not drop one the policy does have.
+    if (!request.authority?.principal) {
       return {
         status: "DENIED",
-        error: "missing authority principal or grantId",
+        error: "missing authority principal",
       };
     }
 
@@ -253,12 +256,15 @@ export class NemoKernel {
       };
     }
 
-    // Validate arguments against capability schema.
-    const schemaError = validateSchema(request.arguments, descriptor.schema);
+    // Validate arguments against the capability's compiled schema.
+    const schemaError = this.catalog.validateArguments(
+      request.capabilityId,
+      request.arguments,
+    );
     if (schemaError) {
       return {
         status: "DENIED",
-        error: `schema validation failed: ${schemaError}`,
+        error: schemaError,
       };
     }
 
@@ -272,6 +278,32 @@ export class NemoKernel {
       ...request,
       executionClass: descriptor.executionClass,
     });
+
+    // A declared result contract is part of the capability's trust
+    // boundary. A SUCCEEDED outcome whose result violates it is a
+    // contract violation: a PURE capability produced no external
+    // effect, so FAILED; a dispatched capability's provider claimed
+    // success but returned something outside the contract, which is
+    // post-dispatch uncertainty — UNKNOWN, never a retryable failure.
+    if (outcome.status === "SUCCEEDED") {
+      const resultError = this.catalog.validateResult(
+        request.capabilityId,
+        outcome.result,
+      );
+      if (resultError) {
+        if (descriptor.executionClass === "PURE") {
+          return {
+            status: "FAILED",
+            error: resultError,
+          };
+        }
+        return {
+          status: "UNKNOWN",
+          error: resultError,
+          execution: outcome.execution,
+        };
+      }
+    }
 
     // For CRITICAL operations, verify the evidence contract.
     // A SUCCEEDED CRITICAL must include:

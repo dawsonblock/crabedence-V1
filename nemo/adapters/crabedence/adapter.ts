@@ -390,7 +390,11 @@ export class CrabedenceExecutionAdapter implements ExecutionPort {
       arguments: request.arguments,
       authority: {
         principal: request.authority.principal,
-        authority_ref: request.authority.grantId,
+        // authorityRef is the stable field; grantId is the deprecated
+        // alias accepted for backward compatibility.
+        ...((request.authority.authorityRef ?? request.authority.grantId) && {
+          authority_ref: request.authority.authorityRef ?? request.authority.grantId,
+        }),
       },
       // execution_class is optional/advisory — only send if the caller
       // explicitly asserts it. Crabedence's registry is authoritative.
