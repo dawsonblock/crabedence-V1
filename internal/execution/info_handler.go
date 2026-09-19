@@ -46,8 +46,8 @@ func (h *SystemInfoHandler) Execute(ctx context.Context, req Request, desc capab
 }
 
 // RegisterSystemInfoCapability registers system.info as a READ capability.
-// READ capabilities go through the remote execution port, proving
-// NEMO → Go service connectivity end-to-end.
+// READ capabilities resolve to the DIRECT route (READ + STANDARD):
+// observational, audited, and outside the durable mutation ledger.
 func RegisterSystemInfoCapability(reg *capability.Registry) error {
 	return reg.Register(capability.CapabilityDescriptor{
 		ID:             "system.info",
@@ -62,5 +62,27 @@ func RegisterSystemInfoCapability(reg *capability.Registry) error {
 			"properties": {},
 			"additionalProperties": false
 		}`),
+	})
+}
+
+// RegisterSystemInfoRead binds system.info to the DIRECT read registry,
+// reusing the handler's projection so there is exactly one
+// implementation of the read.
+func RegisterSystemInfoRead(registry *DirectReadRegistry, handler *SystemInfoHandler) error {
+	return registry.Register("system.info", func(ctx context.Context, call CallContext) (json.RawMessage, error) {
+		response := handler.Execute(ctx, Request{
+			Capability: call.Capability,
+			Arguments:  call.Arguments,
+			Authority:  RequestAuthority{Principal: call.Principal},
+		}, capability.ResolvedDescriptor{
+			ID:             call.Capability,
+			ExecutionClass: capability.ClassRead,
+			ExecutionRoute: capability.RouteDirect,
+			AdapterID:      "system-info",
+		})
+		if response.Status != StatusSucceeded {
+			return nil, fmt.Errorf("system.info read failed: %s", response.Error)
+		}
+		return response.Result, nil
 	})
 }

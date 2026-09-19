@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Execution — real DIRECT provider (GitHub reads)
+
+- Execution: the `DIRECT` route is implemented. `DirectReadRegistry` executes observational reads under the same in-process contract as Function Hooks (route/class enforcement, argument validation, bounded runtime, bounded payload, well-formed JSON, audit record) with the `READ`/`DIRECT` pairing enforced: a failed read is a safe `FAILED`, never `UNKNOWN`, and never a durable ledger entry.
+- Execution: `github.issue.get` is the first real `DIRECT` capability — a bounded, projected GitHub issue read (`owner/name` + number → number, title, state, URL, author, timestamps). It never returns the raw provider payload, never consumes more than a bounded response body, and never echoes response bodies or credentials in errors; it shares the provider identity and configuration with the mutation adapter and is registered when the GitHub integration is enabled.
+- Execution: `system.info` now executes through the `DIRECT` route its descriptor already declared (`READ` + `STANDARD`), via `RegisterSystemInfoRead` reusing the handler projection, so there is exactly one implementation of the read. LOCAL hooks and DIRECT reads share one `routeRuntime` contract (`CallContext`/`CallFunc`), so the two in-process routes cannot drift apart.
+
 ### Execution — trusted route dispatcher and Function Hooks (LOCAL)
 
 - Execution: `RouteDispatcher` is the single dispatch point, reading the resolved `descriptor.execution_route` and never a caller value: `LOCAL` → Function Hooks, `DIRECT` → observational adapters (wired next), `CRABEDENCE` → the durable kernel. The class/route invariant is re-checked at dispatch time as defense in depth — a `MUTATION`/`CRITICAL` on a non-durable route is denied even if a registry bug produced the descriptor — and an unknown route fails closed instead of falling through to a dispatch.

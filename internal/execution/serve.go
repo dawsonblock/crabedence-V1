@@ -84,6 +84,7 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 		githubEnabled = false
 	}
 	var githubHandler *GitHubIssueHandler
+	var githubReads *GitHubReads
 	if githubEnabled {
 		if githubToken == "" {
 			return fmt.Errorf("github.issue.create enabled (CRABBOX_GITHUB_ENABLED) but no CRABBOX_GITHUB_TOKEN or GITHUB_TOKEN configured")
@@ -95,6 +96,12 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 		githubHandler = NewGitHubIssueHandler(baseURL, githubToken)
 		if err := RegisterGitHubIssueCapability(registry); err != nil {
 			return fmt.Errorf("failed to register github.issue.create: %w", err)
+		}
+		// The observational read shares the provider identity and
+		// configuration with the mutation adapter.
+		githubReads = NewGitHubReads(baseURL, githubToken)
+		if err := RegisterGitHubReadCapabilities(registry); err != nil {
+			return fmt.Errorf("failed to register github.issue.get: %w", err)
 		}
 	}
 
@@ -303,8 +310,18 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	if err := RegisterSystemEchoHook(hooks); err != nil {
 		return fmt.Errorf("failed to register system.echo function hook: %w", err)
 	}
+	directReads := NewDirectReadRegistry()
+	if err := RegisterSystemInfoRead(directReads, infoHandler); err != nil {
+		return fmt.Errorf("failed to register system.info direct read: %w", err)
+	}
+	if githubReads != nil {
+		if err := RegisterGitHubReads(directReads, githubReads); err != nil {
+			return fmt.Errorf("failed to register github.issue.get direct read: %w", err)
+		}
+	}
 	dispatcher := NewRouteDispatcher(durable)
 	dispatcher.SetLocal(hooks)
+	dispatcher.SetDirect(directReads)
 	handler = dispatcher
 
 	service := NewService(registry, handler, opts.SocketPath)
