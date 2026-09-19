@@ -370,7 +370,7 @@ jobs:
       # digest claim (evidence-manifest.json) must remain verifiable.
       # artifact.json represents the source archives, not the evidence bundle.
       - name: Verify release artifact
-        run: bash scripts/verify-release-artifact.sh
+        run: bash scripts/verify-release-artifact.sh dist/release-evidence . "dist/crabedence-${RELEASE_VERSION}.tar.gz"
 
       # ─── Generate SBOM (fail-closed, pinned version) ──────────────────
       - name: Generate SBOM

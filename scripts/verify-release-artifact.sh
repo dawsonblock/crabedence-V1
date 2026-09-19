@@ -110,8 +110,16 @@ if [ -f "$ARTIFACT_JSON" ]; then
     fi
   fi
 else
-  check "artifact.json (missing)" "FAIL"
-  echo "  ERROR: artifact.json is not part of the evidence bundle" >&2
+  # No artifact.json. That is only a failure when an archive was
+  # supplied — the release-verification path, where the artifact binding
+  # must exist. A qualification run that builds no archive has no
+  # artifact binding to verify, so the absence is informational.
+  if [ -n "$ARCHIVE_PATH" ]; then
+    check "artifact.json (missing)" "FAIL"
+    echo "  ERROR: artifact.json is not part of the evidence bundle" >&2
+  else
+    echo "  note: artifact.json not present; artifact binding not verified (no archive supplied)"
+  fi
 fi
 
 # 1. SHA256SUMS verification.
