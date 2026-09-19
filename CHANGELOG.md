@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Capability trust — descriptor identity in request identity, registry snapshot for planners
+
+- Capability: descriptors carry a declared `descriptor_version` (default 1) and an optional `policy_revision`; `DescriptorDigest()` returns the canonical SHA-256 of the full policy projection (schema, class, assurance, route, authority policy, adapter, version, revision). The registry digest and the new canonical `Registry.Snapshot()` cover the same bytes.
+- Execution: request identity now binds the descriptor version + digest (`ComputeDigestFromRawWithDescriptor`), so a registry policy change is never invisible to idempotency. Records created before this binding remain replayable through a one-shot legacy-digest compatibility window in the executor — the descriptor-bound digest conflicts, the legacy digest matches, the stored result replays — while a genuine conflict still fails closed and new records always store the descriptor-bound digest. A descriptor version bump is a new execution identity.
+- Execution: `crabbox serve-execution` writes the canonical registry snapshot (`capabilities.json`, 0600, crash-durable atomic write) next to its socket.
+- NEMO: the kernel routes on the resolved `executionRoute` — never on the execution class — resolving the route once at registration (explicit registry route wins; a documented default table mirrors the Go registry for hand-registered descriptors) and failing registration when a route cannot satisfy the class. `loadCatalogFromSnapshot`/`parseRegistrySnapshot` consume the authoritative snapshot with fail-closed validation of the digest, descriptors, classes, routes, and adapters.
+
 ### Execution — framed transport hardening
 
 - Execution: the service's response writer now uses a `writeFull` helper — a Unix stream write may accept fewer bytes than requested, and a truncated frame would corrupt the protocol. Short writes are continued, a zero-byte write is a hard error rather than a silent stall, and frame writes are error-checked instead of ignored. The length prefix uses `binary.BigEndian`, a response that cannot be framed (over the 4 MiB bound) is replaced by a parseable error frame instead of being written truncated, and every connection carries a 60-second whole-connection deadline in addition to the read/write deadlines.

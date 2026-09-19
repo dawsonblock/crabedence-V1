@@ -25,25 +25,97 @@ import (
 // descriptor. Schema is carried as its normalized parsed form so key
 // order and numeric spelling cannot change the digest.
 type canonicalDescriptor struct {
-	ID               string           `json:"id"`
-	ExecutionClass   ExecutionClass   `json:"execution_class"`
-	AssuranceProfile AssuranceProfile `json:"assurance_profile"`
-	ExecutionRoute   ExecutionRoute   `json:"execution_route"`
-	Schema           any              `json:"schema,omitempty"`
-	AuthorityPolicy  AuthorityPolicy  `json:"authority_policy"`
-	AdapterID        string           `json:"adapter_id"`
+	ID                string           `json:"id"`
+	DescriptorVersion int              `json:"descriptor_version"`
+	PolicyRevision    string           `json:"policy_revision,omitempty"`
+	ExecutionClass    ExecutionClass   `json:"execution_class"`
+	AssuranceProfile  AssuranceProfile `json:"assurance_profile"`
+	ExecutionRoute    ExecutionRoute   `json:"execution_route"`
+	Schema            any              `json:"schema,omitempty"`
+	AuthorityPolicy   AuthorityPolicy  `json:"authority_policy"`
+	AdapterID         string           `json:"adapter_id"`
+}
+
+// Snapshot is the machine-readable registry export consumed by
+// planner-side runtimes (NEMO). It carries the registry digest and the
+// canonical descriptor projection — the same bytes the digest covers —
+// so a planner can route on trusted descriptors instead of maintaining
+// its own capability catalog.
+type Snapshot struct {
+	RegistrySHA256 string                `json:"registry_sha256"`
+	Descriptors    []canonicalDescriptor `json:"descriptors"`
+}
+
+// Snapshot returns the canonical registry export.
+func (r *Registry) Snapshot() (Snapshot, error) {
+	digest, err := r.Digest()
+	if err != nil {
+		return Snapshot{}, err
+	}
+
+	r.mu.RLock()
+	ids := make([]string, 0, len(r.entries))
+	for id := range r.entries {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	descriptors := make([]canonicalDescriptor, 0, len(ids))
+	for _, id := range ids {
+		descriptor, err := canonicalDescriptorOf(r.entries[id])
+		if err != nil {
+			r.mu.RUnlock()
+			return Snapshot{}, err
+		}
+		descriptors = append(descriptors, descriptor)
+	}
+	r.mu.RUnlock()
+
+	return Snapshot{RegistrySHA256: digest, Descriptors: descriptors}, nil
+}
+
+// JSON returns the canonical snapshot bytes.
+func (s Snapshot) JSON() ([]byte, error) {
+	canonical, err := idempotency.CanonicalJSON(s)
+	if err != nil {
+		return nil, fmt.Errorf("canonicalize capability registry snapshot: %w", err)
+	}
+	return []byte(canonical), nil
+}
+
+// DescriptorDigest returns the canonical SHA-256 digest of this
+// resolved descriptor — the capability policy identity bound into
+// every request digest. A policy change (schema, class, assurance,
+// route, authority policy, adapter, declared version) changes this
+// digest.
+func (d ResolvedDescriptor) DescriptorDigest() (string, error) {
+	projection, err := canonicalDescriptorOf(d)
+	if err != nil {
+		return "", err
+	}
+	canonical, err := idempotency.CanonicalJSON(projection)
+	if err != nil {
+		return "", fmt.Errorf("canonicalize capability %s descriptor: %w", d.ID, err)
+	}
+	sum := sha256.Sum256([]byte(canonical))
+	return hex.EncodeToString(sum[:]), nil
 }
 
 // canonicalDescriptorOf projects a resolved descriptor into its
 // canonical digest form, failing closed on a malformed schema.
 func canonicalDescriptorOf(d ResolvedDescriptor) (canonicalDescriptor, error) {
+	version := d.DescriptorVersion
+	if version == 0 {
+		version = 1
+	}
 	out := canonicalDescriptor{
-		ID:               d.ID,
-		ExecutionClass:   d.ExecutionClass,
-		AssuranceProfile: d.AssuranceProfile,
-		ExecutionRoute:   d.ExecutionRoute,
-		AuthorityPolicy:  d.AuthorityPolicy,
-		AdapterID:        d.AdapterID,
+		ID:                d.ID,
+		DescriptorVersion: version,
+		PolicyRevision:    d.PolicyRevision,
+		ExecutionClass:    d.ExecutionClass,
+		AssuranceProfile:  d.AssuranceProfile,
+		ExecutionRoute:    d.ExecutionRoute,
+		AuthorityPolicy:   d.AuthorityPolicy,
+		AdapterID:         d.AdapterID,
 	}
 	if len(d.Schema) > 0 {
 		parsed, err := decodeUseNumber(d.Schema)
@@ -194,6 +266,9 @@ func (r *Registry) Validate() error {
 
 	var findings []error
 	for _, descriptor := range descriptors {
+		if descriptor.DescriptorVersion < 0 {
+			findings = append(findings, fmt.Errorf("capability %s: descriptor version must be >= 1, got %d", descriptor.ID, descriptor.DescriptorVersion))
+		}
 		if !descriptor.ExecutionClass.Valid() {
 			findings = append(findings, fmt.Errorf("capability %s: invalid execution class %q", descriptor.ID, descriptor.ExecutionClass))
 		}

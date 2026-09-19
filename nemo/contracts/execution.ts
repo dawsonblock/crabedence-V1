@@ -34,6 +34,21 @@
  */
 export type ExecutionClass = "PURE" | "READ" | "MUTATION" | "CRITICAL";
 
+// ─── Execution route ──────────────────────────────────────────────────
+
+/**
+ * Execution route determines which mechanism dispatches the capability.
+ * It is resolved by the authoritative registry and travels with the
+ * descriptor; the kernel routes on it, never on a classification it
+ * maintains itself.
+ *
+ * LOCAL       — in-process function hook (PURE only)
+ * DIRECT      — observational read adapter (READ only, no durable ledger)
+ * CRABEDENCE  — the durable execution kernel (MUTATION/CRITICAL, and
+ *               any capability needing durable idempotency or evidence)
+ */
+export type ExecutionRoute = "LOCAL" | "DIRECT" | "CRABEDENCE";
+
 // ─── Authority ────────────────────────────────────────────────────────
 
 /**
@@ -170,6 +185,15 @@ export interface CapabilityDescriptor {
   readonly resultSchema?: unknown;
   /** Pinned execution class. Cannot be changed after registration. */
   readonly executionClass: ExecutionClass;
+  /**
+   * Resolved execution route from the authoritative registry. When
+   * absent, the catalog resolves the documented default for the
+   * class/assurance pairing once, at registration — the kernel always
+   * routes on the resolved route, never on the class.
+   */
+  readonly executionRoute?: ExecutionRoute;
+  /** Declared descriptor version from the registry (default 1). */
+  readonly descriptorVersion?: number;
   /** Adapter that handles this capability (e.g. "local", "crabedence"). */
   readonly adapter: string;
   /** Authority policy identifier (e.g. "communications.email.send"). */

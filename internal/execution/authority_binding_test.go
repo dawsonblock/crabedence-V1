@@ -79,24 +79,13 @@ func TestServiceBindsResolvedAuthorityIntoRequestDigest(t *testing.T) {
 	}
 
 	// The stored request digest must bind the resolved generation +
-	// grant digest, not merely the grant_id.
+	// grant digest, not merely the grant_id — and the capability policy
+	// identity (descriptor version + digest).
 	rec, err := istore.LookupByKey(ctx, "alice@example.com", "test.counter.increment", key)
 	if err != nil {
 		t.Fatalf("lookup: %v", err)
 	}
-	desc := registry.Admit(capability.AdmissionRequest{
-		Capability:     "test.counter.increment",
-		Principal:      "alice@example.com",
-		GrantID:        "grant_x",
-		IdempotencyKey: "k",
-	}).Descriptor
-	want, err := idempotency.ComputeDigestFromRawWithAuthority(
-		1, "alice@example.com", "test.counter.increment", args,
-		"grant_x", "MUTATION", issued.Generation, issued.Digest,
-		string(desc.AssuranceProfile), string(desc.ExecutionRoute))
-	if err != nil {
-		t.Fatalf("compute digest: %v", err)
-	}
+	want := expectedRequestDigest(t, registry, "test.counter.increment", args, "grant_x", issued.Generation, issued.Digest)
 	if rec.RequestDigest != want {
 		t.Fatalf("stored digest %s does not bind resolved authority (want %s)", rec.RequestDigest, want)
 	}
@@ -199,21 +188,33 @@ func TestCallerCannotForgeAuthorityBinding(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lookup: %v", err)
 	}
-	desc := registry.Admit(capability.AdmissionRequest{
-		Capability:     "test.counter.increment",
-		Principal:      "alice@example.com",
-		GrantID:        "grant_x",
-		IdempotencyKey: "k",
-	}).Descriptor
-	want, err := idempotency.ComputeDigestFromRawWithAuthority(
-		1, "alice@example.com", "test.counter.increment", args,
-		"grant_x", "MUTATION", issued.Generation, issued.Digest,
-		string(desc.AssuranceProfile), string(desc.ExecutionRoute))
-	if err != nil {
-		t.Fatalf("compute digest: %v", err)
-	}
+	want := expectedRequestDigest(t, registry, "test.counter.increment", args, "grant_x", issued.Generation, issued.Digest)
 	if rec.RequestDigest != want {
 		t.Fatal("caller-supplied authority material leaked into the request digest — " +
 			"service must overwrite it with the resolved grant's values")
 	}
+}
+
+// expectedRequestDigest computes the descriptor-bound request digest the
+// service must have stored for a request admitted under the registry.
+func expectedRequestDigest(t *testing.T, registry *capability.Registry, capabilityID string, args json.RawMessage, authorityRef string, generation int64, grantDigest string) string {
+	t.Helper()
+	desc := registry.Admit(capability.AdmissionRequest{
+		Capability:     capabilityID,
+		Principal:      "alice@example.com",
+		GrantID:        authorityRef,
+		IdempotencyKey: "k",
+	}).Descriptor
+	descriptorDigest, err := desc.DescriptorDigest()
+	if err != nil {
+		t.Fatalf("descriptor digest: %v", err)
+	}
+	digest, err := idempotency.ComputeDigestFromRawWithDescriptor(
+		1, "alice@example.com", capabilityID, args, authorityRef, string(desc.ExecutionClass),
+		generation, grantDigest, string(desc.AssuranceProfile), string(desc.ExecutionRoute),
+		desc.DescriptorVersion, descriptorDigest)
+	if err != nil {
+		t.Fatalf("compute digest: %v", err)
+	}
+	return digest
 }

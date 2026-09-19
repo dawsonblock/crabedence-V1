@@ -27,6 +27,7 @@ import type {
   CapabilityDescriptor,
   ExecutionClass,
   ExecutionPort,
+  ExecutionRoute,
   KernelExecutionOutcome,
   KernelExecutionRequest,
 } from "../contracts/index";
@@ -35,9 +36,28 @@ import { SchemaValidator, type CompiledSchemas } from "./schema";
 // ─── Capability registry ──────────────────────────────────────────────
 
 /**
+ * DefaultExecutionRoute is the registration-time default for a
+ * descriptor that declares no route. It mirrors the Go registry's
+ * DefaultExecutionRoute table — the same policy function, not
+ * per-capability knowledge. In production every descriptor arrives
+ * from the authoritative registry snapshot with an explicit route.
+ */
+export function defaultExecutionRoute(executionClass: ExecutionClass): ExecutionRoute {
+  switch (executionClass) {
+    case "PURE":
+      return "LOCAL";
+    case "READ":
+      return "DIRECT";
+    default:
+      return "CRABEDENCE";
+  }
+}
+
+/**
  * Immutable capability catalog. Once a capability is registered, its
- * execution class cannot be changed. This prevents runtime downgrades
- * (e.g. a model prompt cannot downgrade CRITICAL to READ for speed).
+ * execution class and route cannot be changed. This prevents runtime
+ * downgrades (e.g. a model prompt cannot downgrade CRITICAL to READ for
+ * speed).
  *
  * Schemas are compiled by a real JSON Schema validator at registration
  * time: a capability whose declared schema does not compile never
@@ -45,6 +65,7 @@ import { SchemaValidator, type CompiledSchemas } from "./schema";
  */
 export class CapabilityCatalog {
   private readonly capabilities = new Map<string, CapabilityDescriptor>();
+  private readonly routes = new Map<string, ExecutionRoute>();
   private readonly schemas = new Map<string, CompiledSchemas>();
   private readonly validator = new SchemaValidator();
 
@@ -52,6 +73,9 @@ export class CapabilityCatalog {
     if (this.capabilities.has(descriptor.id)) {
       throw new Error(`capability already registered: ${descriptor.id}`);
     }
+    const route = descriptor.executionRoute ?? defaultExecutionRoute(descriptor.executionClass);
+    validateRoutePairing(descriptor.id, descriptor.executionClass, route);
+
     // Deep freeze the descriptor and its schema to prevent mutation,
     // and compile the schemas FROM THE FROZEN COPY so a caller that
     // keeps a reference to the original object cannot alter what the
@@ -63,6 +87,7 @@ export class CapabilityCatalog {
       frozen.resultSchema,
     );
     this.capabilities.set(frozen.id, frozen);
+    this.routes.set(frozen.id, route);
     this.schemas.set(frozen.id, compiled);
   }
 
@@ -72,6 +97,18 @@ export class CapabilityCatalog {
       throw new Error(`unknown capability: ${capabilityId}`);
     }
     return descriptor;
+  }
+
+  /**
+   * routeOf returns the resolved execution route for a capability —
+   * the only input the kernel uses to choose a dispatch mechanism.
+   */
+  routeOf(capabilityId: string): ExecutionRoute {
+    const route = this.routes.get(capabilityId);
+    if (!route) {
+      throw new Error(`unknown capability: ${capabilityId}`);
+    }
+    return route;
   }
 
   has(capabilityId: string): boolean {
@@ -120,6 +157,35 @@ function deepFreeze<T>(value: T): T {
     }
   }
   return value;
+}
+
+/**
+ * validateRoutePairing fails registration when a route cannot satisfy
+ * the capability's effect class — the same invariant the authoritative
+ * registry enforces. A LOCAL capability is PURE; a DIRECT capability
+ * is READ; MUTATION/CRITICAL require the durable route.
+ */
+function validateRoutePairing(
+  capabilityId: string,
+  executionClass: ExecutionClass,
+  route: ExecutionRoute,
+): void {
+  switch (route) {
+    case "LOCAL":
+      if (executionClass !== "PURE") {
+        throw new Error(`capability ${capabilityId}: route LOCAL requires PURE, got ${executionClass}`);
+      }
+      return;
+    case "DIRECT":
+      if (executionClass !== "READ") {
+        throw new Error(`capability ${capabilityId}: route DIRECT requires READ, got ${executionClass}`);
+      }
+      return;
+    case "CRABEDENCE":
+      return;
+    default:
+      throw new Error(`capability ${capabilityId}: unknown execution route ${JSON.stringify(route)}`);
+  }
 }
 
 // ─── Deadline validation ──────────────────────────────────────────────
@@ -268,11 +334,12 @@ export class NemoKernel {
       };
     }
 
-    // Route based on execution class.
-    const port =
-      descriptor.executionClass === "PURE"
-        ? this.ports.local
-        : this.ports.remote;
+    // Route on the resolved execution route — never on a
+    // classification the kernel maintains itself. LOCAL executes
+    // in-process; DIRECT and CRABEDENCE execute in the service, whose
+    // own route dispatcher decides which mechanism runs.
+    const route = this.catalog.routeOf(request.capabilityId);
+    const port = route === "LOCAL" ? this.ports.local : this.ports.remote;
 
     const outcome = await port.execute({
       ...request,

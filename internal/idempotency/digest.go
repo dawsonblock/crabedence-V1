@@ -275,6 +275,16 @@ type DigestInput struct {
 	// is additive, not a format change).
 	AssuranceProfile string `json:"assurance_profile,omitempty"`
 	ExecutionRoute   string `json:"execution_route,omitempty"`
+	// DescriptorVersion and DescriptorDigest bind the exact capability
+	// policy that admitted the request — a policy change (schema,
+	// class, assurance, route, authority policy, adapter) is a new
+	// execution identity, so idempotency can never silently reinterpret
+	// a durable record under different policy. Zero values bind nothing
+	// (the binding is additive, not a format change), which is also the
+	// compatibility path for records created before descriptor
+	// identity existed.
+	DescriptorVersion int    `json:"descriptor_version,omitempty"`
+	DescriptorDigest  string `json:"descriptor_digest,omitempty"`
 }
 
 // ComputeDigest computes the SHA-256 digest of the canonical JSON
@@ -321,6 +331,12 @@ func ComputeDigest(input DigestInput) (string, error) {
 	if input.ExecutionRoute != "" {
 		canonicalInput["execution_route"] = input.ExecutionRoute
 	}
+	if input.DescriptorVersion != 0 {
+		canonicalInput["descriptor_version"] = input.DescriptorVersion
+	}
+	if input.DescriptorDigest != "" {
+		canonicalInput["descriptor_digest"] = input.DescriptorDigest
+	}
 	canonical, err := CanonicalJSON(canonicalInput)
 	if err != nil {
 		return "", fmt.Errorf("failed to canonicalize digest input: %w", err)
@@ -351,6 +367,26 @@ func ComputeDigestFromRaw(protocolVersion int, principal, capability string, arg
 // Zero values bind nothing and produce byte-identical digests to
 // ComputeDigestFromRaw.
 func ComputeDigestFromRawWithAuthority(protocolVersion int, principal, capability string, args json.RawMessage, grantID, class string, authorityGeneration int64, authorityDigest, assuranceProfile, executionRoute string) (string, error) {
+	return computeDigestFromRaw(protocolVersion, principal, capability, args, grantID, class,
+		authorityGeneration, authorityDigest, assuranceProfile, executionRoute, 0, "")
+}
+
+// ComputeDigestFromRawWithDescriptor is ComputeDigestFromRawWithAuthority
+// plus the capability policy identity: the descriptor version and
+// canonical descriptor digest that admitted the request. A registry
+// policy change (schema, class, assurance, route, authority policy,
+// adapter) produces a new descriptor digest, so it can never silently
+// reinterpret a durable record or idempotency key.
+//
+// Zero values bind nothing and produce byte-identical digests to
+// ComputeDigestFromRawWithAuthority — that is the compatibility path
+// for records created before descriptor identity existed.
+func ComputeDigestFromRawWithDescriptor(protocolVersion int, principal, capability string, args json.RawMessage, grantID, class string, authorityGeneration int64, authorityDigest, assuranceProfile, executionRoute string, descriptorVersion int, descriptorDigest string) (string, error) {
+	return computeDigestFromRaw(protocolVersion, principal, capability, args, grantID, class,
+		authorityGeneration, authorityDigest, assuranceProfile, executionRoute, descriptorVersion, descriptorDigest)
+}
+
+func computeDigestFromRaw(protocolVersion int, principal, capability string, args json.RawMessage, grantID, class string, authorityGeneration int64, authorityDigest, assuranceProfile, executionRoute string, descriptorVersion int, descriptorDigest string) (string, error) {
 	dec := json.NewDecoder(strings.NewReader(string(args)))
 	dec.UseNumber()
 	var argsMap map[string]any
@@ -382,6 +418,8 @@ func ComputeDigestFromRawWithAuthority(protocolVersion int, principal, capabilit
 		AuthorityDigest:     authorityDigest,
 		AssuranceProfile:    assuranceProfile,
 		ExecutionRoute:      executionRoute,
+		DescriptorVersion:   descriptorVersion,
+		DescriptorDigest:    descriptorDigest,
 	})
 }
 

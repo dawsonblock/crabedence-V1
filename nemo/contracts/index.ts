@@ -11,6 +11,7 @@ export type {
   ExecutionEvidence,
   ExecutionMeta,
   ExecutionPort,
+  ExecutionRoute,
   ExecutionStatus,
   KernelExecutionOutcome,
   KernelExecutionRequest,

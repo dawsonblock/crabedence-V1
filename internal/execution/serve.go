@@ -290,6 +290,24 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	}
 	fmt.Fprint(os.Stderr, report.String())
 
+	// Export the canonical registry snapshot next to the socket so
+	// planner-side runtimes (NEMO) route on trusted descriptors instead
+	// of maintaining their own capability catalog. The snapshot carries
+	// the registry digest and the exact bytes it covers.
+	snapshot, err := registry.Snapshot()
+	if err != nil {
+		return fmt.Errorf("capability registry snapshot failed: %w", err)
+	}
+	payload, err := snapshot.JSON()
+	if err != nil {
+		return fmt.Errorf("capability registry snapshot failed: %w", err)
+	}
+	catalogPath := filepath.Join(filepath.Dir(opts.SocketPath), "capabilities.json")
+	if err := writeFileAtomic(catalogPath, payload, 0o600); err != nil {
+		return fmt.Errorf("failed to write capability registry snapshot: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "Capability registry snapshot: %s\n", catalogPath)
+
 	if store != nil {
 		// Use DispatchExecutor for durable idempotency
 		executor := NewDispatchExecutor(multiHandler, store)
@@ -405,6 +423,41 @@ func NewFailClosedHandler(inner Handler) *FailClosedHandler {
 // durationSeconds converts an int64 to a time.Duration.
 func durationSeconds(s int64) time.Duration {
 	return time.Duration(s) * time.Second
+}
+
+// writeFileAtomic writes a file crash-durably: temp file in the same
+// directory, file fsync, rename, then directory fsync. A partially
+// written registry snapshot must never be observable.
+func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
+	dir := filepath.Dir(path)
+	temp, err := os.CreateTemp(dir, ".capabilities-*")
+	if err != nil {
+		return err
+	}
+	tempName := temp.Name()
+	defer os.Remove(tempName) // no-op after a successful rename
+	if _, err := temp.Write(data); err != nil {
+		temp.Close()
+		return err
+	}
+	if err := temp.Sync(); err != nil {
+		temp.Close()
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tempName, mode); err != nil {
+		return err
+	}
+	if err := os.Rename(tempName, path); err != nil {
+		return err
+	}
+	if dirHandle, err := os.Open(dir); err == nil {
+		_ = dirHandle.Sync()
+		_ = dirHandle.Close()
+	}
+	return nil
 }
 
 // replicatedDeployment reports whether the operator declared a

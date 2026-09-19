@@ -188,6 +188,19 @@ type CapabilityDescriptor struct {
 	// ID is the unique capability identifier (e.g. "email.send").
 	ID string `json:"id"`
 
+	// DescriptorVersion is the declared policy version of this
+	// capability. Changing a capability's policy (schema, class,
+	// assurance, route, authority policy, adapter) requires bumping
+	// this version: the version and the canonical descriptor digest
+	// are bound into every request identity, so a policy change is
+	// never invisible to idempotency. Zero defaults to 1.
+	DescriptorVersion int `json:"descriptor_version,omitempty"`
+
+	// PolicyRevision is free-form operator audit text identifying the
+	// policy revision (e.g. a ticket or commit reference). It is part
+	// of the descriptor digest.
+	PolicyRevision string `json:"policy_revision,omitempty"`
+
 	// ExecutionClass is the effect classification.
 	ExecutionClass ExecutionClass `json:"execution_class"`
 
@@ -219,6 +232,12 @@ type CapabilityDescriptor struct {
 type ResolvedDescriptor struct {
 	// ID is the unique capability identifier (e.g. "email.send").
 	ID string `json:"id"`
+
+	// DescriptorVersion is the declared policy version (default 1).
+	DescriptorVersion int `json:"descriptor_version"`
+
+	// PolicyRevision is operator audit text for the policy revision.
+	PolicyRevision string `json:"policy_revision,omitempty"`
 
 	// ExecutionClass is the pinned effect classification.
 	ExecutionClass ExecutionClass `json:"execution_class"`
@@ -295,6 +314,16 @@ func Resolve(d CapabilityDescriptor) (ResolvedDescriptor, error) {
 		return ResolvedDescriptor{}, fmt.Errorf("invalid execution class: %s", d.ExecutionClass)
 	}
 
+	// Resolve the descriptor version: zero means the first policy
+	// version. A negative version is a registration error.
+	descriptorVersion := d.DescriptorVersion
+	if descriptorVersion == 0 {
+		descriptorVersion = 1
+	}
+	if descriptorVersion < 1 {
+		return ResolvedDescriptor{}, fmt.Errorf("capability %s: descriptor version must be >= 1, got %d", d.ID, descriptorVersion)
+	}
+
 	// Resolve assurance profile from default if unspecified.
 	assurance := d.AssuranceProfile
 	if assurance == "" {
@@ -319,13 +348,15 @@ func Resolve(d CapabilityDescriptor) (ResolvedDescriptor, error) {
 	}
 
 	return ResolvedDescriptor{
-		ID:               d.ID,
-		ExecutionClass:   d.ExecutionClass,
-		AssuranceProfile: assurance,
-		ExecutionRoute:   route,
-		Schema:           d.Schema,
-		AuthorityPolicy:  d.AuthorityPolicy,
-		AdapterID:        d.AdapterID,
+		ID:                d.ID,
+		DescriptorVersion: descriptorVersion,
+		PolicyRevision:    d.PolicyRevision,
+		ExecutionClass:    d.ExecutionClass,
+		AssuranceProfile:  assurance,
+		ExecutionRoute:    route,
+		Schema:            d.Schema,
+		AuthorityPolicy:   d.AuthorityPolicy,
+		AdapterID:         d.AdapterID,
 	}, nil
 }
 

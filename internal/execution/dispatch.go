@@ -90,6 +90,12 @@ func durabilityContext(ctx context.Context, budget time.Duration) (context.Conte
 	return context.WithTimeout(context.WithoutCancel(ctx), budget)
 }
 
+// requestDigestProtocolVersion is the digest ABI version. The
+// descriptor-identity binding is additive (zero values bind nothing),
+// so it does not require a protocol bump; the executor's legacy-digest
+// retry covers records created before descriptor identity existed.
+const requestDigestProtocolVersion = 1
+
 // DispatchExecutor wraps a Handler with dispatch-point tracking and
 // durable idempotency. It ensures:
 //   - Pre-dispatch failures return FAILED (safe)
@@ -236,8 +242,22 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	// grant_id under different immutable authority material is a
 	// different request — reissuing or mutating a grant never silently
 	// reinterprets a durable execution or idempotency key.
-	digest, err := idempotency.ComputeDigestFromRawWithAuthority(
-		1, // protocol version
+	//
+	// The capability policy identity is bound too: the descriptor
+	// version and its canonical digest. A registry policy change
+	// (schema, class, assurance, route, authority policy, adapter) is
+	// therefore a new execution identity, never a silent
+	// reinterpretation of an existing record.
+	descriptorDigest, err := desc.DescriptorDigest()
+	if err != nil {
+		return Response{
+			Status:      StatusFailed,
+			FailureCode: string(capability.FailureInternalError),
+			Error:       fmt.Sprintf("failed to compute descriptor digest: %v", err),
+		}
+	}
+	digest, err := idempotency.ComputeDigestFromRawWithDescriptor(
+		requestDigestProtocolVersion,
 		req.Authority.Principal,
 		req.Capability,
 		req.Arguments,
@@ -247,6 +267,8 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		req.Authority.AuthorityDigest,
 		string(desc.AssuranceProfile),
 		string(desc.ExecutionRoute),
+		desc.DescriptorVersion,
+		descriptorDigest,
 	)
 	if err != nil {
 		return Response{
@@ -263,17 +285,46 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	if leaseDuration <= 0 {
 		leaseDuration = idempotency.DefaultLeaseDuration
 	}
+	authorityBinding := idempotency.AuthorityBinding{
+		Ref:        req.Authority.EffectiveAuthorityRef(),
+		Generation: req.Authority.AuthorityGeneration,
+		Digest:     req.Authority.AuthorityDigest,
+	}
 	acq, err := e.store.AcquireWithAuthority(ctx, req.IdempotencyKey, req.Authority.Principal, req.Capability, digest,
-		idempotency.AuthorityBinding{
-			Ref:        req.Authority.EffectiveAuthorityRef(),
-			Generation: req.Authority.AuthorityGeneration,
-			Digest:     req.Authority.AuthorityDigest,
-		}, string(desc.ExecutionClass), leaseDuration)
+		authorityBinding, string(desc.ExecutionClass), leaseDuration)
 	if err != nil {
 		return Response{
 			Status:      StatusFailed,
 			FailureCode: string(capability.FailureInternalError),
 			Error:       fmt.Sprintf("idempotency acquire failed: %v", err),
+		}
+	}
+
+	// Compatibility window for records created before descriptor
+	// identity was bound: their stored digest is the legacy digest, so
+	// the descriptor-bound digest conflicts. Recompute the legacy
+	// digest and retry the acquisition exactly once — a genuine
+	// conflict (neither digest matches the stored record) still fails
+	// closed, and new records always store the descriptor-bound digest.
+	if acq.Kind == idempotency.IdempotencyConflict {
+		legacyDigest, legacyErr := idempotency.ComputeDigestFromRawWithAuthority(
+			requestDigestProtocolVersion,
+			req.Authority.Principal,
+			req.Capability,
+			req.Arguments,
+			req.Authority.EffectiveAuthorityRef(),
+			string(desc.ExecutionClass),
+			req.Authority.AuthorityGeneration,
+			req.Authority.AuthorityDigest,
+			string(desc.AssuranceProfile),
+			string(desc.ExecutionRoute),
+		)
+		if legacyErr == nil && legacyDigest != digest {
+			if legacyAcq, legacyAcquireErr := e.store.AcquireWithAuthority(ctx, req.IdempotencyKey,
+				req.Authority.Principal, req.Capability, legacyDigest, authorityBinding,
+				string(desc.ExecutionClass), leaseDuration); legacyAcquireErr == nil {
+				acq = legacyAcq
+			}
 		}
 	}
 
