@@ -75,6 +75,21 @@ func TestServeWritesRegistrySnapshotOnAFreshDirectory(t *testing.T) {
 	if len(descriptors) == 0 {
 		t.Fatal("snapshot must contain the built-in descriptors")
 	}
+	// The registry is static for a release: the complete built-in
+	// capability surface is present even when a deployment has no
+	// GitHub credentials (adapter availability is runtime state, not
+	// registry membership).
+	ids := make(map[string]bool, len(descriptors))
+	for _, descriptor := range descriptors {
+		if id, ok := descriptor["id"].(string); ok {
+			ids[id] = true
+		}
+	}
+	for _, want := range []string{"system.echo", "system.info", "test.counter.increment", "github.issue.create", "github.issue.get"} {
+		if !ids[want] {
+			t.Fatalf("registry snapshot is missing %s (registry membership must not depend on deployment configuration)", want)
+		}
+	}
 
 	info, err := os.Stat(snapshotPath)
 	if err != nil {

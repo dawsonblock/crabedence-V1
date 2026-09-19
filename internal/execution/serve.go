@@ -66,17 +66,30 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 		return fmt.Errorf("failed to register system.info: %w", err)
 	}
 
-	// github.issue.create is opt-in: it is registered only when
-	// explicitly configured via CRABBOX_GITHUB_TOKEN (or GITHUB_TOKEN)
-	// or CRABBOX_GITHUB_ENABLED. Enabling without a token fails closed
-	// at startup rather than registering a capability that cannot run.
+	// The capability registry is STATIC for a release: every built-in
+	// capability is registered regardless of deployment configuration,
+	// so the registry digest identifies the security policy this build
+	// ships rather than the environment it runs in. Adapter
+	// availability is a runtime property — an unwired adapter fails
+	// closed at dispatch (known capability, unavailable adapter), never
+	// as an unknown capability and never as a routing change.
+	if err := RegisterGitHubIssueCapability(registry); err != nil {
+		return fmt.Errorf("failed to register github.issue.create: %w", err)
+	}
+	if err := RegisterGitHubReadCapabilities(registry); err != nil {
+		return fmt.Errorf("failed to register github.issue.get: %w", err)
+	}
+
+	// Adapter wiring is deployment configuration: CRABBOX_GITHUB_ENABLED
+	// forces the adapter on, a token enables it implicitly, and
+	// enabling without a token still fails closed at startup.
 	githubToken := os.Getenv("CRABBOX_GITHUB_TOKEN")
 	if githubToken == "" {
 		githubToken = os.Getenv("GITHUB_TOKEN")
 	}
 	// GITHUB_TOKEN is ambient in many dev shells and CI environments —
 	// an explicit CRABBOX_GITHUB_ENABLED=false/0/no must disable the
-	// capability even when a token is present.
+	// adapter even when a token is present.
 	githubEnabled := githubToken != ""
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("CRABBOX_GITHUB_ENABLED"))) {
 	case "true", "1", "yes":
@@ -88,22 +101,16 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	var githubReads *GitHubReads
 	if githubEnabled {
 		if githubToken == "" {
-			return fmt.Errorf("github.issue.create enabled (CRABBOX_GITHUB_ENABLED) but no CRABBOX_GITHUB_TOKEN or GITHUB_TOKEN configured")
+			return fmt.Errorf("github adapter enabled (CRABBOX_GITHUB_ENABLED) but no CRABBOX_GITHUB_TOKEN or GITHUB_TOKEN configured")
 		}
 		baseURL := os.Getenv("CRABBOX_GITHUB_API_URL")
 		if baseURL == "" {
 			baseURL = "https://api.github.com"
 		}
 		githubHandler = NewGitHubIssueHandler(baseURL, githubToken)
-		if err := RegisterGitHubIssueCapability(registry); err != nil {
-			return fmt.Errorf("failed to register github.issue.create: %w", err)
-		}
 		// The observational read shares the provider identity and
 		// configuration with the mutation adapter.
 		githubReads = NewGitHubReads(baseURL, githubToken)
-		if err := RegisterGitHubReadCapabilities(registry); err != nil {
-			return fmt.Errorf("failed to register github.issue.get: %w", err)
-		}
 	}
 
 	// Create handlers
@@ -282,8 +289,12 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	for adapterID := range handlers {
 		knownAdapters[adapterID] = true
 	}
+	// Unwired adapters are legitimate deployment state, not a registry
+	// defect: the capability stays registered (static policy) and fails
+	// closed at dispatch (dynamic availability). Report them so an
+	// operator can see exactly what this deployment cannot execute.
 	if err := registry.ValidateAdapters(knownAdapters); err != nil {
-		return err
+		fmt.Fprintf(os.Stderr, "capability adapters not configured (registered but unavailable): %v\n", err)
 	}
 	report, err := registry.Report()
 	if err != nil {
