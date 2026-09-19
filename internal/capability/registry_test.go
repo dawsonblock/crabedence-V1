@@ -152,8 +152,8 @@ func TestAdmitCapabilityUnimplemented(t *testing.T) {
 	if decision.Allowed {
 		t.Fatal("expected not allowed for unimplemented capability")
 	}
-	if decision.FailureCode != FailureCapabilityUnimplemented {
-		t.Errorf("expected CAPABILITY_UNIMPLEMENTED, got %s", decision.FailureCode)
+	if decision.FailureCode != FailureCapabilityUnavailable {
+		t.Errorf("expected CAPABILITY_UNAVAILABLE, got %s", decision.FailureCode)
 	}
 }
 

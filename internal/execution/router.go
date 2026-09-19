@@ -86,7 +86,7 @@ func (d *RouteDispatcher) Execute(ctx context.Context, req Request, desc capabil
 func unimplementedRoute(desc capability.ResolvedDescriptor) Response {
 	return Response{
 		Status:      StatusFailed,
-		FailureCode: string(capability.FailureCapabilityUnimplemented),
+		FailureCode: string(capability.FailureCapabilityUnavailable),
 		Error:       fmt.Sprintf("capability %s declares route %s but no dispatcher is wired for it", desc.ID, desc.ExecutionRoute),
 	}
 }
@@ -192,7 +192,7 @@ func (r *routeRuntime) execute(ctx context.Context, req Request, desc capability
 	if !ok {
 		return Response{
 			Status:      StatusFailed,
-			FailureCode: string(capability.FailureCapabilityUnimplemented),
+			FailureCode: string(capability.FailureCapabilityUnavailable),
 			Error:       fmt.Sprintf("no %s handler registered for capability: %s", r.route, req.Capability),
 		}
 	}

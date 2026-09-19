@@ -77,7 +77,7 @@ class/route invariant at dispatch time as defense in depth (a
 `MUTATION`/`CRITICAL` on a non-durable route is denied even if a
 registry bug produced the descriptor), and fails closed on an unknown
 route. Until the `DIRECT` leg lands, `READ` capabilities that declare
-it fail with `CAPABILITY_UNIMPLEMENTED` rather than silently taking a
+it fail with `CAPABILITY_UNAVAILABLE` rather than silently taking a
 different path.
 
 ## The planner boundary

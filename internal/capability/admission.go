@@ -22,9 +22,9 @@ const (
 	// FailureCapabilityNotFound means the capability is not registered.
 	FailureCapabilityNotFound FailureCode = "CAPABILITY_NOT_FOUND"
 
-	// FailureCapabilityUnimplemented means the capability is registered
+	// FailureCapabilityUnavailable means the capability is registered
 	// but no adapter is wired to handle it.
-	FailureCapabilityUnimplemented FailureCode = "CAPABILITY_UNIMPLEMENTED"
+	FailureCapabilityUnavailable FailureCode = "CAPABILITY_UNAVAILABLE"
 
 	// FailureAdmissionDenied means admission checks failed (class mismatch,
 	// schema validation, authority policy, deadline).
@@ -156,7 +156,7 @@ func (r *Registry) Admit(req AdmissionRequest) AdmissionDecision {
 	if desc.AdapterID == "" {
 		return AdmissionDecision{
 			Allowed:     false,
-			FailureCode: FailureCapabilityUnimplemented,
+			FailureCode: FailureCapabilityUnavailable,
 			Reason:      fmt.Sprintf("capability has no adapter: %s", req.Capability),
 		}
 	}

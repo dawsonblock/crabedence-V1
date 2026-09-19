@@ -93,7 +93,7 @@ func TestRouteDispatcherRoutesByDescriptorRoute(t *testing.T) {
 
 	// DIRECT with no adapter wired fails closed.
 	direct := dispatcher.Execute(context.Background(), testRequest("test.read"), readDirectDescriptor("test.read"))
-	if direct.Status != StatusFailed || direct.FailureCode != string(capability.FailureCapabilityUnimplemented) {
+	if direct.Status != StatusFailed || direct.FailureCode != string(capability.FailureCapabilityUnavailable) {
 		t.Fatalf("unwired DIRECT route must fail closed, got %s: %s", direct.Status, direct.Error)
 	}
 
@@ -163,7 +163,7 @@ func TestFunctionHookRuntimeContract(t *testing.T) {
 
 	// Unregistered capability fails closed.
 	missing := registry.Execute(context.Background(), testRequest("test.missing"), pureLocalDescriptor("test.missing"))
-	if missing.FailureCode != string(capability.FailureCapabilityUnimplemented) {
+	if missing.FailureCode != string(capability.FailureCapabilityUnavailable) {
 		t.Fatalf("unregistered capability must be unimplemented, got %s: %s", missing.FailureCode, missing.Error)
 	}
 

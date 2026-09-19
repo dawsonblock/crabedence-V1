@@ -81,7 +81,7 @@ idempotency key.
 | `UNAUTHORIZED` | Missing principal, missing required grant, or resolution denied (not found, revoked, expired, wrong principal/capability). |
 | `ADMISSION_DENIED` | Registry-level rejection (unknown capability, class mismatch, missing idempotency key for a mutation, expired deadline). |
 | `CAPABILITY_NOT_FOUND` | Capability is not registered. |
-| `CAPABILITY_UNIMPLEMENTED` | Registered but no adapter is wired. |
+| `CAPABILITY_UNAVAILABLE` | Registered but no adapter is wired. |
 
 ## Invariants and their tests
 

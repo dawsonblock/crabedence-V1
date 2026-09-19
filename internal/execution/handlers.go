@@ -25,7 +25,7 @@ func (h *MultiHandler) Execute(ctx context.Context, req Request, desc capability
 	if !ok {
 		return Response{
 			Status:      StatusFailed,
-			FailureCode: string(capability.FailureCapabilityUnimplemented),
+			FailureCode: string(capability.FailureCapabilityUnavailable),
 			Error:       "no handler registered for adapter: " + desc.AdapterID,
 		}
 	}

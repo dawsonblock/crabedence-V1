@@ -410,7 +410,7 @@ func validateSchemaKeywords(schema map[string]any, path string) error {
 // ValidateAdapters checks that every registered capability is bound to
 // an adapter the service can actually dispatch. A capability whose
 // adapter is not wired could only ever produce
-// CAPABILITY_UNIMPLEMENTED at execution time — refuse it at startup
+// CAPABILITY_UNAVAILABLE at execution time — refuse it at startup
 // instead.
 func (r *Registry) ValidateAdapters(known map[string]bool) error {
 	r.mu.RLock()

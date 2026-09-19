@@ -168,7 +168,7 @@ func TestDirectRegistryEnforcesRouteAndClass(t *testing.T) {
 
 	// Unregistered reads fail closed.
 	missing := reads.Execute(context.Background(), testRequest("test.missing"), readDirectDescriptor("test.missing"))
-	if missing.FailureCode != string(capability.FailureCapabilityUnimplemented) {
+	if missing.FailureCode != string(capability.FailureCapabilityUnavailable) {
 		t.Fatalf("unregistered DIRECT capability must be unimplemented, got %s", missing.FailureCode)
 	}
 }

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Capability — availability is distinct from existence
+
+- Capability: the failure code for a registered capability whose adapter is not configured is now `CAPABILITY_UNAVAILABLE` (was `CAPABILITY_UNIMPLEMENTED`), matching the trust model's vocabulary: `CAPABILITY_NOT_FOUND` means the software/policy definition does not recognize the capability, while `CAPABILITY_UNAVAILABLE` means it is known but this runtime cannot currently execute it. Availability remains runtime state — it never changes registry membership, routing, or the registry digest.
+
 ### Trust-closure repair — verified registry envelope, structural trusted catalog, drift fixes
 
 - Capability: the registry export is now a **verifiable envelope** — the digest plus the exact canonical bytes it covers (`canonical_payload`, base64). Consumers verify SHA-256 over the bytes they were given and only then parse them, so a tampered payload, or a digest that does not cover its payload, fails closed. Cross-language canonicalization deliberately never enters the boundary: the canonical bytes are produced once by the authoritative Go implementation and travel with the digest.
