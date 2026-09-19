@@ -2,6 +2,9 @@ package execution
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -46,14 +49,30 @@ func TestServeWritesRegistrySnapshotOnAFreshDirectory(t *testing.T) {
 		t.Fatal("serve must export the registry snapshot next to its socket")
 	}
 
-	var snapshot capability.Snapshot
-	if err := json.Unmarshal(data, &snapshot); err != nil {
+	var envelope capability.SnapshotEnvelope
+	if err := json.Unmarshal(data, &envelope); err != nil {
 		t.Fatalf("snapshot is not valid JSON: %v", err)
 	}
-	if len(snapshot.RegistrySHA256) != 64 {
-		t.Fatalf("registry digest = %q, want a 64-character hex digest", snapshot.RegistrySHA256)
+	if len(envelope.RegistrySHA256) != 64 {
+		t.Fatalf("registry digest = %q, want a 64-character hex digest", envelope.RegistrySHA256)
 	}
-	if len(snapshot.Descriptors) == 0 {
+	if envelope.CanonicalPayload == "" {
+		t.Fatal("envelope must carry the canonical payload bytes")
+	}
+	// The digest must cover exactly the bytes the envelope carries.
+	payload, err := base64.StdEncoding.DecodeString(envelope.CanonicalPayload)
+	if err != nil {
+		t.Fatalf("canonical payload is not valid base64: %v", err)
+	}
+	sum := sha256.Sum256(payload)
+	if hex.EncodeToString(sum[:]) != envelope.RegistrySHA256 {
+		t.Fatal("registry digest does not cover the canonical payload it ships with")
+	}
+	var descriptors []map[string]any
+	if err := json.Unmarshal(payload, &descriptors); err != nil {
+		t.Fatalf("canonical payload is not a descriptor array: %v", err)
+	}
+	if len(descriptors) == 0 {
 		t.Fatal("snapshot must contain the built-in descriptors")
 	}
 

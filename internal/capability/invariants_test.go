@@ -1,11 +1,45 @@
 package capability
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // Architectural laws, as first-class named tests. Each test asserts one
 // law from the capability trust model
 // (docs/architecture/capability-trust-model.md); the law ID is the test
 // name, so a violation is unambiguous in CI output.
+
+// INV-013: A LOCAL capability can never require a grant — LOCAL
+// execution never reaches the authority resolver, so a grant
+// requirement would be silently unenforced.
+func TestINV013LocalCannotRequireAGrant(t *testing.T) {
+	_, err := Resolve(CapabilityDescriptor{
+		ID: "inv.local", ExecutionClass: ClassPure, ExecutionRoute: RouteLocal,
+		AdapterID:       "adapter",
+		AuthorityPolicy: AuthorityPolicy{ID: "inv.local", GrantRequired: true},
+	})
+	if err == nil {
+		t.Fatal("INV-013 violated: a LOCAL capability required a grant")
+	}
+	if !strings.Contains(err.Error(), "LOCAL route cannot require a grant") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// The whole-registry scan rejects it too, so a descriptor that
+	// bypassed Resolve cannot enter a validated registry.
+	registry := NewRegistry()
+	if err := registry.RegisterResolved(ResolvedDescriptor{
+		ID: "inv.local.scan", DescriptorVersion: 1, ExecutionClass: ClassPure,
+		AssuranceProfile: AssuranceNone, ExecutionRoute: RouteLocal, AdapterID: "adapter",
+		AuthorityPolicy: AuthorityPolicy{ID: "inv.local.scan", GrantRequired: true},
+	}); err != nil {
+		t.Fatalf("RegisterResolved: %v", err)
+	}
+	if err := registry.Validate(); err == nil {
+		t.Fatal("INV-013 violated: the registry scan accepted LOCAL + grant-required")
+	}
+}
 
 // INV-001: A MUTATION can never execute through LOCAL (or any other
 // non-durable route).

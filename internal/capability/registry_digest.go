@@ -2,6 +2,7 @@ package capability
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -82,6 +83,44 @@ func (s Snapshot) JSON() ([]byte, error) {
 	return []byte(canonical), nil
 }
 
+// SnapshotEnvelope is the verifiable registry export: the digest plus
+// the exact canonical bytes it covers, base64-encoded.
+//
+// The canonical bytes travel WITH the digest so a consumer never has to
+// reproduce Go's canonicalization — it verifies SHA-256 over the bytes
+// it was given and only then parses them. That removes the entire class
+// of cross-language canonicalization mismatches (number representation,
+// key order, escaping) from the trust boundary: a consumer that cannot
+// reproduce the bytes byte-for-byte still verifies them cryptographically.
+type SnapshotEnvelope struct {
+	// RegistrySHA256 is the SHA-256 of CanonicalPayload's decoded bytes.
+	RegistrySHA256 string `json:"registry_sha256"`
+	// CanonicalPayload is base64 of the canonical descriptor array.
+	CanonicalPayload string `json:"canonical_payload"`
+}
+
+// Envelope returns the verifiable registry export.
+func (r *Registry) Envelope() (SnapshotEnvelope, error) {
+	canonical, err := r.canonicalDescriptorBytes()
+	if err != nil {
+		return SnapshotEnvelope{}, err
+	}
+	sum := sha256.Sum256(canonical)
+	return SnapshotEnvelope{
+		RegistrySHA256:   hex.EncodeToString(sum[:]),
+		CanonicalPayload: base64.StdEncoding.EncodeToString(canonical),
+	}, nil
+}
+
+// JSON returns the canonical envelope bytes.
+func (e SnapshotEnvelope) JSON() ([]byte, error) {
+	canonical, err := idempotency.CanonicalJSON(e)
+	if err != nil {
+		return nil, fmt.Errorf("canonicalize capability registry envelope: %w", err)
+	}
+	return []byte(canonical), nil
+}
+
 // DescriptorDigest returns the canonical SHA-256 digest of this
 // resolved descriptor — the capability policy identity bound into
 // every request digest. A policy change (schema, class, assurance,
@@ -131,9 +170,10 @@ func canonicalDescriptorOf(d ResolvedDescriptor) (canonicalDescriptor, error) {
 	return out, nil
 }
 
-// Digest returns the SHA-256 digest of the canonical registry
-// serialization.
-func (r *Registry) Digest() (string, error) {
+// canonicalDescriptorBytes returns the exact canonical bytes the
+// registry digest covers: the descriptor projection, sorted by ID,
+// canonicalized once by the authoritative Go implementation.
+func (r *Registry) canonicalDescriptorBytes() ([]byte, error) {
 	r.mu.RLock()
 	ids := make([]string, 0, len(r.entries))
 	for id := range r.entries {
@@ -145,7 +185,7 @@ func (r *Registry) Digest() (string, error) {
 		descriptor, err := canonicalDescriptorOf(r.entries[id])
 		if err != nil {
 			r.mu.RUnlock()
-			return "", err
+			return nil, err
 		}
 		projection = append(projection, descriptor)
 	}
@@ -153,9 +193,19 @@ func (r *Registry) Digest() (string, error) {
 
 	canonical, err := idempotency.CanonicalJSON(projection)
 	if err != nil {
-		return "", fmt.Errorf("canonicalize capability registry: %w", err)
+		return nil, fmt.Errorf("canonicalize capability registry: %w", err)
 	}
-	sum := sha256.Sum256([]byte(canonical))
+	return []byte(canonical), nil
+}
+
+// Digest returns the SHA-256 digest of the canonical registry
+// serialization.
+func (r *Registry) Digest() (string, error) {
+	canonical, err := r.canonicalDescriptorBytes()
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(canonical)
 	return hex.EncodeToString(sum[:]), nil
 }
 
@@ -280,6 +330,9 @@ func (r *Registry) Validate() error {
 		}
 		if err := ValidateDescriptorCompatibility(descriptor.ExecutionClass, descriptor.AssuranceProfile, descriptor.ExecutionRoute); err != nil {
 			findings = append(findings, fmt.Errorf("capability %s: %w", descriptor.ID, err))
+		}
+		if descriptor.ExecutionRoute == RouteLocal && descriptor.AuthorityPolicy.GrantRequired {
+			findings = append(findings, fmt.Errorf("capability %s: LOCAL route cannot require a grant — LOCAL execution never reaches the authority resolver", descriptor.ID))
 		}
 		if descriptor.AdapterID == "" {
 			findings = append(findings, fmt.Errorf("capability %s: no adapter binding — the service cannot dispatch it", descriptor.ID))

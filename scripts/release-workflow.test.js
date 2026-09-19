@@ -503,7 +503,7 @@ test("provenance binds the explicit producer manifest, separate packager, notari
       "--producer-arch",
       "arm64",
       "--go-version",
-      "go1.26.4",
+      "go1.26.5",
       "--goreleaser-version",
       "2.17.0",
       "--swift-version",
@@ -548,7 +548,7 @@ test("provenance binds the explicit producer manifest, separate packager, notari
     "--notary-vmd-arm64",
     "44444444-4444-4444-8444-444444444444",
     "--packager-go-version",
-    "go1.26.4",
+    "go1.26.5",
     "--packager-os",
     "15.5",
     "--packager-arch",
@@ -584,7 +584,7 @@ test("provenance binds the explicit producer manifest, separate packager, notari
     assert.equal(provenance.producer.manifestSha256, candidateManifestSha256);
     assert.equal(provenance.producer.swift, "Apple Swift version 6.1 (swiftlang-test)");
     assert.equal(provenance.producer.inputs.length, 7);
-    assert.equal(provenance.packager.go, "go1.26.4");
+    assert.equal(provenance.packager.go, "go1.26.5");
     assert.equal(
       provenance.payloads
         .flatMap((entry) => entry.binaries)
@@ -651,7 +651,7 @@ test("candidate manifest rejects byte, mode, and pinned source drift before sign
       "--producer-arch",
       "arm64",
       "--go-version",
-      "go1.26.4",
+      "go1.26.5",
       "--goreleaser-version",
       "2.17.0",
       "--swift-version",

@@ -20,6 +20,13 @@ function makeTree(overrides = {}) {
       packages: { "": { name: WORKER_NAME, version: "0.50.0" } },
     }),
     "nemo/package.json": JSON.stringify({ name: "@crabedence/nemo", version: "0.50.0" }),
+    "nemo/package-lock.json": JSON.stringify({
+      name: "@crabedence/nemo",
+      version: "0.50.0",
+      lockfileVersion: 3,
+      packages: { "": { name: "@crabedence/nemo", version: "0.50.0" } },
+    }),
+    "go.mod": "module example.test/release\n\ngo 1.26\n\ntoolchain go1.26.4\n",
     "CHANGELOG.md": "# Changelog\n\n## Unreleased\n\n- next\n\n## 0.50.0 - 2026-09-05\n\n- shipped\n",
     "scripts/release-config.sh": "CRABBOX_RELEASE_GO_VERSION=go1.26.4\n",
     "scripts/release-provenance.mjs": 'const GO_VERSION = "go1.26.4";\n',
@@ -84,7 +91,29 @@ test("changelog mismatch is rejected", async (t) => {
   assert.match(findings[0], /latest released section 0\.49\.1 does not equal VERSION 0\.50\.0/);
 });
 
+test("nemo lockfile drift is rejected", async (t) => {
+  const root = withTree(t, {
+    "nemo/package-lock.json": JSON.stringify({
+      name: "@crabedence/nemo",
+      version: "0.1.0",
+      lockfileVersion: 3,
+      packages: { "": { name: "@crabedence/nemo", version: "0.1.0" } },
+    }),
+  });
+  const findings = await verifyVersionConsistency({ root });
+  assert.equal(findings.length, 2);
+  assert.ok(findings.some((finding) => /nemo\/package-lock\.json version 0\.1\.0/.test(finding)));
+  assert.ok(findings.some((finding) => /packages\[""\]\.version 0\.1\.0/.test(finding)));
+});
+
 test("preparing a pre-release requires a newer base than the latest release", async (t) => {
+  const nemoLock = (version) =>
+    JSON.stringify({
+      name: "@crabedence/nemo",
+      version,
+      lockfileVersion: 3,
+      packages: { "": { name: "@crabedence/nemo", version } },
+    });
   const files = {
     VERSION: "0.51.0-rc.1\n",
     "worker/package.json": JSON.stringify({ name: WORKER_NAME, version: "0.51.0-rc.1" }),
@@ -95,10 +124,23 @@ test("preparing a pre-release requires a newer base than the latest release", as
       packages: { "": { name: WORKER_NAME, version: "0.51.0-rc.1" } },
     }),
     "nemo/package.json": JSON.stringify({ name: "@crabedence/nemo", version: "0.51.0-rc.1" }),
+    "nemo/package-lock.json": nemoLock("0.51.0-rc.1"),
   };
   assert.deepEqual(await verifyVersionConsistency({ root: withTree(t, files) }), []);
 
-  const stale = withTree(t, { ...files, VERSION: "0.50.0-rc.1\n", "worker/package.json": JSON.stringify({ name: WORKER_NAME, version: "0.50.0-rc.1" }), "worker/package-lock.json": JSON.stringify({ name: WORKER_NAME, version: "0.50.0-rc.1", lockfileVersion: 3, packages: { "": { name: WORKER_NAME, version: "0.50.0-rc.1" } } }), "nemo/package.json": JSON.stringify({ name: "@crabedence/nemo", version: "0.50.0-rc.1" }) });
+  const stale = withTree(t, {
+    ...files,
+    VERSION: "0.50.0-rc.1\n",
+    "worker/package.json": JSON.stringify({ name: WORKER_NAME, version: "0.50.0-rc.1" }),
+    "worker/package-lock.json": JSON.stringify({
+      name: WORKER_NAME,
+      version: "0.50.0-rc.1",
+      lockfileVersion: 3,
+      packages: { "": { name: WORKER_NAME, version: "0.50.0-rc.1" } },
+    }),
+    "nemo/package.json": JSON.stringify({ name: "@crabedence/nemo", version: "0.50.0-rc.1" }),
+    "nemo/package-lock.json": nemoLock("0.50.0-rc.1"),
+  });
   const findings = await verifyVersionConsistency({ root: stale });
   assert.equal(findings.length, 1);
   assert.match(findings[0], /must be newer than the latest released section 0\.50\.0/);
@@ -117,8 +159,26 @@ test("release toolchain drift is rejected", async (t) => {
     "scripts/release-provenance.mjs": 'const GO_VERSION = "go1.26.5";\n',
   });
   const findings = await verifyVersionConsistency({ root });
-  assert.equal(findings.length, 1);
-  assert.match(findings[0], /release Go toolchain drift/);
+  assert.ok(findings.some((finding) => /release Go toolchain drift/.test(finding)));
+  assert.ok(findings.some((finding) => /does not equal the go\.mod toolchain/.test(finding)));
+});
+
+test("release toolchain must match the module toolchain", async (t) => {
+  // Both release declarations agree with each other but disagree with
+  // go.mod — exactly the drift a mutual-agreement check cannot see.
+  const root = withTree(t, {
+    "scripts/release-config.sh": "CRABBOX_RELEASE_GO_VERSION=go1.26.3\n",
+    "scripts/release-provenance.mjs": 'const GO_VERSION = "go1.26.3";\n',
+  });
+  const findings = await verifyVersionConsistency({ root });
+  assert.equal(findings.length, 2);
+  assert.ok(findings.every((finding) => /does not equal the go\.mod toolchain go1\.26\.4/.test(finding)));
+});
+
+test("a missing module toolchain is rejected", async (t) => {
+  const root = withTree(t, { "go.mod": "module example.test/release\n\ngo 1.26\n" });
+  const findings = await verifyVersionConsistency({ root });
+  assert.deepEqual(findings, ["go.mod does not declare a toolchain"]);
 });
 
 test("malformed VERSION is rejected", async (t) => {

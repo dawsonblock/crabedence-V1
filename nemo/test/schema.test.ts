@@ -11,6 +11,7 @@ import {
   SchemaCompilationError,
   SchemaValidator,
 } from "../kernel/index";
+import { createTestKernel } from "../kernel/testing";
 
 /** A recording mock port that returns canned responses. */
 class MockPort implements ExecutionPort {
@@ -244,7 +245,7 @@ describe("NemoKernel trust boundaries", () => {
     for (const capability of capabilities) {
       catalog.register(capability);
     }
-    return new NemoKernel(catalog, { local, remote });
+    return createTestKernel(catalog, { local, remote });
   }
 
   it("accepts a grant-free invocation (principal only)", async () => {

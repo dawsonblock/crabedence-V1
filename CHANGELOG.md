@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Trust-closure repair — verified registry envelope, structural trusted catalog, drift fixes
+
+- Capability: the registry export is now a **verifiable envelope** — the digest plus the exact canonical bytes it covers (`canonical_payload`, base64). Consumers verify SHA-256 over the bytes they were given and only then parse them, so a tampered payload, or a digest that does not cover its payload, fails closed. Cross-language canonicalization deliberately never enters the boundary: the canonical bytes are produced once by the authoritative Go implementation and travel with the digest.
+- NEMO: `loadCatalogFromSnapshot` performs that verification (strict base64, constant-time digest comparison) before building the catalog — a capability rewritten from `MUTATION`/`CRABEDENCE` to `PURE`/`LOCAL` with a stale digest is rejected. `NemoKernel` now accepts only a `VerifiedCapabilityCatalog`, so a hand-built catalog cannot reach a production kernel; tests use the explicit `createTestKernel`/`createTestCatalog` helpers.
+- Capability: `LOCAL` capabilities can no longer require a grant (INV-013) — LOCAL execution never reaches the authority resolver, so a grant requirement would be silently unenforced. Enforced at registration, in the whole-registry scan, and in the NEMO envelope loader.
+- Execution: the registry envelope's directory fsync and close are hard failures — a write that may not survive a crash is no longer reported as durable.
+- Release: the version checker now covers `nemo/package-lock.json` (which had drifted at 0.1.0) and requires the release Go toolchain to agree with `go.mod`'s toolchain. The release declarations had agreed with each other while both disagreed with the module (`go1.26.4` vs `go1.26.5`); the drift is fixed (release config and provenance now `go1.26.5`, fixtures updated).
+
 ### Capability trust — route invariants tightened, architectural laws named
 
 - Capability: `CRITICAL` now requires `HIGH_ASSURANCE` and `MUTATION` requires durable assurance (`DURABLE` or `HIGH_ASSURANCE`) on the durable route — a CRITICAL operation that cannot produce signed evidence is not a CRITICAL operation, and registering one would silently downgrade the guarantee the class promises.

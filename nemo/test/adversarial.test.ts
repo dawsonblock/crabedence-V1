@@ -38,6 +38,7 @@ import {
 } from "../adapters/crabedence/index";
 import { CapabilityCatalog, NemoKernel } from "../kernel/index";
 import type { ExecutionPort, KernelExecutionOutcome, KernelExecutionRequest } from "../contracts/index";
+import { createTestKernel } from "../kernel/testing";
 
 // ─── Test helpers ─────────────────────────────────────────────────────
 
@@ -330,7 +331,7 @@ describe("Adversarial: Kernel admission", () => {
       adapter: "crabedence",
       authorityPolicy: "test",
     });
-    const kernel = new NemoKernel(catalog, { local, remote });
+    const kernel = createTestKernel(catalog, { local, remote });
 
     const outcome = await kernel.execute({
       capabilityId: "test.cap",
@@ -354,7 +355,7 @@ describe("Adversarial: Kernel admission", () => {
       adapter: "crabedence",
       authorityPolicy: "test",
     });
-    const kernel = new NemoKernel(catalog, { local, remote });
+    const kernel = createTestKernel(catalog, { local, remote });
 
     const outcome = await kernel.execute({
       capabilityId: "test.cap",
@@ -378,7 +379,7 @@ describe("Adversarial: Kernel admission", () => {
       adapter: "crabedence",
       authorityPolicy: "test",
     });
-    const kernel = new NemoKernel(catalog, { local, remote });
+    const kernel = createTestKernel(catalog, { local, remote });
 
     const outcome = await kernel.execute({
       capabilityId: "test.cap",
@@ -408,7 +409,7 @@ describe("Adversarial: Kernel admission", () => {
       adapter: "crabedence",
       authorityPolicy: "email.send",
     });
-    const kernel = new NemoKernel(catalog, { local, remote });
+    const kernel = createTestKernel(catalog, { local, remote });
 
     const outcome = await kernel.execute({
       capabilityId: "email.send",
@@ -437,7 +438,7 @@ describe("Adversarial: Kernel admission", () => {
       adapter: "crabedence",
       authorityPolicy: "email.send",
     });
-    const kernel = new NemoKernel(catalog, { local, remote });
+    const kernel = createTestKernel(catalog, { local, remote });
 
     const outcome = await kernel.execute({
       capabilityId: "email.send",
@@ -464,7 +465,7 @@ describe("Adversarial: Kernel admission", () => {
       adapter: "crabedence",
       authorityPolicy: "email.send",
     });
-    const kernel = new NemoKernel(catalog, { local, remote });
+    const kernel = createTestKernel(catalog, { local, remote });
 
     const outcome = await kernel.execute({
       capabilityId: "email.send",
@@ -684,7 +685,7 @@ describe("Adversarial: Kernel admission", () => {
       adapter: "crabedence",
       authorityPolicy: "email.send",
     });
-    const kernel = new NemoKernel(catalog, { local, remote });
+    const kernel = createTestKernel(catalog, { local, remote });
 
     const outcome = await kernel.execute({
       capabilityId: "email.send",
@@ -716,7 +717,7 @@ describe("Adversarial: Kernel admission", () => {
       adapter: "crabedence",
       authorityPolicy: "email.send",
     });
-    const kernel = new NemoKernel(catalog, { local, remote });
+    const kernel = createTestKernel(catalog, { local, remote });
 
     const outcome = await kernel.execute({
       capabilityId: "email.send",

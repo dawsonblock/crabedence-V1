@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 
 import type {
@@ -10,8 +11,9 @@ import {
   NemoKernel,
   SnapshotError,
   loadCatalogFromSnapshot,
-  parseRegistrySnapshot,
+  parseRegistryEnvelope,
 } from "../kernel/index";
+import { createTestKernel } from "../kernel/testing";
 
 class MockPort implements ExecutionPort {
   readonly calls: KernelExecutionRequest[] = [];
@@ -27,10 +29,13 @@ class MockPort implements ExecutionPort {
   }
 }
 
-const DIGEST = "a".repeat(64);
-
-function snapshot(descriptors: unknown[]): unknown {
-  return { registry_sha256: DIGEST, descriptors };
+/** envelopeOf builds the verifiable envelope the registry exports. */
+function envelopeOf(descriptors: unknown[]): { registry_sha256: string; canonical_payload: string } {
+  const payload = Buffer.from(JSON.stringify(descriptors), "utf-8");
+  return {
+    registry_sha256: createHash("sha256").update(payload).digest("hex"),
+    canonical_payload: payload.toString("base64"),
+  };
 }
 
 const pureLocal = {
@@ -51,26 +56,90 @@ const pureDurable = {
   adapter_id: "crabedence",
 };
 
-describe("registry snapshot loading", () => {
-  it("rejects malformed snapshots", () => {
-    expect(() => parseRegistrySnapshot(null)).toThrow(SnapshotError);
-    expect(() => parseRegistrySnapshot({ descriptors: [] })).toThrow(/registry_sha256/);
-    expect(() => parseRegistrySnapshot({ registry_sha256: "short", descriptors: [] })).toThrow(/registry_sha256/);
-    expect(() => parseRegistrySnapshot({ registry_sha256: DIGEST, descriptors: {} })).toThrow(/must be an array/);
-    expect(() => parseRegistrySnapshot(snapshot([null]))).toThrow(/must be an object/);
-    expect(() => parseRegistrySnapshot(snapshot([{ ...pureLocal, id: "" }]))).toThrow(/has no id/);
-    expect(() => parseRegistrySnapshot(snapshot([{ ...pureLocal, execution_class: "SIDEWAYS" }]))).toThrow(
+describe("registry envelope verification", () => {
+  it("rejects malformed envelopes", () => {
+    expect(() => parseRegistryEnvelope(null)).toThrow(SnapshotError);
+    expect(() => parseRegistryEnvelope({ canonical_payload: "e30=" })).toThrow(/registry_sha256/);
+    expect(() => parseRegistryEnvelope({ registry_sha256: "short", canonical_payload: "e30=" })).toThrow(
+      /registry_sha256/,
+    );
+    expect(() => parseRegistryEnvelope({ registry_sha256: "a".repeat(64) })).toThrow(/canonical_payload/);
+    expect(() => parseRegistryEnvelope({ registry_sha256: "a".repeat(64), canonical_payload: "" })).toThrow(
+      /canonical_payload/,
+    );
+    expect(() =>
+      parseRegistryEnvelope({ registry_sha256: "a".repeat(64), canonical_payload: "not base64!!" }),
+    ).not.toThrow(); // shape is fine; the payload check happens on load
+    expect(() =>
+      loadCatalogFromSnapshot({ registry_sha256: "a".repeat(64), canonical_payload: "not base64!!" }),
+    ).toThrow(/not valid base64/);
+  });
+
+  it("rejects a payload its digest does not cover (the tampering case)", () => {
+    // A legitimate export for a MUTATION capability.
+    const trusted = envelopeOf([
+      { ...pureDurable, id: "account.delete", execution_class: "MUTATION", execution_route: "CRABEDENCE" },
+    ]);
+    // The attack: rewrite the payload to a harmless-looking PURE/LOCAL
+    // capability and keep the original digest.
+    const tamperedPayload = Buffer.from(
+      JSON.stringify([
+        {
+          ...pureLocal,
+          id: "account.delete",
+          execution_class: "PURE",
+          execution_route: "LOCAL",
+        },
+      ]),
+      "utf-8",
+    );
+    const tampered = {
+      registry_sha256: trusted.registry_sha256,
+      canonical_payload: tamperedPayload.toString("base64"),
+    };
+    expect(() => loadCatalogFromSnapshot(tampered)).toThrow(/does not cover its payload/);
+  });
+
+  it("rejects a digest that does not match its payload", () => {
+    const envelope = envelopeOf([pureLocal]);
+    const wrongDigest = { ...envelope, registry_sha256: "b".repeat(64) };
+    expect(() => loadCatalogFromSnapshot(wrongDigest)).toThrow(/does not cover its payload/);
+  });
+
+  it("rejects invalid descriptors inside a valid envelope", () => {
+    expect(() => loadCatalogFromSnapshot(envelopeOf([null]))).toThrow(/must be an object/);
+    expect(() => loadCatalogFromSnapshot(envelopeOf([{ ...pureLocal, id: "" }]))).toThrow(/has no id/);
+    expect(() => loadCatalogFromSnapshot(envelopeOf([{ ...pureLocal, execution_class: "SIDEWAYS" }]))).toThrow(
       /invalid execution_class/,
     );
-    expect(() => parseRegistrySnapshot(snapshot([{ ...pureLocal, execution_route: "FABRIC" }]))).toThrow(
+    expect(() => loadCatalogFromSnapshot(envelopeOf([{ ...pureLocal, execution_route: "FABRIC" }]))).toThrow(
       /invalid execution_route/,
     );
-    expect(() => parseRegistrySnapshot(snapshot([{ ...pureLocal, adapter_id: "" }]))).toThrow(/adapter_id is required/);
+    expect(() => loadCatalogFromSnapshot(envelopeOf([{ ...pureLocal, adapter_id: "" }]))).toThrow(
+      /adapter_id is required/,
+    );
+    expect(() => loadCatalogFromSnapshot(envelopeOf([{ not: "an array element" }]))).toThrow(/has no id/);
+    // A payload that is valid JSON but not an array.
+    const payload = Buffer.from(JSON.stringify({ descriptors: [] }), "utf-8");
+    expect(() =>
+      loadCatalogFromSnapshot({
+        registry_sha256: createHash("sha256").update(payload).digest("hex"),
+        canonical_payload: payload.toString("base64"),
+      }),
+    ).toThrow(/must be a descriptor array/);
+  });
+
+  it("rejects LOCAL with a required grant — LOCAL never reaches the authority resolver", () => {
+    expect(() =>
+      loadCatalogFromSnapshot(
+        envelopeOf([{ ...pureLocal, authority_policy: { id: "sensitive.local", grant_required: true } }]),
+      ),
+    ).toThrow(/LOCAL route cannot require a grant/);
   });
 
   it("loads descriptors with their registry routes", () => {
-    const { catalog, registrySha256 } = loadCatalogFromSnapshot(snapshot([pureLocal, pureDurable]));
-    expect(registrySha256).toBe(DIGEST);
+    const { catalog, registrySha256 } = loadCatalogFromSnapshot(envelopeOf([pureLocal, pureDurable]));
+    expect(registrySha256).toHaveLength(64);
     expect(catalog.has("math.add")).toBe(true);
     expect(catalog.routeOf("math.add")).toBe("LOCAL");
     expect(catalog.routeOf("math.add.durable")).toBe("CRABEDENCE");
@@ -80,8 +149,8 @@ describe("registry snapshot loading", () => {
   it("routes on the resolved route, not the execution class", async () => {
     const local = new MockPort({ status: "SUCCEEDED", result: 1 });
     const remote = new MockPort({ status: "SUCCEEDED", result: 2 });
-    const { catalog } = loadCatalogFromSnapshot(snapshot([pureLocal, pureDurable]));
-    const kernel = new NemoKernel(catalog, { local, remote });
+    const { catalog } = loadCatalogFromSnapshot(envelopeOf([pureLocal, pureDurable]));
+    const kernel = createTestKernel(catalog, { local, remote });
 
     const localOutcome = await kernel.execute({
       capabilityId: "math.add",

@@ -75,6 +75,15 @@ export async function verifyVersionConsistency({ root, tag } = {}) {
     findings.push(`nemo/package.json version ${nemo.version} does not equal VERSION ${version}`);
   }
 
+  const nemoLock = await readJSON("nemo/package-lock.json");
+  if (nemoLock.version !== version) {
+    findings.push(`nemo/package-lock.json version ${nemoLock.version} does not equal VERSION ${version}`);
+  }
+  const nemoLockRoot = nemoLock.packages?.[""]?.version;
+  if (nemoLockRoot !== version) {
+    findings.push(`nemo/package-lock.json packages[""].version ${nemoLockRoot} does not equal VERSION ${version}`);
+  }
+
   const changelog = await read("CHANGELOG.md");
   const released = [...changelog.matchAll(CHANGELOG_SECTION)].map((match) => match[1]);
   if (released.length === 0) {
@@ -104,6 +113,24 @@ export async function verifyVersionConsistency({ root, tag } = {}) {
     findings.push(
       `release Go toolchain drift: release-config.sh ${releaseGo} does not equal release-provenance.mjs ${provenanceGo}`,
     );
+  }
+
+  // The module's declared toolchain is canonical: release declarations
+  // must agree with go.mod, not merely with each other — otherwise two
+  // release components can agree while both disagree with the module.
+  const goMod = await read("go.mod");
+  const moduleToolchain = /^toolchain (go\d+\.\d+\.\d+)$/m.exec(goMod)?.[1];
+  if (!moduleToolchain) {
+    findings.push("go.mod does not declare a toolchain");
+  } else {
+    if (releaseGo && releaseGo !== moduleToolchain) {
+      findings.push(`release Go toolchain ${releaseGo} does not equal the go.mod toolchain ${moduleToolchain}`);
+    }
+    if (provenanceGo && provenanceGo !== moduleToolchain) {
+      findings.push(
+        `release-provenance.mjs Go toolchain ${provenanceGo} does not equal the go.mod toolchain ${moduleToolchain}`,
+      );
+    }
   }
 
   if (tag !== undefined) {

@@ -148,6 +148,33 @@ export class CapabilityCatalog {
   }
 }
 
+/**
+ * VerifiedCapabilityCatalog is a catalog built from a cryptographically
+ * verified registry envelope. The production kernel accepts ONLY this
+ * type, so "route on the authoritative registry" is enforced by the
+ * type system rather than by convention: a hand-built catalog cannot be
+ * passed to a production kernel.
+ *
+ * Tests that need a hand-built catalog use createTestKernel from
+ * ../kernel/testing, which makes the test-only path explicit at the
+ * call site.
+ */
+export class VerifiedCapabilityCatalog extends CapabilityCatalog {
+  private constructor() {
+    super();
+  }
+
+  /**
+   * @internal Verified catalogs are produced by
+   * loadCatalogFromSnapshot after the envelope digest is verified.
+   * This factory exists so the loader (a different module) can
+   * construct one; production code should never call it directly.
+   */
+  static forVerifiedEnvelope(): VerifiedCapabilityCatalog {
+    return new VerifiedCapabilityCatalog();
+  }
+}
+
 /** Deep freeze an object and all nested properties. */
 function deepFreeze<T>(value: T): T {
   if (value && typeof value === "object") {
@@ -269,7 +296,7 @@ export interface KernelPorts {
  */
 export class NemoKernel {
   constructor(
-    private readonly catalog: CapabilityCatalog,
+    private readonly catalog: VerifiedCapabilityCatalog,
     private readonly ports: KernelPorts,
   ) {}
 

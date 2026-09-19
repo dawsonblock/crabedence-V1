@@ -6,6 +6,7 @@ import type {
   KernelExecutionRequest,
 } from "../contracts/index";
 import { CapabilityCatalog, NemoKernel } from "../kernel/index";
+import { createTestKernel } from "../kernel/testing";
 
 // ─── Test helpers ─────────────────────────────────────────────────────
 
@@ -56,7 +57,7 @@ function makeKernel(
   for (const cap of capabilities) {
     catalog.register(cap);
   }
-  return new NemoKernel(catalog, { local, remote });
+  return createTestKernel(catalog, { local, remote });
 }
 
 const pureCap = {

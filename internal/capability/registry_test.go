@@ -207,15 +207,19 @@ func TestAdmitMissingPrincipal(t *testing.T) {
 
 func TestAdmitMissingGrantID(t *testing.T) {
 	r := NewRegistry()
-	r.Register(Descriptor{
+	// A grant-required capability must use a route whose admission
+	// reaches the authority resolver: LOCAL cannot require a grant.
+	if err := r.Register(Descriptor{
 		ID:             "test.nogrant",
-		ExecutionClass: ClassPure,
+		ExecutionClass: ClassRead,
 		AdapterID:      "test",
 		AuthorityPolicy: AuthorityPolicy{
 			ID:            "test.nogrant",
 			GrantRequired: true,
 		},
-	})
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
 
 	decision := r.Admit(AdmissionRequest{
 		Capability: "test.nogrant",

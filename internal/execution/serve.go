@@ -370,26 +370,29 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	}
 	defer service.Stop()
 
-	// Export the canonical registry snapshot next to the socket so
+	// Export the verifiable registry envelope next to the socket so
 	// planner-side runtimes (NEMO) route on trusted descriptors instead
-	// of maintaining their own capability catalog. The snapshot carries
-	// the registry digest and the exact bytes it covers. It is written
-	// AFTER the service starts: Service.Start creates and verifies the
-	// socket directory, so the snapshot lands in a secured directory
-	// (and startup fails closed rather than writing somewhere else).
-	snapshot, err := registry.Snapshot()
+	// of maintaining their own capability catalog. The envelope carries
+	// the registry digest AND the exact canonical bytes it covers, so a
+	// consumer verifies SHA-256 over the bytes it was given and only
+	// then parses them — no cross-language canonicalization is required
+	// for the verification to be sound. It is written AFTER the service
+	// starts: Service.Start creates and verifies the socket directory,
+	// so the envelope lands in a secured directory (and startup fails
+	// closed rather than writing somewhere else).
+	envelope, err := registry.Envelope()
 	if err != nil {
-		return fmt.Errorf("capability registry snapshot failed: %w", err)
+		return fmt.Errorf("capability registry envelope failed: %w", err)
 	}
-	payload, err := snapshot.JSON()
+	payload, err := envelope.JSON()
 	if err != nil {
-		return fmt.Errorf("capability registry snapshot failed: %w", err)
+		return fmt.Errorf("capability registry envelope failed: %w", err)
 	}
 	catalogPath := filepath.Join(filepath.Dir(opts.SocketPath), "capabilities.json")
 	if err := writeFileAtomic(catalogPath, payload, 0o600); err != nil {
-		return fmt.Errorf("failed to write capability registry snapshot: %w", err)
+		return fmt.Errorf("failed to write capability registry envelope: %w", err)
 	}
-	fmt.Fprintf(os.Stderr, "Capability registry snapshot: %s\n", catalogPath)
+	fmt.Fprintf(os.Stderr, "Capability registry snapshot: %s (sha256 %s)\n", catalogPath, envelope.RegistrySHA256)
 
 	fmt.Fprintf(os.Stderr, "Crabedence execution service listening on %s\n", opts.SocketPath)
 	fmt.Fprintf(os.Stderr, "Registered capabilities: %v\n", registry.List())
@@ -456,9 +459,20 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	if err := os.Rename(tempName, path); err != nil {
 		return err
 	}
-	if dirHandle, err := os.Open(dir); err == nil {
-		_ = dirHandle.Sync()
-		_ = dirHandle.Close()
+	// Commit the directory entry so the file survives a power loss.
+	// This is a hard failure, not a best-effort sync: a write that may
+	// not survive a crash must not be reported as durable.
+	dirHandle, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("open %s for durability commit: %w", dir, err)
+	}
+	syncErr := dirHandle.Sync()
+	closeErr := dirHandle.Close()
+	if syncErr != nil {
+		return fmt.Errorf("directory fsync failed — %s durability not guaranteed: %w", filepath.Base(path), syncErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("directory close failed after fsync: %w", closeErr)
 	}
 	return nil
 }

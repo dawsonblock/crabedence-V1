@@ -1,6 +1,7 @@
-export { CapabilityCatalog, NemoKernel, defaultExecutionRoute } from "./kernel";
+export { CapabilityCatalog, NemoKernel, VerifiedCapabilityCatalog, defaultExecutionRoute } from "./kernel";
 export type { KernelPorts } from "./kernel";
+export { createTestCatalog, createTestKernel } from "./testing";
 export { SchemaCompilationError, SchemaValidator } from "./schema";
 export type { CompiledSchemas } from "./schema";
-export { SnapshotError, loadCatalogFromSnapshot, parseRegistrySnapshot } from "./snapshot";
-export type { RegistryDescriptor, RegistrySnapshot } from "./snapshot";
+export { SnapshotError, loadCatalogFromSnapshot, parseRegistryEnvelope } from "./snapshot";
+export type { RegistryDescriptor, RegistryEnvelope } from "./snapshot";

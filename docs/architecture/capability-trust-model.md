@@ -119,20 +119,41 @@ Additional laws (INV-006…INV-010) are enforced in the effect fabric:
 see [recovery-model.md](recovery-model.md) and
 [effect-lifecycle.md](effect-lifecycle.md).
 
+## Registry export and verification
+
+The service writes a **verifiable envelope** next to its socket
+(`capabilities.json`, 0600, crash-durable atomic write):
+
+```json
+{ "registry_sha256": "<hex>", "canonical_payload": "<base64>" }
+```
+
+The payload is the exact canonical descriptor bytes the digest covers.
+A consumer (NEMO) verifies `SHA-256(payload) == registry_sha256` and
+only then parses the verified bytes. That makes the descriptors a
+planner routes on provably the bytes the authoritative registry
+digested — a rewritten capability with a stale digest fails closed.
+
+Cross-language canonicalization deliberately never enters this
+boundary: the canonical bytes are produced once, by the authoritative
+Go implementation, and travel with the digest. There is no second
+serializer whose number representation, key ordering, or escaping could
+disagree with Go's.
+
+The production kernel accepts only a `VerifiedCapabilityCatalog`, which
+is produced solely by the envelope loader; hand-built catalogs are
+confined to tests via `createTestKernel`/`createTestCatalog`. The
+snapshot file lives in the same trust domain as the socket (0600 inside
+a 0700 directory owned by the service user); signing the envelope
+becomes relevant only if it is ever transported or read by a different
+principal.
+
 ## Open items for v0.52 (tracked here as they land)
 
-- Registry invariant scan at startup, registry SHA-256 digest, and a
-  startup report — **landed**: the digest appears in the startup report
-  and in the canonical registry snapshot (`capabilities.json`) written
-  next to the socket.
-- NEMO consuming the authoritative registry — **landed**: the kernel
-  routes on the resolved `execution_route` and
-  `loadCatalogFromSnapshot` consumes the registry export (fail-closed
-  validation), so the planner no longer maintains a capability catalog.
-- Descriptor identity — **landed**: descriptors carry a declared
-  `descriptor_version` and a canonical `descriptor_digest`, both bound
-  into every request identity; a policy change is a new execution
-  identity, with a one-shot legacy-digest compatibility window for
-  records created before the binding.
 - Registry digest in release evidence (artifact.json / qualification)
-  remains open.
+  remains open — the digest is exposed by the startup report and the
+  envelope, but is not yet inside the authenticated release evidence.
+- Release artifact integrity closure (`artifact.json` inside the final
+  evidence manifest and verified by the standalone verifier),
+  clean-room verification ordering, and typed release gates remain
+  open; see the release-engineering findings.

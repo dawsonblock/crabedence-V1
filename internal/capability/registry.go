@@ -357,6 +357,15 @@ func Resolve(d CapabilityDescriptor) (ResolvedDescriptor, error) {
 		return ResolvedDescriptor{}, fmt.Errorf("capability %s: %w", d.ID, err)
 	}
 
+	// LOCAL execution never reaches the authority resolver — it runs
+	// in-process. A LOCAL capability that requires a grant would be
+	// admitted without Crabedence ever adjudicating the authority
+	// material, so the combination is a registration error rather than a
+	// silently weaker guarantee.
+	if route == RouteLocal && d.AuthorityPolicy.GrantRequired {
+		return ResolvedDescriptor{}, fmt.Errorf("capability %s: LOCAL route cannot require a grant — LOCAL execution never reaches the authority resolver", d.ID)
+	}
+
 	return ResolvedDescriptor{
 		ID:                d.ID,
 		DescriptorVersion: descriptorVersion,
