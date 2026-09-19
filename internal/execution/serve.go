@@ -250,6 +250,7 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	// Create a multi-handler that dispatches based on adapter ID
 	// If we have a durable store, wrap it in a DispatchExecutor
 	var handler Handler
+	var durable Handler
 	handlers := map[string]Handler{
 		"system":       echoHandler,
 		"test-counter": counterHandler,
@@ -286,11 +287,25 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 		// Use DispatchExecutor for durable idempotency
 		executor := NewDispatchExecutor(multiHandler, store)
 		executor.SetEvidenceSigner(signer)
-		handler = executor
+		durable = executor
 	} else {
 		// No store — fail closed for MUTATION/CRITICAL
-		handler = NewFailClosedHandler(multiHandler)
+		durable = NewFailClosedHandler(multiHandler)
 	}
+
+	// LOCAL leg — Function Hooks. PURE capabilities resolve to the
+	// LOCAL route (PURE + NONE assurance) and execute in-process under
+	// the hook runtime: validated arguments in, bounded JSON out, audit
+	// record written, no effect-fabric dependency injected. The DIRECT
+	// leg lands with the first observational adapter and fails closed
+	// until then.
+	hooks := NewFunctionHookRegistry()
+	if err := RegisterSystemEchoHook(hooks); err != nil {
+		return fmt.Errorf("failed to register system.echo function hook: %w", err)
+	}
+	dispatcher := NewRouteDispatcher(durable)
+	dispatcher.SetLocal(hooks)
+	handler = dispatcher
 
 	service := NewService(registry, handler, opts.SocketPath)
 

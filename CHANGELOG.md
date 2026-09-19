@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Execution — trusted route dispatcher and Function Hooks (LOCAL)
+
+- Execution: `RouteDispatcher` is the single dispatch point, reading the resolved `descriptor.execution_route` and never a caller value: `LOCAL` → Function Hooks, `DIRECT` → observational adapters (wired next), `CRABEDENCE` → the durable kernel. The class/route invariant is re-checked at dispatch time as defense in depth — a `MUTATION`/`CRITICAL` on a non-durable route is denied even if a registry bug produced the descriptor — and an unknown route fails closed instead of falling through to a dispatch.
+- Execution: Function Hooks implement the LOCAL path as a real subsystem. `FunctionHookRegistry` executes `PURE` capabilities in-process under a contract: PURE-only enforcement at three layers, argument re-validation, a bounded per-hook runtime budget, bounded result payloads, well-formed-JSON results, cancellation, and a structured audit record for every LOCAL execution (LOCAL has no durable ledger by design). Hooks receive data only — no store, dispatcher, or effect-fabric client — so `PURE` is a defensible execution boundary rather than an assertion.
+- Execution: `system.echo` now executes through the `LOCAL` route its descriptor already declared (`PURE` + `NONE`), via `RegisterSystemEchoHook`; the service wires the hook registry and dispatcher at startup.
+
 ### NEMO — real schema validation and optional authority
 
 - NEMO: the hand-written `typeof` schema checker is deleted. Capability schemas are compiled by Ajv (strict mode) when the catalog loads — a schema that does not compile, or that uses a construct strict mode does not recognize, fails registry loading instead of silently weakening validation. Arguments are validated before routing, and declared result schemas are validated on `SUCCEEDED` outcomes: a `PURE` result that violates its contract is `FAILED` (no external effect), a dispatched result that violates it is `UNKNOWN` (post-dispatch uncertainty, never retryable). Compiled validators are built from the frozen descriptor copy, so mutating the caller's schema object after registration cannot weaken enforcement.

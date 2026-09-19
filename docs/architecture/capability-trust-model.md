@@ -67,13 +67,18 @@ identities. A policy change is never invisible to idempotency.
 
 | Route | Intended semantics | Status |
 |---|---|---|
-| `LOCAL` | Deterministic / contained functions in the caller's process — no socket hop, no durability, no admission. Bound to `PURE` + `NONE`. | Declared and validated; execution subsystem **not yet implemented** (v0.52 Function Hooks work) |
+| `LOCAL` | Deterministic / contained functions in the caller's process — no socket hop, no durability, no admission. Bound to `PURE` + `NONE`. | Implemented: `FunctionHookRegistry` executes hooks in-process under the LOCAL contract (PURE-only, input validation, bounded runtime, bounded payload, well-formed JSON results, audit record). Hooks receive data only — no store, dispatcher, or effect-fabric client — so `PURE` is an execution boundary, not an assertion. |
 | `DIRECT` | Observational external operations with admission, schema validation, authority, timeouts, and audit — but without the durable mutation ledger. Bound to `READ` + `STANDARD`. | Declared and validated; **no DIRECT provider yet** (v0.52 work) |
 | `CRABEDENCE` | The durable execution kernel: authority, idempotency, dispatch, evidence, reconciliation. Required for `MUTATION`/`CRITICAL` and for `DURABLE`/`HIGH_ASSURANCE`. | Implemented (`crabbox serve-execution`) |
 
-Until `LOCAL` and `DIRECT` land, every registered capability uses the
-`CRABEDENCE` route and the registry's compatibility rules prevent
-registering anything the service cannot actually dispatch.
+`RouteDispatcher` is the single dispatch point: it reads
+`descriptor.execution_route` (never a caller value), re-checks the
+class/route invariant at dispatch time as defense in depth (a
+`MUTATION`/`CRITICAL` on a non-durable route is denied even if a
+registry bug produced the descriptor), and fails closed on an unknown
+route. Until the `DIRECT` leg lands, `READ` capabilities that declare
+it fail with `CAPABILITY_UNIMPLEMENTED` rather than silently taking a
+different path.
 
 ## The planner boundary
 
