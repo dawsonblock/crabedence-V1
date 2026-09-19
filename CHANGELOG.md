@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Effect Fabric hardening — per-stage durability budgets, fail-closed socket startup, pinned CI dependencies
+
+- Execution: the post-dispatch durability path now uses per-stage budgets (`ExecutorTimeouts`: observation persistence, terminalization, emergency recovery, lease operation) instead of one shared 5-second context. Each stage derives its own bounded, caller-detached context when the stage starts, so a database operation that exhausts its budget can never consume the budget of the stage that follows — emergency recovery in particular no longer inherits a context already exhausted by the observation or terminalization write that failed, which is the difference between a record reaching UNKNOWN with its provider observation persisted and one stranded IN_FLIGHT. Lease heartbeat renewals and pre-dispatch abandons run under the bounded lease-operation budget.
+- Execution: socket startup is fail-closed. The socket directory is created and verified (a real directory, not a symlink, owned by the current user, tightened to owner-only mode and re-verified), an existing path is removed only when it is provably a stale Unix socket owned by the current user, and the bound socket's mode and ownership are verified after listen — a regular file, directory, or symlink occupying the configured path is refused, never deleted.
+- CI: `actions/download-artifact` is pinned to its commit SHA (v4.3.0) — every workflow action reference is now a full commit SHA, enforced by `scripts/workflow_action_pins.go` — and the release-qualification PostgreSQL service is pinned by digest (`postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94`).
+
 ### Effect Fabric r13 repair — digest, authority, forensic record
 
 - Idempotency ABI: request-digest numeric canonicalization is fail-closed — exponents are parsed with `big.Int` (no `int64` wraparound, so `1e18446744073709551616` can no longer collide with `1`), all numbers normalize to canonical scientific form, malformed/trailing JSON returns `ErrTrailingJSON`, and `ComputeDigest` normalizes native Go arguments to the same canonical bytes as raw JSON. Frozen vectors regenerated; hostile vectors + three fuzz targets guard the boundary.

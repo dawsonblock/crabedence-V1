@@ -27,15 +27,68 @@ const (
 	DispatchPost DispatchState = "POST_DISPATCH"
 )
 
-// postDispatchPersistBudget bounds the mandatory post-dispatch
-// durability path — provider observation, recovery entry, and terminal
-// finalization. It runs on a context detached from the caller's
-// cancellation so that a client disconnect or service shutdown cannot
-// lose the provider's already-returned answer. Without this, root
-// context cancellation at teardown could fail RecordProviderObservation
-// and EnterRecoveryWithObservation, stranding the record IN_FLIGHT
-// until lease recovery with its provider metadata lost.
-const postDispatchPersistBudget = 5 * time.Second
+// ExecutorTimeouts bounds each durability stage of the dispatch path.
+// Every stage derives its own bounded context from its own budget, and
+// each budget starts when the stage starts — a database operation that
+// exhausts its budget must never consume the budget of the stage that
+// follows it. Emergency recovery in particular must not inherit a
+// context already exhausted by the operation that failed: that is the
+// difference between a record that reaches UNKNOWN with its provider
+// observation persisted and one stranded IN_FLIGHT.
+//
+// The stage contexts are detached from the caller's cancellation
+// (values preserved) so that a client disconnect or service shutdown
+// cannot lose the provider's already-returned answer.
+type ExecutorTimeouts struct {
+	// ObservationPersistence bounds the durable provider-observation
+	// write after the provider returns.
+	ObservationPersistence time.Duration
+	// Terminalization bounds the terminal stage: CRITICAL evidence
+	// signing, the lease-generation lookup, and the fenced Finalize.
+	Terminalization time.Duration
+	// EmergencyRecovery bounds entering UNKNOWN recovery with the
+	// provider observation. Derived fresh at every recovery entry.
+	EmergencyRecovery time.Duration
+	// LeaseOperation bounds a single lease store operation — a
+	// heartbeat renewal or a pre-dispatch abandon.
+	LeaseOperation time.Duration
+}
+
+// DefaultExecutorTimeouts returns the production budgets for the
+// post-dispatch durability stages.
+func DefaultExecutorTimeouts() ExecutorTimeouts {
+	return ExecutorTimeouts{
+		ObservationPersistence: 5 * time.Second,
+		Terminalization:        5 * time.Second,
+		EmergencyRecovery:      5 * time.Second,
+		LeaseOperation:         3 * time.Second,
+	}
+}
+
+// withDefaults fills zero fields from DefaultExecutorTimeouts.
+func (t ExecutorTimeouts) withDefaults() ExecutorTimeouts {
+	d := DefaultExecutorTimeouts()
+	if t.ObservationPersistence <= 0 {
+		t.ObservationPersistence = d.ObservationPersistence
+	}
+	if t.Terminalization <= 0 {
+		t.Terminalization = d.Terminalization
+	}
+	if t.EmergencyRecovery <= 0 {
+		t.EmergencyRecovery = d.EmergencyRecovery
+	}
+	if t.LeaseOperation <= 0 {
+		t.LeaseOperation = d.LeaseOperation
+	}
+	return t
+}
+
+// durabilityContext derives the bounded context for one durability
+// stage: detached from the caller's cancellation (values preserved),
+// bounded by the stage's own budget.
+func durabilityContext(ctx context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), budget)
+}
 
 // DispatchExecutor wraps a Handler with dispatch-point tracking and
 // durable idempotency. It ensures:
@@ -66,6 +119,9 @@ type DispatchExecutor struct {
 	// database, panic, os.Exit); the executor makes no guarantees
 	// after it runs.
 	crashHook func(CrashPoint)
+	// timeouts bound each durability stage of the post-dispatch path.
+	// See ExecutorTimeouts.
+	timeouts ExecutorTimeouts
 }
 
 // CrashPoint names a deterministic boundary in the execution path at
@@ -123,12 +179,21 @@ func (e *DispatchExecutor) SetCrashHook(h func(CrashPoint)) {
 	e.crashHook = h
 }
 
+// SetTimeouts overrides the per-stage durability budgets. Zero fields
+// keep their defaults. Intended for tests that exercise stage-boundary
+// behavior with sub-second budgets; production keeps
+// DefaultExecutorTimeouts.
+func (e *DispatchExecutor) SetTimeouts(t ExecutorTimeouts) {
+	e.timeouts = t.withDefaults()
+}
+
 // NewDispatchExecutor creates a new dispatch executor with durable idempotency.
 func NewDispatchExecutor(handler Handler, store idempotency.EffectStore) *DispatchExecutor {
 	return &DispatchExecutor{
 		handler:  handler,
 		store:    store,
 		inFlight: make(map[string]context.CancelFunc),
+		timeouts: DefaultExecutorTimeouts(),
 	}
 }
 
@@ -405,11 +470,10 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 
 	// The provider has answered. Everything from here until the terminal
 	// write is mandatory persistence — it must survive caller
-	// cancellation and service shutdown, so it runs on a bounded context
-	// detached from ctx's cancellation (values are preserved).
-	durabilityCtx, durabilityCancel := context.WithTimeout(
-		context.WithoutCancel(ctx), postDispatchPersistBudget)
-	defer durabilityCancel()
+	// cancellation and service shutdown. Each stage below derives its
+	// OWN bounded, detached context (durabilityContext): observation
+	// persistence, emergency recovery, and terminalization never share a
+	// budget, so one exhausted stage cannot strand the next.
 
 	// ─── DURABLE PROVIDER OBSERVATION ────────────────────────────────────
 	// Persist the provider's response metadata BEFORE any terminal
@@ -468,7 +532,9 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		e.postDispatchHook()
 	}
 	e.fireCrashPoint(CrashBeforeObservation)
-	obsErr := e.recordObservation(durabilityCtx, executionID, leaseToken, leaseGen, providerResp, desc)
+	obsCtx, obsCancel := durabilityContext(ctx, e.timeouts.ObservationPersistence)
+	obsErr := e.recordObservation(obsCtx, executionID, leaseToken, leaseGen, providerResp, desc)
+	obsCancel()
 	e.fireCrashPoint(CrashAfterObservation)
 
 	// The heartbeat stays alive through finalization — the lease must
@@ -500,7 +566,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		// Post-dispatch uncertainty — enter recovery carrying the
 		// ORIGINAL provider observation (already persisted above; the
 		// atomic transition also writes it). Do not finalize.
-		recErr := e.enterRecoveryWithObservation(durabilityCtx, executionID, providerResp, desc)
+		recErr := e.enterRecovery(ctx, executionID, providerResp, desc)
 		errMsg := "post-dispatch ambiguity: entered recovery (side effect may have occurred)"
 		if recErr != nil {
 			errMsg = fmt.Sprintf("post-dispatch ambiguity: %v", recErr)
@@ -527,7 +593,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	// reconciliation sees the record rather than sealing the
 	// contradiction into an immutable terminal state.
 	if obsErr != nil {
-		recErr := e.enterRecoveryWithObservation(durabilityCtx, executionID, providerResp, desc)
+		recErr := e.enterRecovery(ctx, executionID, providerResp, desc)
 		errMsg := fmt.Sprintf("provider observation not persisted: %v", obsErr)
 		if recErr != nil {
 			errMsg += fmt.Sprintf("; %v", recErr)
@@ -581,6 +647,16 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		ReceiptVersion:  receiptVersion,
 	}
 
+	// ─── TERMINALIZATION BUDGET ───────────────────────────────────────────
+	// The terminal stage gets its own budget, starting here — after the
+	// observation stage completed or failed — so a slow observation
+	// write can never leave the finalize with an exhausted context. The
+	// budget covers CRITICAL evidence signing, the lease-generation
+	// lookup, and the fenced Finalize; a failure in any of them still
+	// reaches emergency recovery with a fresh budget.
+	termCtx, termCancel := durabilityContext(ctx, e.timeouts.Terminalization)
+	defer termCancel()
+
 	// CRITICAL proof authenticity: attest the terminal outcome with a
 	// signed effect receipt binding the evidence digest, provider/run
 	// identity, and execution/request identity. The store verifies the
@@ -612,7 +688,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		if signErr != nil {
 			// Cannot produce the required proof — treat as post-dispatch
 			// uncertainty, not a terminal outcome.
-			recErr := e.enterRecoveryWithObservation(durabilityCtx, executionID, providerResp, desc)
+			recErr := e.enterRecovery(ctx, executionID, providerResp, desc)
 			errMsg := fmt.Sprintf("failed to sign CRITICAL evidence receipt: %v", signErr)
 			if recErr != nil {
 				errMsg += fmt.Sprintf("; %v", recErr)
@@ -631,7 +707,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	}
 
 	// Look up the lease generation for the fenced finalize.
-	rec, err := e.store.Lookup(durabilityCtx, executionID)
+	rec, err := e.store.Lookup(termCtx, executionID)
 	if err != nil {
 		return Response{
 			Status:      StatusUnknown,
@@ -648,13 +724,13 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		e.preFinalizeHook()
 	}
 	e.fireCrashPoint(CrashBeforeFinalize)
-	if err := e.store.Finalize(durabilityCtx, executionID, leaseToken, rec.LeaseGeneration, idempotency.StateInFlight, receipt); err != nil {
+	if err := e.store.Finalize(termCtx, executionID, leaseToken, rec.LeaseGeneration, idempotency.StateInFlight, receipt); err != nil {
 		// Finalization failed AFTER dispatch — the side effect may
 		// have occurred. The provider observation was already persisted
 		// durably right after the provider returned; the recovery
 		// transition below also writes it atomically. Report persistence
 		// honestly — never claim the observation was stored if it wasn't.
-		recErr := e.enterRecoveryWithObservation(durabilityCtx, executionID, providerResp, desc)
+		recErr := e.enterRecovery(ctx, executionID, providerResp, desc)
 		errMsg := fmt.Sprintf("failed to finalize execution after dispatch: %v", err)
 		if recErr == nil {
 			errMsg += " (provider observation persisted)"
@@ -709,7 +785,15 @@ func deadlineExpired(deadline string) bool {
 // that crossed the dispatch boundary is never unmarked. On failure the
 // lease expiry path is the backstop.
 func (e *DispatchExecutor) abandonPreDispatch(ctx context.Context, executionID, leaseToken string, leaseGen int) {
-	_ = e.store.AbandonPreDispatch(ctx, executionID, leaseToken, leaseGen)
+	// Bounded and detached: the caller's context is commonly already
+	// cancelled in the pre-dispatch abandon paths, and a completed
+	// abandon lets a retry reclaim the record immediately instead of
+	// waiting out the lease. AbandonPreDispatch only touches
+	// PREPARED/EXECUTING records, so running it on a detached context
+	// cannot unmark a record that crossed the dispatch boundary.
+	abandonCtx, cancel := durabilityContext(ctx, e.timeouts.LeaseOperation)
+	defer cancel()
+	_ = e.store.AbandonPreDispatch(abandonCtx, executionID, leaseToken, leaseGen)
 }
 
 // dispatch sends the request to the handler.
@@ -845,6 +929,18 @@ func buildObservation(resp Response, desc capability.ResolvedDescriptor) idempot
 // persistence honestly.
 func (e *DispatchExecutor) recordObservation(ctx context.Context, executionID, leaseToken string, leaseGen int, resp Response, desc capability.ResolvedDescriptor) error {
 	return e.store.RecordProviderObservation(ctx, executionID, leaseToken, leaseGen, buildObservation(resp, desc))
+}
+
+// enterRecovery derives a FRESH emergency-recovery context and enters
+// UNKNOWN recovery carrying the provider observation. It is
+// deliberately not called with the observation or terminalization
+// context: those may already be exhausted by the database operation
+// that just failed, and recovery must still be able to persist the
+// provider observation.
+func (e *DispatchExecutor) enterRecovery(ctx context.Context, executionID string, resp Response, desc capability.ResolvedDescriptor) error {
+	recCtx, cancel := durabilityContext(ctx, e.timeouts.EmergencyRecovery)
+	defer cancel()
+	return e.enterRecoveryWithObservation(recCtx, executionID, resp, desc)
 }
 
 // enterRecoveryWithObservation transitions the record to UNKNOWN while
@@ -1083,7 +1179,12 @@ func (e *DispatchExecutor) leaseHeartbeat(ctx context.Context, executionID, leas
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := e.store.RenewLease(ctx, executionID, leaseToken, leaseGeneration, renewDuration); err != nil {
+			// Bound each renewal: a hung store call must not stall the
+			// heartbeat loop until the lease expires.
+			renewCtx, renewCancel := context.WithTimeout(ctx, e.timeouts.LeaseOperation)
+			err := e.store.RenewLease(renewCtx, executionID, leaseToken, leaseGeneration, renewDuration)
+			renewCancel()
+			if err != nil {
 				// Lease renewal failed — the lease may have expired,
 				// been taken over, or the record advanced. Stop renewing.
 				// The provider call continues; if it succeeds, Finalize

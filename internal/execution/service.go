@@ -165,15 +165,17 @@ func (s *Service) Start(ctx context.Context) error {
 		return fmt.Errorf("service already running")
 	}
 
-	// Remove existing socket
-	if _, err := os.Stat(s.socketPath); err == nil {
-		os.Remove(s.socketPath)
-	}
-
-	// Ensure socket directory exists with restrictive permissions
+	// Secure the socket directory and clear any stale socket before
+	// listening. Both steps fail closed: a path that cannot be
+	// secured, or that is not provably a stale socket owned by the
+	// current user, is never removed.
 	if dir := filepath.Dir(s.socketPath); dir != "" && dir != "." {
-		os.MkdirAll(dir, 0o700)
-		os.Chmod(dir, 0o700)
+		if err := ensureSocketDir(dir); err != nil {
+			return err
+		}
+	}
+	if err := clearStaleSocket(s.socketPath); err != nil {
+		return err
 	}
 
 	listener, err := net.Listen("unix", s.socketPath)
@@ -181,8 +183,17 @@ func (s *Service) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to listen on %s: %w", s.socketPath, err)
 	}
 
-	// Restrict socket access to owner only
-	os.Chmod(s.socketPath, 0o600)
+	// Restrict socket access to owner only, and verify the result — a
+	// socket that cannot be proven owner-only must not serve.
+	if err := os.Chmod(s.socketPath, 0o600); err != nil {
+		listener.Close()
+		return fmt.Errorf("secure socket permissions on %s: %w", s.socketPath, err)
+	}
+	if err := verifySocketFile(s.socketPath); err != nil {
+		listener.Close()
+		os.Remove(s.socketPath)
+		return err
+	}
 
 	s.listener = listener
 	s.running = true

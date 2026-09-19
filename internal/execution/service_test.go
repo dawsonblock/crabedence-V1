@@ -291,16 +291,17 @@ func TestExecutionServiceMissingAuthority(t *testing.T) {
 
 // ─── Helpers ──────────────────────────────────────────────────────────
 
+// testSocketPath returns a socket path inside a private, owner-only
+// directory — the service refuses to bind in a directory it cannot
+// prove is tamper-resistant.
 func testSocketPath(t *testing.T) string {
 	t.Helper()
-	f, err := os.CreateTemp("", "crabedence-exec-test-*.sock")
+	dir, err := os.MkdirTemp("", "cbx-sock-*")
 	if err != nil {
 		t.Fatal(err)
 	}
-	path := f.Name()
-	f.Close()
-	os.Remove(path)
-	return path
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return dir + "/execution.sock"
 }
 
 func sendRequest(t *testing.T, conn net.Conn, req Request) Response {

@@ -37,17 +37,14 @@ func DefaultServeOptions() ServeOptions {
 }
 
 // defaultSocketPath returns a secure socket location.
-// Uses XDG_RUNTIME_DIR if available, falls back to a 0700 directory.
+// Uses XDG_RUNTIME_DIR if available, falls back to a private
+// per-user directory under /tmp. The directory is created and
+// verified fail-closed by Service.Start.
 func defaultSocketPath() string {
 	if xdg := os.Getenv("XDG_RUNTIME_DIR"); xdg != "" {
-		dir := xdg + "/crabedence"
-		os.MkdirAll(dir, 0o700)
-		return dir + "/execution.sock"
+		return xdg + "/crabedence/execution.sock"
 	}
-	// Fallback: create a private directory in /tmp with 0700 permissions
-	dir := "/tmp/crabedence-" + os.Getenv("USER")
-	os.MkdirAll(dir, 0o700)
-	return dir + "/execution.sock"
+	return "/tmp/crabedence-" + os.Getenv("USER") + "/execution.sock"
 }
 
 // Serve starts the persistent execution service.
@@ -280,12 +277,6 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	// denies all grant-required capabilities in production.
 	if authorityStore != nil {
 		service.SetGrantResolver(authorityStore)
-	}
-
-	// Ensure socket directory has restrictive permissions
-	if dir := filepath.Dir(opts.SocketPath); dir != "" && dir != "." {
-		os.MkdirAll(dir, 0o700)
-		os.Chmod(dir, 0o700)
 	}
 
 	// Handle signals
