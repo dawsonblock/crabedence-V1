@@ -196,3 +196,17 @@ test("both archives and the evidence bundle traverse the whole DAG", () => {
     assert.match(body, /outputs\.evidence_archive_sha256/, `${name} compares the evidence digest`);
   }
 });
+
+test("neither release workflow writes an attestation inside the evidence closure", () => {
+  // An attestation is an external statement about the frozen evidence
+  // object. A reference written into the closure would make the evidence
+  // manifest cover an attestation of that same manifest, and — because the
+  // public bundle is packaged before it exists — it could never appear in
+  // the published bundle, so the bundle could not satisfy its own verifier.
+  for (const file of [".github/workflows/release-rc.yml", ".github/workflows/release-qualification.yml"]) {
+    const source = fs.readFileSync(path.join(repoRoot, file), "utf8");
+    assert.doesNotMatch(source, /mkdir -p dist\/release-evidence\/attestation/, file);
+    assert.doesNotMatch(source, /dist\/release-evidence\/attestation\//, file);
+    assert.match(source, /mkdir -p dist\/attestation/, `${file} keeps the reference outside the closure`);
+  }
+});

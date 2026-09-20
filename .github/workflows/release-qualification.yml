@@ -350,12 +350,17 @@ jobs:
               "evidence_sha256": "${{ steps.qual_summary.outputs.evidence_sha256 }}"
             }
 
+      # The attestation reference is written OUTSIDE dist/release-evidence/.
+      # An attestation is an external statement about the frozen evidence
+      # object; a reference inside the closure would make the evidence
+      # manifest cover an attestation of that same manifest, which can never
+      # be packaged.
       - name: Save attestation reference
         run: |
-          mkdir -p dist/release-evidence/attestation
-          echo '${{ steps.attestation.outputs.attestation-id }}' > dist/release-evidence/attestation/attestation-id.txt
-          echo '${{ steps.attestation.outputs.attestation-url }}' > dist/release-evidence/attestation/attestation-url.txt
-          cat > dist/release-evidence/attestation/attestation.json <<'EOF'
+          mkdir -p dist/attestation
+          echo '${{ steps.attestation.outputs.attestation-id }}' > dist/attestation/attestation-id.txt
+          echo '${{ steps.attestation.outputs.attestation-url }}' > dist/attestation/attestation-url.txt
+          cat > dist/attestation/attestation.json <<'EOF'
           {
             "tool": "github-actions-attest",
             "attestation_id": "${{ steps.attestation.outputs.attestation-id }}",

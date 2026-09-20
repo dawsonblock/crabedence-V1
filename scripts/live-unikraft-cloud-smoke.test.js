@@ -723,8 +723,13 @@ esac`,
       CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_DIR: harness.proofDir,
       CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_RAW_HELPER: harness.rawHelper,
       CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_SLUG: "unikraft-cloud-live-smoke-test",
-      CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_UNCERTAINTY_SECONDS: "5",
-      CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_CLEANUP_TIMEOUT_SECONDS: "10",
+      // These tighten the smoke script's 35s/90s defaults to keep the
+      // suite fast. The full suite runs them under load, so the cleanup
+      // window needs headroom: too tight and a delayed-visibility poll
+      // times out and misclassifies as cleanup_failed. Tests that assert
+      // cleanup DOES fail keep the short window deliberately.
+      CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_UNCERTAINTY_SECONDS: "15",
+      CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_CLEANUP_TIMEOUT_SECONDS: "30",
       FAKE_CLAIM_UUID: "",
       FAKE_DELAY_VISIBILITY_AT: "4",
     }),
@@ -772,8 +777,13 @@ esac`,
       CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_DIR: harness.proofDir,
       CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_RAW_HELPER: harness.rawHelper,
       CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_SLUG: "unikraft-cloud-live-smoke-test",
-      CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_UNCERTAINTY_SECONDS: "5",
-      CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_CLEANUP_TIMEOUT_SECONDS: "10",
+      // These tighten the smoke script's 35s/90s defaults to keep the
+      // suite fast. The full suite runs them under load, so the cleanup
+      // window needs headroom: too tight and a delayed-visibility poll
+      // times out and misclassifies as cleanup_failed. Tests that assert
+      // cleanup DOES fail keep the short window deliberately.
+      CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_UNCERTAINTY_SECONDS: "15",
+      CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_CLEANUP_TIMEOUT_SECONDS: "30",
       FAKE_DELAY_VISIBILITY_AT: "5",
     }),
     encoding: "utf8",
@@ -958,7 +968,7 @@ esac`,
       CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_DIR: harness.proofDir,
       CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_RAW_HELPER: harness.rawHelper,
       CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_SLUG: "unikraft-cloud-live-smoke-test",
-      CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_CLEANUP_TIMEOUT_SECONDS: "10",
+      CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_CLEANUP_TIMEOUT_SECONDS: "30",
     }),
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -1028,7 +1038,7 @@ esac`,
       CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_DIR: harness.proofDir,
       CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_RAW_HELPER: harness.rawHelper,
       CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_SLUG: "unikraft-cloud-live-smoke-test",
-      CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_CLEANUP_TIMEOUT_SECONDS: "10",
+      CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_CLEANUP_TIMEOUT_SECONDS: "30",
       FAKE_RAW_OWNED_STARTED: ownedStarted,
     }),
     stdio: ["ignore", "pipe", "pipe"],
@@ -1098,7 +1108,7 @@ esac`,
       CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_DIR: harness.proofDir,
       CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_RAW_HELPER: harness.rawHelper,
       CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_SLUG: "unikraft-cloud-live-smoke-test",
-      CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_CLEANUP_TIMEOUT_SECONDS: "10",
+      CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_CLEANUP_TIMEOUT_SECONDS: "30",
     }),
     stdio: ["ignore", "pipe", "pipe"],
   });
