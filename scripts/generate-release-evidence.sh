@@ -727,12 +727,12 @@ echo "=== Cross-language conformance ==="
 # durable ledger; the harness skips without CRABBOX_TEST_DATABASE_URL, so
 # these gates fail closed when the database is absent (0 executed tests).
 run_gate critical-external INTEGRATION env \
-  CRABBOX_TEST_DATABASE_URL="$CRABBOX_TEST_DATABASE_URL" \
+  CRABBOX_TEST_DATABASE_URL="${CRABBOX_TEST_DATABASE_URL:-}" \
   go test -v -count=1 -timeout=300s \
   -run "TestLiveCriticalQualification(Commit|AmbiguityThenReconcile|DefinitiveRejection|EvidenceIntegrity|AuthorityMatrix|ClosedAuthoritySemantics|TimeoutThenReconcile|LookupOutageThenRecovery|CorruptedArtifact|RegistryExtensionBinding|CrashThenRecover)$" \
   ./internal/execution/
 run_gate critical-faults FAULT_INJECTION env \
-  CRABBOX_TEST_DATABASE_URL="$CRABBOX_TEST_DATABASE_URL" \
+  CRABBOX_TEST_DATABASE_URL="${CRABBOX_TEST_DATABASE_URL:-}" \
   go test -v -count=1 -timeout=300s \
   -run "TestLiveCriticalQualification(FailBeforeAccept|TokenPayloadCollision)$" \
   ./internal/execution/
