@@ -400,6 +400,14 @@ if [ -f "$QUAL_REGISTRY_SHA_FILE" ] && [ -f "$QUAL_REGISTRY_ENVELOPE" ] && [ -f 
     echo "  ERROR: extension record base_registry_sha256=$EXTENSION_BASE does not match the release registry $REGISTRY_SHA" >&2
   fi
 
+  EXTENSION_QUAL="$(jq -r '.qualification_registry_sha256 // empty' "$EXTENSIONS_FILE" 2>/dev/null || true)"
+  if [ -n "$EXTENSION_QUAL" ] && [ "$EXTENSION_QUAL" = "$QUAL_REGISTRY_SHA" ]; then
+    check "Extension record binds the qualification registry" "PASS"
+  else
+    check "Extension record binds the qualification registry" "FAIL"
+    echo "  ERROR: extension record qualification_registry_sha256=$EXTENSION_QUAL does not match the qualification registry $QUAL_REGISTRY_SHA" >&2
+  fi
+
   if [ -n "$QUAL_PAYLOAD" ] && [ -n "$ENVELOPE_PAYLOAD" ]; then
     EXTENSION_IDS="$(jq -c '[.qualification_extensions[]?.capability_id]' "$EXTENSIONS_FILE" 2>/dev/null || echo '[]')"
     RELEASE_DESCRIPTORS="$(printf '%s' "$ENVELOPE_PAYLOAD" | base64 --decode 2>/dev/null | jq -cS 'sort_by(.id)' 2>/dev/null || true)"
@@ -409,6 +417,91 @@ if [ -f "$QUAL_REGISTRY_SHA_FILE" ] && [ -f "$QUAL_REGISTRY_ENVELOPE" ] && [ -f 
     else
       check "Extensions add without replacing release policy" "FAIL"
       echo "  ERROR: the qualification registry is not the release registry plus the declared extensions" >&2
+    fi
+  fi
+
+  # 1e. Extension descriptor digests — recomputed from the qualification
+  # registry's canonical bytes, never trusted from the record. Go marshals
+  # each descriptor independently, so a descriptor's canonical bytes are a
+  # contiguous span of the payload; hashing that span reproduces the
+  # descriptor digest without a second canonicalizer entering the trust
+  # boundary. Each declared extension must name a capability that occurs
+  # exactly once in the qualification registry, is absent from the release
+  # registry, and whose recomputed digest equals the recorded
+  # descriptor_sha256 — so a harness can only ADD declared test
+  # capabilities, never replace or mislabel production policy.
+  if [ -n "$QUAL_PAYLOAD" ] && [ -n "$ENVELOPE_PAYLOAD" ] && [ -n "$EXTENSIONS_FILE" ]; then
+    SPAN_HELPER="$SCRIPT_DIR/lib/registry-spans.mjs"
+    EXT_COUNT="$(jq '.qualification_extensions | length' "$EXTENSIONS_FILE" 2>/dev/null || echo 0)"
+    if [ ! -f "$SPAN_HELPER" ]; then
+      check "Extension descriptor digests recomputed" "FAIL"
+      echo "  ERROR: registry span helper not found: $SPAN_HELPER" >&2
+    elif ! command -v node >/dev/null 2>&1; then
+      check "Extension descriptor digests recomputed" "FAIL"
+      echo "  ERROR: node is required to recompute extension descriptor bytes" >&2
+    else
+      QUAL_PAYLOAD_FILE="$EVIDENCE_DIR/.qual-payload.json"
+      RELEASE_PAYLOAD_FILE="$EVIDENCE_DIR/.release-payload.json"
+      printf '%s' "$QUAL_PAYLOAD" | base64 --decode > "$QUAL_PAYLOAD_FILE" 2>/dev/null || true
+      printf '%s' "$ENVELOPE_PAYLOAD" | base64 --decode > "$RELEASE_PAYLOAD_FILE" 2>/dev/null || true
+      if QUAL_SPANS="$(node "$SPAN_HELPER" "$QUAL_PAYLOAD_FILE" 2>/dev/null)" && \
+         RELEASE_SPANS="$(node "$SPAN_HELPER" "$RELEASE_PAYLOAD_FILE" 2>/dev/null)"; then
+        EXT_IDS="$(jq -c '[.qualification_extensions[]?.capability_id]' "$EXTENSIONS_FILE" 2>/dev/null || echo '[]')"
+        UNIQUE_IDS="$(printf '%s' "$EXT_IDS" | jq 'unique | length' 2>/dev/null || echo 0)"
+        TOTAL_IDS="$(printf '%s' "$EXT_IDS" | jq 'length' 2>/dev/null || echo 0)"
+        UNIQUE_RECORDS="$(jq -c '[.qualification_extensions[]?] | unique | length' "$EXTENSIONS_FILE" 2>/dev/null || echo 0)"
+        if [ "$UNIQUE_IDS" = "$TOTAL_IDS" ] && [ "$UNIQUE_RECORDS" = "$TOTAL_IDS" ]; then
+          check "Extension records unique" "PASS"
+        else
+          check "Extension records unique" "FAIL"
+          echo "  ERROR: the qualification extension record repeats a capability id or a descriptor record" >&2
+        fi
+
+        EXT_DIGEST_OK=true
+        EXT_SCOPE_OK=true
+        EXT_INDEX=0
+        while [ "$EXT_INDEX" -lt "$EXT_COUNT" ]; do
+          EXT_ID="$(jq -r ".qualification_extensions[$EXT_INDEX].capability_id // empty" "$EXTENSIONS_FILE" 2>/dev/null || true)"
+          EXT_DECLARED="$(jq -r ".qualification_extensions[$EXT_INDEX].descriptor_sha256 // empty" "$EXTENSIONS_FILE" 2>/dev/null || true)"
+          if [ -z "$EXT_ID" ] || ! printf '%s' "$EXT_DECLARED" | grep -qE '^[0-9a-f]{64}$'; then
+            EXT_DIGEST_OK=false
+            echo "  ERROR: qualification_extensions[$EXT_INDEX] lacks a capability_id or a well-formed descriptor_sha256" >&2
+            EXT_INDEX=$((EXT_INDEX + 1))
+            continue
+          fi
+          if printf '%s\n' "$RELEASE_SPANS" | awk -F'\t' -v id="$EXT_ID" '$2 == id { found = 1 } END { exit found ? 0 : 1 }'; then
+            EXT_SCOPE_OK=false
+            echo "  ERROR: extension $EXT_ID is a release capability — qualification may not redeclare production policy" >&2
+          fi
+          EXT_MATCHES="$(printf '%s\n' "$QUAL_SPANS" | awk -F'\t' -v id="$EXT_ID" '$2 == id { print $1 }')"
+          EXT_OCCURRENCES="$(printf '%s\n' "$EXT_MATCHES" | grep -c . || true)"
+          if [ "$EXT_OCCURRENCES" -ne 1 ]; then
+            EXT_DIGEST_OK=false
+            echo "  ERROR: extension $EXT_ID occurs $EXT_OCCURRENCES times in the qualification registry (want exactly 1)" >&2
+            EXT_INDEX=$((EXT_INDEX + 1))
+            continue
+          fi
+          if [ "$EXT_MATCHES" != "$EXT_DECLARED" ]; then
+            EXT_DIGEST_OK=false
+            echo "  ERROR: extension $EXT_ID descriptor_sha256=$EXT_DECLARED but its canonical bytes hash to $EXT_MATCHES" >&2
+          fi
+          EXT_INDEX=$((EXT_INDEX + 1))
+        done
+        if [ "$EXT_DIGEST_OK" = true ]; then
+          check "Extension descriptor digests recomputed" "PASS"
+        else
+          check "Extension descriptor digests recomputed" "FAIL"
+        fi
+        if [ "$EXT_SCOPE_OK" = true ]; then
+          check "Extensions are qualification-only" "PASS"
+        else
+          check "Extensions are qualification-only" "FAIL"
+        fi
+      else
+        check "Extension descriptor digests recomputed" "FAIL"
+        echo "  ERROR: the registry envelopes are not canonical descriptor arrays" >&2
+      fi
+      rm -f "$QUAL_PAYLOAD_FILE" "$RELEASE_PAYLOAD_FILE"
     fi
   fi
 fi

@@ -28,6 +28,10 @@ function bundle(
     artifactSchema = 2,
     sbomBound = true,
     qualificationReplacedRelease = false,
+    extraQualificationDescriptor = false,
+    extensionRecords = null,
+    extensionBaseSha = null,
+    extensionQualSha = null,
   } = {},
 ) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cbx-verify-artifact-")));
@@ -56,9 +60,16 @@ function bundle(
   // extension descriptor, bound by the extension record.
   const releaseDescriptors = JSON.parse(canonicalPayload.toString());
   const extensionDescriptor = { id: "qualification.critical.commit", execution_class: "CRITICAL" };
-  const qualificationDescriptors = qualificationReplacedRelease
+  // The descriptor digest is SHA-256 of the descriptor's exact canonical
+  // bytes. Because the payload is a JSON array, those bytes are exactly
+  // the element's serialization — the same span the verifier hashes.
+  const extensionDigest = sha256(Buffer.from(JSON.stringify(extensionDescriptor)));
+  let qualificationDescriptors = qualificationReplacedRelease
     ? [{ ...releaseDescriptors[0], execution_class: "MUTATION" }, extensionDescriptor]
     : [...releaseDescriptors, extensionDescriptor];
+  if (extraQualificationDescriptor) {
+    qualificationDescriptors = [...qualificationDescriptors, { id: "qualification.undeclared", execution_class: "MUTATION" }];
+  }
   const qualificationPayload = Buffer.from(JSON.stringify(qualificationDescriptors));
   const qualificationSha = sha256(qualificationPayload);
   fs.writeFileSync(path.join(root, "qualification-registry.sha256"), qualificationSha + "\n");
@@ -69,9 +80,11 @@ function bundle(
   fs.writeFileSync(
     path.join(root, "qualification-registry-extensions.json"),
     JSON.stringify({
-      base_registry_sha256: registrySha,
-      qualification_registry_sha256: qualificationSha,
-      qualification_extensions: [{ capability_id: "qualification.critical.commit", descriptor_sha256: "a".repeat(64) }],
+      base_registry_sha256: extensionBaseSha ?? registrySha,
+      qualification_registry_sha256: extensionQualSha ?? qualificationSha,
+      qualification_extensions: extensionRecords ?? [
+        { capability_id: "qualification.critical.commit", descriptor_sha256: extensionDigest },
+      ],
     }),
   );
 
@@ -329,6 +342,10 @@ test("the qualification registry extension is bound to the release registry", (t
   const { output } = verify(root, qualificationArgs(root));
   assert.match(output, /Qualification registry digest recomputed\s+PASS/);
   assert.match(output, /Extension record binds the release registry\s+PASS/);
+  assert.match(output, /Extension record binds the qualification registry\s+PASS/);
+  assert.match(output, /Extension records unique\s+PASS/);
+  assert.match(output, /Extension descriptor digests recomputed\s+PASS/);
+  assert.match(output, /Extensions are qualification-only\s+PASS/);
   assert.match(output, /Extensions add without replacing release policy\s+PASS/);
 });
 
@@ -337,4 +354,73 @@ test("a qualification registry that replaces release policy fails closed", (t) =
   const { output } = verify(root, qualificationArgs(root));
   assert.match(output, /Extensions add without replacing release policy\s+FAIL/);
   assert.match(output, /not the release registry plus the declared extensions/);
+});
+
+test("a mislabelled extension descriptor digest fails closed", (t) => {
+  const { root } = bundle(t, {
+    extensionRecords: [{ capability_id: "qualification.critical.commit", descriptor_sha256: "b".repeat(64) }],
+  });
+  const { output } = verify(root, qualificationArgs(root));
+  assert.match(output, /Extension descriptor digests recomputed\s+FAIL/);
+  assert.match(output, /its canonical bytes hash to/);
+});
+
+test("an extension digest borrowed from another capability fails closed", (t) => {
+  const echoDigest = sha256(Buffer.from(JSON.stringify({ id: "system.echo", execution_class: "PURE" })));
+  const { root } = bundle(t, {
+    extensionRecords: [{ capability_id: "qualification.critical.commit", descriptor_sha256: echoDigest }],
+  });
+  const { output } = verify(root, qualificationArgs(root));
+  assert.match(output, /Extension descriptor digests recomputed\s+FAIL/);
+});
+
+test("an extension that claims a production capability fails closed", (t) => {
+  const echoDigest = sha256(Buffer.from(JSON.stringify({ id: "system.echo", execution_class: "PURE" })));
+  const { root } = bundle(t, {
+    extensionRecords: [{ capability_id: "system.echo", descriptor_sha256: echoDigest }],
+  });
+  const { output } = verify(root, qualificationArgs(root));
+  assert.match(output, /Extensions are qualification-only\s+FAIL/);
+  assert.match(output, /may not redeclare production policy/);
+});
+
+test("a duplicate extension record fails closed", (t) => {
+  const extensionDigest = sha256(
+    Buffer.from(JSON.stringify({ id: "qualification.critical.commit", execution_class: "CRITICAL" })),
+  );
+  const { root } = bundle(t, {
+    extensionRecords: [
+      { capability_id: "qualification.critical.commit", descriptor_sha256: extensionDigest },
+      { capability_id: "qualification.critical.commit", descriptor_sha256: extensionDigest },
+    ],
+  });
+  const { output } = verify(root, qualificationArgs(root));
+  assert.match(output, /Extension records unique\s+FAIL/);
+});
+
+test("a declared extension missing from the registry fails closed", (t) => {
+  const { root } = bundle(t, {
+    extensionRecords: [{ capability_id: "qualification.absent", descriptor_sha256: "c".repeat(64) }],
+  });
+  const { output } = verify(root, qualificationArgs(root));
+  assert.match(output, /Extension descriptor digests recomputed\s+FAIL/);
+  assert.match(output, /want exactly 1/);
+});
+
+test("an undeclared extra descriptor fails closed", (t) => {
+  const { root } = bundle(t, { extraQualificationDescriptor: true });
+  const { output } = verify(root, qualificationArgs(root));
+  assert.match(output, /Extensions add without replacing release policy\s+FAIL/);
+});
+
+test("an extension record bound to the wrong base registry fails closed", (t) => {
+  const { root } = bundle(t, { extensionBaseSha: "0".repeat(64) });
+  const { output } = verify(root, qualificationArgs(root));
+  assert.match(output, /Extension record binds the release registry\s+FAIL/);
+});
+
+test("an extension record bound to the wrong qualification registry fails closed", (t) => {
+  const { root } = bundle(t, { extensionQualSha: "0".repeat(64) });
+  const { output } = verify(root, qualificationArgs(root));
+  assert.match(output, /Extension record binds the qualification registry\s+FAIL/);
 });

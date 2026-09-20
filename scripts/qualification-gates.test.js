@@ -203,3 +203,145 @@ test("the admission script and the verifier share one validator", () => {
   }
   execFileSync("bash", ["-n", LIB]);
 });
+
+// A raw record writer for defects that remove or retype the gates array
+// itself, which record() cannot express because it recomputes the
+// summary from gates.
+function rawRecord(t, qualification) {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cbx-gates-")));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, "qualification.json"), JSON.stringify(qualification, null, 2));
+  return root;
+}
+
+const summaryOf = (gates) => ({
+  total: gates.length,
+  passed: gates.filter((g) => g.status === "PASS").length,
+  failed: gates.filter((g) => g.status !== "PASS").length,
+  skipped: 0,
+});
+
+test("a gate with a missing gate_id fails closed", (t) => {
+  const root = record(t, (q) => { delete q.gates[0].gate_id; });
+  const { status, findings } = validate(root);
+  assert.notEqual(status, 0);
+  assert.match(findings, /gates\[0\]\.gate_id is missing/);
+});
+
+test("a gate with an empty gate_id fails closed", (t) => {
+  const root = record(t, (q) => { q.gates[0].gate_id = ""; });
+  const { status, findings } = validate(root);
+  assert.notEqual(status, 0);
+  assert.match(findings, /gates\[0\]\.gate_id is empty/);
+});
+
+test("a gate with a missing mandatory flag fails closed", (t) => {
+  const root = record(t, (q) => { delete q.gates[0].mandatory; });
+  const { status, findings } = validate(root);
+  assert.notEqual(status, 0);
+  assert.match(findings, /mandatory is missing/);
+});
+
+test("a gate with a missing status fails closed", (t) => {
+  const root = record(t, (q) => { delete q.gates[0].status; });
+  const { status, findings } = validate(root);
+  assert.notEqual(status, 0);
+  assert.match(findings, /status is missing/);
+});
+
+test("a gate with a missing exit_code fails closed", (t) => {
+  const root = record(t, (q) => { delete q.gates[0].exit_code; });
+  const { status, findings } = validate(root);
+  assert.notEqual(status, 0);
+  assert.match(findings, /exit_code is missing/);
+});
+
+test("a gate with a missing evidence.file fails closed", (t) => {
+  const root = record(t, (q) => { delete q.gates[0].evidence.file; });
+  const { status, findings } = validate(root);
+  assert.notEqual(status, 0);
+  assert.match(findings, /evidence\.file is missing/);
+});
+
+test("a gate that is not an object fails closed", (t) => {
+  const root = record(t, (q) => { q.gates[0] = "not-a-gate"; });
+  const { status, findings } = validate(root);
+  assert.notEqual(status, 0);
+  assert.match(findings, /gates\[0\] is not an object/);
+});
+
+test("a test-bearing gate that omits its test counts fails closed", (t) => {
+  const root = record(t, (q) => { delete q.gates[0].tests_executed; });
+  const { status, findings } = validate(root);
+  assert.notEqual(status, 0);
+  assert.match(findings, /must report tests_executed and tests_failed/);
+});
+
+test("a truncated evidence digest fails closed", (t) => {
+  const root = record(t, (q) => { q.gates[0].evidence.sha256 = "a".repeat(63); });
+  const { status, findings } = validate(root);
+  assert.notEqual(status, 0);
+  assert.match(findings, /evidence sha256 is missing or malformed/);
+});
+
+test("an uppercase evidence digest fails closed", (t) => {
+  const root = record(t, (q) => { q.gates[0].evidence.sha256 = "A".repeat(64); });
+  const { status, findings } = validate(root);
+  assert.notEqual(status, 0);
+  assert.match(findings, /evidence sha256 is missing or malformed/);
+});
+
+test("a missing gates array fails closed", (t) => {
+  const root = rawRecord(t, {
+    schema_version: 2,
+    release_status: "PASS",
+    artifact_promotable: true,
+    gate_summary: summaryOf([]),
+    invariants: [],
+  });
+  const { status, findings } = validate(root);
+  assert.notEqual(status, 0);
+  assert.match(findings, /gates is missing/);
+});
+
+test("an empty gates array fails closed in the validator", (t) => {
+  const root = rawRecord(t, {
+    schema_version: 2,
+    release_status: "PASS",
+    artifact_promotable: true,
+    gate_summary: summaryOf([]),
+    gates: [],
+    invariants: [],
+  });
+  const { status, findings } = validate(root);
+  assert.notEqual(status, 0);
+  assert.match(findings, /gates is empty/);
+});
+
+test("an empty gates array is rejected by admission", (t) => {
+  const root = rawRecord(t, {
+    schema_version: 2,
+    release_status: "PASS",
+    artifact_promotable: true,
+    gate_summary: summaryOf([]),
+    gates: [],
+    invariants: [],
+  });
+  const { status, output } = admit(root);
+  assert.equal(status, 1);
+  assert.match(output, /no gates found/);
+});
+
+test("a gates value that is not an array fails closed", (t) => {
+  const root = rawRecord(t, {
+    schema_version: 2,
+    release_status: "PASS",
+    artifact_promotable: true,
+    gate_summary: summaryOf([]),
+    gates: {},
+    invariants: [],
+  });
+  const { status, findings } = validate(root);
+  assert.notEqual(status, 0);
+  assert.match(findings, /gates is not an array/);
+});
