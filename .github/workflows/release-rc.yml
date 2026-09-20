@@ -561,7 +561,15 @@ jobs:
       # archive ships its own lockfile, so install the exactly-pinned
       # dependency from the extracted source.
       - name: Install pinned verification dependencies
-        run: npm ci --prefix "clean-room/crabedence-${RELEASE_VERSION}/nemo"
+        run: |
+          # Install OUTSIDE the extracted source. The verifier walks the
+          # source tree to prove it equals the packaged archive, so an
+          # install inside it would add node_modules the archive does not
+          # contain. The verifier resolves ajv from the parent directory.
+          mkdir -p clean-room/nemo
+          cp "clean-room/crabedence-${RELEASE_VERSION}/nemo/package.json" \
+             "clean-room/crabedence-${RELEASE_VERSION}/nemo/package-lock.json" clean-room/nemo/
+          npm ci --prefix clean-room/nemo
 
       - name: Verify release artifact (standalone, no .git)
         run: |
@@ -785,7 +793,15 @@ jobs:
           node-version: 24
 
       - name: Install pinned verification dependencies
-        run: npm ci --prefix "clean-room/crabedence-${RELEASE_VERSION}/nemo"
+        run: |
+          # Install OUTSIDE the extracted source. The verifier walks the
+          # source tree to prove it equals the packaged archive, so an
+          # install inside it would add node_modules the archive does not
+          # contain. The verifier resolves ajv from the parent directory.
+          mkdir -p clean-room/nemo
+          cp "clean-room/crabedence-${RELEASE_VERSION}/nemo/package.json" \
+             "clean-room/crabedence-${RELEASE_VERSION}/nemo/package-lock.json" clean-room/nemo/
+          npm ci --prefix clean-room/nemo
 
       - name: Verify published artifact (standalone, no .git)
         run: |
