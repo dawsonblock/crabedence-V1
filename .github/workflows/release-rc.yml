@@ -564,7 +564,10 @@ jobs:
             dist/crabedence-${{ env.RELEASE_VERSION }}-release-evidence.tar.gz.sha256
           retention-days: 30
 
-      - name: Upload release evidence (for clean-room verify and publish)
+      # Retained for debugging only. It is NOT a trust input: the clean room
+      # verifies the packaged evidence bundle, and public reverification uses
+      # only published release assets.
+      - name: Upload release evidence (diagnostic only)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-evidence
