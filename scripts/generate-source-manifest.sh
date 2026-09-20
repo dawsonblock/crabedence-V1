@@ -35,10 +35,32 @@ mkdir -p "$(dirname "$OUTPUT")"
 
 cd "$SOURCE_DIR"
 
-# Enumerate all files, filter exclusions, compute SHA-256.
+# ─── Enumerate the packaged source ─────────────────────────────────────
+# The manifest must describe exactly what `git archive HEAD` packages.
+# The clean-tree check permits ignored files to be present (local caches,
+# run captures), but `git archive` omits them — so a `find`-only
+# enumeration yields a manifest that can never match the released
+# archive, a mismatch that only surfaces at the clean-room gate.
+# Subtract git's ignored set explicitly.
+ALL_FILES="$(mktemp)"
+IGNORED_FILES="$(mktemp)"
+CANDIDATES="$(mktemp)"
+trap 'rm -f "$ALL_FILES" "$IGNORED_FILES" "$CANDIDATES"' EXIT
+
+find . -type f | sed 's|^\./||' | LC_ALL=C sort > "$ALL_FILES"
+if git -C "$SOURCE_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git -C "$SOURCE_DIR" ls-files --others --ignored --exclude-standard \
+    | LC_ALL=C sort > "$IGNORED_FILES"
+else
+  : > "$IGNORED_FILES"
+fi
+comm -23 "$ALL_FILES" "$IGNORED_FILES" > "$CANDIDATES"
+
+# Filter exclusions and compute SHA-256.
 # Sort with LC_ALL=C for determinism.
-find . -type f | while IFS= read -r filepath; do
-  relpath="${filepath#./}"
+while IFS= read -r relpath; do
+  [ -z "$relpath" ] && continue
+  filepath="./$relpath"
 
   # Skip excluded top-level and nested directories using case matching.
   # This correctly handles both top-level (.git/...) and nested (foo/.git/...).
@@ -81,7 +103,7 @@ find . -type f | while IFS= read -r filepath; do
   # Compute SHA-256
   sha="$(shasum -a 256 "$filepath" | cut -d ' ' -f 1)"
   echo "${sha}  ${relpath}"
-done | LC_ALL=C sort > "$OUTPUT"
+done < "$CANDIDATES" | LC_ALL=C sort > "$OUTPUT"
 
 # Count
 COUNT="$(wc -l < "$OUTPUT" | tr -d ' ')"
