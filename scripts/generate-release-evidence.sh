@@ -173,8 +173,11 @@ cat > "$EVIDENCE_DIR/build-reproducibility.json" << EOF
 EOF
 
 # ─── Phase 6: Source-tree manifest ──────────────────────────────────────────
-# Use the canonical source manifest generator (scripts/generate-source-manifest.sh)
-# which uses find (not git ls-files) and explicit exclusions.
+# The canonical source manifest generator (scripts/generate-source-manifest.sh)
+# treats the Git HEAD tree as authoritative — the same tree `git archive
+# HEAD` packages — and records regular/executable/symlink identity, so the
+# manifest cannot diverge from the released archive and needs no
+# hand-maintained exclusion list.
 bash "$REPO_ROOT/scripts/generate-source-manifest.sh" \
   "$EVIDENCE_DIR/source-tree-sha256.txt" "$REPO_ROOT" 2>&1 | \
   tee "$EVIDENCE_DIR/gate-results/source-manifest-generate.log"

@@ -161,3 +161,26 @@ test("the generator and verifier parse", () => {
     execFileSync("bash", ["-n", file]);
   }
 });
+
+test("tracked .gitattributes introduces no archive-transforming attributes", () => {
+  // The manifest derives from the Git HEAD tree, while `git archive` also
+  // applies export-ignore and export-subst. If either appears, the tree
+  // identity and the packaged archive can diverge silently, so
+  // qualification must fail until the generator has explicit support for
+  // those semantics.
+  const repoRoot = path.resolve(scripts, "..");
+  const tracked = execFileSync("git", ["-C", repoRoot, "ls-files", "-z"], { encoding: "utf8" })
+    .split("\0")
+    .filter((file) => file === ".gitattributes" || file.endsWith("/.gitattributes"));
+  assert.ok(tracked.length > 0, "the repository tracks at least one .gitattributes");
+  for (const file of tracked) {
+    const content = fs.readFileSync(path.join(repoRoot, file), "utf8");
+    for (const line of content.split("\n")) {
+      assert.doesNotMatch(
+        line,
+        /(^|\s)(export-ignore|export-subst)(\s|$)/,
+        `${file} must not use archive-transforming attributes: ${line}`,
+      );
+    }
+  }
+});

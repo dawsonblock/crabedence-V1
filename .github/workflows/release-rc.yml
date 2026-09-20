@@ -271,6 +271,7 @@ jobs:
       release_version: ${{ env.RELEASE_VERSION }}
       tar_sha256: ${{ steps.artifact_hash.outputs.tar_sha256 }}
       zip_sha256: ${{ steps.artifact_hash.outputs.zip_sha256 }}
+      evidence_archive_sha256: ${{ steps.evidence_bundle.outputs.sha256 }}
     services:
       postgres:
         image: postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94
@@ -427,6 +428,22 @@ jobs:
       - name: Finalize release evidence
         run: bash scripts/finalize-release-evidence.sh dist/release-evidence
 
+      # ─── Package the complete finalized evidence bundle ──────────────
+      # The public bundle is the WHOLE finalized tree, not an allow-list.
+      # SHA256SUMS covers every evidence file, so publishing a subset
+      # would leave the published set unable to verify itself. The digest
+      # is computed once here and carried through every later stage; the
+      # evidence directory is never mutated after this point.
+      - name: Package release evidence bundle
+        id: evidence_bundle
+        shell: bash
+        run: |
+          sha="$(bash scripts/package-release-evidence.sh \
+            dist/release-evidence \
+            "dist/crabedence-${RELEASE_VERSION}-release-evidence.tar.gz")"
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+          echo "Evidence bundle SHA-256: $sha"
+
       # ─── Attest the FINAL evidence manifest ───────────────────────────
       # The attestation subject is the final evidence manifest, whose
       # digest covers SHA256SUMS, which in turn covers artifact.json and
@@ -484,6 +501,7 @@ jobs:
             --evidence dist/release-evidence \
             --source . \
             --archive "dist/crabedence-${RELEASE_VERSION}.tar.gz" \
+            --zip "dist/crabedence-${RELEASE_VERSION}.zip" \
             --sbom "dist/crabedence-${RELEASE_VERSION}.bom.json"
 
       # Artifact attestations are created only AFTER the clean-room job
@@ -503,6 +521,8 @@ jobs:
             dist/crabedence-${{ env.RELEASE_VERSION }}.zip
             dist/crabedence-${{ env.RELEASE_VERSION }}.zip.sha256
             dist/crabedence-${{ env.RELEASE_VERSION }}.bom.json
+            dist/crabedence-${{ env.RELEASE_VERSION }}-release-evidence.tar.gz
+            dist/crabedence-${{ env.RELEASE_VERSION }}-release-evidence.tar.gz.sha256
           retention-days: 30
 
       - name: Upload release evidence (for clean-room verify and publish)
@@ -537,20 +557,33 @@ jobs:
           name: release-source-archive
           path: archive
 
-      - name: Verify archive SHA-256
+      # Both archives are official artifacts with their own identity. Each
+      # digest is recomputed from the staged bytes and compared against
+      # the build output AND the declared checksum file — a mismatch in
+      # either stops the workflow.
+      - name: Verify every staged digest
         run: |
-          expected="$(cut -d ' ' -f1 < archive/crabedence-${RELEASE_VERSION}.tar.gz.sha256)"
-          actual="$(sha256sum archive/crabedence-${RELEASE_VERSION}.tar.gz | cut -d ' ' -f1)"
-          if [ "$expected" != "$actual" ]; then
-            echo "SHA-256 mismatch: expected=$expected actual=$actual"
-            exit 1
-          fi
-          echo "Archive SHA-256 verified: $actual"
+          check() {
+            local file="$1" expected="$2" actual declared
+            actual="$(sha256sum "$file" | cut -d ' ' -f1)"
+            declared="$(cut -d ' ' -f1 < "${file}.sha256")"
+            if [ "$actual" != "$expected" ] || [ "$declared" != "$expected" ]; then
+              echo "ERROR: $file digest $actual / declared $declared does not match the build output $expected" >&2
+              exit 1
+            fi
+            echo "$file verified: $actual"
+          }
+          check "archive/crabedence-${RELEASE_VERSION}.tar.gz" "${{ needs.build.outputs.tar_sha256 }}"
+          check "archive/crabedence-${RELEASE_VERSION}.zip" "${{ needs.build.outputs.zip_sha256 }}"
+          check "archive/crabedence-${RELEASE_VERSION}-release-evidence.tar.gz" "${{ needs.build.outputs.evidence_archive_sha256 }}"
 
-      - name: Extract archive into clean directory
+      # Extract each archive into its OWN directory — never one over the
+      # other — so each is verified from its own bytes.
+      - name: Extract both archives
         run: |
-          mkdir -p clean-room
-          tar xzf "archive/crabedence-${RELEASE_VERSION}.tar.gz" -C clean-room
+          mkdir -p clean-room/tar-source clean-room/zip-source
+          tar xzf "archive/crabedence-${RELEASE_VERSION}.tar.gz" -C clean-room/tar-source
+          unzip -q "archive/crabedence-${RELEASE_VERSION}.zip" -d clean-room/zip-source
 
       - name: Set up Node
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
@@ -567,25 +600,64 @@ jobs:
           # install inside it would add node_modules the archive does not
           # contain. The verifier resolves ajv from the parent directory.
           mkdir -p clean-room/nemo
-          cp "clean-room/crabedence-${RELEASE_VERSION}/nemo/package.json" \
-             "clean-room/crabedence-${RELEASE_VERSION}/nemo/package-lock.json" clean-room/nemo/
+          cp "clean-room/tar-source/crabedence-${RELEASE_VERSION}/nemo/package.json" \
+             "clean-room/tar-source/crabedence-${RELEASE_VERSION}/nemo/package-lock.json" clean-room/nemo/
           npm ci --prefix clean-room/nemo
+
+      # Each extracted tree must independently reproduce the source
+      # manifest: same path inventory, same types, same modes, same
+      # regular-file bytes, same symlink target bytes.
+      - name: Verify both source trees against the source manifest
+        run: |
+          cp -r evidence clean-room/qualification
+          for tree in tar-source zip-source; do
+            src="clean-room/${tree}/crabedence-${RELEASE_VERSION}"
+            echo "=== source manifest: $tree ==="
+            bash "$src/scripts/verify-source-manifest.sh" \
+              clean-room/qualification/source-tree-sha256.txt "$src"
+          done
+
+      # Beyond each matching the manifest, the two archives must carry the
+      # SAME normalized source inventory — this catches format-specific
+      # packaging drift (mode loss, symlink flattening, dropped entries).
+      - name: Require tar/ZIP semantic source equivalence
+        run: |
+          normalize() {
+            local root="$1"
+            find "$root" -mindepth 1 \( -type f -o -type l \) -print0 \
+              | while IFS= read -r -d '' path; do
+                  local rel="${path#"$root"/}"
+                  if [ -L "$path" ]; then
+                    printf 'symlink 120000 %s %s\n' \
+                      "$(printf '%s' "$(readlink "$path")" | shasum -a 256 | cut -d ' ' -f1)" "$rel"
+                  else
+                    local mode=100644
+                    [ -x "$path" ] && mode=100755
+                    printf 'file %s %s %s\n' "$mode" "$(shasum -a 256 "$path" | cut -d ' ' -f1)" "$rel"
+                  fi
+                done | LC_ALL=C sort
+          }
+          normalize "clean-room/tar-source/crabedence-${RELEASE_VERSION}" > /tmp/tar.norm
+          normalize "clean-room/zip-source/crabedence-${RELEASE_VERSION}" > /tmp/zip.norm
+          if ! diff -u /tmp/tar.norm /tmp/zip.norm; then
+            echo "ERROR: tar and zip source inventories differ" >&2
+            exit 1
+          fi
+          echo "tar and zip carry identical source inventories ($(wc -l < /tmp/tar.norm | tr -d ' ') entries)"
 
       - name: Verify release artifact (standalone, no .git)
         run: |
-          # Copy evidence bundle alongside extracted source
-          cp -r evidence clean-room/qualification
           # Run the verifier against the extracted source with the
-          # explicit release contract: the archive digest is recomputed
-          # from the staged bytes, artifact.json must bind it, the final
-          # manifest must cover it, and the registry digest is recomputed
-          # from the envelope. The verifier uses find (not git) so it
-          # works without .git
-          bash clean-room/crabedence-${RELEASE_VERSION}/scripts/verify-release-artifact.sh \
+          # explicit release contract: both archive digests are recomputed
+          # from the staged bytes, artifact.json must bind them, the final
+          # manifest must cover the artifact binding, and the registry
+          # digest is recomputed from the envelope.
+          bash clean-room/tar-source/crabedence-${RELEASE_VERSION}/scripts/verify-release-artifact.sh \
             --mode release \
             --evidence clean-room/qualification \
-            --source clean-room/crabedence-${RELEASE_VERSION} \
+            --source clean-room/tar-source/crabedence-${RELEASE_VERSION} \
             --archive "archive/crabedence-${RELEASE_VERSION}.tar.gz" \
+            --zip "archive/crabedence-${RELEASE_VERSION}.zip" \
             --sbom "archive/crabedence-${RELEASE_VERSION}.bom.json"
 
   # ─── Attest (only after clean-room verification passed) ──────────────
@@ -606,6 +678,24 @@ jobs:
           name: release-source-archive
           path: dist
 
+      # Never trust the delivered filenames: recompute every digest
+      # immediately before signing and compare against the qualified
+      # identities the build job reported. A mismatch stops attestation.
+      - name: Recompute staged digests before attestation
+        run: |
+          check() {
+            local file="$1" expected="$2" actual
+            actual="$(sha256sum "$file" | cut -d ' ' -f1)"
+            if [ "$actual" != "$expected" ]; then
+              echo "ERROR: $file digest $actual does not match the qualified $expected" >&2
+              exit 1
+            fi
+            echo "$file: $actual"
+          }
+          check "dist/crabedence-${RELEASE_VERSION}.tar.gz" "${{ needs.build.outputs.tar_sha256 }}"
+          check "dist/crabedence-${RELEASE_VERSION}.zip" "${{ needs.build.outputs.zip_sha256 }}"
+          check "dist/crabedence-${RELEASE_VERSION}-release-evidence.tar.gz" "${{ needs.build.outputs.evidence_archive_sha256 }}"
+
       # ─── GitHub artifact attestation (SLSA provenance) ────────────────
       - name: Attest source archive
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
@@ -616,6 +706,11 @@ jobs:
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: dist/crabedence-${{ env.RELEASE_VERSION }}.zip
+
+      - name: Attest release evidence bundle
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/crabedence-${{ env.RELEASE_VERSION }}-release-evidence.tar.gz
 
       - name: Attest SBOM
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
@@ -654,15 +749,20 @@ jobs:
       # recomputed here against the digest the build job reported — a
       # staging mismatch stops publication instead of shipping unverified
       # bytes.
-      - name: Verify staged archive before publication
+      - name: Verify staged artifacts before publication
         run: |
-          expected="${{ needs.build.outputs.tar_sha256 }}"
-          actual="$(sha256sum "dist/crabedence-${RELEASE_VERSION}.tar.gz" | cut -d ' ' -f1)"
-          if [ "$expected" != "$actual" ]; then
-            echo "ERROR: staged archive SHA-256 $actual does not match the verified $expected" >&2
-            exit 1
-          fi
-          echo "Staged archive matches the verified digest: $actual"
+          check() {
+            local file="$1" expected="$2" actual
+            actual="$(sha256sum "$file" | cut -d ' ' -f1)"
+            if [ "$actual" != "$expected" ]; then
+              echo "ERROR: staged $file SHA-256 $actual does not match the verified $expected" >&2
+              exit 1
+            fi
+            echo "Staged $file matches the verified digest: $actual"
+          }
+          check "dist/crabedence-${RELEASE_VERSION}.tar.gz" "${{ needs.build.outputs.tar_sha256 }}"
+          check "dist/crabedence-${RELEASE_VERSION}.zip" "${{ needs.build.outputs.zip_sha256 }}"
+          check "dist/crabedence-${RELEASE_VERSION}-release-evidence.tar.gz" "${{ needs.build.outputs.evidence_archive_sha256 }}"
 
       # ─── Tag the release candidate ────────────────────────────────────
       - name: Configure Git identity
@@ -695,6 +795,7 @@ jobs:
             ### Artifact hashes
             - **tar.gz SHA-256:** `${{ needs.build.outputs.tar_sha256 }}`
             - **zip SHA-256:** `${{ needs.build.outputs.zip_sha256 }}`
+            - **release-evidence.tar.gz SHA-256:** `${{ needs.build.outputs.evidence_archive_sha256 }}`
 
             ### Verification
             See [VERIFY-RELEASE.md](./VERIFY-RELEASE.md) for instructions on how to verify this release artifact.
@@ -707,25 +808,18 @@ jobs:
 
             ### Qualification
             All mandatory gates passed. See `qualification.json` for the exact gate count and per-gate status.
+          # The COMPLETE finalized evidence tree ships as one immutable
+          # archive. Publishing a hand-maintained subset would leave the
+          # published set unable to verify itself: SHA256SUMS references
+          # every evidence file, so a partial upload cannot be checked.
           files: |
             dist/crabedence-${{ env.RELEASE_VERSION }}.tar.gz
             dist/crabedence-${{ env.RELEASE_VERSION }}.tar.gz.sha256
             dist/crabedence-${{ env.RELEASE_VERSION }}.zip
             dist/crabedence-${{ env.RELEASE_VERSION }}.zip.sha256
             dist/crabedence-${{ env.RELEASE_VERSION }}.bom.json
-            dist/release-evidence/qualification.json
-            dist/release-evidence/qualification-matrix.md
-            dist/release-evidence/source-tree-sha256.txt
-            dist/release-evidence/provenance.json
-            dist/release-evidence/artifact.json
-            dist/release-evidence/evidence-manifest.json
-            dist/release-evidence/registry.sha256
-            dist/release-evidence/registry.json
-            dist/release-evidence/qualification-registry.sha256
-            dist/release-evidence/qualification-registry.json
-            dist/release-evidence/qualification-registry-extensions.json
-            dist/release-evidence/attestation/attestation.json
-            dist/release-evidence/SHA256SUMS
+            dist/crabedence-${{ env.RELEASE_VERSION }}-release-evidence.tar.gz
+            dist/crabedence-${{ env.RELEASE_VERSION }}-release-evidence.tar.gz.sha256
 
   # ─── Public reverify (distribution integrity) ────────────────────────
   # After publication, download the PUBLIC bytes and verify them against
@@ -741,6 +835,10 @@ jobs:
     env:
       RELEASE_VERSION: ${{ needs.build.outputs.release_version }}
     steps:
+      # PUBLIC ASSETS ONLY. This job must never read the internal Actions
+      # evidence artifact: it must prove the release is self-verifying
+      # from exactly the files an external user can download. If it cannot
+      # pass with the workflow artifact store deleted, RC1 is not done.
       - name: Download published artifacts
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -750,42 +848,41 @@ jobs:
             --repo ${{ github.repository }} \
             --pattern "crabedence-${RELEASE_VERSION}.tar.gz" \
             --pattern "crabedence-${RELEASE_VERSION}.tar.gz.sha256" \
+            --pattern "crabedence-${RELEASE_VERSION}.zip" \
+            --pattern "crabedence-${RELEASE_VERSION}.zip.sha256" \
             --pattern "crabedence-${RELEASE_VERSION}.bom.json" \
-            --pattern "artifact.json" \
-            --pattern "evidence-manifest.json" \
-            --pattern "SHA256SUMS" \
+            --pattern "crabedence-${RELEASE_VERSION}-release-evidence.tar.gz" \
+            --pattern "crabedence-${RELEASE_VERSION}-release-evidence.tar.gz.sha256" \
             --dir public
 
-      - name: Verify published archive matches the qualified digest
+      - name: Verify public digests
         run: |
-          qualified="${{ needs.build.outputs.tar_sha256 }}"
-          actual="$(sha256sum "public/crabedence-${RELEASE_VERSION}.tar.gz" | cut -d ' ' -f1)"
-          published="$(cut -d ' ' -f1 < "public/crabedence-${RELEASE_VERSION}.tar.gz.sha256")"
-          if [ "$actual" != "$qualified" ] || [ "$published" != "$qualified" ]; then
-            echo "ERROR: published archive digest $actual / declared $published does not match the qualified $qualified" >&2
-            exit 1
-          fi
-          echo "Published archive matches the qualified digest: $actual"
-
-      - name: Download release evidence
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: release-evidence
-          path: evidence
-
-      - name: Verify published evidence files match the qualified bundle
-        run: |
-          for file in artifact.json evidence-manifest.json SHA256SUMS; do
-            if ! cmp -s "public/$file" "evidence/$file"; then
-              echo "ERROR: published $file differs from the qualified evidence bundle" >&2
+          check() {
+            local file="$1" expected="$2" actual declared
+            actual="$(sha256sum "$file" | cut -d ' ' -f1)"
+            declared="$(cut -d ' ' -f1 < "${file}.sha256")"
+            if [ "$actual" != "$expected" ] || [ "$declared" != "$expected" ]; then
+              echo "ERROR: published $file digest $actual / declared $declared does not match the qualified $expected" >&2
               exit 1
             fi
-          done
+            echo "published $file matches the qualified digest: $actual"
+          }
+          check "public/crabedence-${RELEASE_VERSION}.tar.gz" "${{ needs.build.outputs.tar_sha256 }}"
+          check "public/crabedence-${RELEASE_VERSION}.zip" "${{ needs.build.outputs.zip_sha256 }}"
+          check "public/crabedence-${RELEASE_VERSION}-release-evidence.tar.gz" "${{ needs.build.outputs.evidence_archive_sha256 }}"
 
-      - name: Extract published archive
+      - name: Extract the public evidence bundle and both archives
         run: |
-          mkdir -p clean-room
-          tar xzf "public/crabedence-${RELEASE_VERSION}.tar.gz" -C clean-room
+          mkdir -p evidence clean-room/tar-source clean-room/zip-source
+          tar xzf "public/crabedence-${RELEASE_VERSION}-release-evidence.tar.gz" \
+            -C evidence --strip-components=1
+          tar xzf "public/crabedence-${RELEASE_VERSION}.tar.gz" -C clean-room/tar-source
+          unzip -q "public/crabedence-${RELEASE_VERSION}.zip" -d clean-room/zip-source
+
+      - name: Verify the public evidence bundle self-checks
+        run: |
+          cd evidence
+          shasum -a 256 -c SHA256SUMS
 
       - name: Set up Node
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
@@ -799,23 +896,35 @@ jobs:
           # install inside it would add node_modules the archive does not
           # contain. The verifier resolves ajv from the parent directory.
           mkdir -p clean-room/nemo
-          cp "clean-room/crabedence-${RELEASE_VERSION}/nemo/package.json" \
-             "clean-room/crabedence-${RELEASE_VERSION}/nemo/package-lock.json" clean-room/nemo/
+          cp "clean-room/tar-source/crabedence-${RELEASE_VERSION}/nemo/package.json" \
+             "clean-room/tar-source/crabedence-${RELEASE_VERSION}/nemo/package-lock.json" clean-room/nemo/
           npm ci --prefix clean-room/nemo
 
-      - name: Verify published artifact (standalone, no .git)
+      - name: Verify both public source trees
         run: |
-          cp -r evidence clean-room/qualification
-          bash clean-room/crabedence-${RELEASE_VERSION}/scripts/verify-release-artifact.sh \
+          for tree in tar-source zip-source; do
+            src="clean-room/${tree}/crabedence-${RELEASE_VERSION}"
+            echo "=== source manifest: $tree ==="
+            bash "$src/scripts/verify-source-manifest.sh" evidence/source-tree-sha256.txt "$src"
+          done
+
+      - name: Verify published artifact from public assets only
+        run: |
+          bash clean-room/tar-source/crabedence-${RELEASE_VERSION}/scripts/verify-release-artifact.sh \
             --mode release \
-            --evidence clean-room/qualification \
-            --source clean-room/crabedence-${RELEASE_VERSION} \
+            --evidence evidence \
+            --source clean-room/tar-source/crabedence-${RELEASE_VERSION} \
             --archive "public/crabedence-${RELEASE_VERSION}.tar.gz" \
+            --zip "public/crabedence-${RELEASE_VERSION}.zip" \
             --sbom "public/crabedence-${RELEASE_VERSION}.bom.json"
 
-      - name: Verify published attestation
+      - name: Verify published attestations
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh attestation verify "public/crabedence-${RELEASE_VERSION}.tar.gz" \
+            --repo ${{ github.repository }}
+          gh attestation verify "public/crabedence-${RELEASE_VERSION}.zip" \
+            --repo ${{ github.repository }}
+          gh attestation verify "public/crabedence-${RELEASE_VERSION}-release-evidence.tar.gz" \
             --repo ${{ github.repository }}

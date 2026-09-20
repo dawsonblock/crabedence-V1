@@ -81,11 +81,13 @@ test("release-mode verification binds the archive and the SBOM", () => {
   assert.match(reverify, /--pattern "crabedence-\$\{RELEASE_VERSION\}\.bom\.json"/);
 });
 
-test("publication re-verifies the staged archive against the build digest", () => {
+test("publication re-verifies every staged artifact against the build digests", () => {
   const publish = job("publish");
-  assert.match(publish, /expected="\$\{\{ needs\.build\.outputs\.tar_sha256 \}\}"/);
-  assert.match(publish, /sha256sum "dist\/crabedence-\$\{RELEASE_VERSION\}\.tar\.gz"/);
-  const verifyIndex = publish.indexOf("Verify staged archive before publication");
+  assert.match(publish, /needs\.build\.outputs\.tar_sha256/);
+  assert.match(publish, /needs\.build\.outputs\.zip_sha256/);
+  assert.match(publish, /needs\.build\.outputs\.evidence_archive_sha256/);
+  assert.match(publish, /sha256sum "\$file"/);
+  const verifyIndex = publish.indexOf("Verify staged artifacts before publication");
   const tagIndex = publish.indexOf("Tag release candidate");
   assert.ok(verifyIndex >= 0 && verifyIndex < tagIndex, "staged bytes are verified before tagging");
 });
@@ -98,10 +100,16 @@ test("the build job stages the exact bytes the clean room and publish consume", 
   assert.equal((build.match(/retention-days: 30/g) ?? []).length, 2);
 });
 
-test("the final evidence manifest is a published release asset", () => {
+test("the complete evidence bundle is a published release asset", () => {
   const publish = job("publish");
-  assert.match(publish, /dist\/release-evidence\/evidence-manifest\.json/);
-  assert.match(publish, /dist\/release-evidence\/artifact\.json/);
+  assert.match(publish, /dist\/crabedence-\$\{\{ env\.RELEASE_VERSION \}\}-release-evidence\.tar\.gz/);
+  // The partial allow-list is gone. SHA256SUMS covers every evidence file,
+  // so publishing a subset leaves the published set unable to verify
+  // itself — a consumer would hold a manifest referencing files that were
+  // never uploaded.
+  assert.doesNotMatch(publish, /dist\/release-evidence\/SHA256SUMS/);
+  assert.doesNotMatch(publish, /dist\/release-evidence\/artifact\.json/);
+  assert.doesNotMatch(publish, /dist\/release-evidence\/registry\.json/);
 });
 
 test("published bytes are reverified after publication", () => {
@@ -115,19 +123,40 @@ test("published bytes are reverified after publication", () => {
   assert.doesNotMatch(job("publish"), /public-reverify/);
 });
 
-test("the published evidence set is sufficient for consumer verification", () => {
-  const publish = job("publish");
-  for (const file of [
-    "artifact.json",
-    "evidence-manifest.json",
-    "registry.sha256",
-    "registry.json",
-    "attestation/attestation.json",
-    "SHA256SUMS",
-  ]) {
-    assert.ok(
-      publish.includes(`dist/release-evidence/${file}`),
-      `publish must include dist/release-evidence/${file}`,
-    );
+test("the published evidence bundle is packaged from the finalized tree", () => {
+  const build = job("build");
+  // Packaging runs after finalization, so the bundle is the finalized tree
+  // and nothing mutates the evidence directory afterwards.
+  const finalize = build.indexOf("Finalize release evidence");
+  const packageStep = build.indexOf("Package release evidence bundle");
+  assert.ok(finalize >= 0 && packageStep > finalize, "the bundle is packaged after finalization");
+  assert.match(build, /package-release-evidence\.sh/);
+  assert.match(build, /sha256=\$sha/);
+  assert.match(build, /dist\/crabedence-\$\{\{ env\.RELEASE_VERSION \}\}-release-evidence\.tar\.gz/);
+});
+
+test("public reverify consumes public assets only", () => {
+  const reverify = job("public-reverify");
+  assert.match(reverify, /gh release download/);
+  assert.match(reverify, /-release-evidence\.tar\.gz/);
+  assert.match(reverify, /--pattern "crabedence-\$\{RELEASE_VERSION\}\.zip"/);
+  // It must never substitute the internal Actions evidence artifact for
+  // published evidence: if the release cannot be verified from the public
+  // bytes alone, it is not self-verifying.
+  assert.doesNotMatch(reverify, /actions\/download-artifact@/);
+  assert.doesNotMatch(reverify, /name: release-evidence/);
+  assert.doesNotMatch(reverify, /cp -r evidence clean-room\/qualification/);
+  assert.match(reverify, /shasum -a 256 -c SHA256SUMS/);
+});
+
+test("both archives and the evidence bundle traverse the whole DAG", () => {
+  for (const name of ["clean-room-verify", "attest", "publish", "public-reverify"]) {
+    const body = job(name);
+    assert.match(body, /\.tar\.gz/, `${name} handles the tar.gz`);
+    assert.match(body, /\.zip/, `${name} handles the zip`);
+    assert.match(body, /-release-evidence\.tar\.gz/, `${name} handles the evidence bundle`);
+    assert.match(body, /outputs\.tar_sha256/, `${name} compares the tar digest`);
+    assert.match(body, /outputs\.zip_sha256/, `${name} compares the zip digest`);
+    assert.match(body, /outputs\.evidence_archive_sha256/, `${name} compares the evidence digest`);
   }
 });

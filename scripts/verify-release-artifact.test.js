@@ -92,6 +92,12 @@ function bundle(
   const sbomBytes = Buffer.from(JSON.stringify({ bomFormat: "CycloneDX", components: [] }));
   fs.writeFileSync(sbomPath, sbomBytes);
 
+  // The zip is an official artifact with its own identity, so the fixture
+  // carries a real one whose digest matches artifact.json.
+  const zipBytes = Buffer.from("fixture zip bytes\n");
+  const zipPath = path.join(root, "crabedence-1.0.0-rc.7.zip");
+  fs.writeFileSync(zipPath, zipBytes);
+
   const artifactBytes = Buffer.from(
     JSON.stringify({
       schema_version: artifactSchema,
@@ -106,7 +112,7 @@ function bundle(
         sha256: "c".repeat(64),
         size: 21,
         zip_filename: "crabedence-1.0.0-rc.7.zip",
-        zip_sha256: "d".repeat(64),
+        zip_sha256: sha256(zipBytes),
       },
       policy: { registry_sha256: registryBound ? registrySha : "f".repeat(64) },
       qualification: { sha256: "e".repeat(64), schema_version: 2 },
@@ -158,7 +164,7 @@ function bundle(
       }),
     );
   }
-  return { root, manifest, registrySha, artifactBytes, sbomPath };
+  return { root, manifest, registrySha, artifactBytes, sbomPath, zipPath, zipBytes };
 }
 
 function verify(root, args = []) {
@@ -237,7 +243,7 @@ test("release mode requires an archive (contract violation)", (t) => {
   ]);
   assert.equal(status, 1);
   assert.match(output, /MODE CONTRACT VIOLATED/);
-  assert.match(output, /requires the release archive/);
+  assert.match(output, /requires the release tar\.gz/);
 });
 
 test("release mode requires artifact.json (contract violation)", (t) => {
@@ -273,19 +279,20 @@ test("qualification mode accepts a bundle without archive or artifact", (t) => {
 });
 
 test("release mode recomputes the archive against artifact.json", (t) => {
-  const { root, sbomPath } = bundle(t);
+  const { root, sbomPath, zipPath } = bundle(t);
   const archive = path.join(root, "crabedence-1.0.0-rc.7.tar.gz");
   fs.writeFileSync(archive, "fixture archive bytes\n");
   // artifact.json claims a digest and size that do not match the archive.
   const { output } = verify(root, [
-    "--mode", "release", "--evidence", root, "--source", root, "--archive", archive, "--sbom", sbomPath,
+    "--mode", "release", "--evidence", root, "--source", root, "--archive", archive,
+    "--zip", zipPath, "--sbom", sbomPath,
   ]);
   assert.match(output, /Archive matches artifact\.json \(recomputed\)\s+FAIL/);
   assert.match(output, /Archive size matches artifact\.json\s+FAIL/);
 });
 
 test("release mode accepts an archive whose bytes match the binding", (t) => {
-  const { root, sbomPath } = bundle(t);
+  const { root, sbomPath, zipPath } = bundle(t);
   const archive = path.join(root, "crabedence-1.0.0-rc.7.tar.gz");
   fs.writeFileSync(archive, "fixture archive bytes\n");
   // Rewrite artifact.json to bind the actual archive bytes and size.
@@ -306,19 +313,23 @@ test("release mode accepts an archive whose bytes match the binding", (t) => {
   fs.writeFileSync(path.join(root, "SHA256SUMS"), sums + "\n");
 
   const { output } = verify(root, [
-    "--mode", "release", "--evidence", root, "--source", root, "--archive", archive, "--sbom", sbomPath,
+    "--mode", "release", "--evidence", root, "--source", root, "--archive", archive,
+    "--zip", zipPath, "--sbom", sbomPath,
   ]);
   assert.match(output, /Archive matches artifact\.json \(recomputed\)\s+PASS/);
   assert.match(output, /Archive size matches artifact\.json\s+PASS/);
+  assert.match(output, /Zip matches artifact\.json \(recomputed\)\s+PASS/);
+  assert.match(output, /Zip filename matches artifact\.json\s+PASS/);
   assert.match(output, /artifact\.json binds the SBOM\s+PASS/);
 });
 
 test("an SBOM that does not match the binding fails closed", (t) => {
-  const { root, sbomPath } = bundle(t, { sbomBound: false });
+  const { root, sbomPath, zipPath } = bundle(t, { sbomBound: false });
   const archive = path.join(root, "crabedence-1.0.0-rc.7.tar.gz");
   fs.writeFileSync(archive, "fixture archive bytes\n");
   const { output } = verify(root, [
-    "--mode", "release", "--evidence", root, "--source", root, "--archive", archive, "--sbom", sbomPath,
+    "--mode", "release", "--evidence", root, "--source", root, "--archive", archive,
+    "--zip", zipPath, "--sbom", sbomPath,
   ]);
   assert.match(output, /artifact\.json binds the SBOM\s+FAIL/);
 });
@@ -423,4 +434,56 @@ test("an extension record bound to the wrong qualification registry fails closed
   const { root } = bundle(t, { extensionQualSha: "0".repeat(64) });
   const { output } = verify(root, qualificationArgs(root));
   assert.match(output, /Extension record binds the qualification registry\s+FAIL/);
+});
+
+test("release mode requires the zip (contract violation)", (t) => {
+  const { root, sbomPath } = bundle(t);
+  const archive = path.join(root, "crabedence-1.0.0-rc.7.tar.gz");
+  fs.writeFileSync(archive, "fixture archive bytes\n");
+  const { status, output } = verify(root, [
+    "--mode", "release", "--evidence", root, "--source", root, "--archive", archive, "--sbom", sbomPath,
+  ]);
+  assert.equal(status, 1);
+  assert.match(output, /requires the release zip/);
+});
+
+test("a zip whose bytes do not match the binding fails closed", (t) => {
+  const { root, sbomPath, zipPath } = bundle(t);
+  const archive = path.join(root, "crabedence-1.0.0-rc.7.tar.gz");
+  fs.writeFileSync(archive, "fixture archive bytes\n");
+  // One byte of the zip changes; the recorded digest no longer covers it.
+  const bytes = fs.readFileSync(zipPath);
+  bytes[0] ^= 0x01;
+  fs.writeFileSync(zipPath, bytes);
+  const { output } = verify(root, [
+    "--mode", "release", "--evidence", root, "--source", root, "--archive", archive,
+    "--zip", zipPath, "--sbom", sbomPath,
+  ]);
+  assert.match(output, /Zip matches artifact\.json \(recomputed\)\s+FAIL/);
+});
+
+test("a zip under the wrong filename fails closed", (t) => {
+  const { root, sbomPath, zipBytes } = bundle(t);
+  const archive = path.join(root, "crabedence-1.0.0-rc.7.tar.gz");
+  fs.writeFileSync(archive, "fixture archive bytes\n");
+  const renamed = path.join(root, "renamed.zip");
+  fs.writeFileSync(renamed, zipBytes);
+  const { output } = verify(root, [
+    "--mode", "release", "--evidence", root, "--source", root, "--archive", archive,
+    "--zip", renamed, "--sbom", sbomPath,
+  ]);
+  assert.match(output, /Zip filename matches artifact\.json\s+FAIL/);
+});
+
+test("a missing zip file fails closed", (t) => {
+  const { root, sbomPath } = bundle(t);
+  const archive = path.join(root, "crabedence-1.0.0-rc.7.tar.gz");
+  fs.writeFileSync(archive, "fixture archive bytes\n");
+  const { status, output } = verify(root, [
+    "--mode", "release", "--evidence", root, "--source", root, "--archive", archive,
+    "--zip", path.join(root, "absent.zip"), "--sbom", sbomPath,
+  ]);
+  assert.equal(status, 1);
+  assert.match(output, /MODE CONTRACT VIOLATED/);
+  assert.match(output, /requires the release zip/);
 });

@@ -11,16 +11,32 @@ artifact to a specific Git commit, qualification record, and build environment.
 - `jq` for JSON inspection
 - `git` for source verification
 
+A release publishes exactly three artifacts plus their checksums and
+attestations:
+
+| Asset | Contents |
+|---|---|
+| `crabedence-<version>.tar.gz` | source archive |
+| `crabedence-<version>.zip` | source archive (same source, zip format) |
+| `crabedence-<version>-release-evidence.tar.gz` | the **complete** finalized evidence directory |
+
+The evidence bundle is the whole finalized tree, not a subset: its
+`SHA256SUMS` references every evidence file, so a partial upload could
+not be verified by anyone. Everything below is verifiable from these
+published files alone — no CI artifact store is involved.
+
 ## Verification chain
 
 ```
-downloaded archive
+downloaded tar.gz + zip + release-evidence.tar.gz
     ↓
-SHA-256 checksum
+SHA-256 of all three (recomputed from the bytes)
     ↓
 GitHub artifact attestation (SLSA provenance)
     ↓
 workflow + repository + commit
+    ↓
+evidence bundle self-checks (shasum -c SHA256SUMS)
     ↓
 final evidence manifest (covers artifact.json and every evidence file)
     ↓
@@ -28,10 +44,10 @@ registry policy identity (recomputed from the canonical envelope)
     ↓
 qualification.json
     ↓
-source manifest
+source manifest (both extracted archives)
 ```
 
-## Step 1: Verify the SHA-256 checksum
+## Step 1: Verify the SHA-256 checksums
 
 Each release includes `.sha256` files alongside the archives:
 
@@ -39,14 +55,29 @@ Each release includes `.sha256` files alongside the archives:
 # The release you are verifying (current candidate: 0.52.0-rc.1)
 VERSION=0.52.0-rc.1
 
-# Verify the tar.gz
 sha256sum -c "crabedence-${VERSION}.tar.gz.sha256"
-
-# Verify the zip
 sha256sum -c "crabedence-${VERSION}.zip.sha256"
+sha256sum -c "crabedence-${VERSION}-release-evidence.tar.gz.sha256"
 ```
 
-The checksum must match the hash recorded in `release-evidence/artifact.json`.
+All three must match the hashes in `artifact.json` (for the archives) and
+the release notes (for the evidence bundle). The zip is an official
+artifact with its own identity — `artifact.json` binds it separately as
+`artifact.zip_sha256`, and the standalone verifier recomputes it rather
+than assuming the tar digest applies to both.
+
+## Step 2: Extract and self-check the evidence bundle
+
+```bash
+mkdir -p evidence
+tar xzf "crabedence-${VERSION}-release-evidence.tar.gz" -C evidence --strip-components=1
+cd evidence
+shasum -a 256 -c SHA256SUMS
+```
+
+Every checksum must verify. If any file referenced by `SHA256SUMS` is
+absent, the published evidence set is incomplete and the release cannot
+be independently verified.
 
 ### The release object (artifact.json v2)
 
@@ -73,7 +104,7 @@ archive, the source manifest, `provenance.json`, `qualification.json`,
 and the SBOM — never trusted as a string. An unknown `schema_version`
 fails closed rather than being interpreted with the wrong semantics.
 
-## Step 2: Verify the GitHub artifact attestation
+## Step 3: Verify the GitHub artifact attestations
 
 GitHub attests that the artifact was built from a specific repository,
 workflow, commit, and trigger. This is signed Sigstore-backed SLSA build
@@ -87,12 +118,16 @@ gh attestation verify "crabedence-${VERSION}.tar.gz" \
 # Verify the zip attestation
 gh attestation verify "crabedence-${VERSION}.zip" \
   --repo dawsonblock/crabedence-V1
+
+# Verify the evidence bundle attestation
+gh attestation verify "crabedence-${VERSION}-release-evidence.tar.gz" \
+  --repo dawsonblock/crabedence-V1
 ```
 
 This proves the artifact was produced by the repository's GitHub Actions
 workflow, not by an untrusted source.
 
-## Step 3: Verify the source commit
+## Step 4: Verify the source commit
 
 The attestation binds the artifact to a specific commit SHA. Cross-reference
 this with `release-evidence/provenance.json`:
@@ -105,7 +140,7 @@ jq -r '.commit' release-evidence/provenance.json
 # The attestation output includes the commit SHA in the provenance
 ```
 
-## Step 4: Verify qualification status
+## Step 5: Verify qualification status
 
 Check that all mandatory gates passed:
 
@@ -123,7 +158,7 @@ jq -r '.gates[] | "\(.gate_id): \(.status)"' release-evidence/qualification.json
 All gates must show `PASS`. The `release_status` must be `PASS` and
 `artifact_promotable` must be `true`.
 
-## Step 5: Verify the source manifest
+## Step 6: Verify the source manifest (both archives)
 
 The source manifest is the release source **inventory**: it is derived from
 the Git HEAD tree — the same tree `git archive HEAD` packages — so it cannot
@@ -143,19 +178,32 @@ it fails closed on a missing entry, a symlink replaced by a regular file or
 repointed, a cleared or unexpected executable bit, or any packaged entry
 absent from the manifest.
 
-```bash
-# Extract the archive
-tar xzf "crabedence-${VERSION}.tar.gz"
+Because the manifest is the Git HEAD tree identity, it is only equal to
+`git archive` output while no archive-transforming attributes are in play.
+RC1 is qualified on the basis that tracked `.gitattributes` uses no
+`export-ignore` or `export-subst`; if one is ever introduced, the manifest
+generator must gain explicit support for those semantics first, or the tree
+identity and the packaged archive diverge silently.
 
-# Verify the source manifest from inside the extracted archive
-cd "crabedence-${VERSION}"
-bash scripts/verify-source-manifest.sh release-evidence/source-tree-sha256.txt .
+```bash
+# Extract BOTH archives into separate directories
+mkdir -p tar-source zip-source
+tar xzf "crabedence-${VERSION}.tar.gz" -C tar-source
+unzip -q "crabedence-${VERSION}.zip" -d zip-source
+
+# Each tree must independently reproduce the manifest
+for tree in tar-source zip-source; do
+  bash "${tree}/crabedence-${VERSION}/scripts/verify-source-manifest.sh" \
+    evidence/source-tree-sha256.txt "${tree}/crabedence-${VERSION}"
+done
 ```
 
-The output must show `missing=0`, `mismatched=0`, `unexpected=0`, and
-`malformed=0`, with `status=PASS`.
+Each must show `missing=0`, `mismatched=0`, `unexpected=0`, and
+`malformed=0`, with `status=PASS`. The two archives must also carry the
+same normalized inventory (path, type, mode, content digest) — the clean
+room enforces this directly, which catches format-specific packaging drift.
 
-## Step 6: Verify release invariants
+## Step 7: Verify release invariants
 
 The qualification record includes 21 named release invariants:
 
@@ -190,7 +238,7 @@ release proves:
 | CRAB-V1-020 | post-dispatch uncertainty cannot become retryable without evidence |
 | CRAB-V1-021 | concurrent identical mutations cause at most one provider dispatch |
 
-## Step 7: Verify evidence bundle integrity
+## Step 8: Verify evidence bundle integrity
 
 The `release-evidence/SHA256SUMS` file contains checksums for every evidence
 file — including `artifact.json`, the binding between the release archive,
@@ -247,7 +295,7 @@ qualified = released = runtime.
 
 ## Summary
 
-If all seven steps pass, the artifact is cryptographically attributable to a
+If all eight steps pass, the artifact is cryptographically attributable to a
 specific Git commit, built through a specific GitHub Actions workflow, and
 qualified against the full release matrix. The proof chain is:
 

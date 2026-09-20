@@ -5,15 +5,19 @@
 #
 # Usage:
 #   ./scripts/verify-release-artifact.sh --mode qualification [options]
-#   ./scripts/verify-release-artifact.sh --mode release --archive PATH [options]
+#   ./scripts/verify-release-artifact.sh --mode release --archive PATH --zip PATH [options]
 #
 # Options:
 #   --mode qualification|release  Explicit verification contract (see below).
 #   --evidence DIR                Evidence bundle (default: dist/release-evidence/)
 #   --source DIR                  Source tree to verify (default: repo root)
-#   --archive PATH                Release archive; its SHA-256 is recomputed
+#   --archive PATH                Release tar.gz; its SHA-256 is recomputed
 #                                 from the bytes and required to equal
-#                                 artifact.json's binding
+#                                 artifact.json's artifact.sha256 binding
+#   --zip PATH                    Release zip; its SHA-256 is recomputed
+#                                 from the bytes and required to equal
+#                                 artifact.json's artifact.zip_sha256
+#                                 binding (required in release mode)
 #   --sbom PATH                   SBOM file; its digest must equal the
 #                                 binding in artifact.json (required in
 #                                 release mode)
@@ -48,6 +52,7 @@ MODE=""
 EVIDENCE_DIR=""
 SOURCE_DIR=""
 ARCHIVE_PATH=""
+ZIP_PATH=""
 SBOM_PATH=""
 POSITIONAL=()
 
@@ -65,6 +70,8 @@ while [ $# -gt 0 ]; do
     --source=*) SOURCE_DIR="${1#*=}"; shift ;;
     --archive) ARCHIVE_PATH="${2:-}"; shift 2 ;;
     --archive=*) ARCHIVE_PATH="${1#*=}"; shift ;;
+    --zip) ZIP_PATH="${2:-}"; shift 2 ;;
+    --zip=*) ZIP_PATH="${1#*=}"; shift ;;
     --sbom) SBOM_PATH="${2:-}"; shift 2 ;;
     --sbom=*) SBOM_PATH="${1#*=}"; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -150,7 +157,8 @@ require_file "$EVIDENCE_DIR/registry.sha256" "the registry policy identity"
 require_file "$EVIDENCE_DIR/registry.json" "the verifiable registry envelope"
 if [ "$MODE" = "release" ]; then
   require_file "$EVIDENCE_DIR/artifact.json" "artifact.json (the release artifact binding)"
-  require_file "$ARCHIVE_PATH" "the release archive (--archive)"
+  require_file "$ARCHIVE_PATH" "the release tar.gz (--archive)"
+  require_file "$ZIP_PATH" "the release zip (--zip)"
   require_file "$SBOM_PATH" "the SBOM (--sbom)"
 fi
 
@@ -180,6 +188,8 @@ if [ -f "$ARTIFACT_JSON" ]; then
   ARTIFACT_SHA="$(jq -r '.artifact.sha256 // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
   ARTIFACT_NAME="$(jq -r '.artifact.filename // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
   ARTIFACT_SIZE="$(jq -r '.artifact.size // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
+  ARTIFACT_ZIP_SHA="$(jq -r '.artifact.zip_sha256 // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
+  ARTIFACT_ZIP_NAME="$(jq -r '.artifact.zip_filename // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
   ARTIFACT_COMMIT="$(jq -r '.source.commit // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
   ARTIFACT_TREE="$(jq -r '.source.tree // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
   ARTIFACT_MANIFEST_SHA="$(jq -r '.source.manifest_sha256 // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
@@ -191,13 +201,14 @@ if [ -f "$ARTIFACT_JSON" ]; then
   ARTIFACT_PROV_SHA="$(jq -r '.provenance.sha256 // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
 
   if [ -n "$ARTIFACT_SHA" ] && [ -n "$ARTIFACT_NAME" ] && [ -n "$ARTIFACT_SIZE" ] && \
+     [ -n "$ARTIFACT_ZIP_SHA" ] && [ -n "$ARTIFACT_ZIP_NAME" ] && \
      [ -n "$ARTIFACT_COMMIT" ] && [ -n "$ARTIFACT_TREE" ] && [ -n "$ARTIFACT_MANIFEST_SHA" ] && \
      [ -n "$ARTIFACT_RELEASE" ] && [ -n "$ARTIFACT_REGISTRY" ] && [ -n "$ARTIFACT_QUAL_SHA" ] && \
      [ -n "$ARTIFACT_SBOM_SHA" ] && [ -n "$ARTIFACT_PROV_SHA" ]; then
     check "artifact.json complete (v2)" "PASS"
   else
     check "artifact.json complete (v2)" "FAIL"
-    echo "  ERROR: artifact.json v2 is missing one of: artifact.{filename,sha256,size}, source.{commit,tree,manifest_sha256}, release, policy.registry_sha256, qualification.sha256, sbom.sha256, provenance.sha256" >&2
+    echo "  ERROR: artifact.json v2 is missing one of: artifact.{filename,sha256,size,zip_filename,zip_sha256}, source.{commit,tree,manifest_sha256}, release, policy.registry_sha256, qualification.sha256, sbom.sha256, provenance.sha256" >&2
   fi
 
   # The capability policy the release was qualified against must be bound.
@@ -290,6 +301,31 @@ if [ -f "$ARTIFACT_JSON" ]; then
       else
         check "Archive filename matches artifact.json" "FAIL"
         echo "  ERROR: archive name does not match artifact.json filename $ARTIFACT_NAME" >&2
+      fi
+    fi
+  fi
+
+  # The zip is an official artifact with its own identity: recompute its
+  # digest from its bytes and require it to equal artifact.json's
+  # zip_sha256. A zip that is never recomputed is an unverified artifact
+  # that merely shares a release with the tarball.
+  if [ -n "$ZIP_PATH" ]; then
+    if [ ! -f "$ZIP_PATH" ]; then
+      check "Release zip present" "FAIL"
+      echo "  ERROR: zip not found: $ZIP_PATH" >&2
+    else
+      ACTUAL_ZIP_SHA="$(shasum -a 256 "$ZIP_PATH" | cut -d ' ' -f1)"
+      if [ -n "$ARTIFACT_ZIP_SHA" ] && [ "$ACTUAL_ZIP_SHA" = "$ARTIFACT_ZIP_SHA" ]; then
+        check "Zip matches artifact.json (recomputed)" "PASS"
+      else
+        check "Zip matches artifact.json (recomputed)" "FAIL"
+        echo "  ERROR: zip SHA-256 $ACTUAL_ZIP_SHA does not equal artifact.json zip_sha256 $ARTIFACT_ZIP_SHA" >&2
+      fi
+      if [ "$(basename "$ZIP_PATH")" = "$ARTIFACT_ZIP_NAME" ]; then
+        check "Zip filename matches artifact.json" "PASS"
+      else
+        check "Zip filename matches artifact.json" "FAIL"
+        echo "  ERROR: zip name does not match artifact.json zip_filename $ARTIFACT_ZIP_NAME" >&2
       fi
     fi
   fi
