@@ -50,12 +50,25 @@ done < "$MANIFEST"
 # same shell case-matching (not find -path, which only matches top-level
 # paths and would diverge on nested dirs like plugins/herdr/bin/).
 source_paths_file="$(mktemp)"
-trap 'rm -f "$manifest_paths_file" "$source_paths_file"' EXIT
+ignored_paths_file="$(mktemp)"
+trap 'rm -f "$manifest_paths_file" "$source_paths_file" "$ignored_paths_file"' EXIT
+
+# Ignored-but-present files are not packaged by `git archive`, so they are
+# not part of the released source set — the generator subtracts them, and
+# this walk must match or a working tree carrying local caches reports
+# false UNEXPECTED entries. Applied only when ROOT is the work-tree
+# toplevel; the clean-room extracts an archive with no .git, where this is
+# a no-op.
+if [ "$(git -C "$ROOT" rev-parse --show-toplevel 2>/dev/null || true)" = "$(cd "$ROOT" && pwd -P)" ]; then
+  git -C "$ROOT" ls-files --others --ignored --exclude-standard \
+    | LC_ALL=C sort > "$ignored_paths_file"
+else
+  : > "$ignored_paths_file"
+fi
 
 (
   cd "$ROOT"
-  find . -type f | while IFS= read -r filepath; do
-    relpath="${filepath#./}"
+  find . -type f | sed 's|^\./||' | LC_ALL=C sort | comm -23 - "$ignored_paths_file" | while IFS= read -r relpath; do
 
     # Skip excluded directories (top-level AND nested). Mirror generator.
     case "$relpath" in
@@ -76,7 +89,7 @@ trap 'rm -f "$manifest_paths_file" "$source_paths_file"' EXIT
     esac
 
     # Skip excluded basenames / patterns.
-    case "$(basename "$filepath")" in
+    case "$(basename "$relpath")" in
       .DS_Store) continue ;;
     esac
     case "$relpath" in

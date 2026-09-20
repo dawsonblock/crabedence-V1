@@ -48,7 +48,9 @@ CANDIDATES="$(mktemp)"
 trap 'rm -f "$ALL_FILES" "$IGNORED_FILES" "$CANDIDATES"' EXIT
 
 find . -type f | sed 's|^\./||' | LC_ALL=C sort > "$ALL_FILES"
-if git -C "$SOURCE_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+# Only consult git when the source directory IS the work-tree toplevel, so
+# a nested directory never borrows an outer repository's index.
+if [ "$(git -C "$SOURCE_DIR" rev-parse --show-toplevel 2>/dev/null || true)" = "$(pwd -P)" ]; then
   git -C "$SOURCE_DIR" ls-files --others --ignored --exclude-standard \
     | LC_ALL=C sort > "$IGNORED_FILES"
 else
