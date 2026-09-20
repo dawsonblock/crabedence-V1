@@ -47,7 +47,7 @@ fi
 found=0
 for secret in "${SECRETS[@]}"; do
   [ -z "$secret" ] && continue
-  matches="$(grep -rIlF -- "$secret" "$EVIDENCE_DIR" 2>/dev/null || true)"
+  matches="$(grep -ralF -- "$secret" "$EVIDENCE_DIR" 2>/dev/null || true)"
   while IFS= read -r file; do
     [ -z "$file" ] && continue
     echo "LEAK: a known secret value appears in $file" >&2

@@ -190,6 +190,7 @@ if [ -f "$ARTIFACT_JSON" ]; then
   ARTIFACT_SIZE="$(jq -r '.artifact.size // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
   ARTIFACT_ZIP_SHA="$(jq -r '.artifact.zip_sha256 // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
   ARTIFACT_ZIP_NAME="$(jq -r '.artifact.zip_filename // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
+  ARTIFACT_ZIP_SIZE="$(jq -r '.artifact.zip_size // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
   ARTIFACT_COMMIT="$(jq -r '.source.commit // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
   ARTIFACT_TREE="$(jq -r '.source.tree // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
   ARTIFACT_MANIFEST_SHA="$(jq -r '.source.manifest_sha256 // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
@@ -201,14 +202,14 @@ if [ -f "$ARTIFACT_JSON" ]; then
   ARTIFACT_PROV_SHA="$(jq -r '.provenance.sha256 // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
 
   if [ -n "$ARTIFACT_SHA" ] && [ -n "$ARTIFACT_NAME" ] && [ -n "$ARTIFACT_SIZE" ] && \
-     [ -n "$ARTIFACT_ZIP_SHA" ] && [ -n "$ARTIFACT_ZIP_NAME" ] && \
+     [ -n "$ARTIFACT_ZIP_SHA" ] && [ -n "$ARTIFACT_ZIP_NAME" ] && [ -n "$ARTIFACT_ZIP_SIZE" ] && \
      [ -n "$ARTIFACT_COMMIT" ] && [ -n "$ARTIFACT_TREE" ] && [ -n "$ARTIFACT_MANIFEST_SHA" ] && \
      [ -n "$ARTIFACT_RELEASE" ] && [ -n "$ARTIFACT_REGISTRY" ] && [ -n "$ARTIFACT_QUAL_SHA" ] && \
      [ -n "$ARTIFACT_SBOM_SHA" ] && [ -n "$ARTIFACT_PROV_SHA" ]; then
     check "artifact.json complete (v2)" "PASS"
   else
     check "artifact.json complete (v2)" "FAIL"
-    echo "  ERROR: artifact.json v2 is missing one of: artifact.{filename,sha256,size,zip_filename,zip_sha256}, source.{commit,tree,manifest_sha256}, release, policy.registry_sha256, qualification.sha256, sbom.sha256, provenance.sha256" >&2
+    echo "  ERROR: artifact.json v2 is missing one of: artifact.{filename,sha256,size,zip_filename,zip_sha256,zip_size}, source.{commit,tree,manifest_sha256}, release, policy.registry_sha256, qualification.sha256, sbom.sha256, provenance.sha256" >&2
   fi
 
   # The capability policy the release was qualified against must be bound.
@@ -320,6 +321,13 @@ if [ -f "$ARTIFACT_JSON" ]; then
       else
         check "Zip matches artifact.json (recomputed)" "FAIL"
         echo "  ERROR: zip SHA-256 $ACTUAL_ZIP_SHA does not equal artifact.json zip_sha256 $ARTIFACT_ZIP_SHA" >&2
+      fi
+      ACTUAL_ZIP_SIZE="$(wc -c < "$ZIP_PATH" | tr -d ' ')"
+      if [ -n "$ARTIFACT_ZIP_SIZE" ] && [ "$ACTUAL_ZIP_SIZE" = "$ARTIFACT_ZIP_SIZE" ]; then
+        check "Zip size matches artifact.json" "PASS"
+      else
+        check "Zip size matches artifact.json" "FAIL"
+        echo "  ERROR: zip size $ACTUAL_ZIP_SIZE does not equal artifact.json zip_size $ARTIFACT_ZIP_SIZE" >&2
       fi
       if [ "$(basename "$ZIP_PATH")" = "$ARTIFACT_ZIP_NAME" ]; then
         check "Zip filename matches artifact.json" "PASS"

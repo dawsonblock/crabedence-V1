@@ -106,6 +106,28 @@ test("packaging refuses an evidence tree missing a referenced file", (t) => {
   assert.equal(fs.existsSync(out), false);
 });
 
+test("packaging refuses a file added after finalization", (t) => {
+  const { root, dir } = evidenceFixture(t);
+  // A file that is not covered by SHA256SUMS must not ship inside the
+  // bundle — the packaged set has to equal the finalized set exactly.
+  fs.writeFileSync(path.join(dir, "late-added.txt"), "not checksummed\n");
+  const out = path.join(root, "bundle.tar.gz");
+  const { status, stderr } = packageIt(dir, out);
+  assert.equal(status, 1);
+  assert.match(stderr, /not covered by SHA256SUMS/);
+  assert.equal(fs.existsSync(out), false);
+});
+
+test("packaging refuses a non-regular member that cannot be checksummed", (t) => {
+  const { root, dir } = evidenceFixture(t);
+  fs.symlinkSync("qualification.json", path.join(dir, "link.json"));
+  const out = path.join(root, "bundle.tar.gz");
+  const { status, stderr } = packageIt(dir, out);
+  assert.equal(status, 1);
+  assert.match(stderr, /non-regular file/);
+  assert.equal(fs.existsSync(out), false);
+});
+
 test("packaging refuses an unfinalized evidence directory", (t) => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cbx-unfinalized-")));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

@@ -113,6 +113,7 @@ function bundle(
         size: 21,
         zip_filename: "crabedence-1.0.0-rc.7.zip",
         zip_sha256: sha256(zipBytes),
+        zip_size: zipBytes.length,
       },
       policy: { registry_sha256: registryBound ? registrySha : "f".repeat(64) },
       qualification: { sha256: "e".repeat(64), schema_version: 2 },
@@ -319,6 +320,7 @@ test("release mode accepts an archive whose bytes match the binding", (t) => {
   assert.match(output, /Archive matches artifact\.json \(recomputed\)\s+PASS/);
   assert.match(output, /Archive size matches artifact\.json\s+PASS/);
   assert.match(output, /Zip matches artifact\.json \(recomputed\)\s+PASS/);
+  assert.match(output, /Zip size matches artifact\.json\s+PASS/);
   assert.match(output, /Zip filename matches artifact\.json\s+PASS/);
   assert.match(output, /artifact\.json binds the SBOM\s+PASS/);
 });
@@ -473,6 +475,24 @@ test("a zip under the wrong filename fails closed", (t) => {
     "--zip", renamed, "--sbom", sbomPath,
   ]);
   assert.match(output, /Zip filename matches artifact\.json\s+FAIL/);
+});
+
+test("a zip whose size does not match the binding fails closed", (t) => {
+  const { root, sbomPath, zipPath } = bundle(t);
+  const archive = path.join(root, "crabedence-1.0.0-rc.7.tar.gz");
+  fs.writeFileSync(archive, "fixture archive bytes\n");
+  // The digest still covers the zip bytes, but the recorded size does not —
+  // so the size check must fail independently of the digest check.
+  const artifactPath = path.join(root, "artifact.json");
+  const artifact = JSON.parse(fs.readFileSync(artifactPath, "utf8"));
+  artifact.artifact.zip_size = 9999;
+  fs.writeFileSync(artifactPath, JSON.stringify(artifact));
+  const { output } = verify(root, [
+    "--mode", "release", "--evidence", root, "--source", root, "--archive", archive,
+    "--zip", zipPath, "--sbom", sbomPath,
+  ]);
+  assert.match(output, /Zip matches artifact\.json \(recomputed\)\s+PASS/);
+  assert.match(output, /Zip size matches artifact\.json\s+FAIL/);
 });
 
 test("a missing zip file fails closed", (t) => {

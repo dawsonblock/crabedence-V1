@@ -30,13 +30,14 @@ if [ ! -f "$EVIDENCE_DIR/evidence-manifest.json" ]; then
 fi
 
 # The bundle must be the complete finalized set: every path the checksum
-# manifest references has to be present before packaging.
+# manifest references has to be present before packaging. Each line is
+# "<64-hex><whitespace>[*]<path>": read splits the hash off and leaves the
+# path (binary-mode "*" marker and "./" prefix stripped, internal
+# whitespace preserved).
 missing=0
-while IFS= read -r line; do
-  [ -z "$line" ] && continue
-  entry="${line#*  }"
-  entry="${entry#\*}"; entry="${entry# }"
-  case "$entry" in ./*) entry="${entry#./}" ;; esac
+while read -r _sha entry || [ -n "$_sha" ]; do
+  entry="${entry#\*}"
+  entry="${entry#./}"
   [ -z "$entry" ] && continue
   if [ ! -e "$EVIDENCE_DIR/$entry" ]; then
     echo "ERROR: SHA256SUMS references a missing evidence file: $entry" >&2
@@ -47,6 +48,41 @@ if [ "$missing" -ne 0 ]; then
   echo "ERROR: the evidence tree is incomplete ($missing missing); refusing to package" >&2
   exit 1
 fi
+
+# The reverse direction too: every regular file being packaged must be listed
+# in SHA256SUMS. A file added after finalization — or a non-regular member the
+# checksum walk skipped — would otherwise ship inside the bundle without a
+# checksum, breaking the "complete finalized set" guarantee. SHA256SUMS and
+# evidence-manifest.json are legitimately uncovered (self-reference), and the
+# checksum walk only covers regular files, so both are excluded here as well.
+covered_list="$(mktemp)"
+ondisk_list="$(mktemp)"
+while read -r _sha entry || [ -n "$_sha" ]; do
+  entry="${entry#\*}"
+  entry="${entry#./}"
+  [ -n "$entry" ] && printf '%s\n' "$entry"
+done < "$EVIDENCE_DIR/SHA256SUMS" | LC_ALL=C sort > "$covered_list"
+(cd "$EVIDENCE_DIR" \
+  && find . -type f ! -name SHA256SUMS ! -name evidence-manifest.json -print \
+  | sed 's|^\./||' | LC_ALL=C sort) > "$ondisk_list"
+if ! comm -23 "$ondisk_list" "$covered_list" | grep -q .; then
+  : # every packaged regular file is covered
+else
+  echo "ERROR: evidence file(s) not covered by SHA256SUMS would ship uncovered:" >&2
+  comm -23 "$ondisk_list" "$covered_list" >&2
+  rm -f "$covered_list" "$ondisk_list"
+  exit 1
+fi
+# A non-regular member (symlink, fifo, ...) is never in SHA256SUMS and never
+# reaches a consumer as a verified file — refuse to package one silently.
+nonregular="$(cd "$EVIDENCE_DIR" && find . ! -type f ! -type d -print)"
+if [ -n "$nonregular" ]; then
+  echo "ERROR: evidence tree contains a non-regular file that SHA256SUMS cannot cover:" >&2
+  printf '%s\n' "$nonregular" >&2
+  rm -f "$covered_list" "$ondisk_list"
+  exit 1
+fi
+rm -f "$covered_list" "$ondisk_list"
 
 mkdir -p "$(dirname "$OUTPUT")"
 PARENT="$(cd "$(dirname "$EVIDENCE_DIR")" && pwd)"
@@ -59,9 +95,22 @@ if tar --version 2>/dev/null | grep -q 'GNU tar'; then
   tar --sort=name --mtime='UTC 2020-01-01' --owner=0 --group=0 --numeric-owner \
     -czf "$OUTPUT" -C "$PARENT" "$NAME"
 else
-  COPYFILE_DISABLE=1 tar -czf "$OUTPUT" -C "$PARENT" "$NAME"
+  # BSD tar has no --sort/--mtime; feed it an explicitly sorted file list so
+  # the archive is byte-deterministic on this platform too. --no-recursion is
+  # required: the list already names every member, and without it bsdtar would
+  # also recurse into the directory entries and emit duplicate members.
+  # COPYFILE_DISABLE stops macOS from adding AppleDouble resource-fork members.
+  bundle_list="$(mktemp)"
+  (cd "$PARENT" && find "$NAME" -print | LC_ALL=C sort) > "$bundle_list"
+  COPYFILE_DISABLE=1 tar --no-recursion -czf "$OUTPUT" -C "$PARENT" -T "$bundle_list"
+  rm -f "$bundle_list"
 fi
 
-shasum -a 256 "$OUTPUT" | cut -d ' ' -f1 > "$OUTPUT.sha256"
+# The .sha256 sidecar uses the standard "<hash>  <basename>" format so a
+# consumer can verify the published bundle with `shasum -c` — the same as the
+# source tar/zip checksum files. Only the bare digest goes to stdout so the
+# workflow captures it as the carried-through bundle identity.
+bundle_sha="$(shasum -a 256 "$OUTPUT" | cut -d ' ' -f1)"
+printf '%s  %s\n' "$bundle_sha" "$(basename "$OUTPUT")" > "$OUTPUT.sha256"
 echo "Evidence bundle packaged: $OUTPUT ($(wc -c < "$OUTPUT" | tr -d ' ') bytes)" >&2
-cat "$OUTPUT.sha256"
+printf '%s\n' "$bundle_sha"
