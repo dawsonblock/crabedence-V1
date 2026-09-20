@@ -19,6 +19,10 @@ mkdir -p "$EVIDENCE_DIR/gate-results"
 # Gate semantics live in exactly one validator, shared with release
 # admission and the standalone artifact verifier.
 source "$REPO_ROOT/scripts/lib/qualification-gates.sh"
+# Live-database gates fail closed on their own: a gate that needs
+# PostgreSQL records FAIL when none is configured, rather than letting the
+# suite skip and be recorded as a zero-test PASS.
+source "$REPO_ROOT/scripts/lib/live-gate.sh"
 
 # Clean previous generated artifacts.
 rm -f "$EVIDENCE_DIR"/*.json "$EVIDENCE_DIR"/SHA256SUMS \
@@ -724,15 +728,15 @@ echo ""
 echo "=== Cross-language conformance ==="
 # ─── External CRITICAL qualification gates ──────────────────────────────
 # The external qualification provider runs in its own process with a
-# durable ledger; the harness skips without CRABBOX_TEST_DATABASE_URL, so
-# these gates fail closed when the database is absent (0 executed tests).
-run_gate critical-external INTEGRATION env \
-  CRABBOX_TEST_DATABASE_URL="${CRABBOX_TEST_DATABASE_URL:-}" \
+# durable ledger. Both gates require a live PostgreSQL: with none
+# configured they record FAIL directly (run_required_live_go_gate) rather
+# than letting the suite skip and be stored as a zero-test PASS that only
+# the canonical validator would later reject.
+run_required_live_go_gate critical-external INTEGRATION \
   go test -v -count=1 -timeout=300s \
   -run "TestLiveCriticalQualification(Commit|AmbiguityThenReconcile|DefinitiveRejection|EvidenceIntegrity|AuthorityMatrix|ClosedAuthoritySemantics|TimeoutThenReconcile|LookupOutageThenRecovery|CorruptedArtifact|RegistryExtensionBinding|CrashThenRecover)$" \
   ./internal/execution/
-run_gate critical-faults FAULT_INJECTION env \
-  CRABBOX_TEST_DATABASE_URL="${CRABBOX_TEST_DATABASE_URL:-}" \
+run_required_live_go_gate critical-faults FAULT_INJECTION \
   go test -v -count=1 -timeout=300s \
   -run "TestLiveCriticalQualification(FailBeforeAccept|TokenPayloadCollision)$" \
   ./internal/execution/
