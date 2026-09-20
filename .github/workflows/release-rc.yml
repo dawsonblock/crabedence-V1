@@ -871,17 +871,20 @@ jobs:
           check "public/crabedence-${RELEASE_VERSION}.zip" "${{ needs.build.outputs.zip_sha256 }}"
           check "public/crabedence-${RELEASE_VERSION}-release-evidence.tar.gz" "${{ needs.build.outputs.evidence_archive_sha256 }}"
 
+      # The evidence bundle is extracted to clean-room/qualification so the
+      # verifier resolves its pinned validator from clean-room/nemo (the
+      # directory it searches is the parent of the evidence directory).
       - name: Extract the public evidence bundle and both archives
         run: |
-          mkdir -p evidence clean-room/tar-source clean-room/zip-source
+          mkdir -p clean-room/qualification clean-room/tar-source clean-room/zip-source
           tar xzf "public/crabedence-${RELEASE_VERSION}-release-evidence.tar.gz" \
-            -C evidence --strip-components=1
+            -C clean-room/qualification --strip-components=1
           tar xzf "public/crabedence-${RELEASE_VERSION}.tar.gz" -C clean-room/tar-source
           unzip -q "public/crabedence-${RELEASE_VERSION}.zip" -d clean-room/zip-source
 
       - name: Verify the public evidence bundle self-checks
         run: |
-          cd evidence
+          cd clean-room/qualification
           shasum -a 256 -c SHA256SUMS
 
       - name: Set up Node
@@ -905,14 +908,15 @@ jobs:
           for tree in tar-source zip-source; do
             src="clean-room/${tree}/crabedence-${RELEASE_VERSION}"
             echo "=== source manifest: $tree ==="
-            bash "$src/scripts/verify-source-manifest.sh" evidence/source-tree-sha256.txt "$src"
+            bash "$src/scripts/verify-source-manifest.sh" \
+              clean-room/qualification/source-tree-sha256.txt "$src"
           done
 
       - name: Verify published artifact from public assets only
         run: |
           bash clean-room/tar-source/crabedence-${RELEASE_VERSION}/scripts/verify-release-artifact.sh \
             --mode release \
-            --evidence evidence \
+            --evidence clean-room/qualification \
             --source clean-room/tar-source/crabedence-${RELEASE_VERSION} \
             --archive "public/crabedence-${RELEASE_VERSION}.tar.gz" \
             --zip "public/crabedence-${RELEASE_VERSION}.zip" \
