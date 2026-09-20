@@ -23,6 +23,9 @@ source "$REPO_ROOT/scripts/lib/qualification-gates.sh"
 # PostgreSQL records FAIL when none is configured, rather than letting the
 # suite skip and be recorded as a zero-test PASS.
 source "$REPO_ROOT/scripts/lib/live-gate.sh"
+# Gate logs record the command line; credential-bearing KEY=value tokens
+# are redacted so a secret never lands in the evidence bundle.
+source "$REPO_ROOT/scripts/lib/redact.sh"
 
 # Clean previous generated artifacts.
 rm -f "$EVIDENCE_DIR"/*.json "$EVIDENCE_DIR"/SHA256SUMS \
@@ -80,7 +83,7 @@ run_and_log() {
   local log="$EVIDENCE_DIR/gate-results/${name}.log"
   GATE_START_MS="$(now_ms)"
   {
-    echo "command=$*"
+    echo "command=$(redact_command "$@")"
     echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "---"
   } > "$log"

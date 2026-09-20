@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -9,9 +10,11 @@ const scripts = import.meta.dirname;
 const GENERATOR = path.join(scripts, "generate-source-manifest.sh");
 const VERIFIER = path.join(scripts, "verify-source-manifest.sh");
 
-// A small repository carrying one tracked file, one ignored directory, and
-// one ignored file — the shape that made the manifest diverge from the
-// released archive and from the verifier's walk.
+const sha256 = (value) => crypto.createHash("sha256").update(value).digest("hex");
+
+// A small repository covering every Git object type the manifest must
+// represent — regular file, executable, and symlink — plus ignored
+// material that `git archive` does not package.
 function makeRepo(t) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cbx-manifest-")));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -21,18 +24,19 @@ function makeRepo(t) {
   git("config", "user.name", "Test");
   fs.writeFileSync(path.join(root, ".gitignore"), "ignored/\ncache.bin\n");
   fs.writeFileSync(path.join(root, "tracked.txt"), "hello\n");
+  fs.writeFileSync(path.join(root, "run.sh"), "#!/bin/sh\necho hi\n");
+  fs.chmodSync(path.join(root, "run.sh"), 0o755);
+  fs.symlinkSync("tracked.txt", path.join(root, "link.txt"));
   fs.mkdirSync(path.join(root, "ignored"));
   fs.writeFileSync(path.join(root, "ignored", "run.tar.gz"), "capture\n");
   fs.writeFileSync(path.join(root, "cache.bin"), "binary\n");
-  git("add", ".gitignore", "tracked.txt");
+  git("add", ".gitignore", "tracked.txt", "run.sh", "link.txt");
   git("commit", "--quiet", "-m", "fixture");
   return root;
 }
 
 function generate(t, root) {
-  const out = fs.realpathSync(
-    fs.mkdtempSync(path.join(os.tmpdir(), "cbx-manifest-out-")),
-  );
+  const out = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cbx-manifest-out-")));
   t.after(() => fs.rmSync(out, { recursive: true, force: true }));
   const manifestPath = path.join(out, "source-tree-sha256.txt");
   const result = spawnSync("bash", [GENERATOR, manifestPath, root], { encoding: "utf8" });
@@ -40,16 +44,41 @@ function generate(t, root) {
   return { manifestPath, manifest: fs.readFileSync(manifestPath, "utf8") };
 }
 
-const listedPaths = (manifest) =>
+function extract(t, root) {
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cbx-extract-")));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const archive = execFileSync("git", ["-C", root, "archive", "--format=tar", "HEAD"]);
+  execFileSync("tar", ["-xf", "-", "-C", dir], { input: archive });
+  return dir;
+}
+
+function verify(manifestPath, root) {
+  const result = spawnSync("bash", [VERIFIER, manifestPath, root], { encoding: "utf8" });
+  return { status: result.status, output: `${result.stdout}${result.stderr}` };
+}
+
+const recordFor = (manifest, name) =>
   manifest
     .trim()
     .split("\n")
-    .map((line) => line.replace(/^[0-9a-f]{64} {2}/, ""));
+    .find((line) => line.endsWith(`  ${name}`));
+
+const manifestPaths = (manifest) =>
+  manifest
+    .trim()
+    .split("\n")
+    .map((line) => line.replace(/^\d{6} \w+ [0-9a-f]{64} {2}/, ""));
+
+test("the manifest records type and mode for every Git object kind", (t) => {
+  const { manifest } = generate(t, makeRepo(t));
+  assert.equal(recordFor(manifest, "tracked.txt"), `100644 file ${sha256("hello\n")}  tracked.txt`);
+  assert.equal(recordFor(manifest, "run.sh"), `100755 file ${sha256("#!/bin/sh\necho hi\n")}  run.sh`);
+  // A symlink digests its TARGET BYTES, never the linked file's contents.
+  assert.equal(recordFor(manifest, "link.txt"), `120000 symlink ${sha256("tracked.txt")}  link.txt`);
+});
 
 test("ignored files present in the tree are excluded from the manifest", (t) => {
   const { manifest } = generate(t, makeRepo(t));
-  assert.match(manifest, /tracked\.txt$/m);
-  assert.match(manifest, /\.gitignore$/m);
   assert.doesNotMatch(manifest, /ignored\/run\.tar\.gz/);
   assert.doesNotMatch(manifest, /cache\.bin/);
 });
@@ -62,28 +91,69 @@ test("the manifest lists exactly what git archive packages", (t) => {
     .trim()
     .split("\n")
     .filter((entry) => entry !== "" && !entry.endsWith("/"));
-  assert.deepEqual([...listedPaths(manifest)].sort(), [...entries].sort());
+  assert.deepEqual([...manifestPaths(manifest)].sort(), [...entries].sort());
 });
 
-test("the verifier accepts a working tree carrying ignored files", (t) => {
+test("the verifier accepts the working tree and an extracted archive", (t) => {
   const root = makeRepo(t);
   const { manifestPath } = generate(t, root);
-  const result = spawnSync("bash", [VERIFIER, manifestPath, root], { encoding: "utf8" });
-  assert.equal(result.status, 0, `${result.stdout}${result.stderr}`);
-  assert.match(result.stdout, /unexpected=0/);
-  assert.match(result.stdout, /status=PASS/);
+  for (const target of [root, extract(t, root)]) {
+    const { status, output } = verify(manifestPath, target);
+    assert.equal(status, 0, output);
+    assert.match(output, /status=PASS/);
+  }
 });
 
-test("the verifier works on an extracted archive with no .git", (t) => {
+test("a symlink replaced by a regular file fails closed", (t) => {
   const root = makeRepo(t);
   const { manifestPath } = generate(t, root);
-  const extracted = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cbx-extract-")));
-  t.after(() => fs.rmSync(extracted, { recursive: true, force: true }));
-  const archive = execFileSync("git", ["-C", root, "archive", "--format=tar", "HEAD"]);
-  execFileSync("tar", ["-xf", "-", "-C", extracted], { input: archive });
-  const result = spawnSync("bash", [VERIFIER, manifestPath, extracted], { encoding: "utf8" });
-  assert.equal(result.status, 0, `${result.stdout}${result.stderr}`);
-  assert.match(result.stdout, /status=PASS/);
+  const dir = extract(t, root);
+  fs.rmSync(path.join(dir, "link.txt"));
+  fs.writeFileSync(path.join(dir, "link.txt"), "tracked.txt");
+  const { status, output } = verify(manifestPath, dir);
+  assert.equal(status, 1, output);
+  assert.match(output, /TYPE MISMATCH: link\.txt/);
+});
+
+test("a repointed symlink fails closed", (t) => {
+  const root = makeRepo(t);
+  const { manifestPath } = generate(t, root);
+  const dir = extract(t, root);
+  fs.rmSync(path.join(dir, "link.txt"));
+  fs.symlinkSync("other.txt", path.join(dir, "link.txt"));
+  const { status, output } = verify(manifestPath, dir);
+  assert.equal(status, 1, output);
+  assert.match(output, /MISMATCH: link\.txt/);
+});
+
+test("a cleared executable bit fails closed", (t) => {
+  const root = makeRepo(t);
+  const { manifestPath } = generate(t, root);
+  const dir = extract(t, root);
+  fs.chmodSync(path.join(dir, "run.sh"), 0o644);
+  const { status, output } = verify(manifestPath, dir);
+  assert.equal(status, 1, output);
+  assert.match(output, /MODE MISMATCH: run\.sh \(expected executable\)/);
+});
+
+test("an unexpected executable bit fails closed", (t) => {
+  const root = makeRepo(t);
+  const { manifestPath } = generate(t, root);
+  const dir = extract(t, root);
+  fs.chmodSync(path.join(dir, "tracked.txt"), 0o755);
+  const { status, output } = verify(manifestPath, dir);
+  assert.equal(status, 1, output);
+  assert.match(output, /MODE MISMATCH: tracked\.txt \(unexpected executable bit\)/);
+});
+
+test("a deleted symlink fails closed", (t) => {
+  const root = makeRepo(t);
+  const { manifestPath } = generate(t, root);
+  const dir = extract(t, root);
+  fs.rmSync(path.join(dir, "link.txt"));
+  const { status, output } = verify(manifestPath, dir);
+  assert.equal(status, 1, output);
+  assert.match(output, /MISSING: link\.txt/);
 });
 
 test("the generator and verifier parse", () => {

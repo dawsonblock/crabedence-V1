@@ -1,13 +1,26 @@
 #!/usr/bin/env bash
-# Generate a canonical source manifest for release qualification.
+# Generate the canonical release source manifest for qualification.
 #
-# Enumerates exactly the source files that will be packaged, computes
-# SHA-256 for each, and writes a deterministic manifest.
+# The manifest is the release source INVENTORY: it is derived from the Git
+# HEAD tree — the same tree `git archive HEAD` packages — so it can never
+# diverge from the released archive. Records carry the Git mode, the
+# object type, the SHA-256 of the exact bytes, and the path:
 #
-# Output format (sorted with LC_ALL=C):
-#   <sha256>  <relative/path>
+#   100644 file    <sha256>  README.md
+#   100755 file    <sha256>  scripts/verify-release-artifact.sh
+#   120000 symlink <sha256>  CLAUDE.md
 #
-# Exclusions are explicit and documented. Everything else is qualified.
+# A symlink's digest is SHA-256 of its TARGET BYTES (the blob Git stores),
+# never the contents of the file it points to. Verification therefore
+# checks the link itself rather than dereferencing it.
+#
+# Deriving from Git rather than `find` removes the hand-maintained
+# exclusion lists that had to be kept in sync with `git archive` by hand.
+# Those lists silently admitted ignored files (a manifest that could never
+# match the archive) and would have silently dropped any tracked file
+# living beneath an excluded directory name.
+#
+# Output is sorted by path with LC_ALL=C for determinism.
 #
 # Usage: ./scripts/generate-source-manifest.sh [output-file] [source-dir]
 #   output-file: default: dist/release-evidence/source-tree-sha256.txt
@@ -25,88 +38,68 @@ if [ ! -d "$SOURCE_DIR" ]; then
 fi
 
 mkdir -p "$(dirname "$OUTPUT")"
-
-# ─── Exclusions ────────────────────────────────────────────────────────
-# These are NOT source files and must not appear in the manifest.
-# Everything else in the source tree is qualified source.
-#
-# We use shell case matching (not regex) to avoid pattern-matching bugs.
-# Paths are relative (e.g. ".git/objects/..." not "/.git/objects/...").
-
 cd "$SOURCE_DIR"
 
-# ─── Enumerate the packaged source ─────────────────────────────────────
-# The manifest must describe exactly what `git archive HEAD` packages.
-# The clean-tree check permits ignored files to be present (local caches,
-# run captures), but `git archive` omits them — so a `find`-only
-# enumeration yields a manifest that can never match the released
-# archive, a mismatch that only surfaces at the clean-room gate.
-# Subtract git's ignored set explicitly.
-ALL_FILES="$(mktemp)"
-IGNORED_FILES="$(mktemp)"
-CANDIDATES="$(mktemp)"
-trap 'rm -f "$ALL_FILES" "$IGNORED_FILES" "$CANDIDATES"' EXIT
-
-find . -type f | sed 's|^\./||' | LC_ALL=C sort > "$ALL_FILES"
-# Only consult git when the source directory IS the work-tree toplevel, so
-# a nested directory never borrows an outer repository's index.
-if [ "$(git -C "$SOURCE_DIR" rev-parse --show-toplevel 2>/dev/null || true)" = "$(pwd -P)" ]; then
-  git -C "$SOURCE_DIR" ls-files --others --ignored --exclude-standard \
-    | LC_ALL=C sort > "$IGNORED_FILES"
-else
-  : > "$IGNORED_FILES"
+if ! git -C "$SOURCE_DIR" rev-parse --verify HEAD >/dev/null 2>&1; then
+  echo "ERROR: the source manifest requires a Git work tree with a HEAD commit" >&2
+  exit 1
 fi
-comm -23 "$ALL_FILES" "$IGNORED_FILES" > "$CANDIDATES"
 
-# Filter exclusions and compute SHA-256.
-# Sort with LC_ALL=C for determinism.
-while IFS= read -r relpath; do
-  [ -z "$relpath" ] && continue
-  filepath="./$relpath"
+# Skip the output file itself if it lands inside the tracked tree.
+OUTPUT_RELPATH=""
+if [ "$(cd "$(dirname "$OUTPUT")" && pwd)" = "$(pwd -P)" ]; then
+  OUTPUT_RELPATH="$(basename "$OUTPUT")"
+fi
 
-  # Skip excluded top-level and nested directories using case matching.
-  # This correctly handles both top-level (.git/...) and nested (foo/.git/...).
-  case "$relpath" in
-    .git/*|*/.git/*) continue ;;
-    node_modules/*|*/node_modules/*) continue ;;
-    dist/*|*/dist/*) continue ;;
-    coverage/*|*/coverage/*) continue ;;
-    tmp/*|*/tmp/*) continue ;;
-    .build/*|*/.build/*) continue ;;
-    bin/*|*/bin/*) continue ;;
-    __pycache__/*|*/__pycache__/*) continue ;;
-  esac
-
-  # Skip release-evidence/ (only schemas/README.md are tracked, not generated evidence)
-  case "$relpath" in
-    release-evidence/schemas/*|release-evidence/README.md) ;;
-    release-evidence/*) continue ;;
-  esac
-
-  # Skip excluded files by basename
-  case "$(basename "$filepath")" in
-    .DS_Store) continue ;;
-  esac
-
-  # Skip excluded file patterns
-  case "$relpath" in
-    *.pyc|*.pyo|*.swp|*.swo|*~|.#*) continue ;;
-  esac
-
-  # Skip the output file itself (if it's inside the source tree)
-  OUTPUT_RELPATH=""
-  if [ "$(cd "$(dirname "$OUTPUT")" && pwd)" = "$(pwd)" ]; then
-    OUTPUT_RELPATH="$(basename "$OUTPUT")"
-  fi
-  if [ -n "$OUTPUT_RELPATH" ] && [ "$relpath" = "$OUTPUT_RELPATH" ]; then
+# git ls-tree -z emits "<mode> <type> <object>\t<path>\0" per entry, so
+# paths containing spaces or non-ASCII characters survive intact.
+git -C "$SOURCE_DIR" ls-tree -r -z HEAD | while IFS= read -r -d '' record; do
+  meta="${record%%$'\t'*}"
+  path="${record#*$'\t'}"
+  [ -z "$path" ] && continue
+  if [ -n "$OUTPUT_RELPATH" ] && [ "$path" = "$OUTPUT_RELPATH" ]; then
     continue
   fi
 
-  # Compute SHA-256
-  sha="$(shasum -a 256 "$filepath" | cut -d ' ' -f 1)"
-  echo "${sha}  ${relpath}"
-done < "$CANDIDATES" | LC_ALL=C sort > "$OUTPUT"
+  mode="${meta%% *}"
+  rest="${meta#* }"
+  type="${rest%% *}"
 
-# Count
+  case "$mode" in
+    100644|100755)
+      if [ "$type" != "blob" ]; then
+        echo "ERROR: $path has mode $mode but object type $type" >&2
+        exit 1
+      fi
+      if [ ! -f "$path" ] || [ -L "$path" ]; then
+        echo "ERROR: $path is a regular file in Git but not in the work tree" >&2
+        exit 1
+      fi
+      kind="file"
+      sha="$(shasum -a 256 "$path" | cut -d ' ' -f 1)"
+      ;;
+    120000)
+      if [ "$type" != "blob" ]; then
+        echo "ERROR: $path has mode $mode but object type $type" >&2
+        exit 1
+      fi
+      if [ ! -L "$path" ]; then
+        echo "ERROR: $path is a symlink in Git but not in the work tree" >&2
+        exit 1
+      fi
+      kind="symlink"
+      # Digest the target BYTES exactly as Git stores them — no added
+      # newline, and never the contents of the linked file.
+      sha="$(printf '%s' "$(readlink "$path")" | shasum -a 256 | cut -d ' ' -f 1)"
+      ;;
+    *)
+      echo "ERROR: unsupported Git mode $mode for $path" >&2
+      exit 1
+      ;;
+  esac
+
+  printf '%s %s %s  %s\n' "$mode" "$kind" "$sha" "$path"
+done | LC_ALL=C sort -k4 > "$OUTPUT"
+
 COUNT="$(wc -l < "$OUTPUT" | tr -d ' ')"
-echo "Source manifest generated: $OUTPUT ($COUNT files)" >&2
+echo "Source manifest generated: $OUTPUT ($COUNT entries)" >&2

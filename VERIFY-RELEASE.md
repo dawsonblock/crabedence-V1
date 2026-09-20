@@ -36,11 +36,14 @@ source manifest
 Each release includes `.sha256` files alongside the archives:
 
 ```bash
+# The release you are verifying (current candidate: 0.52.0-rc.1)
+VERSION=0.52.0-rc.1
+
 # Verify the tar.gz
-sha256sum -c crabedence-v1.0.0-rc.2.tar.gz.sha256
+sha256sum -c "crabedence-${VERSION}.tar.gz.sha256"
 
 # Verify the zip
-sha256sum -c crabedence-v1.0.0-rc.2.zip.sha256
+sha256sum -c "crabedence-${VERSION}.zip.sha256"
 ```
 
 The checksum must match the hash recorded in `release-evidence/artifact.json`.
@@ -53,7 +56,7 @@ object this artifact was qualified against:
 ```json
 {
   "schema_version": 2,
-  "release": "1.0.0-rc.7",
+  "release": "0.52.0-rc.1",
   "source": { "commit": "...", "tree": "...", "manifest_sha256": "..." },
   "artifact": { "filename": "...tar.gz", "sha256": "...", "size": 12345,
                 "zip_filename": "...zip", "zip_sha256": "..." },
@@ -78,11 +81,11 @@ provenance.
 
 ```bash
 # Verify the tar.gz attestation
-gh attestation verify crabedence-v1.0.0-rc.2.tar.gz \
+gh attestation verify "crabedence-${VERSION}.tar.gz" \
   --repo dawsonblock/crabedence-V1
 
 # Verify the zip attestation
-gh attestation verify crabedence-v1.0.0-rc.2.zip \
+gh attestation verify "crabedence-${VERSION}.zip" \
   --repo dawsonblock/crabedence-V1
 ```
 
@@ -113,8 +116,8 @@ jq -r '.release_status' release-evidence/qualification.json
 # Check artifact promotability
 jq -r '.artifact_promotable' release-evidence/qualification.json
 
-# List all gate statuses
-jq -r '.gates[] | "\(.name): \(.status)"' release-evidence/qualification.json
+# List all gate statuses (qualification schema v2 keys gates by gate_id)
+jq -r '.gates[] | "\(.gate_id): \(.status)"' release-evidence/qualification.json
 ```
 
 All gates must show `PASS`. The `release_status` must be `PASS` and
@@ -122,23 +125,39 @@ All gates must show `PASS`. The `release_status` must be `PASS` and
 
 ## Step 5: Verify the source manifest
 
-The source manifest records the SHA-256 of every source file at qualification
-time. Verify that the archive contents match:
+The source manifest is the release source **inventory**: it is derived from
+the Git HEAD tree — the same tree `git archive HEAD` packages — so it cannot
+diverge from the archive. Each record carries the Git mode, the object type,
+the SHA-256 of the exact bytes, and the path:
+
+```
+100644 file    <sha256>  README.md
+100755 file    <sha256>  scripts/verify-release-artifact.sh
+120000 symlink <sha256>  CLAUDE.md
+```
+
+A symlink's digest covers its **target bytes**, never the contents of the
+file it points to, so verification checks the link itself rather than
+dereferencing it. Verification is bidirectional and type- and mode-aware:
+it fails closed on a missing entry, a symlink replaced by a regular file or
+repointed, a cleared or unexpected executable bit, or any packaged entry
+absent from the manifest.
 
 ```bash
 # Extract the archive
-tar xzf crabedence-v1.0.0-rc.2.tar.gz
+tar xzf "crabedence-${VERSION}.tar.gz"
 
-# Verify the source manifest
-cd crabedence-v1.0.0-rc.2
+# Verify the source manifest from inside the extracted archive
+cd "crabedence-${VERSION}"
 bash scripts/verify-source-manifest.sh release-evidence/source-tree-sha256.txt .
 ```
 
-The output must show `missing=0` and `mismatched=0`.
+The output must show `missing=0`, `mismatched=0`, `unexpected=0`, and
+`malformed=0`, with `status=PASS`.
 
 ## Step 6: Verify release invariants
 
-The qualification record includes 12 named release invariants:
+The qualification record includes 21 named release invariants:
 
 ```bash
 jq -r '.invariants[] | "\(.id): \(.description)"' release-evidence/qualification.json
@@ -161,6 +180,15 @@ release proves:
 | CRAB-V1-010 | replacement mutations cannot overlap pre-admitted old-coordinator mutations |
 | CRAB-V1-011 | qualified source tree equals packaged source tree |
 | CRAB-V1-012 | every mandatory qualification gate was executed and passed |
+| CRAB-V1-013 | Go capability registry is authoritative for execution class |
+| CRAB-V1-014 | durable idempotency prevents duplicate side effects |
+| CRAB-V1-015 | UNKNOWN is a first-class terminal state for post-dispatch ambiguity |
+| CRAB-V1-016 | crabbox exec never returns fake success for undispatched operations |
+| CRAB-V1-017 | expired IN_FLIGHT work is never blindly redispatched |
+| CRAB-V1-018 | only an unexpired active lease generation may mutate execution state |
+| CRAB-V1-019 | terminal finalization is immutable and conflict-aware |
+| CRAB-V1-020 | post-dispatch uncertainty cannot become retryable without evidence |
+| CRAB-V1-021 | concurrent identical mutations cause at most one provider dispatch |
 
 ## Step 7: Verify evidence bundle integrity
 

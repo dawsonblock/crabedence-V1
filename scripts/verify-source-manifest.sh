@@ -1,10 +1,21 @@
 #!/usr/bin/env bash
-# Verify the source-tree SHA-256 manifest against actual file contents.
-# Bidirectional check:
-#   1. Every manifest entry must exist and match (manifest → source)
-#   2. Every source file must appear in the manifest (source → manifest)
-# Returns 0 if all files match and no unexpected files exist, 1 otherwise.
-# Usage: ./scripts/verify-source-manifest.sh [manifest] [repo-root]
+# Verify the release source manifest against the actual source tree.
+# Bidirectional:
+#   1. Every manifest record must exist and match (manifest -> source):
+#      the Git mode/type is checked, and the digest is recomputed from the
+#      exact bytes the record covers — for a symlink, its TARGET BYTES,
+#      never the contents of the file it points to.
+#   2. Every packaged source entry must appear in the manifest
+#      (source -> manifest).
+#
+# The packaged source set is the Git HEAD tree — the same tree
+# `git archive HEAD` produces — so there are no hand-maintained exclusion
+# lists that could diverge from the archive. When the root under test is
+# not a work-tree toplevel (the clean room extracts an archive with no
+# .git) the walk falls back to `find`, including symlinks.
+#
+# Returns 0 if all records match and no unexpected entries exist, 1 otherwise.
+# Usage: ./scripts/verify-source-manifest.sh [manifest] [source-root]
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -20,87 +31,85 @@ missing=0
 mismatched=0
 checked=0
 unexpected=0
+malformed=0
 
 # Build a set of manifest paths for the inverse check
 manifest_paths_file="$(mktemp)"
 trap 'rm -f "$manifest_paths_file"' EXIT
 
-# 1. Manifest → source: verify each manifest entry exists and matches
-while IFS= read -r line; do
-  [ -z "$line" ] && continue
-  expected_sha="$(echo "$line" | cut -d ' ' -f 1)"
-  file="$(echo "$line" | cut -d ' ' -f 3-)"
+# 1. Manifest -> source: verify each record's type, mode, and digest.
+while read -r mode type sha path; do
+  if [ -z "$mode" ] || [ -z "$path" ]; then
+    echo "MALFORMED: ${mode:-<empty>} ${type:-} ${sha:-} ${path:-}"
+    malformed=$((malformed + 1))
+    continue
+  fi
   checked=$((checked + 1))
-  echo "$file" >> "$manifest_paths_file"
-  if [ ! -f "$ROOT/$file" ]; then
-    echo "MISSING: $file"
+  echo "$path" >> "$manifest_paths_file"
+
+  target="$ROOT/$path"
+  if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+    echo "MISSING: $path"
     missing=$((missing + 1))
     continue
   fi
-  actual_sha="$(shasum -a 256 "$ROOT/$file" | cut -d ' ' -f 1)"
-  if [ "$actual_sha" != "$expected_sha" ]; then
-    echo "MISMATCH: $file (expected=$expected_sha actual=$actual_sha)"
+
+  case "$mode" in
+    120000)
+      if [ ! -L "$target" ]; then
+        echo "TYPE MISMATCH: $path (expected symlink, found $( [ -d "$target" ] && echo directory || echo regular))"
+        mismatched=$((mismatched + 1))
+        continue
+      fi
+      actual="$(printf '%s' "$(readlink "$target")" | shasum -a 256 | cut -d ' ' -f 1)"
+      ;;
+    100644|100755)
+      if [ -L "$target" ] || [ ! -f "$target" ]; then
+        echo "TYPE MISMATCH: $path (expected regular file)"
+        mismatched=$((mismatched + 1))
+        continue
+      fi
+      if [ "$mode" = "100755" ] && [ ! -x "$target" ]; then
+        echo "MODE MISMATCH: $path (expected executable)"
+        mismatched=$((mismatched + 1))
+        continue
+      fi
+      if [ "$mode" = "100644" ] && [ -x "$target" ]; then
+        echo "MODE MISMATCH: $path (unexpected executable bit)"
+        mismatched=$((mismatched + 1))
+        continue
+      fi
+      actual="$(shasum -a 256 "$target" | cut -d ' ' -f 1)"
+      ;;
+    *)
+      echo "UNKNOWN MODE: $path (mode=$mode)"
+      mismatched=$((mismatched + 1))
+      continue
+      ;;
+  esac
+
+  if [ "$actual" != "$sha" ]; then
+    echo "MISMATCH: $path (expected=$sha actual=$actual)"
     mismatched=$((mismatched + 1))
   fi
 done < "$MANIFEST"
 
-# 2. Source → manifest: detect unexpected files not in the manifest
-# Walk the actual source tree and compare against manifest paths.
-# Exclusions MUST match generate-source-manifest.sh exactly — use the
-# same shell case-matching (not find -path, which only matches top-level
-# paths and would diverge on nested dirs like plugins/herdr/bin/).
+# 2. Source -> manifest: detect packaged entries not in the manifest.
 source_paths_file="$(mktemp)"
-ignored_paths_file="$(mktemp)"
-trap 'rm -f "$manifest_paths_file" "$source_paths_file" "$ignored_paths_file"' EXIT
+trap 'rm -f "$manifest_paths_file" "$source_paths_file"' EXIT
 
-# Ignored-but-present files are not packaged by `git archive`, so they are
-# not part of the released source set — the generator subtracts them, and
-# this walk must match or a working tree carrying local caches reports
-# false UNEXPECTED entries. Applied only when ROOT is the work-tree
-# toplevel; the clean-room extracts an archive with no .git, where this is
-# a no-op.
 if [ "$(git -C "$ROOT" rev-parse --show-toplevel 2>/dev/null || true)" = "$(cd "$ROOT" && pwd -P)" ]; then
-  git -C "$ROOT" ls-files --others --ignored --exclude-standard \
-    | LC_ALL=C sort > "$ignored_paths_file"
+  # The packaged set is the Git HEAD tree, exactly as the generator derived it.
+  git -C "$ROOT" ls-tree -r -z HEAD | while IFS= read -r -d '' record; do
+    printf '%s\n' "${record#*$'\t'}"
+  done | LC_ALL=C sort > "$source_paths_file"
 else
-  : > "$ignored_paths_file"
+  (
+    cd "$ROOT"
+    find . \( -type f -o -type l \) | sed 's|^\./||' | LC_ALL=C sort
+  ) > "$source_paths_file"
 fi
 
-(
-  cd "$ROOT"
-  find . -type f | sed 's|^\./||' | LC_ALL=C sort | comm -23 - "$ignored_paths_file" | while IFS= read -r relpath; do
-
-    # Skip excluded directories (top-level AND nested). Mirror generator.
-    case "$relpath" in
-      .git/*|*/.git/*) continue ;;
-      node_modules/*|*/node_modules/*) continue ;;
-      dist/*|*/dist/*) continue ;;
-      coverage/*|*/coverage/*) continue ;;
-      tmp/*|*/tmp/*) continue ;;
-      .build/*|*/.build/*) continue ;;
-      bin/*|*/bin/*) continue ;;
-      __pycache__/*|*/__pycache__/*) continue ;;
-    esac
-
-    # release-evidence/: keep schemas/ and README, skip generated evidence.
-    case "$relpath" in
-      release-evidence/schemas/*|release-evidence/README.md) ;;
-      release-evidence/*) continue ;;
-    esac
-
-    # Skip excluded basenames / patterns.
-    case "$(basename "$relpath")" in
-      .DS_Store) continue ;;
-    esac
-    case "$relpath" in
-      *.pyc|*.pyo|*.swp|*.swo|*~|.#*) continue ;;
-    esac
-
-    printf '%s\n' "$relpath"
-  done | LC_ALL=C sort
-) > "$source_paths_file"
-
-# Find files in source but not in manifest
 while IFS= read -r src_file; do
   [ -z "$src_file" ] && continue
   if ! grep -qxF "$src_file" "$manifest_paths_file"; then
@@ -115,8 +124,9 @@ echo "files_actual=$(wc -l < "$source_paths_file" | tr -d ' ')"
 echo "missing=$missing"
 echo "mismatched=$mismatched"
 echo "unexpected=$unexpected"
+echo "malformed=$malformed"
 
-if [ "$missing" -eq 0 ] && [ "$mismatched" -eq 0 ] && [ "$unexpected" -eq 0 ]; then
+if [ "$missing" -eq 0 ] && [ "$mismatched" -eq 0 ] && [ "$unexpected" -eq 0 ] && [ "$malformed" -eq 0 ]; then
   echo "status=PASS"
   exit 0
 else
