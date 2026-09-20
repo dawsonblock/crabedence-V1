@@ -130,11 +130,11 @@ workflow, not by an untrusted source.
 ## Step 4: Verify the source commit
 
 The attestation binds the artifact to a specific commit SHA. Cross-reference
-this with `release-evidence/provenance.json`:
+this with `evidence/provenance.json`:
 
 ```bash
 # Extract the commit from provenance.json
-jq -r '.commit' release-evidence/provenance.json
+jq -r '.commit' evidence/provenance.json
 
 # Verify it matches the attestation
 # The attestation output includes the commit SHA in the provenance
@@ -146,13 +146,13 @@ Check that all mandatory gates passed:
 
 ```bash
 # Check release status
-jq -r '.release_status' release-evidence/qualification.json
+jq -r '.release_status' evidence/qualification.json
 
 # Check artifact promotability
-jq -r '.artifact_promotable' release-evidence/qualification.json
+jq -r '.artifact_promotable' evidence/qualification.json
 
 # List all gate statuses (qualification schema v2 keys gates by gate_id)
-jq -r '.gates[] | "\(.gate_id): \(.status)"' release-evidence/qualification.json
+jq -r '.gates[] | "\(.gate_id): \(.status)"' evidence/qualification.json
 ```
 
 All gates must show `PASS`. The `release_status` must be `PASS` and
@@ -208,7 +208,7 @@ room enforces this directly, which catches format-specific packaging drift.
 The qualification record includes 21 named release invariants:
 
 ```bash
-jq -r '.invariants[] | "\(.id): \(.description)"' release-evidence/qualification.json
+jq -r '.invariants[] | "\(.id): \(.description)"' evidence/qualification.json
 ```
 
 These invariants encode the security and correctness properties that the
@@ -240,7 +240,7 @@ release proves:
 
 ## Step 8: Verify evidence bundle integrity
 
-The `release-evidence/SHA256SUMS` file contains checksums for every evidence
+The `evidence/SHA256SUMS` file contains checksums for every evidence
 file — including `artifact.json`, the binding between the release archive,
 the qualified source, and the capability registry digest. Verify the bundle:
 
@@ -263,29 +263,38 @@ jq -r '.sha256' evidence-manifest.json
 ```
 
 The release qualification attestation has `evidence-manifest.json` as its
-subject and records the manifest digest in its predicate. Verify the
-attestation and that the digest it binds is the manifest you hold:
+subject and records the manifest digest in its predicate. It is an
+**external** statement about the frozen evidence object, so it is never
+stored inside the evidence bundle — a reference written into the closure
+would make the manifest cover an attestation of that same manifest.
+Verify it from the published bundle:
 
 ```bash
-gh attestation verify release-evidence/evidence-manifest.json \
+gh attestation verify evidence/evidence-manifest.json \
   --repo dawsonblock/crabedence-V1
-jq -r '.evidence_sha256' release-evidence/attestation/attestation.json
 ```
 
-The attested digest must equal `jq -r '.sha256' evidence-manifest.json`.
+The attested digest must equal `jq -r '.sha256' evidence/evidence-manifest.json`.
+The archives and the evidence bundle are attested the same way:
+
+```bash
+gh attestation verify "crabedence-${VERSION}.tar.gz" --repo dawsonblock/crabedence-V1
+gh attestation verify "crabedence-${VERSION}.zip" --repo dawsonblock/crabedence-V1
+gh attestation verify "crabedence-${VERSION}-release-evidence.tar.gz" --repo dawsonblock/crabedence-V1
+```
 
 ### Registry policy identity
 
 The release binds the exact capability policy it was qualified against.
-`release-evidence/registry.json` is the verifiable envelope (the digest
+`evidence/registry.json` is the verifiable envelope (the digest
 plus the canonical descriptor bytes it covers), and `registry.sha256` is
 the digest the artifact binds:
 
 ```bash
 # Recompute the registry digest from the canonical bytes
-jq -r '.canonical_payload' release-evidence/registry.json | base64 --decode | shasum -a 256
-jq -r '.registry_sha256' release-evidence/registry.json
-jq -r '.registry_sha256' release-evidence/artifact.json
+jq -r '.canonical_payload' evidence/registry.json | base64 --decode | shasum -a 256
+jq -r '.registry_sha256' evidence/registry.json
+jq -r '.registry_sha256' evidence/artifact.json
 ```
 
 All three values must be equal — qualified policy = released policy. The

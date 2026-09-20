@@ -487,3 +487,16 @@ test("a missing zip file fails closed", (t) => {
   assert.match(output, /MODE CONTRACT VIOLATED/);
   assert.match(output, /requires the release zip/);
 });
+
+test("a finalized public bundle without an embedded attestation is valid", (t) => {
+  // The public evidence bundle is packaged BEFORE any attestation exists,
+  // so it can never carry one. An attestation is an external statement
+  // about the frozen evidence object; its absence must not invalidate the
+  // bundle, or the published artifact could never satisfy its own
+  // verifier. External attestations are checked with `gh attestation
+  // verify`.
+  const { root } = bundle(t, { attestation: null });
+  const { output } = verify(root, qualificationArgs(root));
+  assert.match(output, /no embedded attestation reference/);
+  assert.doesNotMatch(output, /GitHub attestation \(missing\)\s+FAIL/);
+});

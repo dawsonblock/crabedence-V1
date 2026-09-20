@@ -798,7 +798,13 @@ if [ -f "$EVIDENCE_DIR/attestation/attestation.json" ]; then
     fi
   fi
 else
-  check "GitHub attestation (missing)" "FAIL"
+  # An attestation is an EXTERNAL statement about the frozen evidence
+  # object, not a member of it. Writing a reference back into the
+  # finalized closure would make the manifest cover an attestation of that
+  # same manifest — a recursive object that can never be packaged. Its
+  # absence is therefore informational here: external attestations are
+  # verified with `gh attestation verify`, not from inside the bundle.
+  echo "  note: no embedded attestation reference (external attestations are verified with 'gh attestation verify')"
 fi
 
 # 6. Release invariants documented.

@@ -262,11 +262,44 @@ jobs:
   # bytes runs BEFORE the tag is pushed or the release is created, so a
   # bundle that does not survive outside the build environment can never
   # become public.
+  # ─── Release-script tests ────────────────────────────────────────────
+  # The release workflow's own composition lives in scripts/*.test.js —
+  # including the invariants that keep the evidence closure immutable and
+  # public reverification public-assets-only. Without this job a manually
+  # dispatched release could publish a chain whose own tests are red.
+  release-scripts:
+    name: Release script tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: provenance
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.provenance.outputs.commit }}
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Install script dependencies
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+
+      - name: Release script tests
+        run: node --test scripts/*.test.js scripts/*.test.mjs
+
   build:
     name: Build, Attest, Stage
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: [provenance, go-tests, go-race, worker, postgres, nemo, cross-language]
+    needs: [provenance, go-tests, go-race, worker, postgres, nemo, cross-language, release-scripts]
     outputs:
       release_version: ${{ env.RELEASE_VERSION }}
       tar_sha256: ${{ steps.artifact_hash.outputs.tar_sha256 }}
@@ -475,12 +508,18 @@ jobs:
               "artifact_sha256": "${{ steps.qual_summary.outputs.artifact_sha256 }}"
             }
 
+      # The attestation reference is written OUTSIDE dist/release-evidence/.
+      # An attestation is an external statement about the frozen evidence
+      # object; a reference inside the closure would make the evidence
+      # manifest cover an attestation of that same manifest — a recursive
+      # object — and the packaged public bundle is created before this step,
+      # so a reference written here could never appear in it anyway.
       - name: Save attestation reference
         run: |
-          mkdir -p dist/release-evidence/attestation
-          echo '${{ steps.attestation.outputs.attestation-id }}' > dist/release-evidence/attestation/attestation-id.txt
-          echo '${{ steps.attestation.outputs.attestation-url }}' > dist/release-evidence/attestation/attestation-url.txt
-          cat > dist/release-evidence/attestation/attestation.json <<EOF
+          mkdir -p dist/attestation
+          echo '${{ steps.attestation.outputs.attestation-id }}' > dist/attestation/attestation-id.txt
+          echo '${{ steps.attestation.outputs.attestation-url }}' > dist/attestation/attestation-url.txt
+          cat > dist/attestation/attestation.json <<EOF
           {
             "tool": "github-actions-attest",
             "attestation_id": "${{ steps.attestation.outputs.attestation-id }}",
@@ -545,13 +584,10 @@ jobs:
     env:
       RELEASE_VERSION: ${{ needs.build.outputs.release_version }}
     steps:
-      - name: Download release evidence
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: release-evidence
-          path: evidence
-
-      - name: Download source archive
+      # Only the staged public artifacts are downloaded. The raw evidence
+      # directory is deliberately NOT a verification input: the trust input
+      # is the packaged bundle that will actually be published.
+      - name: Download staged artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: release-source-archive
@@ -579,11 +615,18 @@ jobs:
 
       # Extract each archive into its OWN directory — never one over the
       # other — so each is verified from its own bytes.
-      - name: Extract both archives
+      - name: Extract both archives and the published evidence bundle
         run: |
-          mkdir -p clean-room/tar-source clean-room/zip-source
+          mkdir -p clean-room/tar-source clean-room/zip-source clean-room/qualification
           tar xzf "archive/crabedence-${RELEASE_VERSION}.tar.gz" -C clean-room/tar-source
           unzip -q "archive/crabedence-${RELEASE_VERSION}.zip" -d clean-room/zip-source
+          tar xzf "archive/crabedence-${RELEASE_VERSION}-release-evidence.tar.gz" \
+            -C clean-room/qualification --strip-components=1
+
+      - name: Verify the published evidence bundle self-checks
+        run: |
+          cd clean-room/qualification
+          shasum -a 256 -c SHA256SUMS
 
       - name: Set up Node
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
@@ -609,7 +652,6 @@ jobs:
       # regular-file bytes, same symlink target bytes.
       - name: Verify both source trees against the source manifest
         run: |
-          cp -r evidence clean-room/qualification
           for tree in tar-source zip-source; do
             src="clean-room/${tree}/crabedence-${RELEASE_VERSION}"
             echo "=== source manifest: $tree ==="
@@ -733,17 +775,14 @@ jobs:
         with:
           ref: ${{ env.COMMIT }}
 
-      - name: Download source archive
+      # Publication consumes exactly the staged artifacts that passed the
+      # clean room and attestation. The raw evidence directory is not
+      # downloaded: the published evidence is the packaged bundle.
+      - name: Download staged artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: release-source-archive
           path: dist
-
-      - name: Download release evidence
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: release-evidence
-          path: dist/release-evidence
 
       # The published bytes must be the verified bytes. The archive is
       # recomputed here against the digest the build job reported — a
@@ -932,3 +971,30 @@ jobs:
             --repo ${{ github.repository }}
           gh attestation verify "public/crabedence-${RELEASE_VERSION}-release-evidence.tar.gz" \
             --repo ${{ github.repository }}
+
+      # The receipt is an informational index, not a trust primitive, so it
+      # is produced here and kept OUTSIDE the already-finalized evidence
+      # closure: injecting it back in would change the object it describes.
+      - name: Generate the RC qualification receipt
+        run: |
+          bash "clean-room/tar-source/crabedence-${RELEASE_VERSION}/scripts/generate-rc-receipt.sh" \
+            --evidence clean-room/qualification \
+            --dist public \
+            --clean-room PASS \
+            --attestation PASS \
+            --public-reverify PASS \
+            --output rc-receipt.json
+          {
+            echo "## RC qualification receipt"
+            echo ""
+            echo '```json'
+            cat rc-receipt.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the RC qualification receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rc-qualification-receipt
+          path: rc-receipt.json
+          retention-days: 90

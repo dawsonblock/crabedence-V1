@@ -135,6 +135,42 @@ test("the published evidence bundle is packaged from the finalized tree", () => 
   assert.match(build, /dist\/crabedence-\$\{\{ env\.RELEASE_VERSION \}\}-release-evidence\.tar\.gz/);
 });
 
+test("nothing mutates the finalized evidence after packaging", () => {
+  const build = job("build");
+  const packageAt = build.indexOf("Package release evidence bundle");
+  assert.ok(packageAt >= 0, "the packaging step exists");
+  // Everything after packaging may READ the evidence, but must not write
+  // into it: the packaged bundle is the frozen public object, and a
+  // reference written afterwards could never appear in it.
+  const after = build.slice(packageAt);
+  assert.doesNotMatch(after, /mkdir -p dist\/release-evidence/);
+  assert.doesNotMatch(after, /cat > dist\/release-evidence/);
+  assert.doesNotMatch(after, /> dist\/release-evidence\//);
+  assert.doesNotMatch(after, /dist\/release-evidence\/attestation/);
+  // The attestation reference lives outside the closure.
+  assert.match(build, /> dist\/attestation\//);
+});
+
+test("the clean room verifies the published evidence bundle, not the raw directory", () => {
+  const cleanRoom = job("clean-room-verify");
+  assert.match(cleanRoom, /-release-evidence\.tar\.gz/);
+  assert.match(cleanRoom, /-C clean-room\/qualification --strip-components=1/);
+  assert.match(cleanRoom, /shasum -a 256 -c SHA256SUMS/);
+  // The internal raw evidence artifact is not a verification input.
+  assert.doesNotMatch(cleanRoom, /name: release-evidence/);
+  assert.doesNotMatch(cleanRoom, /cp -r evidence/);
+});
+
+test("the release script suite gates the build", () => {
+  const scriptsJob = job("release-scripts");
+  assert.match(scriptsJob, /node --test scripts\/\*\.test\.js scripts\/\*\.test\.mjs/);
+  assert.match(scriptsJob, /needs: provenance/);
+  assert.match(
+    job("build"),
+    /needs: \[provenance, go-tests, go-race, worker, postgres, nemo, cross-language, release-scripts\]/,
+  );
+});
+
 test("public reverify consumes public assets only", () => {
   const reverify = job("public-reverify");
   assert.match(reverify, /gh release download/);
