@@ -74,6 +74,29 @@ test("the bundle contains every path the checksum manifest references", (t) => {
   execFileSync("shasum", ["-a", "256", "-c", "SHA256SUMS"], { cwd: unpacked });
 });
 
+// A content-addressed snapshot of the whole tree, so any mutation —
+// rewrite, addition, deletion — is visible.
+function snapshot(dir) {
+  const out = {};
+  const walk = (current) => {
+    for (const entry of fs.readdirSync(current, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      const full = path.join(current, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else out[path.relative(dir, full)] = sha256(fs.readFileSync(full));
+    }
+  };
+  walk(dir);
+  return out;
+}
+
+test("packaging never mutates the finalized evidence directory", (t) => {
+  const { root, dir } = evidenceFixture(t);
+  const before = snapshot(dir);
+  const { status } = packageIt(dir, path.join(root, "bundle.tar.gz"));
+  assert.equal(status, 0);
+  assert.deepEqual(snapshot(dir), before, "the finalized evidence tree is immutable after packaging");
+});
+
 test("packaging refuses an evidence tree missing a referenced file", (t) => {
   const { root, dir } = evidenceFixture(t, { omitOne: true });
   const out = path.join(root, "bundle.tar.gz");

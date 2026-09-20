@@ -810,6 +810,16 @@ if [ -f "$WORKER_LINT_LOG" ]; then
 EOF
 fi
 
+# ─── Evidence secret scan (before finalization) ─────────────────────────────
+# The gate runner redacts credential-bearing argv, but a test or provider
+# can still print a secret into its own log. Scan the whole evidence tree
+# for the exact secret values the environment knows about; a hit stops the
+# release rather than shipping the secret in the evidence bundle.
+echo ""
+echo "=== Evidence secret scan ==="
+run_gate evidence-secret-scan PROVENANCE \
+  bash "$REPO_ROOT/scripts/scan-evidence-secrets.sh" "$EVIDENCE_DIR"
+
 # ─── Phase 16: Generate qualification.json ──────────────────────────────────
 # Build the canonical qualification manifest from gate results.
 echo ""
