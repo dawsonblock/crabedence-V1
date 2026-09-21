@@ -118,6 +118,68 @@ test("packaging refuses a file added after finalization", (t) => {
   assert.equal(fs.existsSync(out), false);
 });
 
+// The uncovered-set check used to pipe `comm -23` into `grep -q`. Under
+// pipefail, grep exits after its first line, comm dies with SIGPIPE, and the
+// pipeline status inverts — so a LARGE uncovered set could pass while a small
+// one correctly failed. The comparison is now materialized to a file, and
+// these cases pin the behavior at every scale where the bypass existed.
+for (const uncovered of [1, 10, 1_000, 10_000, 50_000]) {
+  test(`packaging refuses ${uncovered} uncovered file(s) at any scale`, (t) => {
+    const { root, dir } = evidenceFixture(t);
+    const late = path.join(dir, "late");
+    fs.mkdirSync(late);
+    for (let i = 0; i < uncovered; i += 1) {
+      fs.writeFileSync(path.join(late, `uncovered-${i}.txt`), "");
+    }
+    const out = path.join(root, "bundle.tar.gz");
+    const { status, stderr } = packageIt(dir, out);
+    assert.equal(status, 1, "a non-empty uncovered set must fail closed");
+    assert.match(stderr, /not covered by SHA256SUMS/);
+    assert.equal(fs.existsSync(out), false, "no archive may be produced");
+  });
+}
+
+test("packaging refuses a covered file modified after finalization", (t) => {
+  const { root, dir } = evidenceFixture(t);
+  // The file is still listed in SHA256SUMS, but its bytes changed — name
+  // coverage alone must not be enough to package it.
+  fs.writeFileSync(path.join(dir, "artifact.json"), '{"schema_version":2,"tampered":true}\n');
+  const out = path.join(root, "bundle.tar.gz");
+  const { status, stderr } = packageIt(dir, out);
+  assert.equal(status, 1);
+  assert.match(stderr, /SHA256SUMS does not verify/);
+  assert.equal(fs.existsSync(out), false);
+});
+
+test("an extra empty directory is packaged (directories carry no checksummable content)", (t) => {
+  const { root, dir } = evidenceFixture(t);
+  // Defined behavior: a bare directory has no content identity, so it cannot
+  // evade SHA256SUMS. It ships inside the bundle as structure only.
+  fs.mkdirSync(path.join(dir, "empty-subdir"));
+  const out = path.join(root, "bundle.tar.gz");
+  const { status, stderr } = packageIt(dir, out);
+  assert.equal(status, 0, stderr);
+  const extract = path.join(root, "extracted");
+  fs.mkdirSync(extract);
+  execFileSync("tar", ["xzf", out, "-C", extract]);
+  assert.ok(fs.statSync(path.join(extract, "release-evidence", "empty-subdir")).isDirectory());
+  execFileSync("shasum", ["-a", "256", "-c", "SHA256SUMS"], {
+    cwd: path.join(extract, "release-evidence"),
+  });
+});
+
+test("packaging refuses a fifo that SHA256SUMS cannot cover", (t) => {
+  const { root, dir } = evidenceFixture(t);
+  // A fifo is a non-regular member: it can never appear in SHA256SUMS, so it
+  // must be rejected rather than shipped silently.
+  execFileSync("mkfifo", [path.join(dir, "channel.fifo")]);
+  const out = path.join(root, "bundle.tar.gz");
+  const { status, stderr } = packageIt(dir, out);
+  assert.equal(status, 1);
+  assert.match(stderr, /non-regular file/);
+  assert.equal(fs.existsSync(out), false);
+});
+
 test("packaging refuses a non-regular member that cannot be checksummed", (t) => {
   const { root, dir } = evidenceFixture(t);
   fs.symlinkSync("qualification.json", path.join(dir, "link.json"));

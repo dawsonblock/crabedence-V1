@@ -222,6 +222,10 @@ echo "  $(grep 'status=' "$MANIFEST_VERIFY" | tail -1 | cut -d= -f2)  source_man
 
 # ─── Phase 21: Toolchain identity ───────────────────────────────────────────
 GO_VERSION="$(go version 2>/dev/null || echo 'unavailable')"
+GO_ENV_GOVERSION="$(go env GOVERSION 2>/dev/null || echo 'unavailable')"
+GO_ENV_GOTOOLCHAIN="$(go env GOTOOLCHAIN 2>/dev/null || echo 'unavailable')"
+GO_MOD_TOOLCHAIN="$(sed -n 's/^toolchain \(go[0-9][0-9.]*\).*/\1/p' "$REPO_ROOT/go.mod")"
+GO_MOD_TOOLCHAIN="${GO_MOD_TOOLCHAIN%%$'\n'*}"
 NODE_VERSION="$(node --version 2>/dev/null || echo 'unavailable')"
 NPM_VERSION="$(npm --version 2>/dev/null || echo 'unavailable')"
 WORKER_PKG_VERSION="$(node -e "console.log(require('./worker/package.json').version)" 2>/dev/null || echo 'unavailable')"
@@ -243,6 +247,9 @@ fi
 cat > "$EVIDENCE_DIR/toolchains.json" << EOF
 {
   "go": "$GO_VERSION",
+  "goversion": "$GO_ENV_GOVERSION",
+  "gotoolchain": "$GO_ENV_GOTOOLCHAIN",
+  "go_toolchain_directive": "$GO_MOD_TOOLCHAIN",
   "node": "$NODE_VERSION",
   "npm": "$NPM_VERSION",
   "git": "$GIT_VERSION",
@@ -263,6 +270,12 @@ cat > "$EVIDENCE_DIR/environment.json" << EOF
   "date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 EOF
+
+# exact-toolchain: the release must execute on EXACTLY the toolchain go.mod
+# declares — not merely some Go 1.26.x — with GOTOOLCHAIN=local so the go
+# command cannot substitute another toolchain mid-qualification. The gate's
+# own log carries go version / go env GOVERSION / go env GOTOOLCHAIN.
+run_gate exact-toolchain BUILD bash "$REPO_ROOT/scripts/verify-go-toolchain.sh" "$REPO_ROOT"
 
 # ─── Phase 8-9: Go gates (uncached, -count=1) ───────────────────────────────
 echo ""
@@ -1103,7 +1116,8 @@ cat > "$EVIDENCE_DIR/qualification.json" << EOF
     {"id": "CRAB-V1-018", "description": "only an unexpired active lease generation may mutate execution state"},
     {"id": "CRAB-V1-019", "description": "terminal finalization is immutable and conflict-aware"},
     {"id": "CRAB-V1-020", "description": "post-dispatch uncertainty cannot become retryable without evidence"},
-    {"id": "CRAB-V1-021", "description": "concurrent identical mutations cause at most one provider dispatch"}
+    {"id": "CRAB-V1-021", "description": "concurrent identical mutations cause at most one provider dispatch"},
+    {"id": "CRAB-V1-022", "description": "the release toolchain is exactly the declared toolchain (declared = installed = runtime GOVERSION, GOTOOLCHAIN=local)"}
   ],
   "provenance": {
     "commit": "$COMMIT",
@@ -1113,6 +1127,9 @@ cat > "$EVIDENCE_DIR/qualification.json" << EOF
   },
   "toolchains": {
     "go": "$GO_VERSION",
+    "goversion": "$GO_ENV_GOVERSION",
+    "gotoolchain": "$GO_ENV_GOTOOLCHAIN",
+    "go_toolchain_directive": "$GO_MOD_TOOLCHAIN",
     "node": "$NODE_VERSION",
     "npm": "$NPM_VERSION",
     "git": "$GIT_VERSION",
@@ -1242,7 +1259,9 @@ if [ -f "$REPO_ROOT/worker/package-lock.json" ]; then
     [ "$SBOM_IDX" -gt 0 ] && SBOM_PACKAGES+=","
     SBOM_PACKAGES+="{\"name\":\"$pkg_name\",\"version\":\"$pkg_ver\",\"ecosystem\":\"npm\",\"supplier\":\"Unknown\"}"
     SBOM_IDX=$((SBOM_IDX + 1))
-  done < <(jq -r '.packages | to_entries[] | select(.key | startswith("node_modules/")) | .key | sub("node_modules/"; "")' "$REPO_ROOT/worker/package-lock.json" 2>/dev/null | grep -v '/' | sort -u | head -100)
+  # Every top-level npm dependency is listed: truncating this list would
+  # ship an incomplete component inventory inside sealed evidence.
+  done < <(jq -r '.packages | to_entries[] | select(.key | startswith("node_modules/")) | .key | sub("node_modules/"; "")' "$REPO_ROOT/worker/package-lock.json" 2>/dev/null | grep -v '/' | sort -u)
 fi
 
 cat > "$EVIDENCE_DIR/sbom.spdx.json" << EOF

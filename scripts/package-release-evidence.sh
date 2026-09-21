@@ -49,6 +49,14 @@ if [ "$missing" -ne 0 ]; then
   exit 1
 fi
 
+# Coverage by name is not enough: a covered file modified after finalization
+# must not package. Recompute every digest before going further.
+if ! (cd "$EVIDENCE_DIR" && shasum -a 256 -c SHA256SUMS >/dev/null 2>&1); then
+  echo "ERROR: SHA256SUMS does not verify against the evidence tree (a covered file changed after finalization)" >&2
+  (cd "$EVIDENCE_DIR" && shasum -a 256 -c SHA256SUMS 2>&1 | grep -v ': OK$') >&2 || true
+  exit 1
+fi
+
 # The reverse direction too: every regular file being packaged must be listed
 # in SHA256SUMS. A file added after finalization — or a non-regular member the
 # checksum walk skipped — would otherwise ship inside the bundle without a
@@ -57,6 +65,8 @@ fi
 # checksum walk only covers regular files, so both are excluded here as well.
 covered_list="$(mktemp)"
 ondisk_list="$(mktemp)"
+uncovered_list="$(mktemp)"
+trap 'rm -f "$covered_list" "$ondisk_list" "$uncovered_list"' EXIT
 while read -r _sha entry || [ -n "$_sha" ]; do
   entry="${entry#\*}"
   entry="${entry#./}"
@@ -65,12 +75,20 @@ done < "$EVIDENCE_DIR/SHA256SUMS" | LC_ALL=C sort > "$covered_list"
 (cd "$EVIDENCE_DIR" \
   && find . -type f ! -name SHA256SUMS ! -name evidence-manifest.json -print \
   | sed 's|^\./||' | LC_ALL=C sort) > "$ondisk_list"
-if ! comm -23 "$ondisk_list" "$covered_list" | grep -q .; then
-  : # every packaged regular file is covered
-else
-  echo "ERROR: evidence file(s) not covered by SHA256SUMS would ship uncovered:" >&2
-  comm -23 "$ondisk_list" "$covered_list" >&2
-  rm -f "$covered_list" "$ondisk_list"
+# Materialize the set difference, then test the FILE. Piping comm into a
+# short-circuiting consumer (grep -q, head) lets the consumer exit after the
+# first line, comm dies with SIGPIPE, and pipefail inverts the branch — so a
+# very large uncovered set could pass as "fully covered". No pipeline may
+# carry this decision.
+comm -23 "$ondisk_list" "$covered_list" > "$uncovered_list"
+if [ -s "$uncovered_list" ]; then
+  uncovered_count="$(wc -l < "$uncovered_list" | tr -d ' ')"
+  echo "ERROR: $uncovered_count evidence file(s) not covered by SHA256SUMS would ship uncovered:" >&2
+  # A bounded sample: the full list can be tens of thousands of paths.
+  head -100 "$uncovered_list" >&2
+  if [ "$uncovered_count" -gt 100 ]; then
+    echo "  ... and $((uncovered_count - 100)) more" >&2
+  fi
   exit 1
 fi
 # A non-regular member (symlink, fifo, ...) is never in SHA256SUMS and never
@@ -79,10 +97,10 @@ nonregular="$(cd "$EVIDENCE_DIR" && find . ! -type f ! -type d -print)"
 if [ -n "$nonregular" ]; then
   echo "ERROR: evidence tree contains a non-regular file that SHA256SUMS cannot cover:" >&2
   printf '%s\n' "$nonregular" >&2
-  rm -f "$covered_list" "$ondisk_list"
   exit 1
 fi
-rm -f "$covered_list" "$ondisk_list"
+rm -f "$covered_list" "$ondisk_list" "$uncovered_list"
+trap - EXIT
 
 mkdir -p "$(dirname "$OUTPUT")"
 PARENT="$(cd "$(dirname "$EVIDENCE_DIR")" && pwd)"

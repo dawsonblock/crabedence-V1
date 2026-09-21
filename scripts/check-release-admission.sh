@@ -147,6 +147,32 @@ if [ "$INV_COUNT" -gt 0 ]; then
   done
 fi
 
+# ─── Toolchain binding (independent of the gate's self-report) ───────────
+# When the release object exists, its declared toolchain must equal the
+# toolchain the qualification actually ran on. A declaration without a
+# matching runtime record — or no runtime record at all — rejects.
+ARTIFACT_JSON="$EVIDENCE_DIR/artifact.json"
+if [ -f "$ARTIFACT_JSON" ]; then
+  artifact_go="$(jq -r '.toolchain.go // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
+  qual_go_raw="$(jq -r '.toolchains.go // empty' "$QUAL_FILE" 2>/dev/null || true)"
+  qual_go=""
+  if [[ "$qual_go_raw" =~ (go[0-9]+\.[0-9]+\.[0-9]+) ]]; then
+    qual_go="${BASH_REMATCH[1]}"
+  fi
+  if ! [[ "$artifact_go" =~ ^go[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "  INCONSISTENCY: artifact.json toolchain.go is missing or malformed: '${artifact_go:-<empty>}'" >&2
+    CONSISTENT=false
+  elif [ -z "$qual_go" ]; then
+    echo "  INCONSISTENCY: qualification.json records no actual Go toolchain version" >&2
+    CONSISTENT=false
+  elif [ "$artifact_go" != "$qual_go" ]; then
+    echo "  INCONSISTENCY: artifact.json declares toolchain $artifact_go but qualification ran on $qual_go" >&2
+    CONSISTENT=false
+  else
+    echo "  Toolchain binding: $artifact_go (declared = qualified)"
+  fi
+fi
+
 # ─── Admission decision ────────────────────────────────────────────────
 echo ""
 

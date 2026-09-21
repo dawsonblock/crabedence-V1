@@ -277,6 +277,42 @@ if [ -f "$ARTIFACT_JSON" ]; then
     fi
   fi
 
+  # The declared toolchain must equal the toolchain the qualification
+  # actually ran on — checked here, independently of the gate's
+  # self-report, and against the source tree's own go.mod directive.
+  ARTIFACT_GO="$(jq -r '.toolchain.go // empty' "$ARTIFACT_JSON" 2>/dev/null || true)"
+  if [[ "$ARTIFACT_GO" =~ ^go[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    check "artifact.json toolchain declaration" "PASS"
+  else
+    check "artifact.json toolchain declaration" "FAIL"
+    echo "  ERROR: artifact.json toolchain.go is missing or malformed: '${ARTIFACT_GO:-<empty>}'" >&2
+  fi
+  if [ -f "$EVIDENCE_DIR/qualification.json" ]; then
+    QUAL_GO_RAW="$(jq -r '.toolchains.go // empty' "$EVIDENCE_DIR/qualification.json" 2>/dev/null || true)"
+    QUAL_GO=""
+    if [[ "$QUAL_GO_RAW" =~ (go[0-9]+\.[0-9]+\.[0-9]+) ]]; then
+      QUAL_GO="${BASH_REMATCH[1]}"
+    fi
+    if [ -n "$ARTIFACT_GO" ] && [ -n "$QUAL_GO" ] && [ "$ARTIFACT_GO" = "$QUAL_GO" ]; then
+      check "Declared toolchain = qualified toolchain" "PASS"
+    else
+      check "Declared toolchain = qualified toolchain" "FAIL"
+      echo "  ERROR: artifact.json declares toolchain '${ARTIFACT_GO:-<missing>}' but qualification ran on '${QUAL_GO:-<missing>}'" >&2
+    fi
+  fi
+  # The source's own declaration (the go.mod toolchain directive) must
+  # agree with the toolchain the artifact claims it was built under.
+  if [ -f "$SOURCE_DIR/go.mod" ]; then
+    GO_MOD_TOOLCHAIN="$(sed -n 's/^toolchain \(go[0-9][0-9.]*\).*/\1/p' "$SOURCE_DIR/go.mod")"
+    GO_MOD_TOOLCHAIN="${GO_MOD_TOOLCHAIN%%$'\n'*}"
+    if [ -n "$ARTIFACT_GO" ] && [ -n "$GO_MOD_TOOLCHAIN" ] && [ "$ARTIFACT_GO" = "$GO_MOD_TOOLCHAIN" ]; then
+      check "Declared toolchain = go.mod toolchain" "PASS"
+    else
+      check "Declared toolchain = go.mod toolchain" "FAIL"
+      echo "  ERROR: artifact.json declares '${ARTIFACT_GO:-<missing>}' but go.mod declares '${GO_MOD_TOOLCHAIN:-<none>}'" >&2
+    fi
+  fi
+
   # Recompute the archive digest — never trust the stored string.
   if [ -n "$ARCHIVE_PATH" ]; then
     if [ ! -f "$ARCHIVE_PATH" ]; then
