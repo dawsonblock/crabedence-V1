@@ -937,14 +937,72 @@ jobs:
           git config user.name "Crabedence Release Bot"
           git config user.email "release@crabedence.dev"
 
+      # Tag creation is idempotent: an existing tag on the qualified
+      # commit is reused, an existing tag on any other commit is a hard
+      # failure. A published release tag is never moved.
       - name: Tag release candidate
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git tag -a "$RELEASE_VERSION" -m "Crabedence $RELEASE_VERSION"
-          git push origin "$RELEASE_VERSION"
+          existing="$(git ls-remote origin "refs/tags/${RELEASE_VERSION}^{}" | cut -f1)"
+          if [ -z "$existing" ]; then
+            existing="$(git ls-remote origin "refs/tags/${RELEASE_VERSION}" | cut -f1)"
+          fi
+          if [ -n "$existing" ]; then
+            if [ "$existing" != "$COMMIT" ]; then
+              echo "ERROR: tag $RELEASE_VERSION already exists at $existing, which is not the qualified commit $COMMIT" >&2
+              echo "A published release tag is never moved; cut a new RC instead." >&2
+              exit 1
+            fi
+            echo "tag $RELEASE_VERSION already points at the qualified commit; reusing it"
+          else
+            git tag -a "$RELEASE_VERSION" -m "Crabedence $RELEASE_VERSION"
+            git push origin "$RELEASE_VERSION"
+          fi
 
       # ─── Publish as GitHub prerelease ────────────────────────────────
+      - name: Check for an existing release
+        id: existing_release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "$RELEASE_VERSION" --repo "${{ github.repository }}" --json tagName >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # If the release already exists (e.g. a re-dispatch after a
+      # post-publish failure), its published assets must be exactly the
+      # qualified bytes. Anything else is an incident, not an upload.
+      - name: Verify an existing release carries the qualified bytes
+        if: steps.existing_release.outputs.exists == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p existing
+          gh release download "$RELEASE_VERSION" --repo "${{ github.repository }}" \
+            --dir existing --clobber --pattern 'crabedence-*'
+          for f in \
+            "crabedence-${RELEASE_VERSION}.tar.gz" \
+            "crabedence-${RELEASE_VERSION}.tar.gz.sha256" \
+            "crabedence-${RELEASE_VERSION}.zip" \
+            "crabedence-${RELEASE_VERSION}.zip.sha256" \
+            "crabedence-${RELEASE_VERSION}.bom.json" \
+            "crabedence-${RELEASE_VERSION}.bom.json.sha256" \
+            "crabedence-${RELEASE_VERSION}-release-evidence.tar.gz" \
+            "crabedence-${RELEASE_VERSION}-release-evidence.tar.gz.sha256"; do
+            [ -f "existing/$f" ] || { echo "ERROR: published release is missing $f" >&2; exit 1; }
+            if ! cmp -s "existing/$f" "dist/$f"; then
+              echo "ERROR: published $f differs from the qualified staged bytes" >&2
+              exit 1
+            fi
+            echo "Published $f matches the qualified bytes"
+          done
+
       - name: Create GitHub prerelease
+        if: steps.existing_release.outputs.exists != 'true'
         uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.2
         with:
           tag_name: ${{ env.RELEASE_VERSION }}

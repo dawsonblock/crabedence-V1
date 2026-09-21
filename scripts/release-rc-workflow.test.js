@@ -138,6 +138,32 @@ test("published bytes are reverified after publication", () => {
   assert.doesNotMatch(job("publish"), /public-reverify/);
 });
 
+test("tag creation is idempotent and never moves a published tag", () => {
+  const publish = job("publish");
+  const tagStep = publish.indexOf("name: Tag release candidate");
+  assert.ok(tagStep >= 0);
+  const tagBlock = publish.slice(tagStep, publish.indexOf("\n      - name:", tagStep));
+  // An existing tag on the qualified commit is reused; any other target
+  // is a hard failure. A published release tag is never moved.
+  assert.match(tagBlock, /ls-remote origin "refs\/tags\/\$\{RELEASE_VERSION\}\^\{\}"/);
+  assert.match(tagBlock, /"\$existing" != "\$COMMIT"/);
+  assert.match(tagBlock, /exit 1/);
+  assert.match(tagBlock, /git tag -a "\$RELEASE_VERSION"/);
+});
+
+test("an existing release must already carry the qualified bytes", () => {
+  const publish = job("publish");
+  assert.match(publish, /name: Check for an existing release/);
+  assert.match(publish, /gh release view "\$RELEASE_VERSION"/);
+  const verify = publish.indexOf("Verify an existing release carries the qualified bytes");
+  const create = publish.indexOf("Create GitHub prerelease");
+  assert.ok(verify >= 0 && create > verify, "existing releases are byte-verified before any upload path");
+  assert.match(publish, /cmp -s "existing\/\$f" "dist\/\$f"/);
+  // The upload step is skipped entirely when the release already exists —
+  // published assets are never re-uploaded or replaced.
+  assert.match(publish, /if: steps\.existing_release\.outputs\.exists != 'true'/);
+});
+
 test("the published evidence bundle is packaged from the finalized tree", () => {
   const build = job("build");
   // Packaging runs after finalization, so the bundle is the finalized tree
