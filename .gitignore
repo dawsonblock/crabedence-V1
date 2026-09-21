@@ -1,4 +1,5 @@
 bin/
+!plugins/herdr/bin/
 dist/
 dist-release/
 dist-release-unsigned/

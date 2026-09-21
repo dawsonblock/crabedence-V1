@@ -181,6 +181,10 @@ test("the release script suite gates the build", () => {
   const scriptsJob = job("release-scripts");
   assert.match(scriptsJob, /node --test scripts\/\*\.test\.js scripts\/\*\.test\.mjs/);
   assert.match(scriptsJob, /needs: provenance/);
+  // The standalone verifier resolves the pinned AJV at
+  // nemo/node_modules/.bin/ajv; the job must install the lockfile deps or
+  // verification fails closed on a clean runner.
+  assert.match(scriptsJob, /npm ci --prefix nemo/);
   assert.match(
     job("build"),
     /needs: \[provenance, go-tests, go-race, worker, postgres, nemo, cross-language, release-scripts\]/,

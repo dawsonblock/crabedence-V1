@@ -371,6 +371,12 @@ jobs:
       - name: Verify version consistency
         run: node scripts/verify-version-consistency.mjs
 
+      # The standalone release verifier resolves the pinned AJV at
+      # nemo/node_modules/.bin/ajv; without the lockfile install the
+      # verifier fails closed on a clean checkout.
+      - name: Install NeMo dependencies
+        run: npm ci --prefix nemo
+
       - name: Release script tests
         run: node --test scripts/*.test.js scripts/*.test.mjs
 
