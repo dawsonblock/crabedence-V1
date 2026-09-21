@@ -1,0 +1,25 @@
+[Unit]
+Description=Crabedence execution service (v0.52.0-rc.1)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=crabedence
+Group=crabedence
+RuntimeDirectory=crabedence
+RuntimeDirectoryMode=0700
+Environment=CRABBOX_MODE=production
+Environment=CRABEDENCE_STORE_BACKEND=postgres
+Environment=CRABBOX_REPLICAS=1
+EnvironmentFile=/etc/crabedence/staging.env
+ExecStart=/usr/local/bin/crabbox serve-execution --socket /run/crabedence/execution.sock
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
