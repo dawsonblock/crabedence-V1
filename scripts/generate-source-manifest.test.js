@@ -156,6 +156,47 @@ test("a deleted symlink fails closed", (t) => {
   assert.match(output, /MISSING: link\.txt/);
 });
 
+test("a regular file replaced by a symlink fails closed", (t) => {
+  const root = makeRepo(t);
+  const { manifestPath } = generate(t, root);
+  const dir = extract(t, root);
+  fs.rmSync(path.join(dir, "tracked.txt"));
+  fs.symlinkSync("run.sh", path.join(dir, "tracked.txt"));
+  const { status, output } = verify(manifestPath, dir);
+  assert.equal(status, 1, output);
+  assert.match(output, /TYPE MISMATCH: tracked\.txt/);
+});
+
+test("a changed file content fails closed", (t) => {
+  const root = makeRepo(t);
+  const { manifestPath } = generate(t, root);
+  const dir = extract(t, root);
+  fs.writeFileSync(path.join(dir, "tracked.txt"), "tampered\n");
+  const { status, output } = verify(manifestPath, dir);
+  assert.equal(status, 1, output);
+  assert.match(output, /MISMATCH: tracked\.txt/);
+});
+
+test("a deleted regular file fails closed", (t) => {
+  const root = makeRepo(t);
+  const { manifestPath } = generate(t, root);
+  const dir = extract(t, root);
+  fs.rmSync(path.join(dir, "tracked.txt"));
+  const { status, output } = verify(manifestPath, dir);
+  assert.equal(status, 1, output);
+  assert.match(output, /MISSING: tracked\.txt/);
+});
+
+test("a file added after manifest generation fails closed", (t) => {
+  const root = makeRepo(t);
+  const { manifestPath } = generate(t, root);
+  const dir = extract(t, root);
+  fs.writeFileSync(path.join(dir, "extra.txt"), "unmanifested\n");
+  const { status, output } = verify(manifestPath, dir);
+  assert.equal(status, 1, output);
+  assert.match(output, /UNEXPECTED: extra\.txt/);
+});
+
 test("the generator and verifier parse", () => {
   for (const file of [GENERATOR, VERIFIER]) {
     execFileSync("bash", ["-n", file]);
