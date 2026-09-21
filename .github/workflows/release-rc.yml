@@ -1097,20 +1097,37 @@ jobs:
             --zip "public/crabedence-${RELEASE_VERSION}.zip" \
             --sbom "public/crabedence-${RELEASE_VERSION}.bom.json"
 
+      # Attestations must resolve to THIS release workflow at THIS commit —
+      # not merely any signer in the repository. The artifact subjects use
+      # the default SLSA provenance predicate; the evidence manifest carries
+      # the Crabedence release-qualification predicate.
       - name: Verify published attestations
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SIGNER_WORKFLOW: ${{ github.repository }}/.github/workflows/release-rc.yml
+          SOURCE_DIGEST: ${{ github.sha }}
         run: |
           gh attestation verify "public/crabedence-${RELEASE_VERSION}.tar.gz" \
-            --repo ${{ github.repository }}
+            --repo ${{ github.repository }} \
+            --signer-workflow "$SIGNER_WORKFLOW" \
+            --source-digest "$SOURCE_DIGEST"
           gh attestation verify "public/crabedence-${RELEASE_VERSION}.zip" \
-            --repo ${{ github.repository }}
+            --repo ${{ github.repository }} \
+            --signer-workflow "$SIGNER_WORKFLOW" \
+            --source-digest "$SOURCE_DIGEST"
           gh attestation verify "public/crabedence-${RELEASE_VERSION}.bom.json" \
-            --repo ${{ github.repository }}
+            --repo ${{ github.repository }} \
+            --signer-workflow "$SIGNER_WORKFLOW" \
+            --source-digest "$SOURCE_DIGEST"
           gh attestation verify "public/crabedence-${RELEASE_VERSION}-release-evidence.tar.gz" \
-            --repo ${{ github.repository }}
+            --repo ${{ github.repository }} \
+            --signer-workflow "$SIGNER_WORKFLOW" \
+            --source-digest "$SOURCE_DIGEST"
           gh attestation verify clean-room/qualification/evidence-manifest.json \
-            --repo ${{ github.repository }}
+            --repo ${{ github.repository }} \
+            --predicate-type https://crabedence.dev/attestation/release-qualification/v1 \
+            --signer-workflow "$SIGNER_WORKFLOW" \
+            --source-digest "$SOURCE_DIGEST"
 
       # The receipt is an informational index, not a trust primitive, so it
       # is produced here and kept OUTSIDE the already-finalized evidence

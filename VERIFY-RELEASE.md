@@ -310,17 +310,20 @@ Verify it from the published bundle:
 
 ```bash
 gh attestation verify evidence/evidence-manifest.json \
-  --repo dawsonblock/crabedence-V1
+  --repo dawsonblock/crabedence-V1 \
+  --predicate-type https://crabedence.dev/attestation/release-qualification/v1 \
+  --signer-workflow dawsonblock/crabedence-V1/.github/workflows/release-rc.yml
 ```
 
 The attested digest must equal `jq -r '.sha256' evidence/evidence-manifest.json`.
 The archives, the SBOM, and the evidence bundle are attested the same way:
 
 ```bash
-gh attestation verify "crabedence-${VERSION}.tar.gz" --repo dawsonblock/crabedence-V1
-gh attestation verify "crabedence-${VERSION}.zip" --repo dawsonblock/crabedence-V1
-gh attestation verify "crabedence-${VERSION}.bom.json" --repo dawsonblock/crabedence-V1
-gh attestation verify "crabedence-${VERSION}-release-evidence.tar.gz" --repo dawsonblock/crabedence-V1
+SIGNER=dawsonblock/crabedence-V1/.github/workflows/release-rc.yml
+gh attestation verify "crabedence-${VERSION}.tar.gz" --repo dawsonblock/crabedence-V1 --signer-workflow "$SIGNER"
+gh attestation verify "crabedence-${VERSION}.zip" --repo dawsonblock/crabedence-V1 --signer-workflow "$SIGNER"
+gh attestation verify "crabedence-${VERSION}.bom.json" --repo dawsonblock/crabedence-V1 --signer-workflow "$SIGNER"
+gh attestation verify "crabedence-${VERSION}-release-evidence.tar.gz" --repo dawsonblock/crabedence-V1 --signer-workflow "$SIGNER"
 ```
 
 ### Registry policy identity

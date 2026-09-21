@@ -289,6 +289,17 @@ test("public reverification checks the SBOM and tree equivalence from public ass
   assert.match(reverify, /outputs\.sbom_sha256/);
   assert.match(reverify, /compare-source-trees\.sh/);
   assert.match(reverify, /gh attestation verify clean-room\/qualification\/evidence-manifest\.json/);
+  // The manifest attestation uses the Crabedence qualification predicate,
+  // not the default SLSA provenance predicate the artifact attestations
+  // carry — without it the verify queries the wrong predicate and fails.
+  assert.match(
+    reverify,
+    /evidence-manifest\.json \\\n            --repo \$\{\{ github\.repository \}\} \\\n            --predicate-type https:\/\/crabedence\.dev\/attestation\/release-qualification\/v1/,
+  );
+  // Attestation verification is bound to this workflow at this commit,
+  // not merely "some workflow in this repository".
+  assert.match(reverify, /--signer-workflow "\$SIGNER_WORKFLOW"/);
+  assert.match(reverify, /--source-digest "\$SOURCE_DIGEST"/);
 });
 
 test("neither release workflow writes an attestation inside the evidence closure", () => {
