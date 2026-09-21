@@ -36,23 +36,29 @@ test("clean-room verification gates publication", () => {
 
 test("artifact attestations are created only after clean-room verification", () => {
   const attest = job("attest");
-  assert.match(attest, /needs: \[build, clean-room-verify\]/);
+  assert.match(attest, /needs: \[provenance, build, clean-room-verify\]/);
+  assert.match(attest, /- name: Attest the final evidence manifest/);
   assert.match(attest, /- name: Attest source archive/);
   assert.match(attest, /- name: Attest zip archive/);
   assert.match(attest, /- name: Attest SBOM/);
-  // The build job must not attest the archives before they are verified.
-  assert.doesNotMatch(job("build"), /- name: Attest source archive/);
-  assert.doesNotMatch(job("build"), /- name: Attest zip archive/);
+  assert.match(attest, /- name: Attest release evidence bundle/);
+  // No job attests before the clean room proves the staged bytes: the
+  // build job has no attestation steps at all.
+  const build = job("build");
+  assert.doesNotMatch(build, /actions\/attest@/);
+  assert.doesNotMatch(build, /- name: Attest source archive/);
+  assert.doesNotMatch(build, /- name: Attest zip archive/);
+  assert.doesNotMatch(build, /- name: Attest SBOM/);
 });
 
 test("release evidence finalization precedes the final-manifest attestation", () => {
   const build = job("build");
   const order = [
     "Generate SBOM",
+    "Calculate artifact SHA-256",
     "Generate artifact.json",
     "Finalize release evidence",
-    "Create GitHub artifact attestation",
-    "Save attestation reference",
+    "Package release evidence bundle",
     "Verify release artifact",
   ];
   let last = -1;
@@ -61,12 +67,21 @@ test("release evidence finalization precedes the final-manifest attestation", ()
     assert.ok(at > last, `${step} is ordered after the previous step`);
     last = at;
   }
-  assert.match(build, /subject-path: dist\/release-evidence\/evidence-manifest\.json/);
-  assert.match(build, /"evidence_sha256": "\$\{\{ steps\.qual_summary\.outputs\.evidence_sha256 \}\}"/);
   assert.match(build, /finalize-release-evidence\.sh dist\/release-evidence/);
   // The SBOM is generated before artifact.json so the release object can
   // bind its digest.
   assert.match(build, /"schema_version": 2|schema_version: 2/);
+
+  // The manifest attestation lives in the post-clean-room attest job and
+  // binds the manifest INSIDE the staged evidence bundle — the published
+  // object, not a pre-finalization copy in the workspace.
+  const attest = job("attest");
+  const extractAt = attest.indexOf("Extract the final evidence manifest for attestation");
+  const attestAt = attest.indexOf("- name: Attest the final evidence manifest");
+  assert.ok(extractAt >= 0 && attestAt > extractAt, "the manifest is extracted before it is attested");
+  assert.match(attest, /subject-path: dist\/attestation-subject\/evidence-manifest\.json/);
+  assert.match(attest, /"evidence_sha256": "\$\{\{ steps\.qual_summary\.outputs\.evidence_sha256 \}\}"/);
+  assert.match(attest, /-release-evidence\.tar\.gz/);
 });
 
 test("release-mode verification binds the archive and the SBOM", () => {
@@ -147,8 +162,9 @@ test("nothing mutates the finalized evidence after packaging", () => {
   assert.doesNotMatch(after, /cat > dist\/release-evidence/);
   assert.doesNotMatch(after, /> dist\/release-evidence\//);
   assert.doesNotMatch(after, /dist\/release-evidence\/attestation/);
-  // The attestation reference lives outside the closure.
-  assert.match(build, /> dist\/attestation\//);
+  // The attestation reference lives outside the closure, and it is written
+  // by the attest job — the build job no longer attests anything.
+  assert.match(job("attest"), /> dist\/attestation\//);
 });
 
 test("the clean room verifies the published evidence bundle, not the raw directory", () => {
@@ -185,16 +201,90 @@ test("public reverify consumes public assets only", () => {
   assert.match(reverify, /shasum -a 256 -c SHA256SUMS/);
 });
 
-test("both archives and the evidence bundle traverse the whole DAG", () => {
+test("both archives, the SBOM, and the evidence bundle traverse the whole DAG", () => {
   for (const name of ["clean-room-verify", "attest", "publish", "public-reverify"]) {
     const body = job(name);
     assert.match(body, /\.tar\.gz/, `${name} handles the tar.gz`);
     assert.match(body, /\.zip/, `${name} handles the zip`);
+    assert.match(body, /\.bom\.json/, `${name} handles the SBOM`);
     assert.match(body, /-release-evidence\.tar\.gz/, `${name} handles the evidence bundle`);
     assert.match(body, /outputs\.tar_sha256/, `${name} compares the tar digest`);
     assert.match(body, /outputs\.zip_sha256/, `${name} compares the zip digest`);
+    assert.match(body, /outputs\.sbom_sha256/, `${name} compares the SBOM digest`);
     assert.match(body, /outputs\.evidence_archive_sha256/, `${name} compares the evidence digest`);
   }
+});
+
+test("every Go setup pins the exact release toolchain and asserts it", () => {
+  // go-version-file: go.mod resolves a 1.26.x, not the pinned patch: the
+  // release must not delegate patch selection to the module directive.
+  assert.doesNotMatch(workflow, /go-version-file: go\.mod/);
+  assert.match(workflow, /GOTOOLCHAIN: local/);
+  const setups = workflow.match(/uses: actions\/setup-go@/g) ?? [];
+  const pins = workflow.match(/go-version: \$\{\{ env\.GO_EXACT_VERSION \}\}/g) ?? [];
+  const assertions = workflow.match(/- name: Assert the exact Go toolchain/g) ?? [];
+  assert.ok(setups.length > 0, "the workflow sets up Go");
+  assert.equal(pins.length, setups.length, "every setup-go uses the exact pin");
+  assert.equal(assertions.length, setups.length, "every setup-go is followed by a GOVERSION assertion");
+  assert.match(workflow, /GO_EXACT_VERSION: '1\.26\.5'/);
+});
+
+test("release permissions are scoped per job, not granted globally", () => {
+  // The workflow default is read-only; write scopes exist only on the
+  // jobs that perform the operation.
+  assert.match(workflow, /\npermissions:\n  contents: read\n/);
+  const attest = job("attest");
+  assert.match(attest, /\n    permissions:\n      contents: read\n      id-token: write\n      attestations: write\n/);
+  const publish = job("publish");
+  assert.match(publish, /\n    permissions:\n      contents: write\n/);
+  // No test, build, or verification job carries a write scope.
+  for (const name of [
+    "provenance",
+    "go-tests",
+    "go-race",
+    "worker",
+    "postgres",
+    "nemo",
+    "cross-language",
+    "release-scripts",
+    "build",
+    "clean-room-verify",
+    "public-reverify",
+  ]) {
+    assert.doesNotMatch(job(name), /contents: write|id-token: write|attestations: write/, `${name} is read-only`);
+  }
+});
+
+test("read-only checkouts drop the persistent credential", () => {
+  // Every checkout that does not push a tag must not leave a credential in
+  // .git/config. The publish checkout keeps it for the tag push.
+  const checkouts = workflow.match(/- name: Check out\n        uses: actions\/checkout@[\s\S]*?(?=\n      -|\n\n      #|\n  [a-z])/g) ?? [];
+  assert.ok(checkouts.length >= 8, "checkouts are enumerated");
+  const publishCheckout = job("publish").match(/- name: Check out[\s\S]*?persist-credentials[^\n]*/);
+  for (const name of [
+    "provenance",
+    "go-tests",
+    "go-race",
+    "worker",
+    "postgres",
+    "nemo",
+    "cross-language",
+    "release-scripts",
+    "build",
+  ]) {
+    const body = job(name);
+    assert.match(body, /persist-credentials: false/, `${name} checkout drops credentials`);
+  }
+  assert.ok(!publishCheckout || !/persist-credentials: false/.test(publishCheckout[0]),
+    "the publish checkout keeps the credential for the tag push");
+});
+
+test("public reverification checks the SBOM and tree equivalence from public assets", () => {
+  const reverify = job("public-reverify");
+  assert.match(reverify, /--pattern "crabedence-\$\{RELEASE_VERSION\}\.bom\.json\.sha256"/);
+  assert.match(reverify, /outputs\.sbom_sha256/);
+  assert.match(reverify, /compare-source-trees\.sh/);
+  assert.match(reverify, /gh attestation verify clean-room\/qualification\/evidence-manifest\.json/);
 });
 
 test("neither release workflow writes an attestation inside the evidence closure", () => {

@@ -11,13 +11,14 @@ artifact to a specific Git commit, qualification record, and build environment.
 - `jq` for JSON inspection
 - `git` for source verification
 
-A release publishes exactly three artifacts plus their checksums and
+A release publishes exactly four artifacts plus their checksums and
 attestations:
 
 | Asset | Contents |
 |---|---|
 | `crabedence-<version>.tar.gz` | source archive |
 | `crabedence-<version>.zip` | source archive (same source, zip format) |
+| `crabedence-<version>.bom.json` | SBOM (CycloneDX) |
 | `crabedence-<version>-release-evidence.tar.gz` | the **complete** finalized evidence directory |
 
 The evidence bundle is the whole finalized tree, not a subset: its
@@ -28,9 +29,9 @@ published files alone — no CI artifact store is involved.
 ## Verification chain
 
 ```
-downloaded tar.gz + zip + release-evidence.tar.gz
+downloaded tar.gz + zip + bom.json + release-evidence.tar.gz
     ↓
-SHA-256 of all three (recomputed from the bytes)
+SHA-256 of all four (recomputed from the bytes)
     ↓
 GitHub artifact attestation (SLSA provenance)
     ↓
@@ -42,9 +43,11 @@ final evidence manifest (covers artifact.json and every evidence file)
     ↓
 registry policy identity (recomputed from the canonical envelope)
     ↓
-qualification.json
+qualification.json (including the exact-toolchain gate)
     ↓
 source manifest (both extracted archives)
+    ↓
+normalized tar ↔ ZIP tree equivalence
 ```
 
 ## Step 1: Verify the SHA-256 checksums
@@ -57,14 +60,16 @@ VERSION=0.52.0-rc.1
 
 sha256sum -c "crabedence-${VERSION}.tar.gz.sha256"
 sha256sum -c "crabedence-${VERSION}.zip.sha256"
+sha256sum -c "crabedence-${VERSION}.bom.json.sha256"
 sha256sum -c "crabedence-${VERSION}-release-evidence.tar.gz.sha256"
 ```
 
-All three must match the hashes in `artifact.json` (for the archives) and
-the release notes (for the evidence bundle). The zip is an official
-artifact with its own identity — `artifact.json` binds it separately as
-`artifact.zip_sha256`, and the standalone verifier recomputes it rather
-than assuming the tar digest applies to both.
+All four must match the hashes in `artifact.json` (for the archives and
+the SBOM) and the release notes (for the evidence bundle). The zip and
+the SBOM are official artifacts with their own identities —
+`artifact.json` binds them separately as `artifact.zip_sha256` and
+`sbom.sha256`, and the standalone verifier recomputes them rather than
+assuming the tar digest applies to anything else.
 
 ## Step 2: Extract and self-check the evidence bundle
 
@@ -90,7 +95,7 @@ object this artifact was qualified against:
   "release": "0.52.0-rc.1",
   "source": { "commit": "...", "tree": "...", "manifest_sha256": "..." },
   "artifact": { "filename": "...tar.gz", "sha256": "...", "size": 12345,
-                "zip_filename": "...zip", "zip_sha256": "..." },
+                "zip_filename": "...zip", "zip_sha256": "...", "zip_size": 12345 },
   "policy": { "registry_sha256": "..." },
   "qualification": { "sha256": "...", "schema_version": 2 },
   "sbom": { "sha256": "..." },
@@ -117,6 +122,10 @@ gh attestation verify "crabedence-${VERSION}.tar.gz" \
 
 # Verify the zip attestation
 gh attestation verify "crabedence-${VERSION}.zip" \
+  --repo dawsonblock/crabedence-V1
+
+# Verify the SBOM attestation
+gh attestation verify "crabedence-${VERSION}.bom.json" \
   --repo dawsonblock/crabedence-V1
 
 # Verify the evidence bundle attestation
@@ -156,7 +165,27 @@ jq -r '.gates[] | "\(.gate_id): \(.status)"' evidence/qualification.json
 ```
 
 All gates must show `PASS`. The `release_status` must be `PASS` and
-`artifact_promotable` must be `true`.
+`artifact_promotable` must be `true`. One of those gates is
+`exact-toolchain` (type `BUILD`): it proves the release was qualified on
+the exact toolchain `go.mod` declares — `toolchain go1.26.5` — with
+`GOTOOLCHAIN=local`, so no other Go toolchain could have been substituted
+mid-qualification.
+
+The toolchain binding is checked independently three ways:
+
+```bash
+# 1. What the release object declares
+jq -r '.toolchain.go' evidence/artifact.json
+
+# 2. What the qualification actually ran on
+jq -r '.toolchains.go' evidence/qualification.json
+
+# 3. What the released source tree declares
+grep '^toolchain' "tar-source/crabedence-${VERSION}/go.mod"
+```
+
+All three must agree on `go1.26.5`; the standalone verifier fails closed
+if they do not.
 
 ## Step 6: Verify the source manifest (both archives)
 
@@ -200,12 +229,21 @@ done
 
 Each must show `missing=0`, `mismatched=0`, `unexpected=0`, and
 `malformed=0`, with `status=PASS`. The two archives must also carry the
-same normalized inventory (path, type, mode, content digest) — the clean
-room enforces this directly, which catches format-specific packaging drift.
+same normalized inventory (path, type, mode, content digest). The
+comparator ships inside the release source, so this check works with
+public assets alone:
+
+```bash
+bash "tar-source/crabedence-${VERSION}/scripts/compare-source-trees.sh" \
+  "tar-source/crabedence-${VERSION}" \
+  "zip-source/crabedence-${VERSION}"
+```
+
+It must print `identical inventories` and exit 0.
 
 ## Step 7: Verify release invariants
 
-The qualification record includes 21 named release invariants:
+The qualification record includes 22 named release invariants:
 
 ```bash
 jq -r '.invariants[] | "\(.id): \(.description)"' evidence/qualification.json
@@ -237,6 +275,7 @@ release proves:
 | CRAB-V1-019 | terminal finalization is immutable and conflict-aware |
 | CRAB-V1-020 | post-dispatch uncertainty cannot become retryable without evidence |
 | CRAB-V1-021 | concurrent identical mutations cause at most one provider dispatch |
+| CRAB-V1-022 | the release toolchain is exactly the declared toolchain (declared = installed = runtime GOVERSION, GOTOOLCHAIN=local) |
 
 ## Step 8: Verify evidence bundle integrity
 
@@ -275,11 +314,12 @@ gh attestation verify evidence/evidence-manifest.json \
 ```
 
 The attested digest must equal `jq -r '.sha256' evidence/evidence-manifest.json`.
-The archives and the evidence bundle are attested the same way:
+The archives, the SBOM, and the evidence bundle are attested the same way:
 
 ```bash
 gh attestation verify "crabedence-${VERSION}.tar.gz" --repo dawsonblock/crabedence-V1
 gh attestation verify "crabedence-${VERSION}.zip" --repo dawsonblock/crabedence-V1
+gh attestation verify "crabedence-${VERSION}.bom.json" --repo dawsonblock/crabedence-V1
 gh attestation verify "crabedence-${VERSION}-release-evidence.tar.gz" --repo dawsonblock/crabedence-V1
 ```
 

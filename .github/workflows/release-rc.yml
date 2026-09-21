@@ -8,14 +8,20 @@ on:
         required: true
         type: string
 
+# Least privilege by default: every job reads only, and write scopes are
+# granted per job exactly where the operation needs them (attest →
+# id-token/attestations, publish → contents:write).
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
+  contents: read
 
 env:
   GOFLAGS: -mod=readonly -trimpath
   GOTOOLCHAIN: local
+  # The release must execute on exactly this toolchain — never a substituted
+  # or auto-resolved Go 1.26.x. Every Set up Go pins it, every job asserts
+  # `go env GOVERSION` reports it, and the exact-toolchain qualification
+  # gate proves declared = installed = runtime.
+  GO_EXACT_VERSION: '1.26.5'
 
 jobs:
   # ─── Provenance gate ──────────────────────────────────────────────────
@@ -29,6 +35,8 @@ jobs:
     steps:
       - name: Check out
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: Verify clean working tree
         shell: bash
@@ -61,12 +69,26 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ needs.provenance.outputs.commit }}
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
-          go-version-file: go.mod
+          go-version: ${{ env.GO_EXACT_VERSION }}
           cache: false
+
+      # go-version selects the installer; GOVERSION is what actually ran.
+      # A wrong toolchain stops the job here, before it can produce evidence.
+      - name: Assert the exact Go toolchain
+        shell: bash
+        run: |
+          actual="$(go env GOVERSION)"
+          if [ "$actual" != "go${GO_EXACT_VERSION}" ]; then
+            echo "Expected go${GO_EXACT_VERSION}, got $actual" >&2
+            exit 1
+          fi
+          go version
+          go env GOVERSION GOTOOLCHAIN
 
       - name: Go formatting check
         run: |
@@ -109,12 +131,26 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ needs.provenance.outputs.commit }}
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
-          go-version-file: go.mod
+          go-version: ${{ env.GO_EXACT_VERSION }}
           cache: false
+
+      # go-version selects the installer; GOVERSION is what actually ran.
+      # A wrong toolchain stops the job here, before it can produce evidence.
+      - name: Assert the exact Go toolchain
+        shell: bash
+        run: |
+          actual="$(go env GOVERSION)"
+          if [ "$actual" != "go${GO_EXACT_VERSION}" ]; then
+            echo "Expected go${GO_EXACT_VERSION}, got $actual" >&2
+            exit 1
+          fi
+          go version
+          go env GOVERSION GOTOOLCHAIN
 
       - name: Go race tests (${{ matrix.group.name }})
         run: |
@@ -135,6 +171,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ needs.provenance.outputs.commit }}
+          persist-credentials: false
 
       - name: Set up Node
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
@@ -194,6 +231,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ needs.provenance.outputs.commit }}
+          persist-credentials: false
 
       - name: Set up Node
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
@@ -219,6 +257,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ needs.provenance.outputs.commit }}
+          persist-credentials: false
 
       - name: Set up Node
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
@@ -247,12 +286,26 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ needs.provenance.outputs.commit }}
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
-          go-version-file: go.mod
+          go-version: ${{ env.GO_EXACT_VERSION }}
           cache: false
+
+      # go-version selects the installer; GOVERSION is what actually ran.
+      # A wrong toolchain stops the job here, before it can produce evidence.
+      - name: Assert the exact Go toolchain
+        shell: bash
+        run: |
+          actual="$(go env GOVERSION)"
+          if [ "$actual" != "go${GO_EXACT_VERSION}" ]; then
+            echo "Expected go${GO_EXACT_VERSION}, got $actual" >&2
+            exit 1
+          fi
+          go version
+          go env GOVERSION GOTOOLCHAIN
 
       - name: Cross-language conformance
         run: go test -count=1 -timeout=60s -run "TestRunEvidenceConformanceCorpus|TestReceiptContractConformance" ./internal/cli/
@@ -277,6 +330,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ needs.provenance.outputs.commit }}
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Set up Node
@@ -287,8 +341,21 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
-          go-version-file: go.mod
+          go-version: ${{ env.GO_EXACT_VERSION }}
           cache: false
+
+      # go-version selects the installer; GOVERSION is what actually ran.
+      # A wrong toolchain stops the job here, before it can produce evidence.
+      - name: Assert the exact Go toolchain
+        shell: bash
+        run: |
+          actual="$(go env GOVERSION)"
+          if [ "$actual" != "go${GO_EXACT_VERSION}" ]; then
+            echo "Expected go${GO_EXACT_VERSION}, got $actual" >&2
+            exit 1
+          fi
+          go version
+          go env GOVERSION GOTOOLCHAIN
 
       - name: Install script dependencies
         run: sudo apt-get update && sudo apt-get install -y ripgrep
@@ -316,6 +383,7 @@ jobs:
       release_version: ${{ env.RELEASE_VERSION }}
       tar_sha256: ${{ steps.artifact_hash.outputs.tar_sha256 }}
       zip_sha256: ${{ steps.artifact_hash.outputs.zip_sha256 }}
+      sbom_sha256: ${{ steps.artifact_hash.outputs.sbom_sha256 }}
       evidence_archive_sha256: ${{ steps.evidence_bundle.outputs.sha256 }}
     services:
       postgres:
@@ -342,12 +410,26 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ env.COMMIT }}
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
-          go-version-file: go.mod
+          go-version: ${{ env.GO_EXACT_VERSION }}
           cache: false
+
+      # go-version selects the installer; GOVERSION is what actually ran.
+      # A wrong toolchain stops the job here, before it can produce evidence.
+      - name: Assert the exact Go toolchain
+        shell: bash
+        run: |
+          actual="$(go env GOVERSION)"
+          if [ "$actual" != "go${GO_EXACT_VERSION}" ]; then
+            echo "Expected go${GO_EXACT_VERSION}, got $actual" >&2
+            exit 1
+          fi
+          go version
+          go env GOVERSION GOTOOLCHAIN
 
       - name: Set up Node
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
@@ -379,19 +461,10 @@ jobs:
           git archive --format=zip --prefix="crabedence-${RELEASE_VERSION}/" \
             -o "dist/crabedence-${RELEASE_VERSION}.zip" HEAD
 
-      - name: Calculate artifact SHA-256
-        id: artifact_hash
-        shell: bash
-        run: |
-          cd dist
-          sha256sum "crabedence-${RELEASE_VERSION}.tar.gz" > "crabedence-${RELEASE_VERSION}.tar.gz.sha256"
-          sha256sum "crabedence-${RELEASE_VERSION}.zip" > "crabedence-${RELEASE_VERSION}.zip.sha256"
-          echo "tar_sha256=$(cut -d ' ' -f1 < "crabedence-${RELEASE_VERSION}.tar.gz.sha256")" >> "$GITHUB_OUTPUT"
-          echo "zip_sha256=$(cut -d ' ' -f1 < "crabedence-${RELEASE_VERSION}.zip.sha256")" >> "$GITHUB_OUTPUT"
-
       # ─── Generate SBOM (fail-closed, pinned version) ──────────────────
       # The SBOM is generated BEFORE artifact.json so the release object
-      # can bind its digest.
+      # can bind its digest, and BEFORE the digest step so its identity is
+      # carried symmetrically with the two archives.
       - name: Generate SBOM
         shell: bash
         run: |
@@ -406,6 +479,22 @@ jobs:
             exit 1
           fi
           echo "SBOM generated: $(jq '.components | length' dist/crabedence-${RELEASE_VERSION}.bom.json) components"
+
+      # ─── Exact identities for every released object ──────────────────
+      # tar, zip, SBOM: each gets a .sha256 sidecar and a job output, so
+      # every downstream stage recomputes all of them against the same
+      # qualified digests — no special-case object.
+      - name: Calculate artifact SHA-256
+        id: artifact_hash
+        shell: bash
+        run: |
+          cd dist
+          sha256sum "crabedence-${RELEASE_VERSION}.tar.gz" > "crabedence-${RELEASE_VERSION}.tar.gz.sha256"
+          sha256sum "crabedence-${RELEASE_VERSION}.zip" > "crabedence-${RELEASE_VERSION}.zip.sha256"
+          sha256sum "crabedence-${RELEASE_VERSION}.bom.json" > "crabedence-${RELEASE_VERSION}.bom.json.sha256"
+          echo "tar_sha256=$(cut -d ' ' -f1 < "crabedence-${RELEASE_VERSION}.tar.gz.sha256")" >> "$GITHUB_OUTPUT"
+          echo "zip_sha256=$(cut -d ' ' -f1 < "crabedence-${RELEASE_VERSION}.zip.sha256")" >> "$GITHUB_OUTPUT"
+          echo "sbom_sha256=$(cut -d ' ' -f1 < "crabedence-${RELEASE_VERSION}.bom.json.sha256")" >> "$GITHUB_OUTPUT"
 
       # ─── Generate artifact.json (schema version 2) ────────────────────
       # The final release object: release identity, source identity (with
@@ -429,7 +518,7 @@ jobs:
           QUAL_SCHEMA="$(jq -r '.schema_version' dist/release-evidence/qualification.json)"
           MANIFEST_SHA="$(sha256sum dist/release-evidence/source-tree-sha256.txt | cut -d ' ' -f1)"
           PROV_SHA="$(sha256sum dist/release-evidence/provenance.json | cut -d ' ' -f1)"
-          SBOM_SHA="$(sha256sum "dist/crabedence-${RELEASE_VERSION}.bom.json" | cut -d ' ' -f1)"
+          SBOM_SHA="${{ steps.artifact_hash.outputs.sbom_sha256 }}"
           ARCHIVE_SIZE="$(wc -c < "dist/crabedence-${RELEASE_VERSION}.tar.gz" | tr -d ' ')"
           ZIP_SIZE="$(wc -c < "dist/crabedence-${RELEASE_VERSION}.zip" | tr -d ' ')"
           jq -n \
@@ -491,62 +580,11 @@ jobs:
           echo "sha256=$sha" >> "$GITHUB_OUTPUT"
           echo "Evidence bundle SHA-256: $sha"
 
-      # ─── Attest the FINAL evidence manifest ───────────────────────────
-      # The attestation subject is the final evidence manifest, whose
-      # digest covers SHA256SUMS, which in turn covers artifact.json and
-      # every evidence file: the whole chain terminates in one signed
-      # statement.
-      - name: Extract qualification summary for attestation
-        id: qual_summary
-        run: |
-          echo "release_name=$(jq -r '.release_name // "crabedence-rc"' dist/release-evidence/release-manifest.json)" >> "$GITHUB_OUTPUT"
-          echo "gates=$(jq -r '.qualification.total_gates // 0' dist/release-evidence/release-manifest.json)" >> "$GITHUB_OUTPUT"
-          echo "status=$(jq -r '.status // "UNKNOWN"' dist/release-evidence/release-manifest.json)" >> "$GITHUB_OUTPUT"
-          echo "promotable=$(jq -r '.artifact_promotable // false' dist/release-evidence/release-manifest.json)" >> "$GITHUB_OUTPUT"
-          echo "evidence_sha256=$(jq -r '.sha256' dist/release-evidence/evidence-manifest.json)" >> "$GITHUB_OUTPUT"
-          echo "artifact_sha256=$(jq -r '.artifact.sha256' dist/release-evidence/artifact.json)" >> "$GITHUB_OUTPUT"
-
-      - name: Create GitHub artifact attestation
-        id: attestation
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        with:
-          subject-path: dist/release-evidence/evidence-manifest.json
-          predicate-type: https://crabedence.dev/attestation/release-qualification/v1
-          predicate: |
-            {
-              "release_name": "${{ steps.qual_summary.outputs.release_name }}",
-              "qualification_gates": ${{ steps.qual_summary.outputs.gates }},
-              "qualification_status": "${{ steps.qual_summary.outputs.status }}",
-              "artifact_promotable": ${{ steps.qual_summary.outputs.promotable }},
-              "evidence_sha256": "${{ steps.qual_summary.outputs.evidence_sha256 }}",
-              "artifact_sha256": "${{ steps.qual_summary.outputs.artifact_sha256 }}"
-            }
-
-      # The attestation reference is written OUTSIDE dist/release-evidence/.
-      # An attestation is an external statement about the frozen evidence
-      # object; a reference inside the closure would make the evidence
-      # manifest cover an attestation of that same manifest — a recursive
-      # object — and the packaged public bundle is created before this step,
-      # so a reference written here could never appear in it anyway.
-      - name: Save attestation reference
-        run: |
-          mkdir -p dist/attestation
-          echo '${{ steps.attestation.outputs.attestation-id }}' > dist/attestation/attestation-id.txt
-          echo '${{ steps.attestation.outputs.attestation-url }}' > dist/attestation/attestation-url.txt
-          cat > dist/attestation/attestation.json <<EOF
-          {
-            "tool": "github-actions-attest",
-            "attestation_id": "${{ steps.attestation.outputs.attestation-id }}",
-            "attestation_url": "${{ steps.attestation.outputs.attestation-url }}",
-            "subject": "dist/release-evidence/evidence-manifest.json",
-            "predicate_type": "https://crabedence.dev/attestation/release-qualification/v1",
-            "evidence_sha256": "${{ steps.qual_summary.outputs.evidence_sha256 }}",
-            "workflow_run": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
-            "commit": "${{ env.COMMIT }}"
-          }
-          EOF
-
-      # ─── Verify release artifact (after finalization + attestation) ──
+      # ─── Verify release artifact (after finalization + packaging) ────
+      # Nothing in this job attests: an official attestation is only
+      # meaningful once the clean room has proven the exact bytes. The
+      # evidence-manifest attestation and the SLSA artifact attestations
+      # both live in the post-clean-room attest job.
       - name: Verify release artifact
         run: |
           bash scripts/verify-release-artifact.sh \
@@ -574,22 +612,20 @@ jobs:
             dist/crabedence-${{ env.RELEASE_VERSION }}.zip
             dist/crabedence-${{ env.RELEASE_VERSION }}.zip.sha256
             dist/crabedence-${{ env.RELEASE_VERSION }}.bom.json
+            dist/crabedence-${{ env.RELEASE_VERSION }}.bom.json.sha256
             dist/crabedence-${{ env.RELEASE_VERSION }}-release-evidence.tar.gz
             dist/crabedence-${{ env.RELEASE_VERSION }}-release-evidence.tar.gz.sha256
           retention-days: 30
 
       # Retained for debugging only. It is NOT a trust input: the clean room
       # verifies the packaged evidence bundle, and public reverification uses
-      # only published release assets. dist/attestation/ is the external
-      # attestation reference — kept for audit, never part of the evidence
-      # closure.
+      # only published release assets.
       - name: Upload release evidence (diagnostic only)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-evidence
           path: |
             dist/release-evidence/
-            dist/attestation/
           retention-days: 30
 
   # ─── Clean-room verification (pre-publication) ───────────────────────
@@ -632,6 +668,7 @@ jobs:
           }
           check "archive/crabedence-${RELEASE_VERSION}.tar.gz" "${{ needs.build.outputs.tar_sha256 }}"
           check "archive/crabedence-${RELEASE_VERSION}.zip" "${{ needs.build.outputs.zip_sha256 }}"
+          check "archive/crabedence-${RELEASE_VERSION}.bom.json" "${{ needs.build.outputs.sbom_sha256 }}"
           check "archive/crabedence-${RELEASE_VERSION}-release-evidence.tar.gz" "${{ needs.build.outputs.evidence_archive_sha256 }}"
 
       # Extract each archive into its OWN directory — never one over the
@@ -683,30 +720,13 @@ jobs:
       # Beyond each matching the manifest, the two archives must carry the
       # SAME normalized source inventory — this catches format-specific
       # packaging drift (mode loss, symlink flattening, dropped entries).
+      # The comparison ships with the release source so public assets are
+      # self-verifying.
       - name: Require tar/ZIP semantic source equivalence
         run: |
-          normalize() {
-            local root="$1"
-            find "$root" -mindepth 1 \( -type f -o -type l \) -print0 \
-              | while IFS= read -r -d '' path; do
-                  local rel="${path#"$root"/}"
-                  if [ -L "$path" ]; then
-                    printf 'symlink 120000 %s %s\n' \
-                      "$(printf '%s' "$(readlink "$path")" | shasum -a 256 | cut -d ' ' -f1)" "$rel"
-                  else
-                    local mode=100644
-                    [ -x "$path" ] && mode=100755
-                    printf 'file %s %s %s\n' "$mode" "$(shasum -a 256 "$path" | cut -d ' ' -f1)" "$rel"
-                  fi
-                done | LC_ALL=C sort
-          }
-          normalize "clean-room/tar-source/crabedence-${RELEASE_VERSION}" > /tmp/tar.norm
-          normalize "clean-room/zip-source/crabedence-${RELEASE_VERSION}" > /tmp/zip.norm
-          if ! diff -u /tmp/tar.norm /tmp/zip.norm; then
-            echo "ERROR: tar and zip source inventories differ" >&2
-            exit 1
-          fi
-          echo "tar and zip carry identical source inventories ($(wc -l < /tmp/tar.norm | tr -d ' ') entries)"
+          bash "clean-room/tar-source/crabedence-${RELEASE_VERSION}/scripts/compare-source-trees.sh" \
+            "clean-room/tar-source/crabedence-${RELEASE_VERSION}" \
+            "clean-room/zip-source/crabedence-${RELEASE_VERSION}"
 
       - name: Verify release artifact (standalone, no .git)
         run: |
@@ -731,7 +751,13 @@ jobs:
     name: Attest
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: [build, clean-room-verify]
+    needs: [provenance, build, clean-room-verify]
+    # The only job that signs: OIDC token issuance and attestation writes
+    # are scoped here and nowhere else.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     env:
       RELEASE_VERSION: ${{ needs.build.outputs.release_version }}
     steps:
@@ -757,7 +783,76 @@ jobs:
           }
           check "dist/crabedence-${RELEASE_VERSION}.tar.gz" "${{ needs.build.outputs.tar_sha256 }}"
           check "dist/crabedence-${RELEASE_VERSION}.zip" "${{ needs.build.outputs.zip_sha256 }}"
+          check "dist/crabedence-${RELEASE_VERSION}.bom.json" "${{ needs.build.outputs.sbom_sha256 }}"
           check "dist/crabedence-${RELEASE_VERSION}-release-evidence.tar.gz" "${{ needs.build.outputs.evidence_archive_sha256 }}"
+
+      # The evidence manifest attestation binds the FINAL manifest — the
+      # one packaged inside the evidence bundle, covering SHA256SUMS, which
+      # in turn covers artifact.json and every evidence file. Extracting it
+      # from the staged bundle proves the attested object is the published
+      # object, not a stale pre-finalization manifest.
+      - name: Extract the final evidence manifest for attestation
+        run: |
+          mkdir -p dist/attestation-subject
+          tar xzf "dist/crabedence-${RELEASE_VERSION}-release-evidence.tar.gz" \
+            -C dist/attestation-subject --strip-components=1
+          test -f dist/attestation-subject/evidence-manifest.json
+
+      - name: Extract qualification summary for attestation
+        id: qual_summary
+        run: |
+          echo "release_name=$(jq -r '.release_name // "crabedence-rc"' dist/attestation-subject/release-manifest.json)" >> "$GITHUB_OUTPUT"
+          echo "gates=$(jq -r '.qualification.total_gates // 0' dist/attestation-subject/release-manifest.json)" >> "$GITHUB_OUTPUT"
+          echo "status=$(jq -r '.status // "UNKNOWN"' dist/attestation-subject/release-manifest.json)" >> "$GITHUB_OUTPUT"
+          echo "promotable=$(jq -r '.artifact_promotable // false' dist/attestation-subject/release-manifest.json)" >> "$GITHUB_OUTPUT"
+          echo "evidence_sha256=$(jq -r '.sha256' dist/attestation-subject/evidence-manifest.json)" >> "$GITHUB_OUTPUT"
+          echo "artifact_sha256=$(jq -r '.artifact.sha256' dist/attestation-subject/artifact.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Attest the final evidence manifest
+        id: attestation
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/attestation-subject/evidence-manifest.json
+          predicate-type: https://crabedence.dev/attestation/release-qualification/v1
+          predicate: |
+            {
+              "release_name": "${{ steps.qual_summary.outputs.release_name }}",
+              "qualification_gates": ${{ steps.qual_summary.outputs.gates }},
+              "qualification_status": "${{ steps.qual_summary.outputs.status }}",
+              "artifact_promotable": ${{ steps.qual_summary.outputs.promotable }},
+              "evidence_sha256": "${{ steps.qual_summary.outputs.evidence_sha256 }}",
+              "artifact_sha256": "${{ steps.qual_summary.outputs.artifact_sha256 }}"
+            }
+
+      # The attestation reference is written OUTSIDE the evidence closure.
+      # An attestation is an external statement about the frozen evidence
+      # object; a reference inside the closure would make the evidence
+      # manifest cover an attestation of that same manifest — a recursive
+      # object.
+      - name: Save attestation reference
+        run: |
+          mkdir -p dist/attestation
+          echo '${{ steps.attestation.outputs.attestation-id }}' > dist/attestation/attestation-id.txt
+          echo '${{ steps.attestation.outputs.attestation-url }}' > dist/attestation/attestation-url.txt
+          cat > dist/attestation/attestation.json <<EOF
+          {
+            "tool": "github-actions-attest",
+            "attestation_id": "${{ steps.attestation.outputs.attestation-id }}",
+            "attestation_url": "${{ steps.attestation.outputs.attestation-url }}",
+            "subject": "release-evidence/evidence-manifest.json",
+            "predicate_type": "https://crabedence.dev/attestation/release-qualification/v1",
+            "evidence_sha256": "${{ steps.qual_summary.outputs.evidence_sha256 }}",
+            "workflow_run": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+            "commit": "${{ needs.provenance.outputs.commit }}"
+          }
+          EOF
+
+      - name: Upload attestation reference (diagnostic only)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-attestation
+          path: dist/attestation/
+          retention-days: 30
 
       # ─── GitHub artifact attestation (SLSA provenance) ────────────────
       - name: Attest source archive
@@ -786,6 +881,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     needs: [provenance, build, clean-room-verify, attest]
+    # The only job that writes: tag push + release upload. Everything
+    # upstream — tests, build, clean-room — ran with contents:read.
+    permissions:
+      contents: write
     env:
       RELEASE_VERSION: ${{ needs.build.outputs.release_version }}
       COMMIT: ${{ needs.provenance.outputs.commit }}
@@ -822,6 +921,7 @@ jobs:
           }
           check "dist/crabedence-${RELEASE_VERSION}.tar.gz" "${{ needs.build.outputs.tar_sha256 }}"
           check "dist/crabedence-${RELEASE_VERSION}.zip" "${{ needs.build.outputs.zip_sha256 }}"
+          check "dist/crabedence-${RELEASE_VERSION}.bom.json" "${{ needs.build.outputs.sbom_sha256 }}"
           check "dist/crabedence-${RELEASE_VERSION}-release-evidence.tar.gz" "${{ needs.build.outputs.evidence_archive_sha256 }}"
 
       # ─── Tag the release candidate ────────────────────────────────────
@@ -878,6 +978,7 @@ jobs:
             dist/crabedence-${{ env.RELEASE_VERSION }}.zip
             dist/crabedence-${{ env.RELEASE_VERSION }}.zip.sha256
             dist/crabedence-${{ env.RELEASE_VERSION }}.bom.json
+            dist/crabedence-${{ env.RELEASE_VERSION }}.bom.json.sha256
             dist/crabedence-${{ env.RELEASE_VERSION }}-release-evidence.tar.gz
             dist/crabedence-${{ env.RELEASE_VERSION }}-release-evidence.tar.gz.sha256
 
@@ -911,6 +1012,7 @@ jobs:
             --pattern "crabedence-${RELEASE_VERSION}.zip" \
             --pattern "crabedence-${RELEASE_VERSION}.zip.sha256" \
             --pattern "crabedence-${RELEASE_VERSION}.bom.json" \
+            --pattern "crabedence-${RELEASE_VERSION}.bom.json.sha256" \
             --pattern "crabedence-${RELEASE_VERSION}-release-evidence.tar.gz" \
             --pattern "crabedence-${RELEASE_VERSION}-release-evidence.tar.gz.sha256" \
             --dir public
@@ -929,6 +1031,7 @@ jobs:
           }
           check "public/crabedence-${RELEASE_VERSION}.tar.gz" "${{ needs.build.outputs.tar_sha256 }}"
           check "public/crabedence-${RELEASE_VERSION}.zip" "${{ needs.build.outputs.zip_sha256 }}"
+          check "public/crabedence-${RELEASE_VERSION}.bom.json" "${{ needs.build.outputs.sbom_sha256 }}"
           check "public/crabedence-${RELEASE_VERSION}-release-evidence.tar.gz" "${{ needs.build.outputs.evidence_archive_sha256 }}"
 
       # The evidence bundle is extracted to clean-room/qualification so the
@@ -972,6 +1075,12 @@ jobs:
               clean-room/qualification/source-tree-sha256.txt "$src"
           done
 
+      - name: Require public tar/ZIP semantic source equivalence
+        run: |
+          bash "clean-room/tar-source/crabedence-${RELEASE_VERSION}/scripts/compare-source-trees.sh" \
+            "clean-room/tar-source/crabedence-${RELEASE_VERSION}" \
+            "clean-room/zip-source/crabedence-${RELEASE_VERSION}"
+
       - name: Verify published artifact from public assets only
         run: |
           bash clean-room/tar-source/crabedence-${RELEASE_VERSION}/scripts/verify-release-artifact.sh \
@@ -990,7 +1099,11 @@ jobs:
             --repo ${{ github.repository }}
           gh attestation verify "public/crabedence-${RELEASE_VERSION}.zip" \
             --repo ${{ github.repository }}
+          gh attestation verify "public/crabedence-${RELEASE_VERSION}.bom.json" \
+            --repo ${{ github.repository }}
           gh attestation verify "public/crabedence-${RELEASE_VERSION}-release-evidence.tar.gz" \
+            --repo ${{ github.repository }}
+          gh attestation verify clean-room/qualification/evidence-manifest.json \
             --repo ${{ github.repository }}
 
       # The receipt is an informational index, not a trust primitive, so it

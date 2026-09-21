@@ -21,6 +21,10 @@ permissions:
 env:
   GOFLAGS: -mod=readonly -trimpath
   GOTOOLCHAIN: local
+  # Qualification must execute on exactly this toolchain — never a
+  # substituted or auto-resolved Go 1.26.x. Every Set up Go pins it and
+  # every job asserts `go env GOVERSION` reports it.
+  GO_EXACT_VERSION: '1.26.5'
 
 jobs:
   # ─── Provenance gate ──────────────────────────────────────────────────
@@ -37,6 +41,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
 
       - name: Verify clean working tree
         shell: bash
@@ -70,12 +75,26 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ needs.provenance.outputs.commit }}
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
-          go-version-file: go.mod
+          go-version: ${{ env.GO_EXACT_VERSION }}
           cache: false
+
+      # go-version selects the installer; GOVERSION is what actually ran.
+      # A wrong toolchain stops the job before it can produce evidence.
+      - name: Assert the exact Go toolchain
+        shell: bash
+        run: |
+          actual="$(go env GOVERSION)"
+          if [ "$actual" != "go${GO_EXACT_VERSION}" ]; then
+            echo "Expected go${GO_EXACT_VERSION}, got $actual" >&2
+            exit 1
+          fi
+          go version
+          go env GOVERSION GOTOOLCHAIN
 
       - name: Go formatting check
         run: |
@@ -118,12 +137,26 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ needs.provenance.outputs.commit }}
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
-          go-version-file: go.mod
+          go-version: ${{ env.GO_EXACT_VERSION }}
           cache: false
+
+      # go-version selects the installer; GOVERSION is what actually ran.
+      # A wrong toolchain stops the job before it can produce evidence.
+      - name: Assert the exact Go toolchain
+        shell: bash
+        run: |
+          actual="$(go env GOVERSION)"
+          if [ "$actual" != "go${GO_EXACT_VERSION}" ]; then
+            echo "Expected go${GO_EXACT_VERSION}, got $actual" >&2
+            exit 1
+          fi
+          go version
+          go env GOVERSION GOTOOLCHAIN
 
       - name: Go race tests (${{ matrix.group.name }})
         run: |
@@ -144,6 +177,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ needs.provenance.outputs.commit }}
+          persist-credentials: false
 
       - name: Set up Node
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
@@ -203,6 +237,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ needs.provenance.outputs.commit }}
+          persist-credentials: false
 
       - name: Set up Node
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
@@ -228,6 +263,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ needs.provenance.outputs.commit }}
+          persist-credentials: false
 
       - name: Set up Node
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
@@ -256,12 +292,26 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ needs.provenance.outputs.commit }}
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
-          go-version-file: go.mod
+          go-version: ${{ env.GO_EXACT_VERSION }}
           cache: false
+
+      # go-version selects the installer; GOVERSION is what actually ran.
+      # A wrong toolchain stops the job before it can produce evidence.
+      - name: Assert the exact Go toolchain
+        shell: bash
+        run: |
+          actual="$(go env GOVERSION)"
+          if [ "$actual" != "go${GO_EXACT_VERSION}" ]; then
+            echo "Expected go${GO_EXACT_VERSION}, got $actual" >&2
+            exit 1
+          fi
+          go version
+          go env GOVERSION GOTOOLCHAIN
 
       - name: Cross-language conformance
         run: go test -count=1 -timeout=60s -run "TestRunEvidenceConformanceCorpus|TestReceiptContractConformance" ./internal/cli/
@@ -299,12 +349,26 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ needs.provenance.outputs.commit }}
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
-          go-version-file: go.mod
+          go-version: ${{ env.GO_EXACT_VERSION }}
           cache: false
+
+      # go-version selects the installer; GOVERSION is what actually ran.
+      # A wrong toolchain stops the job before it can produce evidence.
+      - name: Assert the exact Go toolchain
+        shell: bash
+        run: |
+          actual="$(go env GOVERSION)"
+          if [ "$actual" != "go${GO_EXACT_VERSION}" ]; then
+            echo "Expected go${GO_EXACT_VERSION}, got $actual" >&2
+            exit 1
+          fi
+          go version
+          go env GOVERSION GOTOOLCHAIN
 
       - name: Set up Node
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
@@ -327,6 +391,11 @@ jobs:
 
       - name: Check release admission
         run: bash scripts/check-release-admission.sh
+
+      # The evidence is verified BEFORE it is attested: a signature over
+      # an object that fails its own verifier is worse than none.
+      - name: Verify release artifact
+        run: bash scripts/verify-release-artifact.sh --mode qualification
 
       - name: Extract qualification summary for attestation
         id: qual_summary
@@ -376,9 +445,6 @@ jobs:
             "commit": "${{ github.sha }}"
           }
           EOF
-
-      - name: Verify release artifact
-        run: bash scripts/verify-release-artifact.sh --mode qualification
 
       - name: Upload release evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
