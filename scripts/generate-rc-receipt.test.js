@@ -54,7 +54,8 @@ function fixture(t) {
   );
   fs.writeFileSync(
     path.join(dist, "crabedence-9.9.9-rc.1-release-evidence.tar.gz.sha256"),
-    `${"4".repeat(64)}\n`,
+    // Published sidecars use the GNU "<digest>  <filename>" format.
+    `${"4".repeat(64)}  crabedence-9.9.9-rc.1-release-evidence.tar.gz\n`,
   );
   return { evidence, dist };
 }

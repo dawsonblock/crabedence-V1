@@ -64,7 +64,8 @@ digest_of_file() {
   [ -f "$1" ] && shasum -a 256 "$1" | cut -d ' ' -f1 || echo ""
 }
 sha_file_value() {
-  [ -f "$1" ] && tr -d '[:space:]' < "$1" || echo ""
+  # Sidecars are "<hex>[  <filename>]": take the digest field only.
+  [ -f "$1" ] && awk '{print $1; exit}' "$1" || echo ""
 }
 
 RELEASE="$(jq -r '.release // empty' "$ARTIFACT_JSON")"
