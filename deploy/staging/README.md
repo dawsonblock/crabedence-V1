@@ -14,6 +14,7 @@ package is operational tooling on `main`.
 | `bootstrap-db.sh` | Idempotent PostgreSQL role/database bootstrap (schema is applied by the service at first boot) |
 | `readiness.sh` | Readiness probe: unit active + socket answers `system.echo` + live registry digest equals `d1de25e9…` |
 | `proofs/` | The operational proofs, in execution order |
+| `rehearse.sh` | Mac-side driver: fresh Lima/vz Ubuntu 24.04 VM → verified artifacts → in-guest build → deploy → proofs. Repeatability is the point — `limactl delete` then re-run must reproduce the same verified state |
 | `cmd/issue-grant` (repo root) | Grant issuance helper — goes through `authority.Store`, never hand-built SQL |
 
 ## Bring-up order

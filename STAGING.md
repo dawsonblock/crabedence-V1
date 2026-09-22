@@ -28,7 +28,7 @@ Single Linux VM plus a separate PostgreSQL instance. No Kubernetes.
 
 ```
 Ubuntu 24.04 LTS VM
-├── crabbox serve-execution  (systemd, Unix socket)
+├── crabbox serve-exec  (systemd, Unix socket)
 ├── NEMO planner (client-side, invokes over the socket)
 ├── external CRITICAL qualification provider (own process, own ledger)
 ├── journald log capture
@@ -80,7 +80,7 @@ Environment=CRABBOX_MODE=production
 Environment=CRABEDENCE_STORE_BACKEND=postgres
 Environment=CRABBOX_REPLICAS=1
 EnvironmentFile=/etc/crabedence/staging.env
-ExecStart=/usr/local/bin/crabbox serve-execution --socket /run/crabedence/execution.sock
+ExecStart=/usr/local/bin/crabbox serve-exec --socket /run/crabedence/execution.sock
 Restart=on-failure
 RestartSec=2
 NoNewPrivileges=yes
