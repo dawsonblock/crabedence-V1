@@ -15,7 +15,9 @@ repo="${STAGING_TEST_ISSUE%#*}"; number="${STAGING_TEST_ISSUE##*#}"
 export STAGING_GRANT_ID
 STAGING_GRANT_ID=$(issue_staging_grant github.issue.get)
 
-resp=$(invoke github.issue.get "{\"repo\":\"$repo\",\"number\":$number}" "$(key read)" DIRECT)
+# No --execution-class: the registry pins github.issue.get as READ and
+# denies a mismatched caller assertion.
+resp=$(invoke github.issue.get "{\"repo\":\"$repo\",\"number\":$number}" "$(key read)")
 status=$(jq -r .status <<<"$resp")
 [ "$status" = "SUCCEEDED" ] || fail "github.issue.get returned $status: $resp"
 
