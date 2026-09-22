@@ -48,7 +48,7 @@ sudo systemctl daemon-reload && sudo systemctl enable --now crabedence
 | `proofs/06-pg-interruption.sh` | PostgreSQL interruption | root + iptables |
 | `proofs/07-authority-revocation.sh` | revocation before dispatch | none |
 | `proofs/08-reconcile-recovery.sh` | injected UNKNOWN → reconcile | systemctl |
-| `proofs/09-external-provider.sh` | provider death/lookup/CRITICAL | qual provider or `CRABEDENCE_SOURCE_DIR` |
+| `proofs/09-external-provider.sh` | provider death/lookup/CRITICAL | live harness — auto-detects `~/rc1/crabedence-*` (or `CRABEDENCE_SOURCE_DIR`) |
 
 Proofs exit `0` pass, `1` fail, `77` skip (missing prerequisite).
 Every durable proof enforces the three-view invariant:
@@ -61,6 +61,13 @@ Every durable proof enforces the three-view invariant:
   registry digest. Observability endpoints are the first RC2 runtime
   change.
 - The external CRITICAL qualification provider is test-harness-only —
-  proofs 3/5/9 stay skipped until a provider is deployed or the live
-  harness runs against the staging DSN.
+  proof 09 runs the live harness (`TestLiveCritical*`) against the
+  staging DSN when a source tree is present; a fully deployed provider
+  is still an RC2 deliverable.
+- Injected-UNKNOWN counter rows correctly stay UNKNOWN: the
+  test-counter provider's state is in-memory, so after a restart there
+  is no provider observation to reconcile from — the row cannot prove
+  itself and must not be promoted. Real reconciliation to COMMITTED is
+  exercised by proof 09's harness path (external provider with a
+  durable ledger).
 - `journald` is the only log sink; ship with your existing log agent.

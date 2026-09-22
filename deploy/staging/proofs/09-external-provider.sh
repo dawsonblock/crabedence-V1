@@ -27,13 +27,23 @@ if [ -n "${CRABEDENCE_QUAL_PROVIDER_URL:-}" ]; then
   fail "qual provider URL is set but no deployed-provider proof flow is implemented yet — see STAGING.md"
 fi
 
+# Auto-detect a verified source tree when CRABEDENCE_SOURCE_DIR is unset
+# (rehearse.sh leaves the RC1 extraction at ~/rc1/crabedence-<version>).
+if [ -z "${CRABEDENCE_SOURCE_DIR:-}" ]; then
+  for d in "$HOME"/rc1/crabedence-* /home/*/rc1/crabedence-* /opt/crabedence-src; do
+    [ -d "$d/internal/execution" ] && CRABEDENCE_SOURCE_DIR="$d" && break
+  done
+fi
+
 if [ -n "${CRABEDENCE_SOURCE_DIR:-}" ] && [ -d "$CRABEDENCE_SOURCE_DIR/internal/execution" ]; then
   echo "running live CRITICAL qualification harness against staging DSN"
   (cd "$CRABEDENCE_SOURCE_DIR" && \
+    export PATH="/usr/local/go/bin:$PATH" && \
     CRABBOX_TEST_DATABASE_URL="$CRABEDENCE_DATABASE_URL" \
     GOTOOLCHAIN=local go test ./internal/execution -run 'TestLiveCritical' -v -count=1) \
     || fail "live CRITICAL harness failed against staging database"
   pass "proofs 3+5+9 (harness): external-provider fault matrix green on staging DSN"
+  exit 0
 fi
 
 skip "no external qualification provider deployed (proofs 3, 5, 9 blocked — STAGING.md known gap)"

@@ -58,7 +58,8 @@ step "install guest packages + go1.26.5"
 guest 'set -e
   sudo apt-get update -qq
   sudo apt-get install -y -qq postgresql-16 postgresql-client jq curl git build-essential >/dev/null
-  curl -fsSL https://go.dev/dl/go1.26.5.linux-arm64.tar.gz -o /tmp/go.tgz
+  case "$(uname -m)" in aarch64|arm64) GOARCH=arm64 ;; x86_64) GOARCH=amd64 ;; *) echo "unsupported arch" >&2; exit 1 ;; esac
+  curl -fsSL "https://go.dev/dl/go1.26.5.linux-${GOARCH}.tar.gz" -o /tmp/go.tgz
   sudo tar -C /usr/local -xzf /tmp/go.tgz
   /usr/local/go/bin/go version'
 
@@ -78,9 +79,10 @@ guest "set -e
   cp -r '$REPO_DIR/deploy/staging' ~/deploy-staging
   chmod -R u+rwX ~/deploy-staging
   cd \"\$SRC\"
-  export PATH=/usr/local/go/bin:\$PATH GOTOOLCHAIN=local
+  export PATH=/usr/local/go/bin:\$PATH GOTOOLCHAIN=local CGO_ENABLED=0
   go env GOVERSION | grep -qx go1.26.5
-  go build -trimpath -o /tmp/bin-crabbox ./cmd/crabbox
+  go build -trimpath -ldflags \"-s -w -X github.com/openclaw/crabbox/internal/cli.version=${VERSION#v}\" \
+    -o /tmp/bin-crabbox ./cmd/crabbox
   go build -trimpath -o /tmp/bin-issue-grant ./cmd/issue-grant
   sudo install -m 0755 /tmp/bin-crabbox /usr/local/bin/crabbox
   sudo install -m 0755 /tmp/bin-issue-grant /usr/local/bin/issue-grant"
