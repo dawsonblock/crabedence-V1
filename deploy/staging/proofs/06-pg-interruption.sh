@@ -16,7 +16,9 @@ need_cmd iptables
 pg_host=$(sed -n 's|.*@\([^:/]*\).*|\1|p' <<<"$CRABEDENCE_DATABASE_URL")
 pg_port=$(sed -n 's|.*:\([0-9]*\)/.*|\1|p' <<<"$CRABEDENCE_DATABASE_URL"); pg_port=${pg_port:-5432}
 [ -n "$pg_host" ] || fail "could not parse PG host from DSN"
-pg_ip=$(getent hosts "$pg_host" | awk '{print $1; exit}')
+# IPv4 only — the service's PG connection and our iptables rule are
+# IPv4-scoped; getent may return ::1 first for localhost.
+pg_ip=$(getent ahostsv4 "$pg_host" | awk '{print $1; exit}')
 [ -n "$pg_ip" ] || fail "could not resolve $pg_host"
 
 export STAGING_GRANT_ID

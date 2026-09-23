@@ -110,7 +110,10 @@ jobs:
             echo "CRABEDENCE_DATABASE_URL=postgres://crabedence_staging:${PW}@localhost:5432/crabedence_staging"
             echo "CRABBOX_EVIDENCE_KEY=/etc/crabedence/evidence-signing.pem"
             echo "STAGING_TEST_ISSUE=${{ vars.STAGING_TEST_ISSUE || 'dawsonblock/crabedence-V1#3' }}"
+            echo "CRABEDENCE_SOURCE_DIR=$(echo /tmp/rc1-src/crabedence-*)"
           } | sudo tee /etc/crabedence/staging.env >/dev/null
+          # go must be resolvable under sudo's secure_path for proof 09
+          sudo ln -sf "$(command -v go)" /usr/local/bin/go
           if [ -n '${{ secrets.STAGING_GITHUB_TOKEN }}' ]; then
             printf 'CRABBOX_GITHUB_ENABLED=true\nCRABBOX_GITHUB_TOKEN=%s\n' '${{ secrets.STAGING_GITHUB_TOKEN }}' \
               | sudo tee -a /etc/crabedence/staging.env >/dev/null

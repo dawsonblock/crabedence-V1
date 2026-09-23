@@ -24,7 +24,7 @@ cleanup
 docker build -q -t "$IMG" - <<'EOF' >/dev/null
 FROM ubuntu:24.04
 RUN apt-get update -qq && apt-get install -y -qq systemd openssl >/dev/null
-CMD ["/sbin/init"]
+CMD ["/usr/lib/systemd/systemd"]
 EOF
 
 # The container reaches the external PG via the host gateway; rewrite
