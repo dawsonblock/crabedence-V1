@@ -57,6 +57,27 @@ Every durable proof enforces the three-view invariant:
 `execution_requests` ↔ `effect_provider_observations` ↔
 `evidence_receipt`/`evidence_digest`.
 
+## Qualification record
+
+- **Stage A** (Mac-local, Lima/vz Ubuntu 24.04 **arm64**, co-located
+  PG 16): full suite green; VM destroyed and recreated via
+  `rehearse.sh` — repeatability proven.
+- **Stage B** (authoritative, **native amd64**): `.github/workflows/
+  stage-b.yml` — each dispatch is a fresh `ubuntu-latest` amd64 VM +
+  PG 16 service container. Three consecutive clean runs
+  (35814105436, 35814681996, 35820987705): all proofs PASS including
+  real DIRECT READ, 13/13 live CRITICAL tests, host-reboot cold-start.
+  Run 35820987705 added a 1800s soak: 836 COMMITTED, 0 duplicate
+  dispatches, 0 stuck rows, restart→ready 1s, PG reconnect→ready <1s.
+- **Supplementary**: `crabedence-stgb` QEMU/TCG amd64 Lima guest —
+  proves `rehearse.sh` bootstraps real amd64 on this Mac; too slow for
+  timing evidence (emulation distortion), not authoritative.
+
+Timing baseline (native amd64): verify+build 151s cold / 4s cached,
+bootstrap→ready ~1s, restart→ready 1s, DB outage→recovery 33s,
+UNKNOWN→reconciled 2.07s, CRITICAL worst case 31s (lookup outage),
+reboot→ready ~20s, duplicate storm 3s, full suite ~160s.
+
 ## Known RC1 gaps (do not paper over)
 
 - No `/healthz` or `/metrics` — readiness is the socket probe +
