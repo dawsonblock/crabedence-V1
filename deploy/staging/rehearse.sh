@@ -168,7 +168,8 @@ if [ "$RUN_PROOFS" = "1" ]; then
     rc=0
     for p in 00-readiness.sh 01-local.sh 02-direct-read.sh 03-durable-mutation.sh \
              04-restart.sh 05-duplicate-storm.sh 06-pg-interruption.sh \
-             07-authority-revocation.sh 08-reconcile-recovery.sh 09-external-provider.sh; do
+             07-authority-revocation.sh 08-reconcile-recovery.sh 09-external-provider.sh \
+             10-host-reboot.sh; do
       echo "--- $p"; sudo ./$p || { s=$?; [ $s -eq 77 ] || rc=$s; }
     done
     exit $rc'

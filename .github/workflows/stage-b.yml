@@ -1,0 +1,167 @@
+name: Stage B (native amd64)
+
+# Authoritative Stage-B staging qualification: a fresh GitHub-hosted
+# ubuntu-latest runner IS a native amd64 Ubuntu 24.04 VM with systemd,
+# sudo and docker — every dispatch is a clean destroy/recreate. The
+# PostgreSQL service container provides a separate database host over a
+# real TCP boundary. Host-reboot semantics are proven by the nested
+# systemd container proof (10-host-reboot.sh).
+#
+# Deploys the immutable RC1 artifacts — never main — overlaid only with
+# the main-only deploy/staging package and cmd/issue-grant helper
+# (internal/ is byte-identical to the tag).
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version to stage (immutable tag)"
+        required: true
+        type: string
+        default: v0.52.0-rc.1
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: local
+  GO_EXACT_VERSION: '1.26.5'
+
+jobs:
+  stage-b:
+    name: Native amd64 staging qualification
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_EXACT_VERSION }}
+
+      - name: Assert exact toolchain
+        run: |
+          set -euo pipefail
+          got=$(go env GOVERSION)
+          echo "GOVERSION=$got"
+          [ "$got" = "go${GO_EXACT_VERSION}" ]
+
+      - name: Timing baseline — start
+        run: |
+          mkdir -p /tmp/stageb-timing
+          date +%s > /tmp/stageb-timing/t0
+          date +%s > /tmp/stageb-timing/bootstrap_start
+
+      - name: Download + verify RC1 public artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release download "${{ inputs.version }}" \
+            --pattern 'crabedence-*.tar.gz*' --dir /tmp/rc1
+          cd /tmp/rc1
+          sha256sum -c "crabedence-${{ inputs.version }}.tar.gz.sha256"
+
+      - name: Build crabbox + issue-grant (in-target, version-stamped)
+        run: |
+          set -euo pipefail
+          SRC=/tmp/rc1-src
+          mkdir -p "$SRC" && tar -xzf "/tmp/rc1/crabedence-${{ inputs.version }}.tar.gz" -C "$SRC"
+          SRC="$SRC/crabedence-${{ inputs.version }}"
+          cp -r "$GITHUB_WORKSPACE/cmd/issue-grant" "$SRC/cmd/"
+          cp -r "$GITHUB_WORKSPACE/deploy/staging" /tmp/deploy-staging
+          cd "$SRC"
+          export CGO_ENABLED=0
+          V="${{ inputs.version }}"; V="${V#v}"
+          go build -trimpath \
+            -ldflags "-s -w -X github.com/openclaw/crabbox/internal/cli.version=$V" \
+            -o /tmp/bin-crabbox ./cmd/crabbox
+          go build -trimpath -o /tmp/bin-issue-grant ./cmd/issue-grant
+          sudo install -m 0755 /tmp/bin-crabbox /usr/local/bin/crabbox
+          sudo install -m 0755 /tmp/bin-issue-grant /usr/local/bin/issue-grant
+          crabbox --version
+          date +%s > /tmp/stageb-timing/build_done
+
+      - name: Provision service (user, db, key, env, systemd)
+        run: |
+          set -euo pipefail
+          sudo rm -rf /opt/staging && sudo cp -r /tmp/deploy-staging /opt/staging && sudo chmod -R a+rX /opt/staging
+          sudo useradd --system --no-create-home --shell /usr/sbin/nologin crabedence || true
+          sudo install -d -m 0750 -o root -g crabedence /etc/crabedence
+          PW="stg-$(openssl rand -hex 16)"
+          PGADMIN_URL='postgres://postgres:postgres@localhost:5432/postgres' \
+            STAGING_DB_PASSWORD="$PW" bash /opt/staging/bootstrap-db.sh
+          sudo openssl genpkey -algorithm ed25519 -out /etc/crabedence/evidence-signing.pem
+          sudo chown crabedence:crabedence /etc/crabedence/evidence-signing.pem
+          sudo chmod 0600 /etc/crabedence/evidence-signing.pem
+          {
+            echo "CRABEDENCE_DATABASE_URL=postgres://crabedence_staging:${PW}@localhost:5432/crabedence_staging"
+            echo "CRABBOX_EVIDENCE_KEY=/etc/crabedence/evidence-signing.pem"
+            echo "STAGING_TEST_ISSUE=${{ vars.STAGING_TEST_ISSUE || 'dawsonblock/crabedence-V1#3' }}"
+          } | sudo tee /etc/crabedence/staging.env >/dev/null
+          if [ -n '${{ secrets.STAGING_GITHUB_TOKEN }}' ]; then
+            printf 'CRABBOX_GITHUB_ENABLED=true\nCRABBOX_GITHUB_TOKEN=%s\n' '${{ secrets.STAGING_GITHUB_TOKEN }}' \
+              | sudo tee -a /etc/crabedence/staging.env >/dev/null
+          fi
+          sudo chown root:crabedence /etc/crabedence/staging.env && sudo chmod 0640 /etc/crabedence/staging.env
+          sudo install -m 0644 /opt/staging/crabedence.service /etc/systemd/system/crabedence.service
+          sudo systemctl daemon-reload && sudo systemctl enable --now crabedence
+          date +%s > /tmp/stageb-timing/bootstrap_done
+
+      - name: Operational proofs
+        run: |
+          set -uo pipefail
+          cd /opt/staging/proofs
+          rc=0
+          for p in 00-readiness.sh 01-local.sh 02-direct-read.sh 03-durable-mutation.sh \
+                   04-restart.sh 05-duplicate-storm.sh 06-pg-interruption.sh \
+                   07-authority-revocation.sh 08-reconcile-recovery.sh \
+                   09-external-provider.sh 10-host-reboot.sh; do
+            echo "=== $p ==="
+            t_start=$SECONDS
+            if sudo ./$p; then echo "TIME $p $((SECONDS - t_start))s" >> /tmp/stageb-timing/proofs
+            else s=$?; echo "TIME $p $((SECONDS - t_start))s (exit $s)" >> /tmp/stageb-timing/proofs
+              [ $s -eq 77 ] || rc=$s
+            fi
+          done
+          date +%s > /tmp/stageb-timing/proofs_done
+          exit $rc
+
+      - name: Timing baseline — report
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo "## Stage B timing (native amd64)"
+            echo
+            t0=$(cat /tmp/stageb-timing/t0); t1=$(cat /tmp/stageb-timing/build_done 2>/dev/null || echo '?')
+            t2=$(cat /tmp/stageb-timing/bootstrap_done 2>/dev/null || echo '?'); t3=$(cat /tmp/stageb-timing/proofs_done 2>/dev/null || echo '?')
+            echo "| phase | seconds |"
+            echo "|---|---|"
+            [ "$t1" != '?' ] && echo "| artifact verify → build done | $((t1 - t0)) |"
+            [ "$t2" != '?' ] && [ "$t1" != '?' ] && echo "| bootstrap → service up | $((t2 - t1)) |"
+            [ "$t3" != '?' ] && [ "$t2" != '?' ] && echo "| proof suite | $((t3 - t2)) |"
+            [ "$t3" != '?' ] && echo "| total | $((t3 - t0)) |"
+            echo
+            echo '```'; cat /tmp/stageb-timing/proofs 2>/dev/null; echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload proof log
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: stage-b-${{ inputs.version }}
+          path: /tmp/stageb-timing/
+          if-no-files-found: ignore
