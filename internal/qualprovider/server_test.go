@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 )
@@ -146,6 +147,51 @@ func TestFaultInjection(t *testing.T) {
 	sresp.Body.Close()
 	if stats.Executions != 0 {
 		t.Fatalf("rejected op must count 0 executions, got %d", stats.Executions)
+	}
+}
+
+func TestEffectsLogSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	s1, err := New(dir, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv1 := httptest.NewServer(s1.Handler())
+	resp, err := http.Post(srv1.URL+"/effects", "application/json", strings.NewReader(`{"token":"fx-1"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var first map[string]any
+	json.NewDecoder(resp.Body).Decode(&first)
+	resp.Body.Close()
+	srv1.Close()
+
+	// A new Server over the same directory must keep the effect
+	// idempotent: a replayed token replays the logged result instead
+	// of appending a second effect.
+	s2, err := New(dir, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv2 := httptest.NewServer(s2.Handler())
+	defer srv2.Close()
+	resp2, err := http.Post(srv2.URL+"/effects", "application/json", strings.NewReader(`{"token":"fx-1"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var replay map[string]any
+	json.NewDecoder(resp2.Body).Decode(&replay)
+	resp2.Body.Close()
+	if replay["run_id"] != first["run_id"] {
+		t.Fatalf("replayed effect minted a new run after restart: %v vs %v", replay, first)
+	}
+
+	data, err := os.ReadFile(s2.LogPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(strings.TrimSpace(string(data)), "\n") + 1; n != 1 {
+		t.Fatalf("effects log holds %d entries after replay, want 1", n)
 	}
 }
 

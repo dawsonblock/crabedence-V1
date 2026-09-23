@@ -222,14 +222,25 @@ func (a *QualificationAdapter) Execute(ctx context.Context, req Request, desc ca
 		// artifact: a response whose bytes differ from the ledger's copy
 		// is transport corruption, and committing it would attest bytes
 		// the provider cannot prove. Ambiguous → UNKNOWN.
-		if durable, err := a.fetchArtifact(ctx, out.ArtifactID); err == nil {
-			if !bytes.Equal(durable, out.Artifact) {
-				return Response{
-					Status:      StatusUnknown,
-					FailureCode: string(capability.FailureExecutionUnknown),
-					Error:       "qualification provider artifact does not match its durable artifact",
-					Execution:   &ExecutionMeta{Provider: QualificationAdapterID, RunID: out.OperationID},
-				}
+		durable, err := a.fetchArtifact(ctx, out.ArtifactID)
+		if err != nil {
+			// The artifact bytes cannot be verified against the
+			// provider's durable copy: committing them would attest
+			// bytes the provider cannot prove. Ambiguous → UNKNOWN;
+			// reconciliation resolves from the provider ledger.
+			return Response{
+				Status:      StatusUnknown,
+				FailureCode: string(capability.FailureExecutionUnknown),
+				Error:       "qualification provider artifact could not be verified against its durable artifact: " + err.Error(),
+				Execution:   &ExecutionMeta{Provider: QualificationAdapterID, RunID: out.OperationID},
+			}
+		}
+		if !bytes.Equal(durable, out.Artifact) {
+			return Response{
+				Status:      StatusUnknown,
+				FailureCode: string(capability.FailureExecutionUnknown),
+				Error:       "qualification provider artifact does not match its durable artifact",
+				Execution:   &ExecutionMeta{Provider: QualificationAdapterID, RunID: out.OperationID},
 			}
 		}
 		result, _ := json.Marshal(map[string]any{"operation_id": out.OperationID})

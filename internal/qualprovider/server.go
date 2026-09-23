@@ -126,6 +126,20 @@ func New(dir, logName string) (*Server, error) {
 			}
 		}
 	}
+	// Reload the effects log the same way: a replayed token must stay
+	// idempotent across restarts and EffectN must not repeat, or a
+	// restarted provider would apply the same effect twice.
+	if data, err := os.ReadFile(s.logPath); err == nil {
+		for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+			var e LogEntry
+			if json.Unmarshal([]byte(line), &e) == nil && e.Token != "" {
+				s.seen[e.Token] = e
+				if e.EffectN > s.effects {
+					s.effects = e.EffectN
+				}
+			}
+		}
+	}
 	return s, nil
 }
 

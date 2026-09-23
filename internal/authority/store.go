@@ -414,6 +414,11 @@ func (s *Store) IssueGrant(ctx context.Context, grantID, principal string, capab
 // generation row and bound into grant_digest, so an execution can
 // prove exactly which resource scope admitted it.
 func (s *Store) IssueGrantWithConstraints(ctx context.Context, grantID, principal string, capabilities []string, constraints map[string][]string, expiresAt time.Time) (*capability.Grant, error) {
+	// Store '{}' rather than JSONB null for an unconstrained grant so
+	// the column always holds an object matching its declared default.
+	if len(constraints) == 0 {
+		constraints = map[string][]string{}
+	}
 	constraintsJSON, err := json.Marshal(constraints)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal grant constraints: %w", err)

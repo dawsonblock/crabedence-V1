@@ -449,6 +449,11 @@ func (s *SQLiteStore) IssueGrantWithConstraints(ctx context.Context, grantID, pr
 	if err != nil {
 		return nil, err
 	}
+	// Store '{}' rather than JSON null for an unconstrained grant so
+	// the column always holds an object matching its declared default.
+	if len(constraints) == 0 {
+		constraints = map[string][]string{}
+	}
 	constraintsJSON, err := json.Marshal(constraints)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal grant constraints: %w", err)

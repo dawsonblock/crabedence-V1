@@ -947,30 +947,32 @@ func (e *DispatchExecutor) dispatch(ctx context.Context, req Request, desc capab
 		case resp := <-respCh:
 			return resp, false
 		case <-time.After(e.timeouts.ProviderExecutionGrace):
-			return e.providerCeilingResponse(desc), false
+			return e.providerCeilingResponse(desc, dispatchCtx.Err()), false
 		}
 	}
 }
 
 // providerCeilingResponse is the conservative outcome when the
-// provider invocation exceeds the executor's own ceiling. For
-// MUTATION/CRITICAL the side effect may already have occurred —
-// UNKNOWN, and the reconciler owns the record from there. PURE/READ
-// have no external effect, so the same ceiling is a safe FAILED.
-func (e *DispatchExecutor) providerCeilingResponse(desc capability.ResolvedDescriptor) Response {
+// provider invocation outlives the dispatch context — the executor's
+// ceiling, the caller's deadline, or caller cancellation (cause
+// distinguishes which). For MUTATION/CRITICAL the side effect may
+// already have occurred — UNKNOWN, and the reconciler owns the record
+// from there. PURE/READ have no external effect, so the same bound is
+// a safe FAILED.
+func (e *DispatchExecutor) providerCeilingResponse(desc capability.ResolvedDescriptor, cause error) Response {
 	if desc.ExecutionClass == capability.ClassPure || desc.ExecutionClass == capability.ClassRead {
 		return Response{
 			Status:      StatusFailed,
 			FailureCode: string(capability.FailureExecutionFailed),
-			Error: fmt.Sprintf("provider execution exceeded the framework ceiling (%s)",
-				e.timeouts.ProviderExecution),
+			Error: fmt.Sprintf("provider execution exceeded the framework ceiling (%s): %v",
+				e.timeouts.ProviderExecution, cause),
 		}
 	}
 	return Response{
 		Status:      StatusUnknown,
 		FailureCode: string(capability.FailureExecutionUnknown),
-		Error: fmt.Sprintf("provider execution exceeded the framework ceiling (%s) — post-dispatch ambiguity, entered recovery",
-			e.timeouts.ProviderExecution),
+		Error: fmt.Sprintf("provider execution exceeded the framework ceiling (%s, %v) — post-dispatch ambiguity, entered recovery",
+			e.timeouts.ProviderExecution, cause),
 	}
 }
 
