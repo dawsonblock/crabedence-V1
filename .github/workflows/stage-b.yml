@@ -19,6 +19,11 @@ on:
         required: true
         type: string
         default: v0.52.0-rc.1
+      soak_seconds:
+        description: "Optional post-qualification soak duration in seconds (0 = skip)"
+        required: false
+        type: string
+        default: "0"
 
 permissions:
   contents: read
@@ -31,7 +36,7 @@ jobs:
   stage-b:
     name: Native amd64 staging qualification
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: ${{ inputs.soak_seconds != '0' && 360 || 60 }}
     services:
       postgres:
         image: postgres:16
@@ -141,6 +146,14 @@ jobs:
           done
           date +%s > /tmp/stageb-timing/proofs_done
           exit $rc
+
+      - name: Post-qualification soak
+        if: ${{ inputs.soak_seconds != '0' }}
+        run: |
+          set -euo pipefail
+          cd /opt/staging/proofs
+          sudo SOAK_DURATION='${{ inputs.soak_seconds }}' ./11-soak.sh
+          date +%s > /tmp/stageb-timing/soak_done
 
       - name: Timing baseline — report
         if: always()

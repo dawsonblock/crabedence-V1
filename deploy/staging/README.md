@@ -50,6 +50,7 @@ sudo systemctl daemon-reload && sudo systemctl enable --now crabedence
 | `proofs/08-reconcile-recovery.sh` | injected UNKNOWN → reconcile | systemctl |
 | `proofs/09-external-provider.sh` | provider death/lookup/CRITICAL | live harness — auto-detects `~/rc1/crabedence-*` (or `CRABEDENCE_SOURCE_DIR`) |
 | `proofs/10-host-reboot.sh` | full host reboot → auto-recovery | docker (nested privileged systemd container; on a bare VM use `sudo reboot` instead) |
+| `proofs/11-soak.sh` | sustained load + mid-soak restart + PG outage | root; `SOAK_DURATION` secs (default 900) — run post-qualification, pre-canary |
 
 Proofs exit `0` pass, `1` fail, `77` skip (missing prerequisite).
 Every durable proof enforces the three-view invariant:
