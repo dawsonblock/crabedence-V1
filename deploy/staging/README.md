@@ -48,7 +48,7 @@ sudo systemctl daemon-reload && sudo systemctl enable --now crabedence
 | `proofs/06-pg-interruption.sh` | PostgreSQL interruption | root + iptables |
 | `proofs/07-authority-revocation.sh` | revocation before dispatch | none |
 | `proofs/08-reconcile-recovery.sh` | injected UNKNOWN → reconcile | systemctl |
-| `proofs/09-external-provider.sh` | provider death/lookup/CRITICAL | live harness — auto-detects `~/rc1/crabedence-*` (or `CRABEDENCE_SOURCE_DIR`) |
+| `proofs/09-external-provider.sh` | provider death/lookup/CRITICAL | deployed tier when `CRABEDENCE_QUAL_PROVIDER_URL` is set (curl + jq); else live harness — auto-detects `~/rc1/crabedence-*` (or `CRABEDENCE_SOURCE_DIR`) |
 | `proofs/10-host-reboot.sh` | full host reboot → auto-recovery | docker (nested privileged systemd container; on a bare VM use `sudo reboot` instead) |
 | `proofs/11-soak.sh` | sustained load + mid-soak restart + PG outage | root; `SOAK_DURATION` secs (default 900) — run post-qualification, pre-canary |
 
@@ -83,10 +83,17 @@ reboot→ready ~20s, duplicate storm 3s, full suite ~160s.
 - No `/healthz` or `/metrics` — readiness is the socket probe +
   registry digest. Observability endpoints are the first RC2 runtime
   change.
-- The external CRITICAL qualification provider is test-harness-only —
-  proof 09 runs the live harness (`TestLiveCritical*`) against the
-  staging DSN when a source tree is present; a fully deployed provider
-  is still an RC2 deliverable.
+- On the immutable RC1 artifact the external CRITICAL qualification
+  provider is test-harness-only — proof 09 runs the live harness
+  (`TestLiveCritical*`) against the staging DSN when a source tree is
+  present. That exercises a real provider process and the durable
+  ledger, but the executor is a test binary, not the deployed systemd
+  unit. Post-RC1 builds close this: `cmd/qual-provider` ships the
+  provider binary and `CRABEDENCE_QUAL_PROVIDER_URL` wires the
+  deployed service to it, which promotes proof 09 to its deployed
+  tier — socket → deployed service → staging PostgreSQL → external
+  provider → reconciliation, including a commit-then-reset fault
+  converging through the deployed reconciler.
 - Injected-UNKNOWN counter rows correctly stay UNKNOWN: the
   test-counter provider's state is in-memory, so after a restart there
   is no provider observation to reconcile from — the row cannot prove

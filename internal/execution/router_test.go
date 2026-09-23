@@ -176,7 +176,11 @@ func TestFunctionHookRuntimeContract(t *testing.T) {
 
 func TestFunctionHookRuntimeBoundsAndFailures(t *testing.T) {
 	registry := NewFunctionHookRegistry()
-	registry.SetTimeout(20 * time.Millisecond)
+	// 100ms is comfortably inside the timeout hook's 2s sleep while
+	// leaving headroom for the oversized hook's marshal under a loaded
+	// test runner — the hook now runs on its own goroutine, so the
+	// budget includes a scheduling hop.
+	registry.SetTimeout(100 * time.Millisecond)
 
 	if err := registry.Register("test.error", FunctionHookFunc(func(context.Context, HookCall) (json.RawMessage, error) {
 		return nil, errors.New("boom")

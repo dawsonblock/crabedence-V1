@@ -170,9 +170,14 @@ that violates one is defective, regardless of test results.
     are never updated in place: reissuing a `grant_id` appends a new
     immutable generation row carrying a `grant_digest` over its
     material (grant_id, generation, principal, sorted capabilities,
-    expiry), and the latest generation supersedes all earlier ones for
-    admission — an older still-valid generation MUST NOT resurface
-    after a reissue. Revocation applies to every generation while
+    constraints, issuance time, expiry), and the latest generation
+    supersedes all earlier ones for admission — an older still-valid
+    generation MUST NOT resurface after a reissue. Constraints are
+    resource caveats per dimension (e.g. `repo: ["a/b"]`); a
+    capability's authority policy binds dimensions it declares to
+    request arguments, and admission MUST deny when a bound argument's
+    value is not admitted by the grant. A dimension absent from the
+    grant is unconstrained. Revocation applies to every generation while
     preserving the rows as forensic snapshots. The execution service
     binds the resolved generation and grant digest — server-assigned,
     never caller-supplied — into the request digest, so the same

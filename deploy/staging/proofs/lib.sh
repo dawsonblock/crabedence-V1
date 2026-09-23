@@ -83,13 +83,27 @@ three_view() {
   echo "three-view: ledger=$state run=$rid observations=$obs evidence=${digest:0:16}…"
 }
 
-# issue_staging_grant <capabilities...> — one narrowly scoped grant for
-# the proof's principal; prints the grant_id. Generation is allocated by
-# the authority store; the helper reports it on stderr for the operator.
+# issue_staging_grant [--constraint dim=value ...] <capabilities...> —
+# one narrowly scoped grant for the proof's principal; prints the
+# grant_id. --constraint binds the grant to a resource dimension (e.g.
+# repo=owner/name); constraints become immutable grant material bound
+# into the authority digest. Generation is allocated by the authority
+# store; the helper reports it on stderr for the operator.
 issue_staging_grant() {
   local args=(--principal "$PRINCIPAL" --expires-at "$(date -u -d '+24 hours' +%Y-%m-%dT%H:%M:%SZ)")
-  local c
-  for c in "$@"; do args+=(--capability "$c"); done
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --constraint)
+        [ $# -ge 2 ] || fail "issue_staging_grant: --constraint needs dim=value"
+        args+=(--constraint "$2")
+        shift 2
+        ;;
+      *)
+        args+=(--capability "$1")
+        shift
+        ;;
+    esac
+  done
   CRABEDENCE_DATABASE_URL="$CRABEDENCE_DATABASE_URL" \
     "$ISSUE_GRANT" "${args[@]}" | jq -r .grant_id
 }

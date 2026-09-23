@@ -13,7 +13,9 @@ repo="${STAGING_TEST_ISSUE%#*}"; number="${STAGING_TEST_ISSUE##*#}"
   || fail "STAGING_TEST_ISSUE must be owner/repo#N, got '$STAGING_TEST_ISSUE'"
 
 export STAGING_GRANT_ID
-STAGING_GRANT_ID=$(issue_staging_grant github.issue.get)
+# Least-privilege: the grant covers github.issue.get constrained to
+# exactly this repository — a read on any other repo must be denied.
+STAGING_GRANT_ID=$(issue_staging_grant --constraint "repo=$repo" github.issue.get)
 
 # No --execution-class: the registry pins github.issue.get as READ and
 # denies a mismatched caller assertion.

@@ -227,3 +227,108 @@ func TestSetTimeoutsFillsZeroFields(t *testing.T) {
 		t.Fatalf("timeouts = %+v, want %+v", exec.timeouts, want)
 	}
 }
+
+// wedgedHandler never returns and never observes context cancellation
+// — the hung-provider case the executor-owned ceiling exists for.
+type wedgedHandler struct{}
+
+func (wedgedHandler) Execute(context.Context, Request, capability.ResolvedDescriptor) Response {
+	select {}
+}
+
+// handlerFunc adapts a function to Handler for tests.
+type handlerFunc func(context.Context, Request, capability.ResolvedDescriptor) Response
+
+func (f handlerFunc) Execute(ctx context.Context, req Request, desc capability.ResolvedDescriptor) Response {
+	return f(ctx, req, desc)
+}
+
+// TestProviderCeilingBoundsHungHandler proves a provider that ignores
+// cancellation entirely cannot pin a lease forever: the executor's own
+// ProviderExecution budget ends the dispatch and converges the record
+// to UNKNOWN + recovery — never FAILED, never an indefinite hold.
+func TestProviderCeilingBoundsHungHandler(t *testing.T) {
+	store := openExecutorSQLiteStore(t, idempotency.DefaultLeaseConfig)
+	exec := NewDispatchExecutor(wedgedHandler{}, store)
+	exec.SetTimeouts(ExecutorTimeouts{
+		ProviderExecution:      100 * time.Millisecond,
+		ProviderExecutionGrace: 20 * time.Millisecond,
+	})
+
+	key := fmt.Sprintf("ceiling-hang-%d", time.Now().UnixNano())
+	start := time.Now()
+	resp := exec.ExecuteWithIdempotency(context.Background(), mutationRequest(key), mutationDescriptor())
+	elapsed := time.Since(start)
+
+	if resp.Status != StatusUnknown {
+		t.Fatalf("expected UNKNOWN after provider ceiling, got %s: %s", resp.Status, resp.Error)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("dispatch held %s for a hung handler — ceiling did not bound it", elapsed)
+	}
+
+	rec, err := store.LookupByKey(context.Background(), "alice@example.com", "test.mut", key)
+	if err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+	if rec.State != idempotency.StateUnknown {
+		t.Fatalf("expected durable UNKNOWN for reconciliation, got %s", rec.State)
+	}
+}
+
+// TestProviderCeilingKeepsCooperativeAnswer proves the grace window:
+// a handler that observes the ceiling cancellation and returns within
+// the grace has its own answer used — including any provider evidence
+// the durable observation must persist.
+func TestProviderCeilingKeepsCooperativeAnswer(t *testing.T) {
+	store := openExecutorSQLiteStore(t, idempotency.DefaultLeaseConfig)
+	exec := NewDispatchExecutor(handlerFunc(func(ctx context.Context, _ Request, desc capability.ResolvedDescriptor) Response {
+		<-ctx.Done() // observe cancellation, then answer promptly
+		return Response{
+			Status:            StatusFailed,
+			FailureCode:       string(capability.FailureExecutionFailed),
+			Error:             "provider aborted on cancellation",
+			DefinitiveFailure: true,
+			Execution:         &ExecutionMeta{Provider: desc.AdapterID, RunID: "run-grace"},
+		}
+	}), store)
+	exec.SetTimeouts(ExecutorTimeouts{
+		ProviderExecution:      50 * time.Millisecond,
+		ProviderExecutionGrace: 2 * time.Second,
+	})
+
+	key := fmt.Sprintf("ceiling-grace-%d", time.Now().UnixNano())
+	resp := exec.ExecuteWithIdempotency(context.Background(), mutationRequest(key), mutationDescriptor())
+	if resp.Status != StatusFailed {
+		t.Fatalf("cooperative handler's own answer must win, got %s: %s", resp.Status, resp.Error)
+	}
+	rec, err := store.LookupByKey(context.Background(), "alice@example.com", "test.mut", key)
+	if err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+	if rec.State != idempotency.StateFailed {
+		t.Fatalf("expected durable FAILED for a definitive no-effect, got %s", rec.State)
+	}
+}
+
+// TestProviderCeilingPureReadFailsSafely proves the ceiling's other
+// half: a no-side-effect route converges to FAILED, not UNKNOWN.
+func TestProviderCeilingPureReadFailsSafely(t *testing.T) {
+	exec := NewDispatchExecutor(wedgedHandler{}, nil)
+	exec.SetTimeouts(ExecutorTimeouts{
+		ProviderExecution:      50 * time.Millisecond,
+		ProviderExecutionGrace: 10 * time.Millisecond,
+	})
+	desc := capability.ResolvedDescriptor{
+		ExecutionClass: capability.ClassRead,
+		AdapterID:      "test-adapter",
+	}
+	resp := exec.ExecuteWithIdempotency(context.Background(), Request{
+		Capability: "test.read",
+		Arguments:  json.RawMessage(`{}`),
+		Authority:  RequestAuthority{Principal: "alice@example.com"},
+	}, desc)
+	if resp.Status != StatusFailed {
+		t.Fatalf("READ ceiling must be a safe FAILED, got %s: %s", resp.Status, resp.Error)
+	}
+}

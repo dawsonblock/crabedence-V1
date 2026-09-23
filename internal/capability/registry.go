@@ -178,6 +178,17 @@ type AuthorityPolicy struct {
 
 	// GrantRequired is true if a grant_id is required.
 	GrantRequired bool `json:"grant_required"`
+
+	// ResourceArguments binds grant-constraint dimensions to request
+	// argument fields. For each entry dimension→argument, authority
+	// verification extracts the argument's string value and requires
+	// the resolved grant to allow it (Grant.AllowsResource). This is
+	// how least-privilege resource scoping is enforced: a grant
+	// constrained to repo=[a/b] admits github.issue.create only for
+	// that repository. The binding is part of the descriptor and
+	// therefore the descriptor digest — a policy change is a new
+	// execution identity. A non-empty binding requires GrantRequired.
+	ResourceArguments map[string]string `json:"resource_arguments,omitempty"`
 }
 
 // CapabilityDescriptor is the raw, pre-resolution capability definition.

@@ -407,6 +407,13 @@ func RegisterGitHubIssueCapability(reg *capability.Registry) error {
 		AuthorityPolicy: capability.AuthorityPolicy{
 			ID:            "github.issue",
 			GrantRequired: true,
+			// Least-privilege resource scope: a grant constrained to
+			// repo=[owner/name] admits issue creation only in those
+			// repositories. An unconstrained grant still covers every
+			// repository the service token can reach.
+			ResourceArguments: map[string]string{
+				"repo": "repo",
+			},
 		},
 		Schema: json.RawMessage(`{
 			"type": "object",

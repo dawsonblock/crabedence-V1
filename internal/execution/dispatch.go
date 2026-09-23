@@ -52,6 +52,20 @@ type ExecutorTimeouts struct {
 	// LeaseOperation bounds a single lease store operation — a
 	// heartbeat renewal or a pre-dispatch abandon.
 	LeaseOperation time.Duration
+	// ProviderExecution is the executor-owned ceiling on a single
+	// provider invocation — independent of the caller's deadline. A
+	// handler may ignore context cancellation entirely; without this
+	// ceiling a hung adapter would heartbeat its lease forever and
+	// reconcilers could never take ownership of the record. Exceeding
+	// the ceiling after dispatch is post-dispatch ambiguity: the
+	// record converges to UNKNOWN + reconciliation, never FAILED,
+	// never redispatch.
+	ProviderExecution time.Duration
+	// ProviderExecutionGrace is the short window after the caller
+	// deadline or the provider ceiling fires during which a
+	// cooperative handler may still return its answer (the answer can
+	// carry provider evidence the durable observation must persist).
+	ProviderExecutionGrace time.Duration
 }
 
 // DefaultExecutorTimeouts returns the production budgets for the
@@ -62,6 +76,8 @@ func DefaultExecutorTimeouts() ExecutorTimeouts {
 		Terminalization:        5 * time.Second,
 		EmergencyRecovery:      5 * time.Second,
 		LeaseOperation:         3 * time.Second,
+		ProviderExecution:      5 * time.Minute,
+		ProviderExecutionGrace: 2 * time.Second,
 	}
 }
 
@@ -79,6 +95,12 @@ func (t ExecutorTimeouts) withDefaults() ExecutorTimeouts {
 	}
 	if t.LeaseOperation <= 0 {
 		t.LeaseOperation = d.LeaseOperation
+	}
+	if t.ProviderExecution <= 0 {
+		t.ProviderExecution = d.ProviderExecution
+	}
+	if t.ProviderExecutionGrace <= 0 {
+		t.ProviderExecutionGrace = d.ProviderExecutionGrace
 	}
 	return t
 }
@@ -881,9 +903,75 @@ func (e *DispatchExecutor) dispatch(ctx context.Context, req Request, desc capab
 		}
 	}
 
-	// The handler.Execute call crosses the dispatch boundary.
-	resp := e.handler.Execute(dispatchCtx, req, desc)
-	return resp, false
+	// Executor-owned provider ceiling. The caller's deadline bounds the
+	// provider call only when the caller supplies one — and a handler
+	// may ignore context cancellation entirely. Without a framework
+	// ceiling a hung adapter would hold the dispatch open while the
+	// heartbeat renews its lease indefinitely: the record would never
+	// reach a reconciler. The provider invocation therefore runs under
+	// the executor's own budget; exceeding it is post-dispatch
+	// ambiguity and converges to UNKNOWN + reconciliation — never
+	// FAILED, never a redispatch.
+	max := e.timeouts.ProviderExecution
+	if max > 0 {
+		var cancel context.CancelFunc
+		dispatchCtx, cancel = context.WithTimeout(dispatchCtx, max)
+		defer cancel()
+	}
+
+	// The handler.Execute call crosses the dispatch boundary. It runs
+	// in its own goroutine so the ceiling can bound even a handler
+	// that never observes cancellation. The channel is buffered: a
+	// late handler answer is dropped rather than blocking a leaked
+	// goroutine on send forever.
+	respCh := make(chan Response, 1)
+	go func() { respCh <- e.handler.Execute(dispatchCtx, req, desc) }()
+
+	if max <= 0 {
+		return <-respCh, false
+	}
+	select {
+	case resp := <-respCh:
+		return resp, false
+	case <-dispatchCtx.Done():
+		// The caller deadline, caller cancellation, or the provider
+		// ceiling fired while the handler was still running. Give a
+		// cooperative handler a brief grace to return its own answer —
+		// it may carry provider evidence the durable observation must
+		// persist — then converge conservatively without waiting
+		// further. The record stays IN_FLIGHT-owned by this executor
+		// until the recovery transition below; the heartbeat stops
+		// when Execute returns, so an ignored handler can never pin
+		// the lease beyond ceiling+grace.
+		select {
+		case resp := <-respCh:
+			return resp, false
+		case <-time.After(e.timeouts.ProviderExecutionGrace):
+			return e.providerCeilingResponse(desc), false
+		}
+	}
+}
+
+// providerCeilingResponse is the conservative outcome when the
+// provider invocation exceeds the executor's own ceiling. For
+// MUTATION/CRITICAL the side effect may already have occurred —
+// UNKNOWN, and the reconciler owns the record from there. PURE/READ
+// have no external effect, so the same ceiling is a safe FAILED.
+func (e *DispatchExecutor) providerCeilingResponse(desc capability.ResolvedDescriptor) Response {
+	if desc.ExecutionClass == capability.ClassPure || desc.ExecutionClass == capability.ClassRead {
+		return Response{
+			Status:      StatusFailed,
+			FailureCode: string(capability.FailureExecutionFailed),
+			Error: fmt.Sprintf("provider execution exceeded the framework ceiling (%s)",
+				e.timeouts.ProviderExecution),
+		}
+	}
+	return Response{
+		Status:      StatusUnknown,
+		FailureCode: string(capability.FailureExecutionUnknown),
+		Error: fmt.Sprintf("provider execution exceeded the framework ceiling (%s) — post-dispatch ambiguity, entered recovery",
+			e.timeouts.ProviderExecution),
+	}
 }
 
 // classifyPostDispatch is the single post-dispatch decision table.

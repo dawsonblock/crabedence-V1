@@ -46,264 +46,11 @@ import (
 //
 // Requires CRABBOX_TEST_DATABASE_URL. Skipped when absent.
 
-const qualificationCapabilityID = "qualification.critical.commit"
+const qualificationCapabilityID = QualificationCapabilityID
 
-// qualificationAdapter is the executor-side handler for the external
-// qualification provider: the full provider contract (capability
-// declaration, recovery locator, dispatch, read-only resolution). It
-// never trusts the provider's claimed digest — the artifact bytes are
-// handed to the executor, which recomputes SHA-256 itself.
-type qualificationAdapter struct {
-	baseURL string
-	client  *http.Client
-	// lookupFault, when set, injects a deterministic lookup outage into
-	// reconciliation (the test clears it to restore the lookup). It is
-	// harness state, never part of the provider contract.
-	lookupFault string
-}
-
-func (a *qualificationAdapter) ProviderCapabilities(string) ProviderCapabilities {
-	return ProviderCapabilities{
-		SupportsProviderIdempotency: true,
-		SupportsStatusLookup:        true,
-		SupportsCompletionProof:     true,
-		SupportsNonexecutionProof:   true,
-		RecoveryLocatorType:         "external-token",
-	}
-}
-
-func (a *qualificationAdapter) PrepareRecovery(_ context.Context, _ string, in idempotency.RecoveryLocatorInput) (*idempotency.RecoveryLocator, error) {
-	return &idempotency.RecoveryLocator{
-		Version:        1,
-		ProviderID:     "qualification",
-		Strategy:       "external-token",
-		ExternalToken:  idempotency.ProviderIdempotencyKey(in.ExecutionID, in.RequestDigest, "qualification"),
-		RequestDigest:  in.RequestDigest,
-		ExecutionID:    in.ExecutionID,
-		PrincipalID:    in.Principal,
-		CapabilityID:   in.CapabilityID,
-		IdempotencyKey: in.IdempotencyKey,
-	}, nil
-}
-
-type qualificationOperationResponse struct {
-	Status      string          `json:"status"`
-	OperationID string          `json:"operation_id"`
-	RunID       string          `json:"run_id"`
-	ArtifactID  string          `json:"artifact_id"`
-	Digest      string          `json:"digest"`
-	Result      json.RawMessage `json:"result"`
-	Artifact    json.RawMessage `json:"artifact"`
-}
-
-// Execute dispatches one CRITICAL operation to the provider process.
-// Transport failure after the request may have been sent is ambiguous:
-// FAILED without DefinitiveFailure, so the executor enters UNKNOWN.
-func (a *qualificationAdapter) Execute(ctx context.Context, req Request, desc capability.ResolvedDescriptor) Response {
-	token := ExternalTokenFromContext(ctx)
-	if token == "" {
-		return Response{
-			Status:            StatusFailed,
-			FailureCode:       string(capability.FailureInternalError),
-			Error:             "missing external operation token",
-			DefinitiveFailure: true,
-			Execution:         &ExecutionMeta{Provider: "qualification"},
-		}
-	}
-	var args struct {
-		Operation string `json:"operation"`
-		Fault     string `json:"fault"`
-	}
-	if err := json.Unmarshal(req.Arguments, &args); err != nil {
-		return Response{
-			Status:            StatusFailed,
-			FailureCode:       string(capability.FailureInvalidRequest),
-			Error:             "invalid arguments: " + err.Error(),
-			DefinitiveFailure: true,
-			Execution:         &ExecutionMeta{Provider: "qualification"},
-		}
-	}
-	body, _ := json.Marshal(map[string]any{
-		"token":   token,
-		"payload": map[string]string{"operation": args.Operation},
-	})
-	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, a.baseURL+"/operations", bytes.NewReader(body))
-	if err != nil {
-		return Response{Status: StatusFailed, FailureCode: string(capability.FailureInternalError), Error: err.Error(), DefinitiveFailure: true}
-	}
-	hreq.Header.Set("Content-Type", "application/json")
-	if args.Fault != "" {
-		hreq.Header.Set("X-Qualification-Fault", args.Fault)
-	}
-	resp, err := a.client.Do(hreq)
-	if err != nil {
-		return Response{
-			Status:      StatusFailed,
-			FailureCode: string(capability.FailureExecutionFailed),
-			Error:       "qualification provider transport: " + err.Error(),
-			Execution:   &ExecutionMeta{Provider: "qualification"},
-		}
-	}
-	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-
-	if resp.StatusCode == http.StatusConflict {
-		// The provider bound this token to a different payload. Definitive
-		// non-effect: the collision was rejected before any operation.
-		return Response{
-			Status:            StatusDenied,
-			FailureCode:       string(capability.FailureIdempotencyConflict),
-			Error:             "qualification provider rejected an operation-token collision",
-			DefinitiveFailure: true,
-			Execution:         &ExecutionMeta{Provider: "qualification"},
-		}
-	}
-	if resp.StatusCode != http.StatusOK {
-		// A rejection before acceptance. The provider declares whether it
-		// accepted anything; only an explicit non-acceptance is a
-		// definitive non-effect.
-		definitive := strings.Contains(string(respBody), `"accepted":false`)
-		return Response{
-			Status:            StatusFailed,
-			FailureCode:       string(capability.FailureExecutionFailed),
-			Error:             fmt.Sprintf("qualification provider returned %d: %s", resp.StatusCode, truncate(string(respBody), 256)),
-			DefinitiveFailure: definitive,
-			Execution:         &ExecutionMeta{Provider: "qualification"},
-		}
-	}
-
-	var out qualificationOperationResponse
-	if err := json.Unmarshal(respBody, &out); err != nil {
-		return Response{
-			Status:      StatusUnknown,
-			FailureCode: string(capability.FailureExecutionUnknown),
-			Error:       "qualification provider returned an unparseable response: " + err.Error(),
-			Execution:   &ExecutionMeta{Provider: "qualification"},
-		}
-	}
-	switch out.Status {
-	case "COMMITTED":
-		// The artifact identity must match the provider's durable
-		// artifact: a response whose bytes differ from the ledger's copy
-		// is transport corruption, and committing it would attest bytes
-		// the provider cannot prove. Ambiguous → UNKNOWN.
-		if durable, err := a.fetchArtifact(ctx, out.ArtifactID); err == nil {
-			if !bytes.Equal(durable, out.Artifact) {
-				return Response{
-					Status:      StatusUnknown,
-					FailureCode: string(capability.FailureExecutionUnknown),
-					Error:       "qualification provider artifact does not match its durable artifact",
-					Execution:   &ExecutionMeta{Provider: "qualification", RunID: out.OperationID},
-				}
-			}
-		}
-		result, _ := json.Marshal(map[string]any{"operation_id": out.OperationID})
-		return Response{
-			Status:           StatusSucceeded,
-			Result:           result,
-			Evidence:         &EvidenceRef{ReceiptVersion: 3},
-			EvidenceArtifact: out.Artifact,
-			Execution:        &ExecutionMeta{Provider: "qualification", RunID: out.OperationID},
-		}
-	case "REJECTED":
-		// Definitive non-effect with the provider's proof artifact.
-		return Response{
-			Status:            StatusFailed,
-			FailureCode:       string(capability.FailureExecutionFailed),
-			Error:             "qualification provider definitively rejected the operation",
-			DefinitiveFailure: true,
-			Evidence:          &EvidenceRef{ReceiptVersion: 3},
-			EvidenceArtifact:  out.Artifact,
-			Execution:         &ExecutionMeta{Provider: "qualification", RunID: out.OperationID},
-		}
-	}
-	return Response{
-		Status:      StatusUnknown,
-		FailureCode: string(capability.FailureExecutionUnknown),
-		Error:       "qualification provider reported status " + out.Status,
-		Execution:   &ExecutionMeta{Provider: "qualification", RunID: out.OperationID},
-	}
-}
-
-// Resolve implements idempotency.RecoveryResolver: strictly read-only.
-// It queries the provider's durable ledger by the stable token and
-// fetches the immutable artifact bytes — the digest is recomputed by
-// the worker before signing, never taken from the provider's claim.
-func (a *qualificationAdapter) Resolve(ctx context.Context, rec *idempotency.Record) (idempotency.RecoveryResult, error) {
-	var loc idempotency.RecoveryLocator
-	if len(rec.RecoveryLocator) > 0 {
-		if err := json.Unmarshal(rec.RecoveryLocator, &loc); err != nil {
-			return idempotency.RecoveryResult{Decision: idempotency.RecoveryUnknown}, nil
-		}
-	}
-	if loc.ExternalToken == "" {
-		return idempotency.RecoveryResult{Decision: idempotency.RecoveryUnknown}, nil
-	}
-	lookupURL := a.baseURL + "/operations/" + url.PathEscape(loc.ExternalToken)
-	if a.lookupFault != "" {
-		lookupURL += "?fault=" + url.QueryEscape(a.lookupFault)
-	}
-	resp, err := a.client.Get(lookupURL)
-	if err != nil {
-		return idempotency.RecoveryResult{Decision: idempotency.RecoveryUnknown}, nil
-	}
-	defer resp.Body.Close()
-	switch resp.StatusCode {
-	case http.StatusServiceUnavailable, http.StatusBadGateway:
-		return idempotency.RecoveryResult{Decision: idempotency.RecoveryUnknown}, nil
-	case http.StatusNotFound:
-		// The provider has no operation for this token: it never accepted
-		// one. This is a non-effect, but a definitive CRITICAL decision
-		// still needs a proof artifact; without one it stays UNKNOWN.
-		return idempotency.RecoveryResult{Decision: idempotency.RecoveryFailed, ProviderID: "qualification"}, nil
-	case http.StatusOK:
-	default:
-		return idempotency.RecoveryResult{Decision: idempotency.RecoveryUnknown}, nil
-	}
-	var op qualificationOperationResponse
-	if err := json.NewDecoder(resp.Body).Decode(&op); err != nil {
-		return idempotency.RecoveryResult{Decision: idempotency.RecoveryUnknown}, nil
-	}
-	artifact, err := a.fetchArtifact(ctx, op.ArtifactID)
-	if err != nil {
-		return idempotency.RecoveryResult{Decision: idempotency.RecoveryUnknown}, nil
-	}
-	switch op.Status {
-	case "COMMITTED":
-		return idempotency.RecoveryResult{
-			Decision:         idempotency.RecoveryCommitted,
-			Result:           op.Result,
-			ProviderID:       "qualification",
-			ProviderRunID:    op.OperationID,
-			ReceiptVersion:   3,
-			EvidenceArtifact: artifact,
-		}, nil
-	case "REJECTED":
-		return idempotency.RecoveryResult{
-			Decision:         idempotency.RecoveryFailed,
-			ProviderID:       "qualification",
-			ProviderRunID:    op.OperationID,
-			ReceiptVersion:   3,
-			EvidenceArtifact: artifact,
-		}, nil
-	}
-	return idempotency.RecoveryResult{Decision: idempotency.RecoveryUnknown}, nil
-}
-
-func (a *qualificationAdapter) fetchArtifact(ctx context.Context, artifactID string) ([]byte, error) {
-	if artifactID == "" {
-		return nil, fmt.Errorf("no artifact id")
-	}
-	resp, err := a.client.Get(a.baseURL + "/artifacts/" + url.PathEscape(artifactID))
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("artifact %s: status %d", artifactID, resp.StatusCode)
-	}
-	return io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-}
+// qualificationAdapter is the production adapter — the same code the
+// deployed service wires when CRABEDENCE_QUAL_PROVIDER_URL is set.
+type qualificationAdapter = QualificationAdapter
 
 // criticalStack is the full qualification stack: PostgreSQL EffectStore
 // and authority store, the service on a Unix socket, the external
@@ -404,16 +151,7 @@ func buildQualificationRegistry(t *testing.T) (*capability.Registry, qualificati
 
 func registerQualificationCapability(t *testing.T, registry *capability.Registry) capability.ResolvedDescriptor {
 	t.Helper()
-	desc, err := capability.Resolve(capability.CapabilityDescriptor{
-		ID:             qualificationCapabilityID,
-		ExecutionClass: capability.ClassCritical,
-		AdapterID:      "qualification",
-		AuthorityPolicy: capability.AuthorityPolicy{
-			ID:            qualificationCapabilityID,
-			GrantRequired: true,
-		},
-		Schema: json.RawMessage(`{"type":"object","properties":{"operation":{"type":"string"},"fault":{"type":"string"}},"required":["operation"],"additionalProperties":false}`),
-	})
+	desc, err := QualificationDescriptor()
 	if err != nil {
 		t.Fatalf("resolve qualification descriptor: %v", err)
 	}
@@ -458,7 +196,12 @@ func newCriticalStack(t *testing.T) *criticalStack {
 
 	registry, binding := buildQualificationRegistry(t)
 
-	exec := NewDispatchExecutor(adapter, store)
+	// Route through MultiHandler exactly as the deployed service does —
+	// the executor delegates recovery-locator preparation and provider
+	// capability declarations through it by adapter ID.
+	exec := NewDispatchExecutor(NewMultiHandler(map[string]Handler{
+		QualificationAdapterID: adapter,
+	}), store)
 	exec.SetEvidenceSigner(signer)
 
 	socketPath := testSocketPath(t)
@@ -1182,7 +925,9 @@ func TestCriticalCrashHelperProcess(t *testing.T) {
 		baseURL: os.Getenv("CRABBOX_PROVIDER_URL"),
 		client:  &http.Client{Timeout: 2 * time.Second},
 	}
-	exec := NewDispatchExecutor(adapter, store)
+	exec := NewDispatchExecutor(NewMultiHandler(map[string]Handler{
+		QualificationAdapterID: adapter,
+	}), store)
 	exec.SetCrashHook(func(p CrashPoint) {
 		if p == CrashAfterProvider {
 			// Provider committed; Crabedence must not have persisted the

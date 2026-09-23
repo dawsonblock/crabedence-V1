@@ -10,7 +10,7 @@
 // Usage:
 //
 //	issue-grant --principal <id> --capability <id> [--capability <id>...] \
-//	  [--grant-id <id>] [--expires-at <RFC3339>]
+//	  [--constraint <dimension=value>...] [--grant-id <id>] [--expires-at <RFC3339>]
 //
 // Prints the issued authority reference as JSON on stdout:
 //
@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/openclaw/crabbox/internal/authority"
@@ -47,14 +48,29 @@ func (c *capabilityList) Set(v string) error {
 	return nil
 }
 
+// constraintList collects --constraint dimension=value flags into the
+// grant's resource constraints (dimension → admitted values).
+type constraintList map[string][]string
+
+func (c constraintList) String() string { return fmt.Sprint(map[string][]string(c)) }
+func (c constraintList) Set(v string) error {
+	dimension, value, ok := strings.Cut(v, "=")
+	if !ok || dimension == "" || value == "" {
+		return fmt.Errorf("constraint must be dimension=value (e.g. repo=example-org/my-app)")
+	}
+	c[dimension] = append(c[dimension], value)
+	return nil
+}
+
 // config is the validated invocation: everything checked before any
 // database work happens.
 type config struct {
-	grantID   string
-	principal string
-	caps      []string
-	expiresAt time.Time // zero means no expiry
-	dsn       string
+	grantID     string
+	principal   string
+	caps        []string
+	constraints map[string][]string
+	expiresAt   time.Time // zero means no expiry
+	dsn         string
 }
 
 // loadConfig parses and validates flags + environment. It never accepts
@@ -70,6 +86,8 @@ func loadConfig(argv []string, getenv func(string) string, stderr io.Writer) (co
 	)
 	var caps capabilityList
 	fs.Var(&caps, "capability", "capability id to authorize (repeatable, required)")
+	constraints := constraintList{}
+	fs.Var(constraints, "constraint", "resource constraint as dimension=value (repeatable; e.g. repo=example-org/my-app)")
 	if err := fs.Parse(argv); err != nil {
 		return config{}, err
 	}
@@ -107,14 +125,14 @@ func loadConfig(argv []string, getenv func(string) string, stderr io.Writer) (co
 		id = fmt.Sprintf("grant_%x", b)
 	}
 
-	return config{grantID: id, principal: *principal, caps: caps, expiresAt: expiry, dsn: dsn}, nil
+	return config{grantID: id, principal: *principal, caps: caps, constraints: constraints, expiresAt: expiry, dsn: dsn}, nil
 }
 
 func main() {
 	cfg, err := loadConfig(os.Args[1:], os.Getenv, os.Stderr)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "issue-grant: %v\n", err)
-		fmt.Fprintln(os.Stderr, "usage: issue-grant --principal <id> --capability <id> [--capability <id>...] [--grant-id <id>] [--expires-at <RFC3339>]")
+		fmt.Fprintln(os.Stderr, "usage: issue-grant --principal <id> --capability <id> [--capability <id>...] [--constraint <dim=value>...] [--grant-id <id>] [--expires-at <RFC3339>]")
 		os.Exit(2)
 	}
 
@@ -136,7 +154,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	grant, err := store.IssueGrant(ctx, cfg.grantID, cfg.principal, cfg.caps, cfg.expiresAt)
+	grant, err := store.IssueGrantWithConstraints(ctx, cfg.grantID, cfg.principal, cfg.caps, cfg.constraints, cfg.expiresAt)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "issue-grant: %v\n", err)
 		os.Exit(1)
@@ -148,6 +166,7 @@ func main() {
 		"grant_digest": grant.Digest,
 		"principal":    grant.Principal,
 		"capabilities": grant.Capabilities,
+		"constraints":  grant.Constraints,
 		"issued_at":    grant.IssuedAt.Format(time.RFC3339Nano),
 		"expires_at":   expiryOrEmpty(grant.ExpiresAt),
 	}, "", "  ")

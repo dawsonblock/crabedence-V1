@@ -203,7 +203,6 @@ describe("Adversarial: Transport ambiguity", () => {
     // Use a client with short timeout
     const adapter = new CrabedenceExecutionAdapter(
       new CrabedenceClient(socketPath, 500),
-      500,
     );
 
     const outcome = await adapter.execute({
@@ -223,7 +222,6 @@ describe("Adversarial: Transport ambiguity", () => {
     // No server — connection refused, PRE_DISPATCH
     const adapter = new CrabedenceExecutionAdapter(
       new CrabedenceClient(socketPath, 500),
-      500,
     );
 
     await expect(

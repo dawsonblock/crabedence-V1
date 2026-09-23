@@ -334,6 +334,9 @@ func (r *Registry) Validate() error {
 		if descriptor.ExecutionRoute == RouteLocal && descriptor.AuthorityPolicy.GrantRequired {
 			findings = append(findings, fmt.Errorf("capability %s: LOCAL route cannot require a grant — LOCAL execution never reaches the authority resolver", descriptor.ID))
 		}
+		if len(descriptor.AuthorityPolicy.ResourceArguments) > 0 && !descriptor.AuthorityPolicy.GrantRequired {
+			findings = append(findings, fmt.Errorf("capability %s: resource arguments require GrantRequired — constraints cannot be evaluated without a resolved grant", descriptor.ID))
+		}
 		if descriptor.AdapterID == "" {
 			findings = append(findings, fmt.Errorf("capability %s: no adapter binding — the service cannot dispatch it", descriptor.ID))
 		}

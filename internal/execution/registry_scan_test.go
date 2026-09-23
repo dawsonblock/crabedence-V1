@@ -12,15 +12,8 @@ import (
 // adapter binding, and be wired to a handler the service dispatches.
 func TestBuiltInRegistryPassesStartupScan(t *testing.T) {
 	registry := capability.NewRegistry()
-	for name, register := range map[string]func(*capability.Registry) error{
-		"system.echo":            RegisterEchoCapability,
-		"test.counter.increment": RegisterCounterCapability,
-		"system.info":            RegisterSystemInfoCapability,
-		"github.issue.create":    RegisterGitHubIssueCapability,
-	} {
-		if err := register(registry); err != nil {
-			t.Fatalf("register %s: %v", name, err)
-		}
+	if err := RegisterBuiltinCapabilities(registry); err != nil {
+		t.Fatalf("register built-ins: %v", err)
 	}
 
 	if err := registry.Validate(); err != nil {
@@ -40,8 +33,8 @@ func TestBuiltInRegistryPassesStartupScan(t *testing.T) {
 	if err != nil {
 		t.Fatalf("report: %v", err)
 	}
-	if report.Total != 4 {
-		t.Fatalf("built-in registry total = %d, want 4", report.Total)
+	if report.Total != 5 {
+		t.Fatalf("built-in registry total = %d, want 5", report.Total)
 	}
 	if report.Digest == "" {
 		t.Fatal("registry digest must be non-empty")

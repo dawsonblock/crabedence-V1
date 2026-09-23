@@ -53,11 +53,16 @@ func RegisterGitHubReadCapabilities(reg *capability.Registry) error {
 		ExecutionClass: capability.ClassRead,
 		AdapterID:      "github",
 		AuthorityPolicy: capability.AuthorityPolicy{
-			// Observational public read: no authority material required.
-			// Policy is per-capability — a private-repository read would
-			// pin GrantRequired: true instead.
+			// The adapter always attaches the configured GitHub token,
+			// so this read can see whatever the service credential can —
+			// including private repositories. It is therefore NOT a
+			// public read: it requires a grant like the mutation leg,
+			// scoped to repositories through the repo constraint.
 			ID:            "github.read",
-			GrantRequired: false,
+			GrantRequired: true,
+			ResourceArguments: map[string]string{
+				"repo": "repo",
+			},
 		},
 		Schema: json.RawMessage(`{
 			"type": "object",

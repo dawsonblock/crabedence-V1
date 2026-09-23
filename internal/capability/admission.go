@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"time"
 )
 
@@ -138,7 +139,50 @@ func (r *Registry) VerifyAuthority(ctx context.Context, req AdmissionRequest, re
 		return nil, FailureUnauthorized, fmt.Sprintf("grant %s does not permit capability %s (expired, revoked, or not authorized)", req.GrantID, req.Capability)
 	}
 
+	// Resource scope: for every constraint dimension the capability
+	// binds to an argument, the grant must admit the argument's value.
+	// A grant without that dimension is unconstrained (admits any
+	// value) — capability scope alone is deliberately not least
+	// privilege, so least-privilege deployments issue constrained
+	// grants.
+	if len(desc.AuthorityPolicy.ResourceArguments) > 0 {
+		if fc, reason := checkResourceConstraints(desc, req.Arguments, grant); fc != "" {
+			return nil, fc, reason
+		}
+	}
+
 	return grant, "", ""
+}
+
+// checkResourceConstraints evaluates the grant's resource constraints
+// against the request arguments. Every dimension the descriptor binds
+// must extract to a string argument the grant admits; anything else —
+// missing argument, non-string value, disallowed value — denies.
+func checkResourceConstraints(desc ResolvedDescriptor, raw json.RawMessage, grant *Grant) (FailureCode, string) {
+	var args map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &args); err != nil {
+		return FailureInvalidRequest, fmt.Sprintf("cannot evaluate resource constraints: arguments are not a JSON object: %v", err)
+	}
+	dimensions := make([]string, 0, len(desc.AuthorityPolicy.ResourceArguments))
+	for dimension := range desc.AuthorityPolicy.ResourceArguments {
+		dimensions = append(dimensions, dimension)
+	}
+	sort.Strings(dimensions)
+	for _, dimension := range dimensions {
+		argName := desc.AuthorityPolicy.ResourceArguments[dimension]
+		field, ok := args[argName]
+		if !ok {
+			return FailureUnauthorized, fmt.Sprintf("grant %s cannot be evaluated: resource argument %q (dimension %q) is missing", grant.ID, argName, dimension)
+		}
+		var value string
+		if err := json.Unmarshal(field, &value); err != nil {
+			return FailureUnauthorized, fmt.Sprintf("grant %s cannot be evaluated: resource argument %q (dimension %q) is not a string", grant.ID, argName, dimension)
+		}
+		if !grant.AllowsResource(dimension, value) {
+			return FailureUnauthorized, fmt.Sprintf("grant %s does not permit %s %q", grant.ID, dimension, value)
+		}
+	}
+	return "", ""
 }
 
 // Admit performs admission checks for an execution request.

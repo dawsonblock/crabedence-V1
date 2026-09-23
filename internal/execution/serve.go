@@ -102,6 +102,40 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 		githubReads = NewGitHubReads(baseURL, githubToken)
 	}
 
+	// Qualification extension: CRABEDENCE_QUAL_PROVIDER_URL wires the
+	// external CRITICAL qualification provider — a separate process with
+	// its own durable ledger — as a deployed adapter. Setting it registers
+	// qualification.critical.commit as an explicit extension of the
+	// release registry (the registry digest and the runtime
+	// configuration identity change to reflect the extension, exactly as
+	// the qualification harness binds it). Unset, the service serves the
+	// unmodified release registry.
+	//
+	// The URL is configuration, not a secret: the qualification provider
+	// is loopback-bound and unauthenticated, so it must only ever be
+	// deployed on staging/qualification hosts.
+	var qualAdapter *QualificationAdapter
+	if qualURL := strings.TrimSpace(os.Getenv("CRABEDENCE_QUAL_PROVIDER_URL")); qualURL != "" {
+		var err error
+		qualAdapter, err = NewQualificationAdapter(qualURL)
+		if err != nil {
+			return err
+		}
+		desc, err := QualificationDescriptor()
+		if err != nil {
+			return fmt.Errorf("qualification capability descriptor: %w", err)
+		}
+		if err := registry.RegisterResolved(desc); err != nil {
+			return fmt.Errorf("register qualification capability: %w", err)
+		}
+		// Fail closed: a configured-but-unreachable provider must not
+		// start a service that would mint UNKNOWN records it cannot
+		// reconcile. The provider serves /stats without side effects.
+		if err := qualAdapter.ping(ctx); err != nil {
+			return fmt.Errorf("qualification provider at %s is not reachable: %w", qualURL, err)
+		}
+	}
+
 	// Create handlers
 	echoHandler := NewEchoHandler()
 	counterHandler := NewCounterHandler()
@@ -119,6 +153,17 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	//   CRABEDENCE_STORE_PATH — SQLite file location.
 	//     Default: ~/.config/crabbox/crabedence.db
 	//   CRABEDENCE_DATABASE_URL — PostgreSQL DSN (postgres backend).
+	//
+	// Exactly-once is a cluster-wide property: every replica must
+	// contend on one ledger. Each SQLite file mints its own execution
+	// IDs, and the provider idempotency token is derived from them, so
+	// two replicas on independent ledgers derive different provider
+	// tokens for the same idempotency key and can dispatch the same
+	// effect twice. CRABBOX_REPLICAS > 1 therefore requires postgres.
+	replicas, err := replicaCount()
+	if err != nil {
+		return err
+	}
 	backend := strings.ToLower(strings.TrimSpace(os.Getenv("CRABEDENCE_STORE_BACKEND")))
 	switch backend {
 	case "", "auto":
@@ -130,6 +175,9 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	case "sqlite", "postgres", "none":
 	default:
 		return fmt.Errorf("unknown CRABEDENCE_STORE_BACKEND %q (want sqlite, postgres, none, or auto)", backend)
+	}
+	if replicas > 1 && backend != "postgres" {
+		return fmt.Errorf("multi-replica deployment (CRABBOX_REPLICAS=%d) requires the shared postgres store backend (CRABEDENCE_STORE_BACKEND=postgres with CRABEDENCE_DATABASE_URL); backend %q gives each replica an independent ledger", replicas, backend)
 	}
 
 	var store idempotency.EffectStore
@@ -263,6 +311,9 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	if githubHandler != nil {
 		handlers["github"] = githubHandler
 	}
+	if qualAdapter != nil {
+		handlers[QualificationAdapterID] = qualAdapter
+	}
 	multiHandler := NewMultiHandler(handlers)
 
 	// Registry invariant scan and startup report. The registry fails
@@ -294,6 +345,20 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 		// Use DispatchExecutor for durable idempotency
 		executor := NewDispatchExecutor(multiHandler, store)
 		executor.SetEvidenceSigner(signer)
+		// CRABEDENCE_PROVIDER_EXECUTION_MAX overrides the executor's
+		// provider-invocation ceiling (Go duration, e.g. "90s", "5m").
+		// The ceiling is executor-owned and applies on top of any
+		// caller deadline: a provider that exceeds it — including one
+		// that ignores cancellation entirely — converges the record to
+		// UNKNOWN + reconciliation instead of heartbeating the lease
+		// forever.
+		if raw := strings.TrimSpace(os.Getenv("CRABEDENCE_PROVIDER_EXECUTION_MAX")); raw != "" {
+			d, err := time.ParseDuration(raw)
+			if err != nil || d <= 0 {
+				return fmt.Errorf("CRABEDENCE_PROVIDER_EXECUTION_MAX %q is not a positive Go duration (e.g. 90s, 5m)", raw)
+			}
+			executor.SetTimeouts(ExecutorTimeouts{ProviderExecution: d})
+		}
 		durable = executor
 	} else {
 		// No store — fail closed for MUTATION/CRITICAL
@@ -338,6 +403,23 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 		service.SetGrantResolver(authorityStore)
 	}
 
+	// Peer authentication: CRABEDENCE_PEER_PRINCIPALS maps Unix peer
+	// UIDs to principals ("uid:principal,uid:*"). When set, every
+	// request's principal claim is verified against the
+	// kernel-supplied peer UID — unmapped UIDs, missing credentials,
+	// and mismatched claims are denied, and the authenticated
+	// principal replaces the claim in the execution identity. Unset,
+	// the service keeps the bearer model's claimed principal (the
+	// socket is already owner-only). A malformed map refuses startup.
+	peerAuth, err := ParsePeerPrincipalMap(os.Getenv("CRABEDENCE_PEER_PRINCIPALS"))
+	if err != nil {
+		return fmt.Errorf("CRABEDENCE_PEER_PRINCIPALS: %w", err)
+	}
+	if peerAuth != nil {
+		service.SetPeerAuth(peerAuth)
+		fmt.Fprintf(os.Stderr, "Peer authentication: strict UID→principal map (%d entries)\n", len(peerAuth))
+	}
+
 	// Handle signals
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -351,6 +433,9 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 		worker.RegisterResolver("test.counter.increment", counterHandler)
 		if githubHandler != nil {
 			worker.RegisterResolver("github.issue.create", githubHandler)
+		}
+		if qualAdapter != nil {
+			worker.RegisterResolver(QualificationCapabilityID, qualAdapter)
 		}
 		worker.SetEvidenceSigner(signer)
 		// Reconciliation runs under a supervisor with an explicit
@@ -551,13 +636,31 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	return nil
 }
 
+// replicaCount parses CRABBOX_REPLICAS into the declared replica
+// count; unset/empty means a single replica. The parse fails closed:
+// a malformed value like "2x" is a startup error, never a silent
+// single-replica downgrade of replicated-mode protections.
+func replicaCount() (int, error) {
+	raw := strings.TrimSpace(os.Getenv("CRABBOX_REPLICAS"))
+	if raw == "" {
+		return 1, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 {
+		return 0, fmt.Errorf("CRABBOX_REPLICAS %q is not a positive integer", os.Getenv("CRABBOX_REPLICAS"))
+	}
+	return n, nil
+}
+
 // replicatedDeployment reports whether the operator declared a
 // multi-replica topology via CRABBOX_REPLICAS > 1. Replicated mode
 // tightens evidence-key requirements — a cryptographic cluster
-// identity must never be accidentally host-local.
+// identity must never be accidentally host-local. A malformed
+// CRABBOX_REPLICAS counts as replicated here (fail closed); Serve
+// rejects it outright via replicaCount before this runs.
 func replicatedDeployment() bool {
-	n, err := strconv.Atoi(strings.TrimSpace(os.Getenv("CRABBOX_REPLICAS")))
-	return err == nil && n > 1
+	n, err := replicaCount()
+	return err != nil || n > 1
 }
 
 // productionMode reports whether the operator declared production

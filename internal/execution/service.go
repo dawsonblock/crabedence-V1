@@ -42,9 +42,18 @@ type Request struct {
 }
 
 // RequestAuthority carries the principal and authority reference.
-// AuthorityRef is an opaque reference to authority material — today
-// a grant ID, tomorrow a capability token, workload identity, or
-// signed assertion. The ABI does not prescribe the authority mechanism.
+// AuthorityRef is an unguessable bearer reference to authority
+// material — today a grant ID, tomorrow a capability token, workload
+// identity, or signed assertion. Possession of the reference plus a
+// Principal matching the resolved material is the complete
+// authorization proof. Treat the reference as a credential — it must
+// never be logged or exposed. The ABI does not prescribe the authority
+// mechanism.
+//
+// Principal is a claim unless the deployment enables peer
+// authentication (CRABEDENCE_PEER_PRINCIPALS): then the kernel-supplied
+// Unix peer UID is mapped to a principal and the claim must agree —
+// the authenticated value replaces the claim before admission.
 type RequestAuthority struct {
 	Principal    string `json:"principal"`
 	AuthorityRef string `json:"authority_ref"`
@@ -144,6 +153,11 @@ type Service struct {
 	// is nil when the caller did not declare one (tests that construct
 	// the service directly); production always sets it.
 	adapterAvailability capability.AdapterAvailability
+	// peerAuth, when non-nil, enforces UID→principal authentication on
+	// every connection: the kernel-supplied peer UID must be mapped and
+	// the claimed principal must agree with the mapping. nil preserves
+	// the bearer model's claimed principal (single-user local socket).
+	peerAuth PeerPrincipalMap
 }
 
 // NewService creates a new execution service.
@@ -166,6 +180,14 @@ func (s *Service) SetAdapterAvailability(availability capability.AdapterAvailabi
 // SetGrantResolver sets the grant resolver for authority verification.
 func (s *Service) SetGrantResolver(resolver capability.GrantResolver) {
 	s.grantResolver = resolver
+}
+
+// SetPeerAuth enables strict UID→principal peer authentication. When
+// set, every request's principal claim is verified against the
+// kernel-supplied peer UID; the authenticated principal replaces the
+// claim for admission, grant resolution, and the durable record.
+func (s *Service) SetPeerAuth(m PeerPrincipalMap) {
+	s.peerAuth = m
 }
 
 // Start begins listening on the Unix socket.
@@ -291,6 +313,27 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 		return
 	}
 
+	// ─── Peer authentication ────────────────────────────────────────────
+	// When the deployment configures a UID→principal map, the caller's
+	// principal is not merely claimed: the kernel supplies the peer UID
+	// and the claim must agree with the mapping. The authenticated
+	// principal replaces the claim for everything downstream — admission,
+	// grant resolution, and the durable execution record — so authority
+	// binds to a kernel-authenticated identity, not a string the client
+	// wrote.
+	if s.peerAuth != nil {
+		principal, err := s.peerAuth.authenticatePeer(conn, req.Authority.Principal)
+		if err != nil {
+			s.writeResponse(conn, Response{
+				Status:      StatusDenied,
+				FailureCode: string(capability.FailureAdmissionDenied),
+				Error:       "peer authentication failed: " + err.Error(),
+			})
+			return
+		}
+		req.Authority.Principal = principal
+	}
+
 	// Admit the request
 	decision := s.registry.Admit(capability.AdmissionRequest{
 		Capability:     req.Capability,
@@ -375,6 +418,7 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 	if decision.Descriptor.AuthorityPolicy.GrantRequired {
 		grant, fc, reason := s.registry.VerifyAuthority(ctx, capability.AdmissionRequest{
 			Capability: req.Capability,
+			Arguments:  req.Arguments,
 			Principal:  req.Authority.Principal,
 			GrantID:    req.Authority.EffectiveAuthorityRef(),
 		}, s.grantResolver)

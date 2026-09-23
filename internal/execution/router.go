@@ -224,11 +224,31 @@ func (r *routeRuntime) execute(ctx context.Context, req Request, desc capability
 	defer cancel()
 
 	started := time.Now()
-	result, err := call(callCtx, CallContext{
-		Capability: req.Capability,
-		Principal:  req.Authority.Principal,
-		Arguments:  req.Arguments,
-	})
+	// The handler runs in its own goroutine: a route handler that
+	// ignores context cancellation would otherwise hold the request —
+	// and the connection — open forever. The buffered channel lets a
+	// late answer drop without pinning a goroutine on send.
+	type callResult struct {
+		result json.RawMessage
+		err    error
+	}
+	resultCh := make(chan callResult, 1)
+	go func() {
+		res, callErr := call(callCtx, CallContext{
+			Capability: req.Capability,
+			Principal:  req.Authority.Principal,
+			Arguments:  req.Arguments,
+		})
+		resultCh <- callResult{res, callErr}
+	}()
+	var result json.RawMessage
+	var err error
+	select {
+	case out := <-resultCh:
+		result, err = out.result, out.err
+	case <-callCtx.Done():
+		err = fmt.Errorf("%w: %s handler exceeded its %s execution budget", callCtx.Err(), r.route, timeout)
+	}
 	duration := time.Since(started)
 
 	runID := fmt.Sprintf("%s-%d", routeRunIDPrefix(r.route), started.UnixNano())

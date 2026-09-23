@@ -36,6 +36,7 @@ func (s *SQLiteStore) ensureSchema(ctx context.Context) error {
 			generation INTEGER NOT NULL,
 			principal TEXT NOT NULL,
 			capabilities TEXT NOT NULL DEFAULT '[]',
+			constraints TEXT NOT NULL DEFAULT '{}',
 			grant_digest TEXT NOT NULL DEFAULT '',
 			expires_at INTEGER,
 			revoked INTEGER NOT NULL DEFAULT 0,
@@ -46,6 +47,19 @@ func (s *SQLiteStore) ensureSchema(ctx context.Context) error {
 		)
 	`); err != nil {
 		return err
+	}
+	// Resource-constraint material: '{}' (unconstrained) digests
+	// identically to an absent field, so no stored digest changes.
+	hasConstraints, err := sqliteHasColumn(ctx, s.db, "authority_grants", "constraints")
+	if err != nil {
+		return err
+	}
+	if !hasConstraints {
+		if _, err := s.db.ExecContext(ctx, `
+			ALTER TABLE authority_grants ADD COLUMN constraints TEXT NOT NULL DEFAULT '{}'
+		`); err != nil {
+			return fmt.Errorf("failed to add constraints column: %w", err)
+		}
 	}
 	if err := s.migrateLegacySchema(ctx); err != nil {
 		return err
@@ -137,7 +151,7 @@ func (s *SQLiteStore) ensureAuthorityHeads(ctx context.Context) error {
 // millisecond-time ABI a resolved grant reproduces.
 func recomputeSQLiteGrantDigests(ctx context.Context, tx *sql.Tx) error {
 	rows, err := tx.QueryContext(ctx, `
-		SELECT grant_id, generation, principal, capabilities, issued_at, expires_at
+		SELECT grant_id, generation, principal, capabilities, constraints, issued_at, expires_at
 		FROM authority_grants
 	`)
 	if err != nil {
@@ -146,22 +160,24 @@ func recomputeSQLiteGrantDigests(ctx context.Context, tx *sql.Tx) error {
 	defer rows.Close()
 
 	type grantRow struct {
-		grantID    string
-		generation int64
-		principal  string
-		caps       []string
-		issuedAt   time.Time
-		expiresAt  time.Time
+		grantID     string
+		generation  int64
+		principal   string
+		caps        []string
+		constraints map[string][]string
+		issuedAt    time.Time
+		expiresAt   time.Time
 	}
 	var pending []grantRow
 	for rows.Next() {
 		var r grantRow
-		var capsJSON string
+		var capsJSON, constraintsJSON string
 		var issuedAt, expiresAt sql.NullInt64
-		if err := rows.Scan(&r.grantID, &r.generation, &r.principal, &capsJSON, &issuedAt, &expiresAt); err != nil {
+		if err := rows.Scan(&r.grantID, &r.generation, &r.principal, &capsJSON, &constraintsJSON, &issuedAt, &expiresAt); err != nil {
 			return fmt.Errorf("failed to scan grant row for digest recompute: %w", err)
 		}
 		_ = json.Unmarshal([]byte(capsJSON), &r.caps)
+		_ = json.Unmarshal([]byte(constraintsJSON), &r.constraints)
 		if issuedAt.Valid {
 			r.issuedAt = time.UnixMilli(issuedAt.Int64).UTC()
 		}
@@ -180,6 +196,7 @@ func recomputeSQLiteGrantDigests(ctx context.Context, tx *sql.Tx) error {
 			Generation:   r.generation,
 			Principal:    r.principal,
 			Capabilities: r.caps,
+			Constraints:  r.constraints,
 			IssuedAt:     r.issuedAt,
 			ExpiresAt:    r.expiresAt,
 		})
@@ -258,6 +275,7 @@ func (s *SQLiteStore) migrateLegacySchema(ctx context.Context) error {
 			generation INTEGER NOT NULL,
 			principal TEXT NOT NULL,
 			capabilities TEXT NOT NULL DEFAULT '[]',
+			constraints TEXT NOT NULL DEFAULT '{}',
 			grant_digest TEXT NOT NULL DEFAULT '',
 			expires_at INTEGER,
 			revoked INTEGER NOT NULL DEFAULT 0,
@@ -267,8 +285,8 @@ func (s *SQLiteStore) migrateLegacySchema(ctx context.Context) error {
 			PRIMARY KEY (grant_id, generation)
 		)`,
 		`INSERT INTO authority_grants_v2
-			(grant_id, generation, principal, capabilities, expires_at, revoked, created_at, updated_at)
-		 SELECT grant_id, 1, principal, capabilities, expires_at, revoked, created_at, updated_at
+			(grant_id, generation, principal, capabilities, constraints, expires_at, revoked, created_at, updated_at)
+		 SELECT grant_id, 1, principal, capabilities, constraints, expires_at, revoked, created_at, updated_at
 		 FROM authority_grants`,
 		`DROP TABLE authority_grants`,
 		`ALTER TABLE authority_grants_v2 RENAME TO authority_grants`,
@@ -288,7 +306,7 @@ func (s *SQLiteStore) migrateLegacySchema(ctx context.Context) error {
 // migrated from the legacy schema (digest column empty).
 func backfillSQLiteGrantDigests(ctx context.Context, tx *sql.Tx) error {
 	rows, err := tx.QueryContext(ctx, `
-		SELECT grant_id, generation, principal, capabilities, expires_at
+		SELECT grant_id, generation, principal, capabilities, constraints, expires_at
 		FROM authority_grants
 		WHERE grant_digest = ''
 	`)
@@ -298,21 +316,23 @@ func backfillSQLiteGrantDigests(ctx context.Context, tx *sql.Tx) error {
 	defer rows.Close()
 
 	type legacyRow struct {
-		grantID    string
-		generation int64
-		principal  string
-		caps       []string
-		expiresAt  time.Time
+		grantID     string
+		generation  int64
+		principal   string
+		caps        []string
+		constraints map[string][]string
+		expiresAt   time.Time
 	}
 	var pending []legacyRow
 	for rows.Next() {
 		var r legacyRow
-		var capsJSON string
+		var capsJSON, constraintsJSON string
 		var expiresAt sql.NullInt64
-		if err := rows.Scan(&r.grantID, &r.generation, &r.principal, &capsJSON, &expiresAt); err != nil {
+		if err := rows.Scan(&r.grantID, &r.generation, &r.principal, &capsJSON, &constraintsJSON, &expiresAt); err != nil {
 			return fmt.Errorf("failed to scan grant row for digest backfill: %w", err)
 		}
 		_ = json.Unmarshal([]byte(capsJSON), &r.caps)
+		_ = json.Unmarshal([]byte(constraintsJSON), &r.constraints)
 		if expiresAt.Valid {
 			r.expiresAt = time.UnixMilli(expiresAt.Int64).UTC()
 		}
@@ -328,6 +348,7 @@ func backfillSQLiteGrantDigests(ctx context.Context, tx *sql.Tx) error {
 			Generation:   r.generation,
 			Principal:    r.principal,
 			Capabilities: r.caps,
+			Constraints:  r.constraints,
 			ExpiresAt:    r.expiresAt,
 		})
 		if _, err := tx.ExecContext(ctx, `
@@ -357,12 +378,12 @@ func (s *SQLiteStore) Resolve(ctx context.Context, grantID string, principal str
 	}
 
 	var g capability.Grant
-	var capabilitiesJSON string
+	var capabilitiesJSON, constraintsJSON string
 	var issuedAt, expiresAt sql.NullInt64
 	var revoked, unexpired int
 	s.metrics.resolves.Add(1)
 	err := s.db.QueryRowContext(ctx, `
-		SELECT grant_id, generation, principal, capabilities, grant_digest,
+		SELECT grant_id, generation, principal, capabilities, constraints, grant_digest,
 		       issued_at, expires_at, revoked,
 		       (expires_at IS NULL OR expires_at > `+sqliteNow+`) AS unexpired
 		FROM authority_grants
@@ -370,7 +391,7 @@ func (s *SQLiteStore) Resolve(ctx context.Context, grantID string, principal str
 		ORDER BY generation DESC
 		LIMIT 1
 	`, grantID).Scan(
-		&g.ID, &g.Generation, &g.Principal, &capabilitiesJSON, &g.Digest,
+		&g.ID, &g.Generation, &g.Principal, &capabilitiesJSON, &constraintsJSON, &g.Digest,
 		&issuedAt, &expiresAt, &revoked, &unexpired,
 	)
 	if err != nil {
@@ -398,6 +419,9 @@ func (s *SQLiteStore) Resolve(ctx context.Context, grantID string, principal str
 	if capabilitiesJSON != "" {
 		_ = json.Unmarshal([]byte(capabilitiesJSON), &g.Capabilities)
 	}
+	if constraintsJSON != "" {
+		_ = json.Unmarshal([]byte(constraintsJSON), &g.Constraints)
+	}
 	return &g, nil
 }
 
@@ -414,9 +438,20 @@ func (s *SQLiteStore) ExpiryIsAuthoritative() bool { return true }
 // MAX(generation)+1 into a primary-key collision. A closed authority
 // reference rejects issuance with ErrAuthorityClosed.
 func (s *SQLiteStore) IssueGrant(ctx context.Context, grantID, principal string, capabilities []string, expiresAt time.Time) (*capability.Grant, error) {
+	return s.IssueGrantWithConstraints(ctx, grantID, principal, capabilities, nil, expiresAt)
+}
+
+// IssueGrantWithConstraints is IssueGrant with resource constraints:
+// dimension → admitted values. Constraints are immutable grant
+// material — stored on the generation row and bound into grant_digest.
+func (s *SQLiteStore) IssueGrantWithConstraints(ctx context.Context, grantID, principal string, capabilities []string, constraints map[string][]string, expiresAt time.Time) (*capability.Grant, error) {
 	caps, err := json.Marshal(capabilities)
 	if err != nil {
 		return nil, err
+	}
+	constraintsJSON, err := json.Marshal(constraints)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal grant constraints: %w", err)
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -444,6 +479,7 @@ func (s *SQLiteStore) IssueGrant(ctx context.Context, grantID, principal string,
 		Generation:   generation,
 		Principal:    principal,
 		Capabilities: append([]string(nil), capabilities...),
+		Constraints:  constraints,
 		IssuedAt:     time.UnixMilli(time.Now().UTC().UnixMilli()).UTC(),
 		ExpiresAt:    normalizedExpiry,
 	}
@@ -451,9 +487,9 @@ func (s *SQLiteStore) IssueGrant(ctx context.Context, grantID, principal string,
 
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO authority_grants
-			(grant_id, generation, principal, capabilities, grant_digest, issued_at, expires_at, created_at, updated_at)
-		VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, `+sqliteNow+`, `+sqliteNow+`)
-	`, grantID, generation, principal, string(caps), grant.Digest,
+			(grant_id, generation, principal, capabilities, constraints, grant_digest, issued_at, expires_at, created_at, updated_at)
+		VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, `+sqliteNow+`, `+sqliteNow+`)
+	`, grantID, generation, principal, string(caps), string(constraintsJSON), grant.Digest,
 		grant.IssuedAt.UnixMilli(), expMs); err != nil {
 		return nil, fmt.Errorf("failed to issue grant: %w", err)
 	}

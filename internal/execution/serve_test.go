@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,6 +22,8 @@ import (
 // take the whole service down.
 func TestServeWritesRegistrySnapshotOnAFreshDirectory(t *testing.T) {
 	t.Setenv("CRABEDENCE_STORE_BACKEND", "none")
+	t.Setenv("CRABEDENCE_QUAL_PROVIDER_URL", "")
+	t.Setenv("CRABEDENCE_PEER_PRINCIPALS", "")
 
 	parent := shortSocketDir(t)
 	// The socket directory deliberately does not exist yet.
@@ -106,6 +109,8 @@ func TestServeWritesRegistrySnapshotOnAFreshDirectory(t *testing.T) {
 // and records only normalized, non-secret configuration.
 func TestServeWritesVerifiableRuntimeIdentity(t *testing.T) {
 	t.Setenv("CRABEDENCE_STORE_BACKEND", "none")
+	t.Setenv("CRABEDENCE_QUAL_PROVIDER_URL", "")
+	t.Setenv("CRABEDENCE_PEER_PRINCIPALS", "")
 	t.Setenv("CRABBOX_GITHUB_ENABLED", "false")
 	t.Setenv("CRABBOX_GITHUB_TOKEN", "")
 	t.Setenv("GITHUB_TOKEN", "")
@@ -188,5 +193,81 @@ func TestServeWritesVerifiableRuntimeIdentity(t *testing.T) {
 	}
 	if envelope.RuntimeConfigurationSHA256 == snapshot.RegistrySHA256 {
 		t.Fatal("runtime configuration identity must be distinct from the registry identity")
+	}
+}
+
+// TestServeRejectsReplicatedDeploymentWithoutSharedStore proves the
+// topology gate: a multi-replica deployment can never run on
+// independent per-host ledgers. Each SQLite file mints its own
+// execution IDs, and the provider idempotency token is derived from
+// them — a retry landing on a peer replica would derive a different
+// provider token and could dispatch the same effect twice.
+func TestServeRejectsReplicatedDeploymentWithoutSharedStore(t *testing.T) {
+	t.Setenv("CRABBOX_GITHUB_ENABLED", "false")
+	t.Setenv("CRABBOX_GITHUB_TOKEN", "")
+	t.Setenv("GITHUB_TOKEN", "")
+	// No ambient DSN — Serve reads the DSN from ServeOptions, but pin
+	// the env anyway so a future env fallback cannot flake the
+	// postgres-without-DSN case.
+	t.Setenv("CRABEDENCE_DATABASE_URL", "")
+
+	for _, tc := range []struct {
+		name     string
+		replicas string
+		backend  string
+		wantErr  string
+	}{
+		{"sqlite", "2", "sqlite", "requires the shared postgres store backend"},
+		{"none", "2", "none", "requires the shared postgres store backend"},
+		{"auto without DSN resolves sqlite", "3", "auto", "requires the shared postgres store backend"},
+		{"unset backend resolves sqlite", "2", "", "requires the shared postgres store backend"},
+		{"malformed replica count fails closed", "2x", "none", "not a positive integer"},
+		{"zero replicas fails closed", "0", "none", "not a positive integer"},
+		{"postgres without DSN still requires it", "2", "postgres", "requires CRABEDENCE_DATABASE_URL"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("CRABBOX_REPLICAS", tc.replicas)
+			t.Setenv("CRABEDENCE_STORE_BACKEND", tc.backend)
+			err := Serve(context.Background(), ServeOptions{})
+			if err == nil {
+				t.Fatalf("serve must refuse replicas=%s backend=%q", tc.replicas, tc.backend)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("serve error = %q, want substring %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestReplicaCountParsing covers the fail-closed parse: malformed
+// values are startup errors, never a silent single-replica downgrade.
+func TestReplicaCountParsing(t *testing.T) {
+	for _, tc := range []struct {
+		raw     string
+		want    int
+		wantErr bool
+	}{
+		{"", 1, false},
+		{"  ", 1, false},
+		{"1", 1, false},
+		{" 3 ", 3, false},
+		{"2x", 0, true},
+		{"0", 0, true},
+		{"-1", 0, true},
+	} {
+		t.Setenv("CRABBOX_REPLICAS", tc.raw)
+		n, err := replicaCount()
+		if tc.wantErr {
+			if err == nil {
+				t.Fatalf("CRABBOX_REPLICAS=%q must fail closed", tc.raw)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("CRABBOX_REPLICAS=%q: %v", tc.raw, err)
+		}
+		if n != tc.want {
+			t.Fatalf("CRABBOX_REPLICAS=%q → %d, want %d", tc.raw, n, tc.want)
+		}
 	}
 }

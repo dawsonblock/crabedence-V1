@@ -377,10 +377,9 @@ function validateWireResponse(raw: unknown): CrabedenceExecutionResponse {
  * thrown, because the side effect may have already occurred.
  */
 export class CrabedenceExecutionAdapter implements ExecutionPort {
-  constructor(
-    private readonly client: CrabedenceClient,
-    private readonly timeoutMs: number = DEFAULT_TIMEOUT_MS,
-  ) {}
+  // Transport timeouts live on the client; the execution ceiling is
+  // owned by the Crabedence executor server-side, not by this adapter.
+  constructor(private readonly client: CrabedenceClient) {}
 
   async execute(
     request: KernelExecutionRequest,

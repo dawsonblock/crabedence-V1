@@ -31,6 +31,11 @@ Ubuntu 24.04 LTS VM
 ├── crabbox serve-exec  (systemd, Unix socket)
 ├── NEMO planner (client-side, invokes over the socket)
 ├── external CRITICAL qualification provider (own process, own ledger)
+│   ships as `qual-provider` (cmd/qual-provider) on post-RC1 builds and
+│   is wired with CRABEDENCE_QUAL_PROVIDER_URL — see
+│     deploy/staging/proofs/09-external-provider.sh for the two tiers
+│   ⚠ the immutable RC1 artifact predates the binary; RC1 deployments
+│     use proof 09's harness tier instead
 ├── journald log capture
 └── (metrics via process/journal + DB inspection — see Observability)
 PostgreSQL 16
@@ -58,7 +63,9 @@ cd crabedence-v0.52.0-rc.1
 export GOTOOLCHAIN=local   # go1.26.5 exactly
 scripts/verify-go-toolchain.sh
 go build -trimpath -o /usr/local/bin/crabbox ./cmd/crabbox
-sha256sum /usr/local/bin/crabbox   # record in deployment manifest
+# post-RC1 builds only — the deployed-tier qualification provider:
+go build -trimpath -o /usr/local/bin/qual-provider ./cmd/qual-provider
+sha256sum /usr/local/bin/crabbox /usr/local/bin/qual-provider   # record in deployment manifest
 ```
 
 ## Service configuration
@@ -103,6 +110,38 @@ complete secret/config inventory:
 | `CRABBOX_GITHUB_ENABLED` | `true` |
 | `CRABBOX_GITHUB_TOKEN` | staging-scoped token only |
 | `CRABBOX_GITHUB_API_URL` | unset (real api.github.com) |
+| `CRABEDENCE_QUAL_PROVIDER_URL` | unset on RC1; `http://127.0.0.1:9100` on builds carrying the qualification extension (enables proof 09's deployed tier) |
+| `CRABEDENCE_PEER_PRINCIPALS` | unset (claimed-principal bearer model); set `uid:principal` pairs to enforce kernel-authenticated principals |
+
+Post-RC1 builds only — deployed qualification provider unit
+(`/etc/systemd/system/crabedence-qual-provider.service`), ordered and
+started before `crabedence.service` because the service fails closed
+when a configured provider is unreachable:
+
+```ini
+[Unit]
+Description=Crabedence external qualification provider
+Before=crabedence.service
+
+[Service]
+Type=simple
+User=crabedence
+Group=crabedence
+ExecStart=/usr/local/bin/qual-provider --dir /var/lib/crabedence-qual --listen 127.0.0.1:9100
+StateDirectory=crabedence-qual
+StateDirectoryMode=0700
+Restart=on-failure
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Loopback-only: the provider API is unauthenticated by design — it is a
+qualification component, never expose it off-host or on a production
+deployment.
 
 `CRABBOX_MODE=production` is mandatory: it forbids silent key generation.
 If the evidence key is absent the service must refuse to start.
@@ -175,7 +214,10 @@ Each stage requires the previous stage healthy. Halt on any discrepancy.
 2. **LOCAL capabilities** (`system.echo`, `system.info`) — no store,
    no provider.
 3. **DIRECT READ** (`github.issue.get` against a staging-scoped repo) —
-   adapter availability, timeout/error mapping, audit log lines.
+   grant-required and repo-constrained (the token-backed read never
+   runs grant-free): issue a grant with `--constraint repo=owner/name`,
+   confirm the foreign-repo read denies, plus adapter availability,
+   timeout/error mapping, audit log lines.
 4. **Durable MUTATION** — one low-impact capability
    (`test.counter.increment`); confirm one request → one durable record
    → one provider operation → one terminal result.

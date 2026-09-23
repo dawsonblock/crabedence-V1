@@ -63,9 +63,18 @@ The `authority` field groups identity and authorization material:
 }
 ```
 
-- `principal` (required): the requesting principal's identity.
-- `authority_ref` (conditionally required): opaque reference to
-  authority material. Crabedence resolves it internally.
+- `principal` (required): the requesting principal's identity. It is a
+  claimed attribute unless the deployment enables peer authentication
+  (`CRABEDENCE_PEER_PRINCIPALS`), in which case it is verified against
+  the kernel-supplied Unix peer UID. Authorization derives from
+  resolving `authority_ref` against the principal; the two together
+  are checked by the authority store.
+- `authority_ref` (conditionally required): an unguessable bearer
+  reference to authority material. Crabedence resolves it internally.
+  Possession of the reference is the authorization proof — treat it
+  like a credential: never log it, never expose it to parties that
+  should not hold the authority, and provision it with entropy
+  comparable to a token (the built-in issuer uses 96-bit random IDs).
 - `grant_id` (deprecated alias): accepted for backward compatibility
   and mapped to `authority_ref` when `authority_ref` is absent.
 
@@ -117,7 +126,7 @@ capability token, workload identity, session authorization, signed
 assertion, or another mechanism. Calling the stable field `grant_id`
 would freeze one implementation model.
 
-`authority_ref` is an opaque reference to authority material.
+`authority_ref` is an opaque bearer reference to authority material.
 Crabedence resolves it internally:
 
 ```
@@ -127,6 +136,29 @@ authority_ref → workload identity (future)
 ```
 
 The ABI does not prescribe the authority mechanism.
+
+### Bearer semantics
+
+In the current model `authority_ref` is bearer authority: possession
+of the reference — plus a `principal` matching the resolved material —
+is the complete authorization proof. The planner supplies the
+`principal` string; the execution service does not independently
+authenticate it beyond the authority store's principal match. The
+trust boundary therefore rests on two controls:
+
+1. `authority_ref` values are unguessable and treated as secrets —
+   they must never appear in logs, receipts, or metrics.
+2. The transport boundary (a `0600` Unix socket today) restricts who
+   can present references at all.
+
+Deployments that need stronger principal authentication can enable
+peer authentication: `CRABEDENCE_PEER_PRINCIPALS` maps Unix peer UIDs
+to principals, the kernel supplies the UID over the socket, and a
+claim that disagrees with the mapping is denied — the authenticated
+principal replaces the claim before admission (see
+`docs/architecture/authority-model.md`). Alternatively, an
+authenticated proxy or a future signed-session authority mechanism can
+front the socket.
 
 ## Three Orthogonal Dimensions
 

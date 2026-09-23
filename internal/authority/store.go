@@ -18,6 +18,7 @@ package authority
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -56,6 +57,7 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 			generation INTEGER NOT NULL,
 			principal TEXT NOT NULL,
 			capabilities TEXT[] NOT NULL DEFAULT '{}',
+			constraints JSONB NOT NULL DEFAULT '{}',
 			grant_digest TEXT NOT NULL DEFAULT '',
 			expires_at TIMESTAMPTZ,
 			revoked BOOLEAN NOT NULL DEFAULT FALSE,
@@ -65,6 +67,16 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 		)
 	`); err != nil {
 		return err
+	}
+	// Resource-constraint material: added after CREATE so existing
+	// pre-constraints tables gain the column too. '{}' (unconstrained)
+	// digests identically to an absent field, so no stored digest
+	// changes under this upgrade.
+	if _, err := s.db.ExecContext(ctx, `
+		ALTER TABLE authority_grants
+		ADD COLUMN IF NOT EXISTS constraints JSONB NOT NULL DEFAULT '{}'
+	`); err != nil {
+		return fmt.Errorf("failed to add constraints column: %w", err)
 	}
 	if err := s.migrateLegacySchema(ctx); err != nil {
 		return err
@@ -119,7 +131,7 @@ func (s *Store) migrateLegacySchema(ctx context.Context) error {
 // migrated from the legacy schema (digest column empty).
 func backfillGrantDigests(ctx context.Context, tx *sql.Tx) error {
 	rows, err := tx.QueryContext(ctx, `
-		SELECT grant_id, generation, principal, capabilities, expires_at
+		SELECT grant_id, generation, principal, capabilities, constraints, expires_at
 		FROM authority_grants
 		WHERE grant_digest = ''
 	`)
@@ -129,21 +141,23 @@ func backfillGrantDigests(ctx context.Context, tx *sql.Tx) error {
 	defer rows.Close()
 
 	type legacyRow struct {
-		grantID    string
-		generation int64
-		principal  string
-		caps       []string
-		expiresAt  time.Time
+		grantID     string
+		generation  int64
+		principal   string
+		caps        []string
+		constraints map[string][]string
+		expiresAt   time.Time
 	}
 	var pending []legacyRow
 	for rows.Next() {
 		var r legacyRow
-		var capsRaw []byte
+		var capsRaw, constraintsRaw []byte
 		var expiresAt sql.NullTime
-		if err := rows.Scan(&r.grantID, &r.generation, &r.principal, &capsRaw, &expiresAt); err != nil {
+		if err := rows.Scan(&r.grantID, &r.generation, &r.principal, &capsRaw, &constraintsRaw, &expiresAt); err != nil {
 			return fmt.Errorf("failed to scan grant row for digest backfill: %w", err)
 		}
 		r.caps = parsePostgresArray(string(capsRaw))
+		r.constraints = parseConstraintsJSON(constraintsRaw)
 		if expiresAt.Valid {
 			r.expiresAt = expiresAt.Time
 		}
@@ -159,6 +173,7 @@ func backfillGrantDigests(ctx context.Context, tx *sql.Tx) error {
 			Generation:   r.generation,
 			Principal:    r.principal,
 			Capabilities: r.caps,
+			Constraints:  r.constraints,
 			ExpiresAt:    r.expiresAt,
 		})
 		if _, err := tx.ExecContext(ctx, `
@@ -223,7 +238,7 @@ func (s *Store) ensureAuthorityHeads(ctx context.Context) error {
 // brought onto the ABI a resolved grant reproduces.
 func recomputeGrantDigests(ctx context.Context, tx *sql.Tx) error {
 	rows, err := tx.QueryContext(ctx, `
-		SELECT grant_id, generation, principal, capabilities, issued_at, expires_at
+		SELECT grant_id, generation, principal, capabilities, constraints, issued_at, expires_at
 		FROM authority_grants
 	`)
 	if err != nil {
@@ -232,22 +247,24 @@ func recomputeGrantDigests(ctx context.Context, tx *sql.Tx) error {
 	defer rows.Close()
 
 	type grantRow struct {
-		grantID    string
-		generation int64
-		principal  string
-		caps       []string
-		issuedAt   time.Time
-		expiresAt  time.Time
+		grantID     string
+		generation  int64
+		principal   string
+		caps        []string
+		constraints map[string][]string
+		issuedAt    time.Time
+		expiresAt   time.Time
 	}
 	var pending []grantRow
 	for rows.Next() {
 		var r grantRow
-		var capsRaw []byte
+		var capsRaw, constraintsRaw []byte
 		var issuedAt, expiresAt sql.NullTime
-		if err := rows.Scan(&r.grantID, &r.generation, &r.principal, &capsRaw, &issuedAt, &expiresAt); err != nil {
+		if err := rows.Scan(&r.grantID, &r.generation, &r.principal, &capsRaw, &constraintsRaw, &issuedAt, &expiresAt); err != nil {
 			return fmt.Errorf("failed to scan grant row for digest recompute: %w", err)
 		}
 		r.caps = parsePostgresArray(string(capsRaw))
+		r.constraints = parseConstraintsJSON(constraintsRaw)
 		if issuedAt.Valid {
 			r.issuedAt = time.UnixMilli(issuedAt.Time.UTC().UnixMilli()).UTC()
 		}
@@ -266,6 +283,7 @@ func recomputeGrantDigests(ctx context.Context, tx *sql.Tx) error {
 			Generation:   r.generation,
 			Principal:    r.principal,
 			Capabilities: r.caps,
+			Constraints:  r.constraints,
 			IssuedAt:     r.issuedAt,
 			ExpiresAt:    r.expiresAt,
 		})
@@ -317,12 +335,12 @@ func (s *Store) Resolve(ctx context.Context, grantID string, principal string) (
 	}
 
 	var g capability.Grant
-	var capabilities []byte
+	var capabilities, constraints []byte
 	var issuedAt, expiresAt sql.NullTime
 	var unexpired bool
 	s.metrics.resolves.Add(1)
 	err := s.db.QueryRowContext(ctx, `
-		SELECT grant_id, generation, principal, capabilities, grant_digest,
+		SELECT grant_id, generation, principal, capabilities, constraints, grant_digest,
 		       issued_at, expires_at, revoked,
 		       (expires_at IS NULL OR expires_at > NOW()) AS unexpired
 		FROM authority_grants
@@ -330,7 +348,7 @@ func (s *Store) Resolve(ctx context.Context, grantID string, principal string) (
 		ORDER BY generation DESC
 		LIMIT 1
 	`, grantID).Scan(
-		&g.ID, &g.Generation, &g.Principal, &capabilities, &g.Digest,
+		&g.ID, &g.Generation, &g.Principal, &capabilities, &constraints, &g.Digest,
 		&issuedAt, &expiresAt, &g.Revoked, &unexpired,
 	)
 	if err != nil {
@@ -361,6 +379,7 @@ func (s *Store) Resolve(ctx context.Context, grantID string, principal string) (
 	if len(capabilities) > 0 {
 		g.Capabilities = parsePostgresArray(string(capabilities))
 	}
+	g.Constraints = parseConstraintsJSON(constraints)
 
 	return &g, nil
 }
@@ -386,6 +405,20 @@ func (s *Store) ExpiryIsAuthoritative() bool { return true }
 // completion, persistence, or reconciliation — admission-time
 // authority material is immutable and digest-bound.
 func (s *Store) IssueGrant(ctx context.Context, grantID, principal string, capabilities []string, expiresAt time.Time) (*capability.Grant, error) {
+	return s.IssueGrantWithConstraints(ctx, grantID, principal, capabilities, nil, expiresAt)
+}
+
+// IssueGrantWithConstraints is IssueGrant with resource constraints:
+// dimension → admitted values (e.g. "repo" → ["openclaw/crabbox"]).
+// Constraints are immutable grant material — they are stored on the
+// generation row and bound into grant_digest, so an execution can
+// prove exactly which resource scope admitted it.
+func (s *Store) IssueGrantWithConstraints(ctx context.Context, grantID, principal string, capabilities []string, constraints map[string][]string, expiresAt time.Time) (*capability.Grant, error) {
+	constraintsJSON, err := json.Marshal(constraints)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal grant constraints: %w", err)
+	}
+
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -409,6 +442,7 @@ func (s *Store) IssueGrant(ctx context.Context, grantID, principal string, capab
 		Generation:   generation,
 		Principal:    principal,
 		Capabilities: append([]string(nil), capabilities...),
+		Constraints:  constraints,
 		IssuedAt:     time.UnixMilli(time.Now().UTC().UnixMilli()).UTC(),
 		ExpiresAt:    normalizedExpiry,
 	}
@@ -416,9 +450,9 @@ func (s *Store) IssueGrant(ctx context.Context, grantID, principal string, capab
 
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO authority_grants
-			(grant_id, generation, principal, capabilities, grant_digest, issued_at, expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
-	`, grantID, generation, principal, capabilities, grant.Digest,
+			(grant_id, generation, principal, capabilities, constraints, grant_digest, issued_at, expires_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+	`, grantID, generation, principal, capabilities, string(constraintsJSON), grant.Digest,
 		nullableTime(grant.IssuedAt), nullableTime(grant.ExpiresAt)); err != nil {
 		return nil, fmt.Errorf("failed to issue grant: %w", err)
 	}
@@ -540,6 +574,20 @@ func (s *Store) RevokeGrant(ctx context.Context, grantID string) error {
 	}
 	s.metrics.grantsRevoked.Add(1)
 	return nil
+}
+
+// parseConstraintsJSON decodes the stored constraint material
+// ({"dimension": ["value", ...]}). Empty or '{}' decodes to nil — an
+// unconstrained grant.
+func parseConstraintsJSON(raw []byte) map[string][]string {
+	if len(raw) == 0 {
+		return nil
+	}
+	var out map[string][]string
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil
+	}
+	return out
 }
 
 // parsePostgresArray parses a PostgreSQL text[] representation like

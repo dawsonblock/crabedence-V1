@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/openclaw/crabbox/internal/capability"
 )
@@ -248,8 +249,21 @@ func TestDirectReadEndToEndOverSocket(t *testing.T) {
 	dispatcher.SetLocal(hooks)
 	dispatcher.SetDirect(reads)
 
+	// github.issue.get is token-backed and grant-required; scope the
+	// grant to example-org/my-app so the resource constraint is also
+	// exercised end-to-end.
+	resolver := capability.NewInMemoryGrantResolver()
+	resolver.AddGrant(&capability.Grant{
+		ID:           "grant_repo",
+		Principal:    "alice@example.com",
+		Capabilities: []string{"github.issue.get"},
+		Constraints:  map[string][]string{"repo": {"example-org/my-app"}},
+		ExpiresAt:    time.Now().Add(1 * time.Hour),
+	})
+
 	socketPath := testSocketPath(t)
 	service := NewService(registry, dispatcher, socketPath)
+	service.SetGrantResolver(resolver)
 	if err := service.Start(context.Background()); err != nil {
 		t.Fatalf("start service: %v", err)
 	}
@@ -269,7 +283,7 @@ func TestDirectReadEndToEndOverSocket(t *testing.T) {
 	response := send(Request{
 		Capability: "github.issue.get",
 		Arguments:  json.RawMessage(`{"repo":"example-org/my-app","number":9}`),
-		Authority:  RequestAuthority{Principal: "alice@example.com"},
+		Authority:  RequestAuthority{Principal: "alice@example.com", AuthorityRef: "grant_repo"},
 	})
 	if response.Status != StatusSucceeded {
 		t.Fatalf("github.issue.get over the socket failed: %s: %s", response.Status, response.Error)
@@ -286,9 +300,29 @@ func TestDirectReadEndToEndOverSocket(t *testing.T) {
 	denied := send(Request{
 		Capability: "github.issue.get",
 		Arguments:  json.RawMessage(`{"repo":"example-org/my-app","number":0}`),
-		Authority:  RequestAuthority{Principal: "alice@example.com"},
+		Authority:  RequestAuthority{Principal: "alice@example.com", AuthorityRef: "grant_repo"},
 	})
 	if denied.Status != StatusDenied {
 		t.Fatalf("invalid read arguments must be denied, got %s: %s", denied.Status, denied.Error)
+	}
+
+	// The grant's repo constraint must deny reads on other repositories.
+	foreign := send(Request{
+		Capability: "github.issue.get",
+		Arguments:  json.RawMessage(`{"repo":"other-org/other-repo","number":9}`),
+		Authority:  RequestAuthority{Principal: "alice@example.com", AuthorityRef: "grant_repo"},
+	})
+	if foreign.Status != StatusDenied {
+		t.Fatalf("repo outside grant scope must be denied, got %s: %s", foreign.Status, foreign.Error)
+	}
+
+	// Without a grant the token-backed read is denied outright.
+	ungranted := send(Request{
+		Capability: "github.issue.get",
+		Arguments:  json.RawMessage(`{"repo":"example-org/my-app","number":9}`),
+		Authority:  RequestAuthority{Principal: "alice@example.com"},
+	})
+	if ungranted.Status != StatusDenied {
+		t.Fatalf("grant-free github.issue.get must be denied, got %s: %s", ungranted.Status, ungranted.Error)
 	}
 }

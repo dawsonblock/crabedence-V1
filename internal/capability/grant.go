@@ -15,8 +15,18 @@ type Grant struct {
 	ID           string
 	Principal    string
 	Capabilities []string // capabilities this grant permits
-	ExpiresAt    time.Time
-	Revoked      bool
+	// Constraints bind the grant to specific resource values per
+	// dimension (e.g. "repo": ["openclaw/crabbox"]). A capability's
+	// authority policy maps each constraint dimension to a request
+	// argument; admission requires the argument's value to be listed
+	// for every bound dimension ("*" admits any value). A dimension
+	// absent from Constraints is unconstrained, so a grant issued
+	// without constraints covers every resource the capability can
+	// name — issue constrained grants for least privilege.
+	// Constraints are immutable grant material, bound into Digest.
+	Constraints map[string][]string
+	ExpiresAt   time.Time
+	Revoked     bool
 	// IssuedAt is the issuance instant, part of the immutable grant
 	// material bound into Digest. Stores normalize it to Unix
 	// milliseconds before persisting.
@@ -56,17 +66,19 @@ func ComputeGrantDigest(g *Grant) string {
 		expiresAtMs = g.ExpiresAt.UTC().UnixMilli()
 	}
 	canonical, err := json.Marshal(struct {
-		GrantID      string   `json:"grant_id"`
-		Generation   int64    `json:"generation"`
-		Principal    string   `json:"principal"`
-		Capabilities []string `json:"capabilities"`
-		IssuedAtMs   int64    `json:"issued_at_ms"`
-		ExpiresAtMs  int64    `json:"expires_at_ms"`
+		GrantID      string              `json:"grant_id"`
+		Generation   int64               `json:"generation"`
+		Principal    string              `json:"principal"`
+		Capabilities []string            `json:"capabilities"`
+		Constraints  map[string][]string `json:"constraints,omitempty"`
+		IssuedAtMs   int64               `json:"issued_at_ms"`
+		ExpiresAtMs  int64               `json:"expires_at_ms"`
 	}{
 		GrantID:      g.ID,
 		Generation:   g.Generation,
 		Principal:    g.Principal,
 		Capabilities: caps,
+		Constraints:  normalizeConstraints(g.Constraints),
 		IssuedAtMs:   issuedAtMs,
 		ExpiresAtMs:  expiresAtMs,
 	})
@@ -75,6 +87,31 @@ func ComputeGrantDigest(g *Grant) string {
 	}
 	sum := sha256.Sum256(canonical)
 	return hex.EncodeToString(sum[:])
+}
+
+// normalizeConstraints returns a canonical copy of constraints: each
+// dimension's value list deduplicated and sorted so logically
+// identical constraints always produce identical digests. Returns nil
+// for empty input so unconstrained grants keep their pre-constraints
+// digest (omitempty drops the field from the canonical material).
+func normalizeConstraints(in map[string][]string) map[string][]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string][]string, len(in))
+	for dimension, values := range in {
+		seen := make(map[string]bool, len(values))
+		list := make([]string, 0, len(values))
+		for _, v := range values {
+			if !seen[v] {
+				seen[v] = true
+				list = append(list, v)
+			}
+		}
+		sort.Strings(list)
+		out[dimension] = list
+	}
+	return out
 }
 
 // IsValid checks whether the grant is valid for the given capability at the given time.
@@ -103,6 +140,24 @@ func (g *Grant) HasCapability(capabilityID string) bool {
 	}
 	for _, c := range g.Capabilities {
 		if c == capabilityID || c == "*" {
+			return true
+		}
+	}
+	return false
+}
+
+// AllowsResource reports whether the grant admits the given value for
+// a resource-constraint dimension. A dimension absent from
+// Constraints is unconstrained (allowed); a present dimension admits
+// only listed values or the "*" wildcard. An explicitly empty list
+// admits nothing.
+func (g *Grant) AllowsResource(dimension, value string) bool {
+	allowed, ok := g.Constraints[dimension]
+	if !ok {
+		return true
+	}
+	for _, v := range allowed {
+		if v == value || v == "*" {
 			return true
 		}
 	}
