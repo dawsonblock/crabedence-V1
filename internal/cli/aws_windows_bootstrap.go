@@ -91,13 +91,18 @@ exit $LASTEXITCODE`)
 	return nil
 }
 
+// windowsBootstrapStableInterval is the settle window between Windows
+// bootstrap SSH stability probes. Production requires consecutive
+// ready-checks 10s apart; tests exercising the probe sequence override
+// it to remove wall-clock dead time without weakening the sequence.
+var windowsBootstrapStableInterval = 10 * time.Second
+
 func waitForWindowsBootstrapSSHReady(ctx context.Context, target *SSHTarget, stderr io.Writer, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	if err := waitForSSHReady(ctx, target, stderr, "bootstrap", timeout); err != nil {
 		return err
 	}
 	const stableProbes = 3
-	const stableInterval = 10 * time.Second
 	stable := 1
 	for stable < stableProbes {
 		if ctx.Err() != nil {
@@ -107,7 +112,7 @@ func waitForWindowsBootstrapSSHReady(ctx context.Context, target *SSHTarget, std
 		if remaining <= 0 {
 			return exit(5, "timed out waiting for stable Windows SSH on %s during bootstrap; %s", target.Host, sshWaitNextAction("bootstrap"))
 		}
-		timer := time.NewTimer(minDuration(stableInterval, remaining))
+		timer := time.NewTimer(minDuration(windowsBootstrapStableInterval, remaining))
 		select {
 		case <-ctx.Done():
 			timer.Stop()

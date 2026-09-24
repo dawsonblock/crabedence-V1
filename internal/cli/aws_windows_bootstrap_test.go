@@ -115,6 +115,9 @@ func TestCoordinatorFreshWindowsBootstrapDelivery(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake SSH executable requires a POSIX shell")
 	}
+	originalInterval := windowsBootstrapStableInterval
+	windowsBootstrapStableInterval = 10 * time.Millisecond
+	t.Cleanup(func() { windowsBootstrapStableInterval = originalInterval })
 	for _, mode := range []string{windowsModeNormal, windowsModeWSL2} {
 		t.Run(mode, func(t *testing.T) {
 			cfg, lease := freshWindowsBootstrapFixture(t, mode, "2222")
