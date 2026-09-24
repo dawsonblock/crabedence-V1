@@ -28,7 +28,7 @@ jobs:
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
-          cache: false
+          cache: true
 
       - name: Check formatting
         shell: bash
@@ -98,7 +98,7 @@ jobs:
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
-          cache: false
+          cache: true
 
       - name: Test all Go modules
         run: scripts/test-go-modules.sh
@@ -116,7 +116,7 @@ jobs:
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
-          cache: false
+          cache: true
 
       - name: Coverage
         run: scripts/check-go-coverage.sh 90.0
@@ -153,7 +153,7 @@ jobs:
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
-          cache: false
+          cache: true
 
       - name: Verify versioned remote module installation
         run: scripts/verify-go-install.sh v0.0.0 "$(git rev-parse HEAD)"
@@ -171,7 +171,7 @@ jobs:
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
-          cache: false
+          cache: true
 
       - name: Test user directory isolation
         run: go test ./internal/testutil ./internal/providers/aws ./internal/providers/daytona ./internal/providers/digitalocean ./internal/providers/hyperv ./internal/providers/namespace ./internal/providers/scaleway ./internal/providers/vast ./internal/providers/vultr -count=1
@@ -258,7 +258,7 @@ jobs:
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
-          cache: false
+          cache: true
 
       - name: Test source-derived hermetic lifecycle packages
         run: scripts/test-provider-lifecycles.sh
@@ -287,7 +287,7 @@ jobs:
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
-          cache: false
+          cache: true
 
       - name: Vet native helper
         run: go vet ./internal/applevmhelper ./cmd/crabbox-apple-vm-helper
@@ -403,7 +403,7 @@ jobs:
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
-          cache: false
+          cache: true
 
       - name: Install script dependencies
         run: sudo apt-get update && sudo apt-get install -y ripgrep
@@ -444,7 +444,7 @@ jobs:
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
-          cache: false
+          cache: true
 
       - name: Check docs
         run: scripts/check-docs.sh
