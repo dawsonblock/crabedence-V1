@@ -116,7 +116,7 @@ func TestConcurrencyDistinctKeys(t *testing.T) {
 			defer wg.Done()
 			req := crashRequest("alice@example.com", fmt.Sprintf("distinct-%d-%d", i, time.Now().UnixNano()))
 			if resp := exec.ExecuteWithIdempotency(context.Background(), req, crashDesc); resp.Status != StatusSucceeded {
-				errs[i] = fmt.Errorf("worker %d: %s", i, resp.Status)
+				errs[i] = fmt.Errorf("worker %d: %s (%s): %s", i, resp.Status, resp.FailureCode, resp.Error)
 			}
 		}(i)
 	}

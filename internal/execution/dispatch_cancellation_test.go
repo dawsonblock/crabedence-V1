@@ -44,7 +44,11 @@ func (h succeedHandler) Execute(_ context.Context, _ Request, desc capability.Re
 
 func openExecutorSQLiteStore(t *testing.T, cfg idempotency.LeaseConfig) *idempotency.SQLiteStore {
 	t.Helper()
-	db, err := idempotency.OpenSQLiteDB(filepath.Join(t.TempDir(), "db", "exec-test.db"))
+	// A generous busy timeout: concurrency torture tests here run many
+	// writers against one ledger, and a slow CI disk can push write-lock
+	// waits past the production 5s. The property under test is
+	// correctness under concurrency, not throughput on a given runner.
+	db, err := idempotency.OpenSQLiteDBForTest(filepath.Join(t.TempDir(), "db", "exec-test.db"), 30000)
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}

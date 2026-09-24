@@ -69,6 +69,21 @@ func sqliteTime(ms int64) time.Time {
 // are tightened to 0600. Unsafe locations are rejected rather than
 // silently hosting the execution ledger under weak permissions.
 func OpenSQLiteDB(path string) (*sql.DB, error) {
+	return openSQLiteDB(path, 5000)
+}
+
+// OpenSQLiteDBForTest is OpenSQLiteDB with a caller-chosen busy
+// timeout (milliseconds). Contention torture tests on slow runners
+// need the ledger to wait for the write lock rather than fail the
+// caller after the production 5s — the property under test is
+// correctness under concurrency, not the ledger's write throughput on
+// a given disk. Every other pragma is identical to production.
+// Test-support only — production never calls it.
+func OpenSQLiteDBForTest(path string, busyTimeoutMs int) (*sql.DB, error) {
+	return openSQLiteDB(path, busyTimeoutMs)
+}
+
+func openSQLiteDB(path string, busyTimeoutMs int) (*sql.DB, error) {
 	// The DSN carries the durability pragmas as query parameters — a
 	// path containing '?' or '#' would let the filename terminate the
 	// path early or inject parameters (e.g. weakening synchronous).
@@ -80,8 +95,8 @@ func OpenSQLiteDB(path string) (*sql.DB, error) {
 	}
 	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)"+
 		"&_pragma=synchronous(FULL)&_pragma=foreign_keys(ON)"+
-		"&_pragma=busy_timeout(5000)&_pragma=temp_store(MEMORY)"+
-		"&_txlock=immediate", path)
+		"&_pragma=busy_timeout(%d)&_pragma=temp_store(MEMORY)"+
+		"&_txlock=immediate", path, busyTimeoutMs)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
