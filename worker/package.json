@@ -22,7 +22,7 @@
     "lint": "oxlint --config .oxlintrc.json .",
     "start:node": "node dist-node/server.mjs",
     "test": "vitest run",
-    "test:postgres": "vitest run test/coordinator-parity.live.test.ts"
+    "test:postgres": "vitest run --config vitest.live.config.ts test/coordinator-parity.live.test.ts"
   },
   "dependencies": {
     "@aws-sdk/credential-providers": "^3.1120.0",
