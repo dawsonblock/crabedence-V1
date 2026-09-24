@@ -259,9 +259,12 @@ func TestLiveMultiProcessLeaseOwnerKilled(t *testing.T) {
 		t.Fatalf("post-kill state = %s, want IN_FLIGHT", rec.State)
 	}
 
-	// Wait out the dead owner's lease, then race 10 reconciler
-	// processes on the same orphaned record.
-	time.Sleep(400 * time.Millisecond)
+	// Force the dead owner's lease to read as expired — an explicit
+	// transition rather than waiting out wall time — then race 10
+	// reconciler processes on the same orphaned record.
+	if err := store.ExpireLeaseForTest(ctx, rec.ExecutionID); err != nil {
+		t.Fatal(err)
+	}
 	const racers = 10
 	cmds := make([]*exec.Cmd, racers)
 	outs := make([]*bytes.Buffer, racers)

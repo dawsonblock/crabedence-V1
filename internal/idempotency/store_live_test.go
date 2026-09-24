@@ -286,8 +286,9 @@ func TestLiveStoreLeaseExpiryReclaim(t *testing.T) {
 	grantID := "grant_test"
 	class := "MUTATION"
 
-	// Caller A reserves with a very short lease (100ms).
-	reserveA, err := testReserveWithLease(store, ctx, key, principal, capability, digest, grantID, class, 100*time.Millisecond)
+	// Caller A reserves under a long lease; expiry is forced explicitly
+	// below so the reclaim assertions never race machine timing.
+	reserveA, err := testReserveWithLease(store, ctx, key, principal, capability, digest, grantID, class, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -304,8 +305,9 @@ func TestLiveStoreLeaseExpiryReclaim(t *testing.T) {
 		t.Error("caller B should NOT acquire while lease is valid")
 	}
 
-	// Wait for the lease to expire.
-	time.Sleep(200 * time.Millisecond)
+	if err := store.ExpireLeaseForTest(ctx, reserveA.Record.ExecutionID); err != nil {
+		t.Fatal(err)
+	}
 
 	// Caller C tries after expiry — SHOULD acquire via lease reclaim.
 	reserveC, err := testReserveWithLease(store, ctx, key, principal, capability, digest, grantID, class, time.Minute)
@@ -443,8 +445,9 @@ func TestLiveStoreListExpiredLeases(t *testing.T) {
 
 	key := fmt.Sprintf("test-expired-%d", time.Now().UnixNano())
 
-	// Create a record with a short lease.
-	_, err = testReserveWithLease(store, ctx, key, "alice", "test.cap", "digest", "", "MUTATION", 50*time.Millisecond)
+	// Create a record under a long lease; expiry is forced explicitly
+	// below so the before/after assertions never race machine timing.
+	shortLease, err := testReserveWithLease(store, ctx, key, "alice", "test.cap", "digest", "", "MUTATION", time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -460,8 +463,9 @@ func TestLiveStoreListExpiredLeases(t *testing.T) {
 		}
 	}
 
-	// Wait for expiry.
-	time.Sleep(100 * time.Millisecond)
+	if err := store.ExpireLeaseForTest(ctx, shortLease.Record.ExecutionID); err != nil {
+		t.Fatal(err)
+	}
 
 	// After expiry — should appear.
 	expired, err = store.ListExpiredLeases(ctx)
@@ -593,9 +597,10 @@ func TestLiveStoreCrashInDispatchingRecovery(t *testing.T) {
 	grantID := "grant_test"
 	class := "MUTATION"
 
-	// Caller A reserves with a short lease and transitions to DISPATCHING,
-	// then "crashes" (does not call the provider, does not finalize).
-	reserveA, err := testReserveWithLease(store, ctx, key, principal, capability, digest, grantID, class, 100*time.Millisecond)
+	// Caller A reserves and transitions to DISPATCHING, then "crashes"
+	// (does not call the provider, does not finalize). The lease is long;
+	// expiry is forced explicitly below.
+	reserveA, err := testReserveWithLease(store, ctx, key, principal, capability, digest, grantID, class, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -606,9 +611,9 @@ func TestLiveStoreCrashInDispatchingRecovery(t *testing.T) {
 		t.Fatalf("A failed to transition to DISPATCHING: %v", err)
 	}
 	// Simulate crash: no further action from caller A.
-
-	// Wait for lease to expire.
-	time.Sleep(200 * time.Millisecond)
+	if err := store.ExpireLeaseForTest(ctx, reserveA.Record.ExecutionID); err != nil {
+		t.Fatal(err)
+	}
 
 	// Caller B reclaims after expiry.
 	reserveB, err := testReserveWithLease(store, ctx, key, principal, capability, digest, grantID, class, time.Minute)
@@ -672,8 +677,9 @@ func TestLiveStoreCrashInFlightUnknown(t *testing.T) {
 	class := "MUTATION"
 
 	// Caller A reserves, transitions to DISPATCHING, then IN_FLIGHT,
-	// then "crashes" (provider accepted but no terminal result).
-	reserveA, err := testReserveWithLease(store, ctx, key, principal, capability, digest, grantID, class, 100*time.Millisecond)
+	// then "crashes" (provider accepted but no terminal result). Expiry
+	// is forced explicitly below.
+	reserveA, err := testReserveWithLease(store, ctx, key, principal, capability, digest, grantID, class, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -690,9 +696,9 @@ func TestLiveStoreCrashInFlightUnknown(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Simulate crash after dispatch: no finalize.
-
-	// Wait for lease to expire.
-	time.Sleep(200 * time.Millisecond)
+	if err := store.ExpireLeaseForTest(ctx, execID); err != nil {
+		t.Fatal(err)
+	}
 
 	// The record should still be IN_FLIGHT with an expired lease.
 	rec, err := store.Lookup(ctx, execID)
@@ -760,8 +766,8 @@ func TestLiveStoreLeaseRenewalByOldTokenRejected(t *testing.T) {
 	grantID := "grant_test"
 	class := "MUTATION"
 
-	// Caller A reserves with a short lease.
-	reserveA, err := testReserveWithLease(store, ctx, key, principal, capability, digest, grantID, class, 100*time.Millisecond)
+	// Caller A reserves; expiry is forced explicitly below.
+	reserveA, err := testReserveWithLease(store, ctx, key, principal, capability, digest, grantID, class, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -770,8 +776,9 @@ func TestLiveStoreLeaseRenewalByOldTokenRejected(t *testing.T) {
 	}
 	oldToken := reserveA.LeaseToken
 
-	// Wait for lease to expire.
-	time.Sleep(200 * time.Millisecond)
+	if err := store.ExpireLeaseForTest(ctx, reserveA.Record.ExecutionID); err != nil {
+		t.Fatal(err)
+	}
 
 	// Caller B takes over.
 	reserveB, err := testReserveWithLease(store, ctx, key, principal, capability, digest, grantID, class, time.Minute)
@@ -1122,14 +1129,16 @@ func TestLiveEffectFabricExpiredLeaseMatrix(t *testing.T) {
 	digest1 := "digest-ef-prepared"
 	db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key = $1`, key1)
 
-	r1, err := store.Acquire(ctx, key1, principal, capability, digest1, grantID, class, 100*time.Millisecond)
+	r1, err := store.Acquire(ctx, key1, principal, capability, digest1, grantID, class, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if r1.Kind != LeaseAcquired {
 		t.Fatalf("expected ACQUIRED, got %s", r1.Kind)
 	}
-	time.Sleep(200 * time.Millisecond)
+	if err := store.ExpireLeaseForTest(ctx, r1.Record.ExecutionID); err != nil {
+		t.Fatal(err)
+	}
 
 	r1b, err := store.Acquire(ctx, key1, principal, capability, digest1, grantID, class, time.Minute)
 	if err != nil {
@@ -1147,14 +1156,16 @@ func TestLiveEffectFabricExpiredLeaseMatrix(t *testing.T) {
 	digest2 := "digest-ef-executing"
 	db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key = $1`, key2)
 
-	r2, err := store.Acquire(ctx, key2, principal, capability, digest2, grantID, class, 100*time.Millisecond)
+	r2, err := store.Acquire(ctx, key2, principal, capability, digest2, grantID, class, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := store.BeginExecution(ctx, r2.Record.ExecutionID, r2.LeaseToken, r2.Generation); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(200 * time.Millisecond)
+	if err := store.ExpireLeaseForTest(ctx, r2.Record.ExecutionID); err != nil {
+		t.Fatal(err)
+	}
 
 	r2b, err := store.Acquire(ctx, key2, principal, capability, digest2, grantID, class, time.Minute)
 	if err != nil {
@@ -1169,7 +1180,7 @@ func TestLiveEffectFabricExpiredLeaseMatrix(t *testing.T) {
 	digest3 := "digest-ef-inflight"
 	db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key = $1`, key3)
 
-	r3, err := store.Acquire(ctx, key3, principal, capability, digest3, grantID, class, 100*time.Millisecond)
+	r3, err := store.Acquire(ctx, key3, principal, capability, digest3, grantID, class, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1179,7 +1190,9 @@ func TestLiveEffectFabricExpiredLeaseMatrix(t *testing.T) {
 	if err := store.MarkInFlight(ctx, r3.Record.ExecutionID, r3.LeaseToken, r3.Generation, "", nil); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(200 * time.Millisecond)
+	if err := store.ExpireLeaseForTest(ctx, r3.Record.ExecutionID); err != nil {
+		t.Fatal(err)
+	}
 
 	r3b, err := store.Acquire(ctx, key3, principal, capability, digest3, grantID, class, time.Minute)
 	if err != nil {
@@ -1280,7 +1293,7 @@ func TestLiveEffectFabricStaleWorkerFencing(t *testing.T) {
 	db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key = $1`, key)
 
 	// Worker A acquires generation 1.
-	rA, err := store.Acquire(ctx, key, principal, capability, digest, grantID, class, 100*time.Millisecond)
+	rA, err := store.Acquire(ctx, key, principal, capability, digest, grantID, class, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1291,8 +1304,9 @@ func TestLiveEffectFabricStaleWorkerFencing(t *testing.T) {
 	tokenA := rA.LeaseToken
 	genA := rA.Generation
 
-	// Wait for lease to expire.
-	time.Sleep(200 * time.Millisecond)
+	if err := store.ExpireLeaseForTest(ctx, execID); err != nil {
+		t.Fatal(err)
+	}
 
 	// Worker B acquires generation 2 (takes over).
 	rB, err := store.Acquire(ctx, key, principal, capability, digest, grantID, class, time.Minute)
@@ -1672,7 +1686,7 @@ func TestLiveEffectFabricCrashAfterPrepared(t *testing.T) {
 
 	// Caller A acquires and reaches PREPARED, then crashes.
 	acqA, err := store.Acquire(ctx, key, "alice@example.com", "test.counter.increment",
-		"digest-crash-prepared", "grant_test", "MUTATION", 100*time.Millisecond)
+		"digest-crash-prepared", "grant_test", "MUTATION", time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1680,8 +1694,9 @@ func TestLiveEffectFabricCrashAfterPrepared(t *testing.T) {
 		t.Fatalf("expected ACQUIRED, got %s", acqA.Kind)
 	}
 	// Crash: no BeginExecution, no further action.
-
-	time.Sleep(200 * time.Millisecond)
+	if err := store.ExpireLeaseForTest(ctx, acqA.Record.ExecutionID); err != nil {
+		t.Fatal(err)
+	}
 
 	// Caller B reclaims after lease expiry.
 	acqB, err := store.Acquire(ctx, key, "alice@example.com", "test.counter.increment",
@@ -2949,16 +2964,19 @@ func TestLiveClaimExpiredBatch(t *testing.T) {
 	// leftovers from earlier tests fill the batch ahead of ours.
 	db.ExecContext(ctx, `DELETE FROM execution_requests`)
 
-	// Create records with very short leases.
+	// Create records under long leases and force expiry explicitly, so
+	// the batch claim never depends on how much wall time has passed.
 	for i := 0; i < 3; i++ {
 		key := fmt.Sprintf("%s-%d", prefix, i)
-		_, err := store.Acquire(ctx, key, "alice@example.com", "test.counter.increment",
-			fmt.Sprintf("digest-exp-%d", i), "grant_e", "MUTATION", 50*time.Millisecond)
+		acq, err := store.Acquire(ctx, key, "alice@example.com", "test.counter.increment",
+			fmt.Sprintf("digest-exp-%d", i), "grant_e", "MUTATION", time.Minute)
 		if err != nil {
 			t.Fatal(err)
 		}
+		if err := store.ExpireLeaseForTest(ctx, acq.Record.ExecutionID); err != nil {
+			t.Fatal(err)
+		}
 	}
-	time.Sleep(200 * time.Millisecond) // Let leases expire.
 
 	// Claim expired batch — should get all 3.
 	batch, err := store.ClaimExpiredBatch(ctx, "worker-a", 10, 5*time.Minute)
