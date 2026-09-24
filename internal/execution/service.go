@@ -256,6 +256,15 @@ func (s *Service) Stop() error {
 }
 
 func (s *Service) acceptLoop(ctx context.Context) {
+	// A persistent accept error (EMFILE, ENFILE, a transient kernel
+	// condition) must not become a hot spin that pegs a core and floods
+	// the log. Mirror net/http: back off exponentially on consecutive
+	// failures, resetting after a successful accept.
+	const (
+		acceptBackoffMin = 5 * time.Millisecond
+		acceptBackoffMax = time.Second
+	)
+	backoff := acceptBackoffMin
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
@@ -266,8 +275,17 @@ func (s *Service) acceptLoop(ctx context.Context) {
 				return
 			}
 			log.Printf("execution service: accept error: %v", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			if backoff *= 2; backoff > acceptBackoffMax {
+				backoff = acceptBackoffMax
+			}
 			continue
 		}
+		backoff = acceptBackoffMin
 
 		go s.handleConnection(ctx, conn)
 	}
