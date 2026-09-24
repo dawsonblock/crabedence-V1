@@ -294,7 +294,7 @@ func (c *e2bClient) doJSONWithHeaders(ctx context.Context, method, path string, 
 		return nil, err
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
+	data, err := shared.ReadBoundedResponse(resp.Body, shared.MaxControlPlaneResponseBytes)
 	if err != nil {
 		return nil, err
 	}

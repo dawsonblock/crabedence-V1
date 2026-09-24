@@ -250,7 +250,7 @@ func (c *spritesClient) doJSON(ctx context.Context, method, requestPath string, 
 		return err
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
+	data, err := shared.ReadBoundedResponse(resp.Body, shared.MaxControlPlaneResponseBytes)
 	if err != nil {
 		return err
 	}

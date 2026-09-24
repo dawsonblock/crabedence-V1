@@ -377,7 +377,7 @@ func (c *apiClient) getWithHeaders(ctx context.Context, path string) ([]byte, ht
 		return nil, nil, err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := shared.ReadBoundedResponse(resp.Body, shared.MaxControlPlaneResponseBytes)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, nil, c.responseError(path, resp.StatusCode, body)
 	}
@@ -430,7 +430,7 @@ func (c *apiClient) get(ctx context.Context, path string, target any) error {
 		return err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := shared.ReadBoundedResponse(resp.Body, shared.MaxControlPlaneResponseBytes)
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return c.responseError(path, resp.StatusCode, body)
@@ -467,7 +467,7 @@ func (c *apiClient) post(ctx context.Context, path string, payload any, target a
 		return err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := shared.ReadBoundedResponse(resp.Body, shared.MaxControlPlaneResponseBytes)
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return c.responseError(path, resp.StatusCode, body)

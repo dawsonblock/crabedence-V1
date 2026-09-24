@@ -400,7 +400,7 @@ func (c *azureDynamicSessionsClient) doJSONURL(ctx context.Context, method, endp
 		return err
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
+	data, err := shared.ReadBoundedResponse(resp.Body, shared.MaxControlPlaneResponseBytes)
 	if err != nil {
 		return err
 	}

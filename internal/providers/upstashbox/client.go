@@ -313,7 +313,7 @@ func (c *client) doJSON(ctx context.Context, method, path string, query url.Valu
 	if out == nil {
 		return nil
 	}
-	data, err := io.ReadAll(resp.Body)
+	data, err := shared.ReadBoundedResponse(resp.Body, shared.MaxControlPlaneResponseBytes)
 	if err != nil {
 		return err
 	}

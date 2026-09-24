@@ -195,9 +195,12 @@ func (c *HetznerClient) do(ctx context.Context, method, path string, body any, o
 		return err
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024+1))
 	if err != nil {
 		return err
+	}
+	if len(data) > 4*1024*1024 {
+		return fmt.Errorf("hetzner response exceeds %d bytes", 4*1024*1024)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return HetznerHTTPError{Method: method, Path: path, StatusCode: resp.StatusCode, Detail: summarizeJSON(data)}

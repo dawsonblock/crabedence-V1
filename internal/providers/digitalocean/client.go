@@ -170,7 +170,7 @@ func (c *digitalOceanClient) do(ctx context.Context, method, path string, body a
 		return err
 	}
 	defer resp.Body.Close()
-	data, readErr := io.ReadAll(resp.Body)
+	data, readErr := shared.ReadBoundedResponse(resp.Body, shared.MaxControlPlaneResponseBytes)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body := shared.RedactErrorSecrets(strings.TrimSpace(string(data)), c.token)
 		if len(body) > 400 {

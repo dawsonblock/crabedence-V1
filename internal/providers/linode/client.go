@@ -14,6 +14,8 @@ import (
 	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
+
+	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
 const apiBaseURL = "https://api.linode.com/v4"
@@ -69,7 +71,7 @@ func (c *linodeClient) do(ctx context.Context, method, path string, body any, ou
 		return err
 	}
 	defer resp.Body.Close()
-	data, readErr := io.ReadAll(resp.Body)
+	data, readErr := shared.ReadBoundedResponse(resp.Body, shared.MaxControlPlaneResponseBytes)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		if len(data) > 400 {
 			data = data[:400]

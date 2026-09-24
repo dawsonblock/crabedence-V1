@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -415,7 +414,7 @@ func (c *Client) do(ctx context.Context, method, requestPath string, body any, o
 		return sanitizeOVHClientError(err)
 	}
 	defer resp.Body.Close()
-	data, readErr := io.ReadAll(resp.Body)
+	data, readErr := shared.ReadBoundedResponse(resp.Body, shared.MaxControlPlaneResponseBytes)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body := redactSecrets(strings.TrimSpace(string(data)), c.applicationKey, c.applicationSecret, c.consumerKey)
 		if len(body) > 400 {

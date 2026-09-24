@@ -18,6 +18,8 @@ import (
 	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
+
+	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
 const vultrAPIBaseURL = "https://api.vultr.com/v2"
@@ -212,7 +214,7 @@ func (c *vultrClient) doAttempt(ctx context.Context, method, path string, body a
 		}
 		return &vultrAPIError{Operation: method + " " + redactPath(path), Status: resp.StatusCode, Body: redactVultr(body, c.token)}
 	}
-	data, readErr := io.ReadAll(resp.Body)
+	data, readErr := shared.ReadBoundedResponse(resp.Body, shared.MaxControlPlaneResponseBytes)
 	if readErr != nil {
 		return fmt.Errorf("vultr %s %s response body: %w", method, redactPath(path), readErr)
 	}
