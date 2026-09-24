@@ -105,7 +105,7 @@ export class NodeCoordinatorRuntime implements CoordinatorRuntime {
   private provisioningRun: Promise<void> | undefined;
   private wakeHintRun: Promise<void> | undefined;
   private wakeHintPending = false;
-  private provisioningScanner?: ReturnType<typeof setInterval>;
+  private provisioningScanner: ReturnType<typeof setInterval> | undefined;
   private coordinatorLock: CoordinatorLock | undefined;
   private bossStarted = false;
   private authorityLost = false;
@@ -114,7 +114,7 @@ export class NodeCoordinatorRuntime implements CoordinatorRuntime {
   private readonly maintenance = new Set<Promise<void>>();
   // Stage 8: explicit lifecycle state and startup abort controller.
   private lifecycleState: CoordinatorLifecycleState = "idle";
-  private startupAbort?: AbortController;
+  private startupAbort: AbortController | undefined;
 
   constructor(connectionString: string) {
     this.storage = new PostgresCoordinatorStorage(connectionString);
