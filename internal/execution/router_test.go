@@ -176,11 +176,11 @@ func TestFunctionHookRuntimeContract(t *testing.T) {
 
 func TestFunctionHookRuntimeBoundsAndFailures(t *testing.T) {
 	registry := NewFunctionHookRegistry()
-	// 100ms is comfortably inside the timeout hook's 2s sleep while
-	// leaving headroom for the oversized hook's marshal under a loaded
-	// test runner — the hook now runs on its own goroutine, so the
-	// budget includes a scheduling hop.
-	registry.SetTimeout(100 * time.Millisecond)
+	// 250ms is comfortably inside the timeout hook's 2s sleep while
+	// leaving headroom for the hook goroutine's scheduling hop under a
+	// loaded test runner — the budget must never be what the oversized
+	// case trips over, or the size check stops being what is tested.
+	registry.SetTimeout(250 * time.Millisecond)
 
 	if err := registry.Register("test.error", FunctionHookFunc(func(context.Context, HookCall) (json.RawMessage, error) {
 		return nil, errors.New("boom")
@@ -198,11 +198,17 @@ func TestFunctionHookRuntimeBoundsAndFailures(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := registry.Register("test.oversized", FunctionHookFunc(func(context.Context, HookCall) (json.RawMessage, error) {
-		oversized := make([]byte, idempotency.MaxResultBytes+1)
-		for i := range oversized {
-			oversized[i] = 'x'
+		// Build the quoted oversized payload directly. fmt.Sprintf("%q")
+		// over a megabyte costs more than the budget under load, which
+		// would trip the execution budget instead of the size check this
+		// hook exists to exercise.
+		oversized := make([]byte, 0, idempotency.MaxResultBytes+3)
+		oversized = append(oversized, '"')
+		for i := 0; i <= idempotency.MaxResultBytes; i++ {
+			oversized = append(oversized, 'x')
 		}
-		return json.RawMessage(fmt.Sprintf("%q", oversized)), nil
+		oversized = append(oversized, '"')
+		return json.RawMessage(oversized), nil
 	})); err != nil {
 		t.Fatal(err)
 	}
