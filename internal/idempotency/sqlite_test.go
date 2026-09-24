@@ -133,7 +133,10 @@ func TestSQLiteStoreExpiredInFlightBecomesUnknown(t *testing.T) {
 	s := openSQLiteStore(t)
 	digest := sqliteDigest("a")
 
-	acq, _ := s.Acquire(ctx, "k1", "alice", "cap.mut", digest, "", "MUTATION", 60*time.Millisecond)
+	// A long lease: acquire→begin→mark must never race expiry, or the
+	// test fails on machine timing instead of the expired-IN_FLIGHT
+	// semantics it asserts. Expiry is forced explicitly below.
+	acq, _ := s.Acquire(ctx, "k1", "alice", "cap.mut", digest, "", "MUTATION", time.Minute)
 	rec := acq.Record
 	if err := s.BeginExecution(ctx, rec.ExecutionID, acq.LeaseToken, acq.Generation); err != nil {
 		t.Fatalf("begin: %v", err)
@@ -141,7 +144,9 @@ func TestSQLiteStoreExpiredInFlightBecomesUnknown(t *testing.T) {
 	if err := s.MarkInFlight(ctx, rec.ExecutionID, acq.LeaseToken, acq.Generation, "prov", nil); err != nil {
 		t.Fatalf("in flight: %v", err)
 	}
-	time.Sleep(80 * time.Millisecond)
+	if err := s.ExpireLeaseForTest(ctx, rec.ExecutionID); err != nil {
+		t.Fatal(err)
+	}
 
 	// Expired IN_FLIGHT must NOT be reclaimed — it becomes UNKNOWN.
 	acq2, err := s.Acquire(ctx, "k1", "alice", "cap.mut", digest, "", "MUTATION", time.Minute)

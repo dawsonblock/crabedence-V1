@@ -13,6 +13,24 @@ import (
 	"time"
 )
 
+// expireLeaseForTest forces the record's lease to read as expired on
+// every engine that implements EffectStore. Expiry is an explicit
+// transition: sleeping out a short lease races the steps that must
+// precede it (acquire→begin→mark under load), and the test then fails
+// on machine timing instead of the semantics it asserts.
+func expireLeaseForTest(t *testing.T, s EffectStore, executionID string) {
+	t.Helper()
+	expirer, ok := s.(interface {
+		ExpireLeaseForTest(context.Context, string) error
+	})
+	if !ok {
+		t.Fatalf("store %T does not expose ExpireLeaseForTest", s)
+	}
+	if err := expirer.ExpireLeaseForTest(context.Background(), executionID); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // eachEffectStore runs a conformance check against every storage
 // engine that implements EffectStore. The embedded SQLite backend
 // always runs; the PostgreSQL backend runs when
@@ -218,7 +236,7 @@ func TestStoreConformanceExpiredInFlight(t *testing.T) {
 	eachEffectStore(t, func(t *testing.T, s EffectStore) {
 		ctx := context.Background()
 		digest := confDigest("alice", "cap.mut", `{"q":"x"}`)
-		acq, _ := s.Acquire(ctx, "k1", "alice", "cap.mut", digest, "", "MUTATION", 80*time.Millisecond)
+		acq, _ := s.Acquire(ctx, "k1", "alice", "cap.mut", digest, "", "MUTATION", time.Minute)
 		rec := acq.Record
 		if err := s.BeginExecution(ctx, rec.ExecutionID, acq.LeaseToken, acq.Generation); err != nil {
 			t.Fatalf("begin: %v", err)
@@ -226,7 +244,7 @@ func TestStoreConformanceExpiredInFlight(t *testing.T) {
 		if err := s.MarkInFlight(ctx, rec.ExecutionID, acq.LeaseToken, acq.Generation, "prov", nil); err != nil {
 			t.Fatalf("in flight: %v", err)
 		}
-		time.Sleep(120 * time.Millisecond)
+		expireLeaseForTest(t, s, rec.ExecutionID)
 
 		acq2, err := s.Acquire(ctx, "k1", "alice", "cap.mut", digest, "", "MUTATION", time.Minute)
 		if err != nil || acq2.Kind != RecoveryRequired {
@@ -256,9 +274,9 @@ func TestStoreConformanceExpiredPreDispatch(t *testing.T) {
 	eachEffectStore(t, func(t *testing.T, s EffectStore) {
 		ctx := context.Background()
 		digest := confDigest("alice", "cap.mut", `{"q":"x"}`)
-		acq, _ := s.Acquire(ctx, "k1", "alice", "cap.mut", digest, "", "MUTATION", 60*time.Millisecond)
+		acq, _ := s.Acquire(ctx, "k1", "alice", "cap.mut", digest, "", "MUTATION", time.Minute)
 		rec := acq.Record
-		time.Sleep(100 * time.Millisecond)
+		expireLeaseForTest(t, s, rec.ExecutionID)
 
 		cur, _ := s.Lookup(ctx, rec.ExecutionID)
 		if err := s.RecoverExpiredPreDispatch(ctx, rec.ExecutionID, cur.Version); err != nil {
