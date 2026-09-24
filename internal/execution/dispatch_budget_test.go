@@ -190,6 +190,47 @@ func TestSufficientTerminalizationBudgetCommits(t *testing.T) {
 	}
 }
 
+// slowRenewalStore stalls every lease renewal, simulating a storage
+// stall (an fsync under load) on the renewal path.
+type slowRenewalStore struct {
+	idempotency.EffectStore
+	delay time.Duration
+}
+
+func (s slowRenewalStore) RenewLease(ctx context.Context, executionID, leaseToken string, leaseGeneration int, duration time.Duration) error {
+	time.Sleep(s.delay)
+	return s.EffectStore.RenewLease(ctx, executionID, leaseToken, leaseGeneration, duration)
+}
+
+// TestLeaseRenewalToleratesStorageLatency proves a storage stall on
+// the renewal path changes latency, not semantics: the dispatch
+// outlives the original lease, a 500ms renewal stall lands well
+// inside the settle window, and the record still reaches COMMITTED.
+// Success is only possible if the stalled renewal actually extended
+// the lease — the handler runs longer than the original lease.
+func TestLeaseRenewalToleratesStorageLatency(t *testing.T) {
+	store := openExecutorSQLiteStore(t, idempotency.LeaseConfig{
+		DefaultDuration: 5 * time.Second,
+		MaxDuration:     10 * time.Second,
+		RenewalWindow:   2 * time.Second,
+	})
+	exec := NewDispatchExecutor(succeedHandler{delay: 6 * time.Second},
+		slowRenewalStore{EffectStore: store, delay: 500 * time.Millisecond})
+
+	key := fmt.Sprintf("budget-latency-%d", time.Now().UnixNano())
+	resp := exec.ExecuteWithIdempotency(context.Background(), mutationRequest(key), mutationDescriptor())
+	if resp.Status != StatusSucceeded {
+		t.Fatalf("expected SUCCEEDED with a stalled renewal inside the lease window, got %s: %s", resp.Status, resp.Error)
+	}
+	rec, err := store.LookupByKey(context.Background(), "alice@example.com", "test.mut", key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.State != idempotency.StateCommitted {
+		t.Fatalf("expected COMMITTED after a stalled renewal, got %s", rec.State)
+	}
+}
+
 // TestHeartbeatRenewalsAreBounded proves lease renewals run under the
 // LeaseOperation budget rather than the unbounded heartbeat lifetime —
 // a hung store call must not stall the renewal loop until the lease

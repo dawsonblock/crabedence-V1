@@ -284,12 +284,17 @@ func TestLiveGitHubIssueAtMostOnce(t *testing.T) {
 		if resp.Status != StatusUnknown {
 			t.Fatalf("expected UNKNOWN after crash, got %s: %s", resp.Status, resp.Error)
 		}
-		// Reconnect and reconcile: lease expires (heartbeat dead with
-		// the DB), crash recovery marks UNKNOWN, resolver finds marker.
+		// Reconnect and reconcile: the lease is forced expired (the
+		// heartbeat died with the DB), crash recovery marks UNKNOWN,
+		// and the resolver finds the provider marker. Expiry is an
+		// explicit transition, not a wall-clock wait.
 		store2, db2 := reopenStore(t, 250*time.Millisecond)
 		defer db2.Close()
-		time.Sleep(400 * time.Millisecond) // let the 250ms lease expire
-		rec := reconcileUnknownRecord(t, store2, gh, lookupExecID(t, store2, ctx, key))
+		execID := lookupExecID(t, store2, ctx, key)
+		if err := store2.ExpireLeaseForTest(ctx, execID); err != nil {
+			t.Fatal(err)
+		}
+		rec := reconcileUnknownRecord(t, store2, gh, execID)
 		if rec.State != idempotency.StateCommitted {
 			t.Fatalf("expected COMMITTED after reconcile, got %s", rec.State)
 		}
@@ -311,8 +316,11 @@ func TestLiveGitHubIssueAtMostOnce(t *testing.T) {
 		}
 		store2, db2 := reopenStore(t, 250*time.Millisecond)
 		defer db2.Close()
-		time.Sleep(400 * time.Millisecond)
-		rec := reconcileUnknownRecord(t, store2, gh, lookupExecID(t, store2, ctx, key))
+		execID := lookupExecID(t, store2, ctx, key)
+		if err := store2.ExpireLeaseForTest(ctx, execID); err != nil {
+			t.Fatal(err)
+		}
+		rec := reconcileUnknownRecord(t, store2, gh, execID)
 		if rec.State != idempotency.StateCommitted {
 			t.Fatalf("expected COMMITTED after reconcile, got %s", rec.State)
 		}

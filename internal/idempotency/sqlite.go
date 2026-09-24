@@ -2284,6 +2284,31 @@ func (s *SQLiteStore) ClaimUnknownBatch(ctx context.Context, owner string, batch
 
 // ClaimExpiredBatch atomically claims expired-lease records for crash
 // recovery — see Store.ClaimExpiredBatch.
+// ExpireLeaseForTest forces an active lease to read as expired under
+// the store's own clock, so crash/recovery tests synchronize on an
+// explicit expiry transition instead of sleeping out a wall-clock
+// lease (a sleep is a hope, not a synchronization; under load it
+// races the very transition it means to wait for). Test-support only —
+// production never calls it.
+func (s *SQLiteStore) ExpireLeaseForTest(ctx context.Context, executionID string) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE execution_requests
+		SET lease_expires_at = `+sqliteNow+` - 1
+		WHERE execution_id = ?1 AND lease_expires_at IS NOT NULL
+	`, executionID)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return fmt.Errorf("expire lease for test: %s matched %d rows", executionID, n)
+	}
+	return nil
+}
+
 func (s *SQLiteStore) ClaimExpiredBatch(ctx context.Context, owner string, batchSize int, claimDuration time.Duration) ([]*Record, error) {
 	if batchSize <= 0 {
 		batchSize = 100

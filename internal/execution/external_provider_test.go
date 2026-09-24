@@ -219,14 +219,18 @@ func TestExternalProviderCrashMatrix(t *testing.T) {
 			dbPath := filepath.Join(dir, "db", "crash.db")
 			key := fmt.Sprintf("ext-%s", point)
 
-			// Executor subprocess — dies at the crash point.
+			// Executor subprocess — dies at the crash point. The lease
+			// is deliberately long: a short lease can expire during
+			// pre-dispatch stages under load, so the helper would
+			// return before ever reaching the crash point. Expiry is
+			// forced explicitly below instead.
 			cmd := exec.Command(os.Args[0], "-test.run=TestCrashHelperProcess")
 			cmd.Env = append(os.Environ(),
 				"CRABBOX_CRASH_HELPER=1",
 				"CRABBOX_CRASH_DB="+dbPath,
 				"CRABBOX_CRASH_POINT="+string(point),
 				"CRABBOX_CRASH_KEY="+key,
-				"CRABBOX_CRASH_LEASE_MS=200",
+				"CRABBOX_CRASH_LEASE_MS="+crashHelperLeaseMs,
 				"CRABBOX_PROVIDER_URL="+providerURL,
 			)
 			if out, err := cmd.CombinedOutput(); err == nil {
@@ -259,11 +263,7 @@ func TestExternalProviderCrashMatrix(t *testing.T) {
 				t.Fatalf("reopen db: %v", err)
 			}
 			defer db.Close()
-			store, err := idempotency.NewSQLiteStoreWithConfig(db, idempotency.LeaseConfig{
-				DefaultDuration: 200 * time.Millisecond,
-				MaxDuration:     time.Second,
-				RenewalWindow:   50 * time.Millisecond,
-			})
+			store, err := idempotency.NewSQLiteStore(db)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -275,6 +275,14 @@ func TestExternalProviderCrashMatrix(t *testing.T) {
 				t.Fatalf("crash at %s produced terminal %s without finalization", point, rec.State)
 			}
 
+			// Synchronize on the explicit expiry transition — the
+			// restarted executor must reclaim the orphaned record, and
+			// that must not depend on how much wall time the parent's
+			// assertions happened to consume.
+			if err := store.ExpireLeaseForTest(context.Background(), rec.ExecutionID); err != nil {
+				t.Fatal(err)
+			}
+
 			// Restarted executor, same idempotency key: must replay the
 			// orphaned record — never redispatch. The provider's effect
 			// count must stay at exactly 1.
@@ -284,7 +292,7 @@ func TestExternalProviderCrashMatrix(t *testing.T) {
 				"CRABBOX_CRASH_DB="+dbPath,
 				"CRABBOX_CRASH_POINT=", // no crash — clean replay
 				"CRABBOX_CRASH_KEY="+key,
-				"CRABBOX_CRASH_LEASE_MS=200",
+				"CRABBOX_CRASH_LEASE_MS="+crashHelperLeaseMs,
 				"CRABBOX_PROVIDER_URL="+providerURL,
 			)
 			out2, _ := cmd2.CombinedOutput()
@@ -319,7 +327,7 @@ func TestExternalProviderStatusLookupReconciliation(t *testing.T) {
 		"CRABBOX_CRASH_DB="+dbPath,
 		"CRABBOX_CRASH_POINT="+string(CrashAfterProvider),
 		"CRABBOX_CRASH_KEY="+key,
-		"CRABBOX_CRASH_LEASE_MS=200",
+		"CRABBOX_CRASH_LEASE_MS="+crashHelperLeaseMs,
 		"CRABBOX_PROVIDER_URL="+providerURL,
 	)
 	if out, err := cmd.CombinedOutput(); err == nil {
@@ -344,17 +352,15 @@ func TestExternalProviderStatusLookupReconciliation(t *testing.T) {
 	}
 
 	// The orphaned record flows through lease expiry into UNKNOWN —
-	// then reconciles against the provider-side evidence.
+	// then reconciles against the provider-side evidence. Expiry is
+	// forced explicitly: sleeping out a lease is a hope, not a
+	// synchronization, and races the transition it means to wait for.
 	db, err := idempotency.OpenSQLiteDB(dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	store, err := idempotency.NewSQLiteStoreWithConfig(db, idempotency.LeaseConfig{
-		DefaultDuration: 200 * time.Millisecond,
-		MaxDuration:     time.Second,
-		RenewalWindow:   50 * time.Millisecond,
-	})
+	store, err := idempotency.NewSQLiteStore(db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -365,7 +371,9 @@ func TestExternalProviderStatusLookupReconciliation(t *testing.T) {
 	if rec.State != idempotency.StateInFlight {
 		t.Fatalf("post-crash state = %s, want IN_FLIGHT", rec.State)
 	}
-	time.Sleep(300 * time.Millisecond)
+	if err := store.ExpireLeaseForTest(context.Background(), rec.ExecutionID); err != nil {
+		t.Fatal(err)
+	}
 	claimed, err := store.ClaimExpiredBatch(context.Background(), "recovery-worker", 10, time.Minute)
 	if err != nil {
 		t.Fatal(err)

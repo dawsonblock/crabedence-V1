@@ -16,6 +16,14 @@ import (
 	"github.com/openclaw/crabbox/internal/idempotency"
 )
 
+// crashHelperLeaseMs is the lease the crash helper runs under. It is
+// deliberately long: the helper must reach its crash point
+// deterministically, and a short lease can expire during pre-dispatch
+// stages under load, making the helper return before the crash point
+// ever fires. Tests that need an expired lease force the transition
+// explicitly with ExpireLeaseForTest instead of waiting on wall time.
+const crashHelperLeaseMs = "120000"
+
 // TestCrashHelperProcess is the subprocess entry point for real process
 // crash tests. It opens the SQLite store itself, runs one execution,
 // and SIGKILLs itself at the configured CrashPoint — goroutine
@@ -64,8 +72,13 @@ func TestCrashHelperProcess(t *testing.T) {
 			// can run in the window between Kill returning and signal
 			// delivery: a raced Finalize there would commit a terminal
 			// state past a crash point that must precede it. SIGKILL
-			// cannot be blocked, so the process still dies.
-			syscall.Kill(syscall.Getpid(), syscall.SIGKILL)
+			// cannot be blocked, so the process still dies — but a
+			// failed kill request must fail hard, not hang the helper
+			// into the test binary's timeout.
+			if err := syscall.Kill(syscall.Getpid(), syscall.SIGKILL); err != nil {
+				fmt.Fprintf(os.Stderr, "crash helper: SIGKILL request failed: %v\n", err)
+				os.Exit(3)
+			}
 			select {}
 		}
 	})
@@ -172,7 +185,7 @@ func TestProcessCrashRecoveryCompletion(t *testing.T) {
 		"CRABBOX_CRASH_DB="+dbPath,
 		"CRABBOX_CRASH_POINT="+string(CrashAfterProvider),
 		"CRABBOX_CRASH_KEY="+key,
-		"CRABBOX_CRASH_LEASE_MS=200",
+		"CRABBOX_CRASH_LEASE_MS="+crashHelperLeaseMs,
 	)
 	if out, err := cmd.CombinedOutput(); err == nil {
 		t.Fatalf("helper should have died at after_provider\n%s", out)
@@ -183,12 +196,7 @@ func TestProcessCrashRecoveryCompletion(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	// Tiny lease so the dead executor's claim expires quickly.
-	store, err := idempotency.NewSQLiteStoreWithConfig(db, idempotency.LeaseConfig{
-		DefaultDuration: 200 * time.Millisecond,
-		MaxDuration:     time.Second,
-		RenewalWindow:   50 * time.Millisecond,
-	})
+	store, err := idempotency.NewSQLiteStore(db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,9 +209,13 @@ func TestProcessCrashRecoveryCompletion(t *testing.T) {
 		t.Fatalf("state = %s, want IN_FLIGHT", rec.State)
 	}
 
-	// Wait out the dead executor's lease, then claim for recovery —
-	// this is the path a reconciliation worker takes after a crash.
-	time.Sleep(300 * time.Millisecond)
+	// Force the dead executor's lease to read as expired, then claim
+	// for recovery — the path a reconciliation worker takes after a
+	// crash, synchronized on the transition itself rather than on
+	// wall-clock time.
+	if err := store.ExpireLeaseForTest(context.Background(), rec.ExecutionID); err != nil {
+		t.Fatal(err)
+	}
 	claimed, err := store.ClaimExpiredBatch(context.Background(), "recovery-worker", 10, time.Minute)
 	if err != nil {
 		t.Fatalf("ClaimExpiredBatch: %v", err)
