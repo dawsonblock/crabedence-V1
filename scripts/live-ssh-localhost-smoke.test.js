@@ -128,7 +128,11 @@ switch (tool) {
           }
         }
         // A retained reused run does not attempt cleanup, so these fields are omitted.
-        process.stderr.write(JSON.stringify({ exitCode: 23, leaseStopped: options.badRetention, leaseStopError: options.stopError }) + "\\n");
+        // Mirror the real --timing-json stderr contract: the camelCase timing
+        // record followed by the snake_case run evidence bound to the same run.
+        const runId = "run_fixture1234";
+        process.stderr.write(JSON.stringify({ exitCode: 23, runId, leaseStopped: options.badRetention, leaseStopError: options.stopError }) + "\\n");
+        process.stderr.write(JSON.stringify({ evidence_type: "run", exit_code: 23, run_id: runId }) + "\\n");
         process.exit(options.workloadExit ?? 23);
       }
       case "cp": {

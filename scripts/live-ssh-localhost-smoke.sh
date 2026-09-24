@@ -238,13 +238,13 @@ assert (first.parent / "arbitrary.bin").stat().st_size == 8 * 1024 * 1024
 assert not list(first.parent.parent.glob("*.tar.gz")), "remote capture archive leaked"
 records = [json.loads(line) for line in stderr.read_text().splitlines() if line.startswith('{"')]
 # --timing-json emits two JSON records: the camelCase timing report and
-# the snake_case run evidence bound to the same run. Select each by
-# shape instead of counting lines.
-timings = [record for record in records if "endToEndMs" in record]
-evidence = [record for record in records if "endToEndMs" not in record]
+# the snake_case run evidence bound to the same run. Identify the
+# evidence record positively; the remainder is the timing record.
+evidence = [record for record in records if record.get("evidence_type") == "run"]
+timings = [record for record in records if record.get("evidence_type") != "run"]
 assert len(timings) == 1 and timings[0]["exitCode"] == 23, records
-assert len(evidence) == 1 and evidence[0]["evidence_type"] == "run", records
-assert evidence[0]["exit_code"] == 23 and evidence[0]["run_id"] == timings[0]["runId"], records
+assert len(evidence) == 1 and evidence[0]["exit_code"] == 23, records
+assert evidence[0]["run_id"] == timings[0]["runId"], records
 # Reused retained leases skip release entirely; no-attempt cleanup fields are omitted.
 # Retention is also checked via the earlier upload above and the status call below.
 assert "leaseStopped" not in timings[0] and "leaseStopError" not in timings[0], timings
