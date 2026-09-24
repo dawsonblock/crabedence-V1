@@ -2309,6 +2309,29 @@ func (s *SQLiteStore) ExpireLeaseForTest(ctx context.Context, executionID string
 	return nil
 }
 
+// ExpireReconcileClaimForTest forces a reconcile claim to read as
+// expired under the store's own clock, so claim-recovery tests
+// synchronize on the expiry transition instead of sleeping out a
+// wall-clock claim TTL. Test-support only — production never calls it.
+func (s *SQLiteStore) ExpireReconcileClaimForTest(ctx context.Context, executionID string) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE execution_requests
+		SET reconcile_lease_expires_at = `+sqliteNow+` - 1
+		WHERE execution_id = ?1 AND reconcile_lease_expires_at IS NOT NULL
+	`, executionID)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return fmt.Errorf("expire reconcile claim for test: %s matched %d rows", executionID, n)
+	}
+	return nil
+}
+
 func (s *SQLiteStore) ClaimExpiredBatch(ctx context.Context, owner string, batchSize int, claimDuration time.Duration) ([]*Record, error) {
 	if batchSize <= 0 {
 		batchSize = 100

@@ -3139,6 +3139,29 @@ func (s *Store) ExpireLeaseForTest(ctx context.Context, executionID string) erro
 	return nil
 }
 
+// ExpireReconcileClaimForTest forces a reconcile claim to read as
+// expired under the database's own clock, so claim-recovery tests
+// synchronize on the expiry transition instead of sleeping out a
+// wall-clock claim TTL. Test-support only — production never calls it.
+func (s *Store) ExpireReconcileClaimForTest(ctx context.Context, executionID string) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE execution_requests
+		SET reconcile_lease_expires_at = clock_timestamp() - INTERVAL '1 millisecond'
+		WHERE execution_id = $1 AND reconcile_lease_expires_at IS NOT NULL
+	`, executionID)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return fmt.Errorf("expire reconcile claim for test: %s matched %d rows", executionID, n)
+	}
+	return nil
+}
+
 // The claim uses the reconcile_owner/reconcile_lease_expires_at
 // fields (shared with UNKNOWN claiming) to avoid adding yet
 // another claim namespace.

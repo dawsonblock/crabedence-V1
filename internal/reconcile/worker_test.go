@@ -507,9 +507,10 @@ func TestLiveClaimExpiryRecovery(t *testing.T) {
 	execID := makeUnknownRecord(t, db, store, ctx, key, "test.counter.increment", "MUTATION")
 	defer db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key = $1`, key)
 
-	// Worker 1 claims with a 150ms claim TTL, then "crashes" — no
-	// renewal, no release.
-	claimed, err := store.ClaimUnknownBatch(ctx, "worker-crash-1", 50, 150*time.Millisecond)
+	// Worker 1 claims, then "crashes" — no renewal, no release. The
+	// claim TTL is long; expiry is forced explicitly below so the
+	// pre-expiry assertion never races machine timing.
+	claimed, err := store.ClaimUnknownBatch(ctx, "worker-crash-1", 50, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -537,8 +538,10 @@ func TestLiveClaimExpiryRecovery(t *testing.T) {
 		_ = store.ReleaseReconcileClaim(ctx, r.ExecutionID, r.Version, 0, "")
 	}
 
-	// After the claim TTL elapses without renewal, worker 2 recovers it.
-	time.Sleep(300 * time.Millisecond)
+	// After the claim expires without renewal, worker 2 recovers it.
+	if err := store.ExpireReconcileClaimForTest(ctx, execID); err != nil {
+		t.Fatal(err)
+	}
 	other, err = store.ClaimUnknownBatch(ctx, "worker-crash-2", 50, time.Minute)
 	if err != nil {
 		t.Fatal(err)
@@ -834,8 +837,9 @@ func TestLiveReconcileSkipsResolverOnStaleClaim(t *testing.T) {
 	w.SetWorkerID("worker-stale")
 	w.SetClaimDuration(200 * time.Millisecond)
 
-	// Worker A claims the record with a short TTL.
-	claimed, err := store.ClaimUnknownBatch(ctx, "worker-stale", 50, 200*time.Millisecond)
+	// Worker A claims the record; expiry is forced explicitly below so
+	// the sequence never races machine timing.
+	claimed, err := store.ClaimUnknownBatch(ctx, "worker-stale", 50, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -852,7 +856,9 @@ func TestLiveReconcileSkipsResolverOnStaleClaim(t *testing.T) {
 	// The claim expires and worker B reclaims (bumping version) — the
 	// situation a queued record is in when a slow batch member delayed
 	// reconcileOne past the claim TTL.
-	time.Sleep(300 * time.Millisecond)
+	if err := store.ExpireReconcileClaimForTest(ctx, execID); err != nil {
+		t.Fatal(err)
+	}
 	recB := claimRecord(t, store, ctx, "worker-fresh", execID)
 
 	// Worker A's stale record must not reach the resolver.
