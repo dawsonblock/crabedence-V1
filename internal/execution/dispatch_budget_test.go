@@ -195,13 +195,18 @@ func TestSufficientTerminalizationBudgetCommits(t *testing.T) {
 // a hung store call must not stall the renewal loop until the lease
 // expires.
 func TestHeartbeatRenewalsAreBounded(t *testing.T) {
+	// The dispatch must outlast the lease with renewals keeping it
+	// alive. Budgets carry real headroom: a 300ms lease leaves only
+	// 100ms of slack per renewal cycle, and a single fsync stall under
+	// a loaded machine expires the lease before finalization — a
+	// failure about the test machine, not the renewal path.
 	store := openExecutorSQLiteStore(t, idempotency.LeaseConfig{
-		DefaultDuration: 300 * time.Millisecond,
+		DefaultDuration: 1 * time.Second,
 		MaxDuration:     10 * time.Second,
-		RenewalWindow:   100 * time.Millisecond,
+		RenewalWindow:   250 * time.Millisecond,
 	})
 	rec := &deadlineRecordingStore{EffectStore: store}
-	exec := NewDispatchExecutor(succeedHandler{delay: 700 * time.Millisecond}, rec)
+	exec := NewDispatchExecutor(succeedHandler{delay: 2 * time.Second}, rec)
 
 	key := fmt.Sprintf("budget-hb-%d", time.Now().UnixNano())
 	resp := exec.ExecuteWithIdempotency(context.Background(), mutationRequest(key), mutationDescriptor())

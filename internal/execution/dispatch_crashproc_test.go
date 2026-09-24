@@ -59,11 +59,17 @@ func TestCrashHelperProcess(t *testing.T) {
 	exec := NewDispatchExecutor(h, store)
 	exec.SetCrashHook(func(cp CrashPoint) {
 		if cp == point {
-			// Die like a power loss — no defers, no cleanup.
+			// Die like a power loss — no defers, no cleanup. Block
+			// after the kill so no instruction past the crash boundary
+			// can run in the window between Kill returning and signal
+			// delivery: a raced Finalize there would commit a terminal
+			// state past a crash point that must precede it. SIGKILL
+			// cannot be blocked, so the process still dies.
 			syscall.Kill(syscall.Getpid(), syscall.SIGKILL)
+			select {}
 		}
 	})
-	exec.ExecuteWithIdempotency(context.Background(), Request{
+	resp := exec.ExecuteWithIdempotency(context.Background(), Request{
 		Capability:     "test.mut",
 		Arguments:      json.RawMessage(`{"x":1}`),
 		Authority:      RequestAuthority{Principal: "alice@example.com", AuthorityRef: "grant_x"},
@@ -72,6 +78,11 @@ func TestCrashHelperProcess(t *testing.T) {
 		ExecutionClass: capability.ClassMutation,
 		AdapterID:      "test-adapter",
 	})
+	// The executor returned without reaching the crash point. Report
+	// what it returned — the parent test asserts this process died, so
+	// a clean exit must explain which pre-dispatch path bailed out.
+	encoded, _ := json.Marshal(resp)
+	fmt.Fprintf(os.Stderr, "crash helper returned without firing %s: %s\n", point, encoded)
 	os.Exit(0)
 }
 
