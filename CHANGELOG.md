@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Review hardening — bounded provider reads, fail-closed qualification artifacts
+
+- Execution: a qualification response whose artifact bytes cannot be re-fetched from the provider's durable ledger now stays `UNKNOWN` instead of committing unverified bytes — the verification the adapter documents is no longer skipped when the fetch itself fails, and reconciliation resolves the outcome from the provider ledger.
+- Execution: the qualification provider reloads its effects log on restart alongside the operation ledger, so a replayed effect token stays idempotent across restarts and `EffectN`/run identities never repeat.
+- Execution: a provider invocation that outlives the dispatch context records the actual termination cause (executor ceiling, caller deadline, or caller cancellation) in the durable record instead of always reporting a ceiling hit.
+- Execution: the service accept loop backs off exponentially (5ms → 1s, reset after a successful accept) on consecutive accept errors instead of spinning hot and flooding the log.
+- Authority: unconstrained grants store `{}` rather than JSON `null` in the constraint column of both authority stores, matching the declared column default.
+- Providers: control-plane response reads are now bounded — 16 MiB for the provider clients via `shared.ReadBoundedResponse` (overflow is an explicit error, never a truncated read) and 4 MiB for the proxmox/hetzner CLI clients, matching the existing conventions.
+- Docs: `docs/architecture/coordinator-scaling.md` records the single-Durable-Object coordinator as a correctness boundary for lease claiming, idempotent effects, and shard claims — what it bounds, and the partition-key/identity/migration/routing questions any sharded topology must answer first.
+
 ### Deployed qualification provider and peer-authenticated principals
 
 - Execution: the external qualification provider is now a shipped component — `internal/qualprovider` holds the server (durable fsynced ledgers, immutable artifacts, deterministic fault injection) shared verbatim between the test harness and `cmd/qual-provider`, a loopback-bound binary with its own state directory. Setting `CRABEDENCE_QUAL_PROVIDER_URL` on the service registers `qualification.critical.commit` as an explicit registry extension (the registry and runtime-configuration digests reflect it), wires the provider as a real adapter plus reconciliation resolver, and fails startup closed if the configured provider is unreachable. The release registry and its digest are unchanged when the variable is unset.
