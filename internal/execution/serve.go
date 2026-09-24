@@ -30,25 +30,6 @@ type ServeOptions struct {
 	Release           string // Release identity for the runtime configuration digest (e.g. "0.52.0-rc.1"); empty for dev builds
 }
 
-// DefaultServeOptions returns sensible defaults.
-func DefaultServeOptions() ServeOptions {
-	return ServeOptions{
-		SocketPath:        defaultSocketPath(),
-		ReconcileInterval: 30,
-	}
-}
-
-// defaultSocketPath returns a secure socket location.
-// Uses XDG_RUNTIME_DIR if available, falls back to a private
-// per-user directory under /tmp. The directory is created and
-// verified fail-closed by Service.Start.
-func defaultSocketPath() string {
-	if xdg := os.Getenv("XDG_RUNTIME_DIR"); xdg != "" {
-		return xdg + "/crabedence/execution.sock"
-	}
-	return "/tmp/crabedence-" + os.Getenv("USER") + "/execution.sock"
-}
-
 // Serve starts the persistent execution service.
 // It registers built-in capabilities, connects to PostgreSQL for durable
 // idempotency, and listens on the Unix socket until the context is
@@ -429,7 +410,7 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	// supports recovery. The default resolver is NoopResolver (fail-
 	// closed: UNKNOWN stays UNKNOWN unless a resolver proves otherwise).
 	if store != nil && opts.ReconcileInterval > 0 {
-		worker := reconcile.NewWorker(store, reconcile.NoopResolver{}, durationSeconds(opts.ReconcileInterval))
+		worker := reconcile.NewWorker(store, reconcile.NoopResolver{})
 		worker.RegisterResolver("test.counter.increment", counterHandler)
 		if githubHandler != nil {
 			worker.RegisterResolver("github.issue.create", githubHandler)

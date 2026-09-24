@@ -3230,31 +3230,6 @@ func writeDelegatedRunReceipt(path, keyPath string, cfg Config, result RunResult
 	return persistPreparedRunReceipt(prepared)
 }
 
-func prepareDelegatedRunReceipt(path string, key ed25519.PrivateKey, cfg Config, result RunResult, req RunRequest) (preparedRunReceipt, error) {
-	command := strings.TrimSpace(result.CommandText)
-	if command == "" {
-		command = runCommandDisplay(req.Command, req.ShellMode)
-	}
-	receipt := runReceiptInput{
-		Provider:   result.Provider,
-		LeaseID:    result.LeaseID,
-		Slug:       result.Slug,
-		RunID:      delegatedRunID(req, result),
-		Command:    command,
-		ExitCode:   result.ExitCode,
-		CommandMs:  result.Command.Milliseconds(),
-		ActionsURL: result.ActionsURL,
-	}
-	if session := result.Session; session != nil {
-		receipt.Provider = firstNonBlank(receipt.Provider, session.Provider)
-		receipt.LeaseID = firstNonBlank(receipt.LeaseID, session.LeaseID)
-		receipt.Slug = firstNonBlank(receipt.Slug, session.Slug)
-		receipt.ActionsURL = firstNonBlank(receipt.ActionsURL, session.ActionsURL)
-	}
-	receipt.Provider = firstNonBlank(receipt.Provider, cfg.Provider)
-	return prepareRunReceipt(path, key, receipt)
-}
-
 // prepareDelegatedTerminalReceipt builds a V3 terminal receipt with evidence
 // binding for a delegated run. This replaces the legacy V1
 // prepareDelegatedRunReceipt path, ensuring delegated providers participate in

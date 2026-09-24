@@ -32,7 +32,7 @@ func TestNoopResolverReturnsUnknown(t *testing.T) {
 // resolvers are selected over the default.
 func TestWorkerRegisterResolver(t *testing.T) {
 	defaultResolver := NoopResolver{}
-	w := NewWorker(nil, defaultResolver, 0)
+	w := NewWorker(nil, defaultResolver)
 
 	custom := &mockResolver{decision: idempotency.RecoveryCommitted}
 	w.RegisterResolver("test.capability", custom)
@@ -59,7 +59,7 @@ func TestWorkerRegisterResolver(t *testing.T) {
 // TestWorkerNilDefaultResolver verifies that a nil default resolver
 // returns UNKNOWN (fail-closed).
 func TestWorkerNilDefaultResolver(t *testing.T) {
-	w := NewWorker(nil, nil, 0)
+	w := NewWorker(nil, nil)
 	result, err := w.resolve(context.Background(), &idempotency.Record{CapabilityID: "any.capability"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -183,7 +183,7 @@ func TestLiveWorkerReconciliation(t *testing.T) {
 		},
 	}
 
-	w := NewWorker(store, NoopResolver{}, 0)
+	w := NewWorker(store, NoopResolver{})
 	w.RegisterResolver("test.counter.increment", proofResolver)
 
 	// Run one reconciliation cycle — claim the record first, as the
@@ -256,7 +256,7 @@ func TestLiveWorkerDeadLettersAfterAttemptCeiling(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	w := NewWorker(store, NoopResolver{}, 0)
+	w := NewWorker(store, NoopResolver{})
 	w.SetMaxAttempts(5) // effectiveAttempt (10-1) already exceeds the ceiling
 
 	rec, _ = store.Lookup(ctx, execID)
@@ -334,7 +334,7 @@ func TestLiveWorkerReconcileCriticalFailedWithoutProof(t *testing.T) {
 		},
 	}
 
-	w := NewWorker(store, NoopResolver{}, 0)
+	w := NewWorker(store, NoopResolver{})
 	w.RegisterResolver("test.critical.deploy", badResolver)
 	// Claim the record so the resolver is actually invoked — without a
 	// claim the pre-resolver revalidation would reject it vacuously.
@@ -429,7 +429,7 @@ func TestLiveClaimHeartbeatBlocksSecondWorker(t *testing.T) {
 	execID := makeUnknownRecord(t, db, store, ctx, key, "test.counter.increment", "MUTATION")
 	defer db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key = $1`, key)
 
-	w := NewWorker(store, NoopResolver{}, 0)
+	w := NewWorker(store, NoopResolver{})
 	w.SetWorkerID("worker-hb-1")
 	w.SetClaimDuration(400 * time.Millisecond)
 	w.RegisterResolver("test.counter.increment", &slowResolver{
@@ -598,7 +598,7 @@ func TestLiveWorkerSuspendsPastClaimCeiling(t *testing.T) {
 	defer db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key = $1`, key)
 
 	resolver := &countingResolver{result: idempotency.RecoveryResult{Decision: idempotency.RecoveryUnknown}}
-	w := NewWorker(store, NoopResolver{}, 0)
+	w := NewWorker(store, NoopResolver{})
 	w.SetWorkerID("worker-ceiling")
 	w.SetMaxAttempts(5)
 	w.RegisterResolver("test.counter.increment", resolver)
@@ -666,7 +666,7 @@ func TestLiveWorkerResolverRunsAtLastAllowedClaim(t *testing.T) {
 	defer db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key = $1`, key)
 
 	resolver := &countingResolver{result: idempotency.RecoveryResult{Decision: idempotency.RecoveryUnknown}}
-	w := NewWorker(store, NoopResolver{}, 0)
+	w := NewWorker(store, NoopResolver{})
 	w.SetWorkerID("worker-ceiling-exact")
 	w.SetMaxAttempts(5)
 	w.RegisterResolver("test.counter.increment", resolver)
@@ -741,7 +741,7 @@ func TestLiveBatchClaimHeartbeatProtectsQueuedRecords(t *testing.T) {
 	queuedID := makeUnknownRecord(t, db, store, ctx, prefix+"-queued", "test.fast", "MUTATION")
 
 	fastResolver := &countingResolver{result: idempotency.RecoveryResult{Decision: idempotency.RecoveryUnknown}}
-	w := NewWorker(store, NoopResolver{}, 0)
+	w := NewWorker(store, NoopResolver{})
 	w.SetWorkerID("worker-batch-1")
 	w.SetClaimDuration(400 * time.Millisecond)
 	w.RegisterResolver("test.slow", &slowResolver{
@@ -830,7 +830,7 @@ func TestLiveReconcileSkipsResolverOnStaleClaim(t *testing.T) {
 	defer db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key = $1`, key)
 
 	resolver := &countingResolver{result: idempotency.RecoveryResult{Decision: idempotency.RecoveryUnknown}}
-	w := NewWorker(store, resolver, 0)
+	w := NewWorker(store, resolver)
 	w.SetWorkerID("worker-stale")
 	w.SetClaimDuration(200 * time.Millisecond)
 

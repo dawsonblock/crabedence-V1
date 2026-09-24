@@ -66,7 +66,7 @@ func (errorResolver) Resolve(context.Context, *idempotency.Record) (idempotency.
 
 func TestSupervisorPublishesReadinessToStatusWriter(t *testing.T) {
 	store := &stubStore{}
-	worker := NewWorker(store, NoopResolver{}, time.Minute)
+	worker := NewWorker(store, NoopResolver{})
 	supervisor := NewSupervisor(worker, store, SupervisorConfig{Interval: time.Minute})
 
 	var published []Health
@@ -85,7 +85,7 @@ func TestSupervisorPublishesReadinessToStatusWriter(t *testing.T) {
 	// A failing cycle publishes NOT_READY — the degraded state escapes
 	// the object graph, not just the logs.
 	failing := &stubStore{claimErr: errors.New("injected claim failure")}
-	failingSupervisor := NewSupervisor(NewWorker(failing, NoopResolver{}, time.Minute), failing, SupervisorConfig{
+	failingSupervisor := NewSupervisor(NewWorker(failing, NoopResolver{}), failing, SupervisorConfig{
 		Interval:               time.Minute,
 		MaxConsecutiveFailures: 1,
 	})
@@ -101,7 +101,7 @@ func TestSupervisorPublishesReadinessToStatusWriter(t *testing.T) {
 
 func TestSupervisorReadinessPolicy(t *testing.T) {
 	store := &stubStore{}
-	worker := NewWorker(store, NoopResolver{}, time.Minute)
+	worker := NewWorker(store, NoopResolver{})
 	supervisor := NewSupervisor(worker, store, SupervisorConfig{
 		Interval:               time.Minute,
 		DegradedAfterCycleAge:  time.Minute,
@@ -149,7 +149,7 @@ func TestSupervisorReadinessPolicy(t *testing.T) {
 
 	// Consecutive failures escalate to not ready.
 	failing := &stubStore{claimErr: errors.New("injected claim failure")}
-	failingWorker := NewWorker(failing, NoopResolver{}, time.Minute)
+	failingWorker := NewWorker(failing, NoopResolver{})
 	failingSupervisor := NewSupervisor(failingWorker, failing, SupervisorConfig{
 		Interval:               time.Minute,
 		MaxConsecutiveFailures: 2,
@@ -174,7 +174,7 @@ func TestSupervisorReadinessPolicy(t *testing.T) {
 func TestSupervisorDegradedOnUnknownBacklogAge(t *testing.T) {
 	old := time.Now().Add(-2 * time.Hour)
 	store := &stubStore{backlog: 3, oldest: &old}
-	worker := NewWorker(store, NoopResolver{}, time.Minute)
+	worker := NewWorker(store, NoopResolver{})
 	supervisor := NewSupervisor(worker, store, SupervisorConfig{
 		Interval:      time.Minute,
 		MaxUnknownAge: time.Hour,
@@ -192,7 +192,7 @@ func TestSupervisorDegradedOnUnknownBacklogAge(t *testing.T) {
 
 func TestSupervisorRunLoopObservesCycles(t *testing.T) {
 	store := &stubStore{}
-	worker := NewWorker(store, NoopResolver{}, time.Minute)
+	worker := NewWorker(store, NoopResolver{})
 	supervisor := NewSupervisor(worker, store, SupervisorConfig{
 		Interval:              10 * time.Millisecond,
 		DegradedAfterCycleAge: time.Minute,
@@ -231,7 +231,7 @@ func TestSupervisorRunLoopObservesCycles(t *testing.T) {
 
 func TestWorkerCountersDeadLettersAndResolverFailures(t *testing.T) {
 	store := &stubStore{}
-	worker := NewWorker(store, errorResolver{}, time.Minute)
+	worker := NewWorker(store, errorResolver{})
 	worker.SetMaxAttempts(1)
 
 	// A record past the attempt ceiling is dead-lettered.
@@ -252,7 +252,7 @@ func TestWorkerCountersDeadLettersAndResolverFailures(t *testing.T) {
 	}
 
 	// A resolver error is counted and the record keeps its UNKNOWN state.
-	pendingWorker := NewWorker(store, errorResolver{}, time.Minute)
+	pendingWorker := NewWorker(store, errorResolver{})
 	pendingWorker.SetMaxAttempts(3)
 	pending := &idempotency.Record{
 		ExecutionID:      "exec-pending",

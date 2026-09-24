@@ -145,7 +145,7 @@ func reconcileUnknownRecord(t *testing.T, store *idempotency.Store, resolver *Gi
 	t.Helper()
 	ctx := context.Background()
 
-	w := reconcile.NewWorker(store, reconcile.NoopResolver{}, 0)
+	w := reconcile.NewWorker(store, reconcile.NoopResolver{})
 	w.SetWorkerID("fault-worker")
 	w.SetClaimDuration(2 * time.Second)
 	w.RegisterResolver("github.issue.create", resolver)

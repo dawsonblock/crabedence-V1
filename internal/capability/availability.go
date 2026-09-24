@@ -175,10 +175,3 @@ func (r *Registry) Availability(adapters AdapterAvailability) []CapabilityAvaila
 	}
 	return entries
 }
-
-// Unavailable returns the registered capabilities this deployment
-// cannot currently execute, in ID order. It is a convenience view over
-// CheckAdapterAvailability.
-func (r *Registry) Unavailable(adapters AdapterAvailability) []CapabilityAvailability {
-	return r.CheckAdapterAvailability(adapters).Unavailable
-}

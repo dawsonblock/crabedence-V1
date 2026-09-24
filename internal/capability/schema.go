@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/big"
-	"strings"
 	"unicode/utf8"
 )
 
@@ -269,34 +268,4 @@ func checkType(expected string, val any, path string) error {
 		return fmt.Errorf("%s: expected %s, got %s", path, expected, actual)
 	}
 	return nil
-}
-
-// SchemaValidationError describes an argument validation failure
-// with the offending path for diagnostics.
-type SchemaValidationError struct {
-	Path    string
-	Message string
-}
-
-func (e *SchemaValidationError) Error() string {
-	if e.Path == "" {
-		return e.Message
-	}
-	return e.Path + ": " + e.Message
-}
-
-// ParseSchemaValidationError extracts the path from a validation error
-// message for structured error reporting.
-func ParseSchemaValidationError(err error) *SchemaValidationError {
-	if err == nil {
-		return nil
-	}
-	msg := err.Error()
-	if idx := strings.Index(msg, ": "); idx > 0 {
-		return &SchemaValidationError{
-			Path:    msg[:idx],
-			Message: msg[idx+2:],
-		}
-	}
-	return &SchemaValidationError{Message: msg}
 }

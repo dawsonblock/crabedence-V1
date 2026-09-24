@@ -323,6 +323,12 @@ func (r TerminalReceipt) Digest() (string, error) {
 // sorted object keys. This ensures that semantically identical JSON
 // produces identical byte sequences for digest computation.
 // nil or empty input returns nil (which omits the field).
+//
+// This is a JSON-level transform only: it does NOT apply provider
+// semantics such as default values ({"by":0} and {"by":1} remain
+// distinct even when a provider treats 0 as "use the default").
+// Provider argument normalization belongs inside PrepareRecovery —
+// the two operations must not be conflated.
 func canonicalizeJSON(raw json.RawMessage) (json.RawMessage, error) {
 	if len(raw) == 0 {
 		return nil, nil
@@ -489,26 +495,6 @@ type RecoveryLocatorProvider interface {
 	// the IN_FLIGHT boundary without a persistable recovery locator
 	// would leave a potential side effect undiscoverable.
 	PrepareRecovery(ctx context.Context, in RecoveryLocatorInput) (*RecoveryLocator, error)
-}
-
-// CanonicalizeArguments canonicalizes a JSON argument blob — parses and
-// re-marshals with sorted object keys so that byte-level differences in
-// key ordering produce identical output. This is purely a JSON-level
-// transform: it does NOT apply provider semantics such as default
-// values ({"by":0} and {"by":1} remain distinct even when a provider
-// treats 0 as "use the default"). Provider argument normalization is
-// the provider's job inside PrepareRecovery — the two operations must
-// not be conflated.
-//
-// Deprecated name retained for callers; CanonicalizeJSON is identical.
-func CanonicalizeArguments(raw json.RawMessage) (json.RawMessage, error) {
-	return CanonicalizeJSON(raw)
-}
-
-// CanonicalizeJSON canonicalizes a JSON blob: sorted object keys,
-// no semantic interpretation.
-func CanonicalizeJSON(raw json.RawMessage) (json.RawMessage, error) {
-	return canonicalizeJSON(raw)
 }
 
 // Ctx is an alias for context.Context to avoid importing context in

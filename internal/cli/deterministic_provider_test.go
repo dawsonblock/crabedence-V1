@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"encoding/json"
-	"flag"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -16,8 +15,6 @@ import (
 // require any external infrastructure.
 type deterministicProvider struct{}
 
-func (deterministicProvider) Name() string      { return "deterministic-test" }
-func (deterministicProvider) Aliases() []string { return nil }
 func (deterministicProvider) Spec() ProviderSpec {
 	return ProviderSpec{
 		Name:        "deterministic-test",
@@ -26,13 +23,6 @@ func (deterministicProvider) Spec() ProviderSpec {
 		Targets:     []TargetSpec{{OS: targetLinux}},
 		Coordinator: CoordinatorNever,
 	}
-}
-func (deterministicProvider) RegisterFlags(*flag.FlagSet, Config) any { return nil }
-func (deterministicProvider) ApplyFlags(*Config, *flag.FlagSet, any) error {
-	return nil
-}
-func (p deterministicProvider) Configure(Config, Runtime) (Backend, error) {
-	return deterministicBackend{spec: p.Spec()}, nil
 }
 
 // deterministicBackend produces a RunResult with configurable exit code,
@@ -56,10 +46,6 @@ var deterministicRunConfig = struct {
 	LogExcerpt:  "hello\n",
 }
 
-func (b deterministicBackend) Spec() ProviderSpec { return b.spec }
-func (b deterministicBackend) Warmup(context.Context, WarmupRequest) error {
-	return nil
-}
 func (b deterministicBackend) Run(context.Context, RunRequest) (RunResult, error) {
 	cfg := deterministicRunConfig
 	result := RunResult{
@@ -79,13 +65,6 @@ func (b deterministicBackend) Run(context.Context, RunRequest) (RunResult, error
 	}
 	return result, nil
 }
-func (b deterministicBackend) List(context.Context, ListRequest) ([]LeaseView, error) {
-	return nil, nil
-}
-func (b deterministicBackend) Status(context.Context, StatusRequest) (StatusView, error) {
-	return StatusView{}, nil
-}
-func (b deterministicBackend) Stop(context.Context, StopRequest) error { return nil }
 
 // TestDeterministicProviderGeneratesValidEvidence verifies that a
 // deterministic test provider produces evidence that passes Go's own

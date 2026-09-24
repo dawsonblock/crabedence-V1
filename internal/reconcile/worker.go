@@ -39,7 +39,6 @@ type Worker struct {
 	store         idempotency.EffectStore
 	resolvers     map[string]idempotency.RecoveryResolver // keyed by capability_id
 	default_      idempotency.RecoveryResolver
-	interval      time.Duration
 	workerID      string
 	batchSize     int
 	claimDuration time.Duration
@@ -67,12 +66,11 @@ type Worker struct {
 // NewWorker creates a reconciliation worker with a default resolver.
 // The default resolver is used when no capability-specific resolver
 // is registered.
-func NewWorker(store idempotency.EffectStore, defaultResolver idempotency.RecoveryResolver, interval time.Duration) *Worker {
+func NewWorker(store idempotency.EffectStore, defaultResolver idempotency.RecoveryResolver) *Worker {
 	return &Worker{
 		store:            store,
 		resolvers:        make(map[string]idempotency.RecoveryResolver),
 		default_:         defaultResolver,
-		interval:         interval,
 		workerID:         fmt.Sprintf("reconcile-%d", os.Getpid()),
 		batchSize:        100,
 		claimDuration:    5 * time.Minute,
@@ -85,17 +83,8 @@ func NewWorker(store idempotency.EffectStore, defaultResolver idempotency.Recove
 // Useful for testing or when a stable identity is needed.
 func (w *Worker) SetWorkerID(id string) { w.workerID = id }
 
-// SetBatchSize overrides the default batch size (100).
-func (w *Worker) SetBatchSize(n int) { w.batchSize = n }
-
 // SetClaimDuration overrides the default claim duration (5 min).
 func (w *Worker) SetClaimDuration(d time.Duration) { w.claimDuration = d }
-
-// SetLocatorRetention overrides the default recovery-locator retention
-// (7 days). UNKNOWN records older than the retention have their
-// recovery_locator scrubbed — they stay UNKNOWN but stop retaining
-// potentially sensitive locator data.
-func (w *Worker) SetLocatorRetention(d time.Duration) { w.locatorRetention = d }
 
 // SetEvidenceSigner configures the Ed25519 receipt signer used to
 // attest definitive CRITICAL recovery decisions. The signer must be a
@@ -162,24 +151,6 @@ func (w *Worker) Metrics() WorkerMetrics {
 // failures.
 func (w *Worker) RunCycle(ctx context.Context) error {
 	return w.reconcileAll(ctx)
-}
-
-// Run starts the reconciliation loop. It runs until the context is cancelled.
-func (w *Worker) Run(ctx context.Context) error {
-	ticker := time.NewTicker(w.interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			if err := w.RunCycle(ctx); err != nil {
-				// Log but continue
-				fmt.Printf("reconciliation error: %v\n", err)
-			}
-		}
-	}
 }
 
 // reconcileAll claims a batch of UNKNOWN records and attempts recovery.

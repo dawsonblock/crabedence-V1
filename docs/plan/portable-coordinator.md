@@ -336,12 +336,12 @@ coordinator's durable control-plane problem.
 - [x] Tart `startVM` migrated to use `ProcessStartupConfirm` internally:
   `confirmStartup` delegates to `shared.TimeoutWindowConfirm.Wait` using
   the caller's context and a new `exitedErr` channel fed by the reaper.
-  The legacy `observe` method is retained as a compatibility wrapper.
+  The legacy `observe` wrapper was removed once it had no callers.
 - [x] Lume `startVM` migrated to use `shared.FileHandoffConfirm` and
   `shared.TimeoutWindowConfirm` internally: the owner/ack handoff waits
   and the final survival window select are all routed through shared
-  strategies. The legacy `waitForLaunchHandoff` is retained as a
-  compatibility wrapper.
+  strategies. The legacy `waitForLaunchHandoff` wrapper was removed
+  once it had no callers.
 - [x] Tart `Acquire` migrated to use `ProcessHandle` methods exclusively:
   `startSupervisedVM` returns `shared.ProcessHandle` (not `*startupProcess`),
   and `Acquire` uses `handle.Context()`, `handle.Abort()`, and

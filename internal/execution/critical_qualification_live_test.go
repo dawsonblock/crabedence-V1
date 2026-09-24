@@ -215,7 +215,7 @@ func newCriticalStack(t *testing.T) *criticalStack {
 	}
 	t.Cleanup(func() { service.Stop() })
 
-	worker := reconcile.NewWorker(store, reconcile.NoopResolver{}, 30*time.Second)
+	worker := reconcile.NewWorker(store, reconcile.NoopResolver{})
 	worker.RegisterResolver(qualificationCapabilityID, adapter)
 	worker.SetEvidenceSigner(signer)
 
@@ -1028,7 +1028,7 @@ func TestLiveCriticalQualificationCrashThenRecover(t *testing.T) {
 	}
 	store.SetTrustedEvidenceSigners(signer.Fingerprint())
 	adapter := &qualificationAdapter{baseURL: providerURL, client: &http.Client{Timeout: 2 * time.Second}}
-	worker := reconcile.NewWorker(store, reconcile.NoopResolver{}, 30*time.Second)
+	worker := reconcile.NewWorker(store, reconcile.NoopResolver{})
 	worker.RegisterResolver(qualificationCapabilityID, adapter)
 	worker.SetEvidenceSigner(signer)
 

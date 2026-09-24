@@ -65,7 +65,7 @@ func TestSQLiteWorkerReconcileCommitted(t *testing.T) {
 		t.Fatalf("enter recovery: %v", err)
 	}
 
-	w := NewWorker(s, NoopResolver{}, time.Minute)
+	w := NewWorker(s, NoopResolver{})
 	w.RegisterResolver("cap.mut", fixedResolver{result: idempotency.RecoveryResult{
 		Decision:       idempotency.RecoveryCommitted,
 		EvidenceDigest: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",

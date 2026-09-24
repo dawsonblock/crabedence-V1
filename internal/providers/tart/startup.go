@@ -132,12 +132,6 @@ func (p *startupProcess) StartupConfirmResult() shared.StartupConfirmResult {
 	return p.startupConfirmResult
 }
 
-// observe is retained for backward compatibility; it delegates to
-// confirmStartup with the startupProcess's own context.
-func (p *startupProcess) observe(timeout time.Duration) error {
-	return p.confirmStartup(p.ctx, timeout)
-}
-
 // capture and closeLog run with mu held (or before the reaper starts).
 func (p *startupProcess) capture() {
 	if p.captured || p.log == nil {

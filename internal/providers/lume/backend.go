@@ -1011,19 +1011,6 @@ func prepareLaunchHandoff(token string) (launchHandoff, error) {
 	return handoff, nil
 }
 
-// waitForLaunchHandoff is retained for backward compatibility; new code uses
-// shared.FileHandoffConfirm directly. It delegates to the shared strategy.
-func waitForLaunchHandoff(ctx context.Context, path, expected string, exitCh <-chan error) error {
-	confirm := shared.FileHandoffConfirm{
-		Path:            path,
-		ExpectedContent: expected,
-		Timeout:         2 * time.Second,
-		PollInterval:    10 * time.Millisecond,
-	}
-	_, err := confirm.Wait(ctx, exitCh)
-	return err
-}
-
 func lumeRunLogPath(name string) (string, error) {
 	dir, err := core.CrabboxStateDir()
 	if err != nil {
