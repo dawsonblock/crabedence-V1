@@ -1021,6 +1021,12 @@ func TestLiveCriticalQualificationCrashThenRecover(t *testing.T) {
 	if rec.State.IsDurablyFinal() {
 		t.Fatalf("crash produced terminal %s without finalization", rec.State)
 	}
+	// Force the orphaned lease to read as expired so the first
+	// reconcile cycle can claim it — an explicit transition instead of
+	// polling until the short lease lapses naturally.
+	if err := store.ExpireLeaseForTest(ctx, rec.ExecutionID); err != nil {
+		t.Fatal(err)
+	}
 
 	signer, err := evidence.GenerateSigner()
 	if err != nil {
@@ -1032,7 +1038,8 @@ func TestLiveCriticalQualificationCrashThenRecover(t *testing.T) {
 	worker.RegisterResolver(qualificationCapabilityID, adapter)
 	worker.SetEvidenceSigner(signer)
 
-	// Let the orphaned lease expire, then reconcile external reality.
+	// Reconcile external reality; the loop is a convergence wait, not
+	// an expiry wait — the lease was expired explicitly above.
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
 		time.Sleep(300 * time.Millisecond)
