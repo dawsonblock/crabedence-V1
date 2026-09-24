@@ -399,10 +399,16 @@ jobs:
         with:
           node-version: 24
 
+      # The script tests assert the real repository resolves the exact
+      # go.mod toolchain pin (go env GOVERSION), and this job runs with
+      # GOTOOLCHAIN=local, so the installer must place that exact
+      # version. go-version-file resolves the `go` directive to the
+      # newest patch, which breaks the assertion as soon as a newer
+      # patch ships; pin the installer to the toolchain instead.
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
-          go-version-file: go.mod
+          go-version: 1.26.5
           cache: false
 
       - name: Install script dependencies
