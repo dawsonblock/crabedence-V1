@@ -2,7 +2,11 @@ import { describe, expect, it } from "vitest";
 
 import type { LeaseConfig } from "../src/config";
 import { rollbackCleanupLease } from "../src/lease-lifecycle";
-import { DurableObjectLeaseRepository, leaseKey } from "../src/lease-repository";
+import {
+  DurableObjectLeaseRepository,
+  LeaseTransitionRefused,
+  leaseKey,
+} from "../src/lease-repository";
 import { orgKeyForLabel } from "../src/org-identity";
 import { providerKeyForLease } from "../src/provider-key";
 import type { LeaseRecord, ProviderMachine } from "../src/types";
@@ -67,7 +71,7 @@ describe("DurableObjectLeaseRepository", () => {
     expect(storage.map.has(leaseKey(lease.id))).toBe(true);
   });
 
-  it("activates a lease, binding the provider identity and keeping the attempt generation", async () => {
+  it("keeps the attempt generation when a reactivated lease is activated", async () => {
     const storage = new MemoryStorage();
     const repository = repositoryFor(storage);
     const lease = leaseFixture({
@@ -75,17 +79,11 @@ describe("DurableObjectLeaseRepository", () => {
       createAttemptGeneration: "gen-9",
     } as Partial<LeaseRecord>);
     await repository.createManagedLease(lease);
-    const activated = await repository.activateLease(lease, {
-      config: configFixture({ providerKey: providerKeyForLease(lease.id) }),
-      server: serverFixture(),
-      serverType: "cx22",
-    });
+    const activated = await repository.activateLease(lease, { at: "2026-09-24T00:05:00.000Z" });
     expect(activated.state).toBe("active");
-    expect(activated.cloudID).toBe("srv-7");
     expect(activated.createAttemptGeneration).toBe("gen-9");
     const stored = await repository.loadLease(lease.id);
     expect(stored?.state).toBe("active");
-    expect(stored?.cloudID).toBe("srv-7");
   });
 
   it("releases idempotently and keeps unresolved-creation debt", async () => {
@@ -213,5 +211,74 @@ describe("rollback cleanup lease", () => {
     );
     expect(withoutStored.state).toBe("active");
     expect(withoutStored.cloudID).toBe("srv-7");
+  });
+});
+
+describe("lease transition validation", () => {
+  it("activates a lease whose provider identity is already bound", async () => {
+    const storage = new MemoryStorage();
+    const repository = repositoryFor(storage);
+    const lease = leaseFixture();
+    await repository.createManagedLease(lease);
+    const activated = await repository.activateLease(lease, { at: "2026-09-24T00:05:00.000Z" });
+    expect(activated.state).toBe("active");
+    expect(activated.updatedAt).toBe("2026-09-24T00:05:00.000Z");
+    expect((await repository.loadLease(lease.id))?.state).toBe("active");
+  });
+
+  it("refuses a transition from a stale state", async () => {
+    const storage = new MemoryStorage();
+    const repository = repositoryFor(storage);
+    const stale = leaseFixture();
+    await repository.createManagedLease(stale);
+    // A caller holding this copy is stale the moment someone else moves
+    // the record.
+    const staleView = structuredClone(stale);
+    await repository.activateLease(stale, { at: "2026-09-24T00:05:00.000Z" });
+    await expect(
+      repository.activateLease(staleView, { at: "2026-09-24T00:06:00.000Z" }),
+    ).rejects.toThrow(LeaseTransitionRefused);
+    expect((await repository.loadLease(stale.id))?.state).toBe("active");
+  });
+
+  it("refuses a transition from a stale incarnation", async () => {
+    const storage = new MemoryStorage();
+    const repository = repositoryFor(storage);
+    const first = leaseFixture({ createAttemptGeneration: "gen-1" } as Partial<LeaseRecord>);
+    await repository.createManagedLease(first);
+    // A new create attempt replaces the incarnation.
+    await repository.createManagedLease({
+      ...first,
+      createAttemptGeneration: "gen-2",
+      updatedAt: "2026-09-24T00:04:00.000Z",
+    } as LeaseRecord);
+    await expect(
+      repository.activateLease(first, { at: "2026-09-24T00:05:00.000Z" }),
+    ).rejects.toThrow(LeaseTransitionRefused);
+  });
+
+  it("refuses to resurrect a terminal lease", async () => {
+    const storage = new MemoryStorage();
+    const repository = repositoryFor(storage);
+    const lease = leaseFixture({ state: "active", cloudID: "srv-1" });
+    await repository.createManagedLease(lease);
+    const released = await repository.releaseLease(lease, { deleteServer: true });
+    expect(released.state).toBe("released");
+    // A terminal record may record release intent again (idempotent), but
+    // it can never return to a live state.
+    await expect(
+      repository.activateLease(released, { at: "2026-09-24T00:05:00.000Z" }),
+    ).rejects.toThrow(LeaseTransitionRefused);
+    const again = await repository.releaseLease(released, { deleteServer: true });
+    expect(again.state).toBe("released");
+    expect((await repository.loadLease(lease.id))?.state).toBe("released");
+  });
+
+  it("refuses to transition a missing lease", async () => {
+    const storage = new MemoryStorage();
+    const repository = repositoryFor(storage);
+    await expect(
+      repository.activateLease(leaseFixture(), { at: "2026-09-24T00:05:00.000Z" }),
+    ).rejects.toThrow(LeaseTransitionRefused);
   });
 });

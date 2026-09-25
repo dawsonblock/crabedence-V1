@@ -436,3 +436,59 @@ export function expiredWorkspaceProvisioningLease(
   lease.updatedAt = input.at;
   lease.endedAt = input.at;
 }
+
+// ─── Transition legality and incarnation identity ────────────────────
+
+/**
+ * The states a lease may move to from each state, derived from the
+ * transitions defined above. Self-transitions are always permitted (an
+ * idempotent re-application of the same transition) and are therefore
+ * not listed.
+ *
+ * A terminal lease may still record release intent — that is evidence,
+ * not resurrection — and a retryable failure may return to `active` or
+ * `provisioning` when recovery proves the workspace exists.
+ */
+const legalLeaseTransitions: Record<LeaseState, readonly LeaseState[]> = {
+  provisioning: ["active", "failed", "released", "expired"],
+  active: ["failed", "released", "expired"],
+  failed: ["active", "provisioning", "released"],
+  released: ["released"],
+  expired: ["released"],
+};
+
+/** Whether a lease state change is one the lifecycle defines. */
+export function isLegalLeaseTransition(from: LeaseState, to: LeaseState): boolean {
+  if (from === to) {
+    return true;
+  }
+  return legalLeaseTransitions[from].includes(to);
+}
+
+/**
+ * The immutable identity of one lease incarnation. A record that has
+ * been released and reactivated for a new create attempt is a DIFFERENT
+ * incarnation: an old caller holding the previous one must never
+ * transition the new one.
+ */
+export interface LeaseIncarnation {
+  createdAt: string;
+  createAttemptID?: string | undefined;
+  createAttemptGeneration?: string | undefined;
+}
+
+export function leaseIncarnation(lease: LeaseRecord): LeaseIncarnation {
+  return {
+    createdAt: lease.createdAt,
+    createAttemptID: lease.createAttemptID,
+    createAttemptGeneration: lease.createAttemptGeneration,
+  };
+}
+
+export function sameLeaseIncarnation(current: LeaseRecord, expected: LeaseIncarnation): boolean {
+  return (
+    current.createdAt === expected.createdAt &&
+    current.createAttemptID === expected.createAttemptID &&
+    current.createAttemptGeneration === expected.createAttemptGeneration
+  );
+}

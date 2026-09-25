@@ -230,10 +230,8 @@ import {
   leaseIsLive,
   INITIAL_LEASE_STATE,
   absentProvisioningLease,
-  activatedLease,
   expiredWorkspaceProvisioningLease,
   finalizedProvisioningLease,
-  provisionedLeaseRecord,
   provisioningFailedLease,
   recoveredWorkspaceLease,
   recoveryFailedLease,
@@ -4366,10 +4364,11 @@ export class FleetCoordinator {
           ) {
             return { committed: false as const, current, pending };
           }
-          activatedLease(current, new Date().toISOString());
-          await this.putLease(current);
+          const activated = await this.leaseRepository.activateLease(current, {
+            at: new Date().toISOString(),
+          });
           await this.scheduleAlarm();
-          return { committed: true as const, current };
+          return { committed: true as const, current: activated };
         });
         if (!activation.committed) {
           if (createAttempt && !activation.pending) {

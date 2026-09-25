@@ -44650,9 +44650,12 @@ describe("synthetic acknowledgement reliability", () => {
         );
         expect(release.status).toBe(200);
         expectBoundedAlarmReads(storage, 2);
-        expect.soft(get.mock.calls.length).toBeLessThanOrEqual(6);
+        // The lease repository reloads the record once per transition to
+        // validate the caller's expectation (incarnation, state, legal
+        // target), so each bound carries exactly one extra read.
+        expect.soft(get.mock.calls.length).toBeLessThanOrEqual(7);
         expect(put).toHaveBeenCalledTimes(1);
-        expect(observedGet.mock.calls.length).toBeLessThanOrEqual(9);
+        expect(observedGet.mock.calls.length).toBeLessThanOrEqual(10);
         expect(observedPut.mock.calls.filter(([key]) => key.startsWith("lease:"))).toHaveLength(1);
         expect(observedPut).toHaveBeenCalledTimes(2);
         expect(storage.alarm()).toBe(before);

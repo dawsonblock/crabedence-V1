@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Hardening — the lease repository validates every transition
+
+- Coordinator: every state-changing lease operation now reloads the record and proves the caller's expectation still holds before persisting — same incarnation (`createdAt` plus the create-attempt ID and generation), same state, and a **resulting** state the lifecycle defines from there. A caller holding a stale record, or a terminal one, can no longer transition a record someone else has moved: stale application and terminal resurrection are refused with `LeaseTransitionRefused` instead of being written.
+- The check is on the resulting state rather than a named target, because a liveness-guarded transition (unresolved-resource evidence, manual expiry) legitimately records debt on a terminal record without changing its state — while any transition that would move a terminal record back to a live state is refused. This was found by the fleet suite: the interrupted-provisioning recovery path records unresolved debt on a *released* record, and a named-target check refused it.
+- The transition is applied to the caller's record, not the reloaded one, so a flow that edited fields before transitioning persists exactly those edits — the reload exists to validate, not to replace the caller's work.
+- `activateLease` is now the reactivation transition and has its production caller; the router no longer applies `provisionedLeaseRecord` directly. The release path's storage-work bound carries one extra read for the validation reload, documented at the assertion.
+- Tests: stale-state refusal, stale-incarnation refusal, terminal-resurrection refusal (with the idempotent re-release that must still work), missing-lease refusal, and the positive activation path.
+- Still open from the audit, now narrowed: `createManagedLease` and `expireLeaseForManualCleanup` have no production caller yet (their flows build records inline or branch inside a module-level helper), and `provisionedLeaseRecord` is currently referenced only by the module — migrating the provisioning-finalization and cleanup-failure flows onto them is the remaining wiring.
+
 ### Hardening — authority material fails closed
 
 - Authority: persisted grant material is now decoded strictly and verified before it can authorize. Corrupted capability or constraint JSON — and any material whose stored `grant_digest` disagrees with the digest recomputed from it — resolves to an authority error instead of a grant. Before this change the decode error was discarded, an empty capability list is the wildcard, and a nil constraint map is unconstrained, so corrupt bytes authorized everything. Verification is constant-time (`capability.VerifyGrantDigest`), and admission already treats a resolution error as `UNAUTHORIZED`: the failure mode is deny, never broaden.

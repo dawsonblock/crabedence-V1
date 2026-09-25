@@ -10,13 +10,17 @@
  */
 import type { LeaseConfig } from "./config";
 import {
+  activatedLease,
   clearProvisioningRecoveryMetadata,
   expiredRegisteredLease,
   failedUnprovisionedExpiryLease,
   finalizedReleasedLease,
-  provisionedLeaseRecord,
+  isLegalLeaseTransition,
+  leaseIncarnation,
   retainUnresolvedProviderResource,
+  sameLeaseIncarnation,
   terminalizeManualProviderCleanup,
+  type LeaseState,
 } from "./lease-lifecycle";
 import type { LeaseRecord, ProviderMachine } from "./types";
 
@@ -40,9 +44,7 @@ export interface DispatchEvidenceRestore {
 }
 
 export interface ActivateLeaseInput {
-  config: LeaseConfig;
-  server: ProviderMachine;
-  serverType: string;
+  at: string;
 }
 
 export interface ReleaseLeaseInput {
@@ -83,7 +85,7 @@ export interface LeaseRepository {
   loadLease(leaseID: string, options?: { noCache?: boolean }): Promise<LeaseRecord | null>;
   /** Persist a newly created managed lease (state provisioning). */
   createManagedLease(lease: LeaseRecord): Promise<void>;
-  /** Activation: bind the provider instance the attempt produced. */
+  /** Activation of a lease whose provider identity is already bound. */
   activateLease(lease: LeaseRecord, input: ActivateLeaseInput): Promise<LeaseRecord>;
   /** Release: record the user's intent to delete the provider resource. */
   releaseLease(lease: LeaseRecord, input: ReleaseLeaseInput): Promise<LeaseRecord>;
@@ -97,8 +99,72 @@ export interface LeaseRepository {
   failUnprovisionedExpiredLease(lease: LeaseRecord, input: LeaseExpiryInput): Promise<LeaseRecord>;
 }
 
+/**
+ * A transition the repository refused: the record is not what the caller
+ * believes it is (a different incarnation, a different state, or a
+ * target state the lifecycle does not define from there).
+ */
+export class LeaseTransitionRefused extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "LeaseTransitionRefused";
+  }
+}
+
 export class DurableObjectLeaseRepository implements LeaseRepository {
   constructor(private readonly storage: LeaseStorageView) {}
+
+  /**
+   * Reload the record and prove the caller's expectation still holds:
+   * same incarnation, same state, and — applying the transition to a
+   * probe copy of the reloaded record — a resulting state the lifecycle
+   * defines from there. Every state-changing operation routes through
+   * this, so a caller holding a stale record, or a terminal one, can
+   * never transition a record someone else has moved.
+   *
+   * The check is on the RESULTING state, not a named target: a
+   * liveness-guarded transition (unresolved-resource evidence, manual
+   * expiry) legitimately records debt on a terminal record without
+   * changing its state, and that must remain possible — while a
+   * transition that would move a terminal record back to a live state is
+   * refused.
+   *
+   * The transition itself is then applied to the CALLER's record, not
+   * the reloaded one, so a flow that edited fields before transitioning
+   * persists exactly those edits — the reload exists to validate, not to
+   * replace the caller's work.
+   *
+   * Callers that need mutual exclusion against concurrent flows still
+   * hold their own serialization boundary; this makes the transition
+   * itself safe regardless, rather than relying on the caller to be
+   * correct about what it is transitioning.
+   */
+  private async assertTransition(
+    expected: LeaseRecord,
+    apply: (lease: LeaseRecord) => LeaseRecord,
+  ): Promise<void> {
+    const current = await this.loadLease(expected.id);
+    if (!current) {
+      throw new LeaseTransitionRefused(`lease ${expected.id} is missing`);
+    }
+    if (!sameLeaseIncarnation(current, leaseIncarnation(expected))) {
+      throw new LeaseTransitionRefused(`lease ${expected.id} incarnation changed`);
+    }
+    if (current.state !== expected.state) {
+      throw new LeaseTransitionRefused(
+        `lease ${expected.id} state changed from ${expected.state} to ${current.state}`,
+      );
+    }
+    const resulting = apply(structuredClone(current));
+    if (
+      resulting.state !== current.state &&
+      !isLegalLeaseTransition(current.state, resulting.state)
+    ) {
+      throw new LeaseTransitionRefused(
+        `lease ${expected.id} may not move from ${current.state} to ${resulting.state}`,
+      );
+    }
+  }
 
   async loadLease(leaseID: string, options?: { noCache?: boolean }): Promise<LeaseRecord | null> {
     return (await this.storage.get<LeaseRecord>(leaseKey(leaseID), options)) ?? null;
@@ -108,13 +174,24 @@ export class DurableObjectLeaseRepository implements LeaseRepository {
     await this.storage.put(leaseKey(lease.id), lease);
   }
 
+  /**
+   * Activation of a lease whose provider identity is already bound (a
+   * released incarnation reactivated for a new create attempt).
+   */
   async activateLease(lease: LeaseRecord, input: ActivateLeaseInput): Promise<LeaseRecord> {
-    const next = provisionedLeaseRecord(lease, input.config, input.server, input.serverType);
-    await this.storage.put(leaseKey(next.id), next);
-    return next;
+    await this.assertTransition(lease, (probe) => {
+      activatedLease(probe, input.at);
+      return probe;
+    });
+    activatedLease(lease, input.at);
+    await this.storage.put(leaseKey(lease.id), lease);
+    return lease;
   }
 
   async releaseLease(lease: LeaseRecord, input: ReleaseLeaseInput): Promise<LeaseRecord> {
+    await this.assertTransition(lease, (probe) =>
+      finalizedReleasedLease(probe, input.deleteServer, input.keep),
+    );
     const next = finalizedReleasedLease(lease, input.deleteServer, input.keep);
     if (input.restoreDispatchEvidence) {
       const evidence = input.restoreDispatchEvidence;
@@ -153,6 +230,10 @@ export class DurableObjectLeaseRepository implements LeaseRepository {
     lease: LeaseRecord,
     input: UnresolvedLeaseInput,
   ): Promise<LeaseRecord> {
+    await this.assertTransition(lease, (probe) => {
+      retainUnresolvedProviderResource(probe, input.message, input.at);
+      return probe;
+    });
     retainUnresolvedProviderResource(lease, input.message, input.at);
     await this.storage.put(leaseKey(lease.id), lease);
     return lease;
@@ -162,12 +243,17 @@ export class DurableObjectLeaseRepository implements LeaseRepository {
     lease: LeaseRecord,
     input: ManualExpiryInput,
   ): Promise<LeaseRecord> {
+    await this.assertTransition(lease, (probe) => {
+      terminalizeManualProviderCleanup(probe, input.error, input.at);
+      return probe;
+    });
     terminalizeManualProviderCleanup(lease, input.error, input.at);
     await this.storage.put(leaseKey(lease.id), lease);
     return lease;
   }
 
   async expireRegisteredLease(lease: LeaseRecord, input: LeaseExpiryInput): Promise<LeaseRecord> {
+    await this.assertTransition(lease, (probe) => expiredRegisteredLease(probe, input.at));
     const next = expiredRegisteredLease(lease, input.at);
     await this.storage.put(leaseKey(next.id), next, { noCache: true });
     return next;
@@ -177,6 +263,7 @@ export class DurableObjectLeaseRepository implements LeaseRepository {
     lease: LeaseRecord,
     input: LeaseExpiryInput,
   ): Promise<LeaseRecord> {
+    await this.assertTransition(lease, (probe) => failedUnprovisionedExpiryLease(probe, input.at));
     const next = failedUnprovisionedExpiryLease(lease, input.at);
     await this.storage.put(leaseKey(next.id), next, { noCache: true });
     return next;
