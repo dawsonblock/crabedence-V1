@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Hardening — coordinator decomposition, extraction 3 (continued): lease repository
+
+- Coordinator: lease state transitions now go through `worker/src/lease-repository.ts` — a semantic `LeaseRepository` (`createManagedLease`, `activateLease`, `releaseLease`, `retainUnresolvedLease`, `expireLeaseForManualCleanup`, `expireRegisteredLease`, `failUnprovisionedExpiredLease`) with deliberately no state setter. All eleven transition sites were rewired, and `fleet.ts` now contains **zero** lease state assignments.
+- The remaining transition rules moved into the lifecycle module: registered-lease expiry, unprovisioned-expiry failure, the late-provider-resource transition, provider-identity binding without granting liveness, and the rollback cleanup lease (which keeps the stored incarnation's state instead of forcing `active`).
+- The repository preserves the invariants: activation carries the create-attempt generation and ID; release is idempotent and keeps unresolved-creation debt; a release canceled before provider identity restores its dispatch evidence and stays visible retryable debt; the expiry sweeps keep their no-cache writes.
+- New tests: eight repository tests (creation, activation identity, idempotent release, queued claim, evidence restoration, unresolved debt, both expiry paths, rollback state preservation), plus the repository adapter added to the layering test. The worker suite (2,923 tests) passes untouched.
+
 ### Hardening — coordinator decomposition, extraction 3: lease lifecycle rules
 
 - Coordinator: the lease lifecycle *rules* moved out of `worker/src/fleet.ts` into `worker/src/lease-lifecycle.ts` — the state predicates (`leaseIsLive`, `isTerminalLeaseState`, `isRegisteredLease`, `leaseHeartbeatStateError`, `leaseCleanupIsUnresolved`), the four transition builders (activation, unresolved-resource failure, terminal manual-cleanup expiry, release), the metadata clearers, and the configuration-derived provider identity helpers. The router imports them; each rule now exists exactly once.

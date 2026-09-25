@@ -124,20 +124,18 @@ export function providerProjectForConfig(config: LeaseConfig): string | undefine
  * produced. The record keeps its identity — including the create-attempt
  * generation that authorized the attempt.
  */
-export function provisionedLeaseRecord(
+function providerIdentityFields(
   lease: LeaseRecord,
   config: LeaseConfig,
   server: ProviderMachine,
   serverType: string,
-): LeaseRecord {
+): Record<string, unknown> {
   const providerProject = lease.providerProject ?? providerProjectForConfig(config);
   const providerKey = server.providerKey?.trim() || config.providerKey;
   const providerKeyCleanupOwned =
     (config.provider === "aws" || config.provider === "hetzner") &&
     providerKey === providerKeyForLease(lease.id);
   return {
-    ...lease,
-    state: "active",
     cloudID: server.cloudID,
     serverID: server.id,
     ...(server.providerResourceID ? { providerResourceID: server.providerResourceID } : {}),
@@ -150,6 +148,55 @@ export function provisionedLeaseRecord(
     ...(providerProject ? { providerProject } : {}),
     ...(server.hostID ? { hostId: server.hostID } : {}),
   };
+}
+
+/**
+ * Bind the provider instance an attempt produced WITHOUT granting
+ * liveness: the record keeps the state it already had. Used by rollback
+ * paths that must record the allocation without activating it.
+ */
+export function bindProviderIdentity(
+  lease: LeaseRecord,
+  config: LeaseConfig,
+  server: ProviderMachine,
+  serverType: string,
+): LeaseRecord {
+  return { ...lease, ...providerIdentityFields(lease, config, server, serverType) } as LeaseRecord;
+}
+
+/**
+ * The cleanup lease for a provider rollback: bind the identity and keep
+ * the stored incarnation's state — a released incarnation stays
+ * released, and only a record with no stored state becomes `active`.
+ */
+export function rollbackCleanupLease(
+  base: LeaseRecord,
+  latest: LeaseRecord | undefined,
+  config: LeaseConfig,
+  server: ProviderMachine,
+  serverType: string,
+): LeaseRecord {
+  const bound = bindProviderIdentity(latest ?? base, config, server, serverType);
+  bound.state = latest?.state ?? "active";
+  return bound;
+}
+
+/**
+ * Activation: bind the provider instance a provisioning attempt
+ * produced. The record keeps its identity — including the create-attempt
+ * generation that authorized the attempt.
+ */
+export function provisionedLeaseRecord(
+  lease: LeaseRecord,
+  config: LeaseConfig,
+  server: ProviderMachine,
+  serverType: string,
+): LeaseRecord {
+  return {
+    ...lease,
+    state: "active",
+    ...providerIdentityFields(lease, config, server, serverType),
+  } as LeaseRecord;
 }
 
 /**
@@ -260,4 +307,61 @@ export function finalizedReleasedLease(
     lease.keep = keep;
   }
   return lease;
+}
+
+/**
+ * Registered-lease expiry: the externally created lease is retired. Its
+ * cleanup and runtime-adapter debt is cleared unless a delete is already
+ * in flight, so maintenance cannot pick it up again.
+ */
+export function expiredRegisteredLease(lease: LeaseRecord, at: string): LeaseRecord {
+  const next = { ...lease };
+  next.state = "expired";
+  next.updatedAt = at;
+  next.endedAt = at;
+  delete next.releaseDeletesServer;
+  clearLeaseCleanupMetadata(next);
+  if (!next.runtimeAdapterDeleteRequestedAt) {
+    clearRuntimeAdapterDeleteMetadata(next);
+  }
+  delete next.cleanupStartedAt;
+  delete next.cleanupClaimExpiresAt;
+  return next;
+}
+
+/**
+ * Expiry of a lease whose provider request never produced a resource:
+ * the lease becomes terminal `failed`, and the dispatched request stays
+ * visible as unresolved cleanup rather than disappearing with the TTL.
+ */
+export function failedUnprovisionedExpiryLease(lease: LeaseRecord, at: string): LeaseRecord {
+  const next = { ...lease };
+  next.state = "failed";
+  next.updatedAt = at;
+  next.endedAt = at;
+  if (next.provisioningRequestStartedAt) next.provisioningResourceMayExist = true;
+  next.cleanupFailedAt = at;
+  next.cleanupError =
+    "lease expired before provider returned a cloud resource; cleanup remains unresolved";
+  return next;
+}
+
+/**
+ * A provider resource returned after the lease ended: the record keeps
+ * the allocation (it exists and must be cleaned up) while the lease
+ * stays terminal, and a cleanup retry is scheduled.
+ */
+export function lateProviderResourceLease(
+  lease: LeaseRecord,
+  at: Date,
+  retryDelayMs: number,
+): void {
+  if (lease.state === "provisioning") lease.state = "failed";
+  lease.endedAt ??= lease.updatedAt;
+  lease.releaseDeletesServer = true;
+  lease.provisioningResourceMayExist = true;
+  lease.provisioningFailureRetryable = false;
+  delete lease.failureError;
+  lease.cleanupError = "provider resource returned after the lease ended; cleanup pending";
+  lease.cleanupRetryAt = new Date(at.getTime() + retryDelayMs).toISOString();
 }

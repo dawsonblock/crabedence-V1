@@ -226,13 +226,16 @@ import {
   isRegisteredLease,
   leaseCleanupIsUnresolved,
   leaseHeartbeatStateError,
+  lateProviderResourceLease,
   leaseIsLive,
   provisionedLeaseRecord,
+  rollbackCleanupLease,
   providerProjectForConfig,
   providerRegionForConfig,
   retainUnresolvedProviderResource,
   terminalizeManualProviderCleanup,
 } from "./lease-lifecycle";
+import { DurableObjectLeaseRepository, type LeaseRepository } from "./lease-repository";
 import {
   MarketplaceInputError,
   marketplaceQuote,
@@ -1178,6 +1181,7 @@ export class FleetCoordinator {
   private providerMaintenanceQueue: Promise<void> = Promise.resolve();
   private readonly webVNCCredentialHandoffs: WebVNCCredentialHandoffs;
   private readonly leaseProvisioning: LeaseProvisioningController;
+  private readonly leaseRepository: LeaseRepository;
   private readonly runLifecycle: RunLifecycleService;
   private maintenanceRun: Promise<void> | undefined;
   private maintenanceFollowup: { grantVersion?: string; preserve: boolean } | undefined;
@@ -1193,6 +1197,9 @@ export class FleetCoordinator {
     // it resolves the actor, verifies request material, and delegates to
     // the lifecycle service through the durable-object repository.
     this.runLifecycle = new RunLifecycleService(new DurableObjectRunRepository(state));
+    // Lease lifecycle: the router never assigns a lease state — every
+    // transition goes through a semantic repository operation.
+    this.leaseRepository = new DurableObjectLeaseRepository(state.storage);
     this.leaseProvisioning = new LeaseProvisioningController(
       state,
       env,
@@ -3595,34 +3602,28 @@ export class FleetCoordinator {
         !lease.cloudID &&
         lease.provisioningRequestStartedAt,
       );
-      const released = finalizedReleasedLease(lease, true, false);
-      if (canceledBeforeProviderIdentity) {
-        released.provisioningRequestStartedAt = lease.provisioningRequestStartedAt!;
-        if (lease.provisioningCoordinatorVersion) {
-          released.provisioningCoordinatorVersion = lease.provisioningCoordinatorVersion;
-        }
-        if (lease.provisioningRequestSettledAt) {
-          released.provisioningRequestSettledAt = lease.provisioningRequestSettledAt;
-        }
-        if (lease.provisioningRecoveryObservedAt) {
-          released.provisioningRecoveryObservedAt = lease.provisioningRecoveryObservedAt;
-        }
-        if (lease.provisioningRecoveryMissingSince) {
-          released.provisioningRecoveryMissingSince = lease.provisioningRecoveryMissingSince;
-        }
-        released.releaseDeletesServer = true;
-        released.provisioningResourceMayExist = true;
-        released.provisioningFailureRetryable = true;
-      }
-      if (shouldDelete) {
-        const cleanupStarted = new Date();
-        released.cleanupStartedAt = cleanupStarted.toISOString();
-        released.cleanupClaimExpiresAt = new Date(
-          cleanupStarted.getTime() + leaseCleanupClaimStaleMs,
-        ).toISOString();
-        released.releaseDeletesServer = true;
-      }
-      await this.putLease(released);
+      const cleanupStarted = shouldDelete ? new Date() : undefined;
+      const released = await this.leaseRepository.releaseLease(lease, {
+        deleteServer: true,
+        keep: false,
+        restoreDispatchEvidence: canceledBeforeProviderIdentity
+          ? {
+              provisioningRequestStartedAt: lease.provisioningRequestStartedAt!,
+              provisioningCoordinatorVersion: lease.provisioningCoordinatorVersion,
+              provisioningRequestSettledAt: lease.provisioningRequestSettledAt,
+              provisioningRecoveryObservedAt: lease.provisioningRecoveryObservedAt,
+              provisioningRecoveryMissingSince: lease.provisioningRecoveryMissingSince,
+            }
+          : undefined,
+        cleanupClaim: cleanupStarted
+          ? {
+              startedAt: cleanupStarted.toISOString(),
+              expiresAt: new Date(
+                cleanupStarted.getTime() + leaseCleanupClaimStaleMs,
+              ).toISOString(),
+            }
+          : undefined,
+      });
       await this.putCreateAttempt(attempt);
       await this.markAWSIngressReconcilePending(released);
       await this.scheduleAlarm();
@@ -3736,14 +3737,7 @@ export class FleetCoordinator {
         !continueReadiness &&
         !(lease.state === "released" && lease.releaseDeletesServer === false)
       ) {
-        if (lease.state === "provisioning") lease.state = "failed";
-        lease.endedAt ??= lease.updatedAt;
-        lease.releaseDeletesServer = true;
-        lease.provisioningResourceMayExist = true;
-        lease.provisioningFailureRetryable = false;
-        delete lease.failureError;
-        lease.cleanupError = "provider resource returned after the lease ended; cleanup pending";
-        lease.cleanupRetryAt = new Date(now.getTime() + leaseCleanupRetryDelayMs).toISOString();
+        lateProviderResourceLease(lease, now, leaseCleanupRetryDelayMs);
       } else if (!continueReadiness) {
         clearProvisioningRecoveryMetadata(lease);
         clearLeaseCleanupMetadata(lease);
@@ -9635,10 +9629,13 @@ export class FleetCoordinator {
         if (!leaseIsLive(current) && !current.runtimeAdapterDeleteRequestedAt) {
           return { status: "completed", lease: current };
         }
-        const finalized = current.runtimeAdapterDeleteRequestedAt
-          ? finalizedRuntimeAdapterDeleteLease(current)
-          : finalizedReleasedLease(current, false);
-        await this.putLease(finalized);
+        let finalized: LeaseRecord;
+        if (current.runtimeAdapterDeleteRequestedAt) {
+          finalized = finalizedRuntimeAdapterDeleteLease(current);
+          await this.putLease(finalized);
+        } else {
+          finalized = await this.leaseRepository.releaseLease(current, { deleteServer: false });
+        }
         await this.clearWorkspaceReleaseError(finalized);
         await this.markAWSIngressReconcilePending(finalized);
         await this.scheduleAlarm();
@@ -9687,10 +9684,13 @@ export class FleetCoordinator {
         if (!leaseIsLive(current) && !current.runtimeAdapterDeleteRequestedAt) {
           return { status: "completed", lease: current };
         }
-        const finalized = current.runtimeAdapterDeleteRequestedAt
-          ? finalizedRuntimeAdapterDeleteLease(current)
-          : finalizedReleasedLease(current, false);
-        await this.putLease(finalized);
+        let finalized: LeaseRecord;
+        if (current.runtimeAdapterDeleteRequestedAt) {
+          finalized = finalizedRuntimeAdapterDeleteLease(current);
+          await this.putLease(finalized);
+        } else {
+          finalized = await this.leaseRepository.releaseLease(current, { deleteServer: false });
+        }
         await this.clearWorkspaceReleaseError(finalized);
         await this.markAWSIngressReconcilePending(finalized);
         await this.scheduleAlarm();
@@ -16426,8 +16426,10 @@ export class FleetCoordinator {
         }
         const failedAt = new Date();
         if (error instanceof ProviderResourceUnresolvedError) {
-          retainUnresolvedProviderResource(current, failure, failedAt.toISOString());
-          await this.putLease(current);
+          await this.leaseRepository.retainUnresolvedLease(current, {
+            message: failure,
+            at: failedAt.toISOString(),
+          });
           return;
         }
         current.cleanupAttempts = (current.cleanupAttempts ?? 0) + 1;
@@ -16660,29 +16662,12 @@ export class FleetCoordinator {
         const nowDate = new Date();
         const nowISO = nowDate.toISOString();
         if (isRegisteredLease(lease)) {
-          lease.state = "expired";
-          lease.updatedAt = nowISO;
-          lease.endedAt = nowISO;
-          delete lease.releaseDeletesServer;
-          clearLeaseCleanupMetadata(lease);
-          if (!lease.runtimeAdapterDeleteRequestedAt) {
-            clearRuntimeAdapterDeleteMetadata(lease);
-          }
-          delete lease.cleanupStartedAt;
-          delete lease.cleanupClaimExpiresAt;
-          await this.putLease(lease, { noCache: true });
+          await this.leaseRepository.expireRegisteredLease(lease, { at: nowISO });
           await this.closeLeaseBridges(lease.id, 1008, "lease expired");
           return;
         }
         if (lease.state === "provisioning" && !lease.cloudID) {
-          lease.state = "failed";
-          lease.updatedAt = nowISO;
-          lease.endedAt = nowISO;
-          if (lease.provisioningRequestStartedAt) lease.provisioningResourceMayExist = true;
-          lease.cleanupFailedAt = nowISO;
-          lease.cleanupError =
-            "lease expired before provider returned a cloud resource; cleanup remains unresolved";
-          await this.putLease(lease, { noCache: true });
+          await this.leaseRepository.failUnprovisionedExpiredLease(lease, { at: nowISO });
           return;
         }
         if (claimed.length >= leaseCleanupBatchSize) {
@@ -18871,9 +18856,8 @@ export class FleetCoordinator {
         return { cleanup: false as const, lease: latest };
       }
       const previous = latest ? structuredClone(latest) : undefined;
-      const cleanupLease = provisionedLeaseRecord(latest ?? record, config, server, serverType);
+      const cleanupLease = rollbackCleanupLease(record, latest, config, server, serverType);
       if (latest?.state === "released" && latest.releaseDeletesServer === false) {
-        cleanupLease.state = "released";
         cleanupLease.keep = true;
         clearLeaseCleanupMetadata(cleanupLease);
         delete cleanupLease.cleanupStartedAt;
@@ -18885,7 +18869,6 @@ export class FleetCoordinator {
       }
       const cleanupStarted = new Date();
       const cleanupStartedAt = cleanupStarted.toISOString();
-      cleanupLease.state = latest?.state ?? cleanupLease.state;
       cleanupLease.cleanupStartedAt = cleanupStartedAt;
       cleanupLease.cleanupClaimExpiresAt = new Date(
         cleanupStarted.getTime() + leaseCleanupClaimStaleMs,
@@ -18921,14 +18904,14 @@ export class FleetCoordinator {
     } catch (error) {
       const failure = await this.state.runExclusive(async () => {
         const latest = await this.getLease(record.id);
-        const cleanupLease = provisionedLeaseRecord(
-          latest ?? preparation.lease,
+        const cleanupLease = rollbackCleanupLease(
+          preparation.lease,
+          latest,
           config,
           server,
           serverType,
         );
         if (latest?.state === "released" && latest.releaseDeletesServer === false) {
-          cleanupLease.state = "released";
           cleanupLease.keep = true;
           clearLeaseCleanupMetadata(cleanupLease);
           delete cleanupLease.cleanupStartedAt;
@@ -18942,7 +18925,6 @@ export class FleetCoordinator {
           return { suppressed: true as const, lease: latest ?? cleanupLease };
         }
         const failedAt = new Date().toISOString();
-        cleanupLease.state = latest?.state ?? "active";
         if (cleanupLease.state === "released") {
           cleanupLease.releaseDeletesServer = true;
         }
@@ -19160,40 +19142,43 @@ export class FleetCoordinator {
               current.cleanupError))),
       );
       if (!shouldDelete) {
-        const released = finalizedReleasedLease(current, deleteServer, options.keep);
-        await this.putLease(released);
+        const released = await this.leaseRepository.releaseLease(current, {
+          deleteServer,
+          keep: options.keep,
+        });
         await this.clearWorkspaceReleaseError(released);
         await this.markAWSIngressReconcilePending(released);
         await this.armAlarmNoLaterThan(Date.now());
         return { cleanup: false as const, blocked: false as const, lease: released };
       }
       if (!options.awaitProviderCleanup) {
-        const pending = finalizedReleasedLease(current, true, options.keep);
         // A zero-duration cleanup claim keeps queued deletion visible to rollback readers
         // while allowing either coordinator version to reclaim it immediately.
         const queuedAt = new Date().toISOString();
-        pending.releaseDeletesServer = true;
-        pending.cleanupStartedAt = queuedAt;
-        pending.cleanupClaimExpiresAt = queuedAt;
-        await this.putLease(pending);
+        const pending = await this.leaseRepository.releaseLease(current, {
+          deleteServer: true,
+          keep: options.keep,
+          cleanupClaim: { startedAt: queuedAt, expiresAt: queuedAt },
+        });
         await this.markAWSIngressReconcilePending(pending);
         await this.armAlarmNoLaterThan(Date.now());
         return { cleanup: false as const, blocked: false as const, lease: pending };
       }
       const now = new Date();
-      const claimed = finalizedReleasedLease(current, true, options.keep);
-      claimed.cleanupStartedAt = now.toISOString();
-      claimed.cleanupClaimExpiresAt = new Date(
-        now.getTime() + leaseCleanupClaimStaleMs,
-      ).toISOString();
-      claimed.releaseDeletesServer = true;
-      await this.putLease(claimed);
+      const claimed = await this.leaseRepository.releaseLease(current, {
+        deleteServer: true,
+        keep: options.keep,
+        cleanupClaim: {
+          startedAt: now.toISOString(),
+          expiresAt: new Date(now.getTime() + leaseCleanupClaimStaleMs).toISOString(),
+        },
+      });
       await this.markAWSIngressReconcilePending(claimed);
       await this.scheduleAlarm();
       return {
         cleanup: true as const,
         blocked: false as const,
-        claim: claimed.cleanupStartedAt,
+        claim: now.toISOString(),
         lease: structuredClone(claimed),
       };
     });
@@ -19253,11 +19238,11 @@ export class FleetCoordinator {
       ) {
         return current ?? preparation.lease;
       }
-      const released = finalizedReleasedLease(current, true, preparation.keep);
-      clearProvisioningRecoveryMetadata(released);
-      delete released.providerKeyCleanupPending;
-      delete released.providerKeyCleanupID;
-      await this.putLease(released);
+      const released = await this.leaseRepository.releaseLease(current, {
+        deleteServer: true,
+        keep: preparation.keep,
+        finalize: true,
+      });
       await this.clearWorkspaceReleaseError(released);
       await this.markAWSIngressReconcilePending(released);
       await this.scheduleAlarm();

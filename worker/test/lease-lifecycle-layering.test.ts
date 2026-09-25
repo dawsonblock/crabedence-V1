@@ -13,6 +13,13 @@ const source = readFileSync(
   "utf-8",
 );
 
+// The repository adapter may depend on storage primitives, but never on
+// the router: the dependency direction is router → lifecycle → repository.
+const repositorySource = readFileSync(
+  join(dirname(fileURLToPath(import.meta.url)), "../src/lease-repository.ts"),
+  "utf-8",
+);
+
 const specifiers = [...source.matchAll(/from "([^"]+)"/g)].map((match) => match[1]);
 
 const allowedSpecifiers = new Set(["./config", "./provider-key", "./types"]);
@@ -35,6 +42,21 @@ describe("lease lifecycle module layering", () => {
     for (const specifier of specifiers) {
       expect(specifier.startsWith("node:")).toBe(false);
       expect(specifier.startsWith("cloudflare:")).toBe(false);
+    }
+  });
+});
+
+describe("lease repository module layering", () => {
+  it("never imports the fleet router", () => {
+    const repositorySpecifiers = [...repositorySource.matchAll(/from "([^"]+)"/g)].map(
+      (match) => match[1],
+    );
+    expect(repositorySpecifiers.length).toBeGreaterThan(0);
+    for (const specifier of repositorySpecifiers) {
+      expect(
+        specifier !== "./fleet" && !specifier.startsWith("cloudflare:"),
+        `lease-repository.ts must not import ${specifier}`,
+      ).toBe(true);
     }
   });
 });
