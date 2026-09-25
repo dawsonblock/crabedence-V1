@@ -241,12 +241,27 @@ func (e *DispatchExecutor) SetProviderGate(g *ProviderGate) {
 func (e *DispatchExecutor) ProviderGate() *ProviderGate { return e.gate }
 
 // observeProviderOutcome accounts one provider outcome on the gate.
-// Only a post-dispatch ambiguous outcome (UNKNOWN) degrades the
-// provider; any definitive answer — success, definitive failure, or
-// denial — proves the provider is answering and resets the streak.
-func (e *DispatchExecutor) observeProviderOutcome(desc capability.ResolvedDescriptor, state idempotency.State) {
+// Health is updated ONLY when the provider actually participated: an
+// executor refusal (open circuit, saturated bound, expired deadline)
+// never resets a failure streak, because the provider was never asked.
+// Among participating invocations, an ambiguous outcome (UNKNOWN) or an
+// invocation that outlived the ceiling degrades the provider; a
+// definitive answer — success, definitive failure, or denial — proves
+// the provider is answering and resets the streak.
+func (e *DispatchExecutor) observeProviderOutcome(
+	desc capability.ResolvedDescriptor,
+	outcome DispatchOutcome,
+	state idempotency.State,
+) {
+	if !outcome.ProviderInvoked {
+		return
+	}
 	if state == idempotency.StateUnknown {
 		e.gate.RecordAmbiguous(desc.AdapterID, "post-dispatch ambiguity (UNKNOWN)")
+		return
+	}
+	if outcome.TimedOut {
+		e.gate.RecordAmbiguous(desc.AdapterID, "provider exceeded the executor ceiling")
 		return
 	}
 	e.gate.RecordSuccess(desc.AdapterID)
@@ -266,10 +281,10 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	// provider gate still applies: capacity and health are properties
 	// of the provider, not of the effect class.
 	if desc.ExecutionClass == capability.ClassPure || desc.ExecutionClass == capability.ClassRead {
-		resp, _ := e.dispatch(ctx, req, desc, nil)
-		state, _ := classifyPostDispatch(resp, desc)
-		e.observeProviderOutcome(desc, state)
-		return resp
+		outcome := e.dispatch(ctx, req, desc, nil)
+		state, _ := classifyPostDispatch(outcome.Response, desc)
+		e.observeProviderOutcome(desc, outcome, state)
+		return outcome.Response
 	}
 
 	// For MUTATION and CRITICAL, durable idempotency is REQUIRED.
@@ -589,7 +604,8 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	}
 	e.fireCrashPoint(CrashBeforeProvider)
 	leaseHandedOff = true
-	resp, provableNoEffect := e.dispatch(dispatchCtx, req, desc, providerLease)
+	outcome := e.dispatch(dispatchCtx, req, desc, providerLease)
+	resp, provableNoEffect := outcome.Response, outcome.ProvableNoEffect
 	e.fireCrashPoint(CrashAfterProvider)
 
 	// The provider has answered. Everything from here until the terminal
@@ -669,7 +685,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 
 	// ─── TERMINAL DECISION — single post-dispatch decision table ─────────
 	state, resp := classifyPostDispatch(providerResp, desc)
-	e.observeProviderOutcome(desc, state)
+	e.observeProviderOutcome(desc, outcome, state)
 
 	evidenceDigest := ""
 	receiptVersion := 0
@@ -931,7 +947,7 @@ func (e *DispatchExecutor) abandonPreDispatch(ctx context.Context, executionID, 
 // DefinitiveFailure is a routing hint, not proof — only responses with
 // executor provenance may be synthesized into attestable no-effect
 // evidence upstream.
-func (e *DispatchExecutor) dispatch(ctx context.Context, req Request, desc capability.ResolvedDescriptor, lease *ProviderLease) (Response, bool) {
+func (e *DispatchExecutor) dispatch(ctx context.Context, req Request, desc capability.ResolvedDescriptor, lease *ProviderLease) DispatchOutcome {
 	// Provider capacity and health: the gate is acquired before the
 	// handler is invoked. A refusal means nothing was dispatched, so
 	// the outcome is a provable no-effect failure — never post-dispatch
@@ -939,7 +955,7 @@ func (e *DispatchExecutor) dispatch(ctx context.Context, req Request, desc capab
 	if lease == nil {
 		acquired, err := e.gate.Acquire(desc.AdapterID)
 		if err != nil {
-			return e.providerRefusedResponse(err), true
+			return DispatchOutcome{Response: e.providerRefusedResponse(err), ProvableNoEffect: true}
 		}
 		lease = acquired
 	}
@@ -955,12 +971,15 @@ func (e *DispatchExecutor) dispatch(ctx context.Context, req Request, desc capab
 				// handler at all. The provider was never called, so
 				// this is a provable no-effect failure.
 				lease.Release()
-				return Response{
-					Status:            StatusFailed,
-					FailureCode:       string(capability.FailureInvalidRequest),
-					Error:             fmt.Sprintf("request deadline %s already passed", req.Deadline),
-					DefinitiveFailure: true,
-				}, true
+				return DispatchOutcome{
+					Response: Response{
+						Status:            StatusFailed,
+						FailureCode:       string(capability.FailureInvalidRequest),
+						Error:             fmt.Sprintf("request deadline %s already passed", req.Deadline),
+						DefinitiveFailure: true,
+					},
+					ProvableNoEffect: true,
+				}
 			}
 			var cancel context.CancelFunc
 			dispatchCtx, cancel = context.WithTimeout(ctx, remaining)
@@ -1000,11 +1019,11 @@ func (e *DispatchExecutor) dispatch(ctx context.Context, req Request, desc capab
 	}()
 
 	if max <= 0 {
-		return <-respCh, false
+		return DispatchOutcome{Response: <-respCh, ProviderInvoked: true}
 	}
 	select {
 	case resp := <-respCh:
-		return resp, false
+		return DispatchOutcome{Response: resp, ProviderInvoked: true}
 	case <-dispatchCtx.Done():
 		// The caller deadline, caller cancellation, or the provider
 		// ceiling fired while the handler was still running. Give a
@@ -1018,12 +1037,36 @@ func (e *DispatchExecutor) dispatch(ctx context.Context, req Request, desc capab
 		lease.MarkTimeout()
 		select {
 		case resp := <-respCh:
-			return resp, false
+			return DispatchOutcome{Response: resp, ProviderInvoked: true}
 		case <-time.After(e.timeouts.ProviderExecutionGrace):
 			lease.MarkWedged()
-			return e.providerCeilingResponse(desc, dispatchCtx.Err()), false
+			return DispatchOutcome{
+				Response:        e.providerCeilingResponse(desc, dispatchCtx.Err()),
+				ProviderInvoked: true,
+				TimedOut:        true,
+			}
 		}
 	}
+}
+
+// DispatchOutcome is the provider response plus the executor's own
+// provenance about the invocation. Provider health accounting must use
+// it: a response the executor produced WITHOUT invoking the provider — a
+// gate refusal, a saturated bound, an already-expired deadline — says
+// nothing about provider health, and must never be recorded as a
+// provider success. A provider that was invoked and did not answer
+// within the ceiling is not healthy either, even when the effect class
+// makes the outcome a safe FAILED.
+type DispatchOutcome struct {
+	Response Response
+	// ProviderInvoked reports whether the handler was actually called.
+	ProviderInvoked bool
+	// ProvableNoEffect reports whether the executor itself can prove no
+	// external effect occurred (the handler never ran).
+	ProvableNoEffect bool
+	// TimedOut reports that the provider was invoked but outlived the
+	// executor ceiling (or the caller deadline) without answering.
+	TimedOut bool
 }
 
 // providerRefusedResponse is the provable no-effect refusal when the

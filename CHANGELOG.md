@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Hardening — audit remediation: provider-health provenance and lease state ownership
+
+- Execution: provider health is now updated only when the provider actually participated. The dispatcher exposes its own provenance (`DispatchOutcome`: provider invoked, provable no effect, timed out), so a gate refusal — an open circuit, a saturated bound, or an already-expired deadline — can no longer reset a provider's failure streak. A provider that *was* invoked and outlived the ceiling is recorded as ambiguous even when the effect class makes the outcome a safe `FAILED` for the caller. Regression tests cover open-circuit READ refusal, saturation, expired-before-invocation, the successful probe (the only path that resets health), and the READ ceiling.
+- Coordinator: the remaining seven lease state transitions moved out of `fleet.ts` into named lifecycle transitions — reactivation, provisioning failure, provisioning finalization, provider-recovery failure, workspace-recovery outcome, absent-provisioning retryable failure, and the workspace-provisioning deadline. The managed-creation sites now take the initial state from the module. `fleet.ts` contains neither a lease state assignment nor the initial-state literal.
+- Coordinator: a source-level architecture test now enforces lease state ownership — it fails if a lease state assignment or the initial-state literal reappears in the router. This is deliberately stronger than the import-layer test, which cannot see a direct assignment.
+- Correction: the previous entry claimed zero lease state assignments. That check used a grep matching only two variable names; eight assignments and four initial-state literals remained. They are now moved, and the claim is enforced by the new test rather than by inspection.
+- Still open from the audit, tracked for the next unit: the lease repository's operations accept a caller-supplied record rather than reloading and validating inside a serialization boundary, and three repository operations (`createManagedLease`, `activateLease`, `expireLeaseForManualCleanup`) are not yet wired to production paths.
+
 ### Hardening — coordinator decomposition, extraction 3 (continued): lease repository
 
 - Coordinator: lease state transitions now go through `worker/src/lease-repository.ts` — a semantic `LeaseRepository` (`createManagedLease`, `activateLease`, `releaseLease`, `retainUnresolvedLease`, `expireLeaseForManualCleanup`, `expireRegisteredLease`, `failUnprovisionedExpiredLease`) with deliberately no state setter. All eleven transition sites were rewired, and `fleet.ts` now contains **zero** lease state assignments.

@@ -228,7 +228,15 @@ import {
   leaseHeartbeatStateError,
   lateProviderResourceLease,
   leaseIsLive,
+  INITIAL_LEASE_STATE,
+  absentProvisioningLease,
+  activatedLease,
+  expiredWorkspaceProvisioningLease,
+  finalizedProvisioningLease,
   provisionedLeaseRecord,
+  provisioningFailedLease,
+  recoveredWorkspaceLease,
+  recoveryFailedLease,
   rollbackCleanupLease,
   providerProjectForConfig,
   providerRegionForConfig,
@@ -4239,7 +4247,7 @@ export class FleetCoordinator {
           idleTimeoutSeconds: config.idleTimeoutSeconds,
           estimatedHourlyUSD: cost.hourlyUSD,
           maxEstimatedUSD: cost.maxUSD,
-          state: "provisioning",
+          state: INITIAL_LEASE_STATE,
           createdAt: now.toISOString(),
           updatedAt: now.toISOString(),
           lastTouchedAt: now.toISOString(),
@@ -4358,8 +4366,7 @@ export class FleetCoordinator {
           ) {
             return { committed: false as const, current, pending };
           }
-          current.state = "active";
-          current.updatedAt = new Date().toISOString();
+          activatedLease(current, new Date().toISOString());
           await this.putLease(current);
           await this.scheduleAlarm();
           return { committed: true as const, current };
@@ -4495,7 +4502,7 @@ export class FleetCoordinator {
         idleTimeoutSeconds: config.idleTimeoutSeconds,
         estimatedHourlyUSD: cost.hourlyUSD,
         maxEstimatedUSD: cost.maxUSD,
-        state: "provisioning",
+        state: INITIAL_LEASE_STATE,
         createdAt: now.toISOString(),
         updatedAt: now.toISOString(),
         lastTouchedAt: now.toISOString(),
@@ -4845,8 +4852,7 @@ export class FleetCoordinator {
           }
           record = structuredClone(current ?? record);
           if (!current || current.state === "provisioning") {
-            record.state = "failed";
-            record.endedAt = failedAt;
+            provisioningFailedLease(record, failedAt);
           }
           mergeProvisioningFailureMetadata(
             record,
@@ -4883,8 +4889,7 @@ export class FleetCoordinator {
     }
     const finalizationBase = structuredClone(current);
     record = structuredClone(current);
-    record.state = "active";
-    clearProvisioningRecoveryMetadata(record);
+    finalizedProvisioningLease(record);
     record.cloudID = server.cloudID;
     record.serverType = serverType;
     if (server.hostID) {
@@ -5089,7 +5094,7 @@ export class FleetCoordinator {
         idleTimeoutSeconds: config.idleTimeoutSeconds,
         estimatedHourlyUSD: cost.hourlyUSD,
         maxEstimatedUSD: cost.maxUSD,
-        state: "provisioning",
+        state: INITIAL_LEASE_STATE,
         createdAt: now.toISOString(),
         updatedAt: now.toISOString(),
         lastTouchedAt: now.toISOString(),
@@ -6168,7 +6173,7 @@ export class FleetCoordinator {
             }
             return current;
           }
-          current.state = "failed";
+          recoveryFailedLease(current);
           applyRecoveredServerIdentity(current, recoveredServer);
           current.updatedAt = failedAt;
           current.endedAt = failedAt;
@@ -6252,18 +6257,15 @@ export class FleetCoordinator {
         applyRecoveredServerIdentity(current, recoveredServer);
         current.estimatedHourlyUSD = recoveredCost.hourlyUSD;
         current.maxEstimatedUSD = recoveredCost.maxUSD;
-        if (
-          workspaceCapability
-            ? workspaceCapability.recoveredReady(recoveredServer)
-            : recoveredServer.status === "running" && recoveredServer.host.trim()
-        ) {
-          current.state = "active";
-          current.host = workspaceCapability
+        const recoveredReady = workspaceCapability
+          ? workspaceCapability.recoveredReady(recoveredServer)
+          : Boolean(recoveredServer.status === "running" && recoveredServer.host.trim());
+        recoveredWorkspaceLease(current, {
+          ready: recoveredReady,
+          host: workspaceCapability
             ? workspaceCapability.recoveredHost(recoveredServer)
-            : recoveredServer.host;
-        } else {
-          current.state = "provisioning";
-        }
+            : recoveredServer.host,
+        });
         if (recoveredServer.region) {
           current.region = recoveredServer.region;
         }
@@ -6345,15 +6347,7 @@ export class FleetCoordinator {
       ) {
         return undefined;
       }
-      current.state = "failed";
-      current.provisioningResourceMayExist = false;
-      current.provisioningFailureRetryable = true;
-      delete current.provisioningRequestStartedAt;
-      delete current.provisioningCoordinatorVersion;
-      delete current.provisioningRequestSettledAt;
-      delete current.provisioningRecoveryObservedAt;
-      delete current.provisioningRecoveryMissingSince;
-      current.updatedAt = new Date().toISOString();
+      absentProvisioningLease(current, new Date().toISOString());
       await this.putLease(current);
       return current;
     });
@@ -7268,11 +7262,10 @@ export class FleetCoordinator {
       const now = new Date();
       if (workspaceProvisionDeadline(currentWorkspace) <= now.getTime()) {
         const message = "workspace provisioning deadline expired";
-        currentLease.state = "failed";
-        currentLease.failureError = message;
-        currentLease.provisioningFailureRetryable = false;
-        currentLease.updatedAt = now.toISOString();
-        currentLease.endedAt = currentLease.updatedAt;
+        expiredWorkspaceProvisioningLease(currentLease, {
+          message,
+          at: now.toISOString(),
+        });
         currentWorkspace.error = message;
         currentWorkspace.updatedAt = now.toISOString();
         delete currentWorkspace.reconcileAfter;

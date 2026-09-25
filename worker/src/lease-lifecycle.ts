@@ -365,3 +365,74 @@ export function lateProviderResourceLease(
   lease.cleanupError = "provider resource returned after the lease ended; cleanup pending";
   lease.cleanupRetryAt = new Date(at.getTime() + retryDelayMs).toISOString();
 }
+
+// ─── Recovery, reactivation, and workspace transitions ───────────────
+
+/** Activation of a lease whose provider identity is already bound. */
+export function activatedLease(lease: LeaseRecord, at: string): void {
+  lease.state = "active";
+  lease.updatedAt = at;
+}
+
+/** A provisioning attempt failed before a resource was confirmed. */
+export function provisioningFailedLease(lease: LeaseRecord, at: string): void {
+  lease.state = "failed";
+  lease.endedAt = at;
+}
+
+/** Provisioning completed: the record becomes live and its recovery markers clear. */
+export function finalizedProvisioningLease(lease: LeaseRecord): void {
+  lease.state = "active";
+  clearProvisioningRecoveryMetadata(lease);
+}
+
+/** Provider recovery failed: the lease is terminal. */
+export function recoveryFailedLease(lease: LeaseRecord): void {
+  lease.state = "failed";
+}
+
+/**
+ * Workspace recovery outcome: a recovered ready workspace reactivates the
+ * lease with its recovered host; anything else returns it to provisioning.
+ */
+export function recoveredWorkspaceLease(
+  lease: LeaseRecord,
+  input: { ready: boolean; host?: string | undefined },
+): void {
+  if (input.ready) {
+    lease.state = "active";
+    if (input.host) {
+      lease.host = input.host;
+    }
+  } else {
+    lease.state = "provisioning";
+  }
+}
+
+/**
+ * A provisioning attempt that left no resource behind: retryable failure,
+ * with every recovery marker cleared so the next attempt starts clean.
+ */
+export function absentProvisioningLease(lease: LeaseRecord, at: string): void {
+  lease.state = "failed";
+  lease.provisioningResourceMayExist = false;
+  lease.provisioningFailureRetryable = true;
+  delete lease.provisioningRequestStartedAt;
+  delete lease.provisioningCoordinatorVersion;
+  delete lease.provisioningRequestSettledAt;
+  delete lease.provisioningRecoveryObservedAt;
+  delete lease.provisioningRecoveryMissingSince;
+  lease.updatedAt = at;
+}
+
+/** Workspace provisioning deadline expired: terminal failure, no retry. */
+export function expiredWorkspaceProvisioningLease(
+  lease: LeaseRecord,
+  input: { message: string; at: string },
+): void {
+  lease.state = "failed";
+  lease.failureError = input.message;
+  lease.provisioningFailureRetryable = false;
+  lease.updatedAt = input.at;
+  lease.endedAt = input.at;
+}
