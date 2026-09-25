@@ -219,6 +219,21 @@ import {
   normalizeImageVariantSelectors,
 } from "./image-capabilities";
 import {
+  clearLeaseCleanupMetadata,
+  clearProvisioningRecoveryMetadata,
+  clearRuntimeAdapterDeleteMetadata,
+  finalizedReleasedLease,
+  isRegisteredLease,
+  leaseCleanupIsUnresolved,
+  leaseHeartbeatStateError,
+  leaseIsLive,
+  provisionedLeaseRecord,
+  providerProjectForConfig,
+  providerRegionForConfig,
+  retainUnresolvedProviderResource,
+  terminalizeManualProviderCleanup,
+} from "./lease-lifecycle";
+import {
   MarketplaceInputError,
   marketplaceQuote,
   marketplaceStatus,
@@ -22847,16 +22862,6 @@ function providerFromQuery(value: string | null): Provider | undefined {
   return undefined;
 }
 
-function providerRegionForConfig(config: LeaseConfig): string | undefined {
-  if (config.provider === "gcp") return config.gcpZone;
-  if (config.provider === "azure") return config.azureLocation;
-  return config.provider === "aws" ? config.awsRegion : undefined;
-}
-
-function providerProjectForConfig(config: LeaseConfig): string | undefined {
-  return config.provider === "gcp" ? config.gcpProject : undefined;
-}
-
 function providerImageResourceName(provider: Provider, name: string, leaseID: string): string {
   if (provider === "aws") {
     return name;
@@ -24513,28 +24518,6 @@ function isActiveProviderAccessRecord(lease: LeaseRecord, now: number): boolean 
   return leaseIsLive(lease) && Date.parse(lease.expiresAt) > now;
 }
 
-function leaseIsLive(lease: LeaseRecord): boolean {
-  return lease.state === "active" || lease.state === "provisioning";
-}
-
-function leaseHeartbeatStateError(
-  lease: LeaseRecord,
-  now = Date.now(),
-): "lease_ended" | "lease_expired" | undefined {
-  if (!leaseIsLive(lease)) {
-    return "lease_ended";
-  }
-  const expiresAt = Date.parse(lease.expiresAt);
-  if (!Number.isFinite(expiresAt) || expiresAt <= now) {
-    return "lease_expired";
-  }
-  return undefined;
-}
-
-function isRegisteredLease(lease: LeaseRecord): boolean {
-  return lease.lifecycle === "registered";
-}
-
 function managedLeaseProvider(lease: LeaseRecord): Provider | undefined {
   // A registered record never grants provider authority, even when its name is aws/azure/etc.
   return !isRegisteredLease(lease) && isCoordinatorProvider(lease.provider)
@@ -24584,34 +24567,6 @@ function sameLeaseAfterLegacyCleanupIdentityCapture(
   delete normalized.providerResourceID;
   normalized.updatedAt = expected.updatedAt;
   return sameLeaseRecord(normalized, expected);
-}
-
-function leaseCleanupIsUnresolved(lease: LeaseRecord): boolean {
-  return Boolean(
-    lease.provisioningResourceMayExist === true &&
-    lease.provisioningFailureRetryable === false &&
-    lease.failureError &&
-    lease.cleanupError &&
-    !lease.cleanupRetryAt,
-  );
-}
-
-function retainUnresolvedProviderResource(lease: LeaseRecord, message: string, at: string): void {
-  if (leaseIsLive(lease)) {
-    lease.state = "failed";
-    lease.endedAt = at;
-  }
-  lease.updatedAt = at;
-  lease.failureError = message;
-  lease.cleanupError = message;
-  lease.cleanupFailedAt = at;
-  lease.provisioningResourceMayExist = true;
-  lease.provisioningFailureRetryable = false;
-  delete lease.cleanupRetryAt;
-  delete lease.cleanupStartedAt;
-  delete lease.cleanupClaimExpiresAt;
-  // Preserve original dispatch/scope and user intent. No next attempt can make
-  // progress without identity resolution, and elapsed TTL is not observed deletion.
 }
 
 function recordLeaseCleanupFailure(
@@ -24689,34 +24644,6 @@ function withRequestedTailscaleMetadata(lease: LeaseRecord, config: LeaseConfig)
     tailscale.exitNodeAllowLanAccess = config.tailscaleExitNodeAllowLanAccess;
   }
   return { ...lease, tailscale };
-}
-
-function provisionedLeaseRecord(
-  lease: LeaseRecord,
-  config: LeaseConfig,
-  server: ProviderMachine,
-  serverType: string,
-): LeaseRecord {
-  const providerProject = lease.providerProject ?? providerProjectForConfig(config);
-  const providerKey = server.providerKey?.trim() || config.providerKey;
-  const providerKeyCleanupOwned =
-    (config.provider === "aws" || config.provider === "hetzner") &&
-    providerKey === providerKeyForLease(lease.id);
-  return {
-    ...lease,
-    state: "active",
-    cloudID: server.cloudID,
-    serverID: server.id,
-    ...(server.providerResourceID ? { providerResourceID: server.providerResourceID } : {}),
-    serverName: server.name,
-    serverType,
-    providerKey,
-    providerKeyCleanupOwned,
-    host: server.host,
-    region: server.region ?? lease.region ?? providerRegionForConfig(config) ?? "",
-    ...(providerProject ? { providerProject } : {}),
-    ...(server.hostID ? { hostId: server.hostID } : {}),
-  };
 }
 
 function leaseHasCurrentCleanupOrFinalRelease(lease: LeaseRecord): boolean {
@@ -25067,56 +24994,6 @@ function cleanupClaimDeadline(lease: LeaseRecord): number {
   return Number.isFinite(startedAt) ? startedAt + leaseCleanupClaimStaleMs : Number.NaN;
 }
 
-function clearLeaseCleanupMetadata(lease: LeaseRecord): void {
-  delete lease.cleanupAttempts;
-  delete lease.cleanupError;
-  delete lease.cleanupFailedAt;
-  delete lease.cleanupRetryAt;
-}
-
-function clearProvisioningRecoveryMetadata(lease: LeaseRecord): void {
-  delete lease.provisioningRequestStartedAt;
-  delete lease.provisioningCoordinatorVersion;
-  delete lease.provisioningRequestSettledAt;
-  delete lease.provisioningRecoveryObservedAt;
-  delete lease.provisioningRecoveryMissingSince;
-  if (lease.provisioningResourceMayExist !== undefined) lease.provisioningResourceMayExist = false;
-  if (lease.provisioningFailureRetryable !== undefined) lease.provisioningFailureRetryable = false;
-}
-
-function terminalizeManualProviderCleanup(
-  lease: LeaseRecord,
-  error: string,
-  terminalAt: string,
-): void {
-  if (leaseIsLive(lease)) {
-    lease.state = "expired";
-  }
-  lease.keep = true;
-  lease.releaseDeletesServer = false;
-  lease.failureError = error;
-  lease.updatedAt = terminalAt;
-  lease.endedAt = terminalAt;
-  clearLeaseCleanupMetadata(lease);
-  delete lease.cleanupStartedAt;
-  delete lease.cleanupClaimExpiresAt;
-  delete lease.provisioningResourceMayExist;
-  delete lease.provisioningFailureRetryable;
-  delete lease.provisioningCoordinatorVersion;
-  delete lease.provisioningRequestSettledAt;
-  delete lease.provisioningRecoveryObservedAt;
-  delete lease.provisioningRecoveryMissingSince;
-}
-
-function clearRuntimeAdapterDeleteMetadata(lease: LeaseRecord): void {
-  delete lease.runtimeAdapterDeleteRequestedAt;
-  delete lease.runtimeAdapterDeleteClaimID;
-  delete lease.runtimeAdapterDeleteRetryAt;
-  delete lease.runtimeAdapterDeleteDispatchUntil;
-  delete lease.runtimeAdapterDeleteAttempts;
-  delete lease.runtimeAdapterDeleteError;
-}
-
 function runtimeAdapterDeleteVersionMatches(
   current: LeaseRecord,
   anchor: LeaseRecord,
@@ -25140,55 +25017,6 @@ function finalizedRuntimeAdapterDeleteLease(current: LeaseRecord): LeaseRecord {
   const lease = structuredClone(current);
   lease.updatedAt = new Date().toISOString();
   clearRuntimeAdapterDeleteMetadata(lease);
-  return lease;
-}
-
-function finalizedReleasedLease(
-  current: LeaseRecord,
-  deleteServer: boolean,
-  keep?: boolean,
-): LeaseRecord {
-  const lease = structuredClone(current);
-  const unresolvedCreation =
-    !lease.cloudID &&
-    Boolean(lease.provisioningRequestStartedAt || lease.provisioningResourceMayExist);
-  const wasUnprovisionedRelease =
-    !lease.cloudID &&
-    (lease.state === "provisioning" || lease.state === "released" || unresolvedCreation);
-  const now = new Date().toISOString();
-  lease.state = "released";
-  lease.updatedAt = now;
-  lease.releasedAt = now;
-  lease.endedAt = now;
-  if (!unresolvedCreation) {
-    delete lease.provisioningCoordinatorVersion;
-    delete lease.provisioningRequestSettledAt;
-    delete lease.provisioningRecoveryObservedAt;
-    delete lease.provisioningRecoveryMissingSince;
-    clearLeaseCleanupMetadata(lease);
-  } else {
-    // Release records user intent, not cancellation of an already-dispatched
-    // provider request. Keep its original recovery evidence and visible debt.
-    lease.provisioningResourceMayExist = true;
-    lease.cleanupError ??= "provider creation is unresolved; cleanup has not been confirmed";
-  }
-  if (wasUnprovisionedRelease) {
-    lease.releaseDeletesServer = deleteServer;
-  } else if (
-    !deleteServer &&
-    !isRegisteredLease(lease) &&
-    (lease.cloudID || lease.providerKeyCleanupPending)
-  ) {
-    lease.releaseDeletesServer = false;
-  } else {
-    delete lease.releaseDeletesServer;
-  }
-  clearRuntimeAdapterDeleteMetadata(lease);
-  delete lease.cleanupStartedAt;
-  delete lease.cleanupClaimExpiresAt;
-  if (keep !== undefined) {
-    lease.keep = keep;
-  }
   return lease;
 }
 

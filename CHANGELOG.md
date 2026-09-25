@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Hardening — coordinator decomposition, extraction 3: lease lifecycle rules
+
+- Coordinator: the lease lifecycle *rules* moved out of `worker/src/fleet.ts` into `worker/src/lease-lifecycle.ts` — the state predicates (`leaseIsLive`, `isTerminalLeaseState`, `isRegisteredLease`, `leaseHeartbeatStateError`, `leaseCleanupIsUnresolved`), the four transition builders (activation, unresolved-resource failure, terminal manual-cleanup expiry, release), the metadata clearers, and the configuration-derived provider identity helpers. The router imports them; each rule now exists exactly once.
+- The builders preserve the invariants the extraction must not weaken: activation carries the create-attempt generation and ID through to `active`; an unresolved provider resource becomes explicit debt (`provisioningResourceMayExist`, no retry scheduled) instead of reading as "no instance"; release records user intent and keeps unresolved recovery evidence; a terminal lease is never resurrected, because every state change is guarded by liveness.
+- New tests: 17 direct tests over the predicates, heartbeat refusal, activation identity preservation, failure-never-absence, release idempotency, terminal expiry, and recovery-metadata clearing — plus a layering test pinning the module's import boundary.
+- This is passes 1–2 of the lease extraction (the rules module). The `LeaseRepository` contract and the rewiring of the eleven in-place transition sites remain the next unit. No behavior changed here: the worker suite (2,914 tests) passes untouched.
+
 ### Hardening — coordinator decomposition, extraction 2: run lifecycle
 
 - Coordinator: the run lifecycle moved out of `worker/src/fleet.ts` into `worker/src/run-lifecycle.ts` (the rules, the `RunRepository` contract, and `RunLifecycleService`) and `worker/src/run-repository.ts` (the durable-object adapter plus the run storage-key and terminal-log layout). The router resolves the actor, verifies request material, and delegates — it no longer knows how a run changes state.
