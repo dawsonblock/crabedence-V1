@@ -230,11 +230,14 @@ import {
   leaseIsLive,
   INITIAL_LEASE_STATE,
   absentProvisioningLease,
+  completedLeaseCleanup,
   expiredWorkspaceProvisioningLease,
   finalizedProvisioningLease,
+  interruptedProvisioningLease,
   provisioningFailedLease,
   recoveredWorkspaceLease,
   recoveryFailedLease,
+  unresolvedWorkspaceProvisioningLease,
   rollbackCleanupLease,
   providerProjectForConfig,
   providerRegionForConfig,
@@ -7313,9 +7316,7 @@ export class FleetCoordinator {
       }
       const failedAt = new Date().toISOString();
       const releaseRequested = Boolean(currentWorkspace?.releaseRequestedAt);
-      current.state = releaseRequested ? "released" : "failed";
-      current.updatedAt = failedAt;
-      current.endedAt = failedAt;
+      unresolvedWorkspaceProvisioningLease(current, { releaseRequested, at: failedAt });
       current.cloudID = "";
       current.serverID = 0;
       delete current.providerResourceID;
@@ -16449,8 +16450,10 @@ export class FleetCoordinator {
       const interruption = "provider provisioning was interrupted";
       current.updatedAt = failedAt;
       if (server) {
-        current.state = lease.state === "released" ? "released" : "failed";
-        current.endedAt = failedAt;
+        interruptedProvisioningLease(current, {
+          releaseRequested: lease.state === "released",
+          at: failedAt,
+        });
         delete current.provisioningRequestStartedAt;
         delete current.provisioningCoordinatorVersion;
         delete current.provisioningRequestSettledAt;
@@ -16491,8 +16494,10 @@ export class FleetCoordinator {
           await this.putLease(current);
           return;
         }
-        current.state = lease.state === "released" ? "released" : "failed";
-        current.endedAt = failedAt;
+        interruptedProvisioningLease(current, {
+          releaseRequested: lease.state === "released",
+          at: failedAt,
+        });
         delete current.provisioningRequestStartedAt;
         delete current.provisioningCoordinatorVersion;
         delete current.provisioningRequestSettledAt;
@@ -16697,28 +16702,13 @@ export class FleetCoordinator {
             const nowDate = new Date();
             const nowISO = nowDate.toISOString();
             if (failure) {
-              recordLeaseCleanupFailure(current, failure.error, failure.message, nowISO);
-              await this.putLease(current);
+              await this.applyLeaseCleanupFailure(current, failure.error, failure.message, nowISO);
               console.warn(
                 `lease cleanup failed lease=${current.id} provider=${current.provider} cloud=${current.cloudID}: ${failure.message}`,
               );
               return;
             }
-            current.state = leaseIsLive(current) ? "expired" : current.state;
-            current.updatedAt = nowISO;
-            current.endedAt = nowISO;
-            if (current.provisioningResourceMayExist) {
-              if (!current.failureError && current.cleanupError) {
-                current.failureError = current.cleanupError;
-              }
-            }
-            clearProvisioningRecoveryMetadata(current);
-            delete current.releaseDeletesServer;
-            clearLeaseCleanupMetadata(current);
-            delete current.providerKeyCleanupPending;
-            delete current.providerKeyCleanupID;
-            delete current.cleanupStartedAt;
-            delete current.cleanupClaimExpiresAt;
+            completedLeaseCleanup(current, nowISO);
             await this.putLease(current);
             await this.clearWorkspaceReleaseError(current);
             await this.markAWSIngressReconcilePending(current);
@@ -18192,6 +18182,31 @@ export class FleetCoordinator {
     await this.runLifecycle.pruneTerminalRun(runID, cutoff);
   }
 
+  /**
+   * Apply a failed cleanup to the lease through the transition that fits:
+   * unresolved provider debt and manual resolution are terminal
+   * transitions owned by the lease repository, a retryable failure stays
+   * a retry on the same record.
+   */
+  private async applyLeaseCleanupFailure(
+    lease: LeaseRecord,
+    error: unknown,
+    message: string,
+    at: string,
+  ): Promise<void> {
+    switch (classifyLeaseCleanupFailure(error)) {
+      case "unresolved":
+        await this.leaseRepository.retainUnresolvedLease(lease, { message, at });
+        return;
+      case "manual":
+        await this.leaseRepository.expireLeaseForManualCleanup(lease, { error: message, at });
+        return;
+      default:
+        applyRetryableLeaseCleanupFailure(lease, message, at);
+        await this.putLease(lease);
+    }
+  }
+
   private async deleteStoragePrefix(prefix: string): Promise<void> {
     await deleteStoragePrefix(this.state.storage, prefix);
   }
@@ -18921,13 +18936,12 @@ export class FleetCoordinator {
           cleanupLease.releaseDeletesServer = true;
         }
         cleanupLease.expiresAt = failedAt;
-        recordLeaseCleanupFailure(
+        await this.applyLeaseCleanupFailure(
           cleanupLease,
           error,
           coordinatorErrorMessage(this.env, error),
           failedAt,
         );
-        await this.putLease(cleanupLease);
         await this.markAWSIngressReconcilePending(cleanupLease);
         await this.scheduleAlarm();
         return { suppressed: false as const, lease: cleanupLease };
@@ -19209,13 +19223,12 @@ export class FleetCoordinator {
           return;
         }
         current.releaseDeletesServer = true;
-        recordLeaseCleanupFailure(
+        await this.applyLeaseCleanupFailure(
           current,
           error,
           coordinatorErrorMessage(this.env, error),
           new Date().toISOString(),
         );
-        await this.putLease(current);
         await this.scheduleAlarm();
       });
       throw error;
@@ -24546,25 +24559,28 @@ function sameLeaseAfterLegacyCleanupIdentityCapture(
   return sameLeaseRecord(normalized, expected);
 }
 
-function recordLeaseCleanupFailure(
-  lease: LeaseRecord,
-  error: unknown,
-  message: string,
-  at: string,
-): void {
+type LeaseCleanupFailureKind = "unresolved" | "manual" | "retryable";
+
+/** How a failed cleanup resolves: unresolved debt, manual resolution, or a retry. */
+function classifyLeaseCleanupFailure(error: unknown): LeaseCleanupFailureKind {
   if (error instanceof ProviderResourceUnresolvedError) {
-    retainUnresolvedProviderResource(lease, message, at);
-  } else if (error instanceof ProviderCleanupManualResolutionError) {
-    terminalizeManualProviderCleanup(lease, message, at);
-  } else {
-    lease.cleanupAttempts = (lease.cleanupAttempts ?? 0) + 1;
-    delete lease.cleanupStartedAt;
-    delete lease.cleanupClaimExpiresAt;
-    lease.cleanupError = message;
-    lease.cleanupFailedAt = at;
-    lease.cleanupRetryAt = new Date(Date.parse(at) + leaseCleanupRetryDelayMs).toISOString();
-    lease.updatedAt = at;
+    return "unresolved";
   }
+  if (error instanceof ProviderCleanupManualResolutionError) {
+    return "manual";
+  }
+  return "retryable";
+}
+
+/** A retryable cleanup failure: schedule the next attempt on the same record. */
+function applyRetryableLeaseCleanupFailure(lease: LeaseRecord, message: string, at: string): void {
+  lease.cleanupAttempts = (lease.cleanupAttempts ?? 0) + 1;
+  delete lease.cleanupStartedAt;
+  delete lease.cleanupClaimExpiresAt;
+  lease.cleanupError = message;
+  lease.cleanupFailedAt = at;
+  lease.cleanupRetryAt = new Date(Date.parse(at) + leaseCleanupRetryDelayMs).toISOString();
+  lease.updatedAt = at;
 }
 
 function leaseNeedsCleanup(lease: LeaseRecord, now: number): boolean {

@@ -492,3 +492,47 @@ export function sameLeaseIncarnation(current: LeaseRecord, expected: LeaseIncarn
     current.createAttemptGeneration === expected.createAttemptGeneration
   );
 }
+
+/** Interrupted provisioning resolved: a released request stays released, anything else fails. */
+export function interruptedProvisioningLease(
+  lease: LeaseRecord,
+  input: { releaseRequested: boolean; at: string },
+): void {
+  lease.state = input.releaseRequested ? "released" : "failed";
+  lease.endedAt = input.at;
+}
+
+/**
+ * Interrupted workspace provisioning left no provider resource: the lease
+ * is released when the user asked for it, and failed otherwise.
+ */
+export function unresolvedWorkspaceProvisioningLease(
+  lease: LeaseRecord,
+  input: { releaseRequested: boolean; at: string },
+): void {
+  lease.state = input.releaseRequested ? "released" : "failed";
+  lease.updatedAt = input.at;
+  lease.endedAt = input.at;
+}
+
+/**
+ * Cleanup completed: a live lease expires, a terminal one keeps its
+ * state, and every cleanup and recovery marker is retired.
+ */
+export function completedLeaseCleanup(lease: LeaseRecord, at: string): void {
+  if (leaseIsLive(lease)) {
+    lease.state = "expired";
+  }
+  lease.updatedAt = at;
+  lease.endedAt = at;
+  if (lease.provisioningResourceMayExist && !lease.failureError && lease.cleanupError) {
+    lease.failureError = lease.cleanupError;
+  }
+  clearProvisioningRecoveryMetadata(lease);
+  delete lease.releaseDeletesServer;
+  clearLeaseCleanupMetadata(lease);
+  delete lease.providerKeyCleanupPending;
+  delete lease.providerKeyCleanupID;
+  delete lease.cleanupStartedAt;
+  delete lease.cleanupClaimExpiresAt;
+}

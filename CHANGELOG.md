@@ -9,7 +9,12 @@
 - The transition is applied to the caller's record, not the reloaded one, so a flow that edited fields before transitioning persists exactly those edits — the reload exists to validate, not to replace the caller's work.
 - `activateLease` is now the reactivation transition and has its production caller; the router no longer applies `provisionedLeaseRecord` directly. The release path's storage-work bound carries one extra read for the validation reload, documented at the assertion.
 - Tests: stale-state refusal, stale-incarnation refusal, terminal-resurrection refusal (with the idempotent re-release that must still work), missing-lease refusal, and the positive activation path.
-- Still open from the audit, now narrowed: `createManagedLease` and `expireLeaseForManualCleanup` have no production caller yet (their flows build records inline or branch inside a module-level helper), and `provisionedLeaseRecord` is currently referenced only by the module — migrating the provisioning-finalization and cleanup-failure flows onto them is the remaining wiring.
+### Hardening — lease transition ownership, closed out
+
+- Coordinator: the four remaining lease state assignments in `fleet.ts` were expression forms (`x.state = live(x) ? "expired" : x.state`, `x.state = requested ? "released" : "failed"`) that the source-level enforcement pattern did not catch. Each is now a named transition — interrupted provisioning, unresolved workspace provisioning, and completed cleanup — and the enforcement pattern matches expression right-hand sides as well as literals, with a negative lookahead so `===` comparisons are not mistaken for assignments.
+- Coordinator: failed cleanups now classify once (`unresolved` / `manual` / `retryable`) and route through the repository for the two terminal cases, which gives `expireLeaseForManualCleanup` its production caller; a retryable failure stays a retry on the same record.
+- `createManagedLease` was removed rather than left unused: creating a managed lease is a plain persist whose only rule — the initial state — is already owned by the lifecycle module, so the operation carried no invariant to enforce.
+- `provisionedLeaseRecord` remains the module's activation rule but is currently exercised only by tests: the provisioning-finalization flow binds a different field set, and migrating it onto that rule is the one remaining wiring item in the lease boundary.
 
 ### Hardening — authority material fails closed
 

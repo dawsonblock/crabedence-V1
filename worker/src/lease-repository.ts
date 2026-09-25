@@ -83,8 +83,6 @@ export interface LeaseExpiryInput {
  */
 export interface LeaseRepository {
   loadLease(leaseID: string, options?: { noCache?: boolean }): Promise<LeaseRecord | null>;
-  /** Persist a newly created managed lease (state provisioning). */
-  createManagedLease(lease: LeaseRecord): Promise<void>;
   /** Activation of a lease whose provider identity is already bound. */
   activateLease(lease: LeaseRecord, input: ActivateLeaseInput): Promise<LeaseRecord>;
   /** Release: record the user's intent to delete the provider resource. */
@@ -168,10 +166,6 @@ export class DurableObjectLeaseRepository implements LeaseRepository {
 
   async loadLease(leaseID: string, options?: { noCache?: boolean }): Promise<LeaseRecord | null> {
     return (await this.storage.get<LeaseRecord>(leaseKey(leaseID), options)) ?? null;
-  }
-
-  async createManagedLease(lease: LeaseRecord): Promise<void> {
-    await this.storage.put(leaseKey(lease.id), lease);
   }
 
   /**

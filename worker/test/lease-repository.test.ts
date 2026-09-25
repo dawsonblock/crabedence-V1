@@ -61,11 +61,11 @@ const repositoryFor = (storage: MemoryStorage) =>
   );
 
 describe("DurableObjectLeaseRepository", () => {
-  it("creates a managed lease in the provisioning state", async () => {
+  it("loads a managed lease in the provisioning state", async () => {
     const storage = new MemoryStorage();
     const repository = repositoryFor(storage);
     const lease = leaseFixture();
-    await repository.createManagedLease(lease);
+    storage.map.set(leaseKey(lease.id), lease);
     const stored = await repository.loadLease(lease.id);
     expect(stored?.state).toBe("provisioning");
     expect(storage.map.has(leaseKey(lease.id))).toBe(true);
@@ -78,7 +78,7 @@ describe("DurableObjectLeaseRepository", () => {
       createAttemptID: "attempt-1",
       createAttemptGeneration: "gen-9",
     } as Partial<LeaseRecord>);
-    await repository.createManagedLease(lease);
+    storage.map.set(leaseKey(lease.id), lease);
     const activated = await repository.activateLease(lease, { at: "2026-09-24T00:05:00.000Z" });
     expect(activated.state).toBe("active");
     expect(activated.createAttemptGeneration).toBe("gen-9");
@@ -92,7 +92,7 @@ describe("DurableObjectLeaseRepository", () => {
     const unresolved = leaseFixture({
       provisioningRequestStartedAt: "2026-09-24T00:10:00.000Z",
     } as Partial<LeaseRecord>);
-    await repository.createManagedLease(unresolved);
+    storage.map.set(leaseKey(unresolved.id), unresolved);
     const first = await repository.releaseLease(unresolved, { deleteServer: true });
     expect(first.state).toBe("released");
     expect(first.provisioningResourceMayExist).toBe(true);
@@ -109,7 +109,7 @@ describe("DurableObjectLeaseRepository", () => {
     const storage = new MemoryStorage();
     const repository = repositoryFor(storage);
     const lease = leaseFixture({ state: "active", cloudID: "srv-1" });
-    await repository.createManagedLease(lease);
+    storage.map.set(leaseKey(lease.id), lease);
     const queuedAt = "2026-09-24T00:30:00.000Z";
     const queued = await repository.releaseLease(lease, {
       deleteServer: true,
@@ -130,7 +130,7 @@ describe("DurableObjectLeaseRepository", () => {
       provisioningRequestStartedAt: "2026-09-24T00:10:00.000Z",
       provisioningCoordinatorVersion: "v1",
     } as Partial<LeaseRecord>);
-    await repository.createManagedLease(lease);
+    storage.map.set(leaseKey(lease.id), lease);
     const released = await repository.releaseLease(lease, {
       deleteServer: true,
       keep: false,
@@ -149,7 +149,7 @@ describe("DurableObjectLeaseRepository", () => {
     const storage = new MemoryStorage();
     const repository = repositoryFor(storage);
     const lease = leaseFixture();
-    await repository.createManagedLease(lease);
+    storage.map.set(leaseKey(lease.id), lease);
     const failed = await repository.retainUnresolvedLease(lease, {
       message: "resource may exist",
       at: "2026-09-24T00:40:00.000Z",
@@ -168,8 +168,8 @@ describe("DurableObjectLeaseRepository", () => {
       id: "lease-2",
       provisioningRequestStartedAt: "2026-09-24T00:10:00.000Z",
     } as Partial<LeaseRecord>);
-    await repository.createManagedLease(registered);
-    await repository.createManagedLease(unprovisioned);
+    storage.map.set(leaseKey(registered.id), registered);
+    storage.map.set(leaseKey(unprovisioned.id), unprovisioned);
 
     const expired = await repository.expireRegisteredLease(registered, {
       at: "2026-09-24T01:00:00.000Z",
@@ -219,7 +219,7 @@ describe("lease transition validation", () => {
     const storage = new MemoryStorage();
     const repository = repositoryFor(storage);
     const lease = leaseFixture();
-    await repository.createManagedLease(lease);
+    storage.map.set(leaseKey(lease.id), lease);
     const activated = await repository.activateLease(lease, { at: "2026-09-24T00:05:00.000Z" });
     expect(activated.state).toBe("active");
     expect(activated.updatedAt).toBe("2026-09-24T00:05:00.000Z");
@@ -230,7 +230,7 @@ describe("lease transition validation", () => {
     const storage = new MemoryStorage();
     const repository = repositoryFor(storage);
     const stale = leaseFixture();
-    await repository.createManagedLease(stale);
+    storage.map.set(leaseKey(stale.id), stale);
     // A caller holding this copy is stale the moment someone else moves
     // the record.
     const staleView = structuredClone(stale);
@@ -245,13 +245,16 @@ describe("lease transition validation", () => {
     const storage = new MemoryStorage();
     const repository = repositoryFor(storage);
     const first = leaseFixture({ createAttemptGeneration: "gen-1" } as Partial<LeaseRecord>);
-    await repository.createManagedLease(first);
+    storage.map.set(leaseKey(first.id), first);
     // A new create attempt replaces the incarnation.
-    await repository.createManagedLease({
-      ...first,
-      createAttemptGeneration: "gen-2",
-      updatedAt: "2026-09-24T00:04:00.000Z",
-    } as LeaseRecord);
+    storage.map.set(
+      leaseKey(first.id),
+      {
+        ...first,
+        createAttemptGeneration: "gen-2",
+        updatedAt: "2026-09-24T00:04:00.000Z",
+      } as LeaseRecord,
+    );
     await expect(
       repository.activateLease(first, { at: "2026-09-24T00:05:00.000Z" }),
     ).rejects.toThrow(LeaseTransitionRefused);
@@ -261,7 +264,7 @@ describe("lease transition validation", () => {
     const storage = new MemoryStorage();
     const repository = repositoryFor(storage);
     const lease = leaseFixture({ state: "active", cloudID: "srv-1" });
-    await repository.createManagedLease(lease);
+    storage.map.set(leaseKey(lease.id), lease);
     const released = await repository.releaseLease(lease, { deleteServer: true });
     expect(released.state).toBe("released");
     // A terminal record may record release intent again (idempotent), but

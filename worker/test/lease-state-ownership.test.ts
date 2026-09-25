@@ -18,7 +18,14 @@ const fleetSource = readFileSync(
 
 const LEASE_STATES = ["provisioning", "active", "released", "expired", "failed"] as const;
 
-const stateAssignment = new RegExp(`\\.state\\s*=\\s*"(${LEASE_STATES.join("|")})"`, "g");
+// Any assignment whose right-hand side names a lease state, or a lease
+// liveness predicate — this catches expression forms such as
+// `x.state = live(x) ? "expired" : x.state`, which a literal-only
+// pattern misses.
+const stateAssignment = new RegExp(
+  `\\.state\\s*=(?!=)\\s*[^;\\n]*(?:"(?:${LEASE_STATES.join("|")})"|leaseIsLive|isTerminalLeaseState)`,
+  "g",
+);
 
 // The initial state of a newly created managed lease is owned by the
 // lifecycle module too: the router may not write the literal.
