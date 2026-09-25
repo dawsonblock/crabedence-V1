@@ -37,6 +37,20 @@ import {
   type GitHubUserGrant,
 } from "./auth";
 import {
+  actorFromRequest,
+  completeBridgePrincipal,
+  leaseAccessRoleForPrincipal,
+  leaseManagerAuthorized,
+  leaseViewerAuthorized,
+  normalizeShareUser,
+  normalizedLeaseShare,
+  runReadableByPrincipal,
+  runReadableToPrincipal,
+  runWritableByPrincipal,
+  sanitizeShareRole,
+  type NormalizedLeaseShare,
+} from "./authorization";
+import {
   EC2SpotClient,
   awsAutomaticProbesConfigured,
   awsCredentialsConfigured,
@@ -2137,21 +2151,21 @@ export class FleetCoordinator {
       }
       if (
         (attachment.kind === "webvnc-viewer" || attachment.kind === "code-viewer") &&
-        !this.leaseViewerAuthorized(lease, attachment)
+        !leaseViewerAuthorized(lease, attachment)
       ) {
         revokedViewers.set(socket, "lease access revoked");
       }
       if (
         (attachment.kind === "webvnc-agent" || attachment.kind === "code-agent") &&
         completeBridgePrincipal(attachment) &&
-        !this.leaseManagerAuthorized(lease, attachment)
+        !leaseManagerAuthorized(lease, attachment)
       ) {
         revokedViewers.set(socket, "lease access revoked");
         continue;
       }
       if (
         (attachment.kind === "egress-host" || attachment.kind === "egress-client") &&
-        !this.leaseManagerAuthorized(lease, attachment)
+        !leaseManagerAuthorized(lease, attachment)
       ) {
         revokedEgressSessions.set(egressSocketKey(lease.id, attachment.sessionID), {
           leaseID: lease.id,
@@ -2732,7 +2746,7 @@ export class FleetCoordinator {
     const runID = typeof input.runID === "string" ? input.runID : "";
     const run = runID ? await this.getRun(runID) : undefined;
     const lease = run ? await this.ensureRunLeaseAttribution(run) : undefined;
-    if (!run || !this.runReadableToControl(run, attachment, lease)) {
+    if (!run || !runReadableToPrincipal(run, attachment, lease)) {
       sendControl(socket, { type: "error", code: "not_found", message: "run not found" });
       return;
     }
@@ -8339,7 +8353,7 @@ export class FleetCoordinator {
       if (
         attachment?.kind !== "webvnc-agent" ||
         !completeBridgePrincipal(attachment) ||
-        this.leaseManagerAuthorized(lease, withCurrentAdminGrant(attachment, adminGrants))
+        leaseManagerAuthorized(lease, withCurrentAdminGrant(attachment, adminGrants))
       ) {
         continue;
       }
@@ -8352,13 +8366,13 @@ export class FleetCoordinator {
       codeAgent &&
       codeAgentAttachment?.kind === "code-agent" &&
       completeBridgePrincipal(codeAgentAttachment) &&
-      !this.leaseManagerAuthorized(lease, withCurrentAdminGrant(codeAgentAttachment, adminGrants))
+      !leaseManagerAuthorized(lease, withCurrentAdminGrant(codeAgentAttachment, adminGrants))
     ) {
       this.clearCodeAgent(lease.id, codeAgent);
       closeSocket(codeAgent, code, reason);
     }
     for (const viewer of this.openWebVNCViewers(lease.id)) {
-      if (this.leaseViewerAuthorized(lease, withCurrentAdminGrant(viewer, adminGrants))) {
+      if (leaseViewerAuthorized(lease, withCurrentAdminGrant(viewer, adminGrants))) {
         continue;
       }
       this.clearWebVNCViewer(lease.id, viewer.id, viewer.socket);
@@ -8369,7 +8383,7 @@ export class FleetCoordinator {
       if (
         attachment?.kind !== "code-viewer" ||
         attachment.leaseID !== lease.id ||
-        this.leaseViewerAuthorized(lease, withCurrentAdminGrant(attachment, adminGrants))
+        leaseViewerAuthorized(lease, withCurrentAdminGrant(attachment, adminGrants))
       ) {
         continue;
       }
@@ -8382,7 +8396,7 @@ export class FleetCoordinator {
       if (
         (attachment?.kind !== "egress-host" && attachment?.kind !== "egress-client") ||
         attachment.leaseID !== lease.id ||
-        this.leaseManagerAuthorized(lease, withCurrentAdminGrant(attachment, adminGrants))
+        leaseManagerAuthorized(lease, withCurrentAdminGrant(attachment, adminGrants))
       ) {
         continue;
       }
@@ -8393,27 +8407,6 @@ export class FleetCoordinator {
         this.clearEgressSession(lease.id, sessionID, code, reason),
       ),
     );
-  }
-
-  private leaseManagerAuthorized(
-    lease: LeaseRecord,
-    principal: { owner?: string; org?: string; admin?: boolean },
-  ): boolean {
-    if (!completeBridgePrincipal(principal)) {
-      return false;
-    }
-    const role = this.leaseAccessRoleForPrincipal(lease, principal);
-    return role === "owner" || role === "manage";
-  }
-
-  private leaseViewerAuthorized(
-    lease: LeaseRecord,
-    principal: { owner?: string; org?: string; admin?: boolean },
-  ): boolean {
-    if (!completeBridgePrincipal(principal)) {
-      return false;
-    }
-    return this.leaseAccessRoleForPrincipal(lease, principal) !== undefined;
   }
 
   private whoami(request: Request): Response {
@@ -9165,7 +9158,8 @@ export class FleetCoordinator {
       }
       await this.ensureRunLeaseAttribution(run);
       return (
-        this.runReferencesLease(run, lease.id) && this.runReadableToRequest(run, request, lease)
+        this.runReferencesLease(run, lease.id) &&
+        runReadableByPrincipal(run, actorFromRequest(request, this.env), lease)
       );
     });
     return portalLeaseDetail(
@@ -9797,7 +9791,7 @@ export class FleetCoordinator {
   ): Promise<Response> {
     const run = await this.getRun(runID);
     const lease = run ? await this.ensureRunLeaseAttribution(run) : undefined;
-    if (!run || !this.runReadableToRequest(run, request, lease)) {
+    if (!run || !runReadableByPrincipal(run, actorFromRequest(request, this.env), lease)) {
       return notFound();
     }
     if (request.method.toUpperCase() !== "GET") {
@@ -10946,7 +10940,7 @@ export class FleetCoordinator {
     if (principal.admin === true && current.admin !== true) {
       return undefined;
     }
-    if (!this.leaseViewerAuthorized(lease, current)) {
+    if (!leaseViewerAuthorized(lease, current)) {
       return undefined;
     }
     if (current.auth === "github" && (await this.githubBridgeGrantFailureReason(current))) {
@@ -12648,7 +12642,7 @@ export class FleetCoordinator {
       ticket.admin === true
         ? withCurrentAdminGrant(ticket, await this.currentAdminGrantValidation())
         : ticket;
-    if (!this.leaseManagerAuthorized(lease, leaseBridgeTicketPrincipal(currentTicket))) {
+    if (!leaseManagerAuthorized(lease, leaseBridgeTicketPrincipal(currentTicket))) {
       return undefined;
     }
     if (
@@ -14651,14 +14645,14 @@ export class FleetCoordinator {
     if (method === "GET" && action === undefined) {
       const run = await this.getRun(runID);
       const lease = run ? await this.ensureRunLeaseAttribution(run) : undefined;
-      return run && this.runReadableToRequest(run, request, lease)
+      return run && runReadableByPrincipal(run, actorFromRequest(request, this.env), lease)
         ? json({ run: publicRunRecord(run) })
         : notFound();
     }
     if (method === "GET" && action === "logs") {
       const run = await this.getRun(runID);
       const lease = run ? await this.ensureRunLeaseAttribution(run) : undefined;
-      if (!run || !this.runReadableToRequest(run, request, lease)) {
+      if (!run || !runReadableByPrincipal(run, actorFromRequest(request, this.env), lease)) {
         return notFound();
       }
       const log = await this.readRunLog(runID);
@@ -14669,7 +14663,7 @@ export class FleetCoordinator {
     if (method === "GET" && action === "receipt") {
       const run = await this.getRun(runID);
       const lease = run ? await this.ensureRunLeaseAttribution(run) : undefined;
-      if (!run || !this.runReadableToRequest(run, request, lease)) {
+      if (!run || !runReadableByPrincipal(run, actorFromRequest(request, this.env), lease)) {
         return notFound();
       }
       return run.terminalReceipt
@@ -14679,7 +14673,7 @@ export class FleetCoordinator {
     if (method === "GET" && action === "events") {
       const run = await this.getRun(runID);
       const lease = run ? await this.ensureRunLeaseAttribution(run) : undefined;
-      if (!run || !this.runReadableToRequest(run, request, lease)) {
+      if (!run || !runReadableByPrincipal(run, actorFromRequest(request, this.env), lease)) {
         return notFound();
       }
       const url = new URL(request.url);
@@ -14689,7 +14683,7 @@ export class FleetCoordinator {
     }
     if (method === "POST" && action === "events") {
       const run = await this.getRun(runID);
-      if (!run || !this.runWritableByRequest(run, request)) {
+      if (!run || !runWritableByPrincipal(run, actorFromRequest(request, this.env))) {
         return notFound();
       }
       const input = await readJson<RunEventRequest>(request);
@@ -14713,7 +14707,7 @@ export class FleetCoordinator {
 
   private async appendRunTelemetry(request: Request, runID: string): Promise<Response> {
     const run = await this.getRun(runID);
-    if (!run || !this.runWritableByRequest(run, request)) {
+    if (!run || !runWritableByPrincipal(run, actorFromRequest(request, this.env))) {
       return notFound();
     }
     const input = await readJson<RunTelemetryRequest>(request);
@@ -14728,7 +14722,7 @@ export class FleetCoordinator {
 
   private async finishRun(request: Request, runID: string): Promise<Response> {
     const run = await this.getRun(runID);
-    if (!run || !this.runWritableByRequest(run, request)) {
+    if (!run || !runWritableByPrincipal(run, actorFromRequest(request, this.env))) {
       return notFound();
     }
     const input = await readJson<RunFinishRequest>(request);
@@ -14937,7 +14931,9 @@ export class FleetCoordinator {
       if (!admin && !run.leaseOwners?.length && !currentLease && validLeaseID(run.leaseID)) {
         currentLease = await this.getLease(run.leaseID);
       }
-      return admin || this.runReadableToRequest(run, request, currentLease);
+      return (
+        admin || runReadableByPrincipal(run, actorFromRequest(request, this.env), currentLease)
+      );
     });
     return json({ runs: runs.map(publicRunRecord) });
   }
@@ -18436,81 +18432,12 @@ export class FleetCoordinator {
     request: Request,
     admin: boolean,
   ): "owner" | LeaseShareRole | "device" | undefined {
-    const role = this.leaseAccessRoleForPrincipal(lease, {
+    const role = leaseAccessRoleForPrincipal(lease, {
       owner: requestOwner(request),
       org: requestOrg(request, this.env),
       admin,
     });
     return role && requestAuthType(request) === "device" ? "device" : role;
-  }
-
-  private leaseAccessRoleForPrincipal(
-    lease: LeaseRecord,
-    principal: { owner: string; org: string; admin: boolean },
-  ): "owner" | LeaseShareRole | undefined {
-    if (principal.admin) {
-      return "owner";
-    }
-    // Legacy org values are lossy and cannot safely prove any non-admin relationship,
-    // including an otherwise explicit user share carried by an ambiguous record.
-    if (!isCurrentOrgKey(lease.org) || !isCurrentOrgKey(principal.org)) {
-      return undefined;
-    }
-    const sameOrg = sameOrgIdentityKey(lease.org, principal.org);
-    if (lease.owner === principal.owner && sameOrg) return "owner";
-    const share = normalizedLeaseShare(lease.share);
-    const userRole = share.users[normalizeShareUser(principal.owner)];
-    const orgRole = sameOrg && lease.org !== MISSING_ORG_KEY ? share.org : undefined;
-    if (userRole === "manage" || orgRole === "manage") {
-      return "manage";
-    }
-    if (userRole === "use" || orgRole === "use") {
-      return "use";
-    }
-    return undefined;
-  }
-
-  private runWritableByRequest(run: RunRecord, request: Request): boolean {
-    return (
-      isAdminRequest(request) ||
-      (run.owner === requestOwner(request) && run.org === requestOrg(request, this.env))
-    );
-  }
-
-  private runReadableToRequest(run: RunRecord, request: Request, lease?: LeaseRecord): boolean {
-    if (this.runWritableByRequest(run, request)) {
-      return true;
-    }
-    const owner = requestOwner(request);
-    const org = requestOrg(request, this.env);
-    return (
-      run.leaseOwners?.some(
-        (attribution) => attribution.owner === owner && attribution.org === org,
-      ) ||
-      (!run.leaseOwners?.length && lease?.owner === owner && lease.org === org)
-    );
-  }
-
-  private runReadableToControl(
-    run: RunRecord,
-    attachment: Extract<BridgeAttachment, { kind: "control" }>,
-    lease?: LeaseRecord,
-  ): boolean {
-    if (!attachment.admin && !isCurrentOrgKey(attachment.org)) {
-      return false;
-    }
-    return Boolean(
-      attachment.admin ||
-      (run.owner === attachment.owner && sameOrgIdentityKey(run.org, attachment.org)) ||
-      run.leaseOwners?.some(
-        (attribution) =>
-          attribution.owner === attachment.owner &&
-          sameOrgIdentityKey(attribution.org, attachment.org),
-      ) ||
-      (!run.leaseOwners?.length &&
-        lease?.owner === attachment.owner &&
-        sameOrgIdentityKey(lease.org, attachment.org)),
-    );
   }
 
   private setRunLeaseAttribution(run: RunRecord, lease: LeaseRecord): void {
@@ -18723,11 +18650,7 @@ export class FleetCoordinator {
         continue;
       }
       const after = attachment.subscriptions?.[run.id];
-      if (
-        after === undefined ||
-        after >= event.seq ||
-        !this.runReadableToControl(run, attachment)
-      ) {
+      if (after === undefined || after >= event.seq || !runReadableToPrincipal(run, attachment)) {
         continue;
       }
       // oxlint-disable-next-line eslint/no-await-in-loop -- validate each subscriber before its event can be sent.
@@ -23831,19 +23754,6 @@ function validOptionalBridgePrincipal(value: {
   return absent || complete;
 }
 
-function completeBridgePrincipal(value: {
-  owner?: unknown;
-  org?: unknown;
-  admin?: unknown;
-}): value is { owner: string; org: string; admin: boolean } {
-  return (
-    typeof value.owner === "string" &&
-    typeof value.org === "string" &&
-    typeof value.admin === "boolean" &&
-    (value.admin || isCurrentOrgKey(value.org))
-  );
-}
-
 function revocableUserBridge(attachment: BridgeAttachment): attachment is Extract<
   BridgeAttachment,
   {
@@ -25481,44 +25391,6 @@ function finalizedReleasedLease(
     lease.keep = keep;
   }
   return lease;
-}
-
-function normalizeShareUser(value: string | undefined): string {
-  return (value ?? "").trim().toLowerCase();
-}
-
-function sanitizeShareRole(value: string | undefined): LeaseShareRole | undefined {
-  return value === "manage" || value === "use" ? value : undefined;
-}
-
-type NormalizedLeaseShare = {
-  users: Record<string, LeaseShareRole>;
-  org?: LeaseShareRole;
-  updatedAt?: string;
-  updatedBy?: string;
-};
-
-function normalizedLeaseShare(share: LeaseShare | undefined): NormalizedLeaseShare {
-  const users: Record<string, LeaseShareRole> = {};
-  for (const [rawUser, rawRole] of Object.entries(share?.users ?? {})) {
-    const user = normalizeShareUser(rawUser);
-    const role = sanitizeShareRole(rawRole);
-    if (user && role) {
-      users[user] = role;
-    }
-  }
-  const role = sanitizeShareRole(share?.org);
-  const normalized: NormalizedLeaseShare = { users };
-  if (role) {
-    normalized.org = role;
-  }
-  if (share?.updatedAt) {
-    normalized.updatedAt = share.updatedAt;
-  }
-  if (share?.updatedBy) {
-    normalized.updatedBy = share.updatedBy;
-  }
-  return normalized;
 }
 
 function leaseShareAccessShrank(

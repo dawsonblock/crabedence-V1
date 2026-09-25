@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Hardening — coordinator decomposition, extraction 1: authorization
+
+- Coordinator: authorization decisions and the resolved actor context moved out of `worker/src/fleet.ts` into `worker/src/authorization.ts` — lease access roles (owner/manage/use), lease manager and viewer authorization, run readability and writability, the bridge-principal completeness rule, and lease-share normalization. The decisions are pure functions over a resolved `ActorContext`, unit-tested directly, and the fleet router now consumes them instead of owning them. Behavior is unchanged: the full worker suite (including 968 fleet tests) passes untouched.
+- Coordinator: run authorization now resolves the actor once per request (`actorFromRequest`) and passes the resolved context to the decision, replacing repeated inline identity parsing on that path.
+- Coordinator: a layering test pins the new module's dependency boundary — `authorization.ts` may import identity and authentication primitives (`auth`, `http`, `org-identity`, `types`) and nothing else, so it can never reach into the fleet router or storage.
+
 ### Hardening — one validated service configuration
 
 - Execution: every environment read on the service startup path is resolved once, before any resource is opened, by a typed loader (`LoadServiceConfig`). Malformed or contradictory values fail closed at load time — including values that previously failed later in startup (the provider-invocation ceiling, the trusted-signer list, the peer-principal map) — and the resolved policy is covered by loader tests.
