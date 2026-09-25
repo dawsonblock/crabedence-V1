@@ -26,6 +26,10 @@ import type {
 
 export type RunState = RunRecord["state"];
 
+/** The state and phase a newly created run starts in. */
+export const INITIAL_RUN_STATE: RunState = "running";
+export const INITIAL_RUN_PHASE = "starting";
+
 /** Terminal states are immutable; only `running` may transition. */
 export function isTerminalRunState(state: RunState): boolean {
   return state !== "running";

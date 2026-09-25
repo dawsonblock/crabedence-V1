@@ -327,7 +327,13 @@ import {
   type ProviderReconciliationObservation,
   type ProviderReconciliationQuarantine,
 } from "./provider-reconciliation";
-import { RunLifecycleService, applyRunEventSummary, terminalRunTimestamp } from "./run-lifecycle";
+import {
+  INITIAL_RUN_PHASE,
+  INITIAL_RUN_STATE,
+  RunLifecycleService,
+  applyRunEventSummary,
+  terminalRunTimestamp,
+} from "./run-lifecycle";
 import { terminalFinishSHA256, validateRunEvidence, verifyTerminalReceipt } from "./run-receipt";
 import {
   DurableObjectRunRepository,
@@ -14598,8 +14604,8 @@ export class FleetCoordinator {
       class: lease?.class ?? input.class ?? "",
       serverType: lease?.serverType ?? input.serverType ?? "",
       command: Array.isArray(input.command) ? input.command.map(String) : [],
-      state: "running",
-      phase: "starting",
+      state: INITIAL_RUN_STATE,
+      phase: INITIAL_RUN_PHASE,
       logBytes: 0,
       logTruncated: false,
       startedAt: now,
