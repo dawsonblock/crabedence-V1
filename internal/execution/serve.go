@@ -35,6 +35,14 @@ type ServeOptions struct {
 // idempotency, and listens on the Unix socket until the context is
 // cancelled or a signal is received.
 func Serve(ctx context.Context, opts ServeOptions) error {
+	// Deployment configuration is resolved and validated before any
+	// resource is opened: a malformed or contradictory declaration
+	// fails closed here, never later.
+	cfg, err := LoadServiceConfig(opts)
+	if err != nil {
+		return err
+	}
+
 	registry := capability.NewRegistry()
 
 	// The capability registry is STATIC for a release: every built-in
@@ -50,37 +58,17 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 		return err
 	}
 
-	// Adapter wiring is deployment configuration: CRABBOX_GITHUB_ENABLED
-	// forces the adapter on, a token enables it implicitly, and
-	// enabling without a token still fails closed at startup.
-	githubToken := os.Getenv("CRABBOX_GITHUB_TOKEN")
-	if githubToken == "" {
-		githubToken = os.Getenv("GITHUB_TOKEN")
-	}
-	// GITHUB_TOKEN is ambient in many dev shells and CI environments —
-	// an explicit CRABBOX_GITHUB_ENABLED=false/0/no must disable the
-	// adapter even when a token is present.
-	githubEnabled := githubToken != ""
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("CRABBOX_GITHUB_ENABLED"))) {
-	case "true", "1", "yes":
-		githubEnabled = true
-	case "false", "0", "no":
-		githubEnabled = false
-	}
+	// Adapter wiring is deployment configuration, resolved by the
+	// loader: CRABBOX_GITHUB_ENABLED forces the adapter on, a token
+	// enables it implicitly, and enabling without a token fails closed
+	// before this point.
 	var githubHandler *GitHubIssueHandler
 	var githubReads *GitHubReads
-	if githubEnabled {
-		if githubToken == "" {
-			return fmt.Errorf("github adapter enabled (CRABBOX_GITHUB_ENABLED) but no CRABBOX_GITHUB_TOKEN or GITHUB_TOKEN configured")
-		}
-		baseURL := os.Getenv("CRABBOX_GITHUB_API_URL")
-		if baseURL == "" {
-			baseURL = "https://api.github.com"
-		}
-		githubHandler = NewGitHubIssueHandler(baseURL, githubToken)
+	if cfg.GitHubEnabled {
+		githubHandler = NewGitHubIssueHandler(cfg.GitHubAPIURL, cfg.GitHubToken)
 		// The observational read shares the provider identity and
 		// configuration with the mutation adapter.
-		githubReads = NewGitHubReads(baseURL, githubToken)
+		githubReads = NewGitHubReads(cfg.GitHubAPIURL, cfg.GitHubToken)
 	}
 
 	// Qualification extension: CRABEDENCE_QUAL_PROVIDER_URL wires the
@@ -97,9 +85,8 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	// enforces that contract — a URL targeting anything but the local
 	// host is a startup error, not a best-effort connection.
 	var qualAdapter *QualificationAdapter
-	if qualURL := strings.TrimSpace(os.Getenv("CRABEDENCE_QUAL_PROVIDER_URL")); qualURL != "" {
-		var err error
-		qualAdapter, err = NewQualificationAdapter(qualURL)
+	if cfg.QualProviderURL != "" {
+		qualAdapter, err = NewQualificationAdapter(cfg.QualProviderURL)
 		if err != nil {
 			return err
 		}
@@ -114,7 +101,7 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 		// start a service that would mint UNKNOWN records it cannot
 		// reconcile. The provider serves /stats without side effects.
 		if err := qualAdapter.ping(ctx); err != nil {
-			return fmt.Errorf("qualification provider at %s is not reachable: %w", qualURL, err)
+			return fmt.Errorf("qualification provider at %s is not reachable: %w", cfg.QualProviderURL, err)
 		}
 	}
 
@@ -127,64 +114,25 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	// idempotency.EffectStore contract — same state graph, fencing,
 	// monotonic observations, and terminal proof policy.
 	//
-	//   CRABEDENCE_STORE_BACKEND — "sqlite" (default for local/
-	//     single-host deployments), "postgres" (clustered/multi-host),
-	//     "none" (durable store explicitly disabled — MUTATION/CRITICAL
-	//     fail closed), or "auto"/unset (postgres when
-	//     CRABEDENCE_DATABASE_URL is configured, sqlite otherwise).
-	//   CRABEDENCE_STORE_PATH — SQLite file location.
-	//     Default: ~/.config/crabbox/crabedence.db
-	//   CRABEDENCE_DATABASE_URL — PostgreSQL DSN (postgres backend).
-	//
+	// The backend, topology, and replica count were resolved and
+	// cross-checked by the configuration loader (CRABEDENCE_STORE_BACKEND
+	// selects the engine; CRABEDENCE_STORE_PATH locates the SQLite file).
 	// Exactly-once is a cluster-wide property: every replica must
 	// contend on one ledger. Each SQLite file mints its own execution
 	// IDs, and the provider idempotency token is derived from them, so
 	// two replicas on independent ledgers derive different provider
 	// tokens for the same idempotency key and can dispatch the same
-	// effect twice. CRABBOX_REPLICAS > 1 therefore requires postgres,
-	// and a cluster topology requires it regardless of the declared
-	// replica count.
-	topology, err := resolveTopology()
-	if err != nil {
-		return err
-	}
-	replicas, err := replicaCount()
-	if err != nil {
-		return err
-	}
-	backend := strings.ToLower(strings.TrimSpace(os.Getenv("CRABEDENCE_STORE_BACKEND")))
-	switch backend {
-	case "", "auto":
-		if opts.DatabaseURL != "" {
-			backend = "postgres"
-		} else {
-			backend = "sqlite"
-		}
-	case "sqlite", "postgres", "none":
-	default:
-		return fmt.Errorf("unknown CRABEDENCE_STORE_BACKEND %q (want sqlite, postgres, none, or auto)", backend)
-	}
-	// Topology, replica count, and store backend must be consistent: a
-	// contradictory declaration is a startup error, never a silent
-	// reinterpretation of what the deployment asked for.
-	if topology == TopologySingle && replicas > 1 {
-		return fmt.Errorf("CRABBOX_TOPOLOGY=single contradicts CRABBOX_REPLICAS=%d: a single-replica topology cannot declare multiple replicas", replicas)
-	}
-	if replicas > 1 && backend != "postgres" {
-		return fmt.Errorf("multi-replica deployment (CRABBOX_REPLICAS=%d) requires the shared postgres store backend (CRABEDENCE_STORE_BACKEND=postgres with CRABEDENCE_DATABASE_URL); backend %q gives each replica an independent ledger", replicas, backend)
-	}
-	if topology == TopologyCluster && backend != "postgres" {
-		return fmt.Errorf("CRABBOX_TOPOLOGY=cluster requires the shared postgres store backend (CRABEDENCE_STORE_BACKEND=postgres with CRABEDENCE_DATABASE_URL); backend %q gives each replica an independent ledger", backend)
-	}
+	// effect twice — which is why a cluster topology, and any declared
+	// replica count above one, requires postgres.
 
 	var store idempotency.EffectStore
 	var authorityStore capability.GrantResolver
-	switch backend {
+	switch cfg.Backend {
 	case "postgres":
-		if opts.DatabaseURL == "" {
+		if cfg.DatabaseURL == "" {
 			return fmt.Errorf("CRABEDENCE_STORE_BACKEND=postgres requires CRABEDENCE_DATABASE_URL")
 		}
-		db, err := sql.Open("pgx", opts.DatabaseURL)
+		db, err := sql.Open("pgx", cfg.DatabaseURL)
 		if err != nil {
 			return fmt.Errorf("failed to open database: %w", err)
 		}
@@ -204,7 +152,7 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 			return fmt.Errorf("failed to create authority store: %w", err)
 		}
 	case "sqlite":
-		path := os.Getenv("CRABEDENCE_STORE_PATH")
+		path := cfg.StorePath
 		if path == "" {
 			base, err := os.UserConfigDir()
 			if err != nil {
@@ -262,8 +210,8 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	//     an explicitly configured secret), never created silently.
 	var signer *evidence.Signer
 	if store != nil {
-		keyPath := os.Getenv("CRABBOX_EVIDENCE_KEY")
-		if err := validateEvidenceKeyPolicy(topology, keyPath); err != nil {
+		keyPath := cfg.EvidenceKeyPath
+		if err := validateEvidenceKeyPolicy(cfg.Topology, keyPath); err != nil {
 			return err
 		}
 		if keyPath == "" {
@@ -281,22 +229,11 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 		if err != nil {
 			return fmt.Errorf("failed to load evidence signer: %w", err)
 		}
-		trusted := []string{signer.Fingerprint()}
-		if extra := os.Getenv("CRABBOX_EVIDENCE_TRUSTED_SIGNERS"); extra != "" {
-			for _, fp := range strings.Split(extra, ",") {
-				fp = strings.TrimSpace(fp)
-				if fp == "" {
-					continue
-				}
-				// A malformed fingerprint is never a plausible signer —
-				// silently dropping it would quietly shrink the trusted
-				// set, so refuse to start instead.
-				if !isSHA256Hex(fp) {
-					return fmt.Errorf("CRABBOX_EVIDENCE_TRUSTED_SIGNERS entry %q is not a SHA-256 fingerprint (64 lowercase hex chars)", fp)
-				}
-				trusted = append(trusted, fp)
-			}
-		}
+		// The local signer is always trusted; additional fingerprints
+		// (rotation, distinct replica identities) were validated by the
+		// configuration loader, so a malformed entry can never quietly
+		// shrink the trusted set.
+		trusted := append([]string{signer.Fingerprint()}, cfg.EvidenceTrustedSigners...)
 		store.SetTrustedEvidenceSigners(trusted...)
 	}
 
@@ -344,32 +281,17 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	fmt.Fprint(os.Stderr, report.String())
 
 	if store != nil {
-		// Use DispatchExecutor for durable idempotency
+		// Use DispatchExecutor for durable idempotency. The
+		// provider-invocation ceiling and the provider gate policy were
+		// resolved and validated by the configuration loader; the gate
+		// bounds simultaneous provider calls and opens a circuit after
+		// consecutive ambiguous outcomes, so a wedged provider cannot
+		// accumulate goroutines without limit. Reconciliation never
+		// acquires it.
 		executor := NewDispatchExecutor(multiHandler, store)
 		executor.SetEvidenceSigner(signer)
-		// CRABEDENCE_PROVIDER_EXECUTION_MAX overrides the executor's
-		// provider-invocation ceiling (Go duration, e.g. "90s", "5m").
-		// The ceiling is executor-owned and applies on top of any
-		// caller deadline: a provider that exceeds it — including one
-		// that ignores cancellation entirely — converges the record to
-		// UNKNOWN + reconciliation instead of heartbeating the lease
-		// forever.
-		if raw := strings.TrimSpace(os.Getenv("CRABEDENCE_PROVIDER_EXECUTION_MAX")); raw != "" {
-			d, err := time.ParseDuration(raw)
-			if err != nil || d <= 0 {
-				return fmt.Errorf("CRABEDENCE_PROVIDER_EXECUTION_MAX %q is not a positive Go duration (e.g. 90s, 5m)", raw)
-			}
-			executor.SetTimeouts(ExecutorTimeouts{ProviderExecution: d})
-		}
-		// Provider containment: the gate bounds simultaneous provider
-		// calls and opens a circuit after consecutive ambiguous
-		// outcomes, so a wedged provider cannot accumulate goroutines
-		// without limit. Reconciliation never acquires it.
-		gateCfg, err := providerGateConfigFromEnv()
-		if err != nil {
-			return err
-		}
-		providerGate = NewProviderGate(gateCfg)
+		executor.SetTimeouts(cfg.ExecutorTimeouts)
+		providerGate = NewProviderGate(cfg.ProviderGate)
 		executor.SetProviderGate(providerGate)
 		durable = executor
 	} else {
@@ -415,21 +337,16 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 		service.SetGrantResolver(authorityStore)
 	}
 
-	// Peer authentication: CRABEDENCE_PEER_PRINCIPALS maps Unix peer
-	// UIDs to principals ("uid:principal,uid:*"). When set, every
-	// request's principal claim is verified against the
-	// kernel-supplied peer UID — unmapped UIDs, missing credentials,
-	// and mismatched claims are denied, and the authenticated
-	// principal replaces the claim in the execution identity. Unset,
-	// the service keeps the bearer model's claimed principal (the
-	// socket is already owner-only). A malformed map refuses startup.
-	peerAuth, err := ParsePeerPrincipalMap(os.Getenv("CRABEDENCE_PEER_PRINCIPALS"))
-	if err != nil {
-		return fmt.Errorf("CRABEDENCE_PEER_PRINCIPALS: %w", err)
-	}
-	if peerAuth != nil {
-		service.SetPeerAuth(peerAuth)
-		fmt.Fprintf(os.Stderr, "Peer authentication: strict UID→principal map (%d entries)\n", len(peerAuth))
+	// Peer authentication was parsed and validated by the configuration
+	// loader: when set, every request's principal claim is verified
+	// against the kernel-supplied peer UID — unmapped UIDs, missing
+	// credentials, and mismatched claims are denied, and the
+	// authenticated principal replaces the claim in the execution
+	// identity. Unset, the service keeps the bearer model's claimed
+	// principal (the socket is already owner-only).
+	if cfg.PeerPrincipals != nil {
+		service.SetPeerAuth(cfg.PeerPrincipals)
+		fmt.Fprintf(os.Stderr, "Peer authentication: strict UID→principal map (%d entries)\n", len(cfg.PeerPrincipals))
 	}
 
 	// Handle signals
@@ -522,7 +439,7 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	runtimeCfg := RuntimeConfiguration{
 		Release:         opts.Release,
 		RegistrySHA256:  report.Digest,
-		EffectStore:     backend,
+		EffectStore:     cfg.Backend,
 		EnabledAdapters: adapterIDs(handlers),
 	}
 	runtimeEnvelope, err := RuntimeIdentityEnvelopeFor(runtimeCfg)
@@ -542,11 +459,14 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	fmt.Fprintf(os.Stderr, "Crabedence execution service listening on %s\n", opts.SocketPath)
 	fmt.Fprintf(os.Stderr, "Registered capabilities: %v\n", registry.List())
 	if store != nil {
-		fmt.Fprintf(os.Stderr, "Durable idempotency: enabled (%s)\n", backend)
+		fmt.Fprintf(os.Stderr, "Durable idempotency: enabled (%s)\n", cfg.Backend)
 	} else {
 		fmt.Fprintf(os.Stderr, "Durable idempotency: disabled (MUTATION/CRITICAL will fail closed)\n")
 	}
-	fmt.Fprintf(os.Stderr, "Deployment topology: %s (declared replicas: %d, effect store: %s)\n", topology, replicas, backend)
+	// Startup configuration report: the resolved, non-secret operating
+	// characteristics of this process, so a misdeployment is visible
+	// before traffic arrives. Secrets are excluded by construction.
+	fmt.Fprint(os.Stderr, cfg.Report())
 	if providerGate != nil {
 		cfg := providerGate.Config()
 		fmt.Fprintf(os.Stderr, "Provider gate: max %d concurrent per provider; degraded after %d consecutive ambiguous outcomes; circuit opens after %d (cooldown %s)\n",

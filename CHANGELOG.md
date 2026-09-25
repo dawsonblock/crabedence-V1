@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Hardening — one validated service configuration
+
+- Execution: every environment read on the service startup path is resolved once, before any resource is opened, by a typed loader (`LoadServiceConfig`). Malformed or contradictory values fail closed at load time — including values that previously failed later in startup (the provider-invocation ceiling, the trusted-signer list, the peer-principal map) — and the resolved policy is covered by loader tests.
+- Execution: the startup configuration report prints the resolved, non-secret operating characteristics — mode, topology and declared replicas, effect-store backend, evidence-key source type, adapter wiring, qualification mode, peer-auth map size, provider ceiling, and provider-gate policy. Secrets (tokens, DSNs, credentials, key paths) are excluded by construction.
+
 ### Hardening — provider containment and lifecycle invariants
 
 - Execution: provider dispatch is now bounded per adapter by a `ProviderGate` — a maximum number of simultaneously executing provider calls, an explicit count of calls that outlived the executor ceiling and are still running (wedged), and a health state (healthy, degraded, open) derived from consecutive ambiguous outcomes. A saturated or open-circuit provider is refused *before* the dispatch boundary with `CAPABILITY_UNAVAILABLE` and a provable no-effect failure; the reservation is abandoned rather than consumed, so the same idempotency key dispatches for real once capacity exists. A wedged call keeps its slot reserved until its goroutine actually returns, so a leaked goroutine stays visible instead of silently freeing capacity. `CRABEDENCE_PROVIDER_MAX_CONCURRENT`, `CRABEDENCE_PROVIDER_DEGRADED_AFTER`, `CRABEDENCE_PROVIDER_OPEN_AFTER`, and `CRABEDENCE_PROVIDER_OPEN_COOLDOWN` override the defaults, and malformed or contradictory values are startup errors.
