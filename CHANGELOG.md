@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Hardening — provider lifecycle, first extraction: the ready pool
+
+- Coordinator: the ready-pool machine moved out of `worker/src/fleet.ts` into `worker/src/ready-pool-lifecycle.ts` — the state vocabulary (`ready | busy | draining | quarantined | stale`), the reuse rule as a pure decision (`classifyReadyPoolBorrow`: borrow, drain on identity mismatch, forbidden on manage access, skip), the borrow-deadline computation, and six named transitions (borrow, heartbeat, return, stale, quarantine, drain). The router selects transitions; it no longer assigns a pool state, and a source-level ownership test enforces that.
+- The reuse rule is preserved exactly: a candidate is borrowable only when its lease exists, is `active`, is unexpired, is not borrowed or quarantined in either namespace, and the requester may manage it. A typed borrow whose identity no longer matches its lease's image is drained *before* anything else is considered, and a manage-access refusal is reported distinctly from a skip so the caller can answer 403 rather than 409.
+- The transition table is explicit and tested over all 25 state pairs — which immediately caught a real defect in the first version: it omitted the `ready → busy` borrow transition.
+- Tests: the state vocabulary, the 25-pair legality matrix, the reuse decision across six refusal cases plus the drain and forbidden paths, the borrow deadline (explicit, anchored, absent), and each transition's field effects (failure streaks, `lastReadyAt`, borrow-metadata stripping).
+- This is the rules pass of the provider-lifecycle extraction. The ready-pool repository (semantic persistence with the same reload-and-validate discipline the lease repository now has) is the next increment; the cleanup and recovery half of provider lifecycle is already anchored in the lease lifecycle transitions.
+
 ### Hardening — the lease repository validates every transition
 
 - Coordinator: every state-changing lease operation now reloads the record and proves the caller's expectation still holds before persisting — same incarnation (`createdAt` plus the create-attempt ID and generation), same state, and a **resulting** state the lifecycle defines from there. A caller holding a stale record, or a terminal one, can no longer transition a record someone else has moved: stale application and terminal resurrection are refused with `LeaseTransitionRefused` instead of being written.

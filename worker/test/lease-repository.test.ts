@@ -247,14 +247,11 @@ describe("lease transition validation", () => {
     const first = leaseFixture({ createAttemptGeneration: "gen-1" } as Partial<LeaseRecord>);
     storage.map.set(leaseKey(first.id), first);
     // A new create attempt replaces the incarnation.
-    storage.map.set(
-      leaseKey(first.id),
-      {
-        ...first,
-        createAttemptGeneration: "gen-2",
-        updatedAt: "2026-09-24T00:04:00.000Z",
-      } as LeaseRecord,
-    );
+    storage.map.set(leaseKey(first.id), {
+      ...first,
+      createAttemptGeneration: "gen-2",
+      updatedAt: "2026-09-24T00:04:00.000Z",
+    } as LeaseRecord);
     await expect(
       repository.activateLease(first, { at: "2026-09-24T00:05:00.000Z" }),
     ).rejects.toThrow(LeaseTransitionRefused);

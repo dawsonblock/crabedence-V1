@@ -355,6 +355,18 @@ import {
   type ProviderReconciliationQuarantine,
 } from "./provider-reconciliation";
 import {
+  INITIAL_READY_POOL_STATE,
+  borrowedReadyPoolEntry,
+  classifyReadyPoolBorrow,
+  drainedReadyPoolEntry,
+  heartbeatedReadyPoolEntry,
+  quarantinedReadyPoolEntry,
+  readyPoolBorrowDeadline,
+  returnedReadyPoolEntry,
+  staleReadyPoolEntry,
+  withoutReadyPoolBorrow,
+} from "./ready-pool-lifecycle";
+import {
   INITIAL_RUN_PHASE,
   INITIAL_RUN_STATE,
   RunLifecycleService,
@@ -555,7 +567,6 @@ const typedReadyPoolCountersPrefix = "typed-ready-pool-v1-counters:";
 const durableObjectStorageKeyMaxBytes = 2048;
 const readyPoolIdentitySchemaV1 = "crabbox-ready-pool-identity/v1";
 const readyPoolSeedFieldMaxBytes = 1024;
-const readyPoolBorrowTimeoutMs = 2 * 60_000;
 const readyPoolFillClaimTimeoutMs = 15 * 60_000;
 const readyPoolTerminalRetentionMs = 24 * 60 * 60_000;
 export const deviceMembershipCacheTTLMS = 60_000;
@@ -13041,7 +13052,7 @@ export class FleetCoordinator {
         const entry: ReadyPoolEntry = {
           key,
           leaseID,
-          state: "ready",
+          state: INITIAL_READY_POOL_STATE,
           owner: lease.owner,
           org: lease.org,
           provider: lease.provider,
@@ -13143,22 +13154,27 @@ export class FleetCoordinator {
         let blockedByManageAccess = false;
         for (const entry of entries) {
           const lease = leases.get(entry.leaseID);
-          if (
-            lease &&
-            entry.state === "ready" &&
-            !unavailableLeases.has(entry.leaseID) &&
-            lease.state === "active" &&
-            Date.parse(lease.expiresAt) > nowMs
-          ) {
-            if (typed && !this.readyPoolIdentityMatchesLease(entry.identity!, lease)) {
-              // oxlint-disable-next-line eslint/no-await-in-loop -- mismatch must be durably drained before another candidate can be borrowed.
-              await this.drainMismatchedReadyPoolEntry(entry, typed);
-              continue;
-            }
-            if (!this.leaseManageableByRequest(lease, request, isAdminRequest(request))) {
-              blockedByManageAccess = true;
-              continue;
-            }
+          const decision = classifyReadyPoolBorrow(entry, {
+            lease,
+            nowMs,
+            unavailableLeases,
+            identityMatches:
+              typed && lease ? this.readyPoolIdentityMatchesLease(entry.identity!, lease) : true,
+            manageable:
+              lease !== undefined &&
+              this.leaseManageableByRequest(lease, request, isAdminRequest(request)),
+            typed,
+          });
+          if (decision === "drain") {
+            // oxlint-disable-next-line eslint/no-await-in-loop -- mismatch must be durably drained before another candidate can be borrowed.
+            await this.drainMismatchedReadyPoolEntry(entry, typed);
+            continue;
+          }
+          if (decision === "forbidden") {
+            blockedByManageAccess = true;
+            continue;
+          }
+          if (decision === "borrow" && lease) {
             candidates.push({ entry, lease });
           }
         }
@@ -13183,21 +13199,15 @@ export class FleetCoordinator {
         }
         const { entry, lease } = first;
         const now = new Date(nowMs).toISOString();
-        const borrowed: ReadyPoolEntry = {
-          ...entry,
-          state: "busy",
-          borrowedBy: requestOwner(request),
-          borrowedAt: now,
-          borrowToken: crypto.randomUUID(),
-          lastUsedAt: now,
-          updatedAt: now,
+        const borrowed = borrowedReadyPoolEntry(entry, {
+          owner: requestOwner(request),
+          token: crypto.randomUUID(),
+          now,
+          nowMs,
+          heartbeat: input.heartbeat === true,
           expiresAt: lease.expiresAt,
-        };
-        if (input.heartbeat === true) {
-          borrowed.borrowHeartbeatRequired = true;
-          borrowed.borrowHeartbeatAt = now;
-          borrowed.borrowExpiresAt = new Date(nowMs + readyPoolBorrowTimeoutMs).toISOString();
-        } else {
+        });
+        if (input.heartbeat !== true) {
           delete borrowed.borrowHeartbeatRequired;
           delete borrowed.borrowHeartbeatAt;
           delete borrowed.borrowExpiresAt;
@@ -13276,14 +13286,11 @@ export class FleetCoordinator {
           );
         }
         const now = new Date(nowMs).toISOString();
-        const updated: ReadyPoolEntry = {
-          ...current,
-          borrowHeartbeatRequired: true,
-          borrowHeartbeatAt: now,
-          borrowExpiresAt: new Date(nowMs + readyPoolBorrowTimeoutMs).toISOString(),
-          updatedAt: now,
-          expiresAt: lease?.expiresAt ?? current.expiresAt,
-        };
+        const updated = heartbeatedReadyPoolEntry(current, {
+          now,
+          nowMs,
+          leaseExpiresAt: lease?.expiresAt,
+        });
         await this.putReadyPoolEntry(updated, typed);
         await this.incrementReadyPoolCounters(request, key, { borrowHeartbeats: 1 }, typed);
         await this.scheduleAlarm();
@@ -13691,22 +13698,12 @@ export class FleetCoordinator {
     state: ReadyPoolEntry["state"],
     reason?: string,
   ): ReadyPoolEntry {
-    const now = new Date().toISOString();
-    const failures = state === "ready" ? 0 : (current.failureCount ?? 0) + 1;
-    const returned: ReadyPoolEntry = {
-      ...withoutReadyPoolBorrow(current),
+    return returnedReadyPoolEntry(current, {
       state,
-      lastResult: nonSecretString(reason) || state,
-      failureCount: failures,
-      updatedAt: now,
-      expiresAt: lease?.expiresAt ?? current.expiresAt,
-    };
-    if (state === "ready") {
-      returned.lastReadyAt = now;
-    } else if (current.lastReadyAt) {
-      returned.lastReadyAt = current.lastReadyAt;
-    }
-    return returned;
+      reason: nonSecretString(reason),
+      now: new Date().toISOString(),
+      leaseExpiresAt: lease?.expiresAt,
+    });
   }
 
   private async maintainReadyPools(nowMs: number): Promise<void> {
@@ -13764,12 +13761,7 @@ export class FleetCoordinator {
       ) {
         // oxlint-disable-next-line eslint/no-await-in-loop -- ordered writes prevent stale maintenance from racing a newer entry transition.
         await this.putReadyPoolEntry(
-          withoutReadyPoolBorrow({
-            ...entry,
-            state: "stale",
-            updatedAt: new Date(nowMs).toISOString(),
-            lastResult: "lease expired or missing",
-          }),
+          staleReadyPoolEntry(entry, new Date(nowMs).toISOString()),
           typed,
         );
         continue;
@@ -13823,13 +13815,7 @@ export class FleetCoordinator {
     typed = false,
   ): Promise<void> {
     await this.putReadyPoolEntry(
-      withoutReadyPoolBorrow({
-        ...entry,
-        state: "quarantined",
-        updatedAt: new Date(nowMs).toISOString(),
-        lastResult: reason,
-        failureCount: (entry.failureCount ?? 0) + 1,
-      }),
+      quarantinedReadyPoolEntry(entry, { reason, at: new Date(nowMs).toISOString() }),
       typed,
     );
     await this.incrementReadyPoolCountersForScope(
@@ -13932,16 +13918,7 @@ export class FleetCoordinator {
     typed: boolean,
   ): Promise<void> {
     if (entry.state === "draining") return;
-    await this.putReadyPoolEntry(
-      withoutReadyPoolBorrow({
-        ...entry,
-        state: "draining",
-        updatedAt: new Date().toISOString(),
-        lastResult: "typed ready-pool lease image or architecture changed",
-        failureCount: (entry.failureCount ?? 0) + 1,
-      }),
-      typed,
-    );
+    await this.putReadyPoolEntry(drainedReadyPoolEntry(entry, new Date().toISOString()), typed);
   }
 
   private async listLeases(request: Request): Promise<Response> {
@@ -19744,37 +19721,6 @@ function readyPoolCapacityCounts(
     counts[entry.state]++;
   }
   return counts;
-}
-
-function readyPoolBorrowDeadline(entry: ReadyPoolEntry): number | undefined {
-  if (entry.borrowHeartbeatRequired !== true) {
-    return undefined;
-  }
-  const explicit = Date.parse(entry.borrowExpiresAt ?? "");
-  if (Number.isFinite(explicit)) {
-    return explicit;
-  }
-  const anchor = Date.parse(entry.borrowHeartbeatAt ?? entry.borrowedAt ?? entry.updatedAt);
-  return Number.isFinite(anchor) ? anchor + readyPoolBorrowTimeoutMs : Number.NEGATIVE_INFINITY;
-}
-
-function withoutReadyPoolBorrow(entry: ReadyPoolEntry): ReadyPoolEntry {
-  const {
-    borrowedAt: _borrowedAt,
-    borrowedBy: _borrowedBy,
-    borrowHeartbeatRequired: _borrowHeartbeatRequired,
-    borrowHeartbeatAt: _borrowHeartbeatAt,
-    borrowExpiresAt: _borrowExpiresAt,
-    borrowToken: _borrowToken,
-    ...rest
-  } = entry;
-  void _borrowedAt;
-  void _borrowedBy;
-  void _borrowHeartbeatRequired;
-  void _borrowHeartbeatAt;
-  void _borrowExpiresAt;
-  void _borrowToken;
-  return rest;
 }
 
 function nonNegativeReadyPoolCapacity(value: unknown, fallback: number): number | undefined {
