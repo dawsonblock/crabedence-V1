@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Hardening — coordinator decomposition, extraction 2: run lifecycle
+
+- Coordinator: the run lifecycle moved out of `worker/src/fleet.ts` into `worker/src/run-lifecycle.ts` (the rules, the `RunRepository` contract, and `RunLifecycleService`) and `worker/src/run-repository.ts` (the durable-object adapter plus the run storage-key and terminal-log layout). The router resolves the actor, verifies request material, and delegates — it no longer knows how a run changes state.
+- Coordinator: the state machine is explicit and has no generic setter — `running → succeeded | failed` from the exit code, plus the single event-driven transition (`run.failed`), with committed terminal evidence immutable against late events. A repeated finish carrying the same fingerprint replays the committed result; a different fingerprint or a rebound terminal binding conflicts, and the classification is repeated inside the storage transaction so a concurrent writer cannot be raced. Terminal log bytes are written before the state commit and removed again when the attempt does not commit.
+- Coordinator: a layering test pins the boundary — `run-lifecycle.ts` may import authorization, receipt contracts, and domain types only, never the router, the storage adapter, Cloudflare runtime globals, HTTP routing, or environment parsing.
+- This is a decomposition-only change with no intended execution semantics change: the worker suite (2,897 tests, including the fleet tests) passes untouched.
+
 ### Hardening — coordinator decomposition, extraction 1: authorization
 
 - Coordinator: authorization decisions and the resolved actor context moved out of `worker/src/fleet.ts` into `worker/src/authorization.ts` — lease access roles (owner/manage/use), lease manager and viewer authorization, run readability and writability, the bridge-principal completeness rule, and lease-share normalization. The decisions are pure functions over a resolved `ActorContext`, unit-tested directly, and the fleet router now consumes them instead of owning them. Behavior is unchanged: the full worker suite (including 968 fleet tests) passes untouched.
