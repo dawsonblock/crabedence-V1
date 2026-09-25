@@ -263,6 +263,11 @@ crabbox serve-execution
 # CRABBOX_TOPOLOGY=single|cluster declares the deployment topology —
 # required in production; cluster requires PostgreSQL and a provisioned
 # CRABBOX_EVIDENCE_KEY.
+# CRABEDENCE_PROVIDER_MAX_CONCURRENT bounds simultaneous provider calls
+# per adapter; CRABEDENCE_PROVIDER_DEGRADED_AFTER,
+# CRABEDENCE_PROVIDER_OPEN_AFTER, and CRABEDENCE_PROVIDER_OPEN_COOLDOWN
+# tune the provider circuit breaker. Reconciliation is never gated by
+# provider capacity.
 ```
 
 The `crabbox exec` command is a stdin/stdout bridge for testing and ad-hoc

@@ -304,6 +304,7 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	// If we have a durable store, wrap it in a DispatchExecutor
 	var handler Handler
 	var durable Handler
+	var providerGate *ProviderGate
 	handlers := map[string]Handler{
 		"system":       echoHandler,
 		"test-counter": counterHandler,
@@ -360,6 +361,16 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 			}
 			executor.SetTimeouts(ExecutorTimeouts{ProviderExecution: d})
 		}
+		// Provider containment: the gate bounds simultaneous provider
+		// calls and opens a circuit after consecutive ambiguous
+		// outcomes, so a wedged provider cannot accumulate goroutines
+		// without limit. Reconciliation never acquires it.
+		gateCfg, err := providerGateConfigFromEnv()
+		if err != nil {
+			return err
+		}
+		providerGate = NewProviderGate(gateCfg)
+		executor.SetProviderGate(providerGate)
 		durable = executor
 	} else {
 		// No store — fail closed for MUTATION/CRITICAL
@@ -431,12 +442,17 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	// closed: UNKNOWN stays UNKNOWN unless a resolver proves otherwise).
 	if store != nil && opts.ReconcileInterval > 0 {
 		worker := reconcile.NewWorker(store, reconcile.NoopResolver{})
-		worker.RegisterResolver("test.counter.increment", counterHandler)
+		// Reconciliation resolvers are wrapped so lookup outcomes are
+		// counted on the provider gate. The wrapper never acquires
+		// dispatch capacity: the provider failure that strands a
+		// record in UNKNOWN must not also block the lookup that
+		// resolves it.
+		worker.RegisterResolver("test.counter.increment", providerGate.ObserveResolver("test-counter", counterHandler))
 		if githubHandler != nil {
-			worker.RegisterResolver("github.issue.create", githubHandler)
+			worker.RegisterResolver("github.issue.create", providerGate.ObserveResolver("github", githubHandler))
 		}
 		if qualAdapter != nil {
-			worker.RegisterResolver(QualificationCapabilityID, qualAdapter)
+			worker.RegisterResolver(QualificationCapabilityID, providerGate.ObserveResolver(QualificationAdapterID, qualAdapter))
 		}
 		worker.SetEvidenceSigner(signer)
 		// Reconciliation runs under a supervisor with an explicit
@@ -531,6 +547,11 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 		fmt.Fprintf(os.Stderr, "Durable idempotency: disabled (MUTATION/CRITICAL will fail closed)\n")
 	}
 	fmt.Fprintf(os.Stderr, "Deployment topology: %s (declared replicas: %d, effect store: %s)\n", topology, replicas, backend)
+	if providerGate != nil {
+		cfg := providerGate.Config()
+		fmt.Fprintf(os.Stderr, "Provider gate: max %d concurrent per provider; degraded after %d consecutive ambiguous outcomes; circuit opens after %d (cooldown %s)\n",
+			cfg.MaxConcurrent, cfg.DegradedAfter, cfg.OpenAfter, cfg.OpenCooldown)
+	}
 
 	// Wait for signal or context cancellation
 	select {
@@ -636,6 +657,50 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 		return fmt.Errorf("directory close failed after fsync: %w", closeErr)
 	}
 	return nil
+}
+
+// providerGateConfigFromEnv applies the deployment's provider-gate
+// overrides to the production defaults. Malformed or contradictory
+// values are startup errors, never a silent fallback.
+func providerGateConfigFromEnv() (ProviderGateConfig, error) {
+	cfg := DefaultProviderGateConfig()
+	positive := func(name string) (int, bool, error) {
+		raw := strings.TrimSpace(os.Getenv(name))
+		if raw == "" {
+			return 0, false, nil
+		}
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 {
+			return 0, false, fmt.Errorf("%s %q is not a positive integer", name, raw)
+		}
+		return n, true, nil
+	}
+	if n, ok, err := positive("CRABEDENCE_PROVIDER_MAX_CONCURRENT"); err != nil {
+		return cfg, err
+	} else if ok {
+		cfg.MaxConcurrent = n
+	}
+	if n, ok, err := positive("CRABEDENCE_PROVIDER_DEGRADED_AFTER"); err != nil {
+		return cfg, err
+	} else if ok {
+		cfg.DegradedAfter = n
+	}
+	if n, ok, err := positive("CRABEDENCE_PROVIDER_OPEN_AFTER"); err != nil {
+		return cfg, err
+	} else if ok {
+		cfg.OpenAfter = n
+	}
+	if raw := strings.TrimSpace(os.Getenv("CRABEDENCE_PROVIDER_OPEN_COOLDOWN")); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d <= 0 {
+			return cfg, fmt.Errorf("CRABEDENCE_PROVIDER_OPEN_COOLDOWN %q is not a positive Go duration (e.g. 30s, 2m)", raw)
+		}
+		cfg.OpenCooldown = d
+	}
+	if cfg.DegradedAfter > cfg.OpenAfter {
+		return cfg, fmt.Errorf("CRABEDENCE_PROVIDER_DEGRADED_AFTER (%d) cannot exceed CRABEDENCE_PROVIDER_OPEN_AFTER (%d)", cfg.DegradedAfter, cfg.OpenAfter)
+	}
+	return cfg, nil
 }
 
 // Topology is the declared deployment topology. It is explicit in

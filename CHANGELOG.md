@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Hardening — provider containment and lifecycle invariants
+
+- Execution: provider dispatch is now bounded per adapter by a `ProviderGate` — a maximum number of simultaneously executing provider calls, an explicit count of calls that outlived the executor ceiling and are still running (wedged), and a health state (healthy, degraded, open) derived from consecutive ambiguous outcomes. A saturated or open-circuit provider is refused *before* the dispatch boundary with `CAPABILITY_UNAVAILABLE` and a provable no-effect failure; the reservation is abandoned rather than consumed, so the same idempotency key dispatches for real once capacity exists. A wedged call keeps its slot reserved until its goroutine actually returns, so a leaked goroutine stays visible instead of silently freeing capacity. `CRABEDENCE_PROVIDER_MAX_CONCURRENT`, `CRABEDENCE_PROVIDER_DEGRADED_AFTER`, `CRABEDENCE_PROVIDER_OPEN_AFTER`, and `CRABEDENCE_PROVIDER_OPEN_COOLDOWN` override the defaults, and malformed or contradictory values are startup errors.
+- Execution: reconciliation is independent of dispatch capacity by construction — recovery lookups never acquire the gate, so the provider failure that strands a record in `UNKNOWN` cannot also block the lookup that resolves it. Lookup outcomes are counted on the gate without gating anything.
+- Execution: the lifecycle graph is now covered by an exhaustive transition matrix on both storage engines — every permitted transition (`PREPARED → EXECUTING → IN_FLIGHT → COMMITTED|FAILED|UNKNOWN`, `EXECUTING → PREPARED` abandonment, `UNKNOWN → COMMITTED|FAILED` reconciliation) and every prohibited one (skipping `EXECUTING`, abandoning post-dispatch, mismatched expected state, terminal immutability, and `UNKNOWN →` any active state, i.e. no blind redispatch). A definitive resolution without proof is refused, and a `CRITICAL` record cannot finalize without a verified signed receipt.
+- Execution: execution identity is pinned by property tests — deterministic, canonical over argument key order, sensitive to every bound field (including the authority generation), and unambiguous across fields, so moving a value between two fields is a different execution.
+- Execution: a terminal receipt is bound to its record — a receipt minted for a different execution, capability, principal, or request digest can never finalize another record, and a refused write leaves the record untouched.
+
 ### Hardening — explicit topology, strict invocation ABI, loopback qualification
 
 - Execution: `CRABBOX_TOPOLOGY=single|cluster` declares the deployment topology explicitly. Production refuses to start without it — an unset topology is never assumed to mean one production replica — and contradictory declarations (`single` with `CRABBOX_REPLICAS > 1`, `cluster` with SQLite/`none`/auto-resolved SQLite) fail closed. `cluster` requires a provisioned, existing `CRABBOX_EVIDENCE_KEY` even at one replica.

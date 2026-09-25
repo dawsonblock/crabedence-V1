@@ -130,6 +130,11 @@ type DispatchExecutor struct {
 	handler Handler
 	store   idempotency.EffectStore
 	signer  *evidence.Signer
+	// gate bounds and observes provider dispatch per adapter: a
+	// saturated or open-circuit provider is refused before dispatch
+	// rather than accumulating goroutines. Reconciliation never
+	// acquires it.
+	gate *ProviderGate
 	// preFinalizeHook, when set, runs after the terminal decision and
 	// before Finalize — a test seam for simulating slow evidence
 	// verification while the lease heartbeat must keep the lease alive.
@@ -217,8 +222,34 @@ func NewDispatchExecutor(handler Handler, store idempotency.EffectStore) *Dispat
 	return &DispatchExecutor{
 		handler:  handler,
 		store:    store,
+		gate:     NewProviderGate(ProviderGateConfig{}),
 		timeouts: DefaultExecutorTimeouts(),
 	}
+}
+
+// SetProviderGate installs a provider gate — deployment configuration
+// (capacity and health thresholds) or a test seam. A nil gate is
+// ignored: the executor always has one.
+func (e *DispatchExecutor) SetProviderGate(g *ProviderGate) {
+	if g != nil {
+		e.gate = g
+	}
+}
+
+// ProviderGate exposes the executor's gate: its snapshot is the
+// provider-level health surface.
+func (e *DispatchExecutor) ProviderGate() *ProviderGate { return e.gate }
+
+// observeProviderOutcome accounts one provider outcome on the gate.
+// Only a post-dispatch ambiguous outcome (UNKNOWN) degrades the
+// provider; any definitive answer — success, definitive failure, or
+// denial — proves the provider is answering and resets the streak.
+func (e *DispatchExecutor) observeProviderOutcome(desc capability.ResolvedDescriptor, state idempotency.State) {
+	if state == idempotency.StateUnknown {
+		e.gate.RecordAmbiguous(desc.AdapterID, "post-dispatch ambiguity (UNKNOWN)")
+		return
+	}
+	e.gate.RecordSuccess(desc.AdapterID)
 }
 
 // SetEvidenceSigner configures the Ed25519 receipt signer used to attest
@@ -231,9 +262,13 @@ func (e *DispatchExecutor) SetEvidenceSigner(s *evidence.Signer) {
 
 // ExecuteWithIdempotency executes a request with durable idempotency.
 func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Request, desc capability.ResolvedDescriptor) Response {
-	// For PURE and READ, skip idempotency (no side effects)
+	// For PURE and READ, skip idempotency (no side effects). The
+	// provider gate still applies: capacity and health are properties
+	// of the provider, not of the effect class.
 	if desc.ExecutionClass == capability.ClassPure || desc.ExecutionClass == capability.ClassRead {
-		resp, _ := e.dispatch(ctx, req, desc)
+		resp, _ := e.dispatch(ctx, req, desc, nil)
+		state, _ := classifyPostDispatch(resp, desc)
+		e.observeProviderOutcome(desc, state)
 		return resp
 	}
 
@@ -447,6 +482,25 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		}
 	}
 
+	// Provider capacity and health: a saturated or open-circuit
+	// provider is refused BEFORE the dispatch boundary, and the
+	// reservation is abandoned rather than consumed — the record
+	// returns to claimable PREPARED, so a retry with the same key
+	// reacquires and, once capacity exists, dispatches for real.
+	providerLease, err := e.gate.Acquire(desc.AdapterID)
+	if err != nil {
+		e.abandonPreDispatch(ctx, executionID, leaseToken, leaseGen)
+		return e.providerRefusedResponse(err)
+	}
+	// Ownership transfers to dispatch() when the provider goroutine
+	// starts; any earlier return releases the reservation here.
+	leaseHandedOff := false
+	defer func() {
+		if !leaseHandedOff {
+			providerLease.Release()
+		}
+	}()
+
 	// Mark as EXECUTING using the typed API (fenced by token + generation).
 	// This is PRE_DISPATCH — if this fails, return FAILED (safe).
 	if err := e.store.BeginExecution(ctx, executionID, leaseToken, leaseGen); err != nil {
@@ -534,7 +588,8 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		dispatchCtx = context.WithValue(ctx, externalTokenKey{}, recoveryLocator.ExternalToken)
 	}
 	e.fireCrashPoint(CrashBeforeProvider)
-	resp, provableNoEffect := e.dispatch(dispatchCtx, req, desc)
+	leaseHandedOff = true
+	resp, provableNoEffect := e.dispatch(dispatchCtx, req, desc, providerLease)
 	e.fireCrashPoint(CrashAfterProvider)
 
 	// The provider has answered. Everything from here until the terminal
@@ -614,6 +669,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 
 	// ─── TERMINAL DECISION — single post-dispatch decision table ─────────
 	state, resp := classifyPostDispatch(providerResp, desc)
+	e.observeProviderOutcome(desc, state)
 
 	evidenceDigest := ""
 	receiptVersion := 0
@@ -875,7 +931,19 @@ func (e *DispatchExecutor) abandonPreDispatch(ctx context.Context, executionID, 
 // DefinitiveFailure is a routing hint, not proof — only responses with
 // executor provenance may be synthesized into attestable no-effect
 // evidence upstream.
-func (e *DispatchExecutor) dispatch(ctx context.Context, req Request, desc capability.ResolvedDescriptor) (Response, bool) {
+func (e *DispatchExecutor) dispatch(ctx context.Context, req Request, desc capability.ResolvedDescriptor, lease *ProviderLease) (Response, bool) {
+	// Provider capacity and health: the gate is acquired before the
+	// handler is invoked. A refusal means nothing was dispatched, so
+	// the outcome is a provable no-effect failure — never post-dispatch
+	// ambiguity.
+	if lease == nil {
+		acquired, err := e.gate.Acquire(desc.AdapterID)
+		if err != nil {
+			return e.providerRefusedResponse(err), true
+		}
+		lease = acquired
+	}
+
 	// Set a timeout if deadline is provided
 	dispatchCtx := ctx
 	if req.Deadline != "" {
@@ -886,6 +954,7 @@ func (e *DispatchExecutor) dispatch(ctx context.Context, req Request, desc capab
 				// The deadline already passed — do not invoke the
 				// handler at all. The provider was never called, so
 				// this is a provable no-effect failure.
+				lease.Release()
 				return Response{
 					Status:            StatusFailed,
 					FailureCode:       string(capability.FailureInvalidRequest),
@@ -921,7 +990,14 @@ func (e *DispatchExecutor) dispatch(ctx context.Context, req Request, desc capab
 	// late handler answer is dropped rather than blocking a leaked
 	// goroutine on send forever.
 	respCh := make(chan Response, 1)
-	go func() { respCh <- e.handler.Execute(dispatchCtx, req, desc) }()
+	go func() {
+		// The slot stays reserved until the provider call actually
+		// finishes: a handler that ignores cancellation keeps its
+		// reservation (and stays visible as wedged) instead of
+		// silently freeing capacity.
+		defer lease.Release()
+		respCh <- e.handler.Execute(dispatchCtx, req, desc)
+	}()
 
 	if max <= 0 {
 		return <-respCh, false
@@ -939,12 +1015,27 @@ func (e *DispatchExecutor) dispatch(ctx context.Context, req Request, desc capab
 		// until the recovery transition below; the heartbeat stops
 		// when Execute returns, so an ignored handler can never pin
 		// the lease beyond ceiling+grace.
+		lease.MarkTimeout()
 		select {
 		case resp := <-respCh:
 			return resp, false
 		case <-time.After(e.timeouts.ProviderExecutionGrace):
+			lease.MarkWedged()
 			return e.providerCeilingResponse(desc, dispatchCtx.Err()), false
 		}
+	}
+}
+
+// providerRefusedResponse is the provable no-effect refusal when the
+// provider gate refuses capacity (the dispatch bound is reached) or
+// health (the circuit is open). Nothing was dispatched, so the caller
+// may safely retry.
+func (e *DispatchExecutor) providerRefusedResponse(err error) Response {
+	return Response{
+		Status:            StatusFailed,
+		FailureCode:       string(capability.FailureCapabilityUnavailable),
+		Error:             fmt.Sprintf("provider refused before dispatch: %v", err),
+		DefinitiveFailure: true,
 	}
 }
 
