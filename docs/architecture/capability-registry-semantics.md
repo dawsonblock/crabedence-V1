@@ -17,15 +17,40 @@ system.info
 test.counter.increment
 github.issue.get
 github.issue.create
-qualification.critical.commit
-qualification.critical.query
-...
 ```
 
 The registry digest is identical on two machines running the same
 qualified release, whether or not GitHub credentials exist. Deployment
 configuration never enters the registry, the registry digest, or any
 descriptor digest.
+
+## The qualification registry is an explicit extension
+
+Qualification-only capabilities are never members of the release
+registry. They are added by an explicit extension layer
+(`internal/execution/qualification_registry.go`) under one rule:
+
+```
+exact release registry + explicit qualification descriptors
+  = qualification registry
+```
+
+The extension refuses to overwrite or modify an existing release
+descriptor, so a qualification build can never silently replace
+production policy. The qualification registry therefore has its own
+digest, and the record that binds the two identities
+(`RegistryExtensionRecord`) carries the release digest, the
+qualification digest, and the descriptor digest of every
+qualification-only capability that separates them. The two digests are
+deliberately different: the release digest identifies the security
+policy a release ships, the qualification digest identifies the policy
+the qualification build actually loaded.
+
+`qualification.critical.commit` exists only as such an extension: it is
+registered when a deployment explicitly configures the external
+qualification provider (`CRABEDENCE_QUAL_PROVIDER_URL`). Unset, the
+service serves the unmodified release registry and its digest is
+unchanged.
 
 ## Four different states
 
@@ -109,6 +134,7 @@ released policy = runtime policy is checkable, not asserted.
 | Rule | Enforcement |
 |---|---|
 | Complete built-in catalog registered unconditionally | `internal/execution/serve.go`; `cmd/registry-digest` |
+| Qualification capabilities are extensions, never release members | `internal/execution/qualification_registry.go`; `RegistryExtensionRecord` |
 | Availability separate from policy | `internal/capability/availability.go`; `Registry.Availability` |
 | Unavailable ≠ unknown | `CAPABILITY_UNAVAILABLE` + `ADAPTER_NOT_CONFIGURED` reason |
 | No routing/class fallback | `RouteDispatcher`; `MultiHandler` |

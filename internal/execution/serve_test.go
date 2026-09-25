@@ -206,6 +206,9 @@ func TestServeRejectsReplicatedDeploymentWithoutSharedStore(t *testing.T) {
 	t.Setenv("CRABBOX_GITHUB_ENABLED", "false")
 	t.Setenv("CRABBOX_GITHUB_TOKEN", "")
 	t.Setenv("GITHUB_TOKEN", "")
+	// A replicated deployment declares the cluster topology; the
+	// declared replica count is a consistency check against it.
+	t.Setenv("CRABBOX_TOPOLOGY", "cluster")
 	// No ambient DSN — Serve reads the DSN from ServeOptions, but pin
 	// the env anyway so a future env fallback cannot flake the
 	// postgres-without-DSN case.

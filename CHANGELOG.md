@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Hardening — explicit topology, strict invocation ABI, loopback qualification
+
+- Execution: `CRABBOX_TOPOLOGY=single|cluster` declares the deployment topology explicitly. Production refuses to start without it — an unset topology is never assumed to mean one production replica — and contradictory declarations (`single` with `CRABBOX_REPLICAS > 1`, `cluster` with SQLite/`none`/auto-resolved SQLite) fail closed. `cluster` requires a provisioned, existing `CRABBOX_EVIDENCE_KEY` even at one replica.
+- Execution: the capability invocation ABI is parsed strictly — duplicate object keys anywhere, explicit `null` for known fields, unknown root/authority fields, invalid UTF-8, nesting beyond 64 containers, and trailing data are refused with `INVALID_REQUEST` before admission instead of being silently reinterpreted. The rules are mirrored by a NEMO validator and verified by a shared Go↔NEMO conformance corpus; the NEMO client refuses to emit a request the server would reject. `grant_id` remains a deliberate compatibility alias.
+- Execution: the qualification provider adapter enforces its documented loopback-only contract — non-loopback hosts, userinfo, alternate IP encodings, and redirects are refused, so an accidental `CRABEDENCE_QUAL_PROVIDER_URL` change cannot turn the unauthenticated provider into a remote request surface.
+- Execution: removed dead `DispatchExecutor` state (`inFlight` and an unused mutex) whose name implied safety behavior it never performed.
+- Docs: `docs/architecture/capability-registry-semantics.md` now describes the qualification extension layer accurately (`qualification.critical.query` never existed), and the ABI spec documents the strict parsing rules.
+
 ### Review hardening — bounded provider reads, fail-closed qualification artifacts
 
 - Execution: a qualification response whose artifact bytes cannot be re-fetched from the provider's durable ledger now stays `UNKNOWN` instead of committing unverified bytes — the verification the adapter documents is no longer skipped when the fetch itself fails, and reconciliation resolves the outcome from the provider ledger.

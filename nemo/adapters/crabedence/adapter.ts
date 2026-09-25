@@ -33,6 +33,7 @@ import type {
   KernelExecutionOutcome,
   KernelExecutionRequest,
 } from "../../contracts/index";
+import { validateInvocationRequest } from "../../contracts/invocation-abi";
 
 // ─── Wire protocol ────────────────────────────────────────────────────
 
@@ -116,6 +117,13 @@ export class TransportError extends Error {
  */
 function encodeFrame(value: unknown): Buffer {
   const payload = Buffer.from(JSON.stringify(value), "utf-8");
+  // The client never emits a request the strict invocation ABI would
+  // refuse: the same rules (and the shared conformance corpus) run
+  // server-side in internal/execution/invocation_abi.go.
+  const validation = validateInvocationRequest(payload);
+  if (!validation.ok) {
+    throw new TransportError(`invocation ABI violation: ${validation.error}`, "PRE_DISPATCH");
+  }
   if (payload.byteLength > MAX_MESSAGE_BYTES) {
     throw new TransportError(
       `message exceeds maximum size: ${payload.byteLength} > ${MAX_MESSAGE_BYTES}`,

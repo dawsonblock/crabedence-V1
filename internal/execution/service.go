@@ -320,13 +320,16 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 		return
 	}
 
-	// Parse request
-	var req Request
-	if err := json.Unmarshal(msgBuf, &req); err != nil {
+	// Parse request under the strict invocation ABI: duplicate keys,
+	// explicit nulls, unknown fields, invalid UTF-8, excessive nesting,
+	// and trailing data are refused before admission ever sees the
+	// request.
+	req, err := parseInvocationRequest(msgBuf)
+	if err != nil {
 		s.writeResponse(conn, Response{
 			Status:      StatusFailed,
 			FailureCode: string(capability.FailureInvalidRequest),
-			Error:       fmt.Sprintf("invalid JSON: %v", err),
+			Error:       fmt.Sprintf("invalid request: %v", err),
 		})
 		return
 	}

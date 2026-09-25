@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 	"time"
@@ -61,15 +62,62 @@ type QualificationAdapter struct {
 
 // NewQualificationAdapter creates the adapter for a deployed
 // qualification provider at baseURL (http://host:port).
+//
+// The provider contract is loopback-only and unauthenticated: the
+// adapter refuses any target that is not the local host, so an
+// accidental URL change cannot turn the contract into a remote
+// request surface. IP literals must be loopback (127.0.0.0/8 or ::1,
+// including IPv4-mapped forms); the only accepted hostname is
+// "localhost" (case-insensitive, optional trailing dot). Userinfo,
+// alternate IP encodings, and every other hostname are refused.
 func NewQualificationAdapter(baseURL string) (*QualificationAdapter, error) {
 	u, err := url.Parse(strings.TrimSpace(baseURL))
 	if err != nil || u == nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return nil, fmt.Errorf("CRABEDENCE_QUAL_PROVIDER_URL %q must be an http(s) URL with a host", baseURL)
 	}
+	if err := requireLoopbackHost(u); err != nil {
+		return nil, fmt.Errorf("CRABEDENCE_QUAL_PROVIDER_URL %q must target the local host: %w", baseURL, err)
+	}
 	return &QualificationAdapter{
 		baseURL: strings.TrimRight(baseURL, "/"),
-		client:  &http.Client{Timeout: 30 * time.Second},
+		client: &http.Client{
+			Timeout: 30 * time.Second,
+			// The provider contract is loopback-only, so a redirect
+			// could only ever move the request off the validated local
+			// host. Refuse redirects outright rather than validating
+			// each hop — the provider API has no legitimate redirect.
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return fmt.Errorf("qualification provider redirect to %s refused: the provider contract is loopback-only", req.URL.Redacted())
+			},
+		},
 	}, nil
+}
+
+// requireLoopbackHost validates that a parsed provider URL targets the
+// local host. The check is structural — it never performs DNS — so a
+// hostname that is not exactly "localhost" is refused regardless of
+// what it might resolve to.
+func requireLoopbackHost(u *url.URL) error {
+	if u.User != nil {
+		return fmt.Errorf("URLs with userinfo are not accepted")
+	}
+	host := u.Hostname()
+	if host == "" {
+		return fmt.Errorf("missing host")
+	}
+	if addr, err := netip.ParseAddr(host); err == nil {
+		if addr.Is4In6() {
+			addr = addr.Unmap()
+		}
+		if !addr.IsLoopback() {
+			return fmt.Errorf("host %q is not a loopback address", host)
+		}
+		return nil
+	}
+	if name := strings.TrimSuffix(strings.ToLower(host), "."); name == "localhost" {
+		return nil
+	}
+	return fmt.Errorf("host %q is not a loopback address or localhost", host)
 }
 
 // SetLookupFault injects a deterministic lookup outage for

@@ -91,9 +91,15 @@ func (a App) execCommand(ctx context.Context, args []string) error {
 	}
 
 	// Build the execution service request (same wire format as invoke).
+	// The wire ABI requires arguments to be a JSON object; a request
+	// without arguments carries the empty object, never null.
+	wireArgs := req.Arguments
+	if len(wireArgs) == 0 {
+		wireArgs = json.RawMessage(`{}`)
+	}
 	execReq := execution.Request{
 		Capability: req.Capability,
-		Arguments:  req.Arguments,
+		Arguments:  wireArgs,
 		Authority: execution.RequestAuthority{
 			Principal:    req.Authority.Principal,
 			AuthorityRef: req.Authority.GrantID,

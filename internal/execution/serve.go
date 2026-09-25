@@ -92,9 +92,10 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	// the qualification harness binds it). Unset, the service serves the
 	// unmodified release registry.
 	//
-	// The URL is configuration, not a secret: the qualification provider
-	// is loopback-bound and unauthenticated, so it must only ever be
-	// deployed on staging/qualification hosts.
+	// The URL is configuration, not a secret: the qualification
+	// provider is loopback-bound and unauthenticated. The adapter
+	// enforces that contract — a URL targeting anything but the local
+	// host is a startup error, not a best-effort connection.
 	var qualAdapter *QualificationAdapter
 	if qualURL := strings.TrimSpace(os.Getenv("CRABEDENCE_QUAL_PROVIDER_URL")); qualURL != "" {
 		var err error
@@ -140,7 +141,13 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	// IDs, and the provider idempotency token is derived from them, so
 	// two replicas on independent ledgers derive different provider
 	// tokens for the same idempotency key and can dispatch the same
-	// effect twice. CRABBOX_REPLICAS > 1 therefore requires postgres.
+	// effect twice. CRABBOX_REPLICAS > 1 therefore requires postgres,
+	// and a cluster topology requires it regardless of the declared
+	// replica count.
+	topology, err := resolveTopology()
+	if err != nil {
+		return err
+	}
 	replicas, err := replicaCount()
 	if err != nil {
 		return err
@@ -157,8 +164,17 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	default:
 		return fmt.Errorf("unknown CRABEDENCE_STORE_BACKEND %q (want sqlite, postgres, none, or auto)", backend)
 	}
+	// Topology, replica count, and store backend must be consistent: a
+	// contradictory declaration is a startup error, never a silent
+	// reinterpretation of what the deployment asked for.
+	if topology == TopologySingle && replicas > 1 {
+		return fmt.Errorf("CRABBOX_TOPOLOGY=single contradicts CRABBOX_REPLICAS=%d: a single-replica topology cannot declare multiple replicas", replicas)
+	}
 	if replicas > 1 && backend != "postgres" {
 		return fmt.Errorf("multi-replica deployment (CRABBOX_REPLICAS=%d) requires the shared postgres store backend (CRABEDENCE_STORE_BACKEND=postgres with CRABEDENCE_DATABASE_URL); backend %q gives each replica an independent ledger", replicas, backend)
+	}
+	if topology == TopologyCluster && backend != "postgres" {
+		return fmt.Errorf("CRABBOX_TOPOLOGY=cluster requires the shared postgres store backend (CRABEDENCE_STORE_BACKEND=postgres with CRABEDENCE_DATABASE_URL); backend %q gives each replica an independent ledger", backend)
 	}
 
 	var store idempotency.EffectStore
@@ -231,6 +247,10 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	//   CRABBOX_EVIDENCE_TRUSTED_SIGNERS — comma-separated additional
 	//     signer fingerprints the store trusts, for key rotation or
 	//     distinct signing identities across replicas.
+	//   CRABBOX_TOPOLOGY — declared deployment topology (single or
+	//     cluster). Cluster refuses to start without an existing,
+	//     provisioned CRABBOX_EVIDENCE_KEY, regardless of the declared
+	//     replica count.
 	//   CRABBOX_REPLICAS — declared replica count. When > 1 the service
 	//     refuses to start without an explicitly configured, existing
 	//     CRABBOX_EVIDENCE_KEY: auto-generating a host-local key per
@@ -243,7 +263,7 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	var signer *evidence.Signer
 	if store != nil {
 		keyPath := os.Getenv("CRABBOX_EVIDENCE_KEY")
-		if err := validateEvidenceKeyPolicy(keyPath); err != nil {
+		if err := validateEvidenceKeyPolicy(topology, keyPath); err != nil {
 			return err
 		}
 		if keyPath == "" {
@@ -510,6 +530,7 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	} else {
 		fmt.Fprintf(os.Stderr, "Durable idempotency: disabled (MUTATION/CRITICAL will fail closed)\n")
 	}
+	fmt.Fprintf(os.Stderr, "Deployment topology: %s (declared replicas: %d, effect store: %s)\n", topology, replicas, backend)
 
 	// Wait for signal or context cancellation
 	select {
@@ -617,6 +638,42 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	return nil
 }
 
+// Topology is the declared deployment topology. It is explicit in
+// production: a missing CRABBOX_TOPOLOGY aborts startup rather than
+// assuming that an unset replica count means one production replica.
+type Topology string
+
+const (
+	// TopologySingle is one service instance: a local (SQLite) ledger
+	// and a host-local evidence key are valid.
+	TopologySingle Topology = "single"
+	// TopologyCluster is a replicated service: every replica must
+	// contend on one shared PostgreSQL ledger and share one
+	// provisioned evidence key.
+	TopologyCluster Topology = "cluster"
+)
+
+// resolveTopology parses CRABBOX_TOPOLOGY. Outside production an unset
+// value resolves to single; production must declare the topology
+// explicitly. CRABBOX_REPLICAS remains a declared replica count and a
+// consistency check — never the source of truth.
+func resolveTopology() (Topology, error) {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv("CRABBOX_TOPOLOGY")))
+	switch raw {
+	case "":
+		if productionMode() {
+			return "", fmt.Errorf("CRABBOX_TOPOLOGY must be explicitly declared in production (single or cluster): a missing topology is never assumed to mean one production replica")
+		}
+		return TopologySingle, nil
+	case string(TopologySingle):
+		return TopologySingle, nil
+	case string(TopologyCluster):
+		return TopologyCluster, nil
+	default:
+		return "", fmt.Errorf("unknown CRABBOX_TOPOLOGY %q (want single or cluster)", os.Getenv("CRABBOX_TOPOLOGY"))
+	}
+}
+
 // replicaCount parses CRABBOX_REPLICAS into the declared replica
 // count; unset/empty means a single replica. The parse fails closed:
 // a malformed value like "2x" is a startup error, never a silent
@@ -654,12 +711,22 @@ func productionMode() bool {
 }
 
 // validateEvidenceKeyPolicy enforces the provisioned-key requirement
-// for deployment modes that must never auto-generate a signer:
-// multi-replica (CRABBOX_REPLICAS > 1) and production
-// (CRABBOX_MODE=production). Both require CRABBOX_EVIDENCE_KEY to
-// point at an existing provisioned key; auto-creation remains
-// available in single-node development mode.
-func validateEvidenceKeyPolicy(keyPath string) error {
+// for deployment modes that must never auto-generate a signer: a
+// cluster topology (CRABBOX_TOPOLOGY=cluster), multi-replica
+// (CRABBOX_REPLICAS > 1), and production (CRABBOX_MODE=production).
+// All require CRABBOX_EVIDENCE_KEY to point at an existing provisioned
+// key; auto-creation remains available only in single-node development
+// mode.
+func validateEvidenceKeyPolicy(topology Topology, keyPath string) error {
+	if topology == TopologyCluster {
+		if keyPath == "" {
+			return fmt.Errorf("cluster topology (CRABBOX_TOPOLOGY=cluster) requires CRABBOX_EVIDENCE_KEY pointing to a provisioned key shared across replicas")
+		}
+		if _, err := os.Stat(keyPath); err != nil {
+			return fmt.Errorf("cluster topology requires an existing evidence key at CRABBOX_EVIDENCE_KEY=%s (key auto-creation is disabled for cluster deployments): %w", keyPath, err)
+		}
+		return nil
+	}
 	if replicatedDeployment() {
 		if keyPath == "" {
 			return fmt.Errorf("multi-replica deployment (CRABBOX_REPLICAS=%s) requires CRABBOX_EVIDENCE_KEY pointing to a provisioned key shared across replicas", os.Getenv("CRABBOX_REPLICAS"))

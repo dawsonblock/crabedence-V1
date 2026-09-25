@@ -127,6 +127,7 @@ func TestExecutionServiceUnknownCapability(t *testing.T) {
 
 	req := Request{
 		Capability: "nonexistent.capability",
+		Arguments:  json.RawMessage(`{}`),
 		Authority:  RequestAuthority{Principal: "alice@example.com"},
 	}
 	resp := sendRequest(t, conn, req)

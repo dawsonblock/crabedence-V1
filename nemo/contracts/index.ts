@@ -16,3 +16,9 @@ export type {
   KernelExecutionOutcome,
   KernelExecutionRequest,
 } from "./execution";
+
+export {
+  MAX_INVOCATION_DEPTH,
+  validateInvocationRequest,
+} from "./invocation-abi";
+export type { InvocationValidation } from "./invocation-abi";

@@ -1,0 +1,252 @@
+{
+  "description": "Shared Go↔NEMO capability invocation ABI conformance corpus. Each vector is one raw wire request; both runtimes must accept or reject it identically, and every rejection must include the rule-level error phrase in error_contains.",
+  "vectors": [
+    {
+      "name": "minimal-valid",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":{\"principal\":\"alice@example.com\"}}",
+      "expected": "accept"
+    },
+    {
+      "name": "full-valid",
+      "wire": "{\"capability\":\"test.counter.increment\",\"arguments\":{\"counter\":\"c\",\"by\":1},\"authority\":{\"principal\":\"alice@example.com\",\"authority_ref\":\"grant-1\",\"grant_id\":\"grant-1\",\"authority_generation\":3,\"authority_digest\":\"ab12\"},\"execution_class\":\"MUTATION\",\"idempotency_key\":\"key-1\",\"deadline\":\"2026-09-24T00:00:00Z\"}",
+      "expected": "accept"
+    },
+    {
+      "name": "authority-absent",
+      "wire": "{\"capability\":\"system.info\",\"arguments\":{}}",
+      "expected": "accept"
+    },
+    {
+      "name": "arguments-absent",
+      "wire": "{\"capability\":\"system.info\",\"authority\":{\"principal\":\"alice@example.com\"}}",
+      "expected": "accept"
+    },
+    {
+      "name": "arguments-nested-null",
+      "wire": "{\"capability\":\"system.info\",\"arguments\":{\"nested\":{\"value\":null}},\"authority\":{\"principal\":\"alice\"}}",
+      "expected": "accept"
+    },
+    {
+      "name": "unicode-values",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{\"text\":\"héllo — 世界 🌍\"},\"authority\":{\"principal\":\"álîçé@example.com\"}}",
+      "expected": "accept"
+    },
+    {
+      "name": "integer-max",
+      "wire": "{\"capability\":\"system.info\",\"arguments\":{},\"authority\":{\"principal\":\"alice\",\"authority_generation\":9223372036854775807}}",
+      "expected": "accept"
+    },
+    {
+      "name": "integer-zero",
+      "wire": "{\"capability\":\"system.info\",\"arguments\":{},\"authority\":{\"principal\":\"alice\",\"authority_generation\":0}}",
+      "expected": "accept"
+    },
+    {
+      "name": "whitespace",
+      "wire": "{\n  \"capability\": \"system.echo\",\n  \"arguments\": {},\n  \"authority\": { \"principal\": \"alice\" }\n}",
+      "expected": "accept"
+    },
+    {
+      "name": "escaped-keys-in-arguments",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{\"\\u006bey\":\"value\"},\"authority\":{\"principal\":\"alice\"}}",
+      "expected": "accept"
+    },
+    {
+      "name": "nested-within-limit",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{\"deep\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]},\"authority\":{\"principal\":\"alice\"}}",
+      "expected": "accept"
+    },
+    {
+      "name": "duplicate-capability",
+      "wire": "{\"capability\":\"system.echo\",\"capability\":\"system.info\",\"arguments\":{},\"authority\":{\"principal\":\"alice\"}}",
+      "expected": "reject",
+      "error_contains": "duplicate key"
+    },
+    {
+      "name": "duplicate-authority-principal",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":{\"principal\":\"alice\",\"principal\":\"bob\"}}",
+      "expected": "reject",
+      "error_contains": "duplicate key"
+    },
+    {
+      "name": "duplicate-arguments-key",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{\"counter\":\"c\",\"counter\":\"d\"},\"authority\":{\"principal\":\"alice\"}}",
+      "expected": "reject",
+      "error_contains": "duplicate key"
+    },
+    {
+      "name": "duplicate-key-escaped",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":{\"principal\":\"alice\",\"princip\\u0061l\":\"bob\"}}",
+      "expected": "reject",
+      "error_contains": "duplicate key"
+    },
+    {
+      "name": "duplicate-root-escaped",
+      "wire": "{\"capability\":\"system.echo\",\"capab\\u0069lity\":\"system.info\",\"arguments\":{}}",
+      "expected": "reject",
+      "error_contains": "duplicate key"
+    },
+    {
+      "name": "null-capability",
+      "wire": "{\"capability\":null,\"arguments\":{},\"authority\":{\"principal\":\"alice\"}}",
+      "expected": "reject",
+      "error_contains": "null is not accepted"
+    },
+    {
+      "name": "null-arguments",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":null,\"authority\":{\"principal\":\"alice\"}}",
+      "expected": "reject",
+      "error_contains": "null is not accepted"
+    },
+    {
+      "name": "null-authority",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":null}",
+      "expected": "reject",
+      "error_contains": "null is not accepted"
+    },
+    {
+      "name": "null-principal",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":{\"principal\":null}}",
+      "expected": "reject",
+      "error_contains": "null is not accepted"
+    },
+    {
+      "name": "null-deadline",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":{\"principal\":\"alice\"},\"deadline\":null}",
+      "expected": "reject",
+      "error_contains": "null is not accepted"
+    },
+    {
+      "name": "unknown-root-field",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":{\"principal\":\"alice\"},\"extra\":\"x\"}",
+      "expected": "reject",
+      "error_contains": "unknown field"
+    },
+    {
+      "name": "unknown-authority-field",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":{\"principal\":\"alice\",\"role\":\"admin\"}}",
+      "expected": "reject",
+      "error_contains": "unknown field"
+    },
+    {
+      "name": "arguments-as-array",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":[],\"authority\":{\"principal\":\"alice\"}}",
+      "expected": "reject",
+      "error_contains": "must be a JSON object"
+    },
+    {
+      "name": "arguments-as-string",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":\"{}\",\"authority\":{\"principal\":\"alice\"}}",
+      "expected": "reject",
+      "error_contains": "must be a JSON object"
+    },
+    {
+      "name": "authority-as-array",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":[]}",
+      "expected": "reject",
+      "error_contains": "must be a JSON object"
+    },
+    {
+      "name": "authority-as-string",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":\"alice\"}",
+      "expected": "reject",
+      "error_contains": "must be a JSON object"
+    },
+    {
+      "name": "capability-as-number",
+      "wire": "{\"capability\":7,\"arguments\":{},\"authority\":{\"principal\":\"alice\"}}",
+      "expected": "reject",
+      "error_contains": "must be a JSON string"
+    },
+    {
+      "name": "generation-as-fraction",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":{\"principal\":\"alice\",\"authority_generation\":1.5}}",
+      "expected": "reject",
+      "error_contains": "must be a JSON integer"
+    },
+    {
+      "name": "generation-as-exponent",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":{\"principal\":\"alice\",\"authority_generation\":1e2}}",
+      "expected": "reject",
+      "error_contains": "must be a JSON integer literal"
+    },
+    {
+      "name": "generation-out-of-range",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":{\"principal\":\"alice\",\"authority_generation\":9223372036854775808}}",
+      "expected": "reject",
+      "error_contains": "must fit in a signed 64-bit integer"
+    },
+    {
+      "name": "generation-as-string",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":{\"principal\":\"alice\",\"authority_generation\":\"7\"}}",
+      "expected": "reject",
+      "error_contains": "must be a JSON integer"
+    },
+    {
+      "name": "root-as-array",
+      "wire": "[{\"capability\":\"system.echo\"}]",
+      "expected": "reject",
+      "error_contains": "must be a JSON object"
+    },
+    {
+      "name": "root-as-string",
+      "wire": "\"system.echo\"",
+      "expected": "reject",
+      "error_contains": "must be a JSON object"
+    },
+    {
+      "name": "empty-input",
+      "wire": "",
+      "expected": "reject",
+      "error_contains": "must be a JSON object"
+    },
+    {
+      "name": "trailing-data",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":{\"principal\":\"alice\"}} x",
+      "expected": "reject",
+      "error_contains": "trailing data"
+    },
+    {
+      "name": "trailing-object",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{}}{\"capability\":\"system.info\"}",
+      "expected": "reject",
+      "error_contains": "trailing data"
+    },
+    {
+      "name": "nested-over-limit",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{\"deep\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}}",
+      "expected": "reject",
+      "error_contains": "nesting exceeds"
+    },
+    {
+      "name": "malformed-json",
+      "wire": "{\"capability\":\"system.echo\",",
+      "expected": "reject",
+      "error_contains": "invalid JSON"
+    },
+    {
+      "name": "malformed-number",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{\"n\":01},\"authority\":{\"principal\":\"alice\"}}",
+      "expected": "reject",
+      "error_contains": "invalid JSON"
+    },
+    {
+      "name": "raw-control-char",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{\"text\":\"line\nbreak\"},\"authority\":{\"principal\":\"alice\"}}",
+      "expected": "reject",
+      "error_contains": "invalid JSON"
+    },
+    {
+      "name": "unterminated-string",
+      "wire": "{\"capability\":\"system.echo",
+      "expected": "reject",
+      "error_contains": "invalid JSON"
+    },
+    {
+      "name": "invalid-utf8",
+      "wire_b64": "eyJjYXBhYmlsaXR5Ijoic3lzdGVtLmVjaG8iLCJhcmd1bWVudHMiOnt9LCJhdXRob3JpdHkiOnsicHJpbmNpcGFsIjoiYWxpY2X/In19",
+      "expected": "reject",
+      "error_contains": "UTF-8"
+    }
+  ]
+}
