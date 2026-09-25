@@ -156,8 +156,12 @@ func backfillGrantDigests(ctx context.Context, tx *sql.Tx) error {
 		if err := rows.Scan(&r.grantID, &r.generation, &r.principal, &capsRaw, &constraintsRaw, &expiresAt); err != nil {
 			return fmt.Errorf("failed to scan grant row for digest backfill: %w", err)
 		}
-		r.caps = parsePostgresArray(string(capsRaw))
-		r.constraints = parseConstraintsJSON(constraintsRaw)
+		caps, constraints, err := decodePostgresGrantMaterial(capsRaw, constraintsRaw)
+		if err != nil {
+			return fmt.Errorf("%w: grant %s generation %d has unverifiable authority material; refusing to backfill its digest: %v", ErrGrantMaterialUnverified, r.grantID, r.generation, err)
+		}
+		r.caps = caps
+		r.constraints = constraints
 		if expiresAt.Valid {
 			r.expiresAt = expiresAt.Time
 		}
@@ -263,8 +267,12 @@ func recomputeGrantDigests(ctx context.Context, tx *sql.Tx) error {
 		if err := rows.Scan(&r.grantID, &r.generation, &r.principal, &capsRaw, &constraintsRaw, &issuedAt, &expiresAt); err != nil {
 			return fmt.Errorf("failed to scan grant row for digest recompute: %w", err)
 		}
-		r.caps = parsePostgresArray(string(capsRaw))
-		r.constraints = parseConstraintsJSON(constraintsRaw)
+		caps, constraints, err := decodePostgresGrantMaterial(capsRaw, constraintsRaw)
+		if err != nil {
+			return fmt.Errorf("%w: grant %s generation %d has unverifiable authority material; refusing to recompute its digest: %v", ErrGrantMaterialUnverified, r.grantID, r.generation, err)
+		}
+		r.caps = caps
+		r.constraints = constraints
 		if issuedAt.Valid {
 			r.issuedAt = time.UnixMilli(issuedAt.Time.UTC().UnixMilli()).UTC()
 		}
@@ -374,12 +382,26 @@ func (s *Store) Resolve(ctx context.Context, grantID string, principal string) (
 		g.ExpiresAt = time.UnixMilli(expiresAt.Time.UTC().UnixMilli()).UTC()
 	}
 
-	// Parse capabilities array from PostgreSQL text[] format.
-	// pgx returns it as a string like {cap1,cap2} or {cap1,cap2,cap3}
-	if len(capabilities) > 0 {
-		g.Capabilities = parsePostgresArray(string(capabilities))
+	// Strict decode + digest verification: corrupted authority material
+	// must deny, never broaden. An empty capability list is the wildcard
+	// and a nil constraint map is unconstrained, so a decode failure must
+	// never be allowed to produce either.
+	caps, err := parsePostgresTextArray(string(capabilities))
+	if err != nil {
+		s.metrics.resolveDenied.Add(1)
+		return nil, fmt.Errorf("%w: grant %s generation %d: %v", ErrGrantMaterialUnverified, g.ID, g.Generation, err)
 	}
-	g.Constraints = parseConstraintsJSON(constraints)
+	constraintMap, err := decodeConstraintsJSON(string(constraints))
+	if err != nil {
+		s.metrics.resolveDenied.Add(1)
+		return nil, fmt.Errorf("%w: grant %s generation %d: %v", ErrGrantMaterialUnverified, g.ID, g.Generation, err)
+	}
+	g.Capabilities = caps
+	g.Constraints = constraintMap
+	if !capability.VerifyGrantDigest(&g) {
+		s.metrics.resolveDenied.Add(1)
+		return nil, fmt.Errorf("%w: grant %s generation %d stored digest does not match its material", ErrGrantMaterialUnverified, g.ID, g.Generation)
+	}
 
 	return &g, nil
 }
@@ -579,45 +601,6 @@ func (s *Store) RevokeGrant(ctx context.Context, grantID string) error {
 	}
 	s.metrics.grantsRevoked.Add(1)
 	return nil
-}
-
-// parseConstraintsJSON decodes the stored constraint material
-// ({"dimension": ["value", ...]}). Empty or '{}' decodes to nil — an
-// unconstrained grant.
-func parseConstraintsJSON(raw []byte) map[string][]string {
-	if len(raw) == 0 {
-		return nil
-	}
-	var out map[string][]string
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return nil
-	}
-	return out
-}
-
-// parsePostgresArray parses a PostgreSQL text[] representation like
-// {cap1,cap2} into a Go []string.
-func parsePostgresArray(s string) []string {
-	if len(s) < 2 || s[0] != '{' || s[len(s)-1] != '}' {
-		return nil
-	}
-	inner := s[1 : len(s)-1]
-	if inner == "" {
-		return nil
-	}
-	// Simple split — assumes no commas or braces inside capability IDs
-	var result []string
-	current := ""
-	for _, c := range inner {
-		if c == ',' {
-			result = append(result, current)
-			current = ""
-		} else {
-			current += string(c)
-		}
-	}
-	result = append(result, current)
-	return result
 }
 
 func nullableTime(t time.Time) any {

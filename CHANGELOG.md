@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Hardening — authority material fails closed
+
+- Authority: persisted grant material is now decoded strictly and verified before it can authorize. Corrupted capability or constraint JSON — and any material whose stored `grant_digest` disagrees with the digest recomputed from it — resolves to an authority error instead of a grant. Before this change the decode error was discarded, an empty capability list is the wildcard, and a nil constraint map is unconstrained, so corrupt bytes authorized everything. Verification is constant-time (`capability.VerifyGrantDigest`), and admission already treats a resolution error as `UNAUTHORIZED`: the failure mode is deny, never broaden.
+- Authority: the derived-data migrations (`recomputeGrantDigests` / `backfillGrantDigests` and their SQLite counterparts) now abort on unverifiable material instead of recomputing a digest over a degraded interpretation, which would have legitimized it. PostgreSQL validates `TEXT[]` and `JSONB` at the storage boundary, so the abort there is defensive and the digest check is the reachable gate; SQLite stores text, so both paths are exercised on that engine.
+- Authority: the permissive `parseConstraintsJSON` / `parsePostgresArray` helpers are gone, replaced by strict decoders in `internal/authority/material.go`.
+- Tests: SQLite and PostgreSQL both cover corrupt capabilities, corrupt constraints, capabilities widened without reissuing the digest, constraints widened without reissuing the digest, and an erased digest — each must deny — plus the positive case (verified material resolves and its digest verifies), the migration aborts, and digest canonicalization over constraint ordering.
+
 ### Hardening — audit remediation: provider-health provenance and lease state ownership
 
 - Execution: provider health is now updated only when the provider actually participated. The dispatcher exposes its own provenance (`DispatchOutcome`: provider invoked, provable no effect, timed out), so a gate refusal — an open circuit, a saturated bound, or an already-expired deadline — can no longer reset a provider's failure streak. A provider that *was* invoked and outlived the ceiling is recorded as ambiguous even when the effect class makes the outcome a safe `FAILED` for the caller. Regression tests cover open-circuit READ refusal, saturation, expired-before-invocation, the successful probe (the only path that resets health), and the READ ceiling.

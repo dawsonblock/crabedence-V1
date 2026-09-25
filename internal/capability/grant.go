@@ -3,6 +3,7 @@ package capability
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"sort"
@@ -112,6 +113,20 @@ func normalizeConstraints(in map[string][]string) map[string][]string {
 		out[dimension] = list
 	}
 	return out
+}
+
+// VerifyGrantDigest reports whether the grant's stored digest matches
+// the digest recomputed from its material, compared in constant time.
+//
+// Authority material must PROVE its identity, not merely carry one: a
+// grant whose stored digest is absent or disagrees with the material it
+// covers is unverified, and callers must refuse it rather than resolve
+// the (possibly degraded) material it decoded.
+func VerifyGrantDigest(g *Grant) bool {
+	if g == nil || g.Digest == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(ComputeGrantDigest(g)), []byte(g.Digest)) == 1
 }
 
 // IsValid checks whether the grant is valid for the given capability at the given time.

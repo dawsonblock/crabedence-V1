@@ -176,8 +176,12 @@ func recomputeSQLiteGrantDigests(ctx context.Context, tx *sql.Tx) error {
 		if err := rows.Scan(&r.grantID, &r.generation, &r.principal, &capsJSON, &constraintsJSON, &issuedAt, &expiresAt); err != nil {
 			return fmt.Errorf("failed to scan grant row for digest recompute: %w", err)
 		}
-		_ = json.Unmarshal([]byte(capsJSON), &r.caps)
-		_ = json.Unmarshal([]byte(constraintsJSON), &r.constraints)
+		caps, constraints, err := decodeGrantMaterial(capsJSON, constraintsJSON)
+		if err != nil {
+			return fmt.Errorf("%w: grant %s generation %d has unverifiable authority material; refusing to recompute its digest: %v", ErrGrantMaterialUnverified, r.grantID, r.generation, err)
+		}
+		r.caps = caps
+		r.constraints = constraints
 		if issuedAt.Valid {
 			r.issuedAt = time.UnixMilli(issuedAt.Int64).UTC()
 		}
@@ -331,8 +335,12 @@ func backfillSQLiteGrantDigests(ctx context.Context, tx *sql.Tx) error {
 		if err := rows.Scan(&r.grantID, &r.generation, &r.principal, &capsJSON, &constraintsJSON, &expiresAt); err != nil {
 			return fmt.Errorf("failed to scan grant row for digest backfill: %w", err)
 		}
-		_ = json.Unmarshal([]byte(capsJSON), &r.caps)
-		_ = json.Unmarshal([]byte(constraintsJSON), &r.constraints)
+		caps, constraints, err := decodeGrantMaterial(capsJSON, constraintsJSON)
+		if err != nil {
+			return fmt.Errorf("%w: grant %s generation %d has unverifiable authority material; refusing to backfill its digest: %v", ErrGrantMaterialUnverified, r.grantID, r.generation, err)
+		}
+		r.caps = caps
+		r.constraints = constraints
 		if expiresAt.Valid {
 			r.expiresAt = time.UnixMilli(expiresAt.Int64).UTC()
 		}
@@ -416,11 +424,20 @@ func (s *SQLiteStore) Resolve(ctx context.Context, grantID string, principal str
 	if expiresAt.Valid {
 		g.ExpiresAt = time.UnixMilli(expiresAt.Int64).UTC()
 	}
-	if capabilitiesJSON != "" {
-		_ = json.Unmarshal([]byte(capabilitiesJSON), &g.Capabilities)
+	// Strict decode + digest verification: corrupted authority material
+	// must deny, never broaden. An empty capability list is the wildcard
+	// and a nil constraint map is unconstrained, so a decode failure must
+	// never be allowed to produce either.
+	caps, constraints, err := decodeGrantMaterial(capabilitiesJSON, constraintsJSON)
+	if err != nil {
+		s.metrics.resolveDenied.Add(1)
+		return nil, fmt.Errorf("%w: grant %s generation %d: %v", ErrGrantMaterialUnverified, g.ID, g.Generation, err)
 	}
-	if constraintsJSON != "" {
-		_ = json.Unmarshal([]byte(constraintsJSON), &g.Constraints)
+	g.Capabilities = caps
+	g.Constraints = constraints
+	if !capability.VerifyGrantDigest(&g) {
+		s.metrics.resolveDenied.Add(1)
+		return nil, fmt.Errorf("%w: grant %s generation %d stored digest does not match its material", ErrGrantMaterialUnverified, g.ID, g.Generation)
 	}
 	return &g, nil
 }
