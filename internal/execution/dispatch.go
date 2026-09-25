@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/openclaw/crabbox/internal/capability"
@@ -128,11 +127,9 @@ const requestDigestProtocolVersion = 1
 //   - CRITICAL evidence is validated BEFORE terminal state is persisted
 //   - Only the reservation owner (lease holder) may dispatch
 type DispatchExecutor struct {
-	handler  Handler
-	store    idempotency.EffectStore
-	signer   *evidence.Signer
-	mu       sync.Mutex
-	inFlight map[string]context.CancelFunc
+	handler Handler
+	store   idempotency.EffectStore
+	signer  *evidence.Signer
 	// preFinalizeHook, when set, runs after the terminal decision and
 	// before Finalize — a test seam for simulating slow evidence
 	// verification while the lease heartbeat must keep the lease alive.
@@ -220,7 +217,6 @@ func NewDispatchExecutor(handler Handler, store idempotency.EffectStore) *Dispat
 	return &DispatchExecutor{
 		handler:  handler,
 		store:    store,
-		inFlight: make(map[string]context.CancelFunc),
 		timeouts: DefaultExecutorTimeouts(),
 	}
 }
