@@ -1,0 +1,618 @@
+package cli
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"runtime"
+	"strconv"
+	"strings"
+	"time"
+
+	"nhooyr.io/websocket"
+)
+
+const (
+	vncLoopbackHost                     = "127.0.0.1"
+	vncTunnelSSHConnectTimeout          = 10 * time.Second
+	vncTunnelListenerVerificationWindow = 5 * time.Second
+)
+
+func vncTunnelReadinessTimeout() time.Duration {
+	return vncTunnelSSHConnectTimeout + vncTunnelListenerVerificationWindow
+}
+
+func (a App) vnc(ctx context.Context, args []string) error {
+	defaults := defaultConfig()
+	fs := newFlagSet("vnc", a.Stderr)
+	provider := registerProviderSelectionFlag(fs, defaults, providerHelpSSH())
+	id := fs.String("id", "", "lease id or slug")
+	reclaim := fs.Bool("reclaim", false, "claim this lease for the current repo")
+	localPort := fs.String("local-port", "", "local VNC tunnel port")
+	openClient := fs.Bool("open", false, "open the VNC client locally")
+	nativeHandoff := fs.Bool("native-handoff", false, "emit a native-client JSON handoff and keep its tunnel in the foreground")
+	nativeGrantURL := fs.String("native-grant-url", "", "coordinator URL for a one-time native VNC grant")
+	nativeGrantStdin := fs.Bool("native-grant-stdin", false, "read a one-time native VNC grant from stdin")
+	hostManaged := fs.Bool("host-managed", false, "allow opening host-managed static VNC")
+	providerFlags := registerProviderFlags(fs, defaults)
+	targetFlags := registerTargetFlags(fs, defaults)
+	networkFlags := registerNetworkModeFlag(fs, defaults)
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if *nativeHandoff && *openClient {
+		return exit(2, "--native-handoff and --open cannot be used together")
+	}
+	if (*nativeGrantURL != "" || *nativeGrantStdin) && (!*nativeHandoff || *nativeGrantURL == "" || !*nativeGrantStdin) {
+		return exit(2, "--native-grant-url and --native-grant-stdin must be used together with --native-handoff")
+	}
+	setIDFromFirstArg(fs, id)
+	if *nativeGrantURL != "" {
+		return a.vncFromNativeGrant(ctx, *id, *nativeGrantURL, *localPort)
+	}
+	cfg, err := loadLeaseTargetConfig(fs, *provider, targetFlags, networkFlags, leaseTargetConfigOptions{LeaseID: *id, Desktop: true})
+	if err != nil {
+		return err
+	}
+	if err := applyProviderFlags(&cfg, fs, providerFlags); err != nil {
+		return err
+	}
+	if isBlacksmithProvider(cfg.Provider) {
+		return exit(2, "desktop/VNC is not supported for provider=%s; Blacksmith owns machine connectivity", cfg.Provider)
+	}
+	if err := requireLeaseID(*id, "crabbox vnc --id <lease-id-or-slug>", cfg); err != nil {
+		return err
+	}
+	if *openClient && isStaticProvider(cfg.Provider) && !*hostManaged {
+		return exit(2, "static %s VNC is an existing host, not a Crabbox-created box; rerun with --host-managed only if you want to open that host's OS login prompt", cfg.TargetOS)
+	}
+	server, target, leaseID, err := a.resolveNetworkLeaseTargetForRepo(ctx, cfg, *id, true, *reclaim)
+	if err != nil {
+		return err
+	}
+	if err := enforceManagedLeaseCapabilities(cfg, server, leaseID); err != nil {
+		return err
+	}
+	if err := a.claimAndTouchLeaseTarget(ctx, cfg, &server, target, leaseID, *reclaim); err != nil {
+		return err
+	}
+	cfg = desktopConfigForResolvedLease(cfg, server, target)
+	endpoint, err := resolveVNCEndpoint(ctx, cfg, &target)
+	if err != nil {
+		return err
+	}
+	credentials, err := resolveNativeVNCCredentials(ctx, cfg, target, endpoint)
+	if err != nil {
+		return err
+	}
+	if *nativeHandoff {
+		if err := validateNativeVNCHandoffEndpoint(endpoint); err != nil {
+			return err
+		}
+		return runVNCNativeHandoff(ctx, a.Stdout, target, *localPort, endpoint, credentials.Username, credentials.Password)
+	}
+	if *localPort == "" {
+		*localPort = availableLocalVNCPort()
+	}
+	tunnel := vncTunnelCommand(target, *localPort)
+	staticHostVNC := isStaticProvider(cfg.Provider) && !endpoint.Managed
+	if staticHostVNC {
+		fmt.Fprintf(a.Stdout, "target: static-host slug=%s provider=%s os=%s host=%s\n", blank(serverSlug(server), "-"), blank(server.Provider, cfg.Provider), blank(target.TargetOS, cfg.TargetOS), target.Host)
+	} else {
+		fmt.Fprintf(a.Stdout, "lease: %s slug=%s provider=%s target=%s\n", leaseID, blank(serverSlug(server), "-"), blank(server.Provider, cfg.Provider), blank(target.TargetOS, cfg.TargetOS))
+	}
+	if staticHostVNC {
+		fmt.Fprintln(a.Stdout, "managed: false")
+		fmt.Fprintln(a.Stdout, "note: this is an existing host VNC service, not a Crabbox-created box")
+	} else {
+		fmt.Fprintln(a.Stdout, "managed: true")
+	}
+	if target.TargetOS == targetLinux {
+		fmt.Fprintf(a.Stdout, "display: %s\n", desktopDisplay)
+	}
+	if endpoint.Direct {
+		fmt.Fprintln(a.Stdout, "direct vnc:")
+		fmt.Fprintf(a.Stdout, "  %s:%s\n", endpoint.Host, endpoint.Port)
+		fmt.Fprintf(a.Stdout, "  vnc://%s:%s\n", endpoint.Host, endpoint.Port)
+	} else {
+		fmt.Fprintln(a.Stdout, "ssh tunnel:")
+		fmt.Fprintf(a.Stdout, "  %s\n", tunnel)
+	}
+	fmt.Fprintln(a.Stdout, "vnc:")
+	if endpoint.Direct {
+		fmt.Fprintf(a.Stdout, "  %s:%s\n", endpoint.Host, endpoint.Port)
+	} else {
+		fmt.Fprintf(a.Stdout, "  %s:%s\n", vncLoopbackHost, *localPort)
+	}
+	writeVNCCredentials(a.Stdout, cfg, target, endpoint, staticHostVNC, credentials)
+	if *openClient {
+		if staticHostVNC {
+			fmt.Fprintln(a.Stdout, "opening existing host VNC; expect that host's OS credential prompt")
+		}
+		url := fmt.Sprintf("vnc://%s:%s", endpoint.Host, endpoint.Port)
+		if !endpoint.Direct {
+			pid, err := startVNCTunnel(ctx, target, *localPort, endpoint.Host, endpoint.Port)
+			if err != nil {
+				return err
+			}
+			if pid > 0 {
+				fmt.Fprintf(a.Stdout, "tunnel pid: %d\n", pid)
+			} else {
+				fmt.Fprintln(a.Stdout, "tunnel: started in background")
+			}
+			url = fmt.Sprintf("vnc://%s:%s", vncLoopbackHost, *localPort)
+		}
+		if err := openLocalURLWithEnvironment(url, target.ChildEnvDenylist...); err != nil {
+			return err
+		}
+		fmt.Fprintf(a.Stdout, "opened: %s\n", url)
+	}
+	if endpoint.Direct {
+		fmt.Fprintln(a.Stdout, "Connect directly to the printed VNC endpoint.")
+	} else {
+		fmt.Fprintln(a.Stdout, "Keep the tunnel process running while connected.")
+	}
+	return nil
+}
+
+func writeVNCCredentials(w io.Writer, cfg Config, target SSHTarget, endpoint vncEndpoint, staticHostVNC bool, credentials rfbCredentials) {
+	passwordEnv := strings.TrimSpace(cfg.External.Connection.Desktop.PasswordEnv)
+	providerName := normalizeProviderName(cfg.Provider)
+	if provider, err := ProviderFor(cfg.Provider); err == nil {
+		providerName = provider.Name()
+	}
+	externalDesktopCredentials := providerName == "external" || providerName == "exec-provider"
+	if externalDesktopCredentials && normalizeTargetOS(target.TargetOS) == targetMacOS && len(externalDesktopChildEnvDenylist(cfg, target.TargetOS)) > 0 {
+		fmt.Fprintln(w, "credentials: operator-managed")
+		if endpoint.Managed && strings.TrimSpace(credentials.Username) != "" {
+			fmt.Fprintf(w, "%s username: %s\n", target.TargetOS, credentials.Username)
+		}
+		fmt.Fprintf(w, "credential hint: password comes from environment variable %s and is not printed\n", passwordEnv)
+		return
+	}
+	if strings.TrimSpace(credentials.Password) != "" {
+		fmt.Fprintf(w, "password: %s\n", credentials.Password)
+		if endpoint.Managed && target.TargetOS == targetWindows {
+			fmt.Fprintf(w, "windows username: %s\n", credentials.Username)
+			fmt.Fprintf(w, "windows password: %s\n", credentials.Password)
+		}
+		if endpoint.Managed && target.TargetOS == targetMacOS {
+			fmt.Fprintf(w, "macos username: %s\n", credentials.Username)
+			fmt.Fprintf(w, "macos password: %s\n", credentials.Password)
+		}
+	} else if staticHostVNC {
+		fmt.Fprintln(w, "credentials: host-managed")
+		if target.TargetOS == targetMacOS {
+			fmt.Fprintln(w, "credential hint: use the macOS account or Screen Sharing password configured on that host")
+		}
+		if target.TargetOS == targetWindows {
+			fmt.Fprintln(w, "credential hint: use the Windows/VNC password configured on that host")
+		}
+	}
+}
+
+func resolveNativeVNCCredentials(ctx context.Context, cfg Config, target SSHTarget, endpoint vncEndpoint) (rfbCredentials, error) {
+	if endpoint.Managed {
+		credentials, ok, err := providerDesktopCredentials(cfg, target)
+		if err != nil {
+			return rfbCredentials{}, err
+		}
+		if ok {
+			return credentials, nil
+		}
+	}
+	password := ""
+	if endpoint.Managed || !isStaticProvider(cfg.Provider) {
+		password, _ = runVNCPasswordSSH(ctx, target, remoteVNCCredentialReadCommand(target))
+	}
+	username := ""
+	if endpoint.Managed && (target.TargetOS == targetWindows || target.TargetOS == targetMacOS) {
+		username = strings.TrimSpace(target.User)
+	}
+	return rfbCredentials{Username: username, Password: strings.TrimSpace(password)}, nil
+}
+
+func (a App) vncFromNativeGrant(ctx context.Context, expectedLeaseID, brokerURL, localPort string) error {
+	parsed, err := url.Parse(strings.TrimSpace(brokerURL))
+	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" ||
+		(parsed.Scheme != "https" && !(parsed.Scheme == "http" && isNativeVNCLoopbackHost(parsed.Hostname()))) {
+		return exit(2, "--native-grant-url must be an HTTPS coordinator URL or loopback HTTP URL")
+	}
+	ticketBytes, err := io.ReadAll(io.LimitReader(a.input(), 4097))
+	if err != nil {
+		return exit(2, "read native VNC grant: %v", err)
+	}
+	ticket := strings.TrimSuffix(string(ticketBytes), "\n")
+	ticket = strings.TrimSuffix(ticket, "\r")
+	if len(ticketBytes) > 4096 || !validNativeVNCTicket(ticket) {
+		return exit(2, "native VNC grant is invalid")
+	}
+	parsed.Path = "/v1/native-vnc/handoff"
+	parsed.RawPath = ""
+	if parsed.Scheme == "https" {
+		parsed.Scheme = "wss"
+	} else {
+		parsed.Scheme = "ws"
+	}
+	header := http.Header{}
+	header.Set("Authorization", "Bearer "+ticket)
+	ws, response, err := websocket.Dial(ctx, parsed.String(), &websocket.DialOptions{HTTPHeader: header})
+	if err != nil {
+		if response != nil {
+			return exit(5, "native VNC coordinator websocket: http %d", response.StatusCode)
+		}
+		return exit(5, "native VNC coordinator websocket: %v", err)
+	}
+	defer ws.Close(websocket.StatusNormalClosure, "native VNC closed")
+	ws.SetReadLimit(1 << 20)
+	messageType, payload, err := ws.Read(ctx)
+	if err != nil || messageType != websocket.MessageText {
+		return exit(5, "native VNC coordinator returned an invalid ready message")
+	}
+	var ready struct {
+		Schema   string `json:"schema"`
+		LeaseID  string `json:"leaseId"`
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := json.Unmarshal(payload, &ready); err != nil || ready.Schema != "crabbox/native-vnc-ready/v1" ||
+		ready.LeaseID == "" || len(ready.LeaseID) > 256 || len(ready.Username) > 256 ||
+		ready.Password == "" || len(ready.Password) > 256 ||
+		strings.ContainsAny(ready.LeaseID+ready.Username+ready.Password, "\x00\r\n") {
+		return exit(5, "native VNC coordinator returned an invalid ready message")
+	}
+	if expectedLeaseID != "" && ready.LeaseID != expectedLeaseID {
+		return exit(5, "native VNC grant returned a different lease")
+	}
+	return runNativeVNCWebSocketHandoff(ctx, a.Stdout, ws, localPort, ready.Username, ready.Password)
+}
+
+func runNativeVNCWebSocketHandoff(
+	ctx context.Context,
+	stdout interface{ Write([]byte) (int, error) },
+	ws *websocket.Conn,
+	requestedPort, username, password string,
+) error {
+	address := net.JoinHostPort(vncLoopbackHost, requestedPort)
+	if requestedPort == "" {
+		address = net.JoinHostPort(vncLoopbackHost, "0")
+	}
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		return exit(5, "reserve native VNC loopback port: %v", err)
+	}
+	defer listener.Close()
+	port := listener.Addr().(*net.TCPAddr).Port
+	handoff := vncNativeHandoff{
+		Schema:   vncNativeHandoffSchema,
+		Host:     vncLoopbackHost,
+		Port:     port,
+		Username: username,
+		Password: password,
+	}
+	if err := json.NewEncoder(stdout).Encode(handoff); err != nil {
+		return err
+	}
+	acceptDone := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = listener.Close()
+		case <-acceptDone:
+		}
+	}()
+	tcp, err := listener.Accept()
+	close(acceptDone)
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return exit(5, "accept native VNC client: %v", err)
+	}
+	defer tcp.Close()
+	if err := ws.Write(ctx, websocket.MessageText, []byte("start")); err != nil {
+		return exit(5, "start native VNC coordinator tunnel: %v", err)
+	}
+	relayCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	errors := make(chan error, 2)
+	go func() { errors <- copyNativeVNCWebSocketToTCP(relayCtx, ws, tcp) }()
+	go func() { errors <- copyTCPToWebSocket(relayCtx, ws, tcp) }()
+	err = <-errors
+	cancel()
+	if err != nil && ctx.Err() == nil && !isExpectedNativeVNCRelayClose(err) {
+		return exit(5, "native VNC tunnel: %v", err)
+	}
+	return nil
+}
+
+func validNativeVNCTicket(ticket string) bool {
+	const prefix = "native_vnc_"
+	if len(ticket) != len(prefix)+32 || !strings.HasPrefix(ticket, prefix) {
+		return false
+	}
+	for _, character := range ticket[len(prefix):] {
+		if !((character >= '0' && character <= '9') || (character >= 'a' && character <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+func isNativeVNCLoopbackHost(host string) bool {
+	switch strings.ToLower(host) {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	default:
+		return false
+	}
+}
+
+func copyNativeVNCWebSocketToTCP(ctx context.Context, ws *websocket.Conn, tcp net.Conn) error {
+	for {
+		messageType, payload, err := ws.Read(ctx)
+		if err != nil {
+			return err
+		}
+		if messageType != websocket.MessageBinary {
+			return fmt.Errorf("coordinator sent a non-binary VNC frame")
+		}
+		if _, err := tcp.Write(payload); err != nil {
+			return err
+		}
+	}
+}
+
+func isExpectedNativeVNCRelayClose(err error) bool {
+	status := websocket.CloseStatus(err)
+	return status == websocket.StatusNormalClosure || status == websocket.StatusGoingAway
+}
+
+const vncNativeHandoffSchema = "crabbox/vnc-handoff/v1"
+
+type vncNativeHandoff struct {
+	Schema   string `json:"schema"`
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+func validateNativeVNCHandoffEndpoint(endpoint vncEndpoint) error {
+	if !endpoint.Managed {
+		return exit(2, "--native-handoff requires a Crabbox-managed desktop over a loopback SSH tunnel")
+	}
+	if endpoint.Direct {
+		return exit(2, "--native-handoff requires a loopback SSH tunnel")
+	}
+	return nil
+}
+
+func runVNCNativeHandoff(
+	ctx context.Context,
+	stdout interface{ Write([]byte) (int, error) },
+	target SSHTarget,
+	requestedPort string,
+	endpoint vncEndpoint,
+	username, password string,
+) error {
+	tunnel, localPort, err := startVNCForegroundTunnelOnReservedPort(
+		ctx,
+		target,
+		requestedPort,
+		endpoint.Host,
+		endpoint.Port,
+	)
+	if err != nil {
+		return err
+	}
+	defer stopProcess(tunnel)
+	port, err := strconv.Atoi(localPort)
+	if err != nil || port < 1 || port > 65535 {
+		return exit(5, "invalid reserved VNC tunnel port")
+	}
+	if len(username) > 256 || len(password) > 4096 {
+		return exit(5, "native VNC credentials exceed the handoff limit")
+	}
+	handoff := vncNativeHandoff{
+		Schema: vncNativeHandoffSchema, Host: vncLoopbackHost, Port: port,
+		Username: username, Password: password,
+	}
+	if err := json.NewEncoder(stdout).Encode(handoff); err != nil {
+		return fmt.Errorf("write native VNC handoff: %w", err)
+	}
+	select {
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	case <-tunnel.Done():
+		return tunnel.ExitError()
+	}
+}
+
+func vncTunnelCommand(target SSHTarget, localPort string) string {
+	return vncTunnelCommandTo(target, localPort, "127.0.0.1", managedVNCPort)
+}
+
+func startVNCTunnel(ctx context.Context, target SSHTarget, localPort, remoteHost, remotePort string) (int, error) {
+	args, session, err := vncTunnelInvocation(ctx, target, localPort, remoteHost, remotePort)
+	if err != nil {
+		return 0, err
+	}
+	cmd := exec.Command(directSSHExecutable(), args...)
+	applyTargetChildEnvironment(cmd, target)
+	configureDaemonCommand(cmd)
+	cmd.WaitDelay = pondMeshCancelWaitDelay
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	if err := cmd.Start(); err != nil {
+		return 0, errors.Join(err, session.Close())
+	}
+	// One waiter observes early exit and reaps while this CLI is alive. It owns
+	// no config after successful detachment and does not cancel on parent exit.
+	wait := startSSHForwardWait(cmd.Wait)
+	err = waitSSHForwardRoots(ctx, []sshForwardRoot{{pid: cmd.Process.Pid, ports: []string{localPort}, wait: wait}}, vncTunnelReadinessTimeout())
+	if err == nil {
+		err = session.Close()
+	}
+	if err == nil {
+		err = sshForwardStartupError(ctx, wait)
+	}
+	if err == nil {
+		return cmd.Process.Pid, nil
+	}
+	cleanupErr := terminateWebVNCDaemonProcessTree(cmd.Process.Pid)
+	if cleanupErr != nil {
+		_ = stopDaemonProcess(cmd.Process, cmd.Process.Pid)
+	}
+	<-wait.done
+	if cleanupErr == nil {
+		cleanupErr = session.Close()
+	}
+	if diagnostic := strings.TrimSpace(redactSSHTransportDiagnostic(target, output.String())); diagnostic != "" {
+		err = fmt.Errorf("%w: %s", err, diagnostic)
+	}
+	if cause := context.Cause(ctx); cause == nil || !errors.Is(err, cause) {
+		err = errors.Join(exit(5, "start VNC SSH tunnel on %s:%s", vncLoopbackHost, localPort), err)
+	}
+	return 0, errors.Join(err, cleanupErr)
+}
+
+func vncTunnelInvocation(ctx context.Context, target SSHTarget, localPort, remoteHost, remotePort string) ([]string, *sshTransportSession, error) {
+	if !target.AuthSecret {
+		return vncTunnelArgs(target, localPort, remoteHost, remotePort), nil, nil
+	}
+	session, err := newSSHTransportSession(ctx, target, true)
+	if err != nil {
+		return nil, nil, err
+	}
+	args := append(session.commandPrefix(), "-o", "ForkAfterAuthentication=no", "-N", "-L",
+		fmt.Sprintf("%s:%s:%s:%s", vncLoopbackHost, localPort, remoteHost, remotePort), session.host())
+	return args, session, nil
+}
+
+func vncTunnelArgs(target SSHTarget, localPort, remoteHost, remotePort string) []string {
+	args := append(sshForwardingDenyArgs(),
+		"-o", "BatchMode=yes",
+	)
+	args = append(args, sshHostKeyVerificationArgs(target)...)
+	args = append(args,
+		"-o", "ConnectTimeout="+strconv.Itoa(int(vncTunnelSSHConnectTimeout/time.Second)),
+		"-o", "ConnectionAttempts=1",
+		"-o", "ExitOnForwardFailure=yes",
+		"-o", "GatewayPorts=no",
+		// Never attach a tunnel to an ambient master: doing so would bypass
+		// this target's authoritative host-key verification and forwarding policy.
+		"-o", "ControlMaster=no",
+		"-o", "ControlPath=none",
+		"-o", "ControlPersist=no",
+		"-o", "ForkAfterAuthentication=no",
+		"-o", "ServerAliveInterval=15",
+		"-o", "ServerAliveCountMax=2",
+		"-p", target.Port,
+	)
+	if target.Key != "" {
+		args = append([]string{"-i", target.Key, "-o", "IdentitiesOnly=yes"}, args...)
+	}
+	if target.ProxyCommand != "" {
+		args = append(args, "-o", "ProxyCommand="+target.ProxyCommand)
+	}
+	args = append(args,
+		"-N",
+		"-L", fmt.Sprintf("%s:%s:%s:%s", vncLoopbackHost, localPort, remoteHost, remotePort),
+		target.User+"@"+target.Host,
+	)
+	return args
+}
+
+func openLocalURLWithEnvironment(url string, denied ...string) error {
+	name, args := openURLCommand(url)
+	if name == "" {
+		return exit(2, "opening VNC URLs is not supported on this local OS")
+	}
+	cmd := exec.Command(name, args...)
+	cmd.Env = browserOpenerEnvironment(os.Environ(), denied...)
+	return cmd.Start()
+}
+
+func browserOpenerEnvironment(environment []string, denied ...string) []string {
+	allowed := map[string]struct{}{
+		"PATH": {}, "HOME": {}, "USER": {}, "LOGNAME": {}, "SHELL": {},
+		"TMPDIR": {}, "TMP": {}, "TEMP": {}, "LANG": {}, "TZ": {},
+		"LC_ALL": {}, "LC_CTYPE": {}, "LC_MESSAGES": {},
+	}
+	switch runtime.GOOS {
+	case "darwin":
+		allowed["__CF_USER_TEXT_ENCODING"] = struct{}{}
+	case "linux":
+		for _, name := range []string{
+			"DISPLAY",
+			"XAUTHORITY",
+			"WAYLAND_DISPLAY",
+			"XDG_RUNTIME_DIR",
+			"XDG_CONFIG_HOME",
+			"XDG_CONFIG_DIRS",
+			"XDG_DATA_HOME",
+			"XDG_DATA_DIRS",
+			"DBUS_SESSION_BUS_ADDRESS",
+			"XDG_CURRENT_DESKTOP",
+			"DESKTOP_SESSION",
+			"BROWSER",
+		} {
+			allowed[name] = struct{}{}
+		}
+	case "windows":
+		for _, name := range []string{
+			"SYSTEMROOT",
+			"WINDIR",
+			"COMSPEC",
+			"PATHEXT",
+			"USERPROFILE",
+			"HOMEDRIVE",
+			"HOMEPATH",
+			"APPDATA",
+			"LOCALAPPDATA",
+		} {
+			allowed[name] = struct{}{}
+		}
+	}
+	blocked := make(map[string]struct{}, len(denied))
+	for _, name := range denied {
+		if name = strings.TrimSpace(name); name != "" {
+			blocked[strings.ToUpper(name)] = struct{}{}
+		}
+	}
+	result := make([]string, 0, len(allowed)+4)
+	for _, entry := range environment {
+		name, _, _ := strings.Cut(entry, "=")
+		upper := strings.ToUpper(name)
+		if _, denied := blocked[upper]; denied {
+			continue
+		}
+		if _, ok := allowed[upper]; ok {
+			result = append(result, entry)
+		}
+	}
+	return result
+}
+
+func openURLCommand(url string) (string, []string) {
+	switch runtime.GOOS {
+	case "darwin":
+		return "open", []string{url}
+	case "windows":
+		return "rundll32", []string{"url.dll,FileProtocolHandler", url}
+	case "linux":
+		return "xdg-open", []string{url}
+	default:
+		return "", nil
+	}
+}

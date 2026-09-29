@@ -1,0 +1,282 @@
+# doctor
+
+`crabbox doctor` runs a preflight before you commit to a long workflow. It is
+fast on a healthy machine, non-destructive, and never creates, mutates, or
+deletes provider resources. Bare `crabbox doctor` is also the pre-configuration
+local-readiness check: with no selected provider, doctor reports
+`source=compiled_default selected=false`, leaves the top-level JSON provider
+empty, and skips provider credential readiness with a warning. Run it before
+your first `crabbox run`, after rotating tokens or
+editing config, and as a sanity check in agent boot sequences or CI smoke jobs.
+
+```sh
+crabbox doctor
+crabbox doctor --provider aws
+crabbox doctor --provider hetzner --target linux
+crabbox doctor --provider xcp-ng --json
+crabbox doctor --provider hostinger
+crabbox doctor --provider ssh --target windows --windows-mode normal --static-host win-dev.local
+crabbox doctor --id swift-crab
+crabbox doctor --profile live-qa --id swift-crab
+crabbox doctor --from-run run_abcdef123456
+crabbox doctor --pond my-pond
+crabbox doctor --all --prepare-check
+crabbox doctor --json
+```
+
+`crabbox doctor --help` (or `-h`) shows these modes and the primary doctor flags
+before the complete provider flag reference. Help prints to stderr and exits
+successfully even when configuration is invalid; it does not run readiness checks or change
+configuration.
+
+## What it checks
+
+Doctor walks a sequence of checks, skipping any that do not apply to the
+selected provider, target, or context:
+
+```text
+config     writable config file exists and has safe permissions (expects 0600)
+provider-selection selected provider and its winning config source
+tools      provider-applicable local tools are present and executable
+remote     optional SSH/tool probe against a resolved lease (--id / --from-run)
+coord      coordinator URL is reachable and healthy (brokered providers)
+broker     signed token is valid and an identity resolves
+provider   provider readiness, with no mutation; broker secrets or a direct API probe
+admin      admin token can list the machine pool (only when an admin token is set)
+capacity   warns when the implicit default machine type is oversized for tests
+ssh-key    explicit SSH key path and matching .pub are readable
+pond       Tailscale policy row exists for a local pond (--pond)
+```
+
+### Local tools
+
+The tool list is derived from the provider's capabilities. `git` is always
+checked. Providers that use SSH add `ssh` and `ssh-keygen`; providers that
+rsync your checkout add `rsync`; providers that ship a local archive add `tar`.
+A missing tool prints `missing` and fails the run.
+
+### Provider readiness
+
+Provider readiness validates the selected provider without creating a lease.
+
+Doctor first prints `provider-selection` with the selected state and source:
+`compiled_default`, `user_config`, `repo_config`, `environment`, `flag`,
+`recorded_run`, or `lease_context`. If the only source is `compiled_default`,
+doctor explicitly says `no provider selected`, reports `selected=false`, and
+does not run provider-specific tool or credential readiness. This warning does not hide other
+failures: missing local tools, invalid coordinator authentication, unsafe config
+permissions, and other applicable checks still determine the exit status.
+Selecting the same provider explicitly is strict; for example,
+`crabbox doctor --provider hetzner` still fails when its credentials are absent.
+
+- When a coordinator is configured for a brokered provider (`aws`, `azure`,
+  `daytona`, `gcp`, `hetzner`), doctor asks the broker for secret readiness. It
+  reports missing coordinator secret names such as `AZURE_TENANT_ID` without
+  exposing secret values. For AWS, broker readiness can also include non-mutating
+  EC2 vCPU quota checks; low quotas print advisory `warning` lines and do not fail
+  the run.
+- Without a coordinator, providers that implement a direct doctor run their own
+  non-mutating check (cheapest list or readiness API). These print stable fields
+  such as `timeout=10s`, `api=list`, and `mutation=false` so scripts can tell
+  what was probed. Proxmox checks API auth, node status, storage, bridge,
+  template, next-id, and inventory endpoints separately so authenticated but
+  under-authorized API tokens produce actionable failed checks. Direct AWS also
+  checks EC2 vCPU quotas. GCP uses an aggregated Compute Engine inventory query
+  across zones. XCP-ng opens a XAPI
+  session and lists Crabbox-managed leases without creating, changing, or
+  deleting VMs. Hostinger lists VPS
+  inventory plus priced VPS catalog entries, payment methods, templates, and
+  data centers, then reports `purchase=explicit release=stop`; it does not
+  purchase, start, stop, delete, or cancel a VPS.
+  Firecracker validates the local Linux KVM contract instead of starting a
+  microVM: host OS, openable `/dev/kvm`, the configured Firecracker binary,
+  unset jailer, kernel/rootfs paths, CNI directories, and the named CNI config.
+  Unsupported hosts, configured jailer paths, missing assets, or missing CNI
+  configs fail with provider-specific checks such as `host`, `kvm`, `binary`,
+  `jailer`, `kernel`, `rootfs`, and `network`, all marked `mutation=false`.
+- Delegated providers run their own direct readiness check where available; for
+  example Cloudflare Containers validate the configured runner URL and bearer
+  token against the runner readiness API. Cloudflare Dynamic Workers validate
+  loader readiness, bearer auth, the Dynamic Workers loader binding, default
+  egress, and runtime compatibility metadata without creating a Dynamic Worker.
+  Cloudflare Sandbox validates the configured bridge URL, bridge health, and
+  OpenAPI document without creating a sandbox; when no bridge URL is configured
+  it exits clearly with the missing `cloudflareSandbox.url` /
+  `CRABBOX_CLOUDFLARE_SANDBOX_URL` requirement.
+  Blaxel validates the configured API URL, reports whether an API key and
+  workspace are configured, probes the Blaxel API, and lists inventory with
+  `mutation=false`.
+  Nomad validates the configured HTTP API address, optional env-only ACL token
+  source, `agent.self`, and configured region/namespace values with
+  `mutation=false`; ACL-disabled clusters may omit a token, and doctor does not
+  register jobs or execute allocations.
+  Vercel Sandbox checks the SDK bridge
+  contract, local `sandbox` CLI, read-only `sandbox list --all --limit 1`
+  auth/inventory access, project scoping readiness, and local `vsbx_...`
+  inventory without creating resources. Blacksmith Testbox reports runtime as
+  provider-hydrated because GitHub Actions hydration is owned by Testbox.
+- `provider=coder` runs only non-mutating Coder CLI checks: `coder version`,
+  `coder whoami -o json`, and workspace inventory. Missing login is reported as
+  `auth=missing_login` with `mutation=false`; doctor does not create, start,
+  stop, or delete Coder workspaces.
+- Providers with no direct doctor print `skip provider ... direct_doctor=unsupported`.
+
+For a static Windows WSL2 target, Doctor also reports `wsl2-sftp`. Without
+`--doctor-probe-ssh` the check is skipped with
+`runtime=unchecked transport=sftp_required mutation=false` and a rerun hint.
+With the flag, Doctor verifies shell access, performs an SFTP protocol
+handshake without filesystem operations, and then runs the WSL readiness
+command. A missing subsystem fails with instructions to enable
+`Subsystem sftp internal-sftp`, restart Windows `sshd`, and rerun the probe.
+Only OpenSSH's explicit subsystem-rejection diagnostic is reported as missing
+SFTP; disconnects and malformed protocol responses remain transport failures.
+This prerequisite probe does not qualify staged execution, its DefaultShell
+exit/stream behavior, or repair HOME ACLs. Execution preparation separately binds
+the observed `cmd.exe` or PowerShell shell to its route nonce; unknown shells
+fail closed. Unsafe existing staging permissions require operator quiescence
+before repair.
+
+The provider check is bounded to a 10s timeout. A failure adds a `class`
+(`timeout`, `tool`, `config`, `auth`, `permission`, `network`, or `provider`) and a
+remediation `hint`:
+
+```text
+failed  provider provider=gcp class=auth hint=check_gcp_project_credentials_and_compute_instances_list ...
+```
+
+### SSH key
+
+When `CRABBOX_SSH_KEY` is set, doctor validates the private key and its matching
+`.pub` file. When it is unset, doctor reports `ok ssh-key per-lease` because
+each lease generates its own key, so a global key is not required.
+
+### Remote probe (`--id`)
+
+`crabbox doctor --id <lease-id-or-slug>` resolves the lease and runs a short
+remote probe over SSH against the target host. The default probe reports remote
+`git`, `rsync`, `curl`, and `jq` versions. Native Windows targets use a
+Windows-specific probe. A failing remote probe exits `7`.
+
+### Profile prerequisites (`--profile` + `--id`)
+
+When `--profile <name> --id <lease>` selects a profile with `doctor.enabled:
+true`, doctor runs that profile's remote prerequisite contract instead of the
+generic probe. Profiles can require exact tool availability, a Node major
+version, a usable Docker daemon, Docker Compose v2, and a minimum free disk. A
+failing profile doctor reports `failed` lines for the missing prerequisites and
+exits nonzero without installing or changing anything. Profile doctor is not
+supported for native Windows targets (exits `2`).
+
+### From a recorded run (`--from-run`)
+
+`crabbox doctor --from-run <run-id>` is for triaging a recorded failure. Doctor
+fetches the run record and applies its provider, target, class, server type,
+lease, and phase before running diagnostics. This requires a configured
+coordinator (exits `2` otherwise). An explicit `--provider` remains the
+higher-precedence provider selection while the other recorded context is
+retained. Older run records may omit fields; doctor
+prints a `warning run` line with `missing=...` and skips checks that cannot be
+tied to the run, such as the remote probe when no lease ID was recorded.
+
+### Pond Tailscale policy (`--pond`)
+
+`crabbox doctor --pond <name>` verifies the Tailscale policy row for an existing
+local pond claim set. The check confirms that the concrete
+`tag:cbx-pond-<owner>-<pond>` tag is declared in `tagOwners` and is allowed to
+reach itself through either `grants` or legacy `acls`. It reads the policy only
+when the pond has at least one locally claimed Tailscale-capable member and
+`TS_API_KEY` is exported (`TS_TAILNET` selects the tailnet); otherwise it skips
+with a reason. Self-hosted control planes that do not expose the Tailscale
+policy API are skipped with a pointer to the manual snippet. Plain
+`crabbox doctor` never calls the Tailscale API. Verification needs only
+`TS_API_KEY`; automatic ACL edits also require `CRABBOX_POND_ACL_BOOTSTRAP=1`.
+
+### Provider matrix (`--all --prepare-check`)
+
+`crabbox doctor --all --prepare-check` checks the default test-runner provider
+matrix (`blacksmith-testbox,aws,azure,gcp`) and adds a `prepare` row for each
+provider. The prepare row reports the resolved class, machine type, and
+configured hydration workflow/job, without creating a lease. Use
+`--providers a,b,c` to override the matrix.
+
+For the full per-check breakdown of how each one decides between `ok`, `skip`,
+`warning`, and `failed`, see [Doctor checks](../features/doctor.md).
+
+## Output
+
+```text
+ok      config   ~/.config/crabbox/config.yaml permissions=0600
+ok      provider-selection provider=aws source=repo_config
+ok      git      /usr/bin/git
+ok      ssh      /usr/bin/ssh
+ok      ssh-keygen /usr/bin/ssh-keygen
+ok      rsync    /usr/bin/rsync
+ok      coord    https://broker.example.com access=none
+ok      broker   auth=user owner=alice@example.com org= default_type=
+ok      provider provider=aws coordinator_secrets=ready
+ok      ssh-key  per-lease
+```
+
+Failures swap the leading `ok` for `failed` (or `missing` for absent tools) and
+add a class plus remediation hint. AWS quota warnings are advisory: doctor still
+exits `0` unless another check fails.
+
+`--json` prints the same checks as a structured object with `ok`, `provider`,
+and `checks` fields. Each check includes `status`, `check`, `message`, and
+parsed `details` when available; the `provider-selection` details include
+`source`.
+
+Both output modes apply the same final diagnostic redaction to coordinator and
+provider messages and details. Configured credentials, authorization headers,
+credential-bearing URL components, common secret JSON fields, and private-key
+blocks render as `[redacted]`; non-secret routing and failure context remains.
+This protection covers Crabbox-generated diagnostics, not arbitrary output from
+the optional remote command probe.
+
+Exit codes:
+
+- `0` — no failures (skips and warnings do not change this).
+- `1` — at least one check failed.
+- `2` — `--from-run` without a coordinator, or profile doctor on a native
+  Windows target.
+- `7` — the remote SSH probe failed.
+
+## Flags
+
+```text
+--provider <name>             provider to validate strictly (defaults to configured selection)
+--profile <name>              configured profile for remote prerequisite checks
+--id <lease-id-or-slug>       resolve a lease and run a remote SSH/tool probe
+--from-run <run-id>           load provider/target/lease/phase context from a recorded run
+--pond <name>                 verify Tailscale policy setup for this pond
+--all                         check the provider test-runner matrix
+--providers <list>            comma-separated providers for --all
+--prepare-check               include test-preparation readiness checks
+--doctor-probe-ssh            probe static SSH reachability without leasing
+--json                        print JSON
+--target linux|macos|windows  target OS (affects which checks apply)
+--windows-mode normal|wsl2    when target=windows
+--static-host <host>          static SSH host (provider ssh)
+--static-user <user>          static SSH user override
+--static-port <port>          static SSH port override
+--static-work-root <path>     static target work root
+```
+
+Provider-specific flags (for example Azure Dynamic Sessions endpoint and pool)
+are also accepted; see the relevant provider docs.
+
+## Why it is safe to automate
+
+Doctor never provisions, never costs money, and never modifies state, so it is
+safe to run from `pre-commit`, scheduled jobs, and CI. Use it when triaging
+"Crabbox is broken" reports: it often catches the problem before the user has to
+describe it.
+
+Related docs:
+
+- [Doctor checks](../features/doctor.md)
+- [Configuration](../features/configuration.md)
+- [Auth and admin](../features/auth-admin.md)
+- [Network and reachability](../features/network.md)
+- [Pond](../features/pond.md)
+- [Troubleshooting](../troubleshooting.md)

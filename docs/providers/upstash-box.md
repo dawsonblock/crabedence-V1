@@ -1,0 +1,210 @@
+# Upstash Box Provider
+
+Read this when you:
+
+- choose `provider: upstash-box`;
+- configure the Upstash Box runtime, size, base-URL endpoint, or working
+  directory;
+- change `internal/providers/upstashbox`.
+
+[Upstash Box](https://upstash.com/docs/box/overall/quickstart) is a **delegated-run** provider. Crabbox calls the Upstash Box REST
+API to manage Box lifecycle (create, get, list, delete), upload files, and run
+commands over its exec / exec-stream endpoints. Upstash owns the sandbox state
+and process transport; Crabbox owns local config, repo claims, archive sync and
+guardrails, slugs, timing summaries, and the normalized `list`/`status` output.
+There is no SSH target.
+
+## When to use
+
+Use Upstash Box when commands should run in Upstash-managed ephemeral Linux
+sandboxes and you do not need a Crabbox SSH box. Reach for a provisioned SSH
+provider (AWS, Hetzner, Azure, GCP, static SSH) or another SSH-capable delegated
+provider instead when you need `crabbox ssh`, VNC, code-server, or Actions
+hydration — none of those surfaces exist on Upstash Box.
+
+## Prerequisites
+
+- Create an Upstash Box API key.
+- Export it as `UPSTASH_BOX_API_KEY` or `CRABBOX_UPSTASH_BOX_API_KEY`. Crabbox
+  never accepts the key as a command-line flag.
+
+## Auth
+
+Crabbox sends the API key as the `X-Box-Api-Key` request header. Provide it
+through the environment:
+
+```sh
+export UPSTASH_BOX_API_KEY=...
+# or
+export CRABBOX_UPSTASH_BOX_API_KEY=...
+```
+
+Crabbox redacts the configured API key from Upstash Box HTTP error bodies and
+exec-stream error events before displaying diagnostics.
+
+Rotate the key if it was ever pasted into a chat, shell history, issue, or log.
+
+## Commands
+
+```sh
+crabbox warmup --provider upstash-box --upstash-box-runtime node --upstash-box-size small
+crabbox run --provider upstash-box -- pnpm test
+crabbox run --provider upstash-box --id swift-crab --shell 'pnpm install && pnpm test'
+crabbox status --provider upstash-box --id swift-crab
+crabbox stop --provider upstash-box swift-crab
+```
+
+## Config
+
+```yaml
+provider: upstash-box
+target: linux
+upstashBox:
+  baseUrl: https://us-east-1.box.upstash.com
+  runtime: node
+  size: small
+  workdir: /workspace/home/crabbox
+  keepAlive: false
+```
+
+Provider flags:
+
+```text
+--upstash-box-base-url
+--upstash-box-runtime
+--upstash-box-size
+--upstash-box-workdir
+--upstash-box-keep-alive
+```
+
+Environment overrides:
+
+```text
+CRABBOX_UPSTASH_BOX_API_KEY / UPSTASH_BOX_API_KEY
+CRABBOX_UPSTASH_BOX_BASE_URL / UPSTASH_BOX_BASE_URL
+CRABBOX_UPSTASH_BOX_RUNTIME
+CRABBOX_UPSTASH_BOX_SIZE
+CRABBOX_UPSTASH_BOX_WORKDIR
+CRABBOX_UPSTASH_BOX_KEEP_ALIVE
+```
+
+Defaults: base URL `https://us-east-1.box.upstash.com`, runtime `node`, size
+`small`, workdir `/workspace/home/crabbox`, `keepAlive` false.
+
+Accepted values, validated before the API is called:
+
+- `runtime`: `node`, `python`, `golang`, `ruby`, `rust`, or the Alpine variants
+  `node-alpine`, `python-alpine`, `golang-alpine`, `ruby-alpine`,
+  `rust-alpine`.
+- `size`: `small`, `medium`, or `large`.
+
+## Lifecycle
+
+1. `warmup` / `run` without `--id` creates a Box named
+   `crabbox-<slug>-<lease-hex>` with the configured runtime and size, then waits
+   (up to 5 minutes) until the Box reports a ready status (`idle`, `running`,
+   `ready`, or `paused`). Crabbox stores a local claim with a normal `cbx_...`
+   lease ID and a friendly slug, bound to the exact Box ID and API endpoint.
+2. By default `run` archive-syncs the working tree: Git manifest → local
+   `tar -czf` → upload into the Box workspace as
+   `.crabbox-upstash-box-sync-*.tgz` → in-Box `tar -xzf` into the workdir
+   (the temp archive is removed afterward). The full archive is checked and built
+   before fresh allocation. With delete-sync enabled, extraction completes in a
+   sibling staging directory before replacing the existing workdir; failed upload
+   or extraction leaves the previous workspace intact. Temporary archive/staging
+   cleanup is attempted even after a partial upload or cancellation. Cleanup
+   failures warn without replacing the original sync outcome.
+3. The user command runs through the Box exec-stream endpoint wrapped in
+   `sh -c`, with the workspace folder set as the working directory, streaming
+   output back through Crabbox.
+4. One-shot Boxes are deleted after a `run` that did not pass `--keep`. `--keep`
+   retains the Box until `crabbox stop`; `--keep-on-failure` also retains it after
+   workspace setup, sync, command preparation, execution, or mandatory profile
+   cleanup fails. Reused Boxes are never automatically deleted.
+
+Run sequencing and finalization use the shared delegated-sandbox lifecycle.
+The adapter still owns Box identity and deletion authority, file-profile custody,
+workspace paths, uploads, and native command transport. Local configuration/auth
+validation precedes archive preparation; fresh archives are prepared before
+allocation, while reused archives are prepared after the Box is resolved.
+
+A failed Box deletion returns exit code 1 and a kept recovery session instead
+of a successful run. An earlier command or provider failure retains its exit code
+and status; later profile cleanup, Box deletion, and timing-write failures add
+diagnostics without replacing it. Failure retention is decided before timing
+output, so a failed timing writer cannot delete a Box already retained for a
+failed command. Profile-cleanup-only failures retain their documented code 5.
+
+Note: `warmup` always keeps the Box until an explicit `crabbox stop`. If you
+pass `--keep=false` to `warmup`, Crabbox prints a warning and still keeps it.
+
+Stream errors retain their cancellation or timeout cause for run status.
+Crabbox checks cancellation immediately before submitting the command, including
+after a successful environment upload; existing profile cleanup still runs.
+
+## Capabilities
+
+- SSH: no.
+- Crabbox sync: yes — archive sync through Box file upload + exec.
+- Run session: yes. `--lease-output` records the Box lease, reuse/retention
+  state, and the matching `crabbox stop` cleanup command.
+- Provider sync: no separate Upstash sync step.
+- Desktop / browser / code: no.
+- Actions hydration: no.
+- Coordinator (broker): no — Upstash Box always runs direct from the CLI.
+
+## Gotchas
+
+- IDs can be a Crabbox slug, a `cbx_...` lease ID, or a raw Upstash Box ID (when
+  that Box carries Crabbox naming, i.e. `crabbox-<slug>-<hex>`). Destructive
+  stop additionally requires the unchanged local claim to match the exact Box
+  ID and API endpoint; a matching Box name alone never grants deletion authority.
+- `--class` and `--type` are rejected; use `--upstash-box-size` and
+  `--upstash-box-runtime`.
+- `upstashBox.workdir` must resolve to an absolute path **under**
+  `/workspace/home/`. Broad or system roots — `/`, `/bin`, `/dev`, `/etc`,
+  `/home`, `/lib`, `/lib64`, `/opt`, `/proc`, `/root`, `/sbin`, `/sys`, `/tmp`,
+  `/usr`, `/var`, `/workspace`, and `/workspace/home` — are rejected before any
+  sync or command runs.
+- `--checksum` is rejected because Upstash Box has no SSH/rsync target.
+  Large-sync guardrails still apply; `--force-sync-large` is honored for
+  intentional large archive syncs.
+- Use `--sync-only` to pre-upload the archive into a kept Box before a later
+  command.
+- Delegated run/sync options that need an SSH target or proof surface are
+  rejected: `--script` / `--script-stdin`, `--fresh-pr`, `--full-resync`,
+  `--env-helper`, `--capture-stdout` / `--capture-stderr`, `--capture-on-fail`,
+  `--download`, `--artifact-glob`, `--require-artifact`, `--emit-proof`, and
+  `--stop-after`.
+- Forwarded environment values use a private local profile and a unique remote
+  profile under `/workspace/home`, uploaded through the normal multipart file
+  transport. The command sources it (`set -a`) in its existing shell; failed
+  sourcing stops the whole script, and an explicitly empty script is valid.
+  Values are never placed on the local process argv. Removal is attempted after
+  command completion or a failed/canceled upload, with a separate 15-second
+  budget. A cleanup-only failure is reported as exit code 5; cleanup diagnostics
+  do not replace an existing command exit or upload/cancellation error.
+- Profile upload/removal requires an unchanged Box ID, name, positive creation
+  timestamp, and the originally observed local claim (or continued absence of
+  one). Discovery-only runs remain supported without creating a claim. This
+  file-only receipt cannot authorize Box deletion. Changed/uncertain identity
+  refuses file mutation; it does not promise an atomic remote check-and-remove,
+  cancellation of a delayed server upload, or whole-run concurrency isolation.
+- `upstashBox.keepAlive` maps to the Box create `keep_alive` option. Crabbox
+  `--keep` independently controls whether a one-shot `run` deletes the Box
+  afterward.
+
+## Command interpretation
+
+Quoted and interpolated profile arguments remain literal through the source-only
+command transport. Unmarked single-string commands follow the shared shell-source
+inference, while explicit `--shell` remains source in the provider's existing
+shell. Literal argv retains terminal `exec`; Crabbox does not introduce another
+shell or a Bash dependency for this interpretation. Environment-profile and
+working-directory handling remain provider-specific.
+
+
+## Related docs
+
+- [Crabbox setup guide](https://upstash.com/docs/box/guides/crabbox-setup) — Upstash's walkthrough for running Crabbox on Upstash Box.
+- [Provider backends](../provider-backends.md)

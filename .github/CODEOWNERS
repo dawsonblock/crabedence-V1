@@ -1,0 +1,18 @@
+# Protected release workflow and trust policy.
+/.github/CODEOWNERS @dawsonblock
+/.github/release-allowed-signers @dawsonblock
+/.github/workflows/release-assets.yml @dawsonblock
+/.github/workflows/release-check.yml @dawsonblock
+/.github/workflows/release-qualification.yml @dawsonblock
+/.github/workflows/verify-homebrew.yml @dawsonblock
+/.mac-release.env @dawsonblock
+/.goreleaser.yaml @dawsonblock
+/release/records/ @dawsonblock
+/scripts/*release* @dawsonblock
+/scripts/*publish* @dawsonblock
+/scripts/codesign-* @dawsonblock
+/scripts/verify-go-install.sh @dawsonblock
+/scripts/verify-macos-* @dawsonblock
+
+# Every eventually executed Apple VM Mach-O shares this boundary.
+/internal/applevmhelper/ @dawsonblock

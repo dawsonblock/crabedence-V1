@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "nemo-crabedence-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Crabedence execution-port bridge for the NeMo Relay kernel."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+nemo-relay-executor = { workspace = true, features = ["unstable-hardening"] }
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+
+[dev-dependencies]
+# The shared effect-state vocabulary the kernel's classifier returns. Used by
+# tests to assert that a mapped error reaches the state Crabedence reached.
+nemo-relay-ledger = { workspace = true, features = ["unstable-hardening"] }

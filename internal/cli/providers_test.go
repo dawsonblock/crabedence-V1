@@ -1,0 +1,1890 @@
+package cli
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+)
+
+func recommendAliasForTest(t *testing.T, alias string) []providerRecommendationEntry {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	err := (App{Stdout: &stdout, Stderr: &stderr}).providers(context.Background(), []string{
+		"recommend", alias,
+		"--limit", "1",
+		"--json",
+	})
+	if err != nil {
+		t.Fatalf("providers recommend %s error=%v stderr=%q", alias, err, stderr.String())
+	}
+	var entries []providerRecommendationEntry
+	if err := json.Unmarshal(stdout.Bytes(), &entries); err != nil {
+		t.Fatalf("invalid json: %v\n%s", err, stdout.String())
+	}
+	return entries
+}
+
+func TestProviderMatrixIncludesCapabilities(t *testing.T) {
+	entries := providerMatrix()
+	var aws *providerMatrixEntry
+	var incus *providerMatrixEntry
+	var digitalOcean *providerMatrixEntry
+	var vultr *providerMatrixEntry
+	var firecracker *providerMatrixEntry
+	var vast *providerMatrixEntry
+	var nvidiaBrev *providerMatrixEntry
+	var linode *providerMatrixEntry
+	var nebius *providerMatrixEntry
+	var scaleway *providerMatrixEntry
+	var blacksmith *providerMatrixEntry
+	var e2b *providerMatrixEntry
+	var islo *providerMatrixEntry
+	var localContainer *providerMatrixEntry
+	var parallels *providerMatrixEntry
+	var moduleRuntime *providerMatrixEntry
+	for i := range entries {
+		if entries[i].Provider == "aws" {
+			aws = &entries[i]
+		}
+		if entries[i].Provider == "incus" {
+			incus = &entries[i]
+		}
+		if entries[i].Provider == "digitalocean" {
+			digitalOcean = &entries[i]
+		}
+		if entries[i].Provider == "vultr" {
+			vultr = &entries[i]
+		}
+		if entries[i].Provider == "firecracker" {
+			firecracker = &entries[i]
+		}
+		if entries[i].Provider == "vast" {
+			vast = &entries[i]
+		}
+		if entries[i].Provider == "nvidia-brev" {
+			nvidiaBrev = &entries[i]
+		}
+		if entries[i].Provider == "linode" {
+			linode = &entries[i]
+		}
+		if entries[i].Provider == "nebius" {
+			nebius = &entries[i]
+		}
+		if entries[i].Provider == "scaleway" {
+			scaleway = &entries[i]
+		}
+		if entries[i].Provider == "blacksmith-testbox" {
+			blacksmith = &entries[i]
+		}
+		if entries[i].Provider == "e2b" {
+			e2b = &entries[i]
+		}
+		if entries[i].Provider == "islo" {
+			islo = &entries[i]
+		}
+		if entries[i].Provider == "local-container" {
+			localContainer = &entries[i]
+		}
+		if entries[i].Provider == "parallels" {
+			parallels = &entries[i]
+		}
+		if entries[i].Provider == "module-runtime-test" {
+			moduleRuntime = &entries[i]
+		}
+	}
+	if aws == nil {
+		t.Fatal("aws provider not found")
+	}
+	if incus == nil {
+		t.Fatal("incus provider not found")
+	}
+	if digitalOcean == nil {
+		t.Fatal("digitalocean provider not found")
+	}
+	if vultr == nil {
+		t.Fatal("vultr provider not found")
+	}
+	if firecracker == nil {
+		t.Fatal("firecracker provider not found")
+	}
+	if len(firecracker.Classes) != 0 {
+		t.Fatalf("firecracker classes=%#v want omitted", firecracker.Classes)
+	}
+	encodedFirecracker, err := json.Marshal(firecracker)
+	if err != nil {
+		t.Fatalf("marshal firecracker matrix entry: %v", err)
+	}
+	if bytes.Contains(encodedFirecracker, []byte(`"classes"`)) {
+		t.Fatalf("firecracker JSON unexpectedly contains classes: %s", encodedFirecracker)
+	}
+	if !bytes.Contains(encodedFirecracker, []byte(`"classCatalog"`)) {
+		t.Fatalf("firecracker JSON missing classCatalog: %s", encodedFirecracker)
+	}
+	if vast == nil {
+		t.Fatal("vast provider not found")
+	}
+	if nvidiaBrev == nil {
+		t.Fatal("nvidia-brev provider not found")
+	}
+	if linode == nil {
+		t.Fatal("linode provider not found")
+	}
+	if nebius == nil {
+		t.Fatal("nebius provider not found")
+	}
+	if scaleway == nil {
+		t.Fatal("scaleway provider not found")
+	}
+	if blacksmith == nil {
+		t.Fatal("blacksmith-testbox provider not found")
+	}
+	if e2b == nil {
+		t.Fatal("e2b provider not found")
+	}
+	if islo == nil {
+		t.Fatal("islo provider not found")
+	}
+	if localContainer == nil {
+		t.Fatal("local-container provider not found")
+	}
+	if parallels == nil {
+		t.Fatal("parallels provider not found")
+	}
+	if aws.Kind != ProviderKindSSHLease {
+		t.Fatalf("aws kind=%q", aws.Kind)
+	}
+	if aws.Family != "aws" {
+		t.Fatalf("aws family=%q", aws.Family)
+	}
+	if aws.Category != "brokerable-cloud" {
+		t.Fatalf("aws category=%q", aws.Category)
+	}
+	if !containsString(aws.Targets, targetLinux) || !containsString(aws.Targets, targetMacOS) {
+		t.Fatalf("aws targets=%v", aws.Targets)
+	}
+	if !containsFeature(aws.Features, FeatureSSH) || !containsFeature(aws.Features, FeatureDesktop) {
+		t.Fatalf("aws features=%v", aws.Features)
+	}
+	for _, capability := range []string{"ssh-host", "interactive"} {
+		if !containsString(aws.Runtime, capability) {
+			t.Fatalf("aws runtime=%v missing %s", aws.Runtime, capability)
+		}
+	}
+	if !containsString(aws.Reachability, "ssh-tunnel") {
+		t.Fatalf("aws reachability=%v missing ssh-tunnel", aws.Reachability)
+	}
+	for _, capability := range []string{"coordinator-governed", "cleanup"} {
+		if !containsString(aws.Lifecycle, capability) {
+			t.Fatalf("aws lifecycle=%v missing %s", aws.Lifecycle, capability)
+		}
+	}
+	if incus.Kind != ProviderKindSSHLease || incus.Family != "local-vm" {
+		t.Fatalf("incus kind/family=%q/%q", incus.Kind, incus.Family)
+	}
+	if !containsString(incus.Targets, targetLinux) {
+		t.Fatalf("incus targets=%v", incus.Targets)
+	}
+	for _, feature := range []Feature{FeatureSSH, FeatureCrabboxSync, FeatureCleanup} {
+		if !containsFeature(incus.Features, feature) {
+			t.Fatalf("incus features=%v missing %s", incus.Features, feature)
+		}
+	}
+	if digitalOcean.Kind != ProviderKindSSHLease || digitalOcean.Family != "digitalocean" || digitalOcean.Coordinator != string(CoordinatorNever) {
+		t.Fatalf("digitalocean kind/family/coordinator=%q/%q/%q", digitalOcean.Kind, digitalOcean.Family, digitalOcean.Coordinator)
+	}
+	if !containsString(digitalOcean.Targets, targetLinux) {
+		t.Fatalf("digitalocean targets=%v", digitalOcean.Targets)
+	}
+	if vultr.Kind != ProviderKindSSHLease || vultr.Family != "vultr" || vultr.Coordinator != string(CoordinatorNever) {
+		t.Fatalf("vultr kind/family/coordinator=%q/%q/%q", vultr.Kind, vultr.Family, vultr.Coordinator)
+	}
+	if !containsString(vultr.Targets, targetLinux) {
+		t.Fatalf("vultr targets=%v", vultr.Targets)
+	}
+	for _, feature := range []Feature{FeatureSSH, FeatureCrabboxSync, FeatureCleanup} {
+		if !containsFeature(vultr.Features, feature) {
+			t.Fatalf("vultr features=%v missing %s", vultr.Features, feature)
+		}
+	}
+	if firecracker.Kind != ProviderKindSSHLease || firecracker.Family != "firecracker" || firecracker.Coordinator != string(CoordinatorNever) {
+		t.Fatalf("firecracker kind/family/coordinator=%q/%q/%q", firecracker.Kind, firecracker.Family, firecracker.Coordinator)
+	}
+	if !containsString(firecracker.Targets, targetLinux) {
+		t.Fatalf("firecracker targets=%v", firecracker.Targets)
+	}
+	for _, feature := range []Feature{FeatureSSH, FeatureCrabboxSync, FeatureCleanup} {
+		if !containsFeature(firecracker.Features, feature) {
+			t.Fatalf("firecracker features=%v missing %s", firecracker.Features, feature)
+		}
+	}
+	if len(firecracker.Aliases) != 0 {
+		t.Fatalf("firecracker aliases=%v, want none", firecracker.Aliases)
+	}
+	if linode.Kind != ProviderKindSSHLease || linode.Family != "linode" || linode.Coordinator != string(CoordinatorNever) {
+		t.Fatalf("linode kind/family/coordinator=%q/%q/%q", linode.Kind, linode.Family, linode.Coordinator)
+	}
+	if !containsString(linode.Targets, targetLinux) {
+		t.Fatalf("linode targets=%v", linode.Targets)
+	}
+	if nebius.Kind != ProviderKindSSHLease || nebius.Family != "nebius" || nebius.Coordinator != string(CoordinatorNever) {
+		t.Fatalf("nebius kind/family/coordinator=%q/%q/%q", nebius.Kind, nebius.Family, nebius.Coordinator)
+	}
+	if !containsString(nebius.Targets, targetLinux) {
+		t.Fatalf("nebius targets=%v", nebius.Targets)
+	}
+	if !containsFeature(nebius.Features, FeatureSSH) || !containsFeature(nebius.Features, FeatureCrabboxSync) || !containsFeature(nebius.Features, FeatureCleanup) {
+		t.Fatalf("nebius features=%v", nebius.Features)
+	}
+	if scaleway.Kind != ProviderKindSSHLease || scaleway.Family != "scaleway" || scaleway.Coordinator != string(CoordinatorNever) {
+		t.Fatalf("scaleway kind/family/coordinator=%q/%q/%q", scaleway.Kind, scaleway.Family, scaleway.Coordinator)
+	}
+	if !containsString(scaleway.Targets, targetLinux) {
+		t.Fatalf("scaleway targets=%v", scaleway.Targets)
+	}
+	for _, feature := range []Feature{FeatureSSH, FeatureCrabboxSync, FeatureCleanup, FeatureTailscale} {
+		if !containsFeature(scaleway.Features, feature) {
+			t.Fatalf("scaleway features=%v missing %s", scaleway.Features, feature)
+		}
+	}
+	for _, capability := range []string{"tailnet-peer", "ssh-tunnel"} {
+		if !containsString(scaleway.Reachability, capability) {
+			t.Fatalf("scaleway reachability=%v missing %s", scaleway.Reachability, capability)
+		}
+	}
+	if moduleRuntime == nil {
+		t.Fatal("module-runtime-test provider not found")
+	}
+	if moduleRuntime.Kind != ProviderKindDelegatedRun || !containsString(moduleRuntime.Targets, targetWorkerRuntime) {
+		t.Fatalf("module-runtime-test kind/targets=%q/%v", moduleRuntime.Kind, moduleRuntime.Targets)
+	}
+	if !containsFeature(moduleRuntime.Features, FeatureModuleRun) {
+		t.Fatalf("module-runtime-test features=%v missing %s", moduleRuntime.Features, FeatureModuleRun)
+	}
+	for _, capability := range []string{"delegated-command", "worker-module"} {
+		if !containsString(moduleRuntime.Runtime, capability) {
+			t.Fatalf("module-runtime-test runtime=%v missing %s", moduleRuntime.Runtime, capability)
+		}
+	}
+	if nvidiaBrev.Kind != ProviderKindSSHLease || nvidiaBrev.Family != "nvidia-brev" || nvidiaBrev.Coordinator != string(CoordinatorNever) {
+		t.Fatalf("nvidia-brev kind/family/coordinator=%q/%q/%q", nvidiaBrev.Kind, nvidiaBrev.Family, nvidiaBrev.Coordinator)
+	}
+	if !containsString(nvidiaBrev.Targets, targetLinux) {
+		t.Fatalf("nvidia-brev targets=%v", nvidiaBrev.Targets)
+	}
+	if !containsFeature(nvidiaBrev.Features, FeatureSSH) || !containsFeature(nvidiaBrev.Features, FeatureCrabboxSync) || !containsFeature(nvidiaBrev.Features, FeatureCleanup) {
+		t.Fatalf("nvidia-brev features=%v", nvidiaBrev.Features)
+	}
+	if !containsString(nvidiaBrev.Aliases, "brev") || !containsString(nvidiaBrev.Aliases, "nvidia") {
+		t.Fatalf("nvidia-brev aliases=%v", nvidiaBrev.Aliases)
+	}
+	if vast.Kind != ProviderKindSSHLease || vast.Family != "vast" || vast.Coordinator != string(CoordinatorNever) {
+		t.Fatalf("vast kind/family/coordinator=%q/%q/%q", vast.Kind, vast.Family, vast.Coordinator)
+	}
+	if !containsString(vast.Targets, targetLinux) {
+		t.Fatalf("vast targets=%v", vast.Targets)
+	}
+	if !containsFeature(vast.Features, FeatureSSH) || !containsFeature(vast.Features, FeatureCrabboxSync) || !containsFeature(vast.Features, FeatureCleanup) {
+		t.Fatalf("vast features=%v", vast.Features)
+	}
+	if !containsString(vast.Aliases, "vast-ai") || !containsString(vast.Aliases, "vastai") {
+		t.Fatalf("vast aliases=%v", vast.Aliases)
+	}
+	for _, capability := range []string{"local-runtime", "ssh-host"} {
+		if !containsString(localContainer.Runtime, capability) {
+			t.Fatalf("local-container runtime=%v missing %s", localContainer.Runtime, capability)
+		}
+	}
+	if !containsString(localContainer.Workspace, "checkpoint") || !containsString(localContainer.Workspace, "fork") {
+		t.Fatalf("local-container workspace=%v", localContainer.Workspace)
+	}
+	for _, capability := range []string{"cleanup", "workspace-state"} {
+		if !containsString(localContainer.Lifecycle, capability) {
+			t.Fatalf("local-container lifecycle=%v missing %s", localContainer.Lifecycle, capability)
+		}
+	}
+	for _, capability := range []string{"checkpoint", "fork", "restore", "snapshot-ref"} {
+		if !containsString(parallels.Workspace, capability) {
+			t.Fatalf("parallels workspace=%v missing %s", parallels.Workspace, capability)
+		}
+	}
+	for _, capability := range []string{"proof", "artifacts", "session"} {
+		if !containsString(blacksmith.Evidence, capability) {
+			t.Fatalf("blacksmith evidence=%v missing %s", blacksmith.Evidence, capability)
+		}
+	}
+	if !containsString(blacksmith.Lifecycle, "run-session") {
+		t.Fatalf("blacksmith lifecycle=%v missing run-session", blacksmith.Lifecycle)
+	}
+	for _, capability := range []string{"delegated-command", "ci-runner"} {
+		if !containsString(blacksmith.Runtime, capability) {
+			t.Fatalf("blacksmith runtime=%v missing %s", blacksmith.Runtime, capability)
+		}
+	}
+	for _, capability := range []string{"preview-url", "session"} {
+		if !containsString(e2b.Evidence, capability) {
+			t.Fatalf("e2b evidence=%v missing %s", e2b.Evidence, capability)
+		}
+	}
+	if !containsString(e2b.Lifecycle, "run-session") {
+		t.Fatalf("e2b lifecycle=%v missing run-session", e2b.Lifecycle)
+	}
+	if !containsString(e2b.Reachability, "provider-url") {
+		t.Fatalf("e2b reachability=%v missing provider-url", e2b.Reachability)
+	}
+	for _, capability := range []string{"delegated-command", "managed-sandbox"} {
+		if !containsString(e2b.Runtime, capability) {
+			t.Fatalf("e2b runtime=%v missing %s", e2b.Runtime, capability)
+		}
+	}
+	for _, capability := range []string{"downloads", "preview-url", "session"} {
+		if !containsString(islo.Evidence, capability) {
+			t.Fatalf("islo evidence=%v missing %s", islo.Evidence, capability)
+		}
+	}
+	for _, capability := range []string{"pause-resume", "run-session"} {
+		if !containsString(islo.Lifecycle, capability) {
+			t.Fatalf("islo lifecycle=%v missing %s", islo.Lifecycle, capability)
+		}
+	}
+	for _, capability := range []string{"tailnet-egress", "provider-url"} {
+		if !containsString(islo.Reachability, capability) {
+			t.Fatalf("islo reachability=%v missing %s", islo.Reachability, capability)
+		}
+	}
+}
+
+func TestProvidersCommandJSON(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	err := (App{Stdout: &stdout, Stderr: &stderr}).providers(context.Background(), []string{"--json"})
+	if err != nil {
+		t.Fatalf("providers --json error=%v stderr=%q", err, stderr.String())
+	}
+	var entries []providerMatrixEntry
+	if err := json.Unmarshal(stdout.Bytes(), &entries); err != nil {
+		t.Fatalf("invalid json: %v\n%s", err, stdout.String())
+	}
+	if len(entries) == 0 {
+		t.Fatal("empty providers json")
+	}
+	for _, entry := range entries {
+		if entry.Features == nil {
+			t.Fatalf("provider %s encoded nil features", entry.Provider)
+		}
+		if entry.Provider == "aws" && entry.Category != "brokerable-cloud" {
+			t.Fatalf("aws json category=%q", entry.Category)
+		}
+		if entry.Provider == "aws" && !containsString(entry.Runtime, "ssh-host") {
+			t.Fatalf("aws json missing ssh-host runtime: %#v", entry)
+		}
+		if entry.Provider == "aws" && !containsString(entry.Reachability, "ssh-tunnel") {
+			t.Fatalf("aws json missing ssh-tunnel reachability: %#v", entry)
+		}
+		if entry.Provider == "aws" && !containsString(entry.Lifecycle, "coordinator-governed") {
+			t.Fatalf("aws json missing coordinator-governed lifecycle: %#v", entry)
+		}
+		if entry.Provider == "parallels" && !containsString(entry.Workspace, "snapshot-ref") {
+			t.Fatalf("parallels json missing workspace snapshot-ref: %#v", entry)
+		}
+		if entry.Provider == "parallels" && !containsString(entry.Lifecycle, "workspace-state") {
+			t.Fatalf("parallels json missing workspace-state lifecycle: %#v", entry)
+		}
+		if entry.Provider == "blacksmith-testbox" && !containsString(entry.Evidence, "proof") {
+			t.Fatalf("blacksmith json missing evidence proof: %#v", entry)
+		}
+		if entry.Provider == "blacksmith-testbox" && !containsString(entry.Lifecycle, "run-session") {
+			t.Fatalf("blacksmith json missing run-session lifecycle: %#v", entry)
+		}
+	}
+}
+
+func TestProvidersCommandHumanOutput(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	err := (App{Stdout: &stdout, Stderr: &stderr}).providers(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("providers error=%v stderr=%q", err, stderr.String())
+	}
+	text := stdout.String()
+	for _, want := range []string{"aws\n", "  family: aws\n", "  kind: ssh-lease\n", "  category: brokerable-cloud\n", "  features: ", "  runtime: ssh-host,interactive\n", "  reachability: ssh-tunnel\n", "  lifecycle: coordinator-governed,cleanup\n"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("providers output missing %q:\n%s", want, text)
+		}
+	}
+	if !strings.Contains(text, "module-runtime-test\n") || !strings.Contains(text, "  targets: worker-runtime\n") || !strings.Contains(text, "  features: module-run\n") {
+		t.Fatalf("providers output missing module runtime contract:\n%s", text)
+	}
+	if !strings.Contains(text, "incus\n") {
+		t.Fatalf("providers output missing incus:\n%s", text)
+	}
+	if !strings.Contains(text, "parallels\n") || !strings.Contains(text, "  workspace: checkpoint,fork,restore,snapshot-ref\n") {
+		t.Fatalf("providers output missing workspace contract:\n%s", text)
+	}
+	if !strings.Contains(text, "parallels\n") || !strings.Contains(text, "  lifecycle: cleanup,workspace-state\n") {
+		t.Fatalf("providers output missing lifecycle contract:\n%s", text)
+	}
+	if !strings.Contains(text, "blacksmith-testbox\n") || !strings.Contains(text, "  evidence: proof,artifacts,session\n") {
+		t.Fatalf("providers output missing evidence contract:\n%s", text)
+	}
+	if !strings.Contains(text, "blacksmith-testbox\n") || !strings.Contains(text, "  lifecycle: run-session\n") {
+		t.Fatalf("providers output missing run-session lifecycle:\n%s", text)
+	}
+}
+
+func TestPrintProviderMatrixClasses(t *testing.T) {
+	var output bytes.Buffer
+	printProviderMatrix(&output, []providerMatrixEntry{{
+		Provider:    "example",
+		Family:      "example",
+		Kind:        ProviderKindSSHLease,
+		Targets:     []string{targetLinux},
+		Features:    FeatureSet{},
+		Coordinator: string(CoordinatorNever),
+		Classes: []ClassSpec{
+			{Class: "standard", Type: "shape-1", VCPUs: 4, MemoryGB: 8},
+			{Class: "fast", Type: "shape-2", VCPUs: 8},
+			{Class: "large", Type: "shape-3", MemoryGB: 32},
+			{Class: "beast", Type: "shape-4"},
+		},
+	}})
+	for _, want := range []string{
+		"  class standard: shape-1 (4 vCPU, 8 GB RAM)\n",
+		"  class fast: shape-2 (8 vCPU)\n",
+		"  class large: shape-3 (32 GB RAM)\n",
+		"  class beast: shape-4\n",
+	} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("provider matrix output missing %q:\n%s", want, output.String())
+		}
+	}
+}
+
+func TestClassSpecJSON(t *testing.T) {
+	tests := []struct {
+		name string
+		spec ClassSpec
+		want string
+	}{
+		{
+			name: "known shape",
+			spec: ClassSpec{Class: "standard", Type: "shape-1", VCPUs: 4, MemoryGB: 8},
+			want: `{"class":"standard","type":"shape-1","vcpu":4,"memoryGb":8}`,
+		},
+		{
+			name: "unknown shape",
+			spec: ClassSpec{Class: "standard", Type: "shape-1"},
+			want: `{"class":"standard","type":"shape-1"}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			encoded, err := json.Marshal(test.spec)
+			if err != nil {
+				t.Fatalf("marshal ClassSpec: %v", err)
+			}
+			if string(encoded) != test.want {
+				t.Fatalf("ClassSpec JSON=%s want %s", encoded, test.want)
+			}
+		})
+	}
+}
+
+func TestProviderClassMachineJSONUsesNullForUnknownShape(t *testing.T) {
+	machine := ProviderClassMachine{
+		Type:         "shape-1",
+		Architecture: ProviderClassArchitectureAMD64,
+	}
+	encoded, err := json.Marshal(machine)
+	if err != nil {
+		t.Fatalf("marshal ProviderClassMachine: %v", err)
+	}
+	want := `{"type":"shape-1","architecture":"amd64","vcpu":null,"memory":null}`
+	if string(encoded) != want {
+		t.Fatalf("ProviderClassMachine JSON=%s want %s", encoded, want)
+	}
+}
+
+func TestProviderClassCatalogJSONKeepsArrays(t *testing.T) {
+	catalog := ProviderClassCatalog{Disposition: ProviderClassDispositionUnmapped, Profiles: []ProviderClassProfile{}}
+	encoded, err := json.Marshal(catalog)
+	if err != nil {
+		t.Fatalf("marshal ProviderClassCatalog: %v", err)
+	}
+	if string(encoded) != `{"disposition":"unmapped","profiles":[]}` {
+		t.Fatalf("ProviderClassCatalog JSON=%s", encoded)
+	}
+}
+
+func TestProvidersCommandFiltersJSON(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	err := (App{Stdout: &stdout, Stderr: &stderr}).providers(context.Background(), []string{
+		"--kind", "delegated-run",
+		"--category", "delegated-sandbox",
+		"--target", "linux",
+		"--runtime", "managed-sandbox",
+		"--reachability", "provider-url",
+		"--evidence", "preview-url",
+		"--lifecycle", "run-session",
+		"--json",
+	})
+	if err != nil {
+		t.Fatalf("providers filtered --json error=%v stderr=%q", err, stderr.String())
+	}
+	var entries []providerMatrixEntry
+	if err := json.Unmarshal(stdout.Bytes(), &entries); err != nil {
+		t.Fatalf("invalid json: %v\n%s", err, stdout.String())
+	}
+	if len(entries) == 0 {
+		t.Fatal("expected delegated preview providers")
+	}
+	for _, entry := range entries {
+		if entry.Kind != ProviderKindDelegatedRun || entry.Category != "delegated-sandbox" || !containsString(entry.Targets, targetLinux) || !containsString(entry.Runtime, "managed-sandbox") || !containsString(entry.Reachability, "provider-url") || !containsString(entry.Evidence, "preview-url") || !containsString(entry.Lifecycle, "run-session") {
+			t.Fatalf("entry escaped filters: %#v", entry)
+		}
+	}
+}
+
+func TestProvidersCommandFiltersRequireAllCapabilities(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	err := (App{Stdout: &stdout, Stderr: &stderr}).providers(context.Background(), []string{
+		"--workspace", "checkpoint,fork",
+		"--lifecycle", "cleanup,workspace-state",
+	})
+	if err != nil {
+		t.Fatalf("providers workspace filter error=%v stderr=%q", err, stderr.String())
+	}
+	text := stdout.String()
+	if !strings.Contains(text, "local-container\n") {
+		t.Fatalf("workspace/lifecycle filter should include local-container:\n%s", text)
+	}
+	if !strings.Contains(text, "parallels\n") {
+		t.Fatalf("workspace/lifecycle filter should include parallels:\n%s", text)
+	}
+	if strings.Contains(text, "blacksmith-testbox\n") {
+		t.Fatalf("workspace/lifecycle filter should exclude providers without workspace capabilities:\n%s", text)
+	}
+}
+
+func TestProvidersCommandRejectsUnknownFilter(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	err := (App{Stdout: &stdout, Stderr: &stderr}).providers(context.Background(), []string{"--runtime", "microvm-fork"})
+	var exitErr ExitError
+	if !AsExitError(err, &exitErr) || exitErr.Code != 2 {
+		t.Fatalf("providers unknown filter error=%v stdout=%q stderr=%q", err, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(err.Error(), `unknown provider runtime filter "microvm-fork"`) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestProvidersCommandRejectsUnknownLifecycleFilter(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	err := (App{Stdout: &stdout, Stderr: &stderr}).providers(context.Background(), []string{"--lifecycle", "immortal"})
+	var exitErr ExitError
+	if !AsExitError(err, &exitErr) || exitErr.Code != 2 {
+		t.Fatalf("providers unknown lifecycle filter error=%v stdout=%q stderr=%q", err, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(err.Error(), `unknown provider lifecycle filter "immortal"`) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestProvidersFiltersCommandHumanOutput(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	err := (App{Stdout: &stdout, Stderr: &stderr}).providers(context.Background(), []string{"filters"})
+	if err != nil {
+		t.Fatalf("providers filters error=%v stderr=%q", err, stderr.String())
+	}
+	text := stdout.String()
+	for _, want := range []string{
+		"provider filter values:",
+		"  kind: ",
+		"delegated-run",
+		"  category: ",
+		"delegated-sandbox",
+		"  runtime: ",
+		"managed-sandbox",
+		"  reachability: ",
+		"provider-url",
+		"  evidence: ",
+		"preview-url",
+		"  lifecycle: ",
+		"run-session",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("providers filters output missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestProvidersFiltersCommandJSON(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	err := (App{Stdout: &stdout, Stderr: &stderr}).providers(context.Background(), []string{"filters", "--json"})
+	if err != nil {
+		t.Fatalf("providers filters --json error=%v stderr=%q", err, stderr.String())
+	}
+	var values providerFilterValuesEntry
+	if err := json.Unmarshal(stdout.Bytes(), &values); err != nil {
+		t.Fatalf("invalid json: %v\n%s", err, stdout.String())
+	}
+	for _, tc := range []struct {
+		name   string
+		values []string
+		want   string
+	}{
+		{name: "kind", values: values.Kind, want: "delegated-run"},
+		{name: "category", values: values.Category, want: "delegated-sandbox"},
+		{name: "runtime", values: values.Runtime, want: "managed-sandbox"},
+		{name: "reachability", values: values.Reachability, want: "provider-url"},
+		{name: "evidence", values: values.Evidence, want: "preview-url"},
+		{name: "workspace", values: values.Workspace, want: "fork"},
+		{name: "lifecycle", values: values.Lifecycle, want: "workspace-state"},
+	} {
+		if !containsString(tc.values, tc.want) {
+			t.Fatalf("%s values=%v missing %q", tc.name, tc.values, tc.want)
+		}
+	}
+}
+
+func TestProvidersFiltersRejectsArgs(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	err := (App{Stdout: &stdout, Stderr: &stderr}).providers(context.Background(), []string{"filters", "kind"})
+	var exitErr ExitError
+	if !AsExitError(err, &exitErr) || exitErr.Code != 2 {
+		t.Fatalf("providers filters arg error=%v stdout=%q stderr=%q", err, stdout.String(), stderr.String())
+	}
+}
+
+func TestProvidersRecommendListsUseCases(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	err := (App{Stdout: &stdout, Stderr: &stderr}).providers(context.Background(), []string{"recommend"})
+	if err != nil {
+		t.Fatalf("providers recommend error=%v stderr=%q", err, stderr.String())
+	}
+	text := stdout.String()
+	for _, want := range []string{
+		"provider recommendation use cases:",
+		"artifact-download",
+		"ci-proof",
+		"code-interpreter",
+		"cost-control",
+		"agent-sandbox",
+		"disposable-execution",
+		"fast-feedback",
+		"failure-diagnostics",
+		"fanout-testing",
+		"interactive-debug",
+		"isolated-execution",
+		"live-smoke",
+		"mcp-sandbox",
+		"network-isolation",
+		"offline-validation",
+		"pause-resume",
+		"preview-url",
+		"reachability",
+		"remote-dev",
+		"resource-observability",
+		"run-evidence",
+		"run-session",
+		"team-cloud",
+		"versioned-workspace",
+		"warm-start",
+		"web-app-smoke",
+		"worker-runtime",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("providers recommend output missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestProvidersRecommendArtifactDownloadPrefersArtifactProviders(t *testing.T) {
+	recommendations := recommendProvidersForUseCase(providerMatrix(), "artifact-download", 4)
+	if len(recommendations) == 0 {
+		t.Fatal("expected artifact-download recommendations")
+	}
+	found := map[string]bool{}
+	for _, recommendation := range recommendations {
+		hasArtifact := providerRecommendationHasFeature(recommendation.Features, FeatureRunArtifacts)
+		hasDownload := providerRecommendationHasFeature(recommendation.Features, FeatureRunDownloads)
+		if !hasArtifact && !hasDownload {
+			t.Fatalf("artifact-download recommendation lacks artifact/download capability: %#v", recommendation)
+		}
+		if hasArtifact && !containsString(recommendation.Evidence, "artifacts") {
+			t.Fatalf("artifact-download recommendation missing artifacts evidence: %#v", recommendation)
+		}
+		if hasDownload && !containsString(recommendation.Evidence, "downloads") {
+			t.Fatalf("artifact-download recommendation missing downloads evidence: %#v", recommendation)
+		}
+		found[recommendation.Provider] = true
+	}
+	for _, provider := range []string{"blacksmith-testbox", "islo"} {
+		if !found[provider] {
+			t.Fatalf("artifact-download recommendations should include %s: %#v", provider, recommendations)
+		}
+	}
+}
+
+func TestProvidersRecommendArtifactDownloadAlias(t *testing.T) {
+	entries := recommendAliasForTest(t, "run-artifacts")
+	if len(entries) != 1 || !providerRecommendationHasFeature(entries[0].Features, FeatureRunArtifacts) {
+		t.Fatalf("run-artifacts alias entries=%#v", entries)
+	}
+}
+
+func TestProvidersRecommendCodeInterpreterPrefersSandboxExecution(t *testing.T) {
+	recommendations := recommendProvidersForUseCase(providerMatrix(), "code-interpreter", 12)
+	if len(recommendations) == 0 {
+		t.Fatal("expected code-interpreter recommendations")
+	}
+	foundDelegatedSandbox := false
+	foundLocalSandbox := false
+	foundSession := false
+	foundSeededWorkload := false
+	foundOutputsOrPreview := false
+	for _, recommendation := range recommendations {
+		hasSession := providerRecommendationHasFeature(recommendation.Features, FeatureRunSession)
+		hasArchiveSync := providerRecommendationHasFeature(recommendation.Features, FeatureArchiveSync)
+		hasOutputsOrPreview := providerRecommendationHasFeature(recommendation.Features, FeatureRunDownloads) ||
+			providerRecommendationHasFeature(recommendation.Features, FeatureRunArtifacts) ||
+			providerRecommendationHasFeature(recommendation.Features, FeatureURLBridge)
+		hasMCPOrModule := providerRecommendationHasFeature(recommendation.Features, FeatureMCP) ||
+			providerRecommendationHasFeature(recommendation.Features, FeatureModuleRun)
+		if recommendation.Category != "delegated-sandbox" && recommendation.Category != "local-sandbox" {
+			t.Fatalf("code-interpreter recommendation escaped sandbox categories: %#v", recommendation)
+		}
+		if !hasSession && !hasArchiveSync && !hasOutputsOrPreview && !hasMCPOrModule {
+			t.Fatalf("code-interpreter recommendation lacks interpreter execution signal: %#v", recommendation)
+		}
+		foundDelegatedSandbox = foundDelegatedSandbox || recommendation.Category == "delegated-sandbox"
+		foundLocalSandbox = foundLocalSandbox || recommendation.Category == "local-sandbox"
+		foundSession = foundSession || hasSession
+		foundSeededWorkload = foundSeededWorkload || hasArchiveSync
+		foundOutputsOrPreview = foundOutputsOrPreview || hasOutputsOrPreview
+	}
+	if !foundDelegatedSandbox || !foundLocalSandbox || !foundSession || !foundSeededWorkload || !foundOutputsOrPreview {
+		t.Fatalf("code-interpreter should include delegated/local sandboxes, sessions, seeded workloads, and outputs/previews: %#v", recommendations)
+	}
+}
+
+func TestProvidersRecommendPythonSandboxAlias(t *testing.T) {
+	entries := recommendAliasForTest(t, "python-sandbox")
+	if len(entries) != 1 {
+		t.Fatalf("python-sandbox alias entries=%#v", entries)
+	}
+	if entries[0].Category != "delegated-sandbox" && entries[0].Category != "local-sandbox" {
+		t.Fatalf("python-sandbox alias should prefer sandbox providers: %#v", entries)
+	}
+}
+
+func TestProvidersRecommendCostControlPrefersReusableOrGovernedCapacity(t *testing.T) {
+	recommendations := recommendProvidersForUseCase(providerMatrix(), "cost-control", 64)
+	if len(recommendations) == 0 {
+		t.Fatal("expected cost-control recommendations")
+	}
+	if !strings.HasPrefix(recommendations[0].Category, "local-") {
+		t.Fatalf("top cost-control category=%q recommendations=%v", recommendations[0].Category, recommendations)
+	}
+	foundLocal := false
+	foundCoordinator := false
+	foundCleanup := false
+	for _, recommendation := range recommendations {
+		if strings.HasPrefix(recommendation.Category, "local-") {
+			foundLocal = true
+		}
+		if recommendation.Provider == "aws" || recommendation.Provider == "azure" ||
+			recommendation.Provider == "gcp" || recommendation.Provider == "hetzner" {
+			foundCoordinator = true
+		}
+		if providerRecommendationHasFeature(recommendation.Features, FeatureCleanup) {
+			foundCleanup = true
+		}
+	}
+	if !foundLocal {
+		t.Fatalf("cost-control recommendations should include local providers: %#v", recommendations)
+	}
+	if !foundCoordinator {
+		t.Fatalf("cost-control recommendations should include coordinator-governed cloud providers: %#v", recommendations)
+	}
+	if !foundCleanup {
+		t.Fatalf("cost-control recommendations should include cleanup-capable providers: %#v", recommendations)
+	}
+}
+
+func TestProvidersRecommendCostControlAlias(t *testing.T) {
+	entries := recommendAliasForTest(t, "budget")
+	if len(entries) != 1 || !strings.HasPrefix(entries[0].Category, "local-") {
+		t.Fatalf("budget alias entries=%#v", entries)
+	}
+}
+
+func TestProvidersRecommendDisposableExecutionRequiresCleanupSandboxes(t *testing.T) {
+	recommendations := recommendProvidersForUseCase(providerMatrix(), "disposable-execution", 12)
+	if len(recommendations) == 0 {
+		t.Fatal("expected disposable-execution recommendations")
+	}
+	foundDelegatedSandbox := false
+	foundSeededWorkload := false
+	foundSessionOrEvidence := false
+	for _, recommendation := range recommendations {
+		if recommendation.Category != "delegated-sandbox" && recommendation.Category != "local-sandbox" {
+			t.Fatalf("disposable-execution recommendation escaped sandbox categories: %#v", recommendation)
+		}
+		if !providerRecommendationHasFeature(recommendation.Features, FeatureCleanup) {
+			t.Fatalf("disposable-execution recommendation lacks cleanup feature: %#v", recommendation)
+		}
+		hasArchiveSync := providerRecommendationHasFeature(recommendation.Features, FeatureArchiveSync)
+		hasSessionOrEvidence := providerRecommendationHasFeature(recommendation.Features, FeatureRunSession) ||
+			providerRecommendationHasFeature(recommendation.Features, FeatureRunArtifacts) ||
+			providerRecommendationHasFeature(recommendation.Features, FeatureRunDownloads) ||
+			providerRecommendationHasFeature(recommendation.Features, FeatureURLBridge)
+		foundDelegatedSandbox = foundDelegatedSandbox || recommendation.Category == "delegated-sandbox"
+		foundSeededWorkload = foundSeededWorkload || hasArchiveSync
+		foundSessionOrEvidence = foundSessionOrEvidence || hasSessionOrEvidence
+	}
+	if !foundDelegatedSandbox || !foundSeededWorkload || !foundSessionOrEvidence {
+		t.Fatalf("disposable-execution should include delegated sandboxes, seeded workloads, and inspectable outputs: %#v", recommendations)
+	}
+}
+
+func TestProvidersRecommendEphemeralSandboxAlias(t *testing.T) {
+	entries := recommendAliasForTest(t, "ephemeral-sandbox")
+	if len(entries) != 1 {
+		t.Fatalf("ephemeral-sandbox alias entries=%#v", entries)
+	}
+	if entries[0].Category != "delegated-sandbox" && entries[0].Category != "local-sandbox" {
+		t.Fatalf("ephemeral-sandbox alias should prefer sandbox providers: %#v", entries)
+	}
+	if !providerRecommendationHasFeature(entries[0].Features, FeatureCleanup) {
+		t.Fatalf("ephemeral-sandbox alias should require cleanup: %#v", entries)
+	}
+}
+
+func TestProvidersRecommendOfflineValidationPrefersCredentiallessProviders(t *testing.T) {
+	recommendations := recommendProvidersForUseCase(providerMatrix(), "offline-validation", 16)
+	if len(recommendations) == 0 {
+		t.Fatal("expected offline-validation recommendations")
+	}
+	if !strings.HasPrefix(recommendations[0].Category, "local-") {
+		t.Fatalf("top offline-validation category=%q recommendations=%v", recommendations[0].Category, recommendations)
+	}
+	foundLocalRuntime := false
+	foundLocalSandbox := false
+	foundLocalVM := false
+	foundBYO := false
+	for _, recommendation := range recommendations {
+		switch {
+		case strings.HasPrefix(recommendation.Category, "local-"):
+			if recommendation.Category == "local-runtime" {
+				foundLocalRuntime = true
+			}
+			if recommendation.Category == "local-sandbox" {
+				foundLocalSandbox = true
+			}
+			if recommendation.Category == "local-vm" {
+				foundLocalVM = true
+			}
+		case recommendation.Category == "byo-ssh":
+			foundBYO = true
+		case recommendation.Category == "external-provider":
+		default:
+			t.Fatalf("offline-validation recommendation requires provider credentials: %#v", recommendation)
+		}
+	}
+	if !foundLocalRuntime || !foundLocalSandbox || !foundLocalVM {
+		t.Fatalf("offline-validation should include local runtime, sandbox, and VM providers: %#v", recommendations)
+	}
+	if !foundBYO {
+		t.Fatalf("offline-validation should include BYO SSH fallback: %#v", recommendations)
+	}
+}
+
+func TestProvidersRecommendNoCredentialsAlias(t *testing.T) {
+	entries := recommendAliasForTest(t, "no-credentials")
+	if len(entries) != 1 || !strings.HasPrefix(entries[0].Category, "local-") {
+		t.Fatalf("no-credentials alias entries=%#v", entries)
+	}
+}
+
+func TestProvidersRecommendFastFeedbackPrefersCacheVolumes(t *testing.T) {
+	recommendations := recommendProvidersForUseCase(providerMatrix(), "fast-feedback", 5)
+	if len(recommendations) == 0 {
+		t.Fatal("expected fast-feedback recommendations")
+	}
+	if !strings.HasPrefix(recommendations[0].Category, "local-") {
+		t.Fatalf("top fast-feedback category=%q recommendations=%v", recommendations[0].Category, recommendations)
+	}
+	if !providerRecommendationHasFeature(recommendations[0].Features, FeatureCacheVolume) {
+		t.Fatalf("top fast-feedback recommendation missing cache-volume feature: %#v", recommendations[0])
+	}
+	foundProofRunner := false
+	for _, recommendation := range recommendations {
+		if recommendation.Provider == "blacksmith-testbox" {
+			foundProofRunner = true
+		}
+		if !providerRecommendationHasFeature(recommendation.Features, FeatureCacheVolume) &&
+			!strings.HasPrefix(recommendation.Category, "local-") &&
+			recommendation.Category != "ci-proof-runner" {
+			t.Fatalf("fast-feedback recommendation lacks cache, local runtime, or proof-runner signal: %#v", recommendation)
+		}
+	}
+	if !foundProofRunner {
+		t.Fatalf("fast-feedback recommendations should include CI proof runners: %#v", recommendations)
+	}
+}
+
+func TestProvidersRecommendFailureDiagnosticsPrefersInspectableEvidence(t *testing.T) {
+	recommendations := recommendProvidersForUseCase(providerMatrix(), "failure-diagnostics", 8)
+	if len(recommendations) == 0 {
+		t.Fatal("expected failure-diagnostics recommendations")
+	}
+	if recommendations[0].Provider != "blacksmith-testbox" {
+		t.Fatalf("top failure-diagnostics provider=%q recommendations=%v", recommendations[0].Provider, recommendations)
+	}
+	foundProof := false
+	foundSession := false
+	foundDownload := false
+	foundPreview := false
+	foundSSHDebug := false
+	for _, recommendation := range recommendations {
+		hasProof := providerRecommendationHasFeature(recommendation.Features, FeatureRunProof)
+		hasSession := providerRecommendationHasFeature(recommendation.Features, FeatureRunSession)
+		hasArtifact := providerRecommendationHasFeature(recommendation.Features, FeatureRunArtifacts)
+		hasDownload := providerRecommendationHasFeature(recommendation.Features, FeatureRunDownloads)
+		hasPreview := providerRecommendationHasFeature(recommendation.Features, FeatureURLBridge)
+		hasSSHDebug := providerRecommendationHasFeature(recommendation.Features, FeatureSSH) &&
+			providerRecommendationHasFeature(recommendation.Features, FeatureCrabboxSync)
+		if !hasProof && !hasSession && !hasArtifact && !hasDownload && !hasPreview && !hasSSHDebug {
+			t.Fatalf("failure-diagnostics recommendation lacks diagnostic signal: %#v", recommendation)
+		}
+		foundProof = foundProof || hasProof
+		foundSession = foundSession || hasSession
+		foundDownload = foundDownload || hasDownload
+		foundPreview = foundPreview || hasPreview
+		foundSSHDebug = foundSSHDebug || hasSSHDebug
+	}
+	if !foundProof || !foundSession || !foundDownload || !foundPreview || !foundSSHDebug {
+		t.Fatalf("failure-diagnostics should include proof, session, download, preview, and SSH-debuggable providers: %#v", recommendations)
+	}
+}
+
+func TestProvidersRecommendWarmStartPrefersReusableState(t *testing.T) {
+	recommendations := recommendProvidersForUseCase(providerMatrix(), "warm-start", 12)
+	if len(recommendations) == 0 {
+		t.Fatal("expected warm-start recommendations")
+	}
+	if recommendations[0].Provider != "local-container" && recommendations[0].Provider != "parallels" {
+		t.Fatalf("top warm-start provider=%q recommendations=%v", recommendations[0].Provider, recommendations)
+	}
+	foundCache := false
+	foundSession := false
+	foundPause := false
+	foundWorkspaceState := false
+	foundLocalRuntime := false
+	for _, recommendation := range recommendations {
+		hasCache := providerRecommendationHasFeature(recommendation.Features, FeatureCacheVolume)
+		hasSession := providerRecommendationHasFeature(recommendation.Features, FeatureRunSession)
+		hasPause := providerRecommendationHasFeature(recommendation.Features, FeaturePauseResume)
+		hasWorkspaceState := providerRecommendationHasFeature(recommendation.Features, FeatureCheckpoint) ||
+			providerRecommendationHasFeature(recommendation.Features, FeatureFork) ||
+			providerRecommendationHasFeature(recommendation.Features, FeatureRestore) ||
+			providerRecommendationHasFeature(recommendation.Features, FeatureSnapshot)
+		hasLocalRuntime := strings.HasPrefix(recommendation.Category, "local-")
+		if !hasCache && !hasSession && !hasPause && !hasWorkspaceState && !hasLocalRuntime {
+			t.Fatalf("warm-start recommendation lacks warm-state signal: %#v", recommendation)
+		}
+		foundCache = foundCache || hasCache
+		foundSession = foundSession || hasSession
+		foundPause = foundPause || hasPause
+		foundWorkspaceState = foundWorkspaceState || hasWorkspaceState
+		foundLocalRuntime = foundLocalRuntime || hasLocalRuntime
+	}
+	if !foundCache || !foundSession || !foundPause || !foundWorkspaceState || !foundLocalRuntime {
+		t.Fatalf("warm-start should include cache, session, pause/resume, workspace-state, and local-runtime signals: %#v", recommendations)
+	}
+}
+
+func TestProvidersRecommendWarmPoolAlias(t *testing.T) {
+	entries := recommendAliasForTest(t, "warm-pool")
+	if len(entries) != 1 {
+		t.Fatalf("warm-pool alias entries=%#v", entries)
+	}
+	if entries[0].Provider != "local-container" && entries[0].Provider != "parallels" {
+		t.Fatalf("warm-pool alias should prefer local reusable state providers: %#v", entries)
+	}
+}
+
+func TestProvidersRecommendWebAppSmokeUsesReachableAppSurfaces(t *testing.T) {
+	recommendations := recommendProvidersForUseCase(providerMatrix(), "web-app-smoke", 16)
+	if len(recommendations) == 0 {
+		t.Fatal("expected web-app-smoke recommendations")
+	}
+	foundURLBridge := false
+	foundInteractive := false
+	foundSSHTunnel := false
+	foundTailnet := false
+	foundSessionOrEvidence := false
+	for _, recommendation := range recommendations {
+		capabilities := providerCapabilities(recommendation.Provider)
+		hasInteractive := providerRecommendationHasFeature(recommendation.Features, FeatureBrowser) ||
+			providerRecommendationHasFeature(recommendation.Features, FeatureCode) ||
+			providerRecommendationHasFeature(recommendation.Features, FeatureDesktop)
+		hasSessionOrEvidence := providerRecommendationHasFeature(recommendation.Features, FeatureRunSession) ||
+			providerRecommendationHasFeature(recommendation.Features, FeatureRunArtifacts) ||
+			providerRecommendationHasFeature(recommendation.Features, FeatureRunDownloads)
+		if !capabilities.URLBridge && !capabilities.SSHMesh && !capabilities.Tailscale &&
+			!capabilities.TailscaleEgress && !hasInteractive {
+			t.Fatalf("web-app-smoke recommendation lacks web access plane: %#v", recommendation)
+		}
+		foundURLBridge = foundURLBridge || capabilities.URLBridge
+		foundInteractive = foundInteractive || hasInteractive
+		foundSSHTunnel = foundSSHTunnel || capabilities.SSHMesh
+		foundTailnet = foundTailnet || capabilities.Tailscale || capabilities.TailscaleEgress
+		foundSessionOrEvidence = foundSessionOrEvidence || hasSessionOrEvidence
+	}
+	if !foundURLBridge || !foundInteractive || !foundSSHTunnel || !foundTailnet || !foundSessionOrEvidence {
+		t.Fatalf("web-app-smoke should include URL bridge, interactive, SSH/tunnel, tailnet, and session/evidence signals: %#v", recommendations)
+	}
+}
+
+func TestProvidersRecommendBrowserSmokeAlias(t *testing.T) {
+	entries := recommendAliasForTest(t, "browser-smoke")
+	if len(entries) != 1 {
+		t.Fatalf("browser-smoke alias entries=%#v", entries)
+	}
+	capabilities := providerCapabilities(entries[0].Provider)
+	hasInteractive := providerRecommendationHasFeature(entries[0].Features, FeatureBrowser) ||
+		providerRecommendationHasFeature(entries[0].Features, FeatureCode) ||
+		providerRecommendationHasFeature(entries[0].Features, FeatureDesktop)
+	if !capabilities.URLBridge && !capabilities.SSHMesh && !capabilities.Tailscale && !hasInteractive {
+		t.Fatalf("browser-smoke alias should prefer reachable app providers: %#v", entries)
+	}
+}
+
+func TestProvidersRecommendFailedRunAlias(t *testing.T) {
+	entries := recommendAliasForTest(t, "failed-run")
+	if len(entries) != 1 || entries[0].Provider != "blacksmith-testbox" {
+		t.Fatalf("failed-run alias entries=%#v", entries)
+	}
+}
+
+func TestProvidersRecommendInteractiveDebugSurfaces(t *testing.T) {
+	recommendations := recommendProvidersForUseCase(providerMatrix(), "interactive-debug", 16)
+	if len(recommendations) == 0 {
+		t.Fatal("expected interactive-debug recommendations")
+	}
+	foundSSH := false
+	foundInteractive := false
+	foundSession := false
+	foundURLBridge := false
+	foundEvidence := false
+	for _, recommendation := range recommendations {
+		hasSSHDebug := providerRecommendationHasFeature(recommendation.Features, FeatureSSH) &&
+			providerRecommendationHasFeature(recommendation.Features, FeatureCrabboxSync)
+		hasInteractive := providerRecommendationHasFeature(recommendation.Features, FeatureBrowser) ||
+			providerRecommendationHasFeature(recommendation.Features, FeatureCode) ||
+			providerRecommendationHasFeature(recommendation.Features, FeatureDesktop)
+		hasSession := providerRecommendationHasFeature(recommendation.Features, FeatureRunSession)
+		hasURLBridge := providerRecommendationHasFeature(recommendation.Features, FeatureURLBridge)
+		hasEvidence := providerRecommendationHasFeature(recommendation.Features, FeatureRunArtifacts) ||
+			providerRecommendationHasFeature(recommendation.Features, FeatureRunDownloads) ||
+			providerRecommendationHasFeature(recommendation.Features, FeatureRunProof)
+		if !hasSSHDebug && !hasInteractive && !hasSession && !hasURLBridge {
+			t.Fatalf("interactive-debug recommendation lacks debug surface: %#v", recommendation)
+		}
+		foundSSH = foundSSH || hasSSHDebug
+		foundInteractive = foundInteractive || hasInteractive
+		foundSession = foundSession || hasSession
+		foundURLBridge = foundURLBridge || hasURLBridge
+		foundEvidence = foundEvidence || hasEvidence
+	}
+	if !foundSSH || !foundInteractive || !foundSession || !foundURLBridge || !foundEvidence {
+		t.Fatalf("interactive-debug should include SSH, interactive, session, URL bridge, and evidence signals: %#v", recommendations)
+	}
+}
+
+func TestProvidersRecommendLiveDebugAlias(t *testing.T) {
+	entries := recommendAliasForTest(t, "live-debug")
+	if len(entries) != 1 {
+		t.Fatalf("live-debug alias entries=%#v", entries)
+	}
+	hasSSHDebug := providerRecommendationHasFeature(entries[0].Features, FeatureSSH) &&
+		providerRecommendationHasFeature(entries[0].Features, FeatureCrabboxSync)
+	hasInteractive := providerRecommendationHasFeature(entries[0].Features, FeatureBrowser) ||
+		providerRecommendationHasFeature(entries[0].Features, FeatureCode) ||
+		providerRecommendationHasFeature(entries[0].Features, FeatureDesktop)
+	if !hasSSHDebug && !hasInteractive && !providerRecommendationHasFeature(entries[0].Features, FeatureRunSession) {
+		t.Fatalf("live-debug alias should prefer live inspection providers: %#v", entries)
+	}
+}
+
+func TestProvidersRecommendFanoutTestingRequiresForkableWorkspaces(t *testing.T) {
+	recommendations := recommendProvidersForUseCase(providerMatrix(), "fanout-testing", 8)
+	if len(recommendations) == 0 {
+		t.Fatal("expected fanout-testing recommendations")
+	}
+	if recommendations[0].Provider != "parallels" {
+		t.Fatalf("top fanout-testing provider=%q recommendations=%v", recommendations[0].Provider, recommendations)
+	}
+	foundLocalContainer := false
+	for _, recommendation := range recommendations {
+		if !providerRecommendationHasFeature(recommendation.Features, FeatureFork) {
+			t.Fatalf("fanout-testing recommendation lacks fork feature: %#v", recommendation)
+		}
+		if !containsString(recommendation.Workspace, "fork") {
+			t.Fatalf("fanout-testing recommendation missing fork workspace capability: %#v", recommendation)
+		}
+		if recommendation.Provider == "local-container" {
+			foundLocalContainer = true
+		}
+	}
+	if !foundLocalContainer {
+		t.Fatalf("fanout-testing recommendations should include local-container: %#v", recommendations)
+	}
+}
+
+func TestProvidersRecommendBestOfNAlias(t *testing.T) {
+	entries := recommendAliasForTest(t, "best-of-n")
+	if len(entries) != 1 || !providerRecommendationHasFeature(entries[0].Features, FeatureFork) {
+		t.Fatalf("best-of-n alias entries=%#v", entries)
+	}
+}
+
+func TestProvidersRecommendRunEvidence(t *testing.T) {
+	recommendations := recommendProvidersForUseCase(providerMatrix(), "run-evidence", 5)
+	if len(recommendations) == 0 {
+		t.Fatal("expected run-evidence recommendations")
+	}
+	if recommendations[0].Provider != "blacksmith-testbox" {
+		t.Fatalf("top run-evidence provider=%q recommendations=%v", recommendations[0].Provider, recommendations)
+	}
+	for _, capability := range []string{"proof", "artifacts", "session"} {
+		if !containsString(recommendations[0].Evidence, capability) {
+			t.Fatalf("top recommendation evidence=%v missing %s", recommendations[0].Evidence, capability)
+		}
+	}
+	for _, recommendation := range recommendations {
+		if len(recommendation.Evidence) == 0 {
+			t.Fatalf("run-evidence recommendation lacks evidence capabilities: %#v", recommendation)
+		}
+		if recommendation.Provider == "wandb" {
+			t.Fatalf("run-evidence should not recommend session-only providers: %#v", recommendation)
+		}
+	}
+}
+
+func TestProvidersRecommendResourceObservability(t *testing.T) {
+	recommendations := recommendProvidersForUseCase(providerMatrix(), "resource-observability", 16)
+	if len(recommendations) == 0 {
+		t.Fatal("expected resource-observability recommendations")
+	}
+	foundCoordinator := false
+	foundSSHTelemetry := false
+	foundRunSession := false
+	foundRunEvidence := false
+	for _, recommendation := range recommendations {
+		hasCoordinator := recommendation.Provider == "aws" || recommendation.Provider == "azure" ||
+			recommendation.Provider == "gcp" || recommendation.Provider == "hetzner"
+		hasSSHTelemetry := providerRecommendationHasFeature(recommendation.Features, FeatureSSH) &&
+			providerRecommendationHasFeature(recommendation.Features, FeatureCrabboxSync)
+		hasRunEvidence := providerRecommendationHasFeature(recommendation.Features, FeatureRunProof) ||
+			providerRecommendationHasFeature(recommendation.Features, FeatureRunArtifacts) ||
+			providerRecommendationHasFeature(recommendation.Features, FeatureRunDownloads) ||
+			providerRecommendationHasFeature(recommendation.Features, FeatureURLBridge)
+		hasRunSession := providerRecommendationHasFeature(recommendation.Features, FeatureRunSession)
+		if !hasCoordinator && !hasSSHTelemetry && !hasRunEvidence && !hasRunSession {
+			t.Fatalf("resource-observability recommendation lacks telemetry or evidence signal: %#v", recommendation)
+		}
+		foundCoordinator = foundCoordinator || hasCoordinator
+		foundSSHTelemetry = foundSSHTelemetry || hasSSHTelemetry
+		foundRunSession = foundRunSession || hasRunSession
+		foundRunEvidence = foundRunEvidence || hasRunEvidence
+	}
+	if !foundCoordinator || !foundSSHTelemetry || !foundRunSession || !foundRunEvidence {
+		t.Fatalf("resource-observability should include coordinator, SSH telemetry, run-session, and run-evidence providers: %#v", recommendations)
+	}
+}
+
+func TestProvidersRecommendTelemetryAlias(t *testing.T) {
+	entries := recommendAliasForTest(t, "telemetry")
+	if len(entries) != 1 {
+		t.Fatalf("telemetry alias entries=%#v", entries)
+	}
+	if entries[0].Provider != "aws" && entries[0].Provider != "azure" &&
+		entries[0].Provider != "gcp" && entries[0].Provider != "hetzner" {
+		t.Fatalf("telemetry alias should prefer coordinator-backed SSH providers: %#v", entries)
+	}
+}
+
+func TestProvidersRecommendRunSessionPrefersInspectableRuns(t *testing.T) {
+	recommendations := recommendProvidersForUseCase(providerMatrix(), "run-session", 8)
+	if len(recommendations) == 0 {
+		t.Fatal("expected run-session recommendations")
+	}
+	foundProof := false
+	foundPreview := false
+	foundWorker := false
+	for _, recommendation := range recommendations {
+		if !providerRecommendationHasFeature(recommendation.Features, FeatureRunSession) {
+			t.Fatalf("run-session recommendation lacks run-session feature: %#v", recommendation)
+		}
+		if !containsString(recommendation.Evidence, "session") {
+			t.Fatalf("run-session recommendation lacks session evidence: %#v", recommendation)
+		}
+		if providerRecommendationHasFeature(recommendation.Features, FeatureRunProof) {
+			foundProof = true
+		}
+		if providerRecommendationHasFeature(recommendation.Features, FeatureURLBridge) {
+			foundPreview = true
+		}
+		if providerRecommendationHasString(recommendation.Targets, targetWorkerRuntime) {
+			foundWorker = true
+		}
+	}
+	if !foundProof {
+		t.Fatalf("run-session recommendations should include proof-capable sessions: %#v", recommendations)
+	}
+	if !foundPreview {
+		t.Fatalf("run-session recommendations should include preview-capable sessions: %#v", recommendations)
+	}
+	if !foundWorker {
+		t.Fatalf("run-session recommendations should include worker runtime sessions: %#v", recommendations)
+	}
+}
+
+func TestProvidersRecommendRunSessionAlias(t *testing.T) {
+	entries := recommendAliasForTest(t, "inspectable-run")
+	if len(entries) != 1 || !providerRecommendationHasFeature(entries[0].Features, FeatureRunSession) {
+		t.Fatalf("inspectable-run alias entries=%#v", entries)
+	}
+}
+
+func TestProvidersRecommendReachabilityUsesTransportCapabilities(t *testing.T) {
+	recommendations := recommendProvidersForUseCase(providerMatrix(), "reachability", 12)
+	if len(recommendations) == 0 {
+		t.Fatal("expected reachability recommendations")
+	}
+	top := providerCapabilities(recommendations[0].Provider)
+	if !top.Tailscale && !top.URLBridge && !top.SSHMesh {
+		t.Fatalf("top reachability recommendation lacks transport capabilities: %#v", recommendations[0])
+	}
+	foundTailnet := false
+	foundURLBridge := false
+	for _, recommendation := range recommendations {
+		capabilities := providerCapabilities(recommendation.Provider)
+		if capabilities.Tailscale {
+			foundTailnet = true
+		}
+		if capabilities.URLBridge {
+			foundURLBridge = true
+		}
+		if !capabilities.Tailscale && !capabilities.TailscaleEgress && !capabilities.URLBridge && !capabilities.SSHMesh {
+			t.Fatalf("reachability recommendation lacks any transport plane: %#v", recommendation)
+		}
+		if len(recommendation.Reachability) == 0 {
+			t.Fatalf("reachability recommendation missing normalized reachability capabilities: %#v", recommendation)
+		}
+	}
+	if !foundTailnet {
+		t.Fatalf("reachability recommendations should include tailnet peer providers: %#v", recommendations)
+	}
+	if !foundURLBridge {
+		t.Fatalf("reachability recommendations should include URL bridge providers: %#v", recommendations)
+	}
+}
+
+func TestProvidersRecommendIsolatedExecutionPrefersDelegatedSandboxes(t *testing.T) {
+	recommendations := recommendProvidersForUseCase(providerMatrix(), "isolated-execution", 8)
+	if len(recommendations) == 0 {
+		t.Fatal("expected isolated-execution recommendations")
+	}
+	if recommendations[0].Kind != ProviderKindDelegatedRun {
+		t.Fatalf("top isolated-execution kind=%q recommendations=%v", recommendations[0].Kind, recommendations)
+	}
+	if recommendations[0].Category != "delegated-sandbox" && recommendations[0].Category != "local-sandbox" {
+		t.Fatalf("top isolated-execution category=%q recommendations=%v", recommendations[0].Category, recommendations)
+	}
+	for _, recommendation := range recommendations {
+		if recommendation.Category != "delegated-sandbox" && recommendation.Category != "local-sandbox" {
+			t.Fatalf("isolated-execution recommendation escaped sandbox categories: %#v", recommendation)
+		}
+	}
+}
+
+func TestProvidersRecommendIsolatedExecutionIncludesLocalSandboxes(t *testing.T) {
+	recommendations := recommendProvidersForUseCase(providerMatrix(), "isolated-execution", 64)
+	if len(recommendations) == 0 {
+		t.Fatal("expected isolated-execution recommendations")
+	}
+	foundLocalSandbox := false
+	foundDelegatedSandbox := false
+	for _, recommendation := range recommendations {
+		switch recommendation.Category {
+		case "local-sandbox":
+			foundLocalSandbox = true
+		case "delegated-sandbox":
+			foundDelegatedSandbox = true
+		}
+	}
+	if !foundLocalSandbox {
+		t.Fatalf("isolated-execution recommendations should include local sandbox providers: %#v", recommendations)
+	}
+	if !foundDelegatedSandbox {
+		t.Fatalf("isolated-execution recommendations should include delegated sandbox providers: %#v", recommendations)
+	}
+}
+
+func TestProvidersRecommendIsolatedExecutionAlias(t *testing.T) {
+	entries := recommendAliasForTest(t, "secure-sandbox")
+	if len(entries) != 1 || entries[0].Kind != ProviderKindDelegatedRun {
+		t.Fatalf("secure-sandbox alias entries=%#v", entries)
+	}
+}
+
+func TestProvidersRecommendNetworkIsolationPrefersSandboxBoundaries(t *testing.T) {
+	recommendations := recommendProvidersForUseCase(providerMatrix(), "network-isolation", 64)
+	if len(recommendations) == 0 {
+		t.Fatal("expected network-isolation recommendations")
+	}
+	foundLocalSandbox := false
+	foundDelegatedSandbox := false
+	for _, recommendation := range recommendations {
+		switch recommendation.Category {
+		case "delegated-sandbox":
+			foundDelegatedSandbox = true
+		case "local-sandbox":
+			foundLocalSandbox = true
+		default:
+			t.Fatalf("network-isolation recommendation escaped sandbox categories: %#v", recommendation)
+		}
+	}
+	if !foundDelegatedSandbox {
+		t.Fatalf("network-isolation recommendations should include delegated sandboxes: %#v", recommendations)
+	}
+	if !foundLocalSandbox {
+		t.Fatalf("network-isolation recommendations should include local sandboxes: %#v", recommendations)
+	}
+}
+
+func TestProvidersRecommendNetworkIsolationAlias(t *testing.T) {
+	entries := recommendAliasForTest(t, "egress-control")
+	if len(entries) != 1 || entries[0].Category != "delegated-sandbox" {
+		t.Fatalf("egress-control alias entries=%#v", entries)
+	}
+}
+
+func TestProvidersRecommendTeamCloudPrefersBrokerableProviders(t *testing.T) {
+	recommendations := recommendProvidersForUseCase(providerMatrix(), "team-cloud", 4)
+	if len(recommendations) == 0 {
+		t.Fatal("expected team-cloud recommendations")
+	}
+	for _, recommendation := range recommendations {
+		if recommendation.Category != "brokerable-cloud" {
+			t.Fatalf("team-cloud top recommendations should be brokerable cloud providers: %#v", recommendations)
+		}
+		if recommendation.Kind != ProviderKindSSHLease {
+			t.Fatalf("team-cloud recommendation should be SSH lease: %#v", recommendation)
+		}
+		if !providerRecommendationHasFeature(recommendation.Features, FeatureCleanup) {
+			t.Fatalf("team-cloud recommendation missing cleanup feature: %#v", recommendation)
+		}
+		if !providerRecommendationHasFeature(recommendation.Features, FeatureCrabboxSync) {
+			t.Fatalf("team-cloud recommendation missing crabbox-sync feature: %#v", recommendation)
+		}
+	}
+}
+
+func TestProvidersRecommendTeamCloudAlias(t *testing.T) {
+	entries := recommendAliasForTest(t, "brokered-cloud")
+	if len(entries) != 1 || entries[0].Category != "brokerable-cloud" {
+		t.Fatalf("brokered-cloud alias entries=%#v", entries)
+	}
+}
+
+func TestProvidersRecommendVersionedWorkspace(t *testing.T) {
+	recommendations := recommendProvidersForUseCase(providerMatrix(), "versioned-workspace", 3)
+	if len(recommendations) == 0 {
+		t.Fatal("expected versioned-workspace recommendations")
+	}
+	if recommendations[0].Provider != "parallels" {
+		t.Fatalf("top versioned-workspace provider=%q recommendations=%v", recommendations[0].Provider, recommendations)
+	}
+	for _, capability := range []string{"checkpoint", "fork", "restore", "snapshot-ref"} {
+		if !containsString(recommendations[0].Workspace, capability) {
+			t.Fatalf("top recommendation workspace=%v missing %s", recommendations[0].Workspace, capability)
+		}
+	}
+	for _, recommendation := range recommendations {
+		if len(recommendation.Workspace) == 0 {
+			t.Fatalf("versioned-workspace recommendation lacks workspace capabilities: %#v", recommendation)
+		}
+	}
+}
+
+func TestProvidersRecommendForkableWorkspaceAlias(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	err := (App{Stdout: &stdout, Stderr: &stderr}).providers(context.Background(), []string{
+		"recommend", "forkable-workspace",
+		"--workspace", "fork",
+		"--limit", "1",
+		"--json",
+	})
+	if err != nil {
+		t.Fatalf("providers recommend forkable-workspace error=%v stderr=%q", err, stderr.String())
+	}
+	var entries []providerRecommendationEntry
+	if err := json.Unmarshal(stdout.Bytes(), &entries); err != nil {
+		t.Fatalf("invalid json: %v\n%s", err, stdout.String())
+	}
+	if len(entries) != 1 {
+		t.Fatalf("entry count=%d entries=%#v", len(entries), entries)
+	}
+	if !containsString(entries[0].Workspace, "fork") {
+		t.Fatalf("forkable-workspace alias entry missing fork workspace capability: %#v", entries[0])
+	}
+}
+
+func TestProvidersRecommendWorkspaceReuseAlias(t *testing.T) {
+	entries := recommendAliasForTest(t, "workspace-reuse")
+	if len(entries) != 1 {
+		t.Fatalf("entry count=%d entries=%#v", len(entries), entries)
+	}
+	if len(entries[0].Workspace) == 0 {
+		t.Fatalf("workspace-reuse alias entry missing workspace capabilities: %#v", entries[0])
+	}
+}
+
+func TestProvidersRecommendMCPSandbox(t *testing.T) {
+	recommendations := recommendProvidersForUseCase(providerMatrix(), "mcp-sandbox", 5)
+	if len(recommendations) == 0 {
+		t.Fatal("expected mcp-sandbox recommendations")
+	}
+	if recommendations[0].Provider != "docker-sandbox" {
+		t.Fatalf("top mcp-sandbox provider=%q recommendations=%v", recommendations[0].Provider, recommendations)
+	}
+	for _, recommendation := range recommendations {
+		if !providerRecommendationHasFeature(recommendation.Features, FeatureMCP) {
+			t.Fatalf("mcp-sandbox recommendation lacks MCP attachments feature: %#v", recommendation)
+		}
+	}
+}
+
+func TestProvidersRecommendMCPSandboxAlias(t *testing.T) {
+	entries := recommendAliasForTest(t, "mcp")
+	if len(entries) != 1 || !providerRecommendationHasFeature(entries[0].Features, FeatureMCP) {
+		t.Fatalf("mcp alias entries=%#v", entries)
+	}
+}
+
+func TestProvidersRecommendRemoteDevPrefersManagedDevEnvironments(t *testing.T) {
+	recommendations := recommendProvidersForUseCase(providerMatrix(), "remote-dev", 3)
+	if len(recommendations) == 0 {
+		t.Fatal("expected remote-dev recommendations")
+	}
+	found := map[string]bool{}
+	for _, recommendation := range recommendations {
+		if !providerRecommendationHasFeature(recommendation.Features, FeatureCrabboxSync) &&
+			!providerRecommendationHasFeature(recommendation.Features, FeatureArchiveSync) {
+			t.Fatalf("remote-dev recommendation cannot sync workspace: %#v", recommendation)
+		}
+		found[recommendation.Provider] = true
+	}
+	for _, provider := range []string{"daytona", "morph", "namespace-devbox"} {
+		if !found[provider] {
+			t.Fatalf("remote-dev recommendations should include %s: %#v", provider, recommendations)
+		}
+	}
+}
+
+func TestSealosDevboxIsRemoteDevProvider(t *testing.T) {
+	if !isRemoteDevProvider("sealos-devbox") {
+		t.Fatal("sealos-devbox should advertise the remote-dev runtime capability")
+	}
+}
+
+func TestProvidersRecommendRemoteDevAlias(t *testing.T) {
+	entries := recommendAliasForTest(t, "codespaces")
+	if len(entries) != 1 || !isRemoteDevProvider(entries[0].Provider) {
+		t.Fatalf("codespaces alias entries=%#v", entries)
+	}
+}
+
+func TestProvidersRecommendPreviewURLPrefersURLBridgeProviders(t *testing.T) {
+	recommendations := recommendProvidersForUseCase(providerMatrix(), "preview-url", 3)
+	if len(recommendations) == 0 {
+		t.Fatal("expected preview-url recommendations")
+	}
+	found := map[string]bool{}
+	for _, recommendation := range recommendations {
+		if !providerRecommendationHasFeature(recommendation.Features, FeatureURLBridge) {
+			t.Fatalf("preview-url recommendation lacks url-bridge feature: %#v", recommendation)
+		}
+		if !containsString(recommendation.Evidence, "preview-url") {
+			t.Fatalf("preview-url recommendation lacks preview-url evidence: %#v", recommendation)
+		}
+		found[recommendation.Provider] = true
+	}
+	for _, provider := range []string{"e2b", "islo"} {
+		if !found[provider] {
+			t.Fatalf("preview-url recommendations should include %s: %#v", provider, recommendations)
+		}
+	}
+}
+
+func TestProvidersRecommendPreviewURLAlias(t *testing.T) {
+	entries := recommendAliasForTest(t, "app-preview")
+	if len(entries) != 1 || !providerRecommendationHasFeature(entries[0].Features, FeatureURLBridge) {
+		t.Fatalf("app-preview alias entries=%#v", entries)
+	}
+}
+
+func TestProvidersRecommendPauseResumePrefersResumableProviders(t *testing.T) {
+	recommendations := recommendProvidersForUseCase(providerMatrix(), "pause-resume", 64)
+	if len(recommendations) == 0 {
+		t.Fatal("expected pause-resume recommendations")
+	}
+	found := map[string]bool{}
+	for _, recommendation := range recommendations {
+		if !providerRecommendationHasFeature(recommendation.Features, FeaturePauseResume) {
+			t.Fatalf("pause-resume recommendation lacks pause-resume feature: %#v", recommendation)
+		}
+		found[recommendation.Provider] = true
+	}
+	for _, provider := range []string{"islo"} {
+		if !found[provider] {
+			t.Fatalf("pause-resume recommendations should include %s: %#v", provider, recommendations)
+		}
+	}
+}
+
+func TestProvidersRecommendPauseResumeAlias(t *testing.T) {
+	entries := recommendAliasForTest(t, "resumable-workspace")
+	if len(entries) != 1 || !providerRecommendationHasFeature(entries[0].Features, FeaturePauseResume) {
+		t.Fatalf("resumable-workspace alias entries=%#v", entries)
+	}
+}
+
+func TestProvidersRecommendLiveSmokePrefersProvableLifecycle(t *testing.T) {
+	recommendations := recommendProvidersForUseCase(providerMatrix(), "live-smoke", 8)
+	if len(recommendations) == 0 {
+		t.Fatal("expected live-smoke recommendations")
+	}
+	foundEvidence := false
+	foundLocalRuntime := false
+	for _, recommendation := range recommendations {
+		if recommendation.Kind == ProviderKindServiceControl {
+			t.Fatalf("live-smoke should not prefer service-control providers: %#v", recommendation)
+		}
+		if recommendation.Category == "local-runtime" {
+			foundLocalRuntime = true
+		}
+		hasSync := providerRecommendationHasFeature(recommendation.Features, FeatureCrabboxSync) ||
+			providerRecommendationHasFeature(recommendation.Features, FeatureArchiveSync)
+		hasEvidence := providerRecommendationHasFeature(recommendation.Features, FeatureRunProof) ||
+			providerRecommendationHasFeature(recommendation.Features, FeatureRunArtifacts) ||
+			providerRecommendationHasFeature(recommendation.Features, FeatureRunDownloads) ||
+			providerRecommendationHasFeature(recommendation.Features, FeatureURLBridge)
+		if hasEvidence {
+			foundEvidence = true
+		}
+		if !hasSync && !hasEvidence {
+			t.Fatalf("live-smoke recommendation lacks sync or evidence capability: %#v", recommendation)
+		}
+	}
+	if !foundEvidence {
+		t.Fatalf("live-smoke recommendations should include at least one evidence-capable provider: %#v", recommendations)
+	}
+	if !foundLocalRuntime {
+		t.Fatalf("live-smoke recommendations should include a local runtime for credentialless smoke paths: %#v", recommendations)
+	}
+}
+
+func TestProvidersRecommendLiveSmokeAlias(t *testing.T) {
+	entries := recommendAliasForTest(t, "provider-smoke")
+	if len(entries) != 1 || entries[0].Score <= 0 {
+		t.Fatalf("provider-smoke alias entries=%#v", entries)
+	}
+}
+
+func TestProvidersRecommendCIPrefersProofRunner(t *testing.T) {
+	recommendations := recommendProvidersForUseCase(providerMatrix(), "ci-proof", 3)
+	if len(recommendations) == 0 {
+		t.Fatal("expected ci-proof recommendations")
+	}
+	if recommendations[0].Provider != "blacksmith-testbox" {
+		t.Fatalf("top ci-proof provider=%q recommendations=%v", recommendations[0].Provider, recommendations)
+	}
+	if !providerRecommendationHasFeature(recommendations[0].Features, FeatureRunProof) {
+		t.Fatalf("top ci-proof recommendation missing run-proof feature: %#v", recommendations[0])
+	}
+}
+
+func TestProvidersRecommendWorkerRuntimeFindsModuleProvider(t *testing.T) {
+	recommendations := recommendProvidersForUseCase(providerMatrix(), "worker-runtime", 5)
+	if len(recommendations) == 0 {
+		t.Fatal("expected worker-runtime recommendations")
+	}
+	if !providerRecommendationHasString(recommendations[0].Targets, targetWorkerRuntime) {
+		t.Fatalf("top worker-runtime recommendation lacks worker target: %#v", recommendations[0])
+	}
+	if !providerRecommendationHasFeature(recommendations[0].Features, FeatureModuleRun) {
+		t.Fatalf("top worker-runtime recommendation lacks module-run feature: %#v", recommendations[0])
+	}
+}
+
+func TestProvidersRecommendCommandJSONAndLimit(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	err := (App{Stdout: &stdout, Stderr: &stderr}).providers(context.Background(), []string{"recommend", "linux-vm", "--limit", "2", "--json"})
+	if err != nil {
+		t.Fatalf("providers recommend --json error=%v stderr=%q", err, stderr.String())
+	}
+	var entries []providerRecommendationEntry
+	if err := json.Unmarshal(stdout.Bytes(), &entries); err != nil {
+		t.Fatalf("invalid json: %v\n%s", err, stdout.String())
+	}
+	if len(entries) != 2 {
+		t.Fatalf("recommendation count=%d want=2 entries=%#v", len(entries), entries)
+	}
+	for _, entry := range entries {
+		if entry.Score <= 0 || len(entry.Reasons) == 0 {
+			t.Fatalf("entry missing score/reasons: %#v", entry)
+		}
+	}
+}
+
+func TestProvidersRecommendCommandAppliesFilters(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	err := (App{Stdout: &stdout, Stderr: &stderr}).providers(context.Background(), []string{
+		"recommend", "run-evidence",
+		"--category", "delegated-sandbox",
+		"--runtime", "managed-sandbox",
+		"--reachability", "provider-url",
+		"--evidence", "preview-url",
+		"--json",
+	})
+	if err != nil {
+		t.Fatalf("providers recommend filtered --json error=%v stderr=%q", err, stderr.String())
+	}
+	var entries []providerRecommendationEntry
+	if err := json.Unmarshal(stdout.Bytes(), &entries); err != nil {
+		t.Fatalf("invalid json: %v\n%s", err, stdout.String())
+	}
+	if len(entries) == 0 {
+		t.Fatal("expected filtered run-evidence recommendations")
+	}
+	for _, entry := range entries {
+		if entry.Category != "delegated-sandbox" || !containsString(entry.Runtime, "managed-sandbox") || !containsString(entry.Reachability, "provider-url") || !containsString(entry.Evidence, "preview-url") {
+			t.Fatalf("recommendation escaped filters: %#v", entry)
+		}
+	}
+}
+
+func TestProvidersRecommendFiltersRequireUseCase(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	err := (App{Stdout: &stdout, Stderr: &stderr}).providers(context.Background(), []string{"recommend", "--kind", "ssh-lease"})
+	var exitErr ExitError
+	if !AsExitError(err, &exitErr) || exitErr.Code != 2 {
+		t.Fatalf("providers recommend filter without use case error=%v stdout=%q stderr=%q", err, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(err.Error(), "provider recommendation filters require a use case") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestProvidersRecommendFilteredNoMatch(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	err := (App{Stdout: &stdout, Stderr: &stderr}).providers(context.Background(), []string{"recommend", "run-evidence", "--workspace", "checkpoint"})
+	var exitErr ExitError
+	if !AsExitError(err, &exitErr) || exitErr.Code != 1 {
+		t.Fatalf("providers recommend filtered no-match error=%v stdout=%q stderr=%q", err, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(err.Error(), `no providers matched use case "run-evidence" with the requested filters`) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestProvidersRecommendRejectsUnknownUseCase(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	err := (App{Stdout: &stdout, Stderr: &stderr}).providers(context.Background(), []string{"recommend", "moon-base"})
+	var exitErr ExitError
+	if !AsExitError(err, &exitErr) || exitErr.Code != 2 {
+		t.Fatalf("providers recommend unknown error=%v stdout=%q stderr=%q", err, stdout.String(), stderr.String())
+	}
+}
+
+func TestProvidersJSONIncludesBuiltIns(t *testing.T) {
+	root := filepath.Clean(filepath.Join("..", ".."))
+	binary, err := builtCLITestBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	run := exec.Command(binary, "providers", "--json")
+	run.Dir = root
+	output, err := run.CombinedOutput()
+	if err != nil {
+		t.Fatalf("crabbox providers --json: %v\n%s", err, output)
+	}
+
+	var entries []providerMatrixEntry
+	if err := json.Unmarshal(output, &entries); err != nil {
+		t.Fatalf("invalid providers json: %v\n%s", err, output)
+	}
+
+	var firecracker, machine0 *providerMatrixEntry
+	classProviders := map[string]*providerMatrixEntry{}
+	wantLegacyClassProviders := map[string]struct{}{
+		"aws": {}, "azure": {}, "gcp": {}, "hetzner": {}, "namespace-instance": {},
+	}
+	for i := range entries {
+		entry := &entries[i]
+		switch entry.Provider {
+		case "firecracker":
+			firecracker = entry
+		case "machine0":
+			machine0 = entry
+		}
+		if len(entry.Classes) != 0 {
+			if _, ok := wantLegacyClassProviders[entry.Provider]; !ok {
+				t.Fatalf("provider=%s unexpectedly expanded the legacy classes compatibility boundary", entry.Provider)
+			}
+			classProviders[entry.Provider] = entry
+		}
+	}
+	if len(classProviders) != len(wantLegacyClassProviders) {
+		t.Fatalf("legacy class providers=%d want exactly %d", len(classProviders), len(wantLegacyClassProviders))
+	}
+	for _, provider := range []string{"aws", "azure", "gcp", "hetzner", "namespace-instance"} {
+		entry := classProviders[provider]
+		if entry == nil {
+			t.Fatalf("built binary providers json missing %s", provider)
+		}
+		if len(entry.Classes) != len(CanonicalProviderClasses()) {
+			t.Fatalf("%s classes=%#v want %d entries", provider, entry.Classes, len(CanonicalProviderClasses()))
+		}
+		for classIndex, className := range CanonicalProviderClasses() {
+			classSpec := entry.Classes[classIndex]
+			if classSpec.Class != className || classSpec.Type == "" || classSpec.VCPUs <= 0 || classSpec.MemoryGB <= 0 {
+				t.Fatalf("%s class[%d]=%#v", provider, classIndex, classSpec)
+			}
+		}
+		if entry.ClassCatalog.Disposition != ProviderClassDispositionMapped || len(entry.ClassCatalog.Profiles) < 4 {
+			t.Fatalf("%s classCatalog=%#v want mapped profiles", provider, entry.ClassCatalog)
+		}
+	}
+	if machine0 == nil {
+		t.Fatal("built binary providers json missing machine0")
+	}
+	if len(machine0.Classes) != 0 {
+		t.Fatalf("machine0 compatibility classes=%#v want omitted", machine0.Classes)
+	}
+	if machine0.ClassCatalog.Disposition != ProviderClassDispositionMapped || len(machine0.ClassCatalog.Profiles) != len(CanonicalProviderClasses()) {
+		t.Fatalf("machine0 classCatalog=%#v want mapped canonical profiles", machine0.ClassCatalog)
+	}
+	encodedMachine0, err := json.Marshal(machine0)
+	if err != nil {
+		t.Fatalf("marshal machine0 matrix entry: %v", err)
+	}
+	if bytes.Contains(encodedMachine0, []byte(`"classes"`)) || !bytes.Contains(encodedMachine0, []byte(`"classCatalog"`)) {
+		t.Fatalf("machine0 discovery changed the compatibility JSON shape: %s", encodedMachine0)
+	}
+	if firecracker == nil {
+		t.Fatal("built binary providers json missing firecracker")
+	}
+	if firecracker.Kind != ProviderKindSSHLease || firecracker.Family != "firecracker" || firecracker.Coordinator != string(CoordinatorNever) {
+		t.Fatalf("firecracker built-in spec=%#v", *firecracker)
+	}
+	if firecracker.ClassCatalog.Disposition != ProviderClassDispositionUnmapped || len(firecracker.ClassCatalog.Profiles) != 0 {
+		t.Fatalf("firecracker classCatalog=%#v", firecracker.ClassCatalog)
+	}
+	if !containsString(firecracker.Targets, targetLinux) {
+		t.Fatalf("firecracker built-in targets=%v", firecracker.Targets)
+	}
+	for _, feature := range []Feature{FeatureSSH, FeatureCrabboxSync, FeatureCleanup} {
+		if !containsFeature(firecracker.Features, feature) {
+			t.Fatalf("firecracker built-in features=%v missing %s", firecracker.Features, feature)
+		}
+	}
+	if len(firecracker.Aliases) != 0 {
+		t.Fatalf("firecracker built-in aliases=%v, want none", firecracker.Aliases)
+	}
+
+	for _, smoke := range []struct {
+		requested string
+		canonical string
+	}{{requested: "aws", canonical: "aws"}, {requested: "google", canonical: "gcp"}, {requested: "machine0", canonical: "machine0"}} {
+		var matrix *providerMatrixEntry
+		for index := range entries {
+			if entries[index].Provider == smoke.canonical {
+				matrix = &entries[index]
+				break
+			}
+		}
+		if matrix == nil {
+			t.Fatalf("built binary providers json missing %s", smoke.canonical)
+		}
+		discoveryHome := t.TempDir()
+		describe := exec.Command(binary, "providers", "describe", smoke.requested, "--json")
+		describe.Dir = root
+		describe.Env = []string{
+			"PATH=" + os.Getenv("PATH"),
+			"HOME=" + discoveryHome,
+			"CRABBOX_CONFIG=" + filepath.Join(discoveryHome, "missing.yaml"),
+			"CRABBOX_PROVIDER=static-discovery-marker",
+		}
+		describeOutput, err := describe.CombinedOutput()
+		if err != nil {
+			t.Fatalf("crabbox providers describe %s --json: %v\n%s", smoke.requested, err, describeOutput)
+		}
+		var description providerDescription
+		if err := json.Unmarshal(describeOutput, &description); err != nil {
+			t.Fatalf("invalid providers describe %s json: %v\n%s", smoke.requested, err, describeOutput)
+		}
+		if description.SchemaVersion != 2 || !reflect.DeepEqual(description.ClassCatalog, matrix.ClassCatalog) {
+			t.Fatalf("provider=%s requested=%s schema=%d describe classCatalog=%#v matrix classCatalog=%#v", smoke.canonical, smoke.requested, description.SchemaVersion, description.ClassCatalog, matrix.ClassCatalog)
+		}
+		if smoke.canonical == "machine0" {
+			flags := descriptionFlagMap(description.ProviderFlags)
+			for name, wantCreationOnly := range map[string]bool{
+				"machine0-size":           true,
+				"machine0-image":          true,
+				"machine0-image-version":  true,
+				"machine0-desktop-image":  true,
+				"machine0-region":         true,
+				"machine0-key":            true,
+				"machine0-cli":            false,
+				"machine0-work-root":      false,
+				"machine0-release-policy": false,
+				"machine0-create-timeout": false,
+				"machine0-poll-interval":  false,
+			} {
+				item, ok := flags[name]
+				if !ok || item.CreationOnly != wantCreationOnly {
+					t.Errorf("--%s present=%t creationOnly=%t want=%t", name, ok, item.CreationOnly, wantCreationOnly)
+				}
+			}
+		}
+	}
+}
+
+func containsFeature(values []Feature, want Feature) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}

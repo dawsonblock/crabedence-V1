@@ -1,0 +1,938 @@
+package lambda
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"maps"
+	"os"
+	"strings"
+	"time"
+
+	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared"
+)
+
+type lambdaAPI interface {
+	ListInstances(context.Context) ([]Instance, error)
+	GetInstance(context.Context, string) (Instance, error)
+	LaunchInstance(context.Context, LaunchInstanceRequest) (LaunchInstanceResponse, error)
+	TerminateInstances(context.Context, []string) error
+	ListSSHKeys(context.Context) ([]SSHKey, error)
+	AddSSHKey(context.Context, AddSSHKeyRequest) (SSHKey, error)
+	DeleteSSHKey(context.Context, string) error
+	ListRegions(context.Context) ([]Region, error)
+	ListInstanceTypes(context.Context) ([]InstanceType, error)
+	ListImages(context.Context) ([]Image, error)
+	ListFilesystems(context.Context) ([]Filesystem, error)
+	ListFirewallRulesets(context.Context) ([]FirewallRuleset, error)
+}
+
+type ambiguousLambdaCreateError struct {
+	err error
+}
+
+func (e *ambiguousLambdaCreateError) Error() string {
+	return fmt.Sprintf("lambda instance creation remains indeterminate; preserving SSH credentials for recovery: %v", e.err)
+}
+
+func (e *ambiguousLambdaCreateError) Unwrap() error { return e.err }
+
+type ambiguousLambdaRecoveryConflictError struct {
+	err core.ExitError
+}
+
+func (e *ambiguousLambdaRecoveryConflictError) Error() string { return e.err.Error() }
+
+func (e *ambiguousLambdaRecoveryConflictError) Unwrap() error { return e.err }
+
+type lambdaSSHKeyIdentity struct {
+	ID      string
+	Name    string
+	Created bool
+}
+
+func (b *backend) initDirect() {
+	b.cfg.Provider = providerName
+	if b.cfg.TargetOS == "" {
+		b.cfg.TargetOS = core.TargetLinux
+	}
+	if b.cfg.SSHUser == "" {
+		b.cfg.SSHUser = defaultUser
+	}
+	if b.cfg.SSHPort == "" {
+		b.cfg.SSHPort = defaultPort
+	}
+	if b.cfg.ServerType == "" {
+		b.cfg.ServerType = typeForConfig(b.cfg)
+	}
+	if b.cfg.Lambda.Region == "" {
+		b.cfg.Lambda.Region = defaultRegion
+	}
+	if b.cfg.Lambda.Type == "" {
+		b.cfg.Lambda.Type = defaultType
+	}
+	if b.cfg.Lambda.Image == "" && b.cfg.Lambda.ImageFamily == "" {
+		b.cfg.Lambda.ImageFamily = defaultImageFamily
+	}
+	b.DirectSSHBackend = shared.DirectSSHBackend{
+		SpecValue:       b.spec,
+		Cfg:             b.cfg,
+		RT:              b.rt,
+		Delete:          b.deleteServer,
+		StoredLeaseKeys: true,
+	}
+	if b.waitSSH == nil {
+		b.waitSSH = func(ctx context.Context, target *core.SSHTarget, phase string, timeout time.Duration) error {
+			return core.WaitForSSHReady(ctx, target, b.rt.Stderr, phase, timeout)
+		}
+	}
+}
+
+func (b *backend) Acquire(ctx context.Context, req core.AcquireRequest) (core.LeaseTarget, error) {
+	b.initDirect()
+	return shared.AcquireAttemptsRetry(b.rt, req.Keep, func() (core.LeaseTarget, error) {
+		return b.acquireOnce(ctx, req)
+	})
+}
+
+func (b *backend) acquireOnce(ctx context.Context, req core.AcquireRequest) (target core.LeaseTarget, err error) {
+	if err := validateConfig(b.cfg); err != nil {
+		return core.LeaseTarget{}, err
+	}
+	if b.cfg.TargetOS != "" && b.cfg.TargetOS != core.TargetLinux {
+		return core.LeaseTarget{}, core.Exit(2, "provider=lambda only supports target=linux")
+	}
+	if b.cfg.Tailscale.Enabled && b.cfg.Tailscale.AuthKey == "" {
+		return core.LeaseTarget{}, core.Exit(2, "direct --tailscale requires %s to contain a Tailscale auth key", b.cfg.Tailscale.AuthKeyEnv)
+	}
+	client, err := b.clientFactory(b.rt)
+	if err != nil {
+		return core.LeaseTarget{}, err
+	}
+	leaseID := core.NewLeaseID()
+	instances, err := client.ListInstances(ctx)
+	if err != nil {
+		return core.LeaseTarget{}, err
+	}
+	servers, err := b.ownedServersFromInstances(instances)
+	if err != nil {
+		return core.LeaseTarget{}, err
+	}
+	slug, err := core.AllocateDirectLeaseSlug(leaseID, req.RequestedSlug, servers)
+	if err != nil {
+		return core.LeaseTarget{}, err
+	}
+	keyPath, publicKey, err := core.EnsureTestboxKeyForConfig(b.cfg, leaseID)
+	if err != nil {
+		return core.LeaseTarget{}, err
+	}
+	cfg := b.cfg
+	cfg.Provider = providerName
+	cfg.TargetOS = core.TargetLinux
+	if cfg.SSHUser == "" {
+		cfg.SSHUser = defaultUser
+	}
+	if cfg.SSHPort == "" {
+		cfg.SSHPort = defaultPort
+	}
+	cfg.SSHKey = keyPath
+	cfg.ProviderKey = providerKeyForLease(leaseID)
+	cfg.ServerType = typeForConfig(cfg)
+	if cfg.Tailscale.Enabled && cfg.Tailscale.Hostname == "" {
+		cfg.Tailscale.Hostname = core.RenderTailscaleHostname(cfg.Tailscale.HostnameTemplate, leaseID, slug, cfg.Provider)
+	}
+	now := b.now()
+	var (
+		key        lambdaSSHKeyIdentity
+		instanceID string
+		committed  bool
+	)
+	defer func() {
+		if err == nil || committed {
+			return
+		}
+		var ambiguous *ambiguousLambdaCreateError
+		if errors.As(err, &ambiguous) {
+			return
+		}
+		if instanceID == "" && !key.Created {
+			core.RemoveStoredTestboxKey(leaseID)
+			return
+		}
+		_ = b.persistRecoveryClaim(leaseID, slug, cfg, req.Repo.Root, key, instanceID, "rollback-cleanup", req.Keep, now)
+		cleanupErr := rollbackLambdaAcquire(client, instanceID, key)
+		if cleanupErr != nil {
+			err = fmt.Errorf("%v; lambda cleanup failed: %w", err, cleanupErr)
+			return
+		}
+		core.RemoveLeaseClaim(leaseID)
+		core.RemoveStoredTestboxKey(leaseID)
+	}()
+	key, err = b.ensureSSHKey(ctx, client, cfg.ProviderKey, publicKey)
+	if err != nil {
+		if !key.Created {
+			return core.LeaseTarget{}, err
+		}
+		if claimErr := b.persistRecoveryClaim(leaseID, slug, cfg, req.Repo.Root, key, "", "ambiguous-key-create", req.Keep, now); claimErr != nil {
+			return core.LeaseTarget{}, errors.Join(&ambiguousLambdaCreateError{err: err}, fmt.Errorf("persist lambda SSH-key recovery: %w", claimErr))
+		}
+		return core.LeaseTarget{}, &ambiguousLambdaCreateError{err: err}
+	}
+	fmt.Fprintf(b.rt.Stderr, "provisioning provider=lambda lease=%s slug=%s type=%s region=%s image=%s image_family=%s keep=%v\n", leaseID, slug, cfg.ServerType, regionForConfig(cfg), imageForConfig(cfg), imageFamilyForConfig(cfg), req.Keep)
+	launchReq := b.launchRequest(cfg, leaseID, slug, publicKey, key, req.Keep, now)
+	launch, err := client.LaunchInstance(ctx, launchReq)
+	if err != nil {
+		if !isAmbiguousLambdaMutationError(err) {
+			return core.LeaseTarget{}, err
+		}
+		if claimErr := b.persistRecoveryClaim(leaseID, slug, cfg, req.Repo.Root, key, "", "ambiguous-create", req.Keep, now); claimErr != nil {
+			return core.LeaseTarget{}, errors.Join(&ambiguousLambdaCreateError{err: err}, fmt.Errorf("persist lambda launch recovery: %w", claimErr))
+		}
+		return core.LeaseTarget{}, &ambiguousLambdaCreateError{err: err}
+	}
+	if len(launch.InstanceIDs) != 1 || strings.TrimSpace(launch.InstanceIDs[0]) == "" {
+		err = core.Exit(5, "lambda launch returned %d instance ids; want exactly one", len(launch.InstanceIDs))
+		return core.LeaseTarget{}, err
+	}
+	instanceID = strings.TrimSpace(launch.InstanceIDs[0])
+	instance, err := b.waitForInstanceReady(ctx, client, instanceID)
+	if err != nil {
+		return core.LeaseTarget{}, err
+	}
+	server := serverFromInstance(instance, cfg)
+	ssh := core.SSHTargetFromConfig(cfg, server.PublicNet.IPv4.IP)
+	if err := b.waitSSH(ctx, &ssh, "lambda bootstrap", core.BootstrapWaitTimeout(cfg)); err != nil {
+		return core.LeaseTarget{}, err
+	}
+	server.Labels = lambdaLabelsWithKey(leaseTags(cfg, leaseID, slug, "ready", req.Keep, now), key)
+	target = core.LeaseTarget{Server: server, SSH: ssh, LeaseID: leaseID}
+	if req.OnAcquired != nil {
+		if err := req.OnAcquired(target); err != nil {
+			return core.LeaseTarget{}, err
+		}
+	}
+	if err := core.ClaimLeaseTargetForRepoConfig(leaseID, slug, cfg, server, ssh, req.Repo.Root, cfg.IdleTimeout, req.Reclaim); err != nil {
+		return core.LeaseTarget{}, err
+	}
+	claim, exists, err := core.ReadLeaseClaimWithPresence(leaseID)
+	if err != nil {
+		return core.LeaseTarget{}, fmt.Errorf("read acquired lambda claim: %w", err)
+	}
+	if !exists {
+		return core.LeaseTarget{}, core.Exit(2, "lambda lease=%s claim is missing after acquire", leaseID)
+	}
+	core.SetServerLeaseClaimSnapshot(&server, claim, true)
+	target.Server = server
+	committed = true
+	fmt.Fprintf(b.rt.Stderr, "provisioned lease=%s lambda=%s type=%s\n", leaseID, server.DisplayID(), cfg.ServerType)
+	return target, nil
+}
+
+func (b *backend) launchRequest(cfg core.Config, leaseID, slug, publicKey string, key lambdaSSHKeyIdentity, keep bool, now time.Time) LaunchInstanceRequest {
+	req := LaunchInstanceRequest{
+		RegionName:       regionForConfig(cfg),
+		InstanceTypeName: typeForConfig(cfg),
+		Quantity:         1,
+		SSHKeyNames:      []string{key.Name},
+		UserData:         lambdaUserData(cfg, publicKey),
+	}
+	if image := imageForConfig(cfg); image != "" {
+		req.ImageID = image
+	} else {
+		req.ImageFamily = imageFamilyForConfig(cfg)
+	}
+	if ruleset := strings.TrimSpace(cfg.Lambda.FirewallRuleset); ruleset != "" {
+		req.FirewallRulesetName = ruleset
+	}
+	req.FileSystemNames = append([]string(nil), cfg.Lambda.FilesystemNames...)
+	for _, mount := range cfg.Lambda.FilesystemMounts {
+		if strings.TrimSpace(mount.Name) == "" {
+			continue
+		}
+		req.FileSystemMounts = append(req.FileSystemMounts, FilesystemMountRequest{Name: strings.TrimSpace(mount.Name), MountPath: strings.TrimSpace(mount.MountPath)})
+	}
+	return req
+}
+
+func lambdaLabelsWithKey(labels map[string]string, key lambdaSSHKeyIdentity) map[string]string {
+	labels[lambdaKeyIDLabel] = key.ID
+	labels[lambdaKeyNameLabel] = key.Name
+	labels[lambdaKeyOwnedLabel] = fmt.Sprint(key.Created)
+	return labels
+}
+
+func lambdaProviderLaunchTags(labels map[string]string, key lambdaSSHKeyIdentity) map[string]string {
+	labels = lambdaLabelsWithKey(labels, key)
+	// Keep launch-time expiry for complete provider-tagged instances that are
+	// manually seeded, legacy-created, or supported by a future tag API. Local
+	// claims carry fresh touch data for the current launch path.
+	for _, field := range []string{"last_touched_at", "idle_timeout", "idle_timeout_secs"} {
+		delete(labels, field)
+	}
+	return labels
+}
+
+func (b *backend) ensureSSHKey(ctx context.Context, client lambdaAPI, name, publicKey string) (lambdaSSHKeyIdentity, error) {
+	keys, err := client.ListSSHKeys(ctx)
+	if err != nil {
+		return lambdaSSHKeyIdentity{}, err
+	}
+	for _, key := range keys {
+		if key.Name != name {
+			continue
+		}
+		if strings.TrimSpace(key.PublicKey) != strings.TrimSpace(publicKey) {
+			return lambdaSSHKeyIdentity{}, core.Exit(2, "lambda SSH key %q already exists with different public key", name)
+		}
+		return lambdaSSHKeyIdentity{ID: key.ID, Name: key.Name, Created: false}, nil
+	}
+	key, err := client.AddSSHKey(ctx, AddSSHKeyRequest{Name: name, PublicKey: publicKey})
+	if err != nil {
+		return lambdaSSHKeyIdentity{Name: name, Created: isAmbiguousLambdaMutationError(err)}, err
+	}
+	return lambdaSSHKeyIdentity{ID: key.ID, Name: firstNonBlank(key.Name, name), Created: true}, nil
+}
+
+func (b *backend) waitForInstanceReady(ctx context.Context, client lambdaAPI, id string) (Instance, error) {
+	deadline := b.now().Add(5 * time.Minute)
+	result, err := shared.Poll(context.WithoutCancel(ctx), 0, 3*time.Second,
+		func(context.Context, time.Duration) error {
+			if err := shared.SleepContext(ctx, 3*time.Second); err != nil {
+				return ctx.Err()
+			}
+			return nil
+		},
+		func(context.Context) (Instance, error) { return client.GetInstance(ctx, id) },
+		func(_ context.Context, item Instance, fetchErr error) (bool, error) {
+			if fetchErr != nil {
+				return false, fetchErr
+			}
+			if strings.EqualFold(item.Status, "active") && strings.TrimSpace(item.IP) != "" {
+				return true, nil
+			}
+			if isTerminalInstanceStatus(item.Status) {
+				return false, core.Exit(5, "lambda instance %s reached terminal status %s", id, item.Status)
+			}
+			if b.now().After(deadline) {
+				return false, core.Exit(5, "timed out waiting for Lambda instance %s to become active with public IP", id)
+			}
+			return false, nil
+		}, nil)
+	if err != nil {
+		return Instance{}, err
+	}
+	return result.Value, nil
+}
+
+func (b *backend) Resolve(ctx context.Context, req core.ResolveRequest) (core.LeaseTarget, error) {
+	b.initDirect()
+	client, err := b.clientFactory(b.rt)
+	if err != nil {
+		return core.LeaseTarget{}, err
+	}
+	instances, err := client.ListInstances(ctx)
+	if err != nil {
+		return core.LeaseTarget{}, err
+	}
+	servers, err := b.ownedServersFromInstances(instances)
+	if err != nil {
+		return core.LeaseTarget{}, err
+	}
+	byID := map[string]Instance{}
+	for _, item := range instances {
+		byID[item.ID] = item
+	}
+	if claim, ok, claimErr := core.ResolveLeaseClaimForProvider(req.ID, providerName); claimErr != nil {
+		return core.LeaseTarget{}, claimErr
+	} else if ok && claim.CloudID != "" {
+		if item, found := byID[claim.CloudID]; found {
+			server, err := serverFromLambdaClaim(item, b.cfg, claim)
+			if err != nil {
+				return core.LeaseTarget{}, err
+			}
+			return b.targetFromClaimedServer(server, req)
+		}
+	}
+	server, leaseID, err := core.FindServerByAlias(servers, req.ID)
+	if err == nil && leaseID != "" {
+		_, found := byID[server.CloudID]
+		if !found {
+			return core.LeaseTarget{}, core.Exit(4, "lease/lambda instance not found: %s", req.ID)
+		}
+		return b.targetFromClaimedServer(server, req)
+	}
+	if item, ok := byID[req.ID]; ok {
+		if server, claimed, claimErr := claimedServerFromInstance(item, instances, b.cfg); claimErr != nil {
+			return core.LeaseTarget{}, claimErr
+		} else if claimed {
+			return b.targetFromClaimedServer(server, req)
+		}
+	}
+	if req.ReleaseOnly {
+		return b.releaseTargetFromClaim(req.ID)
+	}
+	return core.LeaseTarget{}, core.Exit(4, "lease/lambda instance not found: %s", req.ID)
+}
+
+func (b *backend) releaseTargetFromClaim(id string) (core.LeaseTarget, error) {
+	claim, ok, err := core.ResolveLeaseClaimForProvider(id, providerName)
+	if err != nil {
+		return core.LeaseTarget{}, err
+	}
+	if !ok {
+		claim, ok, err = core.ResolveLeaseClaimForProviderCloudID(id, providerName)
+		if err != nil {
+			return core.LeaseTarget{}, err
+		}
+	}
+	if !ok || claim.LeaseID == "" {
+		return core.LeaseTarget{}, core.Exit(4, "lease/lambda instance not found: %s", id)
+	}
+	if err := validateLambdaLabels(claim.Labels); err != nil {
+		return core.LeaseTarget{}, err
+	}
+	if claim.CloudID == "" && claim.Labels[lambdaRecoveryKeyLabel] != "rollback-cleanup" && claim.Labels[lambdaRecoveryKeyLabel] != "ambiguous-key-create" {
+		return core.LeaseTarget{}, core.Exit(4, "lambda recovery is still pending for lease=%s; credentials and recovery claim retained", claim.LeaseID)
+	}
+	server := core.Server{Provider: providerName, CloudID: claim.CloudID, Name: claim.Slug, Labels: claim.Labels}
+	server.PublicNet.IPv4.IP = claim.SSHHost
+	server.ServerType.Name = claim.Labels["server_type"]
+	core.SetServerLeaseClaimSnapshot(&server, claim, true)
+	return core.LeaseTarget{LeaseID: claim.LeaseID, Server: server}, nil
+}
+
+func (b *backend) targetFromClaimedServer(server core.Server, req core.ResolveRequest) (core.LeaseTarget, error) {
+	if err := validateLambdaLabels(server.Labels); err != nil {
+		return core.LeaseTarget{}, err
+	}
+	leaseID := server.Labels["lease"]
+	if req.ReleaseOnly {
+		return core.LeaseTarget{Server: server, LeaseID: leaseID}, nil
+	}
+	ssh := core.SSHTargetFromConfig(b.cfg, server.PublicNet.IPv4.IP)
+	core.UseStoredTestboxKey(&ssh, leaseID)
+	if req.Repo.Root != "" {
+		if err := core.ClaimLeaseTargetForRepoConfig(leaseID, server.Labels["slug"], b.cfg, server, ssh, req.Repo.Root, b.cfg.IdleTimeout, req.Reclaim); err != nil {
+			return core.LeaseTarget{}, err
+		}
+		claim, exists, err := core.ReadLeaseClaimWithPresence(leaseID)
+		if err != nil {
+			return core.LeaseTarget{}, err
+		}
+		if !exists {
+			return core.LeaseTarget{}, core.Exit(2, "lambda lease=%s claim disappeared during resolve", leaseID)
+		}
+		core.SetServerLeaseClaimSnapshot(&server, claim, true)
+	}
+	return core.LeaseTarget{Server: server, SSH: ssh, LeaseID: leaseID}, nil
+}
+
+func (b *backend) List(ctx context.Context, _ core.ListRequest) ([]core.LeaseView, error) {
+	b.initDirect()
+	servers, err := b.listOwnedServers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]core.LeaseView, 0, len(servers))
+	for _, server := range servers {
+		out = append(out, server)
+	}
+	return out, nil
+}
+
+func (b *backend) ReleaseLease(ctx context.Context, req core.ReleaseLeaseRequest) error {
+	b.initDirect()
+	return b.deleteServer(ctx, b.cfg, req.Lease.Server)
+}
+
+func (b *backend) ReleaseLeaseMessage(lease core.LeaseTarget) string {
+	return fmt.Sprintf("deleted lease=%s lambda=%s name=%s", lease.LeaseID, lease.Server.DisplayID(), lease.Server.Name)
+}
+
+func (b *backend) Cleanup(ctx context.Context, req core.CleanupRequest) error {
+	b.initDirect()
+	servers, err := b.List(ctx, core.ListRequest{Options: req.Options})
+	if err != nil {
+		return err
+	}
+	return b.CleanupServers(ctx, req, servers)
+}
+
+func (b *backend) Touch(ctx context.Context, req core.TouchRequest) (core.Server, error) {
+	_ = ctx
+	b.initDirect()
+	server := req.Lease.Server
+	claim, err := revalidateLambdaClaimSnapshot(server)
+	if err != nil {
+		return core.Server{}, err
+	}
+	cfg := b.cfg
+	if req.IdleTimeout > 0 {
+		cfg.IdleTimeout = req.IdleTimeout
+	}
+	labels := core.TouchDirectLeaseLabels(server.Labels, cfg, req.State, b.now())
+	labels[lambdaTouchLocalLabel] = "true"
+	server.Labels = labels
+	updated, err := core.UpdateLeaseClaimLabelsIfUnchanged(req.Lease.LeaseID, claim, labels)
+	if err != nil {
+		return core.Server{}, err
+	}
+	core.SetServerLeaseClaimSnapshot(&server, updated, true)
+	return server, nil
+}
+
+func (b *backend) UpdateTailscaleMetadata(ctx context.Context, lease core.LeaseTarget, meta core.TailscaleMetadata) (core.Server, error) {
+	_ = ctx
+	b.initDirect()
+	server := lease.Server
+	expected, exists, set := core.ServerLeaseClaimSnapshot(server)
+	if !set || !exists {
+		return core.Server{}, core.Exit(2, "lambda lease=%s has no exact local claim snapshot; refusing metadata update", lease.LeaseID)
+	}
+	baseline := server
+	baseline.Labels = shared.CloneLabels(expected.Labels)
+	claim, err := revalidateLambdaClaimSnapshot(baseline)
+	if err != nil {
+		return core.Server{}, err
+	}
+	labels := shared.CloneLabels(claim.Labels)
+	applyTailscaleMetadata(labels, meta)
+	labels[lambdaTouchLocalLabel] = "true"
+	server.Labels = labels
+	updated, err := core.UpdateLeaseClaimLabelsIfUnchanged(lease.LeaseID, claim, labels)
+	if err != nil {
+		return core.Server{}, err
+	}
+	core.SetServerLeaseClaimSnapshot(&server, updated, true)
+	return server, nil
+}
+
+func (b *backend) deleteServer(ctx context.Context, _ core.Config, server core.Server) error {
+	claim, err := revalidateLambdaClaimSnapshot(server)
+	if err != nil {
+		return err
+	}
+	instanceID := firstNonBlank(server.CloudID, claim.CloudID)
+	if claim.CloudID == "" {
+		switch claim.Labels[lambdaRecoveryKeyLabel] {
+		case "rollback-cleanup", "ambiguous-key-create":
+			if instanceID != "" {
+				return core.Exit(2, "refusing to release unbound Lambda instance %s", instanceID)
+			}
+		case "ambiguous-create":
+			if instanceID == "" {
+				return core.Exit(2, "lambda recovery is still pending for lease=%s; credentials and recovery claim retained", claim.LeaseID)
+			}
+		default:
+			return core.Exit(2, "lambda lease=%s has no instance-bound cleanup claim", claim.LeaseID)
+		}
+	}
+	client, err := b.clientFactory(b.rt)
+	if err != nil {
+		return err
+	}
+	server.CloudID = instanceID
+	server.Labels = shared.CloneLabels(claim.Labels)
+	if claim.CloudID == "" && claim.Labels[lambdaRecoveryKeyLabel] == "ambiguous-create" {
+		updated, err := core.UpdateLeaseClaimEndpointIfUnchangedAfter(claim.LeaseID, claim, server, core.SSHTarget{}, func() error {
+			instances, err := client.ListInstances(ctx)
+			if err != nil {
+				return err
+			}
+			return validateUniqueAmbiguousLaunchInstance(instanceID, instances, claim)
+		})
+		if err != nil {
+			return fmt.Errorf("bind ambiguous lambda recovery: %w", err)
+		}
+		claim = updated
+		instanceID = claim.CloudID
+		server.CloudID = instanceID
+		core.SetServerLeaseClaimSnapshot(&server, claim, true)
+	}
+	keyID := claim.Labels[lambdaKeyIDLabel]
+	keyName := claim.Labels[lambdaKeyNameLabel]
+	keyOwned := claim.Labels[lambdaKeyOwnedLabel] == "true"
+	if err := core.RemoveLeaseClaimIfUnchangedAfter(claim.LeaseID, claim, func() error {
+		liveFound := false
+		if instanceID != "" {
+			live, getErr := client.GetInstance(ctx, instanceID)
+			if getErr == nil {
+				liveFound = true
+				if err := validateLiveInstance(live, server); err != nil {
+					return err
+				}
+			} else if !isLambdaNotFound(getErr) {
+				return getErr
+			}
+		}
+		if liveFound {
+			if err := client.TerminateInstances(ctx, []string{instanceID}); err != nil {
+				return err
+			}
+		}
+		if keyOwned && keyID == "" && keyName != "" {
+			resolvedID, found, err := resolveSSHKeyIDByName(ctx, client, keyName)
+			if err != nil {
+				return err
+			}
+			if found {
+				keyID = resolvedID
+			}
+		}
+		if keyOwned && keyID != "" {
+			if err := client.DeleteSSHKey(ctx, keyID); err != nil && !isLambdaNotFound(err) {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("finalize lambda cleanup claim: %w", err)
+	}
+	core.RemoveStoredTestboxKey(claim.LeaseID)
+	return nil
+}
+
+func revalidateLambdaClaimSnapshot(server core.Server) (core.LeaseClaim, error) {
+	if err := validateLambdaLabels(server.Labels); err != nil {
+		return core.LeaseClaim{}, err
+	}
+	expected, expectedExists, snapshotSet := core.ServerLeaseClaimSnapshot(server)
+	if !snapshotSet || !expectedExists {
+		return core.LeaseClaim{}, core.Exit(2, "lambda lease=%s has no exact local claim snapshot; refusing operation", server.Labels["lease"])
+	}
+	if expected.Provider != providerName ||
+		expected.LeaseID != server.Labels["lease"] ||
+		expected.Slug != server.Labels["slug"] ||
+		expected.Labels["lease"] != expected.LeaseID ||
+		expected.Labels["slug"] != expected.Slug ||
+		!maps.Equal(expected.Labels, server.Labels) ||
+		(expected.CloudID != "" && server.CloudID != "" && expected.CloudID != server.CloudID) {
+		return core.LeaseClaim{}, core.Exit(2, "refusing Lambda operation on %s from a stale local claim", server.DisplayID())
+	}
+	current, exists, err := core.ReadLeaseClaimWithPresence(expected.LeaseID)
+	if err != nil {
+		return core.LeaseClaim{}, fmt.Errorf("read lambda claim: %w", err)
+	}
+	if !exists ||
+		!lambdaClaimOwnershipMatches(expected, current) ||
+		!maps.Equal(current.Labels, server.Labels) {
+		return core.LeaseClaim{}, core.Exit(2, "lambda lease=%s claim changed; retry", expected.LeaseID)
+	}
+	if err := validateLambdaLabels(current.Labels); err != nil {
+		return core.LeaseClaim{}, core.Exit(2, "lambda lease=%s has an invalid local claim; refusing operation", current.LeaseID)
+	}
+	return current, nil
+}
+
+func lambdaClaimOwnershipMatches(expected, current core.LeaseClaim) bool {
+	return expected.LeaseID == current.LeaseID &&
+		expected.Slug == current.Slug &&
+		expected.Provider == current.Provider &&
+		expected.CloudID == current.CloudID &&
+		expected.ProviderScope == current.ProviderScope &&
+		expected.StaticHost == current.StaticHost &&
+		expected.StaticUser == current.StaticUser &&
+		expected.StaticPort == current.StaticPort &&
+		expected.StaticWorkRoot == current.StaticWorkRoot &&
+		expected.TargetOS == current.TargetOS &&
+		expected.WindowsMode == current.WindowsMode &&
+		expected.Pond == current.Pond &&
+		expected.RepoRoot == current.RepoRoot
+}
+
+func (b *backend) persistRecoveryClaim(leaseID, slug string, cfg core.Config, repoRoot string, key lambdaSSHKeyIdentity, cloudID, recovery string, keep bool, now time.Time) error {
+	labels := leaseTags(cfg, leaseID, slug, "provisioning", keep, now)
+	labels[lambdaRecoveryKeyLabel] = recovery
+	labels[lambdaKeyIDLabel] = key.ID
+	labels[lambdaKeyNameLabel] = firstNonBlank(key.Name, cfg.ProviderKey)
+	labels[lambdaKeyOwnedLabel] = fmt.Sprint(key.Created)
+	if repoRoot == "" {
+		var err error
+		repoRoot, err = os.Getwd()
+		if err != nil {
+			return fmt.Errorf("resolve lambda recovery working directory: %w", err)
+		}
+	}
+	server := core.Server{Provider: providerName, Name: lambdaInstanceName(leaseID, slug), CloudID: cloudID, Labels: labels}
+	return core.ClaimLeaseTargetForRepoConfig(leaseID, slug, cfg, server, core.SSHTarget{}, repoRoot, cfg.IdleTimeout, false)
+}
+
+func resolveSSHKeyIDByName(ctx context.Context, client lambdaAPI, name string) (string, bool, error) {
+	keys, err := client.ListSSHKeys(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	for _, key := range keys {
+		if key.Name == name && key.ID != "" {
+			return key.ID, true, nil
+		}
+	}
+	return "", false, nil
+}
+
+func (b *backend) listOwnedServers(ctx context.Context) ([]core.Server, error) {
+	client, err := b.clientFactory(b.rt)
+	if err != nil {
+		return nil, err
+	}
+	instances, err := client.ListInstances(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return b.ownedServersFromInstances(instances)
+}
+
+func (b *backend) ownedServersFromInstances(instances []Instance) ([]core.Server, error) {
+	servers := make([]core.Server, 0, len(instances))
+	for _, item := range instances {
+		server, claimed, err := claimedServerFromInstance(item, instances, b.cfg)
+		if err != nil {
+			var conflict *ambiguousLambdaRecoveryConflictError
+			if errors.As(err, &conflict) {
+				continue
+			}
+			return nil, err
+		}
+		if claimed {
+			servers = append(servers, server)
+		}
+	}
+	return servers, nil
+}
+
+func claimedServerFromInstance(item Instance, instances []Instance, cfg core.Config) (core.Server, bool, error) {
+	if strings.TrimSpace(item.ID) == "" {
+		return core.Server{}, false, nil
+	}
+	claim, ok, err := core.ResolveLeaseClaimForProviderCloudID(item.ID, providerName)
+	if err != nil {
+		return core.Server{}, false, err
+	}
+	if !ok {
+		claim, ok, err = ambiguousLaunchClaimForInstance(item, instances)
+		if err != nil {
+			return core.Server{}, false, err
+		}
+	}
+	if !ok || claim.Provider != providerName {
+		return core.Server{}, false, nil
+	}
+	if claim.CloudID != "" && claim.CloudID != item.ID {
+		return core.Server{}, false, nil
+	}
+	server, err := serverFromLambdaClaim(item, cfg, claim)
+	if err != nil {
+		return core.Server{}, false, err
+	}
+	return server, true, nil
+}
+
+func serverFromLambdaClaim(item Instance, cfg core.Config, claim core.LeaseClaim) (core.Server, error) {
+	if err := validateLambdaLabels(claim.Labels); err != nil {
+		return core.Server{}, err
+	}
+	server := serverFromInstance(item, cfg)
+	server.Labels = shared.CloneLabels(claim.Labels)
+	core.SetServerLeaseClaimSnapshot(&server, claim, true)
+	return server, nil
+}
+
+func ambiguousLaunchClaimForInstance(item Instance, instances []Instance) (core.LeaseClaim, bool, error) {
+	keyNames := make(map[string]struct{}, len(item.SSHKeyNames))
+	for _, keyName := range item.SSHKeyNames {
+		keyName = strings.TrimSpace(keyName)
+		if keyName != "" {
+			keyNames[keyName] = struct{}{}
+		}
+	}
+	if len(keyNames) == 0 {
+		return core.LeaseClaim{}, false, nil
+	}
+	claims, err := core.ListLeaseClaims()
+	if err != nil {
+		return core.LeaseClaim{}, false, err
+	}
+	var matched core.LeaseClaim
+	found := false
+	for _, claim := range claims {
+		if claim.Provider != providerName || claim.CloudID != "" || claim.Labels[lambdaRecoveryKeyLabel] != "ambiguous-create" {
+			continue
+		}
+		keyName := strings.TrimSpace(claim.Labels[lambdaKeyNameLabel])
+		if keyName == "" {
+			continue
+		}
+		if _, ok := keyNames[keyName]; !ok {
+			continue
+		}
+		if found {
+			return core.LeaseClaim{}, false, core.Exit(2, "multiple Lambda recovery claims match instance %s by SSH key", item.ID)
+		}
+		matched = claim
+		found = true
+	}
+	if found {
+		if err := validateUniqueAmbiguousLaunchInstance(item.ID, instances, matched); err != nil {
+			return core.LeaseClaim{}, false, err
+		}
+	}
+	return matched, found, nil
+}
+
+func serverFromInstance(item Instance, cfg core.Config) core.Server {
+	labels := normalizeLambdaLabels(item.Tags)
+	server := core.Server{
+		CloudID:  item.ID,
+		Provider: providerName,
+		Name:     firstNonBlank(item.Name, item.Hostname, item.ID),
+		Status:   normalizeInstanceStatus(item.Status),
+		Labels:   labels,
+	}
+	server.PublicNet.IPv4.IP = strings.TrimSpace(item.IP)
+	server.ServerType.Name = firstNonBlank(item.Type, cfg.ServerType, typeForConfig(cfg))
+	return server
+}
+
+func validateLiveInstance(item Instance, expected core.Server) error {
+	labels := normalizeLambdaLabels(item.Tags)
+	if err := validateLambdaLabels(labels); err != nil {
+		if item.ID == expected.CloudID {
+			if claimErr := validateLambdaLabels(expected.Labels); claimErr == nil {
+				return nil
+			}
+		}
+		return err
+	}
+	expectedProviderKey := expected.Labels["provider_key"]
+	if expectedProviderKey == "" && expected.Labels["lease"] != "" {
+		expectedProviderKey = providerKeyForLease(expected.Labels["lease"])
+	}
+	if item.ID != expected.CloudID ||
+		labels["lease"] != expected.Labels["lease"] ||
+		labels["slug"] != expected.Labels["slug"] ||
+		labels["provider_key"] != expectedProviderKey {
+		return core.Exit(2, "refusing to operate on changed Lambda instance %s", expected.CloudID)
+	}
+	return nil
+}
+
+func validateUniqueAmbiguousLaunchInstance(instanceID string, instances []Instance, claim core.LeaseClaim) error {
+	if claim.Labels[lambdaRecoveryKeyLabel] != "ambiguous-create" {
+		return core.Exit(2, "refusing to release unbound Lambda instance %s", instanceID)
+	}
+	expectedKey := strings.TrimSpace(claim.Labels[lambdaKeyNameLabel])
+	matchedID := ""
+	matches := 0
+	for _, item := range instances {
+		for _, keyName := range item.SSHKeyNames {
+			if expectedKey != "" && strings.TrimSpace(keyName) == expectedKey {
+				matchedID = item.ID
+				matches++
+				break
+			}
+		}
+	}
+	if matches != 1 {
+		err := core.Exit(2, "refusing Lambda recovery for lease=%s: recovery SSH key matches %d instances", claim.LeaseID, matches)
+		return &ambiguousLambdaRecoveryConflictError{err: err}
+	}
+	if matchedID != instanceID {
+		return core.Exit(2, "refusing to release Lambda instance %s without its recovery SSH key binding", instanceID)
+	}
+	return nil
+}
+
+func rollbackLambdaAcquire(client lambdaAPI, instanceID string, key lambdaSSHKeyIdentity) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	var errs []error
+	if instanceID != "" {
+		if err := client.TerminateInstances(ctx, []string{instanceID}); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if key.Created && key.ID != "" {
+		if err := client.DeleteSSHKey(ctx, key.ID); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func normalizeInstanceStatus(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "active":
+		return "ready"
+	case "booting":
+		return "starting"
+	case "terminating":
+		return "stopping"
+	case "terminated":
+		return "deleted"
+	case "preempted":
+		return "preempted"
+	case "unhealthy":
+		return "unhealthy"
+	default:
+		if strings.TrimSpace(status) == "" {
+			return "unknown"
+		}
+		return strings.ToLower(strings.TrimSpace(status))
+	}
+}
+
+func isTerminalInstanceStatus(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "terminated", "terminating", "preempted", "unhealthy":
+		return true
+	default:
+		return false
+	}
+}
+
+func isLambdaNotFound(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.Status == 404
+}
+
+func isAmbiguousLambdaMutationError(err error) bool {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		return true
+	}
+	return apiErr.Status >= 500 || apiErr.Status == 408 || apiErr.Status == 429
+}
+
+func lambdaInstanceName(leaseID, slug string) string {
+	name := strings.ToLower(core.LeaseProviderName(leaseID, slug))
+	var b strings.Builder
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+			b.WriteRune(r)
+		}
+	}
+	out := strings.Trim(b.String(), "-")
+	if len(out) > 63 {
+		out = strings.Trim(out[:63], "-")
+	}
+	if out == "" || out[0] == '-' {
+		return "crabbox-" + strings.TrimPrefix(strings.ReplaceAll(leaseID, "_", "-"), "-")
+	}
+	return out
+}
+
+func providerKeyForLease(leaseID string) string {
+	key := core.ProviderKeyForLease(leaseID)
+	if len(key) > 64 {
+		key = key[:64]
+	}
+	return strings.TrimRight(key, "-")
+}
+
+func (b *backend) now() time.Time {
+	if b.rt.Clock != nil {
+		return b.rt.Clock.Now().UTC()
+	}
+	return time.Now().UTC()
+}

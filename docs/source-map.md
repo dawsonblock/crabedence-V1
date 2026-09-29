@@ -1,0 +1,297 @@
+# Source Map
+
+Read this when:
+
+- checking whether the docs still match the implementation;
+- changing a feature that is documented in more than one place;
+- writing a release note from source instead of memory.
+
+This page maps user-facing behavior to the files that implement it. The docs are
+descriptive; treat these files as the source-backed check before changing any
+behavior claim. When a doc and the code disagree, the code wins.
+
+Crabbox has three implementation surfaces:
+
+- **CLI** — Go, under `cmd/crabbox` (entrypoint) and `internal/cli` (commands,
+  flags, lease/sync/run logic).
+- **Provider adapters** — Go, under `internal/providers/<name>`. Each adapter
+  registers a provider and implements an SSH-lease, delegated-run, or
+  service-control backend. `internal/providers/all/all.go` imports every
+  adapter for its registration side effects; `internal/providers/shared` holds
+  common helpers.
+- **Coordinator** — TypeScript, under `worker/src` and `worker/node`. Shared
+  `FleetCoordinator` behavior runs either in a Cloudflare Worker plus one
+  Durable Object or in Node.js backed by PostgreSQL and pg-boss. Only `aws`,
+  `azure`, `daytona`, `gcp`, and `hetzner` can transfer provider lifecycle to it;
+  everything else runs direct or delegated from the CLI.
+
+## CLI Surface
+
+- Kong command tree and top-level help: `internal/cli/cli_kong.go`, `internal/cli/app.go`
+- Per-command `flag` parsing, shared lease-create flags, and exit helpers:
+  `internal/cli/flags.go`, `internal/cli/lease_flags.go`, `internal/cli/errors.go`, `internal/cli/fmt.go`
+- Config defaults, YAML keys, env overrides, and per-provider config sections:
+  `internal/cli/config.go`, `worker/src/config.ts`
+- Target selection (linux/macos/windows) and class maps: `internal/cli/target.go`, `internal/cli/config.go`
+- Network target resolution and Tailscale metadata: `internal/cli/network.go`
+- Named profiles: `internal/cli/profiles.go`
+- `crabbox init` generated repo files (workflow, skill, config): `internal/cli/init.go`, `internal/cli/init_detect.go`
+- `login`/`logout`/`whoami` and `config path|show|set-broker`: `internal/cli/auth.go`, `internal/cli/config_cmd.go`
+- `azure login` (subscription detection via `az` CLI): `internal/cli/azure_login.go`, `internal/cli/azure_cli.go`
+- Doctor checks, broker/provider readiness output, and pond doctor: `internal/cli/doctor.go`, `internal/cli/doctor_pond.go`
+- Provider matrix/filter/recommend output: `internal/cli/providers.go`
+- Provider-scoped `run` flag discovery and JSON schema v1: `internal/cli/providers_describe.go`, with the real reusable registration owner in `internal/cli/run.go` and coupled flag annotations in `internal/cli/flag_metadata.go`
+- `usage` and admin commands: `internal/cli/usage.go`, `internal/cli/admin.go`
+- Provider image bake/promote/fsr-status/delete: `internal/cli/image.go`, `internal/cli/os_image.go`, `internal/cli/coordinator.go`
+- Deterministic perf evidence is contract-only for now:
+  `docs/features/deterministic-perf-evidence.md`; no `--perf-budget`,
+  `--fuel-budget`, WASI, or wasmtime-fuel implementation is registered yet.
+
+## Integration Surfaces
+
+- Public integration catalog and authoring boundary: `docs/integrations`;
+  docs-site navigation registration: `scripts/build-docs-site.mjs`.
+- The catalog inventories Crabbox-hosted surfaces. Host-owned integrations are
+  versioned and inventoried in their host repositories rather than duplicated
+  in this source map.
+- Publishable generic Agent Skill: `skills/crabbox/SKILL.md`, with the
+  byte-identical repo-discovery projection at
+  `.agents/skills/crabbox/SKILL.md` and drift validation in
+  `scripts/check-agent-skills.mjs`. The docs builder publishes the same bytes
+  plus a SHA-256 digest at `/.well-known/agent-skills/` for domain discovery,
+  and advertises the artifact through `/.well-known/ai-catalog.json` for
+  Agentic Resource Discovery.
+- Generated repo-local Agent Skill: `internal/cli/init.go`, with onboarding
+  behavior in `docs/commands/init.md`.
+- Versioned editor handoff and foreground lease activity:
+  `internal/cli/open.go`, `docs/commands/open.md`.
+- Zed task/language package and validation: `integrations/zed`,
+  `scripts/check-zed-extension.mjs`, `scripts/test-zed-extension-e2e.mjs`.
+- Herdr package and CLI adapter: `plugins/herdr`,
+  `internal/cli/herdr_plugin.go`, `scripts/herdr-plugin.test.js`.
+
+## Leases, Slugs, Claims, And Expiry
+
+- Canonical lease IDs (`cbx_<12 hex>`) and per-lease SSH key paths: `internal/cli/lease.go`
+- Friendly slug generation, normalization, and collision handling: `internal/cli/slug.go`
+- Repo-local claim files and `--reclaim` checks: `internal/cli/claim.go`
+- Fixed-ID direct acquisition intent, cross-process locking, and durable EC2
+  attempt checkpoints: `internal/cli/claim.go`, `internal/providers/aws/backend.go`
+- Direct-provider labels, safe label encoding, idle-touch labels, TTL cap math: `internal/cli/provider_labels.go`
+- Lease status/inspect/list/share/unshare/stop/cleanup commands: `internal/cli/status.go`, `internal/cli/inspect.go`, `internal/cli/pool.go`, `internal/cli/share.go`, `internal/cli/rescue.go`
+- Coordinator client request/response structs, same-origin credential redirect guard, curl fallback, slug lookup, heartbeats, usage, and run history: `internal/cli/coordinator.go`, `internal/cli/provider_coordinator.go`
+- Lease backend selection (brokered vs direct SSH vs delegated): `internal/cli/provider_backend.go`
+- Worker env/request/record types: `worker/src/types.ts`
+- Worker lease records, public routes, slug allocation, heartbeat/expiry math, cleanup alarms: `worker/src/fleet.ts`
+- Worker lease config coercion and defaults (ttl, idle, ssh port, class): `worker/src/config.ts`
+- Worker Tailscale OAuth auth-key minting: `worker/src/tailscale.ts`
+- Worker slug generation and provider labels: `worker/src/slug.ts`, `worker/src/provider-labels.ts`
+
+## Providers And Runner Bootstrap
+
+Provider adapters live under `internal/providers/<name>` and each expose
+`Name()`, `Aliases()`, and `Spec()` in their `provider.go`. The `Spec.Kind`
+field distinguishes an SSH-lease backend (Crabbox provisions and connects to an
+SSH-reachable box) from a delegated-run backend (the provider owns sync and run;
+there is no SSH lease) or service-control backend (Crabbox inspects a
+provider-owned service without command execution). `internal/providers/all/all.go`
+imports them all.
+
+SSH-lease providers:
+
+- AWS (EC2): `internal/providers/aws`, with CLI helpers in `internal/cli/aws.go`, `internal/cli/aws_ssh_cidr.go`, `internal/cli/aws_windows_bootstrap.go`
+- Azure VM: `internal/providers/azure`, with CLI helpers in `internal/cli/azure.go`
+- Google Cloud (Compute Engine): `internal/providers/gcp`, with CLI helpers in `internal/cli/gcp.go`
+- Hetzner Cloud: `internal/providers/hetzner`, with CLI helpers in `internal/cli/hcloud.go`
+- DigitalOcean Droplets: `internal/providers/digitalocean`, with config glue in `internal/cli/config.go`
+- Vultr instances: `internal/providers/vultr`, with config glue in `internal/cli/config.go`
+- OVHcloud Public Cloud: `internal/providers/ovh`, with config glue in `internal/cli/config.go`
+- GitHub Codespaces: `internal/providers/githubcodespaces`, with config glue
+  and env overrides in `internal/cli/config.go`
+- Parallels (macOS VM host): `internal/providers/parallels`, with CLI helpers in `internal/cli/parallels.go`
+- Proxmox VE: `internal/providers/proxmox`, with CLI helpers in `internal/cli/proxmox.go`
+- XCP-ng (`xcp-ng`): `internal/providers/xcpng`
+- Incus: `internal/providers/incus`
+- Static/BYO SSH host: `internal/providers/ssh`, with target mapping in `internal/cli/static.go`
+- Local Docker container: `internal/providers/localcontainer`
+- Apple `Virtualization.framework` Linux VM helper and provider:
+  `internal/applevmhelper`, `internal/providers/applevm`; the Swift VM daemon
+  lives in `vmd/` and is embedded into the helper by `scripts/build-vmd.sh`
+  plus `-tags vmdembed`; release packaging is in `.goreleaser.yaml` and the
+  macOS CI/release jobs
+- Boxd KVM microVMs via the HTTPS console API, authenticated WSS guest
+  bootstrap, and per-lease SSH trust: `internal/providers/boxd`; config wiring
+  lives in `internal/cli/config.go`; explicit HTTPS device login lives in
+  `scripts/boxd-login.mjs`
+- Canonical Multipass local Ubuntu VM: `internal/providers/multipass`
+- Cirrus Labs tart local macOS VM: `internal/providers/tart`
+- Lume local macOS VM cloned from a stopped golden image: `internal/providers/lume`
+- Microsoft Hyper-V local Windows VM: `internal/providers/hyperv`
+- Daytona, Morph, exe.dev, KubeVirt, Sealos DevBox, External, Tenki, Namespace devbox, RunPod, Semaphore, Sprites, Lambda, Vast:
+  `internal/providers/daytona`, `internal/providers/morph`, `internal/providers/exedev`, `internal/providers/kubevirt`, `internal/providers/sealosdevbox`, `internal/providers/external`, `internal/providers/tenki`, `internal/providers/namespace`,
+  `internal/providers/runpod`, `internal/providers/semaphore`, `internal/providers/sprites`, `internal/providers/lambda`,
+  `internal/providers/vast`, live smoke `scripts/live-vast-smoke.sh`
+
+Delegated-run providers (no SSH lease):
+
+- Cloudflare Containers: `internal/providers/cloudflare`, with the Worker runtime in `worker/src/cloudflare-container-runner.ts`
+- Agent Sandbox delegated Kubernetes claims and `kubectl exec`:
+  `internal/providers/agentsandbox`, live smoke `scripts/live-agent-sandbox-smoke.sh`
+- Blaxel delegated lifecycle, archive sync, process execution, cleanup, and live
+  smoke: `internal/providers/blaxel`, `scripts/live-blaxel-smoke.sh`
+- AWS Lambda MicroVM, Docker Sandbox, E2B, Islo, Modal, OpenComputer, Anthropic Sandbox Runtime, Tensorlake, Upstash, Blacksmith, W&B:
+  `internal/providers/awslambdamicrovm`, runner `runtimes/aws-lambda-microvm`,
+  live smoke `scripts/live-aws-lambda-microvm-smoke.sh`,
+  `internal/providers/dockersandbox`,
+  `internal/providers/e2b`, `internal/providers/islo`, `internal/providers/modal`,
+  `internal/providers/opencomputer`, `internal/providers/cloudrunsandbox`,
+  `internal/providers/anthropicsandboxruntime`,
+  `internal/providers/tensorlake`, `internal/providers/upstashbox`,
+  `internal/providers/blacksmith`, `internal/providers/wandb`
+- Superserve delegated lifecycle, archive sync, data-plane file upload, exec,
+  and live smoke: `internal/providers/superserve`, `scripts/live-superserve-smoke.sh`
+- Crownest Workspace Runs delegated lifecycle, archive-transfer upload, SSE
+  event streaming, and local claims: `internal/providers/crownest`
+- CUA experimental diagnostics, read-only inventory, Python SDK bridge,
+  fail-closed lifecycle guards, and non-mutating smoke: `internal/providers/cua`,
+  `docs/providers/cua.md`, `scripts/live-cua-smoke.sh`
+- Anthropic Sandbox Runtime live local enforcement smoke: `scripts/live-anthropic-sandbox-runtime-smoke.sh`
+- Azure Container Apps dynamic sessions (shares the `azure` family, but
+  delegated-run): `internal/providers/azuredynamicsessions`, runner image `worker/azure-dynamic-sessions.Dockerfile`
+
+Service-control providers (no SSH lease and no arbitrary command execution):
+
+- Railway service control: `internal/providers/railway`
+- FastAPI Cloud app inspection: `internal/providers/fastapicloud`
+
+Shared and registration:
+
+- Provider backend interfaces, kinds, coordinator modes, and feature flags: `internal/cli/provider_backend.go`
+- Shared backend helpers: `internal/providers/shared`
+- Built-in provider registration (imports every adapter): `internal/providers/all/all.go`
+
+Coordinator-side provider operations (brokered providers only):
+
+- Hetzner: `worker/src/hetzner.ts`
+- AWS EC2 (provision, capacity fallback, private SSM workspaces, Mac hosts, orphan sweep): `worker/src/aws.ts`
+- Azure VM provision, canonical resource inventory, and owned-resource cleanup:
+  `worker/src/azure.ts`; coordinator lease and sweep orchestration:
+  `worker/src/fleet.ts`; GCP provision and image routes: `worker/src/gcp.ts`
+- Daytona sandbox lifecycle and rotating SSH access: `worker/src/daytona.ts`
+- Image create/read/delete/promote routing: `worker/src/fleet.ts`, `worker/src/os-image.ts`
+
+Bootstrap:
+
+- CLI cloud-init bootstrap: `internal/cli/bootstrap.go`
+- Worker cloud-init bootstrap: `worker/src/bootstrap.ts`
+- Shared script fragments, pinned downloads, and portable OS aliases/images: `recipes/bootstrap/v1/`; regenerate with `node scripts/generate-bootstrap.mjs` and verify with `--check`. See [runner bootstrap](features/runner-bootstrap.md#editing-shared-bootstrap-sources).
+- Generated consumers: `internal/cli/bootstrap_generated.go`, `internal/cli/os_image.go`, `worker/src/bootstrap.generated.ts`, `worker/src/os-image.generated.ts`
+- Shared rendering and catalog fixtures: `testdata/bootstrap/`; generator/parity/escaping tests: `scripts/generate-bootstrap.test.mjs`; composition tests: `internal/cli/bootstrap_shared_test.go`, `worker/test/bootstrap-shared.test.ts`
+- Portable OS normalization and provider image selection helpers: `internal/cli/os_image_resolve.go`; the generated catalog retains `internal/cli/os_image.go` for image-source and release verification.
+- Linux readiness recipes and generation remain separate: `recipes/linux/v1/`, `scripts/generate-linux-readiness.mjs`
+
+Bootstrap stays intentionally small unless optional lease capabilities are
+requested: OpenSSH, CA certificates, curl, Git, rsync, jq, the work root
+(`/work/crabbox` on Linux), cache directories, and the `crabbox-ready` readiness
+marker. `--desktop` adds resize-capable TigerVNC and a slim XFCE session;
+`--browser` adds Chrome stable with a Chromium fallback; `--code` adds
+code-server for the authenticated portal editor. Project runtimes (Go, Node,
+pnpm, Docker, databases) are repository-owned setup, usually driven through
+Actions hydration or repo scripts.
+
+Provider docs:
+
+- Per-provider feature notes: `docs/features/aws.md`, `docs/features/azure.md`, `docs/features/hetzner.md`, `docs/features/blacksmith-testbox.md`, `docs/features/namespace-devbox.md`, `docs/features/namespace-devbox-setup.md`, `docs/features/semaphore.md`, `docs/features/sprites.md`, `docs/features/daytona.md`, `docs/features/islo.md`, `docs/features/e2b.md`
+- Per-provider reference: `docs/providers/README.md` plus one file per provider under `docs/providers/`, including `docs/providers/aws-lambda-microvm.md` for Lambda MicroVM delegated execution and its runner image, `docs/providers/lambda.md` for the direct Lambda GPU SSH lease provider, `docs/providers/vast.md` for the direct Vast.ai GPU SSH lease provider, `docs/providers/blaxel.md` for delegated Blaxel sandbox execution, `docs/providers/apple-vm.md` for the local Apple Silicon `Virtualization.framework` path, `docs/providers/digitalocean.md` for the direct Droplet provider, `docs/providers/vultr.md` for the direct Vultr provider, `docs/providers/ovh.md` for the direct OVHcloud provider, `docs/providers/incus.md` for the separate local live validation contract, `docs/providers/sealos-devbox.md` for the Kubernetes-backed Sealos DevBox SSH lease, `docs/providers/superserve.md` for delegated Superserve execution and live proof, and `docs/providers/cloudflare-sandbox.md` for Cloudflare Sandbox bridge-backed delegated Linux execution
+- Provider selection, landscape, live-smoke, and backend authoring guide: `docs/features/provider-selection.md`, `docs/features/provider-landscape.md`, `docs/features/provider-live-smoke.md`, `docs/provider-backends.md`, `docs/features/provider-authoring.md`
+- Delegated runner contract for non-SSH hosted APIs: `docs/features/delegated-runner-contract.md`
+- Tailscale contract: `docs/features/tailscale.md`
+
+## Capabilities, Desktop, And Access Bridges
+
+- Desktop/browser/code capability flags, env injection, and VNC checks: `internal/cli/capabilities.go`, `internal/cli/run.go`
+- Desktop app launch, terminal, record, proof, input (`click`/`type`/`paste`/`key`): `internal/cli/desktop.go`, `internal/cli/desktop_input.go`, `internal/cli/desktop_proof.go`
+- VNC tunnel command: `internal/cli/vnc.go`
+- Generic SSH copy and local tunnel commands: `internal/cli/cp.go`, `internal/cli/tunnel.go`, `internal/cli/ssh_transport_session.go`
+- Screenshot capture (incl. direct RFB grab): `internal/cli/screenshot.go`, `internal/cli/rfb_screenshot.go`
+- WebVNC portal bridge and daemon process identity: `internal/cli/webvnc.go`, `internal/cli/webvnc_process_*.go`, `worker/src/portal.ts`, `worker/src/fleet.ts`
+- Workspace controller HTTP service, descriptor-verified durable state lock, crash-owned lifecycle subprocess adapter, and platform process controls: `internal/cli/controller.go`, `internal/cli/controller_service.go`, `internal/cli/controller_state_lock_*.go`, `internal/cli/controller_subprocess.go`, `internal/cli/controller_command_*.go`
+- Public Linux desktop bootstrap: `scripts/install-linux-desktop.sh`
+- Web code-server portal bridge: `internal/cli/code.go`, `worker/src/portal.ts`, `worker/src/fleet.ts`
+- Mediated egress bridge: `internal/cli/egress.go`, `internal/cli/coordinator.go`, `worker/src/index.ts`, `worker/src/fleet.ts`
+- Interactive desktop/VNC contract: `docs/features/interactive-desktop-vnc.md`, `docs/features/vnc-linux.md`, `docs/features/vnc-windows.md`, `docs/features/vnc-macos.md`
+- Mediated egress doc: `docs/features/egress.md`
+
+## Sync, Execution, Actions, And Results
+
+- Remote command flow, sync/reuse/release, heartbeat lifecycle: `internal/cli/run.go`
+- Run subcomponents (fresh PR, env profiles, downloads, capture, scripts, artifacts, failure handling, phases, observability): `internal/cli/run_fresh_pr.go`, `internal/cli/run_env_profile.go`, `internal/cli/run_download.go`, `internal/cli/run_capture.go`, `internal/cli/run_script.go`, `internal/cli/run_artifacts.go`, `internal/cli/run_failure.go`, `internal/cli/run_phase.go`, `internal/cli/run_observability.go`
+- Git manifest, rsync plan, fingerprints, and guardrails: `internal/cli/repo.go`
+- Sync-plan preview command: `internal/cli/sync_plan.go`
+- Native Windows target archive sync and PowerShell command wrapping: `internal/cli/sync_windows_target.go`, `internal/cli/ssh.go`
+- SSH command output, direct SSH touch, per-lease known_hosts and ControlMaster config: `internal/cli/ssh.go`, `internal/cli/ssh_cmd.go`
+- Named repo-local job orchestration: `internal/cli/job.go`
+- GitHub Actions hydrate/register/dispatch bridge: `internal/cli/actions.go`
+- Actions-first failure capsules: `internal/cli/capsule.go`
+- VM/workspace checkpoints (create/list/inspect/restore/fork/delete/prune): `internal/cli/checkpoint.go`, `internal/cli/checkpoint_native.go`, `internal/cli/checkpoint_store.go`
+- Cache list/stats/purge/warm commands: `internal/cli/cache.go`
+- Run history creation/retry, logs/events/attach, and retained run logs: `internal/cli/history.go`, `internal/cli/run_recorder.go`, `internal/cli/run_output_events.go`, `internal/cli/runlog.go`, `internal/cli/control_ws.go`
+- JUnit result parsing, remote markers, and the `results` command: `internal/cli/results.go`, `internal/cli/results_parse.go`, `internal/cli/results_remote.go`
+- Per-run telemetry sampling: `internal/cli/telemetry.go`
+- Run timing breakdowns: `internal/cli/timing.go`
+
+## Artifacts, Media, And Pond
+
+- Artifact bundle collect/video/gif/template/publish/list/pull and regular-file publication checks: `internal/cli/artifacts.go`, `internal/cli/artifacts_manifest.go`, `internal/cli/artifacts_publish.go`
+- Automatic failure-bundle member/link confinement: `internal/cli/run_observability.go`
+- Media preview (trimmed GIF/MP4): `internal/cli/media.go`
+- Worker artifact upload endpoint and storage: `worker/src/artifacts.ts`, `worker/src/fleet.ts`
+- Pond peer discovery, SSH-mesh forwards, ACL tags, bulk release: `internal/cli/pond.go`, `internal/cli/pond_acl.go`, `internal/cli/pond_bridge.go`, `internal/cli/pond_bridge_doctor.go`, `internal/cli/pond_mesh.go`
+
+## Worker API, Cost, And Operations
+
+- Shared coordinator auth and top-level routing: `worker/src/coordinator-entry.ts`, `worker/src/index.ts`, `worker/src/auth.ts`
+- HTTP response/request helpers: `worker/src/http.ts`
+- GitHub OAuth login flow and user-token issuance: `worker/src/oauth.ts`
+- Shared fleet routes and behavior: `worker/src/fleet.ts`
+- Cloudflare runtime adapter: `worker/src/coordinator-runtime.ts`
+- Node.js/PostgreSQL runtime, HTTP/WebSocket server, default-chain AWS credentials, private AWS deployment guard, and durable jobs: `worker/node/node-runtime.ts`, `worker/node/postgres-storage.ts`, `worker/node/server.ts`, `worker/node/aws-credentials.ts`, `worker/node/aws-deployment.ts`
+- Node request limits, trusted proxy handling, and graceful shutdown: `worker/node/server-support.ts`, `worker/node/server.ts`
+- Direct-provider coordinator registration and automatic WebVNC bridge startup: `internal/cli/coordinator_registration.go`, `internal/cli/coordinator.go`, `internal/cli/webvnc.go`
+- Browser portal lease detail, bridge status, and run log/event pages: `worker/src/portal.ts`, `worker/src/fleet.ts`
+- Usage aggregation, pricing fallback, owner/org limits, and cost guardrails: `worker/src/usage.ts`
+- Worker package scripts and dependencies: `worker/package.json`
+- Coordinator deployment config: `worker/wrangler.jsonc`, `worker/wrangler.cloudflare.jsonc`, `worker/Dockerfile.node`, `deploy/aws/ecs-fargate-coordinator.yaml`
+
+## Cross-cutting Feature Docs
+
+- Configuration precedence and YAML schema: `docs/features/configuration.md` (code: `internal/cli/config.go`, `internal/cli/config_cmd.go`)
+- Jobs: `docs/features/jobs.md` (code: `internal/cli/job.go`)
+- Identifiers (lease IDs, slugs, claims, run IDs): `docs/features/identifiers.md` (code: `internal/cli/lease.go`, `internal/cli/slug.go`, `internal/cli/claim.go`)
+- Doctor checks: `docs/features/doctor.md` (code: `internal/cli/doctor.go`; readiness API in `worker/src/fleet.ts`)
+- Network and reachability: `docs/features/network.md` (code: `internal/cli/network.go`)
+- Lease capabilities: `docs/features/capabilities.md` (code: `internal/cli/capabilities.go`)
+- Environment forwarding: `docs/features/env-forwarding.md` (logic in `internal/cli/run.go`, `internal/cli/run_env_profile.go`)
+- Mediated egress: `docs/features/egress.md`
+- Capacity and fallback: `docs/features/capacity-fallback.md` (code: `internal/cli/aws.go`, `worker/src/aws.ts`; class maps in `internal/cli/config.go`)
+- Telemetry: `docs/features/telemetry.md` (code: `internal/cli/telemetry.go`)
+- Browser portal: `docs/features/portal.md` (code: `worker/src/portal.ts`)
+- Capsules: `docs/features/capsules.md` (code: `internal/cli/capsule.go`)
+- Checkpoints: `docs/features/checkpoints.md` (code: `internal/cli/checkpoint.go`)
+- Pond: `docs/features/pond.md` (code: `internal/cli/pond*.go`)
+- Artifacts: `docs/features/artifacts.md` (code: `internal/cli/artifacts*.go`)
+- Provider authoring guide: `docs/features/provider-authoring.md` (cross-references `internal/cli/provider_backend.go` and `internal/providers/*`)
+- Concepts/glossary: `docs/concepts.md`
+- Getting started walkthrough: `docs/getting-started.md`
+
+## Build, CI, Docs, And Release
+
+- Go module and toolchain version: `go.mod`
+- Go core coverage gate: `scripts/check-go-coverage.sh`
+- CI gate: `.github/workflows/ci.yml`
+- Protected native release verifier: `.github/workflows/release-assets.yml`
+- Credential-free GoReleaser archive config: `.goreleaser.yaml`
+- Local signing, draft, publication, and downstream proof contract: `docs/RELEASING.md`, `scripts/package-release.sh`, `scripts/create-release-draft.sh`, `scripts/publish-release.sh`, `scripts/verify-homebrew-release.sh`
+- Docs command-surface check, link check, site builder, and Pages deploy: `scripts/check-command-docs.mjs`, `scripts/check-docs-links.mjs`, `scripts/build-docs-site.mjs`, `.github/workflows/pages.yml`
+- Live provider smoke coverage: `scripts/live-smoke.sh`, plus provider-specific guarded smokes such as `scripts/live-blaxel-smoke.sh`, `scripts/live-cua-smoke.sh`, `scripts/live-digitalocean-smoke.sh`, `scripts/live-github-codespaces-smoke.sh`, `scripts/live-vultr-smoke.sh`, `scripts/live-vast-smoke.sh`, and `scripts/live-superserve-smoke.sh`
+- Live coordinator auth smoke coverage: `scripts/live-auth-smoke.sh`

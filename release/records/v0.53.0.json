@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "repository": "dawsonblock/crabedence-V1",
+  "tag": "v0.53.0",
+  "tagObject": "a4d1569d487742fdc7810617342e42e42c0cf106",
+  "sourceCommit": "9196668d67d0db3257c310341a04056db594f020",
+  "publicationStatus": "blocked",
+  "blocker": "persistence integrity: lease and ready-pool transitions were applied to the caller's stale record with no revision check (same-state lost update), and terminal-attempt garbage collection could race a terminal commit and delete a log the run references. The signed tag is preserved; the fixes land in v0.53.1."
+}

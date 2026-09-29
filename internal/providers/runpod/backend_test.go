@@ -1,0 +1,1131 @@
+package runpod
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	core "github.com/openclaw/crabbox/internal/cli"
+)
+
+func TestRunpodProviderSpec(t *testing.T) {
+	spec := Provider{}.Spec()
+	if spec.Name != providerName {
+		t.Fatalf("spec.Name = %q, want %q", spec.Name, providerName)
+	}
+	if spec.Kind != "ssh-lease" {
+		t.Fatalf("spec.Kind = %q, want ssh-lease", spec.Kind)
+	}
+	aliases := Provider{}.Aliases()
+	if len(aliases) != 2 || aliases[0] != "run-pod" || aliases[1] != "runpodio" {
+		t.Fatalf("aliases = %#v, want [run-pod runpodio]", aliases)
+	}
+}
+
+func TestRunpodClientRedactsReflectedCredential(t *testing.T) {
+	const secret = "runpod-secret-token"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"message":"Bearer `+secret+` quota exceeded"}`)
+	}))
+	defer server.Close()
+
+	client, err := newRunpodClient(Config{Runpod: RunpodConfig{APIKey: secret, APIURL: server.URL}}, Runtime{HTTP: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Whoami(context.Background())
+	if err == nil || strings.Contains(err.Error(), secret) || !strings.Contains(err.Error(), "[redacted]") || !strings.Contains(err.Error(), "quota exceeded") {
+		t.Fatalf("Whoami error=%v, want redacted useful provider error", err)
+	}
+	var apiErr *runpodAPIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusUnauthorized || apiErr.Status != "401 Unauthorized" {
+		t.Fatalf("API error classification changed: %v", err)
+	}
+}
+
+func TestRunpodIsRunpodProviderNameAcceptsAliases(t *testing.T) {
+	for _, name := range []string{"runpod", "Run-Pod", "  runpodio  ", "RUNPOD"} {
+		if !isRunpodProviderName(name) {
+			t.Fatalf("isRunpodProviderName(%q) = false, want true", name)
+		}
+	}
+	for _, name := range []string{"", "exe-dev", "railway", "runpods"} {
+		if isRunpodProviderName(name) {
+			t.Fatalf("isRunpodProviderName(%q) = true, want false", name)
+		}
+	}
+}
+
+func TestRunpodClientRequiresAPIKey(t *testing.T) {
+	cfg := Config{}
+	cfg.Runpod.APIURL = "https://rest.runpod.io/v1"
+	if _, err := newRunpodClient(cfg, Runtime{}); err == nil {
+		t.Fatal("newRunpodClient accepted empty API key")
+	}
+}
+
+func TestRunpodClientRejectsBareHTTPURL(t *testing.T) {
+	cfg := Config{}
+	cfg.Runpod.APIKey = "test-key"
+	cfg.Runpod.APIURL = "http://rest.runpod.io/v1"
+	if _, err := newRunpodClient(cfg, Runtime{}); err == nil {
+		t.Fatal("newRunpodClient accepted plaintext http URL")
+	}
+}
+
+func TestRunpodClientAllowsLoopbackHTTPURL(t *testing.T) {
+	cfg := Config{}
+	cfg.Runpod.APIKey = "test-key"
+	cfg.Runpod.APIURL = "http://127.0.0.1:8080/v1"
+	if _, err := newRunpodClient(cfg, Runtime{}); err != nil {
+		t.Fatalf("loopback http rejected: %v", err)
+	}
+}
+
+func TestRunpodTokenFlagIsNotRegistered(t *testing.T) {
+	cfg := Config{}
+	cfg.Runpod.APIKey = "secret-key"
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	RegisterRunpodProviderFlags(fs, cfg)
+	for _, name := range []string{"runpod-token", "runpod-api-token", "runpod-key", "runpod-api-key"} {
+		if fs.Lookup(name) != nil {
+			t.Fatalf("runpod API key surfaced as a flag --%s", name)
+		}
+	}
+	for _, name := range []string{"runpod-url", "runpod-cloud-type", "runpod-instance-id", "runpod-image", "runpod-template-id", "runpod-disk-gb", "runpod-user", "runpod-work-root"} {
+		if fs.Lookup(name) == nil {
+			t.Fatalf("%s flag missing", name)
+		}
+	}
+}
+
+func TestRunpodFlagsRejectGenericClassAndType(t *testing.T) {
+	for _, args := range [][]string{
+		{"--class", "beast"},
+		{"--type", "ubuntu:24.04"},
+	} {
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		fs.String("class", "", "")
+		fs.String("type", "", "")
+		values := RegisterRunpodProviderFlags(fs, Config{})
+		if err := fs.Parse(args); err != nil {
+			t.Fatal(err)
+		}
+		cfg := Config{Provider: providerName}
+		err := ApplyRunpodProviderFlags(&cfg, fs, values)
+		if err == nil || !strings.Contains(err.Error(), "not supported for provider=runpod") {
+			t.Fatalf("args=%v err=%v", args, err)
+		}
+	}
+}
+
+func TestRunpodConfigureRejectsUnsupportedTargetAndTailscale(t *testing.T) {
+	for name, cfg := range map[string]Config{
+		"macos target": {TargetOS: "macos"},
+		"tailscale":    {TargetOS: targetLinux, Tailscale: TailscaleConfig{Enabled: true}},
+		"network":      {TargetOS: targetLinux, Network: "tailscale"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Provider{}.Configure(cfg, Runtime{Stdout: io.Discard, Stderr: io.Discard})
+			if err == nil {
+				t.Fatal("expected error")
+			}
+		})
+	}
+}
+
+func TestRunpodDefaultsPickPublicSSHGPUAndPreserveCustomWorkRoot(t *testing.T) {
+	cfg := Config{}
+	applyRunpodDefaults(&cfg)
+	if cfg.Runpod.APIURL != "https://rest.runpod.io/v1" {
+		t.Fatalf("default apiUrl = %q, want REST API", cfg.Runpod.APIURL)
+	}
+	if cfg.Runpod.InstanceID != "NVIDIA L4,NVIDIA RTX 4000 Ada Generation,NVIDIA RTX A4000,NVIDIA GeForce RTX 3090,NVIDIA GeForce RTX 4090,NVIDIA RTX A5000,NVIDIA RTX A4500" {
+		t.Fatalf("default instanceId = %q, want GPU priority list", cfg.Runpod.InstanceID)
+	}
+	if cfg.Runpod.CloudType != "SECURE" {
+		t.Fatalf("default cloudType = %q, want SECURE", cfg.Runpod.CloudType)
+	}
+	if cfg.Runpod.DiskGB != 20 {
+		t.Fatalf("default diskGB = %d, want 20", cfg.Runpod.DiskGB)
+	}
+
+	cfg = Config{WorkRoot: "/custom/crabbox"}
+	applyRunpodDefaults(&cfg)
+	if cfg.WorkRoot != "/custom/crabbox" || cfg.Runpod.WorkRoot != "/custom/crabbox" {
+		t.Fatalf("workRoot=%q runpod.workRoot=%q", cfg.WorkRoot, cfg.Runpod.WorkRoot)
+	}
+
+	cfg = Config{WorkRoot: "/custom/crabbox", Runpod: RunpodConfig{WorkRoot: "/runpod/crabbox"}}
+	applyRunpodDefaults(&cfg)
+	if cfg.WorkRoot != "/runpod/crabbox" || cfg.Runpod.WorkRoot != "/runpod/crabbox" {
+		t.Fatalf("workRoot=%q runpod.workRoot=%q", cfg.WorkRoot, cfg.Runpod.WorkRoot)
+	}
+}
+
+func TestRunpodSSHEndpointPicksPublicPort22(t *testing.T) {
+	pod := runpodPod{Runtime: &runpodRuntime{Ports: []runpodRuntimePort{
+		{IP: "10.0.0.1", PrivatePort: 8888, PublicPort: 41234, IsIPPublic: true, Type: "tcp"},
+		{IP: "203.0.113.5", PrivatePort: 22, PublicPort: 32100, IsIPPublic: true, Type: "tcp"},
+		{IP: "203.0.113.5", PrivatePort: 22, PublicPort: 32101, IsIPPublic: true, Type: "tcp"},
+	}}}
+	endpoint := pod.SSHEndpoint()
+	if endpoint.Host != "203.0.113.5" || endpoint.Port != 32100 || endpoint.Kind != "public-tcp" || !endpoint.Public {
+		t.Fatalf("endpoint=%#v, want public 203.0.113.5:32100", endpoint)
+	}
+
+	pod = runpodPod{Runtime: &runpodRuntime{Ports: []runpodRuntimePort{
+		{IP: "10.0.0.1", PrivatePort: 22, PublicPort: 32100, IsIPPublic: false, Type: "tcp"},
+	}}, Machine: runpodMachine{PodHostID: "pod-host-id"}}
+	endpoint = pod.SSHEndpoint()
+	if endpoint.Host != "" || endpoint.Port != 0 {
+		t.Fatalf("private mapping should not yield SSH endpoint, got %#v", endpoint)
+	}
+
+	pod = runpodPod{Runtime: nil}
+	endpoint = pod.SSHEndpoint()
+	if endpoint.Host != "" || endpoint.Port != 0 {
+		t.Fatalf("nil runtime without host id should yield empty endpoint, got %#v", endpoint)
+	}
+}
+
+func TestRunpodDeployPayloadUsesGPUAvailabilityPriority(t *testing.T) {
+	payload := runpodDeployPayload(runpodDeployInput{
+		Name:              "crabbox-blue-12345678",
+		ImageName:         "runpod/pytorch:custom",
+		InstanceID:        "NVIDIA L4, NVIDIA RTX A4000",
+		CloudType:         "SECURE",
+		ContainerDiskInGb: 20,
+		Ports:             "22/tcp",
+	})
+	if payload["computeType"] != "GPU" || payload["gpuTypePriority"] != "availability" {
+		t.Fatalf("payload=%#v", payload)
+	}
+	gpuIDs, ok := payload["gpuTypeIds"].([]string)
+	if !ok || len(gpuIDs) != 2 || gpuIDs[0] != "NVIDIA L4" || gpuIDs[1] != "NVIDIA RTX A4000" {
+		t.Fatalf("gpuTypeIds=%#v", payload["gpuTypeIds"])
+	}
+	ports, ok := payload["ports"].([]string)
+	if !ok || len(ports) != 1 || ports[0] != "22/tcp" {
+		t.Fatalf("ports=%#v", payload["ports"])
+	}
+	if payload["supportPublicIp"] != true {
+		t.Fatalf("supportPublicIp=%#v", payload["supportPublicIp"])
+	}
+}
+
+func TestRunpodDeployPayloadSerializesSSHPublicKey(t *testing.T) {
+	payload := runpodDeployPayload(runpodDeployInput{
+		InstanceID: "NVIDIA L4",
+		PublicKey:  testRunpodPublicKey,
+	})
+	data, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded struct {
+		Env map[string]string `json:"env"`
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Env["PUBLIC_KEY"] != testRunpodPublicKey {
+		t.Fatalf("serialized PUBLIC_KEY=%q, want configured key", decoded.Env["PUBLIC_KEY"])
+	}
+}
+
+func TestRunpodSSHTargetUsesPublicPortAndUser(t *testing.T) {
+	cfg := Config{Runpod: RunpodConfig{User: "root", WorkRoot: "/tmp/crabbox"}}
+	applyRunpodDefaults(&cfg)
+	pod := runpodPod{Name: "crabbox-blue-12345678", ID: "pod_abc", Runtime: &runpodRuntime{Ports: []runpodRuntimePort{
+		{IP: "203.0.113.7", PrivatePort: 22, PublicPort: 41010, IsIPPublic: true, Type: "tcp"},
+	}}}
+	target := runpodSSHTarget(cfg, pod)
+	if target.Host != "203.0.113.7" || target.Port != "41010" {
+		t.Fatalf("target=%#v", target)
+	}
+	if target.User != "root" {
+		t.Fatalf("target user=%q, want root", target.User)
+	}
+	if target.TargetOS != targetLinux || target.NetworkKind != networkPublic {
+		t.Fatalf("target=%#v", target)
+	}
+}
+
+func TestRunpodDefaultsUseRootInsteadOfLocalUser(t *testing.T) {
+	t.Setenv("USER", "alice")
+	cfg := Config{}
+	applyRunpodDefaults(&cfg)
+	if cfg.SSHUser != "root" {
+		t.Fatalf("ssh user=%q, want root", cfg.SSHUser)
+	}
+
+	cfg = Config{Runpod: RunpodConfig{User: "ubuntu"}}
+	applyRunpodDefaults(&cfg)
+	if cfg.SSHUser != "ubuntu" {
+		t.Fatalf("explicit runpod user=%q, want ubuntu", cfg.SSHUser)
+	}
+
+	cfg = Config{SSHUser: "custom"}
+	applyRunpodDefaults(&cfg)
+	if cfg.SSHUser != "custom" {
+		t.Fatalf("explicit generic user=%q, want custom", cfg.SSHUser)
+	}
+}
+
+func TestRunpodLeaseIdentityHandlesNamedAndManualPods(t *testing.T) {
+	leaseID, slug := runpodLeaseIdentity("crabbox-blue-12345678")
+	if leaseID != "rpod_12345678" || slug != "blue" {
+		t.Fatalf("leaseID=%q slug=%q", leaseID, slug)
+	}
+	leaseID, slug = runpodLeaseIdentity("manual-pod")
+	if leaseID != "rpod_manual-pod" || slug != "manual-pod" {
+		t.Fatalf("leaseID=%q slug=%q", leaseID, slug)
+	}
+	leaseID, slug = runpodLeaseIdentity("")
+	if leaseID != "rpod_manual" || slug != "manual" {
+		t.Fatalf("leaseID=%q slug=%q", leaseID, slug)
+	}
+}
+
+func TestRunpodDoctorChecksAuthAndListPods(t *testing.T) {
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer test-key" {
+			t.Errorf("auth = %q, want Bearer test-key", r.Header.Get("Authorization"))
+		}
+		if r.Header.Get("Content-Type") != "" {
+			t.Errorf("content-type = %q", r.Header.Get("Content-Type"))
+		}
+		paths = append(paths, r.URL.Path)
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer server.Close()
+
+	cfg := Config{}
+	cfg.Runpod.APIKey = "test-key"
+	cfg.Runpod.APIURL = server.URL
+	doctor, err := Provider{}.ConfigureDoctor(cfg, Runtime{Stdout: io.Discard, Stderr: io.Discard, HTTP: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := doctor.Doctor(context.Background(), DoctorRequest{})
+	if err != nil {
+		t.Fatalf("doctor returned err: %v", err)
+	}
+	if result.Provider != providerName {
+		t.Fatalf("provider=%q", result.Provider)
+	}
+	if len(paths) != 2 || paths[0] != "/pods" || paths[1] != "/pods" {
+		t.Fatalf("paths=%v, want two /pods reads", paths)
+	}
+}
+
+func TestRunpodDoctorReportsMissingAPIKey(t *testing.T) {
+	doctor, err := Provider{}.ConfigureDoctor(Config{}, Runtime{Stdout: io.Discard, Stderr: io.Discard})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = doctor.Doctor(context.Background(), DoctorRequest{})
+	if err == nil || !strings.Contains(err.Error(), "RUNPOD_API_KEY") {
+		t.Fatalf("err=%v, want clear missing-key message", err)
+	}
+}
+
+type fakeRunpodAPI struct {
+	mu           sync.Mutex
+	whoamiCalls  int
+	listCalls    int
+	deployCalls  []runpodDeployInput
+	getCalls     []string
+	terminated   []string
+	listPods     []runpodPod
+	getPod       func(string) (runpodPod, error)
+	terminatePod func(context.Context, string) error
+	deployPod    runpodPod
+}
+
+const testRunpodPublicKey = "ssh-ed25519 AAAATEST crabbox-runpod-test"
+
+func testRunpodConfig(t *testing.T) Config {
+	t.Helper()
+	keyPath := t.TempDir() + "/id_ed25519"
+	if err := os.WriteFile(keyPath+".pub", []byte(testRunpodPublicKey+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return Config{
+		SSHKey: keyPath,
+		Runpod: RunpodConfig{
+			APIKey:     "test-key",
+			InstanceID: "NVIDIA L4",
+		},
+	}
+}
+
+func (f *fakeRunpodAPI) Whoami(_ context.Context) (runpodMyself, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.whoamiCalls++
+	return runpodMyself{ID: "user_x", Email: "a@b"}, nil
+}
+func (f *fakeRunpodAPI) DeployPod(_ context.Context, input runpodDeployInput) (runpodPod, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deployCalls = append(f.deployCalls, input)
+	return f.deployPod, nil
+}
+func (f *fakeRunpodAPI) GetPod(_ context.Context, podID string) (runpodPod, error) {
+	f.mu.Lock()
+	f.getCalls = append(f.getCalls, podID)
+	getPod := f.getPod
+	deployPod := f.deployPod
+	f.mu.Unlock()
+	if getPod != nil {
+		return getPod(podID)
+	}
+	return deployPod, nil
+}
+func (f *fakeRunpodAPI) ListPods(_ context.Context) ([]runpodPod, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.listCalls++
+	return f.listPods, nil
+}
+func (f *fakeRunpodAPI) TerminatePod(ctx context.Context, podID string) error {
+	f.mu.Lock()
+	f.terminated = append(f.terminated, podID)
+	terminatePod := f.terminatePod
+	f.mu.Unlock()
+	if terminatePod != nil {
+		return terminatePod(ctx, podID)
+	}
+	return nil
+}
+
+func TestRunpodAcquireUsesConfiguredSSHPublicKey(t *testing.T) {
+	fake := &fakeRunpodAPI{
+		deployPod: runpodPod{ID: "pod_created"},
+		getPod: func(string) (runpodPod, error) {
+			return runpodPod{}, errors.New("stop after deploy")
+		},
+	}
+	backend := &runpodLeaseBackend{
+		cfg:    testRunpodConfig(t),
+		rt:     Runtime{Stdout: io.Discard, Stderr: io.Discard},
+		client: fake,
+	}
+
+	if _, err := backend.Acquire(context.Background(), AcquireRequest{Repo: core.Repo{Root: t.TempDir()}}); err == nil {
+		t.Fatal("Acquire succeeded after the fake readiness failure")
+	}
+	if len(fake.deployCalls) != 1 || fake.deployCalls[0].PublicKey != testRunpodPublicKey {
+		t.Fatalf("deploy calls=%#v, want configured public key", fake.deployCalls)
+	}
+}
+
+func TestRunpodAcquireRejectsInvalidSSHPublicKeyBeforeDeploy(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*testing.T, *Config)
+		wantError string
+	}{
+		{
+			name: "unconfigured key path",
+			configure: func(_ *testing.T, cfg *Config) {
+				cfg.SSHKey = ""
+			},
+			wantError: "ssh key path is not configured",
+		},
+		{
+			name: "missing public key",
+			configure: func(t *testing.T, cfg *Config) {
+				t.Helper()
+				if err := os.Remove(cfg.SSHKey + ".pub"); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantError: "read ssh public key",
+		},
+		{
+			name: "empty public key",
+			configure: func(t *testing.T, cfg *Config) {
+				t.Helper()
+				if err := os.WriteFile(cfg.SSHKey+".pub", nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantError: "is empty",
+		},
+		{
+			name: "private key material",
+			configure: func(t *testing.T, cfg *Config) {
+				t.Helper()
+				privateKey := "-----BEGIN OPENSSH PRIVATE KEY-----\nnot-a-public-key\n-----END OPENSSH PRIVATE KEY-----\n"
+				if err := os.WriteFile(cfg.SSHKey+".pub", []byte(privateKey), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantError: "is not a supported OpenSSH public key",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := testRunpodConfig(t)
+			test.configure(t, &cfg)
+			fake := &fakeRunpodAPI{}
+			backend := &runpodLeaseBackend{
+				cfg:    cfg,
+				rt:     Runtime{Stdout: io.Discard, Stderr: io.Discard},
+				client: fake,
+			}
+
+			_, err := backend.Acquire(context.Background(), AcquireRequest{Repo: core.Repo{Root: t.TempDir()}})
+			var exitErr core.ExitError
+			if err == nil || !core.AsExitError(err, &exitErr) || exitErr.Code != 2 || !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("Acquire error=%v, want exit 2 containing %q", err, test.wantError)
+			}
+			if len(fake.deployCalls) != 0 {
+				t.Fatalf("deploy calls=%#v, want zero paid resources created", fake.deployCalls)
+			}
+		})
+	}
+}
+
+func TestRunpodListFiltersCrabboxPodsByDefault(t *testing.T) {
+	fake := &fakeRunpodAPI{listPods: []runpodPod{
+		{ID: "pod_a", Name: "crabbox-blue-12345678", DesiredStatus: "RUNNING"},
+		{ID: "pod_b", Name: "manual-pod", DesiredStatus: "RUNNING"},
+	}}
+	backend := &runpodLeaseBackend{cfg: Config{Runpod: RunpodConfig{APIKey: "k"}}, rt: Runtime{Stdout: io.Discard, Stderr: io.Discard}, client: fake}
+	views, err := backend.List(context.Background(), ListRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(views) != 1 || views[0].Name != "crabbox-blue-12345678" || views[0].Provider != providerName {
+		t.Fatalf("views=%#v", views)
+	}
+	views, err = backend.List(context.Background(), ListRequest{All: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(views) != 2 {
+		t.Fatalf("views=%#v", views)
+	}
+}
+
+func TestRunpodWaitForPodSSHReturnsWhenPublicPortReady(t *testing.T) {
+	calls := 0
+	fake := &fakeRunpodAPI{getPod: func(id string) (runpodPod, error) {
+		calls++
+		if calls < 2 {
+			return runpodPod{ID: id, Name: "crabbox-blue-12345678", DesiredStatus: "PROVISIONING"}, nil
+		}
+		return runpodPod{ID: id, Name: "crabbox-blue-12345678", DesiredStatus: "RUNNING", Runtime: &runpodRuntime{Ports: []runpodRuntimePort{
+			{IP: "203.0.113.9", PrivatePort: 22, PublicPort: 41200, IsIPPublic: true, Type: "tcp"},
+		}}}, nil
+	}}
+	backend := &runpodLeaseBackend{
+		cfg:                 Config{Runpod: RunpodConfig{APIKey: "k"}},
+		rt:                  Runtime{Stdout: io.Discard, Stderr: io.Discard},
+		client:              fake,
+		pollInitialOverride: 10 * time.Millisecond,
+		pollTimeoutOverride: 2 * time.Second,
+	}
+	pod, err := backend.waitForPodSSH(context.Background(), fake, "pod_a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := pod.SSHEndpoint()
+	if endpoint.Host != "203.0.113.9" || endpoint.Port != 41200 {
+		t.Fatalf("endpoint=%#v", endpoint)
+	}
+}
+
+func TestRunpodWaitForSSHRejectsProxyOnlyPods(t *testing.T) {
+	fake := &fakeRunpodAPI{getPod: func(id string) (runpodPod, error) {
+		return runpodPod{ID: id, Name: "crabbox-blue-12345678", DesiredStatus: "RUNNING", Machine: runpodMachine{PodHostID: "pod_abc-1234"}}, nil
+	}}
+	backend := &runpodLeaseBackend{
+		cfg:                 Config{Runpod: RunpodConfig{APIKey: "k"}},
+		rt:                  Runtime{Stdout: io.Discard, Stderr: io.Discard},
+		client:              fake,
+		pollInitialOverride: 10 * time.Millisecond,
+		pollTimeoutOverride: 2 * time.Second,
+	}
+	_, err := backend.waitForPodSSH(context.Background(), fake, "pod_a")
+	if err == nil || !strings.Contains(err.Error(), "ssh endpoint not exposed") {
+		t.Fatalf("err=%v, want timeout without public TCP endpoint", err)
+	}
+}
+
+func TestRunpodAcquireRollbackUsesBoundedCleanup(t *testing.T) {
+	terminateErr := errors.New("terminate failed")
+	fake := &fakeRunpodAPI{
+		deployPod: runpodPod{ID: "pod_failed", Name: "crabbox-blue-12345678", DesiredStatus: "PROVISIONING"},
+		getPod: func(id string) (runpodPod, error) {
+			return runpodPod{ID: id, Name: "crabbox-blue-12345678", DesiredStatus: "PROVISIONING"}, nil
+		},
+		terminatePod: func(ctx context.Context, podID string) error {
+			if podID != "pod_failed" {
+				t.Fatalf("podID=%q, want pod_failed", podID)
+			}
+			if _, ok := ctx.Deadline(); !ok {
+				t.Fatal("cleanup context should have a deadline")
+			}
+			return terminateErr
+		},
+	}
+	backend := &runpodLeaseBackend{
+		cfg:                    testRunpodConfig(t),
+		rt:                     Runtime{Stdout: io.Discard, Stderr: io.Discard},
+		client:                 fake,
+		pollInitialOverride:    time.Millisecond,
+		pollTimeoutOverride:    5 * time.Millisecond,
+		cleanupTimeoutOverride: 20 * time.Millisecond,
+	}
+
+	_, err := backend.Acquire(context.Background(), AcquireRequest{Repo: core.Repo{Root: t.TempDir()}})
+	if err == nil || !strings.Contains(err.Error(), "ssh endpoint not exposed") || !strings.Contains(err.Error(), "cleanup failed") || !errors.Is(err, terminateErr) {
+		t.Fatalf("err=%v, want original wait failure plus cleanup failure", err)
+	}
+	if len(fake.terminated) != 1 || fake.terminated[0] != "pod_failed" {
+		t.Fatalf("terminated=%v", fake.terminated)
+	}
+}
+
+func TestRunpodAcquireRollbackCannotBlockForever(t *testing.T) {
+	fake := &fakeRunpodAPI{
+		deployPod: runpodPod{ID: "pod_blocked", Name: "crabbox-blue-12345678", DesiredStatus: "PROVISIONING"},
+		getPod: func(id string) (runpodPod, error) {
+			return runpodPod{ID: id, Name: "crabbox-blue-12345678", DesiredStatus: "PROVISIONING"}, nil
+		},
+		terminatePod: func(ctx context.Context, _ string) error {
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+	backend := &runpodLeaseBackend{
+		cfg:                    testRunpodConfig(t),
+		rt:                     Runtime{Stdout: io.Discard, Stderr: io.Discard},
+		client:                 fake,
+		pollInitialOverride:    time.Millisecond,
+		pollTimeoutOverride:    5 * time.Millisecond,
+		cleanupTimeoutOverride: 20 * time.Millisecond,
+	}
+	_, err := backend.Acquire(context.Background(), AcquireRequest{Repo: core.Repo{Root: t.TempDir()}})
+	if err == nil || !strings.Contains(err.Error(), "cleanup failed") || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err=%v, want bounded cleanup deadline error", err)
+	}
+	if len(fake.terminated) != 1 || fake.terminated[0] != "pod_blocked" {
+		t.Fatalf("terminated=%v", fake.terminated)
+	}
+}
+
+func TestRunpodAcquireRejectsMismatchedReadyPodAndRollsBack(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		mutate     func(*runpodPod)
+		diagnostic string
+	}{
+		{"different ID", func(p *runpodPod) { p.ID = "pod_other" }, "readiness resolved pod_other"},
+		{"missing ID", func(p *runpodPod) { p.ID = "" }, "readiness resolved <empty>"},
+		{"different name", func(p *runpodPod) { p.Name = "other-name" }, "readiness returned other-name"},
+		{"missing name", func(p *runpodPod) { p.Name = "" }, "readiness returned <empty>"},
+	} {
+		for _, keep := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/keep=%v", tt.name, keep), func(t *testing.T) {
+				fake := &fakeRunpodAPI{deployPod: runpodPod{ID: "pod_created"}}
+				fake.getPod = func(id string) (runpodPod, error) {
+					if id != "pod_created" {
+						t.Fatalf("GET pod=%s", id)
+					}
+					pod := runpodPod{
+						ID: "pod_created", Name: fake.deployCalls[0].Name, DesiredStatus: "RUNNING",
+						Runtime: &runpodRuntime{Ports: []runpodRuntimePort{{
+							IP: "203.0.113.9", PrivatePort: 22, PublicPort: 41200, IsIPPublic: true, Type: "tcp",
+						}}},
+					}
+					tt.mutate(&pod)
+					return pod, nil
+				}
+				backend := &runpodLeaseBackend{cfg: testRunpodConfig(t), rt: Runtime{Stdout: io.Discard, Stderr: io.Discard}, client: fake}
+				_, err := backend.Acquire(context.Background(), AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, Keep: keep})
+				if err == nil || !strings.Contains(err.Error(), tt.diagnostic) {
+					t.Fatalf("err=%v, want %s", err, tt.diagnostic)
+				}
+				if keep {
+					if len(fake.terminated) != 0 {
+						t.Fatalf("kept pod terminated: %v", fake.terminated)
+					}
+				} else if len(fake.terminated) != 1 || fake.terminated[0] != "pod_created" {
+					t.Fatalf("terminated=%v, want original pod only", fake.terminated)
+				}
+			})
+		}
+	}
+}
+
+func TestRunpodResolveReleaseOnlyRejectsUnclaimedPodWithoutProviderLookup(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	fake := &fakeRunpodAPI{}
+	backend := &runpodLeaseBackend{cfg: Config{Runpod: RunpodConfig{APIKey: "k"}}, rt: Runtime{Stdout: io.Discard, Stderr: io.Discard}, client: fake}
+
+	_, err := backend.Resolve(context.Background(), ResolveRequest{ID: "pod_manual", ReleaseOnly: true})
+	if err == nil || !strings.Contains(err.Error(), "no exact resource-bound local claim") {
+		t.Fatalf("err=%v, want unclaimed refusal", err)
+	}
+	if len(fake.getCalls) != 0 || len(fake.terminated) != 0 {
+		t.Fatalf("getCalls=%v terminated=%v, want no provider mutation path", fake.getCalls, fake.terminated)
+	}
+}
+
+func TestRunpodResolveReleaseOnlyPrefersLocalSlugOverProviderAlias(t *testing.T) {
+	tests := []struct {
+		name       string
+		identifier string
+		pod        runpodPod
+	}{
+		{name: "provider id", identifier: "pod-collision", pod: runpodPod{ID: "pod-collision", Name: "crabbox-remote-456789ab", DesiredStatus: "RUNNING"}},
+		{name: "pod name", identifier: "name-collision", pod: runpodPod{ID: "pod-remote", Name: "name-collision", DesiredStatus: "RUNNING"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("XDG_STATE_HOME", t.TempDir())
+			if err := core.ClaimLeaseForRepoProvider("rpod_local123", tt.identifier, providerName, t.TempDir(), 0, false); err != nil {
+				t.Fatal(err)
+			}
+			claimRunpodPod(t, "rpod_456789ab", "remote", tt.pod)
+			fake := &fakeRunpodAPI{getPod: func(string) (runpodPod, error) { return tt.pod, nil }}
+			backend := &runpodLeaseBackend{cfg: Config{Runpod: RunpodConfig{APIKey: "k"}}, rt: Runtime{Stdout: io.Discard, Stderr: io.Discard}, client: fake}
+
+			_, err := backend.Resolve(context.Background(), ResolveRequest{ID: tt.identifier, ReleaseOnly: true})
+			if err == nil || !strings.Contains(err.Error(), "no exact resource-bound local claim") {
+				t.Fatalf("err=%v, want local slug claim refusal", err)
+			}
+			if len(fake.getCalls) != 0 || len(fake.terminated) != 0 {
+				t.Fatalf("getCalls=%v terminated=%v, want no access to the colliding pod", fake.getCalls, fake.terminated)
+			}
+		})
+	}
+}
+
+func TestRunpodResolveRequiresExplicitReclaimBeforeBindingPod(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	pod := runpodPod{ID: "pod_manual", Name: "manual-pod", DesiredStatus: "RUNNING"}
+	fake := &fakeRunpodAPI{getPod: func(string) (runpodPod, error) { return pod, nil }}
+	backend := &runpodLeaseBackend{cfg: Config{Runpod: RunpodConfig{APIKey: "k"}}, rt: Runtime{Stdout: io.Discard, Stderr: io.Discard}, client: fake}
+	repo := core.Repo{Root: t.TempDir()}
+
+	_, err := backend.Resolve(context.Background(), ResolveRequest{ID: pod.ID, Repo: repo})
+	if err == nil || !strings.Contains(err.Error(), "retry with --reclaim") {
+		t.Fatalf("err=%v, want explicit reclaim requirement", err)
+	}
+	if _, exists, err := core.ReadLeaseClaimWithPresence("rpod_manual-pod"); err != nil || exists {
+		t.Fatalf("claim before reclaim: exists=%v err=%v", exists, err)
+	}
+
+	lease, err := backend.Resolve(context.Background(), ResolveRequest{ID: pod.ID, Repo: repo, Reclaim: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, exists, err := core.ReadLeaseClaimWithPresence(lease.LeaseID)
+	if err != nil || !exists {
+		t.Fatalf("claim after reclaim: exists=%v err=%v", exists, err)
+	}
+	if claim.Provider != providerName || claim.CloudID != pod.ID || claim.Labels["name"] != pod.Name {
+		t.Fatalf("claim=%#v, want exact provider/id/name binding", claim)
+	}
+}
+
+func TestRunpodReclaimCannotRetargetBoundClaim(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	claimed := runpodPod{ID: "pod_original", Name: "manual-pod", DesiredStatus: "RUNNING"}
+	claimRunpodPod(t, "rpod_manual-pod", "manual-pod", claimed)
+	replacement := runpodPod{ID: "pod_replacement", Name: claimed.Name, DesiredStatus: "RUNNING"}
+	fake := &fakeRunpodAPI{getPod: func(string) (runpodPod, error) { return replacement, nil }}
+	backend := &runpodLeaseBackend{cfg: Config{Runpod: RunpodConfig{APIKey: "k"}}, rt: Runtime{Stdout: io.Discard, Stderr: io.Discard}, client: fake}
+
+	_, err := backend.Resolve(context.Background(), ResolveRequest{ID: replacement.ID, Repo: core.Repo{Root: t.TempDir()}, Reclaim: true})
+	if err == nil || !strings.Contains(err.Error(), "cannot retarget RunPod claim") {
+		t.Fatalf("err=%v, want retarget refusal", err)
+	}
+	claim, err := core.ReadLeaseClaim("rpod_manual-pod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim.CloudID != claimed.ID || claim.Labels["name"] != claimed.Name {
+		t.Fatalf("claim=%#v, want original resource binding", claim)
+	}
+}
+
+func TestRunpodFindPodByNamePrefersExactMatchOverNormalizedAlias(t *testing.T) {
+	fake := &fakeRunpodAPI{listPods: []runpodPod{
+		{ID: "pod_alias", Name: "manual_pod"},
+		{ID: "pod_exact", Name: "manual-pod"},
+	}}
+	backend := &runpodLeaseBackend{}
+	pod, err := backend.findPodByName(context.Background(), fake, "manual-pod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pod.ID != "pod_exact" {
+		t.Fatalf("pod=%#v, want exact name match", pod)
+	}
+}
+
+func TestRunpodFindPodByNameRejectsAmbiguousNormalizedAlias(t *testing.T) {
+	fake := &fakeRunpodAPI{listPods: []runpodPod{
+		{ID: "pod_a", Name: "manual_pod"},
+		{ID: "pod_b", Name: "manual.pod"},
+	}}
+	backend := &runpodLeaseBackend{}
+	_, err := backend.findPodByName(context.Background(), fake, "manual-pod")
+	if err == nil || !strings.Contains(err.Error(), "multiple RunPod pods match normalized name") {
+		t.Fatalf("err=%v, want ambiguous normalized-name refusal", err)
+	}
+}
+
+func TestRunpodFindPodByLeaseNameRejectsAmbiguousIdentity(t *testing.T) {
+	fake := &fakeRunpodAPI{listPods: []runpodPod{
+		{ID: "pod_a", Name: "crabbox-blue-abcdef12"},
+		{ID: "pod_b", Name: "crabbox-green-abcdef12"},
+	}}
+	backend := &runpodLeaseBackend{}
+	_, _, err := backend.findPodByLeaseName(context.Background(), fake, "rpod_abcdef12")
+	if err == nil || !strings.Contains(err.Error(), "multiple RunPod pods match lease") {
+		t.Fatalf("err=%v, want ambiguous lease-identity refusal", err)
+	}
+}
+
+func TestRunpodLegacyClaimRequiresReclaimToBindExactPod(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	const leaseID = "rpod_abcdef12"
+	const slug = "blue"
+	repo := core.Repo{Root: t.TempDir()}
+	if err := core.ClaimLeaseForRepoProvider(leaseID, slug, providerName, repo.Root, 0, false); err != nil {
+		t.Fatal(err)
+	}
+	pod := runpodPod{ID: "pod_legacy", Name: leaseProviderName(leaseID, slug), DesiredStatus: "RUNNING"}
+	fake := &fakeRunpodAPI{listPods: []runpodPod{pod}}
+	backend := &runpodLeaseBackend{cfg: Config{Runpod: RunpodConfig{APIKey: "k"}}, rt: Runtime{Stdout: io.Discard, Stderr: io.Discard}, client: fake}
+
+	_, err := backend.Resolve(context.Background(), ResolveRequest{ID: leaseID, Repo: repo})
+	if err == nil || !strings.Contains(err.Error(), "retry with --reclaim") {
+		t.Fatalf("err=%v, want legacy claim reclaim requirement", err)
+	}
+	if _, err := backend.Resolve(context.Background(), ResolveRequest{ID: leaseID, Repo: repo, Reclaim: true}); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := core.ReadLeaseClaim(leaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim.CloudID != pod.ID || claim.Labels["name"] != pod.Name {
+		t.Fatalf("claim=%#v, want exact pod binding", claim)
+	}
+}
+
+func TestRunpodReclaimByPodIDUpgradesLegacySlugClaim(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	const leaseID = "cbx_abcdef123456"
+	const slug = "blue"
+	repo := core.Repo{Root: t.TempDir()}
+	if err := core.ClaimLeaseForRepoProvider(leaseID, slug, providerName, repo.Root, 0, false); err != nil {
+		t.Fatal(err)
+	}
+	pod := runpodPod{ID: "pod-legacy", Name: leaseProviderName(leaseID, slug), DesiredStatus: "RUNNING"}
+	fake := &fakeRunpodAPI{getPod: func(string) (runpodPod, error) { return pod, nil }}
+	backend := &runpodLeaseBackend{cfg: Config{Runpod: RunpodConfig{APIKey: "k"}}, rt: Runtime{Stdout: io.Discard, Stderr: io.Discard}, client: fake}
+
+	lease, err := backend.Resolve(context.Background(), ResolveRequest{ID: pod.ID, Repo: repo, Reclaim: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.LeaseID != leaseID {
+		t.Fatalf("leaseID=%q, want legacy claim %q", lease.LeaseID, leaseID)
+	}
+	claims, err := core.ListLeaseClaims()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claims) != 1 || claims[0].LeaseID != leaseID || claims[0].CloudID != pod.ID || claims[0].Labels["name"] != pod.Name {
+		t.Fatalf("claims=%#v, want one upgraded legacy claim", claims)
+	}
+	releaseLease, err := backend.Resolve(context.Background(), ResolveRequest{ID: slug, ReleaseOnly: true})
+	if err != nil {
+		t.Fatalf("resolve upgraded claim by slug: %v", err)
+	}
+	if err := backend.ReleaseLease(context.Background(), ReleaseLeaseRequest{Lease: releaseLease}); err != nil {
+		t.Fatalf("release upgraded claim by slug: %v", err)
+	}
+	if len(fake.terminated) != 1 || fake.terminated[0] != pod.ID {
+		t.Fatalf("terminated=%v, want %s", fake.terminated, pod.ID)
+	}
+}
+
+func TestRunpodReleaseLeaseRechecksBoundClaimAndTerminatesPod(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	pod := runpodPod{ID: "pod_z", Name: "crabbox-blue-abcdef12", DesiredStatus: "RUNNING"}
+	claimRunpodPod(t, "rpod_abcdef12", "blue", pod)
+	fake := &fakeRunpodAPI{getPod: func(string) (runpodPod, error) { return pod, nil }}
+	backend := &runpodLeaseBackend{cfg: Config{Runpod: RunpodConfig{APIKey: "k"}}, rt: Runtime{Stdout: io.Discard, Stderr: io.Discard}, client: fake}
+	req := ReleaseLeaseRequest{Lease: LeaseTarget{Server: Server{CloudID: pod.ID}, LeaseID: "rpod_abcdef12"}}
+	if err := backend.ReleaseLease(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.getCalls) != 1 || fake.getCalls[0] != pod.ID || len(fake.terminated) != 1 || fake.terminated[0] != pod.ID {
+		t.Fatalf("getCalls=%v terminated=%v", fake.getCalls, fake.terminated)
+	}
+	if _, exists, err := core.ReadLeaseClaimWithPresence("rpod_abcdef12"); err != nil || exists {
+		t.Fatalf("claim after release: exists=%v err=%v", exists, err)
+	}
+}
+
+func TestRunpodReleaseLeaseRejectsResourceOutsideBoundClaim(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	pod := runpodPod{ID: "pod_owned", Name: "crabbox-blue-abcdef12", DesiredStatus: "RUNNING"}
+	claimRunpodPod(t, "rpod_abcdef12", "blue", pod)
+	fake := &fakeRunpodAPI{getPod: func(string) (runpodPod, error) { return pod, nil }}
+	backend := &runpodLeaseBackend{cfg: Config{Runpod: RunpodConfig{APIKey: "k"}}, rt: Runtime{Stdout: io.Discard, Stderr: io.Discard}, client: fake}
+
+	err := backend.ReleaseLease(context.Background(), ReleaseLeaseRequest{Lease: LeaseTarget{
+		Server:  Server{CloudID: "pod_other"},
+		LeaseID: "rpod_abcdef12",
+	}})
+	if err == nil || !strings.Contains(err.Error(), "does not match bound claim pod") {
+		t.Fatalf("err=%v, want forged resource refusal", err)
+	}
+	if len(fake.getCalls) != 0 || len(fake.terminated) != 0 {
+		t.Fatalf("getCalls=%v terminated=%v, want no provider mutation", fake.getCalls, fake.terminated)
+	}
+}
+
+func TestRunpodReleaseLeaseRejectsProviderNameMismatch(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	claimed := runpodPod{ID: "pod_owned", Name: "crabbox-blue-abcdef12", DesiredStatus: "RUNNING"}
+	claimRunpodPod(t, "rpod_abcdef12", "blue", claimed)
+	changed := claimed
+	changed.Name = "renamed-outside-crabbox"
+	fake := &fakeRunpodAPI{getPod: func(string) (runpodPod, error) { return changed, nil }}
+	backend := &runpodLeaseBackend{cfg: Config{Runpod: RunpodConfig{APIKey: "k"}}, rt: Runtime{Stdout: io.Discard, Stderr: io.Discard}, client: fake}
+
+	err := backend.ReleaseLease(context.Background(), ReleaseLeaseRequest{Lease: LeaseTarget{
+		Server:  Server{CloudID: claimed.ID},
+		LeaseID: "rpod_abcdef12",
+	}})
+	if err == nil || !strings.Contains(err.Error(), "expects pod name") {
+		t.Fatalf("err=%v, want provider identity mismatch", err)
+	}
+	if len(fake.terminated) != 0 {
+		t.Fatalf("terminated=%v, want no termination", fake.terminated)
+	}
+	if _, exists, err := core.ReadLeaseClaimWithPresence("rpod_abcdef12"); err != nil || !exists {
+		t.Fatalf("claim after refusal: exists=%v err=%v", exists, err)
+	}
+}
+
+func claimRunpodPod(t *testing.T, leaseID, slug string, pod runpodPod) {
+	t.Helper()
+	cfg := Config{Provider: providerName}
+	applyRunpodDefaults(&cfg)
+	server := runpodServer(pod, leaseID, slug, cfg, true)
+	if err := core.ClaimLeaseTargetForRepoConfig(leaseID, slug, cfg, server, runpodSSHTarget(cfg, pod), t.TempDir(), 0, false); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRunpodClientSendsBearerAndRESTRequest(t *testing.T) {
+	var (
+		gotAuth        string
+		gotContentType string
+		gotMethod      string
+		gotPath        string
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotContentType = r.Header.Get("Content-Type")
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer server.Close()
+	cfg := Config{}
+	cfg.Runpod.APIKey = "test-key"
+	cfg.Runpod.APIURL = server.URL
+	client, err := newRunpodClient(cfg, Runtime{HTTP: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Whoami(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if gotMethod != http.MethodGet {
+		t.Fatalf("method=%q", gotMethod)
+	}
+	if gotPath != "/pods" {
+		t.Fatalf("path=%q", gotPath)
+	}
+	if gotAuth != "Bearer test-key" {
+		t.Fatalf("auth=%q", gotAuth)
+	}
+	if gotContentType != "" {
+		t.Fatalf("content-type=%q", gotContentType)
+	}
+}
+
+func TestRunpodClientRefusesCrossOriginRedirectBeforeReplay(t *testing.T) {
+	var targetRequests int
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetRequests++
+		t.Errorf("redirect target received %s %s auth=%q", r.Method, r.URL.Path, r.Header.Get("Authorization"))
+		http.Error(w, "unexpected request", http.StatusInternalServerError)
+	}))
+	defer target.Close()
+
+	trusted := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+"/stolen", http.StatusTemporaryRedirect)
+	}))
+	defer trusted.Close()
+	cfg := Config{Runpod: RunpodConfig{APIKey: "test-key", APIURL: trusted.URL}}
+	client, err := newRunpodClient(cfg, Runtime{HTTP: trusted.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.DeployPod(context.Background(), runpodDeployInput{
+		Name: "test-pod", ImageName: "example/image", InstanceID: "NVIDIA L4", Ports: "22/tcp",
+	})
+	if err == nil || !strings.Contains(err.Error(), "refused cross-origin redirect") {
+		t.Fatalf("DeployPod error = %v, want cross-origin refusal", err)
+	}
+	if targetRequests != 0 {
+		t.Fatalf("redirect target received %d requests, want 0", targetRequests)
+	}
+}
+
+func TestRunpodClientFollowsSameOriginRedirect(t *testing.T) {
+	var redirectedAuth string
+	var redirectedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/pods":
+			http.Redirect(w, r, "/redirected", http.StatusTemporaryRedirect)
+		case "/redirected":
+			redirectedAuth = r.Header.Get("Authorization")
+			if err := json.NewDecoder(r.Body).Decode(&redirectedBody); err != nil {
+				t.Errorf("decode redirected body: %v", err)
+			}
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, `{"id":"pod_ok","status":"RUNNING"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	cfg := Config{Runpod: RunpodConfig{APIKey: "test-key", APIURL: server.URL}}
+	client, err := newRunpodClient(cfg, Runtime{HTTP: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pod, err := client.DeployPod(context.Background(), runpodDeployInput{
+		Name: "test-pod", ImageName: "example/image", InstanceID: "NVIDIA L4", Ports: "22/tcp",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pod.ID != "pod_ok" || redirectedAuth != "Bearer test-key" || redirectedBody["name"] != "test-pod" {
+		t.Fatalf("pod=%#v auth=%q body=%#v", pod, redirectedAuth, redirectedBody)
+	}
+}
+
+func TestRunpodClientPreservesCallerRedirectPolicy(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/redirected", http.StatusFound)
+	}))
+	defer server.Close()
+	callerErr := errors.New("caller refused redirect")
+	callerChecks := 0
+	httpClient := server.Client()
+	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+		callerChecks++
+		return callerErr
+	}
+	client, err := newRunpodClient(
+		Config{Runpod: RunpodConfig{APIKey: "test-key", APIURL: server.URL}},
+		Runtime{HTTP: httpClient},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.Whoami(context.Background())
+	if !errors.Is(err, callerErr) || callerChecks != 1 {
+		t.Fatalf("Whoami error = %v, caller checks = %d", err, callerChecks)
+	}
+}
+
+func TestRunpodClientRetriesGPUCapacityFallbacks(t *testing.T) {
+	var seen []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/pods" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		var payload struct {
+			GPUTypeIDs []string `json:"gpuTypeIds"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		if len(payload.GPUTypeIDs) != 1 {
+			t.Fatalf("gpuTypeIds=%#v, want one id per fallback attempt", payload.GPUTypeIDs)
+		}
+		seen = append(seen, payload.GPUTypeIDs[0])
+		if payload.GPUTypeIDs[0] == "NVIDIA L4" {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, `{"error":"create pod: There are no instances currently available","status":500}`)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(w, `{"id":"pod_ok","name":"crabbox-blue-12345678","status":"RUNNING"}`)
+	}))
+	defer server.Close()
+
+	cfg := Config{}
+	cfg.Runpod.APIKey = "test-key"
+	cfg.Runpod.APIURL = server.URL
+	client, err := newRunpodClient(cfg, Runtime{HTTP: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pod, err := client.DeployPod(context.Background(), runpodDeployInput{
+		Name:              "crabbox-blue-12345678",
+		ImageName:         "runpod/pytorch:custom",
+		InstanceID:        "NVIDIA L4,NVIDIA RTX 4000 Ada Generation",
+		CloudType:         "SECURE",
+		ContainerDiskInGb: 20,
+		Ports:             "22/tcp",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pod.ID != "pod_ok" {
+		t.Fatalf("pod=%#v", pod)
+	}
+	if len(seen) != 2 || seen[0] != "NVIDIA L4" || seen[1] != "NVIDIA RTX 4000 Ada Generation" {
+		t.Fatalf("seen=%v", seen)
+	}
+}

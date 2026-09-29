@@ -1,0 +1,424 @@
+# Sync
+
+Read this when you are:
+
+- changing rsync behavior or the remote sync flow;
+- debugging missing, stale, or unexpectedly deleted files on a runner;
+- tuning Git seeding, fingerprints, excludes, or large-sync guardrails.
+
+Before running a command, `crabbox run` syncs your current checkout to the
+leased runner. Sync only applies to SSH-lease providers; delegated-run providers
+own their own file transfer and reject the local sync options. Native Windows
+targets use the same file list but ship it as a tar archive over OpenSSH instead
+of rsync.
+
+SSH-backed workspace sync uses a private, temporary OpenSSH configuration and a
+fixed host alias, so IPv6 addresses are not parsed as rsync host/path separators.
+The configuration preserves the resolved user, authentication, proxy route, and
+host-key policy, and is removed after transfer and workspace-owner cleanup.
+Windows keeps native rsync/SSH pairing or privately staged WSL credentials;
+native SSH-config routes stay on the native client. Artifact and egress uploads
+use the same private SSH configuration boundary.
+
+`--no-sync` skips local file transfer only on providers that support it.
+Blacksmith Testbox rejects it before lease access or execution because native
+Testbox runs own sync and offer no supported bypass, including when reusing an
+ID. See [Blacksmith Testbox](../providers/blacksmith-testbox.md).
+
+Skipping sync does not skip provider initialization. Generated prewarm probes
+are admitted before backend configuration or warmup.
+
+## Remote workspace path
+
+For normal SSH-backed runs, sync starts from the effective work root and derives
+the repository workspace as `<root>/<lease>/<repository>`. Top-level
+`workRoot` and `CRABBOX_WORK_ROOT` change only `<root>`; they do not name the
+exact sync target or command working directory. An explicitly configured
+provider-specific work root or workdir takes precedence over the generic root
+and remains subject to that adapter's validation and path translation.
+
+Actions hydration has final authority over the exact workspace. When a lease
+has a valid hydration marker, Crabbox uses the marker's canonical `WORKSPACE`
+for both sync and command execution instead of the base-derived candidate.
+Changing `CRABBOX_WORK_ROOT` does not relocate an already adopted Actions
+workspace. Local automatic hydration uses the canonical lease workspace it
+derived before writing the marker; `--full-resync` refuses a noncanonical
+adopted workspace when it cannot safely rebuild that path. See
+[Actions hydration](actions-hydration.md) for the marker lifecycle.
+
+## What gets synced
+
+Sync transfers the Git-managed working set, not the whole directory tree. The
+file list comes from `git ls-files --cached --others --exclude-standard -z`,
+which is:
+
+- tracked files in the index;
+- nonignored untracked files (new files Git would not ignore).
+
+That list is then filtered by the active excludes:
+
+- Crabbox's built-in cache and generated-output excludes;
+- repo-local `sync.exclude` (config) patterns;
+- root `.crabboxignore` patterns.
+
+Before transfer, Crabbox checks tracked paths that remain in the effective
+manifest scope. If sparse-checkout rules or `skip-worktree` state hide one of
+those paths, sync stops instead of treating the omission as a deletion. Hidden
+paths outside `sync.include` or removed by ordered excludes are ignored.
+Gitlinks are not manifest files or remote file deletions, while symlinks remain
+file-like.
+
+Git 2.41 or newer distinguishes an intentional in-scope deletion from a sparse
+omission after index metadata becomes ambiguous. Older Git fails closed only
+for an ambiguous missing path that remains in the effective manifest scope.
+
+Git-ignored output, dependency folders, `.git`, and common local caches stay out
+of the transfer. This keeps a first sync close to what CI would see while still
+letting you test uncommitted local edits.
+
+Filesystem Git origins are resolved on the runner during Git seeding and must
+be readable from that runner; otherwise Crabbox falls back to a full manifest sync.
+
+### Jujutsu workspaces
+
+Crabbox currently supports Jujutsu workspaces only when they are colocated with
+Git metadata: the workspace root must contain both `.jj` and `.git`. Native
+Jujutsu revision mapping is not supported yet. Because the sync manifest is
+Git-owned, Crabbox rejects a native `.jj` workspace before leasing or borrowing
+a runner rather than letting Git discover an outer checkout and sync the wrong
+revision. This also applies when the native workspace is nested inside an outer
+Git repository.
+
+If you are starting from an existing Git checkout and want a colocated Jujutsu
+workspace, `jj git init --git-repo=.` is one initialization example. It does not
+convert an existing native Jujutsu repository in place. Use `--no-sync` with a
+supporting provider when you intentionally want to run without transferring
+local files.
+
+The built-in excludes are intentionally conservative. They cover common churn
+such as `node_modules`, `.git`, `dist`, `coverage`, `playwright-report`,
+`test-results`, `.next`, `.vite`, `.turbo`, `target`, `.venv`, `__pycache__`,
+`.gradle`, and Crabbox runtime state under `.crabbox/env`,
+`.crabbox/scripts`, `.crabbox/logs`, `.crabbox/captures`, and
+`.crabbox/runs`. Built-in rules for the ambiguous artifact names `dist`,
+`dist-runtime`, `coverage`, `playwright-report`, `test-results`, `.build`, and
+`target` still omit untracked output, but do not omit a Git-tracked regular file
+solely because one of those names appears in its path. Crabbox reports a bounded
+path-and-pattern summary when it protects such files. Unmistakable dependency
+and cache rules such as `node_modules`, `.cache`, `.venv`, and `__pycache__`
+remain component-wide, including for tracked files.
+
+Except for the protected Crabbox runtime state described below, rules from
+`sync.exclude` and `.crabboxignore` are authoritative, including bare
+component-wide patterns. They can deliberately exclude tracked artifact files
+or trees, and a later `!pattern` can re-include them. This keeps existing
+repository policy intact across upgrades while making Crabbox-owned ambiguous
+defaults safe. Crabbox also does not globally drop tracked source files just
+because a path segment happens to be named `build` or `out`. Put project-specific
+generated directories in `.crabboxignore` or `sync.exclude`.
+
+`crabbox watch` observes only the ancestor chains needed by tracked protected
+files or explicit re-includes, so unrelated untracked artifact trees do not
+create watch churn. It also watches Git's resolved index and attaches the parent
+chain when an index-only transition makes an artifact path tracked.
+
+## Excludes
+
+Patterns match against POSIX-style relative paths. A pattern with no `/` matches
+any path segment by name or by glob (for example, `node_modules` or `*.log`);
+patterns with a `/` match a path prefix or a glob over the full relative path.
+Rules are evaluated in order and the last matching rule wins. Prefix a pattern
+with `!` to re-include a path excluded by an earlier rule, including a built-in
+default; prefix a literal leading `!` with a backslash (`\!cache`). For example:
+
+```gitignore
+# Keep generated target directories excluded, except this source package.
+target
+!apps/backend/app/connectors/target
+```
+
+Use `.crabboxignore` when you only need repo-local sync exclusions. The file is
+read from the repository root. Blank lines and lines starting with `#` are
+ignored; the remaining lines are appended to `sync.exclude` and use the same
+matcher as config excludes. Crabbox supports only the exact `.crabboxignore`
+name; there is no short alias.
+
+Crabbox-owned runtime state under `.crabbox/env`, `.crabbox/scripts`,
+`.crabbox/logs`, `.crabbox/captures`, and `.crabbox/runs` is always excluded
+after repo rules are applied. Those paths can contain forwarded env profiles,
+uploaded scripts, local run artifacts, or failure bundles, so `.crabboxignore`
+cannot re-include them. Case aliases of these reserved paths are protected too,
+including on case-insensitive filesystems.
+
+If a project stores source files in one of these reserved directories, move
+them elsewhere before upgrading; reserved runtime paths are no longer eligible
+for sync even when they are tracked or explicitly re-included.
+
+Repo-local config should hold project-specific excludes and env allowlists.
+Secrets must never be passed as command-line arguments or via broad env globs.
+
+## Sync flow
+
+For an existing SSH lease, Crabbox first acquires a remote lease-scoped
+workspace owner. It does this before reading hydration state, Git metadata, or
+the sync fingerprint, and retains ownership through command execution, evidence
+collection, failure capture, and ready-pool cleanup. Separate clients and watch
+iterations contend on the same owner. Newly acquired one-shot leases bypass it
+because the acquisition itself is exclusive.
+
+The owner state lives under the remote user's Crabbox state directory, outside
+the replaceable checkout. Its filename is derived from a non-reversible lease
+digest, and its bounded contents contain only protocol version, expiry, random
+fencing token, and an optional witnessed child PID/start identity. Token-bound
+renewal and release fail closed. After a client crash, an expired owner is
+recoverable only when the exact witnessed child is no longer alive. POSIX,
+WSL2, and native Windows targets share these semantics.
+
+POSIX and WSL2 children register themselves before executing the requested
+workload. Registration waits at most five seconds for the owner lock; it does
+not leave a background child waiting indefinitely for a start file. A failed
+setup exits cooperatively and closes inherited SSH streams without requiring
+permission to signal the child. If the supervising shell disappears before
+handoff, the registration deadline and closed identity pipe still prevent the
+waiting child from running the workload. After handoff, the existing witnessed
+child and recovery rules continue to apply. A denied `kill -0` is never proof
+that a recorded child is dead: cleanup and recovery require independent PID
+absence evidence, and retain authority when observation is ambiguous.
+
+Once ownership is established, sync runs these steps:
+
+1. Resolve the local repository root.
+2. Build the sync manifest (the NUL-delimited file list) and a parallel list of
+   tracked paths that were deleted locally.
+3. Print a candidate estimate and, when the checkout is dirty, a dirty-delta
+   estimate; then enforce the large-sync guardrails (see below).
+4. When fingerprinting is enabled, compute a local fingerprint and compare it to
+   the remote one. If they match, print
+   `No changes detected, skipping sync` and skip the rest.
+5. On `--full-resync` / `--fresh-sync`, reset the remote workdir first.
+6. Seed the remote Git tree from `origin` at the local `HEAD` when that commit
+   is reachable from a remote ref, so rsync only ships the diff.
+7. Write the manifest (and the deletion list) to the remote workdir.
+8. When delete-sync is enabled, prune previously synced remote files that are no
+   longer in the manifest.
+9. rsync the working set with `--files-from=- --from0` (the manifest drives the
+   transfer).
+10. Finalize: git-hydrate the worktree against the configured base ref, run the
+    mass-deletion sanity check, and record the new fingerprint.
+
+The remote prune in step 8 only removes paths Crabbox previously synced. It does
+not touch workflow-created state, package caches, `.git`, or any other runner
+file outside the managed list. The mass-deletion guard in step 10 aborts a sync
+that would delete an unexpectedly large fraction of tracked files; set
+`CRABBOX_ALLOW_MASS_DELETIONS=1` to override it (this is also implied during
+Actions hydration).
+
+On the remote box, sync metadata (including the fingerprint) is stored under
+`.git/crabbox` when `.git` is a directory, and under `.crabbox` otherwise. The
+`.crabbox/` directory in your repository remains available for repository-owned
+files and config; Crabbox does not delete files there.
+
+## Fingerprints and Git seeding
+
+When `sync.fingerprint` is enabled (the default), Crabbox derives a fingerprint
+from `HEAD`, the delete/checksum settings, the manifest, the deletion list, the
+excludes, and the content of every changed regular file. Changed symlinks are
+hashed by their target text, without following the link, so retargeting a link
+invalidates the fingerprint even when both targets contain identical bytes.
+Dangling links and links to directories are supported. If the remote workdir
+already carries that fingerprint, the sync is skipped entirely. `--full-resync`
+ignores the remote fingerprint and forces a clean transfer.
+
+Git seeding (`sync.gitSeed`, default on) clones or fetches the base tree on the
+runner before rsync, so only your diff travels over the wire. It activates only
+when the local `HEAD` commit is reachable from a remote ref.
+Among local origin tracking branches that contain the selected commit, Crabbox
+prefers the explicit `sync.baseRef` (or the inferred repository base when unset),
+then origin's symbolic default branch, then
+the first eligible branch in ref-name order. A preferred branch may have newer
+commits; the selected commit and tree remain unchanged. Planning does not contact
+origin or prune tracking refs, so a local candidate may still be stale. On the
+runner, Git coherence fetches the chosen advertised branch and verifies target
+ancestry and tree before aligning metadata.
+
+Crabbox disables Git seeding when the origin is an HTTP(S) URL with embedded
+userinfo, warns without printing the URL, and uses the normal file sync instead.
+This prevents credentials stored in local Git remotes from reaching lease
+command arguments or the seeded worktree's Git configuration.
+
+Git seeding, coherence finalization, and Git-state probes run in non-login Bash
+shells with `BASH_ENV` and `ENV` disabled. Runner login and logout hooks cannot
+replace these control-command exit statuses. User workload commands keep their
+existing login-shell behavior.
+
+If an otherwise forwardable origin requires authentication or is unreachable
+due to DNS, connectivity, or TLS transport errors, ordinary POSIX/WSL2 sync
+and local Actions hydration fall back to the full, plain manifest sync. This
+includes a peer disconnect during connection setup reported by Git/libcurl as
+`getpeername() ... is not connected`, and a reused Git worktree whose fetch
+fails during finalization.
+Fallback warnings contain only a fixed reason. The plain manifest path clears
+reusable fingerprints and Git hydration markers and does not forward local
+credentials.
+
+Local Actions hydration keeps unclassified seeding failures fatal, including
+missing refs, verification failures, and HTTP 5xx or other server failures,
+and aborts before file sync. Seed failure diagnostics report a fixed phase,
+advisory category, and command exit status. Raw Git/SSH output, URLs, paths,
+and credential-helper messages are never replayed in warnings. Capture is
+limited to 16 KiB in memory; oversized or unrecognized output produces an
+`unknown` diagnosis instead of guessing. Existing Git metadata may still be
+present; a failed seed has not established that it is current or usable.
+
+### Opt-in Git overlay
+
+Set `sync.gitOverlay: true` or `CRABBOX_SYNC_GIT_OVERLAY=true` to let eligible
+Linux SSH-backed runners fetch the exact advertised local commit and transfer
+only the files that differ from that commit. A clean checkout sends no source
+file payload. Staged, unstaged, and untracked changes, removals, renames,
+executable bits, and symlink identities remain governed by the complete normal
+sync and deletion manifests; excluded tracked files are pruned after the reset.
+The selected remote branch may contain newer commits than the chosen checkout.
+Overlay fetches complete filtered commit/tree ancestry for that branch and the
+configured base ref, so `HEAD^`, `git merge-base`, and
+`git diff origin/main...HEAD` continue to work without downloading unrelated
+historical blobs. Origins that cannot support filtered history use ordinary
+sync instead.
+
+Before transferring an eligible overlay, Crabbox copies its payload to a local
+snapshot and checks it against the checkout's index, manifest, exclusions, and
+fingerprint. Rsync reads the accepted snapshot, so edits made after acceptance
+wait for the next sync. If preparation cannot produce a stable supported
+snapshot, Crabbox falls back to ordinary full-manifest sync after successful
+cleanup. Cleanup failures stop the run and report the retained snapshot path.
+
+The optimization is off by default and requires `sync.gitSeed: true`,
+`sync.delete: true`, an unrestricted, complete, conflict-free Git checkout
+without submodules, and an anonymous HTTP(S) or remotely readable filesystem
+origin. Actions-owned workspaces, full resyncs, fresh PR checkouts, delegated
+providers, Windows/WSL2, macOS, `sync.include`, embedded credentials, SSH
+origins, private origins, unsafe Git configuration, and unavailable runner
+prerequisites fall back to the complete ordinary file manifest. Git commands
+never receive forwarded credentials, credential helpers, hooks, global Git
+configuration, external transports, or repository-defined filters.
+Anonymous HTTP authentication failures and eligible-origin DNS, TLS, firewall,
+connection, and fetch failures safely fall back to the complete ordinary file
+manifest. HTTP authentication classification uses response statuses, not
+status-like digits in origin URLs.
+
+A fallback involving `assume-unchanged` or `skip-worktree` index flags does
+not reuse or publish a sync fingerprint: Git can hide edits behind those
+flags. Crabbox transfers the full ordinary manifest instead. An index
+inspection failure also disables fingerprint reuse for that fallback.
+
+Only dependency caches ignored by verified `.gitignore` files from the exact
+target tree may survive overlay preparation: `node_modules`, `.pnpm-store`,
+`.yarn/cache`, and `.yarn/unplugged`. Local `.git/info/exclude` cannot grant
+cache preservation. Existing workspace ownership and ready-pool preparation
+remain unchanged. A real, contained `.crabbox` directory and its reserved
+`env`, `scripts`, `logs`, `captures`, and `runs` runtime state survive overlay
+cleanup; symlinked runtime or Git metadata roots are rejected.
+
+When overlay mode is requested, timing JSON may additionally report `syncMode`,
+`syncTransferFiles`, `syncTransferBytes`, and `syncFallbackReason`; ordinary
+default-off timing output retains its existing shape.
+
+## Large-sync guardrails
+
+`crabbox run` prints a one-line size estimate before transferring. Ordinary SSH
+sync counts the full candidate when the checkout is clean, or the dirty delta
+when there are changes. Providers with full-archive guardrails always count the
+complete candidate because they transfer that archive, even when only one file
+changed. Other provider transports retain their documented policy. The estimate
+still shows the full candidate size so first-sync cost stays visible:
+
+```text
+sync candidate: 299 files, 14.2 MiB dirty_delta=7 files, 92.4 KiB
+```
+
+The guardrail scope (candidate or dirty delta) is compared against the warn and
+fail thresholds. `crabbox sync-plan --json` reports this scope for the configured
+provider's ordinary workspace sync, without contacting the provider. Compressed
+upload caps and native service limits remain separate. Crossing a warn threshold
+prints a warning plus the top source
+directories by file count, so accidental dependency repair or generated churn is
+easy to spot. Crossing a fail threshold aborts the run.
+
+`crabbox run --force-sync-large` bypasses the fail thresholds for one run.
+`--debug` adds rsync progress and stat output; quiet syncs still print a
+heartbeat when rsync goes silent for a while.
+
+## Alternatives to syncing the whole checkout
+
+For noisy worktrees, `crabbox run --fresh-pr example-org/my-app#123` is often
+faster and clearer than syncing the local checkout. The runner starts from the
+PR head; add `--apply-local-patch` to layer your local git diff on top. The
+`--fresh-pr` path replaces rsync and cannot be combined with `--no-sync`,
+`--sync-only`, or `--full-resync`.
+
+Use `crabbox sync-plan` to inspect the manifest before leasing a box. It prints
+the candidate file count, total bytes, the count of deleted tracked paths, and
+the largest files and directories, using the same excludes as `run`. When an
+ambiguous built-in artifact rule would otherwise hide a tracked regular file,
+the plan also prints a bounded annotation naming the protected paths and
+patterns. Use `--limit` to change how many top files and directories are listed
+(default 20).
+
+```text
+$ crabbox sync-plan
+sync candidate: 299 files, 14.2 MiB
+top files:
+  3.1 MiB    docs/assets/demo.gif
+  ...
+top dirs:
+  6.4 MiB    docs/assets
+  ...
+```
+
+## Configuration
+
+Sync defaults (override per repo in config or via env):
+
+```yaml
+sync:
+  delete: true
+  checksum: false
+  gitSeed: true
+  gitOverlay: false
+  fingerprint: true
+  baseRef: "" # defaults to the repo's origin HEAD / current branch
+  timeout: 15m
+  warnFiles: 50000
+  warnBytes: 5368709120 # 5 GiB
+  failFiles: 150000
+  failBytes: 21474836480 # 20 GiB
+  allowLarge: false
+  exclude: []
+```
+
+Environment overrides:
+
+```text
+CRABBOX_SYNC_CHECKSUM
+CRABBOX_SYNC_DELETE
+CRABBOX_SYNC_GIT_SEED
+CRABBOX_SYNC_GIT_OVERLAY
+CRABBOX_SYNC_FINGERPRINT
+CRABBOX_SYNC_BASE_REF
+CRABBOX_SYNC_TIMEOUT
+CRABBOX_SYNC_WARN_FILES
+CRABBOX_SYNC_WARN_BYTES
+CRABBOX_SYNC_FAIL_FILES
+CRABBOX_SYNC_FAIL_BYTES
+CRABBOX_SYNC_ALLOW_LARGE
+CRABBOX_ALLOW_MASS_DELETIONS
+CRABBOX_ENV_ALLOW
+```
+
+## Related docs
+
+- [CLI](../cli.md)
+- [run command](../commands/run.md)
+- [sync-plan command](../commands/sync-plan.md)
+- [Environment forwarding](env-forwarding.md)
+- [Repository onboarding](repository-onboarding.md)

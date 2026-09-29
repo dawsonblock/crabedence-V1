@@ -1,0 +1,1557 @@
+package cli
+
+import (
+	"context"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+)
+
+type recordingCommandRunner struct {
+	calls  []LocalCommandRequest
+	result LocalCommandResult
+	err    error
+}
+
+func (r *recordingCommandRunner) Run(_ context.Context, req LocalCommandRequest) (LocalCommandResult, error) {
+	r.calls = append(r.calls, req)
+	return r.result, r.err
+}
+
+func testRuntimeWithRunner(r CommandRunner) Runtime {
+	return Runtime{Stdout: io.Discard, Stderr: io.Discard, Clock: realClock{}, Exec: r}
+}
+
+func parseAndApplyProviderFlagsForTest(t *testing.T, defaults Config, args []string) Config {
+	t.Helper()
+	fs := newFlagSet("test", io.Discard)
+	provider := fs.String("provider", defaults.Provider, "")
+	values := registerProviderFlags(fs, defaults)
+	if err := parseFlags(fs, args); err != nil {
+		t.Fatal(err)
+	}
+	cfg := defaults
+	cfg.Provider = *provider
+	if err := applyProviderFlags(&cfg, fs, values); err != nil {
+		t.Fatal(err)
+	}
+	return cfg
+}
+
+func TestLoadBackendRequiresActionableProviderSelection(t *testing.T) {
+	t.Setenv(controllerProviderScopeEnv, "")
+	t.Setenv("HCLOUD_TOKEN", "")
+	t.Setenv("HETZNER_TOKEN", "")
+	cfg := baseConfig()
+
+	_, err := loadBackend(cfg, testRuntimeWithRunner(&recordingCommandRunner{}))
+	var exitErr ExitError
+	if !AsExitError(err, &exitErr) || exitErr.Code != 2 || exitErr.Message != providerSelectionRequiredDiagnostic {
+		t.Fatalf("compiled-default error=%v, want exit 2 %q", err, providerSelectionRequiredDiagnostic)
+	}
+	if strings.Contains(err.Error(), "HCLOUD_TOKEN") || strings.Contains(err.Error(), "HETZNER_TOKEN") {
+		t.Fatalf("compiled default reached provider credential validation: %v", err)
+	}
+
+	setProviderSelection(&cfg, claimRoutingUnusableProvider, providerSelectionFlag)
+	if _, err := loadBackend(cfg, testRuntimeWithRunner(&recordingCommandRunner{})); err == nil || !strings.Contains(err.Error(), "configured provider credentials are unavailable") {
+		t.Fatalf("actionable selection did not reach provider configuration: %v", err)
+	}
+
+	setProviderSelection(&cfg, "ssh", providerSelectionEnvironment)
+	if _, err := loadBackend(cfg, testRuntimeWithRunner(&recordingCommandRunner{})); err != nil {
+		t.Fatalf("actionable non-Hetzner selection rejected: %v", err)
+	}
+}
+
+func TestLoadBackendScrubsTrustedExternalDesktopPasswordFromNonExternalCommands(t *testing.T) {
+	t.Setenv(controllerProviderScopeEnv, "")
+	t.Setenv("TRUSTED_DESKTOP_PASSWORD", "ambient-secret")
+	t.Setenv("CRABBOX_TEST_CHILD_KEEP", "ambient-value")
+	cfg := baseConfig()
+	setProviderSelection(&cfg, "aws", providerSelectionFlag)
+	cfg.Coordinator = "https://coordinator.example"
+	cfg.External.Connection.Desktop.PasswordEnv = "TRUSTED_DESKTOP_PASSWORD"
+	MarkExternalDesktopPasswordEnvExplicit(&cfg)
+
+	recorder := &recordingCommandRunner{}
+	backend, err := loadBackend(cfg, testRuntimeWithRunner(recorder))
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinator, ok := backend.(*coordinatorLeaseBackend)
+	if !ok {
+		t.Fatalf("backend=%T, want coordinatorLeaseBackend", backend)
+	}
+	for _, request := range []LocalCommandRequest{
+		{Env: []string{"trusted_desktop_password=explicit-secret", "KEEP=explicit-value"}},
+		{},
+	} {
+		if _, err := coordinator.rt.Exec.Run(context.Background(), request); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(recorder.calls) != 2 {
+		t.Fatalf("command calls=%d", len(recorder.calls))
+	}
+	for index, call := range recorder.calls {
+		for _, entry := range call.Env {
+			if strings.EqualFold(strings.SplitN(entry, "=", 2)[0], "TRUSTED_DESKTOP_PASSWORD") {
+				t.Fatalf("call %d retained desktop credential variable", index)
+			}
+		}
+	}
+	if !strings.Contains(strings.Join(recorder.calls[0].Env, "\n"), "KEEP=explicit-value") {
+		t.Fatal("explicit environment lost unrelated marker")
+	}
+	if !strings.Contains(strings.Join(recorder.calls[1].Env, "\n"), "CRABBOX_TEST_CHILD_KEEP=ambient-value") {
+		t.Fatal("ambient environment lost unrelated marker")
+	}
+}
+
+func TestFinalizeRunResultClassifiesStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		result    RunResult
+		err       error
+		want      RunStatus
+		wantError RunErrorKind
+	}{
+		{name: "success", result: RunResult{}, want: RunStatusSucceeded, wantError: RunErrorNone},
+		{name: "command exit", result: RunResult{ExitCode: 7}, err: ExitError{Code: 7, Message: "failed"}, want: RunStatusFailed, wantError: RunErrorCommandExit},
+		{name: "provider error", result: RunResult{}, err: io.ErrUnexpectedEOF, want: RunStatusFailed, wantError: RunErrorProvider},
+		{name: "timeout", result: RunResult{}, err: context.DeadlineExceeded, want: RunStatusTimedOut, wantError: RunErrorTimeout},
+		{name: "canceled", result: RunResult{}, err: context.Canceled, want: RunStatusCanceled, wantError: RunErrorCanceled},
+		{name: "preserve provider status", result: RunResult{Status: RunStatusFailed, ErrorKind: RunErrorProvider}, want: RunStatusFailed, wantError: RunErrorProvider},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := FinalizeRunResult(tc.result, tc.err)
+			if got.Status != tc.want || got.ErrorKind != tc.wantError {
+				t.Fatalf("status/error=%q/%q want %q/%q", got.Status, got.ErrorKind, tc.want, tc.wantError)
+			}
+		})
+	}
+}
+
+func TestExecCommandRunnerBoundsCapturedOutputAndStopsChild(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	result, err := (execCommandRunner{}).Run(ctx, LocalCommandRequest{
+		Name:                   executable,
+		Args:                   []string{"-test.run=TestExecCommandRunnerOutputLimitHelperProcess", "--"},
+		Env:                    append(os.Environ(), "CRABBOX_TEST_OUTPUT_LIMIT_HELPER=1"),
+		MaxCapturedOutputBytes: 1024,
+	})
+	if err == nil || !strings.Contains(err.Error(), "exceeded 1024-byte limit") {
+		t.Fatalf("output limit error=%v stdout_bytes=%d stdout=%q stderr=%q", err, len(result.Stdout), result.Stdout, result.Stderr)
+	}
+	if len(result.Stdout) != 1024 {
+		t.Fatalf("captured stdout bytes=%d", len(result.Stdout))
+	}
+	if result.ExitCode != 5 {
+		t.Fatalf("output limit exit code=%d want=5", result.ExitCode)
+	}
+}
+
+func TestExecCommandRunnerOutputLimitHelperProcess(t *testing.T) {
+	mode := os.Getenv("CRABBOX_TEST_OUTPUT_LIMIT_HELPER")
+	if mode == "" {
+		return
+	}
+	if mode == "child" {
+		time.Sleep(time.Hour)
+		return
+	}
+	child := exec.Command(os.Args[0], "-test.run=TestExecCommandRunnerOutputLimitHelperProcess", "--")
+	child.Env = make([]string, 0, len(os.Environ())+1)
+	for _, entry := range os.Environ() {
+		if !strings.HasPrefix(entry, "CRABBOX_TEST_OUTPUT_LIMIT_HELPER=") {
+			child.Env = append(child.Env, entry)
+		}
+	}
+	child.Env = append(child.Env, "CRABBOX_TEST_OUTPUT_LIMIT_HELPER=child")
+	child.Stdout = os.Stdout
+	child.Stderr = os.Stderr
+	if err := child.Start(); err != nil {
+		os.Exit(97)
+	}
+	if mode == "retained-pipe" {
+		pidPath := os.Getenv("CRABBOX_TEST_OUTPUT_LIMIT_CHILD_PID")
+		if err := os.WriteFile(pidPath, []byte(strconv.Itoa(child.Process.Pid)), 0o600); err != nil {
+			_ = child.Process.Kill()
+			_ = child.Wait()
+			os.Exit(98)
+		}
+		os.Exit(0)
+	}
+	_, _ = io.WriteString(os.Stdout, strings.Repeat("x", 1<<20))
+	time.Sleep(time.Hour)
+}
+
+func TestControllerCoordinatorRegistrationBindingRejectsAcquisitionDrift(t *testing.T) {
+	t.Setenv(controllerCoordinatorRegistrationExpectedEnv, "1")
+	t.Setenv(controllerCoordinatorRegistrationURLEnv, "https://old-coordinator.example.test/root")
+	matching := Config{BrokerMode: BrokerModeRegistered, Coordinator: "https://old-coordinator.example.test/root/"}
+	if err := validateControllerCoordinatorRegistrationBinding(matching); err != nil {
+		t.Fatalf("canonical matching binding: %v", err)
+	}
+	drifted := Config{BrokerMode: BrokerModeRegistered, Coordinator: "https://new-coordinator.example.test/root"}
+	if err := validateControllerCoordinatorRegistrationBinding(drifted); err == nil || !strings.Contains(err.Error(), "binding changed") {
+		t.Fatalf("binding drift error=%v", err)
+	}
+}
+
+func TestProviderRegistryCanonicalAndAliases(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		canonical string
+	}{
+		{name: "hetzner", canonical: "hetzner"},
+		{name: "digitalocean", canonical: "digitalocean"},
+		{name: "aws", canonical: "aws"},
+		{name: "azure", canonical: "azure"},
+		{name: "azure-dynamic-sessions", canonical: "azure-dynamic-sessions"},
+		{name: "gcp", canonical: "gcp"},
+		{name: "google", canonical: "gcp"},
+		{name: "google-cloud", canonical: "gcp"},
+		{name: "incus", canonical: "incus"},
+		{name: "proxmox", canonical: "proxmox"},
+		{name: "xcp-ng", canonical: "xcp-ng"},
+		{name: "ssh", canonical: "ssh"},
+		{name: "static", canonical: "ssh"},
+		{name: "static-ssh", canonical: "ssh"},
+		{name: "exe-dev", canonical: "exe-dev"},
+		{name: "exe", canonical: "exe-dev"},
+		{name: "exedev", canonical: "exe-dev"},
+		{name: "blacksmith", canonical: "blacksmith-testbox"},
+		{name: "blacksmith-testbox", canonical: "blacksmith-testbox"},
+		{name: "namespace", canonical: "namespace-devbox"},
+		{name: "namespace-devbox", canonical: "namespace-devbox"},
+		{name: "morph", canonical: "morph"},
+		{name: "daytona", canonical: "daytona"},
+		{name: "islo", canonical: "islo"},
+		{name: "e2b", canonical: "e2b"},
+		{name: "modal", canonical: "modal"},
+		{name: "cloudflare", canonical: "cloudflare"},
+		{name: "cf", canonical: "cloudflare"},
+		{name: "sprites", canonical: "sprites"},
+		{name: "local-container", canonical: "local-container"},
+		{name: "docker", canonical: "local-container"},
+		{name: "container", canonical: "local-container"},
+		{name: "local-docker", canonical: "local-container"},
+	} {
+		provider, err := ProviderFor(tc.name)
+		if err != nil {
+			t.Fatalf("ProviderFor(%q): %v", tc.name, err)
+		}
+		if provider.Name() != tc.canonical {
+			t.Fatalf("ProviderFor(%q).Name() = %q, want %q", tc.name, provider.Name(), tc.canonical)
+		}
+	}
+	if _, err := ProviderFor("missing"); err == nil {
+		t.Fatal("expected missing provider to fail")
+	}
+}
+
+func TestLeaseOptionsFromConfigCanonicalizesProviderScope(t *testing.T) {
+	cfg := baseConfig()
+	cfg.Provider = "google-cloud"
+	cfg.GCPProject = "project-a"
+	if scope := leaseOptionsFromConfig(cfg).ProviderScope; scope != "project:project-a" {
+		t.Fatalf("provider scope=%q", scope)
+	}
+
+	cfg.Provider = "purpose-routing-alias"
+	if scope := leaseOptionsFromConfig(cfg).ProviderScope; scope != " opaque routing identity " {
+		t.Fatalf("core changed opaque provider scope: %q", scope)
+	}
+
+}
+
+func TestProviderHelpAllIncludesDelegatedProviders(t *testing.T) {
+	help := providerHelpAll()
+	for _, provider := range []string{"freestyle", "morph", "wandb"} {
+		if !strings.Contains(help, provider) {
+			t.Fatalf("providerHelpAll() = %q, want %s", help, provider)
+		}
+	}
+	if strings.Contains(providerHelpSSH(), "azure-dynamic-sessions") {
+		t.Fatalf("providerHelpSSH() = %q, want only ssh-capable providers", providerHelpSSH())
+	}
+}
+
+func TestAzureBackendFlagRoutesToDynamicSessions(t *testing.T) {
+	defaults := baseConfig()
+	fs := newFlagSet("test", io.Discard)
+	values := registerLeaseCreateFlags(fs, defaults)
+	if err := parseFlags(fs, []string{"--provider", "azure", "--azure-backend", "dynamic-sessions"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := defaults
+	if err := applyLeaseCreateFlags(&cfg, fs, values); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Provider != "azure-dynamic-sessions" || cfg.AzureBackend != AzureBackendDynamicSessions || cfg.ServerType != "" {
+		t.Fatalf("provider=%q azureBackend=%q serverType=%q", cfg.Provider, cfg.AzureBackend, cfg.ServerType)
+	}
+}
+
+func TestProviderFlagsRouteAzureBackendWithoutLeaseCreate(t *testing.T) {
+	defaults := baseConfig()
+	fs := newFlagSet("test", io.Discard)
+	providerFlag := fs.String("provider", defaults.Provider, "")
+	values := registerProviderFlags(fs, defaults)
+	if err := parseFlags(fs, []string{"--provider", "azure", "--azure-backend", "dynamic-sessions"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := defaults
+	cfg.Provider = *providerFlag
+	if err := applyProviderFlags(&cfg, fs, values); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Provider != "azure-dynamic-sessions" || cfg.AzureBackend != AzureBackendDynamicSessions {
+		t.Fatalf("provider=%q azureBackend=%q", cfg.Provider, cfg.AzureBackend)
+	}
+}
+
+func TestAzureBackendFlagOverridesDynamicSessionsConfig(t *testing.T) {
+	defaults := baseConfig()
+	defaults.Provider = "azure-dynamic-sessions"
+	defaults.AzureBackend = AzureBackendDynamicSessions
+	fs := newFlagSet("test", io.Discard)
+	values := registerLeaseCreateFlags(fs, defaults)
+	if err := parseFlags(fs, []string{"--azure-backend", "vm"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := defaults
+	if err := applyLeaseCreateFlags(&cfg, fs, values); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Provider != "azure" || cfg.AzureBackend != AzureBackendVM || cfg.ServerType == "" {
+		t.Fatalf("provider=%q azureBackend=%q serverType=%q", cfg.Provider, cfg.AzureBackend, cfg.ServerType)
+	}
+}
+
+func TestProviderFlagsOverrideDynamicSessionsConfigWithoutLeaseCreate(t *testing.T) {
+	defaults := baseConfig()
+	defaults.Provider = "azure-dynamic-sessions"
+	defaults.AzureBackend = AzureBackendDynamicSessions
+	fs := newFlagSet("test", io.Discard)
+	providerFlag := fs.String("provider", defaults.Provider, "")
+	values := registerProviderFlags(fs, defaults)
+	if err := parseFlags(fs, []string{"--azure-backend", "vm"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := defaults
+	cfg.Provider = *providerFlag
+	if err := applyProviderFlags(&cfg, fs, values); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Provider != "azure" || cfg.AzureBackend != AzureBackendVM {
+		t.Fatalf("provider=%q azureBackend=%q", cfg.Provider, cfg.AzureBackend)
+	}
+}
+
+func TestRouteConfiguredProviderPreservesAuthoritativeProviderFamilyRoute(t *testing.T) {
+	for _, source := range []providerSelectionSource{providerSelectionLeaseContext, providerSelectionRecordedRun} {
+		t.Run(string(source), func(t *testing.T) {
+			defaults := baseConfig()
+			defaults.Provider = "azure"
+			defaults.AzureBackend = AzureBackendDynamicSessions
+			fs := newFlagSet("authoritative Azure flags", io.Discard)
+			values := registerProviderFlags(fs, defaults)
+			if err := parseFlags(fs, []string{"--azure-snapshot-sku", "premium_lrs"}); err != nil {
+				t.Fatal(err)
+			}
+			cfg := defaults
+			setProviderSelection(&cfg, "azure", source)
+			if !ProviderSelectionIsAuthoritativeRoute(cfg) {
+				t.Fatalf("source=%q not exposed as authoritative", source)
+			}
+			if err := routeConfiguredProvider(&cfg); err != nil {
+				t.Fatal(err)
+			}
+			if err := applyProviderFlags(&cfg, fs, values); err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Provider != "azure" || cfg.providerSelectionSource != source {
+				t.Fatalf("provider=%q source=%q, want authoritative azure/%s", cfg.Provider, cfg.providerSelectionSource, source)
+			}
+			if cfg.AzureSnapshotSKU != "Premium_LRS" {
+				t.Fatalf("snapshot SKU=%q, want non-routing flag applied", cfg.AzureSnapshotSKU)
+			}
+		})
+	}
+
+	for _, source := range []providerSelectionSource{providerSelectionUserConfig, providerSelectionFlag} {
+		t.Run("routed_"+string(source), func(t *testing.T) {
+			cfg := baseConfig()
+			setProviderSelection(&cfg, "azure", source)
+			cfg.AzureBackend = AzureBackendDynamicSessions
+			if err := routeConfiguredProvider(&cfg); err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Provider != "azure-dynamic-sessions" || cfg.providerSelectionSource != source {
+				t.Fatalf("provider=%q source=%q, want routed azure-dynamic-sessions/%s", cfg.Provider, cfg.providerSelectionSource, source)
+			}
+		})
+	}
+
+	t.Run("routing flag overrides authoritative route", func(t *testing.T) {
+		defaults := baseConfig()
+		defaults.Provider = "azure"
+		fs := newFlagSet("authoritative route override", io.Discard)
+		values := registerProviderFlags(fs, defaults)
+		if err := parseFlags(fs, []string{"--azure-backend", "dynamic-sessions"}); err != nil {
+			t.Fatal(err)
+		}
+		cfg := defaults
+		setProviderSelection(&cfg, "azure", providerSelectionLeaseContext)
+		if err := applyProviderFlags(&cfg, fs, values); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Provider != "azure-dynamic-sessions" || cfg.providerSelectionSource != providerSelectionFlag {
+			t.Fatalf("provider=%q source=%q", cfg.Provider, cfg.providerSelectionSource)
+		}
+	})
+}
+
+func TestApplyProviderRoutingFlagsPreservesAuthoritativeAzureRoute(t *testing.T) {
+	defaults := baseConfig()
+	defaults.Provider = "azure"
+	defaults.AzureBackend = AzureBackendDynamicSessions
+
+	fs := newFlagSet("authoritative Azure route", io.Discard)
+	values := registerProviderFlags(fs, defaults)
+	if err := parseFlags(fs, nil); err != nil {
+		t.Fatal(err)
+	}
+	cfg := defaults
+	setProviderSelection(&cfg, "azure", providerSelectionRecordedRun)
+	if err := applyProviderRoutingFlags(&cfg, fs, values); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Provider != "azure" || cfg.providerSelectionSource != providerSelectionRecordedRun {
+		t.Fatalf("provider=%q source=%q", cfg.Provider, cfg.providerSelectionSource)
+	}
+
+	overrideFS := newFlagSet("authoritative Azure route override", io.Discard)
+	overrideValues := registerProviderFlags(overrideFS, defaults)
+	if err := parseFlags(overrideFS, []string{"--azure-backend", "dynamic-sessions"}); err != nil {
+		t.Fatal(err)
+	}
+	setProviderSelection(&cfg, "azure", providerSelectionRecordedRun)
+	if err := applyProviderRoutingFlags(&cfg, overrideFS, overrideValues); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Provider != "azure-dynamic-sessions" || cfg.providerSelectionSource != providerSelectionFlag {
+		t.Fatalf("provider=%q source=%q", cfg.Provider, cfg.providerSelectionSource)
+	}
+}
+
+func TestLoadBackendWrapsCoordinatorOnlyForSupportedSSHProviders(t *testing.T) {
+	t.Setenv(controllerProviderScopeEnv, "")
+	cfg := baseConfig()
+	setProviderSelection(&cfg, "aws", providerSelectionFlag)
+	cfg.Coordinator = "https://coordinator.example"
+	backend, err := loadBackend(cfg, testRuntimeWithRunner(&recordingCommandRunner{}))
+	if err != nil {
+		t.Fatalf("load aws coordinator backend: %v", err)
+	}
+	if _, ok := backend.(*coordinatorLeaseBackend); !ok {
+		t.Fatalf("backend=%T, want coordinatorLeaseBackend", backend)
+	}
+
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("DAYTONA_API_KEY", "")
+	t.Setenv("DAYTONA_JWT_TOKEN", "")
+	t.Setenv("CRABBOX_DAYTONA_API_KEY", "")
+	t.Setenv("CRABBOX_DAYTONA_JWT_TOKEN", "")
+	cfg.Provider = "daytona"
+	backend, err = loadBackend(cfg, testRuntimeWithRunner(&recordingCommandRunner{}))
+	if err != nil {
+		t.Fatalf("load Daytona coordinator backend without client Daytona auth: %v", err)
+	}
+	if _, ok := backend.(*coordinatorLeaseBackend); !ok {
+		t.Fatalf("backend=%T, want coordinatorLeaseBackend", backend)
+	}
+
+	cfg.Provider = "ssh"
+	backend, err = loadBackend(cfg, testRuntimeWithRunner(&recordingCommandRunner{}))
+	if err != nil {
+		t.Fatalf("load static ssh backend: %v", err)
+	}
+	if _, ok := backend.(*coordinatorLeaseBackend); ok {
+		t.Fatalf("static ssh unexpectedly used coordinator wrapper")
+	}
+
+	cfg.Provider = "exe-dev"
+	backend, err = loadBackend(cfg, testRuntimeWithRunner(&recordingCommandRunner{}))
+	if err != nil {
+		t.Fatalf("load exe-dev backend: %v", err)
+	}
+	if _, ok := backend.(SSHLeaseBackend); !ok {
+		t.Fatalf("backend=%T, want ssh lease backend", backend)
+	}
+
+	cfg.Provider = "blacksmith-testbox"
+	backend, err = loadBackend(cfg, testRuntimeWithRunner(&recordingCommandRunner{}))
+	if err != nil {
+		t.Fatalf("load blacksmith backend: %v", err)
+	}
+	if _, ok := backend.(DelegatedRunBackend); !ok {
+		t.Fatalf("backend=%T, want delegated run backend", backend)
+	}
+
+	cfg.Provider = "namespace-devbox"
+	backend, err = loadBackend(cfg, testRuntimeWithRunner(&recordingCommandRunner{}))
+	if err != nil {
+		t.Fatalf("load namespace backend: %v", err)
+	}
+	if _, ok := backend.(SSHLeaseBackend); !ok {
+		t.Fatalf("backend=%T, want ssh lease backend", backend)
+	}
+
+	cfg.Provider = "proxmox"
+	backend, err = loadBackend(cfg, testRuntimeWithRunner(&recordingCommandRunner{}))
+	if err != nil {
+		t.Fatalf("load proxmox backend: %v", err)
+	}
+	if _, ok := backend.(SSHLeaseBackend); !ok {
+		t.Fatalf("backend=%T, want ssh lease backend", backend)
+	}
+
+	cfg.Provider = "xcp-ng"
+	backend, err = loadBackend(cfg, testRuntimeWithRunner(&recordingCommandRunner{}))
+	if err != nil {
+		t.Fatalf("load xcp-ng backend: %v", err)
+	}
+	if _, ok := backend.(SSHLeaseBackend); !ok {
+		t.Fatalf("backend=%T, want ssh lease backend", backend)
+	}
+
+	cfg.Provider = "e2b"
+	backend, err = loadBackend(cfg, testRuntimeWithRunner(&recordingCommandRunner{}))
+	if err != nil {
+		t.Fatalf("load e2b backend: %v", err)
+	}
+	if _, ok := backend.(DelegatedRunBackend); !ok {
+		t.Fatalf("backend=%T, want delegated run backend", backend)
+	}
+
+	cfg.Provider = "modal"
+	backend, err = loadBackend(cfg, testRuntimeWithRunner(&recordingCommandRunner{}))
+	if err != nil {
+		t.Fatalf("load modal backend: %v", err)
+	}
+	if _, ok := backend.(DelegatedRunBackend); !ok {
+		t.Fatalf("backend=%T, want delegated run backend", backend)
+	}
+
+	cfg.Provider = "sprites"
+	backend, err = loadBackend(cfg, testRuntimeWithRunner(&recordingCommandRunner{}))
+	if err != nil {
+		t.Fatalf("load sprites backend: %v", err)
+	}
+	if _, ok := backend.(SSHLeaseBackend); !ok {
+		t.Fatalf("backend=%T, want ssh lease backend", backend)
+	}
+
+	cfg.Provider = "local-container"
+	backend, err = loadBackend(cfg, testRuntimeWithRunner(&recordingCommandRunner{}))
+	if err != nil {
+		t.Fatalf("load local-container backend: %v", err)
+	}
+	if _, ok := backend.(SSHLeaseBackend); !ok {
+		t.Fatalf("backend=%T, want ssh lease backend", backend)
+	}
+}
+
+func TestLoadBackendRejectsChangedControllerProviderScope(t *testing.T) {
+	cfg := baseConfig()
+	setProviderSelection(&cfg, "external", providerSelectionFlag)
+	cfg.External.Command = "provider-a"
+	_, scope, _, err := controllerProviderIdentityForConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(controllerProviderScopeEnv, scope)
+	if _, err := loadBackend(cfg, testRuntimeWithRunner(&recordingCommandRunner{})); err != nil {
+		t.Fatalf("matching scope rejected: %v", err)
+	}
+	cfg.External.Command = "provider-b"
+	if _, err := loadBackend(cfg, testRuntimeWithRunner(&recordingCommandRunner{})); err == nil || !strings.Contains(err.Error(), "controller routing scope changed") {
+		t.Fatalf("changed scope error=%v", err)
+	}
+}
+
+func TestLoadBackendResetsInferredTargetAfterProviderSwitch(t *testing.T) {
+	cfg := baseConfig()
+	setProviderSelection(&cfg, "cloudflare-dynamic-workers", providerSelectionFlag)
+	applySingleProviderTargetDefault(&cfg)
+	if cfg.TargetOS != "worker-runtime" {
+		t.Fatalf("initial target=%q, want worker-runtime", cfg.TargetOS)
+	}
+
+	cfg.Provider = "hetzner"
+	cfg.Coordinator = "https://coordinator.example"
+	backend, err := loadBackend(cfg, testRuntimeWithRunner(&recordingCommandRunner{}))
+	if err != nil {
+		t.Fatalf("load backend after provider switch: %v", err)
+	}
+	coordinator, ok := backend.(*coordinatorLeaseBackend)
+	if !ok {
+		t.Fatalf("backend=%T, want coordinatorLeaseBackend", backend)
+	}
+	if coordinator.cfg.TargetOS != targetLinux {
+		t.Fatalf("coordinator target=%q, want %q", coordinator.cfg.TargetOS, targetLinux)
+	}
+}
+
+func TestRegisteredBrokerKeepsProviderLifecycleDirect(t *testing.T) {
+	t.Setenv(controllerProviderScopeEnv, "")
+	cfg := baseConfig()
+	setProviderSelection(&cfg, "aws", providerSelectionFlag)
+	cfg.Coordinator = "https://coordinator.example"
+	cfg.BrokerMode = BrokerModeRegistered
+	backend, err := loadBackend(cfg, testRuntimeWithRunner(&recordingCommandRunner{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := backend.(*coordinatorLeaseBackend); ok {
+		t.Fatal("registered broker mode must not transfer lifecycle ownership to the coordinator")
+	}
+	if !shouldRegisterCoordinatorLease(cfg) {
+		t.Fatal("registered broker mode should register direct leases")
+	}
+}
+
+func TestProviderFlagsApplyNamespaceWithoutCoreEdits(t *testing.T) {
+	defaults := baseConfig()
+	cfg := parseAndApplyProviderFlagsForTest(t, defaults, []string{
+		"--provider", "namespace-devbox",
+		"--namespace-image", "crabbox-ready",
+		"--namespace-size", "L",
+		"--namespace-work-root", "/workspaces/test",
+	})
+	if cfg.Namespace.Image != "crabbox-ready" || cfg.Namespace.Size != "L" || cfg.Namespace.WorkRoot != "/workspaces/test" {
+		t.Fatalf("namespace flags not applied: %#v", cfg.Namespace)
+	}
+}
+
+func TestProviderFlagsApplyMorphWithoutCoreEdits(t *testing.T) {
+	defaults := baseConfig()
+	cfg := parseAndApplyProviderFlagsForTest(t, defaults, []string{
+		"--provider", "morph",
+		"--morph-api-url", "https://morph.example.test",
+		"--morph-snapshot", "snapshot_123",
+		"--morph-work-root", "/tmp/morph-work",
+		"--morph-delete-on-release",
+		"--morph-wake-on-ssh=false",
+	})
+	if cfg.Morph.APIURL != "https://morph.example.test" || cfg.Morph.Snapshot != "snapshot_123" || cfg.Morph.WorkRoot != "/tmp/morph-work" || cfg.WorkRoot != "/tmp/morph-work" || !cfg.Morph.DeleteOnRelease || cfg.Morph.WakeOnSSH {
+		t.Fatalf("morph flags not applied: %#v workRoot=%q", cfg.Morph, cfg.WorkRoot)
+	}
+}
+
+func TestProviderFlagsApplyExeDevWithoutCoreEdits(t *testing.T) {
+	defaults := baseConfig()
+	cfg := parseAndApplyProviderFlagsForTest(t, defaults, []string{
+		"--provider", "exe",
+		"--exe-dev-control-host", "ssh.exe.example.test",
+		"--exe-dev-image", "ubuntu:24.04",
+		"--exe-dev-user", "runner",
+		"--exe-dev-work-root", "/tmp/work",
+	})
+	if cfg.ExeDev.ControlHost != "ssh.exe.example.test" || cfg.ExeDev.Image != "ubuntu:24.04" || cfg.ExeDev.User != "runner" || cfg.SSHUser != "runner" || cfg.WorkRoot != "/tmp/work" {
+		t.Fatalf("exe-dev flags not applied: %#v", cfg.ExeDev)
+	}
+}
+
+func TestProviderFlagsApplyLocalContainerWithoutCoreEdits(t *testing.T) {
+	defaults := baseConfig()
+	cfg := parseAndApplyProviderFlagsForTest(t, defaults, []string{
+		"--provider", "docker",
+		"--local-container-runtime", "docker",
+		"--local-container-image", "ubuntu:24.04",
+		"--local-container-user", "runner",
+		"--local-container-work-root", "/workspace/crabbox",
+		"--local-container-cpus", "4",
+		"--local-container-memory", "8g",
+		"--local-container-network", "bridge",
+		"--local-container-docker-socket",
+		"--local-container-volume", "/host/cache:/cache:ro",
+		"--local-container-volume", "/host/tmp:/tmp/host",
+	})
+	if cfg.Provider != "local-container" || cfg.LocalContainer.Runtime != "docker" || cfg.LocalContainer.Image != "ubuntu:24.04" || cfg.LocalContainer.User != "runner" || cfg.SSHUser != "runner" || cfg.WorkRoot != "/workspace/crabbox" || cfg.LocalContainer.CPUs != 4 || cfg.LocalContainer.Memory != "8g" || cfg.LocalContainer.Network != "bridge" || !cfg.LocalContainer.DockerSocket || len(cfg.LocalContainer.Volumes) != 2 || cfg.LocalContainer.Volumes[0] != "/host/cache:/cache:ro" || cfg.LocalContainer.Volumes[1] != "/host/tmp:/tmp/host" {
+		t.Fatalf("local-container flags not applied: provider=%s cfg=%#v", cfg.Provider, cfg.LocalContainer)
+	}
+}
+
+func TestSSHCommandConfigAppliesProviderFlags(t *testing.T) {
+	defaults := baseConfig()
+	fs := newFlagSet("ssh", io.Discard)
+	provider := fs.String("provider", defaults.Provider, "")
+	id := fs.String("id", "", "")
+	providerFlags := registerProviderFlags(fs, defaults)
+	targetFlags := registerTargetFlags(fs, defaults)
+	networkFlags := registerNetworkModeFlag(fs, defaults)
+	if err := parseFlags(fs, []string{
+		"--provider", "local-container",
+		"--local-container-runtime", "podman",
+		"--id", "example-podman",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadSSHCommandConfig(fs, *provider, providerFlags, targetFlags, networkFlags, leaseTargetConfigOptions{LeaseID: *id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Provider != "local-container" || cfg.LocalContainer.Runtime != "podman" {
+		t.Fatalf("ssh config did not apply local-container runtime: provider=%s runtime=%s", cfg.Provider, cfg.LocalContainer.Runtime)
+	}
+}
+
+func TestProviderFlagsApplyProxmoxWithoutSecrets(t *testing.T) {
+	defaults := baseConfig()
+	cfg := parseAndApplyProviderFlagsForTest(t, defaults, []string{
+		"--provider", "proxmox",
+		"--proxmox-api-url", "https://pve.example.test:8006",
+		"--proxmox-node", "pve1",
+		"--proxmox-template-id", "9000",
+		"--proxmox-user", "runner",
+		"--proxmox-work-root", "/work/test",
+		"--proxmox-insecure-tls",
+	})
+	if cfg.Proxmox.APIURL != "https://pve.example.test:8006" || cfg.Proxmox.Node != "pve1" || cfg.Proxmox.TemplateID != 9000 || cfg.Proxmox.User != "runner" || cfg.SSHUser != "runner" || cfg.WorkRoot != "/work/test" || !cfg.Proxmox.InsecureTLS {
+		t.Fatalf("proxmox flags not applied: %#v", cfg.Proxmox)
+	}
+	if cfg.ServerType != "template-9000" {
+		t.Fatalf("server type=%q want template-9000", cfg.ServerType)
+	}
+}
+
+func TestProviderFlagsApplyXCPNgWithoutPasswordFlag(t *testing.T) {
+	defaults := baseConfig()
+	fs := newFlagSet("test", io.Discard)
+	provider := fs.String("provider", defaults.Provider, "")
+	values := registerProviderFlags(fs, defaults)
+	if fs.Lookup("xcp-ng-password") != nil {
+		t.Fatal("xcp-ng password must not be registered as an argv flag")
+	}
+	if err := parseFlags(fs, []string{
+		"--provider", "xcp-ng",
+		"--xcp-ng-api-url", "https://xcp-ng.example.test",
+		"--xcp-ng-username", "root",
+		"--xcp-ng-template", "ubuntu-template",
+		"--xcp-ng-template-uuid", "tpl-0001",
+		"--xcp-ng-sr", "default-sr",
+		"--xcp-ng-sr-uuid", "sr-0001",
+		"--xcp-ng-network", "pool-network",
+		"--xcp-ng-network-uuid", "net-0001",
+		"--xcp-ng-host", "host-0001",
+		"--xcp-ng-user", "runner",
+		"--xcp-ng-work-root", "/work/xcp-ng",
+		"--xcp-ng-insecure-tls",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := defaults
+	cfg.Provider = *provider
+	if err := applyProviderFlags(&cfg, fs, values); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.XCPNg.APIURL != "https://xcp-ng.example.test" || cfg.XCPNg.Username != "root" || cfg.XCPNg.Template != "ubuntu-template" || cfg.XCPNg.TemplateUUID != "tpl-0001" || cfg.XCPNg.SR != "default-sr" || cfg.XCPNg.SRUUID != "sr-0001" || cfg.XCPNg.Network != "pool-network" || cfg.XCPNg.NetworkUUID != "net-0001" || cfg.XCPNg.Host != "host-0001" || cfg.XCPNg.User != "runner" || cfg.SSHUser != "runner" || cfg.WorkRoot != "/work/xcp-ng" || !cfg.XCPNg.InsecureTLS {
+		t.Fatalf("xcp-ng flags not applied: %#v", cfg.XCPNg)
+	}
+	if cfg.XCPNg.Password != "" {
+		t.Fatalf("xcp-ng password unexpectedly set from flags: %q", cfg.XCPNg.Password)
+	}
+	if cfg.ServerType != "template-tpl-0001" {
+		t.Fatalf("server type=%q want template-tpl-0001", cfg.ServerType)
+	}
+}
+
+func TestLeaseCreateFlagsApplySelectedProviderFlags(t *testing.T) {
+	defaults := baseConfig()
+	fs := newFlagSet("test", io.Discard)
+	values := registerLeaseCreateFlags(fs, defaults)
+	if err := parseFlags(fs, []string{
+		"--provider", "blacksmith-testbox",
+		"--blacksmith-org", "openclaw",
+		"--blacksmith-workflow", ".github/workflows/testbox.yml",
+		"--blacksmith-job", "test",
+		"--blacksmith-ref", "feature",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := baseConfig()
+	if err := applyLeaseCreateFlags(&cfg, fs, values); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Blacksmith.Org != "openclaw" || cfg.Blacksmith.Workflow != ".github/workflows/testbox.yml" || cfg.Blacksmith.Job != "test" || cfg.Blacksmith.Ref != "feature" {
+		t.Fatalf("blacksmith flags not applied through provider registry: %#v", cfg.Blacksmith)
+	}
+}
+
+func TestLeaseCreateFlagsRejectLumeLinuxTarget(t *testing.T) {
+	defaults := baseConfig()
+	fs := newFlagSet("test", io.Discard)
+	values := registerLeaseCreateFlags(fs, defaults)
+	if err := parseFlags(fs, []string{"--provider", "lume", "--target", "linux"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := baseConfig()
+	err := applyLeaseCreateFlags(&cfg, fs, values)
+	if err == nil || !strings.Contains(err.Error(), "provider=lume supports target=macos only") {
+		t.Fatalf("err=%v, want explicit Linux target rejection", err)
+	}
+}
+
+func TestLeaseCreateFlagsApplyCacheVolumes(t *testing.T) {
+	defaults := baseConfig()
+	fs := newFlagSet("test", io.Discard)
+	values := registerLeaseCreateFlags(fs, defaults)
+	if err := parseFlags(fs, []string{
+		"--provider", "blacksmith-testbox",
+		"--blacksmith-workflow", ".github/workflows/testbox.yml",
+		"--cache-volume", "pnpm=repo-linux-node24-lock:/var/cache/crabbox/pnpm",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := baseConfig()
+	if err := applyLeaseCreateFlags(&cfg, fs, values); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Cache.Volumes) != 1 || cfg.Cache.Volumes[0].Name != "pnpm" || !cfg.Cache.Volumes[0].Required {
+		t.Fatalf("cache volume flag not applied: %#v", cfg.Cache.Volumes)
+	}
+}
+
+func TestLeaseCreateFlagsMergeCacheVolumes(t *testing.T) {
+	defaults := baseConfig()
+	fs := newFlagSet("test", io.Discard)
+	values := registerLeaseCreateFlags(fs, defaults)
+	if err := parseFlags(fs, []string{
+		"--provider", "blacksmith-testbox",
+		"--cache-volume", "npm=repo-linux-node24-npm:/var/cache/crabbox/npm",
+		"--cache-volume", "pnpm=repo-linux-node24-pnpm:/var/cache/crabbox/pnpm",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := baseConfig()
+	cfg.Cache.Volumes = []CacheVolumeConfig{
+		{Name: "pnpm-store", Key: "repo-linux-node24-pnpm", Path: "/var/cache/crabbox/pnpm"},
+	}
+	if err := applyLeaseCreateFlags(&cfg, fs, values); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Cache.Volumes) != 2 {
+		t.Fatalf("cache volumes not merged: %#v", cfg.Cache.Volumes)
+	}
+	if cfg.Cache.Volumes[0].Name != "pnpm" || !cfg.Cache.Volumes[0].Required {
+		t.Fatalf("duplicate cache volume was not upgraded to required: %#v", cfg.Cache.Volumes)
+	}
+	if cfg.Cache.Volumes[1].Name != "npm" || cfg.Cache.Volumes[1].Key != "repo-linux-node24-npm" || !cfg.Cache.Volumes[1].Required {
+		t.Fatalf("new cache volume was not appended: %#v", cfg.Cache.Volumes)
+	}
+}
+
+func TestRequiredCacheVolumeRejectsUnsupportedProvider(t *testing.T) {
+	defaults := baseConfig()
+	fs := newFlagSet("test", io.Discard)
+	values := registerLeaseCreateFlags(fs, defaults)
+	if err := parseFlags(fs, []string{
+		"--provider", "aws",
+		"--cache-volume", "pnpm=repo-linux-node24-lock:/var/cache/crabbox/pnpm",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := baseConfig()
+	err := applyLeaseCreateFlags(&cfg, fs, values)
+	if err == nil || !strings.Contains(err.Error(), "does not support required cache volume") {
+		t.Fatalf("err=%v, want unsupported cache volume", err)
+	}
+}
+
+func TestRequiredCacheVolumeRejectsExistingLease(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	defaults := baseConfig()
+	fs := newFlagSet("test", io.Discard)
+	values := registerLeaseCreateFlags(fs, defaults)
+	if err := parseFlags(fs, []string{
+		"--provider", "blacksmith-testbox",
+		"--cache-volume", "pnpm=repo-linux-node24-lock:/var/cache/crabbox/pnpm",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := baseConfig()
+	err := applyLeaseCreateFlagsForLease(&cfg, fs, values, "tbx_existing")
+	if err == nil || !strings.Contains(err.Error(), "cannot be verified for existing lease") {
+		t.Fatalf("err=%v, want existing lease cache volume rejection", err)
+	}
+}
+
+func TestConfiguredCacheVolumeAllowsExistingLeaseReuse(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	defaults := baseConfig()
+	fs := newFlagSet("test", io.Discard)
+	values := registerLeaseCreateFlags(fs, defaults)
+	if err := parseFlags(fs, []string{"--provider", "blacksmith-testbox"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := baseConfig()
+	cfg.Cache.Volumes = []CacheVolumeConfig{{
+		Name:     "pnpm",
+		Key:      "repo-linux-node24-lock",
+		Path:     "/var/cache/crabbox/pnpm",
+		Required: true,
+	}}
+	if err := claimLeaseForRepoProvider("tbx_existing", "existing", "blacksmith-testbox", "/repo", time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := updateLeaseClaimCacheVolumes("tbx_existing", CacheVolumeStickyDiskSpecs(cfg.Cache.Volumes)); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyLeaseCreateFlagsForLease(&cfg, fs, values, "tbx_existing"); err != nil {
+		t.Fatalf("configured cache volume should allow reuse: %v", err)
+	}
+}
+
+func TestConfiguredCacheVolumeRejectsExistingLeaseWithoutClaimedVolume(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	defaults := baseConfig()
+	fs := newFlagSet("test", io.Discard)
+	values := registerLeaseCreateFlags(fs, defaults)
+	if err := parseFlags(fs, []string{"--provider", "blacksmith-testbox"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := baseConfig()
+	cfg.Cache.Volumes = []CacheVolumeConfig{{
+		Name:     "pnpm",
+		Key:      "repo-linux-node24-lock",
+		Path:     "/var/cache/crabbox/pnpm",
+		Required: true,
+	}}
+	if err := claimLeaseForRepoProvider("tbx_existing", "existing", "blacksmith-testbox", "/repo", time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+	err := applyLeaseCreateFlagsForLease(&cfg, fs, values, "tbx_existing")
+	if err == nil || !strings.Contains(err.Error(), "is not recorded on existing lease") {
+		t.Fatalf("err=%v, want missing cache volume claim rejection", err)
+	}
+}
+
+func TestLeaseCreateFlagsReapplyProxmoxDefaultsAfterProviderOverride(t *testing.T) {
+	defaults := baseConfig()
+	defaults.Provider = "hetzner"
+	defaults.Proxmox.TemplateID = 9000
+	defaults.Proxmox.User = "runner"
+	defaults.Proxmox.WorkRoot = "/work/proxmox"
+	defaults.ServerType = serverTypeForConfig(defaults)
+
+	fs := newFlagSet("test", io.Discard)
+	values := registerLeaseCreateFlags(fs, defaults)
+	if err := parseFlags(fs, []string{"--provider", "proxmox"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := defaults
+	if err := applyLeaseCreateFlags(&cfg, fs, values); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SSHUser != "runner" {
+		t.Fatalf("ssh user=%q want proxmox default", cfg.SSHUser)
+	}
+	if cfg.WorkRoot != "/work/proxmox" {
+		t.Fatalf("work root=%q want proxmox default", cfg.WorkRoot)
+	}
+	if cfg.ServerType != "template-9000" {
+		t.Fatalf("server type=%q want template-9000", cfg.ServerType)
+	}
+}
+
+func TestLeaseCreateFlagsReapplyXCPNgDefaultsAfterProviderOverride(t *testing.T) {
+	defaults := baseConfig()
+	defaults.Provider = "hetzner"
+	defaults.XCPNg.Template = "Ubuntu Ready"
+	defaults.XCPNg.User = "runner"
+	defaults.XCPNg.WorkRoot = "/work/xcp-ng"
+	defaults.ServerType = serverTypeForConfig(defaults)
+
+	fs := newFlagSet("test", io.Discard)
+	values := registerLeaseCreateFlags(fs, defaults)
+	if err := parseFlags(fs, []string{"--provider", "xcp-ng"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := defaults
+	if err := applyLeaseCreateFlags(&cfg, fs, values); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SSHUser != "runner" {
+		t.Fatalf("ssh user=%q want xcp-ng default", cfg.SSHUser)
+	}
+	if cfg.WorkRoot != "/work/xcp-ng" {
+		t.Fatalf("work root=%q want xcp-ng default", cfg.WorkRoot)
+	}
+	if cfg.ServerType != "template-ubuntu-ready" {
+		t.Fatalf("server type=%q want template-ubuntu-ready", cfg.ServerType)
+	}
+}
+
+func TestLeaseCreateFlagsReapplyDigitalOceanTargetAfterProviderOverride(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		target     string
+		hyperVRoot string
+		hyperVUser string
+		sourcePort string
+		modeFlag   string
+		wantErr    string
+		wantTarget string
+		wantMode   string
+		wantRoot   string
+		wantUser   string
+		wantPort   string
+	}{
+		{name: "implicit target", wantTarget: targetLinux, wantMode: windowsModeNormal, wantRoot: defaultPOSIXWorkRoot, wantUser: baseConfig().SSHUser, wantPort: baseConfig().SSHPort},
+		{name: "provider settings", hyperVRoot: `D:\work`, hyperVUser: "Administrator", sourcePort: "2202", wantTarget: targetLinux, wantMode: windowsModeNormal, wantRoot: defaultPOSIXWorkRoot, wantUser: baseConfig().SSHUser, wantPort: baseConfig().SSHPort},
+		{name: "explicit Windows mode", modeFlag: windowsModeWSL2, wantErr: "windows.mode is only valid with target=windows", wantTarget: targetLinux, wantMode: windowsModeWSL2, wantRoot: defaultPOSIXWorkRoot, wantUser: baseConfig().SSHUser, wantPort: baseConfig().SSHPort},
+		{name: "explicit target alias", target: "ubuntu", wantTarget: targetLinux, wantMode: windowsModeNormal, wantRoot: defaultPOSIXWorkRoot, wantUser: baseConfig().SSHUser, wantPort: baseConfig().SSHPort},
+		{name: "explicit Linux target with provider work root", target: targetLinux, hyperVRoot: `D:\work`, wantTarget: targetLinux, wantMode: windowsModeNormal, wantRoot: defaultPOSIXWorkRoot, wantUser: baseConfig().SSHUser, wantPort: baseConfig().SSHPort},
+		{name: "explicit target", target: targetWindows, modeFlag: windowsModeWSL2, wantErr: "supports target=linux only", wantTarget: targetWindows, wantMode: windowsModeWSL2, wantRoot: defaultPOSIXWorkRoot, wantUser: baseConfig().SSHUser, wantPort: baseConfig().SSHPort},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			defaults := baseConfig()
+			defaults.Provider = "hyperv"
+			if tt.hyperVRoot != "" {
+				defaults.HyperV.WorkRoot = tt.hyperVRoot
+			}
+			if tt.hyperVUser != "" {
+				defaults.HyperV.User = tt.hyperVUser
+			}
+			if err := applyProviderConfigDefaults(&defaults); err != nil {
+				t.Fatal(err)
+			}
+			if tt.sourcePort != "" {
+				defaults.SSHPort = tt.sourcePort
+			}
+			if tt.target != "" {
+				defaults.TargetOS = tt.target
+				MarkTargetExplicit(&defaults)
+			}
+
+			fs := newFlagSet("test", io.Discard)
+			values := registerLeaseCreateFlags(fs, defaults)
+			args := []string{"--provider", "digitalocean"}
+			if tt.modeFlag != "" {
+				args = append(args, "--windows-mode", tt.modeFlag)
+			}
+			if err := parseFlags(fs, args); err != nil {
+				t.Fatal(err)
+			}
+			cfg := defaults
+			err := applyLeaseCreateFlags(&cfg, fs, values)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("err=%v, want %q", err, tt.wantErr)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.TargetOS != tt.wantTarget {
+				t.Fatalf("target=%q want %q", cfg.TargetOS, tt.wantTarget)
+			}
+			if cfg.WindowsMode != tt.wantMode {
+				t.Fatalf("windows mode=%q want %q", cfg.WindowsMode, tt.wantMode)
+			}
+			if cfg.WorkRoot != tt.wantRoot {
+				t.Fatalf("work root=%q want %q", cfg.WorkRoot, tt.wantRoot)
+			}
+			if cfg.SSHUser != tt.wantUser {
+				t.Fatalf("SSH user=%q want %q", cfg.SSHUser, tt.wantUser)
+			}
+			if cfg.SSHPort != tt.wantPort {
+				t.Fatalf("SSH port=%q want %q", cfg.SSHPort, tt.wantPort)
+			}
+		})
+	}
+}
+
+func TestLeaseCreateFlagsCanonicalizeGCPAliasAndDeriveType(t *testing.T) {
+	defaults := baseConfig()
+	fs := newFlagSet("test", io.Discard)
+	values := registerLeaseCreateFlags(fs, defaults)
+	if err := parseFlags(fs, []string{"--provider", "google", "--class", "standard"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := baseConfig()
+	if err := applyLeaseCreateFlags(&cfg, fs, values); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Provider != "gcp" {
+		t.Fatalf("provider=%q want canonical gcp", cfg.Provider)
+	}
+	if cfg.ServerType != "c4-standard-32" {
+		t.Fatalf("server type=%q want gcp default", cfg.ServerType)
+	}
+}
+
+func TestLoadLeaseTargetConfigReappliesProxmoxDefaultsAfterProviderOverride(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "crabbox.yaml")
+	t.Setenv("CRABBOX_CONFIG", configPath)
+	if err := os.WriteFile(configPath, []byte(`provider: hetzner
+proxmox:
+  templateId: 9000
+  user: runner
+  workRoot: /work/proxmox
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	defaults := defaultConfig()
+	fs := newFlagSet("test", io.Discard)
+	targetFlags := registerTargetFlags(fs, defaults)
+	networkFlags := registerNetworkModeFlag(fs, defaults)
+	if err := parseFlags(fs, nil); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadLeaseTargetConfig(fs, "proxmox", targetFlags, networkFlags, leaseTargetConfigOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SSHUser != "runner" {
+		t.Fatalf("ssh user=%q want proxmox default", cfg.SSHUser)
+	}
+	if cfg.WorkRoot != "/work/proxmox" {
+		t.Fatalf("work root=%q want proxmox default", cfg.WorkRoot)
+	}
+	if cfg.ServerType != "template-9000" {
+		t.Fatalf("server type=%q want template-9000", cfg.ServerType)
+	}
+}
+
+func TestLoadLeaseTargetConfigRejectsUnsupportedProviderTarget(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "crabbox.yaml")
+	t.Setenv("CRABBOX_CONFIG", configPath)
+	if err := os.WriteFile(configPath, []byte(`provider: xcp-ng
+xcpNg:
+  apiUrl: https://xcp.example.test
+  username: root
+  password: secret
+  template: ubuntu
+  sr: local
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	defaults := defaultConfig()
+	fs := newFlagSet("test", io.Discard)
+	targetFlags := registerTargetFlags(fs, defaults)
+	networkFlags := registerNetworkModeFlag(fs, defaults)
+	if err := parseFlags(fs, []string{"--target", "macos"}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := loadLeaseTargetConfig(fs, "xcp-ng", targetFlags, networkFlags, leaseTargetConfigOptions{})
+	if err == nil || !strings.Contains(err.Error(), "provider=xcp-ng managed provisioning supports target=linux only") {
+		t.Fatalf("err=%v, want xcp-ng target validation", err)
+	}
+}
+
+func TestLoadLeaseTargetConfigAllowsExistingLeaseDespiteUnsupportedProvisioningTarget(t *testing.T) {
+	isolateTestUserDirs(t)
+	configPath := filepath.Join(t.TempDir(), "crabbox.yaml")
+	t.Setenv("CRABBOX_CONFIG", configPath)
+	if err := os.WriteFile(configPath, []byte(`provider: xcp-ng
+target: macos
+xcpNg:
+  apiUrl: https://xcp.example.test
+  username: root
+  password: secret
+  template: ubuntu
+  sr: local
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	defaults := defaultConfig()
+	fs := newFlagSet("test", io.Discard)
+	targetFlags := registerTargetFlags(fs, defaults)
+	networkFlags := registerNetworkModeFlag(fs, defaults)
+	if err := parseFlags(fs, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := loadLeaseTargetConfig(fs, "xcp-ng", targetFlags, networkFlags, leaseTargetConfigOptions{LeaseID: "cbx_existing"})
+	if err != nil {
+		t.Fatalf("loadLeaseTargetConfig existing lease: %v", err)
+	}
+}
+
+func TestLoadLeaseTargetConfigAllowsAWSMacOSWithoutProvisioningHost(t *testing.T) {
+	isolateTestUserDirs(t)
+	configPath := filepath.Join(t.TempDir(), "crabbox.yaml")
+	t.Setenv("CRABBOX_CONFIG", configPath)
+	t.Setenv("CRABBOX_HOST_ID", "")
+	t.Setenv("CRABBOX_AWS_MAC_HOST_ID", "")
+	t.Setenv("CRABBOX_COORDINATOR", "")
+	if err := os.WriteFile(configPath, []byte(`provider: aws
+aws:
+  region: us-east-1
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	defaults := defaultConfig()
+	fs := newFlagSet("test", io.Discard)
+	targetFlags := registerTargetFlags(fs, defaults)
+	networkFlags := registerNetworkModeFlag(fs, defaults)
+	if err := parseFlags(fs, []string{"--target", "macos"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadLeaseTargetConfig(fs, "aws", targetFlags, networkFlags, leaseTargetConfigOptions{LeaseID: "i-1234567890abcdef0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TargetOS != targetMacOS || cfg.Provider != "aws" {
+		t.Fatalf("cfg provider=%q target=%q", cfg.Provider, cfg.TargetOS)
+	}
+}
+
+func TestLeaseCreateFlagsRejectSnapshotSandboxResourceNoops(t *testing.T) {
+	defaults := baseConfig()
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{name: "type", args: []string{"--provider", "daytona", "--type", "large"}},
+		{name: "e2b class", args: []string{"--provider", "e2b", "--class", "standard"}},
+		{name: "e2b type", args: []string{"--provider", "e2b", "--type", "large"}},
+		{name: "modal class", args: []string{"--provider", "modal", "--class", "standard"}},
+		{name: "modal type", args: []string{"--provider", "modal", "--type", "large"}},
+		{name: "sprites class", args: []string{"--provider", "sprites", "--class", "standard"}},
+		{name: "sprites type", args: []string{"--provider", "sprites", "--type", "large"}},
+		{name: "opencomputer class", args: []string{"--provider", "opencomputer", "--class", "standard"}},
+		{name: "opencomputer type", args: []string{"--provider", "opencomputer", "--type", "large"}},
+		{name: "opencomputer alias class", args: []string{"--provider", "oc", "--class", "standard"}},
+		{name: "opencomputer alias type", args: []string{"--provider", "open-computer", "--type", "large"}},
+		{name: "opencomputer mixed-case class", args: []string{"--provider", "OpenComputer", "--class", "standard"}},
+		{name: "opencomputer spaced alias type", args: []string{"--provider", " OC ", "--type", "large"}},
+		{name: "codesandbox class", args: []string{"--provider", "codesandbox", "--class", "standard"}},
+		{name: "codesandbox type", args: []string{"--provider", "codesandbox", "--type", "large"}},
+		{name: "codesandbox alias class", args: []string{"--provider", "csb", "--class", "standard"}},
+		{name: "codesandbox alias type", args: []string{"--provider", "code-sandbox", "--type", "large"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := newFlagSet("test", io.Discard)
+			values := registerLeaseCreateFlags(fs, defaults)
+			if err := parseFlags(fs, tc.args); err != nil {
+				t.Fatal(err)
+			}
+			cfg := defaults
+			if err := applyLeaseCreateFlags(&cfg, fs, values); err == nil {
+				t.Fatalf("expected %v to be rejected", tc.args)
+			}
+		})
+	}
+}
+
+func TestValidateRequestedCapabilitiesUsesProviderSpec(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Config)
+		want   string
+	}{
+		{
+			name: "desktop",
+			mutate: func(cfg *Config) {
+				cfg.Desktop = true
+			},
+			want: "desktop/VNC is not supported",
+		},
+		{
+			name: "browser",
+			mutate: func(cfg *Config) {
+				cfg.Browser = true
+			},
+			want: "browser provisioning is not supported",
+		},
+		{
+			name: "code",
+			mutate: func(cfg *Config) {
+				cfg.Code = true
+			},
+			want: "web code is not supported",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := baseConfig()
+			cfg.Provider = "blacksmith-testbox"
+			tc.mutate(&cfg)
+			err := validateRequestedCapabilities(cfg)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error=%v want %q", err, tc.want)
+			}
+		})
+	}
+
+	cfg := baseConfig()
+	cfg.Provider = "hetzner"
+	cfg.Desktop = true
+	if err := validateRequestedCapabilities(cfg); err != nil {
+		t.Fatalf("hetzner desktop capability rejected: %v", err)
+	}
+}
+
+func TestRejectDelegatedSyncOptionsAllowsArchiveSyncControls(t *testing.T) {
+	spec := ProviderSpec{Name: "modal", Kind: ProviderKindDelegatedRun, Features: FeatureSet{FeatureArchiveSync}}
+	if err := RejectDelegatedSyncOptionsForSpec(spec, RunRequest{SyncOnly: true}); err != nil {
+		t.Fatalf("archive sync provider should allow --sync-only: %v", err)
+	}
+	if err := RejectDelegatedSyncOptionsForSpec(spec, RunRequest{ForceSyncLarge: true}); err != nil {
+		t.Fatalf("archive sync provider should allow --force-sync-large: %v", err)
+	}
+	if err := RejectDelegatedSyncOptionsForSpec(spec, RunRequest{ChecksumSync: true}); err == nil {
+		t.Fatal("archive sync provider should still reject --checksum")
+	}
+	if err := RejectDelegatedSyncOptionsForSpec(spec, RunRequest{RequiredArtifactGlobs: []string{"reports/data/manifest.json"}}); err == nil {
+		t.Fatal("archive sync provider should reject --require-artifact")
+	}
+	spec.Features = append(spec.Features, FeatureRunArtifacts)
+	if err := RejectDelegatedSyncOptionsForSpec(spec, RunRequest{RequiredArtifactGlobs: []string{"reports/data/manifest.json"}}); err != nil {
+		t.Fatalf("delegated artifact provider should allow --require-artifact: %v", err)
+	}
+	if err := RejectDelegatedSyncOptionsForSpec(spec, RunRequest{ArtifactGlobs: []string{"reports/data/**"}}); err != nil {
+		t.Fatalf("delegated artifact provider should allow --artifact-glob: %v", err)
+	}
+	if err := RejectDelegatedSyncOptionsForSpec(ProviderSpec{Name: "islo"}, RunRequest{SyncOnly: true}); err == nil {
+		t.Fatal("plain delegated provider should reject --sync-only")
+	}
+}
+
+func TestRejectDelegatedSyncOptionsLeavesNoSyncToAdapter(t *testing.T) {
+	// Archive sync is not required: SDK/CLI transports can also skip uploads.
+	for _, features := range []FeatureSet{nil, {FeatureArchiveSync}} {
+		spec := ProviderSpec{Name: "delegated-test", Kind: ProviderKindDelegatedRun, Features: features}
+		if err := RejectDelegatedSyncOptionsForSpec(spec, RunRequest{NoSync: true}); err != nil {
+			t.Fatalf("generic guard rejected adapter-owned --no-sync: %v", err)
+		}
+		if err := RejectDelegatedSyncOptionsForSpec(spec, RunRequest{NoSync: true, FullResync: true}); err == nil {
+			t.Fatal("--no-sync bypassed unsupported --full-resync rejection")
+		}
+	}
+}
+
+func TestRejectDelegatedSyncOptionsAllowsBoundedDownloads(t *testing.T) {
+	spec := ProviderSpec{
+		Name:     "islo",
+		Kind:     ProviderKindDelegatedRun,
+		Features: FeatureSet{FeatureRunDownloads},
+	}
+	req := RunRequest{
+		RequiredArtifactGlobs: []string{"reports/manifest.json"},
+		Downloads:             []string{"reports/manifest.json=manifest.json"},
+	}
+	if err := RejectDelegatedSyncOptionsForSpec(spec, req); err != nil {
+		t.Fatalf("bounded download provider rejected supported options: %v", err)
+	}
+	if err := RejectDelegatedSyncOptionsForSpec(spec, RunRequest{
+		ArtifactGlobs: []string{"reports/**"},
+	}); err == nil {
+		t.Fatal("bounded download provider should reject artifact globs")
+	}
+	if err := RejectDelegatedSyncOptionsForSpec(spec, RunRequest{
+		RequiredArtifactGlobs: []string{"reports/*.json"},
+	}); err == nil {
+		t.Fatal("bounded download provider should reject required globs")
+	}
+	if err := RejectDelegatedSyncOptionsForSpec(spec, RunRequest{
+		Downloads: []string{"https://example.test/proof=proof.json"},
+	}); err == nil {
+		t.Fatal("bounded download provider should reject URL-shaped paths")
+	}
+}
+
+func TestRejectDelegatedSyncOptionsAllowsProofFeature(t *testing.T) {
+	spec := ProviderSpec{Name: "blacksmith-testbox", Kind: ProviderKindDelegatedRun, Features: FeatureSet{FeatureRunProof}}
+	if err := RejectDelegatedSyncOptionsForSpec(spec, RunRequest{EmitProof: "/tmp/proof.md"}); err != nil {
+		t.Fatalf("delegated proof provider should allow --emit-proof: %v", err)
+	}
+	if err := RejectDelegatedSyncOptionsForSpec(ProviderSpec{Name: "islo"}, RunRequest{EmitProof: "/tmp/proof.md"}); err == nil {
+		t.Fatal("plain delegated provider should reject --emit-proof")
+	}
+}
+
+func TestRejectDelegatedSyncOptionsAllowsModuleRunScriptOnly(t *testing.T) {
+	spec := ProviderSpec{Name: "module-runtime-test", Kind: ProviderKindDelegatedRun, Features: FeatureSet{FeatureModuleRun}}
+	if err := RejectDelegatedSyncOptionsForSpec(spec, RunRequest{
+		ScriptRequested: true,
+		Script:          &RunScriptSpec{Source: "worker.mjs", Data: []byte("export default {}")},
+	}); err != nil {
+		t.Fatalf("module-run provider should allow script input: %v", err)
+	}
+	if err := RejectDelegatedSyncOptionsForSpec(spec, RunRequest{
+		Command: []string{"node", "worker.mjs"},
+	}); err == nil {
+		t.Fatal("module-run provider should reject trailing command argv")
+	}
+	if err := RejectDelegatedSyncOptionsForSpec(spec, RunRequest{
+		ScriptRequested: true,
+		ShellMode:       true,
+	}); err == nil {
+		t.Fatal("module-run provider should reject --shell")
+	}
+	if err := RejectDelegatedSyncOptionsForSpec(ProviderSpec{Name: "e2b", Kind: ProviderKindDelegatedRun}, RunRequest{
+		ScriptRequested: true,
+		Script:          &RunScriptSpec{Source: "worker.mjs", Data: []byte("export default {}")},
+	}); err == nil {
+		t.Fatal("delegated provider without module-run feature should reject script input")
+	}
+}
+
+func TestValidateRunSessionForSpec(t *testing.T) {
+	spec := ProviderSpec{Name: "e2b", Kind: ProviderKindDelegatedRun, Features: FeatureSet{FeatureRunSession}}
+	valid := RunResult{Session: &RunSessionHandle{
+		Provider:       "e2b",
+		LeaseID:        "cbx_test",
+		CleanupCommand: "crabbox stop --provider e2b cbx_test",
+	}}
+	if err := ValidateRunSessionForSpec(spec, RunResult{}); err != nil {
+		t.Fatalf("nil session should be allowed: %v", err)
+	}
+	if err := ValidateRunSessionForSpec(spec, valid); err != nil {
+		t.Fatalf("valid session rejected: %v", err)
+	}
+	if err := ValidateRunSessionForSpec(ProviderSpec{Name: "plain"}, valid); err == nil || !strings.Contains(err.Error(), "does not advertise run-session") {
+		t.Fatalf("missing feature err=%v", err)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		mutate  func(*RunSessionHandle)
+		wantErr string
+	}{
+		{name: "provider", mutate: func(s *RunSessionHandle) { s.Provider = " " }, wantErr: "without provider"},
+		{name: "lease id", mutate: func(s *RunSessionHandle) { s.LeaseID = "" }, wantErr: "without lease id"},
+		{name: "cleanup", mutate: func(s *RunSessionHandle) { s.CleanupCommand = "\t" }, wantErr: "without cleanup command"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			session := *valid.Session
+			tc.mutate(&session)
+			err := ValidateRunSessionForSpec(spec, RunResult{Session: &session})
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("err=%v want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestProviderFlagsApplyDaytonaAndIsloWithoutCoreEdits(t *testing.T) {
+	defaults := baseConfig()
+	cfg := parseAndApplyProviderFlagsForTest(t, defaults, []string{
+		"--provider", "daytona",
+		"--daytona-snapshot", "snap-crabbox",
+		"--daytona-target", "us",
+		"--daytona-work-root", "/home/daytona/work",
+	})
+	if cfg.Daytona.Snapshot != "snap-crabbox" || cfg.Daytona.Target != "us" || cfg.Daytona.WorkRoot != "/home/daytona/work" {
+		t.Fatalf("daytona flags not applied: %#v", cfg.Daytona)
+	}
+
+	cfg = parseAndApplyProviderFlagsForTest(t, defaults, []string{
+		"--provider", "islo",
+		"--islo-image", "ubuntu:24.04",
+		"--islo-vcpus", "4",
+		"--islo-memory-mb", "8192",
+	})
+	if cfg.Islo.Image != "ubuntu:24.04" || cfg.Islo.VCPUs != 4 || cfg.Islo.MemoryMB != 8192 {
+		t.Fatalf("islo flags not applied: %#v", cfg.Islo)
+	}
+
+	cfg = parseAndApplyProviderFlagsForTest(t, defaults, []string{
+		"--provider", "e2b",
+		"--e2b-template", "crabbox-ready",
+		"--e2b-workdir", "work/repo",
+	})
+	if cfg.E2B.Template != "crabbox-ready" || cfg.E2B.Workdir != "work/repo" {
+		t.Fatalf("e2b flags not applied: %#v", cfg.E2B)
+	}
+
+	cfg = parseAndApplyProviderFlagsForTest(t, defaults, []string{
+		"--provider", "modal",
+		"--modal-app", "crabbox-test",
+		"--modal-image", "python:3.13-slim",
+		"--modal-workdir", "/workspace/test",
+	})
+	if cfg.Modal.App != "crabbox-test" || cfg.Modal.Image != "python:3.13-slim" || cfg.Modal.Workdir != "/workspace/test" {
+		t.Fatalf("modal flags not applied: %#v", cfg.Modal)
+	}
+
+	cfg = parseAndApplyProviderFlagsForTest(t, defaults, []string{
+		"--provider", "sprites",
+		"--sprites-api-url", "https://sprites.example.test",
+		"--sprites-work-root", "/home/sprite/work",
+	})
+	if cfg.Sprites.APIURL != "https://sprites.example.test" || cfg.Sprites.WorkRoot != "/home/sprite/work" {
+		t.Fatalf("sprites flags not applied: %#v", cfg.Sprites)
+	}
+}
+
+func TestProviderFlagsApplyIncusWithoutCoreEdits(t *testing.T) {
+	defaults := baseConfig()
+	cfg := parseAndApplyProviderFlagsForTest(t, defaults, []string{
+		"--provider", "incus",
+		"--incus-instance-type", "vm",
+		"--incus-image", "images:ubuntu/24.04/cloud",
+		"--incus-user", "ubuntu",
+		"--incus-work-root", "/workspace/incus",
+		"--incus-proxy-listen-port", "2201",
+	})
+	if cfg.Incus.InstanceType != "virtual-machine" || cfg.Incus.User != "ubuntu" || cfg.Incus.WorkRoot != "/workspace/incus" {
+		t.Fatalf("incus flags not applied: %#v", cfg.Incus)
+	}
+	if cfg.SSHPort != "2201" || cfg.WorkRoot != "/workspace/incus" || cfg.ServerType != "virtual-machine:images:ubuntu/24.04/cloud" {
+		t.Fatalf("derived incus config wrong: sshPort=%q workRoot=%q serverType=%q", cfg.SSHPort, cfg.WorkRoot, cfg.ServerType)
+	}
+}
+
+func TestRedactedSSHUserOnlyForDaytona(t *testing.T) {
+	target := SSHTarget{User: "tok_live_secret"}
+	if got := redactedSSHUser(Config{Provider: "hetzner"}, Server{Provider: "hetzner"}, target); got != target.User {
+		t.Fatalf("redactedSSHUser hetzner=%q", got)
+	}
+	if got := redactedSSHUser(Config{Provider: "hetzner"}, Server{Provider: "hetzner"}, SSHTarget{User: "secret", AuthSecret: true}); got != "<token>" {
+		t.Fatalf("redactedSSHUser auth secret=%q", got)
+	}
+	if got := redactedSSHUser(Config{Provider: "daytona"}, Server{}, target); got != "<token>" {
+		t.Fatalf("redactedSSHUser daytona=%q", got)
+	}
+}
+
+func TestServerLeaseClaimSnapshotIsExplicitAndCloned(t *testing.T) {
+	server := Server{}
+	if _, exists, set := ServerLeaseClaimSnapshot(server); exists || set {
+		t.Fatalf("empty snapshot exists=%v set=%v", exists, set)
+	}
+	claim := LeaseClaim{LeaseID: "cbx_abcdef123456", Labels: map[string]string{"state": "ready"}}
+	SetServerLeaseClaimSnapshot(&server, claim, true)
+	claim.Labels["state"] = "changed"
+	got, exists, set := ServerLeaseClaimSnapshot(server)
+	if !exists || !set || got.LeaseID != claim.LeaseID || got.Labels["state"] != "ready" {
+		t.Fatalf("snapshot=%#v exists=%v set=%v", got, exists, set)
+	}
+	got.Labels["state"] = "mutated"
+	again, _, _ := ServerLeaseClaimSnapshot(server)
+	if again.Labels["state"] != "ready" {
+		t.Fatalf("snapshot alias=%#v", again)
+	}
+}

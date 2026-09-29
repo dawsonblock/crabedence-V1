@@ -1,0 +1,241 @@
+name: Bootstrap Daytona Snapshot
+run-name: Bootstrap Daytona snapshot ${{ inputs.name }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      name:
+        description: Daytona snapshot name
+        required: true
+        type: string
+      cpu:
+        description: Snapshot CPU cores
+        required: true
+        default: "2"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "3"
+          - "4"
+      memoryGiB:
+        description: Snapshot memory in GiB
+        required: true
+        default: "4"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "3"
+          - "4"
+          - "5"
+          - "6"
+          - "7"
+          - "8"
+      diskGiB:
+        description: Snapshot disk in GiB
+        required: true
+        default: "10"
+        type: choice
+        options:
+          - "3"
+          - "4"
+          - "5"
+          - "6"
+          - "7"
+          - "8"
+          - "9"
+          - "10"
+      baseImage:
+        description: OCI base image pinned by sha256 digest
+        required: true
+        type: string
+      confirm:
+        description: Type create to confirm this paid provider operation
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daytona-snapshot-bootstrap
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    name: Guard protected snapshot bootstrap
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require the protected default-branch workflow
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          RUN_SHA: ${{ github.sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          expected_ref="refs/heads/$DEFAULT_BRANCH"
+          expected_workflow_ref="$GITHUB_REPOSITORY/.github/workflows/daytona-snapshot-bootstrap.yml@$expected_ref"
+          [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]
+          [[ "$GITHUB_REF" == "$expected_ref" ]]
+          [[ "$GITHUB_WORKFLOW_REF" == "$expected_workflow_ref" ]]
+          [[ "$REF_PROTECTED" == true ]]
+          [[ "$WORKFLOW_SHA" == "$RUN_SHA" ]]
+
+      - name: Validate snapshot inputs
+        shell: bash
+        env:
+          SNAPSHOT_NAME: ${{ inputs.name }}
+          CPU: ${{ inputs.cpu }}
+          MEMORY_GIB: ${{ inputs.memoryGiB }}
+          DISK_GIB: ${{ inputs.diskGiB }}
+          BASE_IMAGE: ${{ inputs.baseImage }}
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          set -euo pipefail
+          [[ "$CONFIRM" == create ]]
+          [[ "$SNAPSHOT_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$ ]]
+          [[ "$CPU" =~ ^[1-4]$ ]]
+          [[ "$MEMORY_GIB" =~ ^[1-8]$ ]]
+          [[ "$DISK_GIB" =~ ^([3-9]|10)$ ]]
+          [[ "$BASE_IMAGE" =~ @sha256:[a-f0-9]{64}$ ]]
+          [[ "$BASE_IMAGE" != *[[:space:]]* ]]
+
+  bootstrap:
+    name: Create and verify snapshot
+    needs: guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: image-publisher
+    env:
+      CRABBOX_COORDINATOR: ${{ vars.CRABBOX_COORDINATOR }}
+      CRABBOX_COORDINATOR_ADMIN_TOKEN: ${{ secrets.CRABBOX_COORDINATOR_ADMIN_TOKEN }}
+      CRABBOX_ACCESS_CLIENT_ID: ${{ secrets.CRABBOX_ACCESS_CLIENT_ID }}
+      CRABBOX_ACCESS_CLIENT_SECRET: ${{ secrets.CRABBOX_ACCESS_CLIENT_SECRET }}
+      SNAPSHOT_NAME: ${{ inputs.name }}
+      CPU: ${{ inputs.cpu }}
+      MEMORY_GIB: ${{ inputs.memoryGiB }}
+      DISK_GIB: ${{ inputs.diskGiB }}
+      BASE_IMAGE: ${{ inputs.baseImage }}
+    steps:
+      - name: Verify broker configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$CRABBOX_COORDINATOR" =~ ^https:// ]]; then
+            echo "::error::Set the HTTPS CRABBOX_COORDINATOR variable on the image-publisher environment."
+            exit 1
+          fi
+          if [[ -z "$CRABBOX_COORDINATOR_ADMIN_TOKEN" ]]; then
+            echo "::error::Set the CRABBOX_COORDINATOR_ADMIN_TOKEN secret on the image-publisher environment."
+            exit 1
+          fi
+          if [[ -n "$CRABBOX_ACCESS_CLIENT_ID" || -n "$CRABBOX_ACCESS_CLIENT_SECRET" ]]; then
+            if [[ -z "$CRABBOX_ACCESS_CLIENT_ID" || -z "$CRABBOX_ACCESS_CLIENT_SECRET" ]]; then
+              echo "::error::Set both Cloudflare Access client secrets or neither."
+              exit 1
+            fi
+          fi
+
+      - name: Check out protected source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+
+      - name: Bootstrap and verify Daytona snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          payload="$RUNNER_TEMP/daytona-snapshot-request.json"
+          response="$RUNNER_TEMP/daytona-snapshot-response.json"
+          proof_dir="$RUNNER_TEMP/daytona-snapshot-proof"
+          mkdir -p "$proof_dir"
+
+          jq -n \
+            --arg name "$SNAPSHOT_NAME" \
+            --arg baseImage "$BASE_IMAGE" \
+            --argjson cpu "$CPU" \
+            --argjson memoryGiB "$MEMORY_GIB" \
+            --argjson diskGiB "$DISK_GIB" \
+            '{
+              name: $name,
+              cpu: $cpu,
+              memoryGiB: $memoryGiB,
+              diskGiB: $diskGiB,
+              baseImage: $baseImage,
+              confirm: true
+            }' >"$payload"
+
+          request_headers() {
+            printf 'Authorization: Bearer '
+            printf '%s' "$CRABBOX_COORDINATOR_ADMIN_TOKEN"
+            printf '\n'
+            if [[ -n "$CRABBOX_ACCESS_CLIENT_ID" ]]; then
+              printf 'CF-Access-Client-Id: %s\n' "$CRABBOX_ACCESS_CLIENT_ID"
+              printf 'CF-Access-Client-Secret: %s\n' "$CRABBOX_ACCESS_CLIENT_SECRET"
+            fi
+          }
+
+          request_headers | curl --fail-with-body --silent --show-error \
+            --connect-timeout 10 \
+            --max-time 1200 \
+            -X POST \
+            -H @- \
+            -H 'Content-Type: application/json' \
+            --data-binary @"$payload" \
+            -o "$response" \
+            "${CRABBOX_COORDINATOR%/}/v1/admin/providers/daytona/snapshot-bootstrap"
+
+          jq -e \
+            --arg name "$SNAPSHOT_NAME" \
+            --arg baseImage "$BASE_IMAGE" \
+            --argjson cpu "$CPU" \
+            --argjson memoryGiB "$MEMORY_GIB" \
+            --argjson diskGiB "$DISK_GIB" \
+            '
+              .snapshot.snapshot == $name
+              and .snapshot.sourceSnapshot == $baseImage
+              and .snapshot.cpu == $cpu
+              and .snapshot.memoryGiB == $memoryGiB
+              and .snapshot.diskGiB == $diskGiB
+              and .snapshot.sourceCPU == $cpu
+              and .snapshot.sourceMemoryGiB == $memoryGiB
+              and .snapshot.sourceDiskGiB == $diskGiB
+              and .snapshot.cleanup == "deleted"
+            ' "$response" >/dev/null
+
+          jq '{
+            capturedAt: (now | todateiso8601),
+            snapshot: {
+              name: .snapshot.snapshot,
+              cpu: .snapshot.cpu,
+              memoryGiB: .snapshot.memoryGiB,
+              diskGiB: .snapshot.diskGiB,
+              sourceCPU: .snapshot.sourceCPU,
+              sourceMemoryGiB: .snapshot.sourceMemoryGiB,
+              sourceDiskGiB: .snapshot.sourceDiskGiB,
+              cleanup: .snapshot.cleanup
+            }
+          }' "$response" >"$proof_dir/result.json"
+
+          {
+            echo "## Daytona snapshot bootstrap"
+            echo
+            jq -r '
+              "- Snapshot: `\(.snapshot.name)`",
+              "- Resources: `\(.snapshot.cpu) CPU / \(.snapshot.memoryGiB) GiB / \(.snapshot.diskGiB) GiB`",
+              "- Builder cleanup: `\(.snapshot.cleanup)`"
+            ' "$proof_dir/result.json"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload sanitized snapshot proof
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: daytona-snapshot-${{ github.run_id }}
+          path: ${{ runner.temp }}/daytona-snapshot-proof
+          if-no-files-found: error
+          retention-days: 30

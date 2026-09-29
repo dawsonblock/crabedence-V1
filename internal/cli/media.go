@@ -1,0 +1,655 @@
+package cli
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"math"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+)
+
+type mediaPreviewResult struct {
+	Input                    string                `json:"input"`
+	Output                   string                `json:"output"`
+	TrimmedVideoOutput       string                `json:"trimmedVideoOutput,omitempty"`
+	SourceDurationSeconds    float64               `json:"sourceDurationSeconds"`
+	PreviewStartSeconds      float64               `json:"previewStartSeconds"`
+	PreviewDurationSeconds   float64               `json:"previewDurationSeconds"`
+	PreviewSegments          []mediaPreviewSegment `json:"previewSegments"`
+	TrimmedStaticEdges       bool                  `json:"trimmedStaticEdges"`
+	DetectedFreezeIntervals  int                   `json:"detectedFreezeIntervals"`
+	DetectedMotionWindowNote string                `json:"detectedMotionWindowNote,omitempty"`
+	GifsicleOptimized        bool                  `json:"gifsicleOptimized"`
+}
+
+type mediaContactSheetResult struct {
+	Input                 string  `json:"input"`
+	Output                string  `json:"output"`
+	SourceDurationSeconds float64 `json:"sourceDurationSeconds"`
+	Frames                int     `json:"frames"`
+	Cols                  int     `json:"cols"`
+	Rows                  int     `json:"rows"`
+	Width                 int     `json:"width"`
+}
+
+type mediaPreviewOptions struct {
+	Input              string
+	Output             string
+	TrimmedVideoOutput string
+	ChildEnvDenylist   []string
+	Width              int
+	FPS                float64
+	TrimStatic         bool
+	TrimPadding        time.Duration
+	FreezeDuration     time.Duration
+	FreezeNoise        string
+	MinDuration        time.Duration
+	GifsicleMode       string
+	GifsicleLossy      int
+	GifsicleGamma      float64
+	JSON               bool
+}
+
+type mediaContactSheetOptions struct {
+	Input            string
+	Output           string
+	ChildEnvDenylist []string
+	Frames           int
+	Cols             int
+	Width            int
+}
+
+type mediaInterval struct {
+	Start float64
+	End   float64
+}
+
+type mediaPreviewSegment struct {
+	StartSeconds float64 `json:"startSeconds"`
+	EndSeconds   float64 `json:"endSeconds"`
+}
+
+const (
+	defaultMediaPreviewWidth         = 1000
+	defaultMediaPreviewFPS           = 24
+	defaultMediaPreviewGifsicleMode  = "auto"
+	defaultMediaPreviewGifsicleLossy = 65
+	defaultMediaPreviewGifsicleGamma = 1.2
+)
+
+func defaultMediaPreviewOptions(input, output, trimmedVideoOutput string) mediaPreviewOptions {
+	return mediaPreviewOptions{
+		Input:              input,
+		Output:             output,
+		TrimmedVideoOutput: trimmedVideoOutput,
+		Width:              defaultMediaPreviewWidth,
+		FPS:                defaultMediaPreviewFPS,
+		TrimStatic:         true,
+		TrimPadding:        750 * time.Millisecond,
+		FreezeDuration:     500 * time.Millisecond,
+		FreezeNoise:        "-50dB",
+		MinDuration:        1500 * time.Millisecond,
+		GifsicleMode:       defaultMediaPreviewGifsicleMode,
+		GifsicleLossy:      defaultMediaPreviewGifsicleLossy,
+		GifsicleGamma:      defaultMediaPreviewGifsicleGamma,
+	}
+}
+
+func (a App) mediaPreview(ctx context.Context, args []string) error {
+	fs := newFlagSet("media preview", a.Stderr)
+	input := fs.String("input", "", "input MP4/video path")
+	output := fs.String("output", "", "output GIF preview path")
+	trimmedVideoOutput := fs.String("trimmed-video-output", "", "optional output MP4 containing the same motion segments")
+	width := fs.Int("width", defaultMediaPreviewWidth, "preview width in pixels")
+	fps := fs.Float64("fps", defaultMediaPreviewFPS, "preview frames per second")
+	trimStatic := fs.Bool("trim-static", true, "remove static regions before making the preview")
+	noTrimStatic := fs.Bool("no-trim-static", false, "disable static-region trimming")
+	trimPadding := fs.Duration("trim-padding", 750*time.Millisecond, "context kept around each motion segment")
+	freezeDuration := fs.Duration("freeze-duration", 500*time.Millisecond, "minimum still duration for ffmpeg freezedetect")
+	freezeNoise := fs.String("freeze-noise", "-50dB", "ffmpeg freezedetect noise threshold")
+	minDuration := fs.Duration("min-duration", 1500*time.Millisecond, "minimum preview duration after trimming")
+	gifsicleMode := fs.String("gifsicle", defaultMediaPreviewGifsicleMode, "gifsicle optimization: auto, off, or required")
+	gifsicleLossy := fs.Int("gifsicle-lossy", defaultMediaPreviewGifsicleLossy, "gifsicle lossy compression value")
+	gifsicleGamma := fs.Float64("gifsicle-gamma", defaultMediaPreviewGifsicleGamma, "gifsicle gamma value")
+	jsonOut := fs.Bool("json", false, "print machine-readable result metadata")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if *noTrimStatic {
+		*trimStatic = false
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	if err := ValidateProviderCredentialDestination(cfg); err != nil {
+		return err
+	}
+	opts := defaultMediaPreviewOptions(*input, *output, *trimmedVideoOutput)
+	opts.ChildEnvDenylist = externalDesktopChildEnvDenylist(cfg, cfg.TargetOS)
+	opts.Width = *width
+	opts.FPS = *fps
+	opts.TrimStatic = *trimStatic
+	opts.TrimPadding = *trimPadding
+	opts.FreezeDuration = *freezeDuration
+	opts.FreezeNoise = *freezeNoise
+	opts.MinDuration = *minDuration
+	opts.GifsicleMode = *gifsicleMode
+	opts.GifsicleLossy = *gifsicleLossy
+	opts.GifsicleGamma = *gifsicleGamma
+	opts.JSON = *jsonOut
+	result, err := createMediaPreview(ctx, opts)
+	if err != nil {
+		return err
+	}
+	if opts.JSON {
+		enc := json.NewEncoder(a.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(result)
+	}
+	if result.TrimmedStaticEdges {
+		fmt.Fprintf(a.Stdout, "wrote %s motion-only (%.3fs)\n", result.Output, result.PreviewDurationSeconds)
+	} else {
+		fmt.Fprintf(a.Stdout, "wrote %s\n", result.Output)
+	}
+	if result.TrimmedVideoOutput != "" {
+		fmt.Fprintf(a.Stdout, "wrote %s\n", result.TrimmedVideoOutput)
+	}
+	return nil
+}
+
+func createMediaPreview(ctx context.Context, opts mediaPreviewOptions) (mediaPreviewResult, error) {
+	if strings.TrimSpace(opts.Input) == "" {
+		return mediaPreviewResult{}, exit(2, "media preview requires --input")
+	}
+	if strings.TrimSpace(opts.Output) == "" {
+		return mediaPreviewResult{}, exit(2, "media preview requires --output")
+	}
+	if opts.Width <= 0 {
+		return mediaPreviewResult{}, exit(2, "media preview --width must be positive")
+	}
+	if opts.FPS <= 0 {
+		return mediaPreviewResult{}, exit(2, "media preview --fps must be positive")
+	}
+	if opts.FreezeDuration <= 0 {
+		return mediaPreviewResult{}, exit(2, "media preview --freeze-duration must be positive")
+	}
+	if opts.MinDuration < 0 {
+		return mediaPreviewResult{}, exit(2, "media preview --min-duration must be non-negative")
+	}
+	gifsicleMode := strings.ToLower(strings.TrimSpace(opts.GifsicleMode))
+	if gifsicleMode == "" {
+		gifsicleMode = defaultMediaPreviewGifsicleMode
+	}
+	if gifsicleMode != "auto" && gifsicleMode != "off" && gifsicleMode != "required" {
+		return mediaPreviewResult{}, exit(2, "media preview --gifsicle must be auto, off, or required")
+	}
+	if opts.GifsicleLossy < 0 {
+		return mediaPreviewResult{}, exit(2, "media preview --gifsicle-lossy must be non-negative")
+	}
+	if opts.GifsicleGamma <= 0 {
+		return mediaPreviewResult{}, exit(2, "media preview --gifsicle-gamma must be positive")
+	}
+	if _, err := os.Stat(opts.Input); err != nil {
+		return mediaPreviewResult{}, exit(2, "read input video: %v", err)
+	}
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		return mediaPreviewResult{}, exit(2, "ffmpeg is required for media preview: %v", err)
+	}
+	if _, err := exec.LookPath("ffprobe"); err != nil {
+		return mediaPreviewResult{}, exit(2, "ffprobe is required for media preview: %v", err)
+	}
+
+	duration, err := probeMediaDuration(ctx, opts.Input, opts.ChildEnvDenylist)
+	if err != nil {
+		return mediaPreviewResult{}, err
+	}
+	segments := []mediaInterval{{Start: 0, End: duration}}
+	freezeCount := 0
+	trimmed := false
+	note := ""
+	if opts.TrimStatic && duration > 0 {
+		freezes, err := detectFreezeIntervals(ctx, opts.Input, duration, opts.FreezeNoise, opts.FreezeDuration, opts.ChildEnvDenylist)
+		if err != nil {
+			return mediaPreviewResult{}, err
+		}
+		freezeCount = len(freezes)
+		plan := motionPreviewSegments(duration, freezes, opts.TrimPadding, opts.MinDuration)
+		segments = plan.Segments
+		trimmed = plan.Trimmed
+		note = plan.Note
+	}
+	previewDuration := intervalsDuration(segments)
+
+	if err := os.MkdirAll(filepath.Dir(opts.Output), 0o755); err != nil && filepath.Dir(opts.Output) != "." {
+		return mediaPreviewResult{}, exit(2, "create output directory: %v", err)
+	}
+	previewInput := opts.Input
+	previewSegment := segments[0]
+	if len(segments) > 1 {
+		motionVideo := opts.TrimmedVideoOutput
+		if motionVideo == "" {
+			motionVideo = strings.TrimSuffix(opts.Output, filepath.Ext(opts.Output)) + ".motion.mp4"
+			defer os.Remove(motionVideo)
+		}
+		if err := createTrimmedVideo(ctx, opts.ChildEnvDenylist, opts.Input, motionVideo, segments); err != nil {
+			return mediaPreviewResult{}, err
+		}
+		previewInput = motionVideo
+		previewSegment = mediaInterval{Start: 0, End: previewDuration}
+	}
+	palette := strings.TrimSuffix(opts.Output, filepath.Ext(opts.Output)) + ".palette.png"
+	defer os.Remove(palette)
+	if err := runMediaCommand(ctx, opts.ChildEnvDenylist, "ffmpeg", previewPaletteArgs(previewInput, palette, opts.Width, opts.FPS, previewSegment)...); err != nil {
+		return mediaPreviewResult{}, err
+	}
+	if err := runMediaCommand(ctx, opts.ChildEnvDenylist, "ffmpeg", previewGIFArgs(previewInput, palette, opts.Output, opts.Width, opts.FPS, previewSegment)...); err != nil {
+		return mediaPreviewResult{}, err
+	}
+	optimized := false
+	if gifsicleMode != "off" {
+		optimized, err = optimizeGIF(ctx, opts.Output, opts.GifsicleLossy, opts.GifsicleGamma, gifsicleMode == "required", opts.ChildEnvDenylist)
+		if err != nil {
+			return mediaPreviewResult{}, err
+		}
+	}
+	if opts.TrimmedVideoOutput != "" && len(segments) == 1 {
+		if err := createTrimmedVideo(ctx, opts.ChildEnvDenylist, opts.Input, opts.TrimmedVideoOutput, segments); err != nil {
+			return mediaPreviewResult{}, err
+		}
+	}
+	return mediaPreviewResult{
+		Input:                    opts.Input,
+		Output:                   opts.Output,
+		TrimmedVideoOutput:       opts.TrimmedVideoOutput,
+		SourceDurationSeconds:    roundMillis(duration),
+		PreviewStartSeconds:      roundMillis(segments[0].Start),
+		PreviewDurationSeconds:   roundMillis(previewDuration),
+		PreviewSegments:          previewResultSegments(segments),
+		TrimmedStaticEdges:       trimmed,
+		DetectedFreezeIntervals:  freezeCount,
+		DetectedMotionWindowNote: note,
+		GifsicleOptimized:        optimized,
+	}, nil
+}
+
+func createMediaContactSheet(ctx context.Context, opts mediaContactSheetOptions) (mediaContactSheetResult, error) {
+	if strings.TrimSpace(opts.Input) == "" {
+		return mediaContactSheetResult{}, exit(2, "media contact sheet requires input")
+	}
+	if strings.TrimSpace(opts.Output) == "" {
+		return mediaContactSheetResult{}, exit(2, "media contact sheet requires output")
+	}
+	if opts.Frames <= 0 {
+		opts.Frames = 5
+	}
+	if opts.Cols <= 0 || opts.Cols > opts.Frames {
+		opts.Cols = opts.Frames
+	}
+	if opts.Width <= 0 {
+		opts.Width = 320
+	}
+	if _, err := os.Stat(opts.Input); err != nil {
+		return mediaContactSheetResult{}, exit(2, "read input video: %v", err)
+	}
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		return mediaContactSheetResult{}, exit(2, "ffmpeg is required for media contact sheet: %v", err)
+	}
+	if _, err := exec.LookPath("ffprobe"); err != nil {
+		return mediaContactSheetResult{}, exit(2, "ffprobe is required for media contact sheet: %v", err)
+	}
+	duration, err := probeMediaDuration(ctx, opts.Input, opts.ChildEnvDenylist)
+	if err != nil {
+		return mediaContactSheetResult{}, err
+	}
+	rows := int(math.Ceil(float64(opts.Frames) / float64(opts.Cols)))
+	if err := os.MkdirAll(filepath.Dir(opts.Output), 0o755); err != nil && filepath.Dir(opts.Output) != "." {
+		return mediaContactSheetResult{}, exit(2, "create contact sheet directory: %v", err)
+	}
+	if err := runMediaCommand(ctx, opts.ChildEnvDenylist, "ffmpeg", contactSheetArgs(opts.Input, opts.Output, opts.Frames, opts.Cols, rows, opts.Width, duration)...); err != nil {
+		return mediaContactSheetResult{}, err
+	}
+	return mediaContactSheetResult{
+		Input:                 opts.Input,
+		Output:                opts.Output,
+		SourceDurationSeconds: roundMillis(duration),
+		Frames:                opts.Frames,
+		Cols:                  opts.Cols,
+		Rows:                  rows,
+		Width:                 opts.Width,
+	}, nil
+}
+
+func probeMediaDuration(ctx context.Context, input string, childEnvDenylist []string) (float64, error) {
+	out, err := mediaCommandOutput(ctx, childEnvDenylist, "ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", input)
+	if err != nil {
+		return 0, exit(2, "ffprobe duration failed: %v: %s", err, strings.TrimSpace(out))
+	}
+	duration, err := strconv.ParseFloat(strings.TrimSpace(out), 64)
+	if err != nil || duration <= 0 {
+		return 0, exit(2, "ffprobe returned invalid duration %q", strings.TrimSpace(out))
+	}
+	return duration, nil
+}
+
+func detectFreezeIntervals(ctx context.Context, input string, duration float64, noise string, freezeDuration time.Duration, childEnvDenylist []string) ([]mediaInterval, error) {
+	filter := fmt.Sprintf("freezedetect=n=%s:d=%.3f", noise, freezeDuration.Seconds())
+	out, err := mediaCommandOutput(ctx, childEnvDenylist, "ffmpeg", "-hide_banner", "-i", input, "-vf", filter, "-an", "-f", "null", "-")
+	if err != nil {
+		return nil, exit(2, "ffmpeg freezedetect failed: %v: %s", err, tailForError(out))
+	}
+	return parseFreezeIntervals(out, duration), nil
+}
+
+func previewPaletteArgs(input, palette string, width int, fps float64, segment mediaInterval) []string {
+	args := []string{"-hide_banner", "-loglevel", "error", "-y"}
+	filter := fmt.Sprintf("fps=%s,scale=%d:-1:flags=lanczos,palettegen=stats_mode=diff", formatMediaSeconds(fps), width)
+	args = appendTrimInputArgs(args, input, segment.Start, segment.End-segment.Start)
+	args = append(args, "-vf", filter)
+	args = append(args,
+		"-frames:v", "1",
+		"-update", "1",
+		palette,
+	)
+	return args
+}
+
+func previewGIFArgs(input, palette, output string, width int, fps float64, segment mediaInterval) []string {
+	args := []string{"-hide_banner", "-loglevel", "error", "-y"}
+	args = appendTrimInputArgs(args, input, segment.Start, segment.End-segment.Start)
+	args = append(args,
+		"-i", palette,
+		"-lavfi", fmt.Sprintf("fps=%s,scale=iw*sar:ih,scale=%d:-1:flags=lanczos[x];[x][1:v]paletteuse=dither=floyd_steinberg", formatMediaSeconds(fps), width),
+	)
+	args = append(args,
+		"-loop", "0",
+		output,
+	)
+	return args
+}
+
+func gifsicleOptimizeArgs(input, output string, lossy int, gamma float64) []string {
+	return []string{
+		"-O3",
+		fmt.Sprintf("--gamma=%s", formatMediaSeconds(gamma)),
+		fmt.Sprintf("--lossy=%d", lossy),
+		input,
+		"-o",
+		output,
+	}
+}
+
+func optimizeGIF(ctx context.Context, output string, lossy int, gamma float64, required bool, childEnvDenylist []string) (bool, error) {
+	if _, err := exec.LookPath("gifsicle"); err != nil {
+		if required {
+			return false, exit(2, "gifsicle is required for media preview: %v", err)
+		}
+		return false, nil
+	}
+	temp := strings.TrimSuffix(output, filepath.Ext(output)) + ".optimized.gif"
+	defer os.Remove(temp)
+	if err := runMediaCommand(ctx, childEnvDenylist, "gifsicle", gifsicleOptimizeArgs(output, temp, lossy, gamma)...); err != nil {
+		return false, err
+	}
+	if err := os.Rename(temp, output); err != nil {
+		return false, exit(2, "replace optimized GIF: %v", err)
+	}
+	return true, nil
+}
+
+func trimmedVideoArgs(input, output string, segments []mediaInterval) []string {
+	args := []string{"-hide_banner", "-loglevel", "error", "-y"}
+	args = appendSegmentedInputArgs(args, input, segments, "format=yuv420p")
+	args = append(args,
+		"-an",
+		"-c:v", "libx264",
+		"-preset", "veryfast",
+		"-pix_fmt", "yuv420p",
+		"-movflags", "+faststart",
+		output,
+	)
+	return args
+}
+
+func createTrimmedVideo(ctx context.Context, childEnvDenylist []string, input, output string, segments []mediaInterval) error {
+	if err := os.MkdirAll(filepath.Dir(output), 0o755); err != nil && filepath.Dir(output) != "." {
+		return exit(2, "create trimmed video output directory: %v", err)
+	}
+	return runMediaCommand(ctx, childEnvDenylist, "ffmpeg", trimmedVideoArgs(input, output, segments)...)
+}
+
+func contactSheetArgs(input, output string, frames, cols, rows, width int, duration float64) []string {
+	sampleFPS := 1.0
+	if duration > 0 {
+		sampleFPS = float64(frames) / duration
+	}
+	filter := fmt.Sprintf("fps=%s,scale=%d:-1:flags=lanczos,tile=%dx%d:padding=4:margin=4:color=black", formatMediaSeconds(sampleFPS), width, cols, rows)
+	return []string{
+		"-hide_banner", "-loglevel", "error", "-y",
+		"-i", input,
+		"-vf", filter,
+		"-frames:v", "1",
+		output,
+	}
+}
+
+func contactSheetPathForVideo(path string) string {
+	ext := filepath.Ext(path)
+	if ext == "" {
+		return path + ".contact.png"
+	}
+	return strings.TrimSuffix(path, ext) + ".contact.png"
+}
+
+func appendTrimInputArgs(args []string, input string, start, duration float64) []string {
+	if start > 0 {
+		args = append(args, "-ss", formatMediaSeconds(start))
+	}
+	if duration > 0 {
+		args = append(args, "-t", formatMediaSeconds(duration))
+	}
+	return append(args, "-i", input)
+}
+
+func appendSegmentedInputArgs(args []string, input string, segments []mediaInterval, filter string) []string {
+	if len(segments) == 1 {
+		segment := segments[0]
+		args = appendTrimInputArgs(args, input, segment.Start, segment.End-segment.Start)
+		return append(args, "-vf", filter)
+	}
+	return append(args, "-i", input, "-filter_complex", segmentedVideoFilter(segments, filter), "-map", "[out]")
+}
+
+func segmentedVideoFilter(segments []mediaInterval, outputFilter string) string {
+	inputs := make([]string, len(segments))
+	parts := make([]string, 0, len(segments)+2)
+	for i := range segments {
+		inputs[i] = fmt.Sprintf("[source%d]", i)
+	}
+	parts = append(parts, fmt.Sprintf("[0:v]split=%d%s", len(segments), strings.Join(inputs, "")))
+	for i, segment := range segments {
+		parts = append(parts, fmt.Sprintf("[source%d]trim=start=%s:end=%s,setpts=PTS-STARTPTS[segment%d]", i, formatMediaSeconds(segment.Start), formatMediaSeconds(segment.End), i))
+	}
+	segmentInputs := make([]string, len(segments))
+	for i := range segments {
+		segmentInputs[i] = fmt.Sprintf("[segment%d]", i)
+	}
+	parts = append(parts, fmt.Sprintf("%sconcat=n=%d:v=1:a=0,%s[out]", strings.Join(segmentInputs, ""), len(segments), outputFilter))
+	return strings.Join(parts, ";")
+}
+
+func runMediaCommand(ctx context.Context, childEnvDenylist []string, name string, args ...string) error {
+	out, err := mediaCommandOutput(ctx, childEnvDenylist, name, args...)
+	if err != nil {
+		return exit(2, "%s failed: %v: %s", name, err, tailForError(out))
+	}
+	return nil
+}
+
+func mediaCommandOutput(ctx context.Context, childEnvDenylist []string, name string, args ...string) (string, error) {
+	if len(childEnvDenylist) == 0 {
+		return commandOutput(ctx, name, args...)
+	}
+	return commandOutputWithEnvAndInput(ctx, childEnvironmentWithout(os.Environ(), childEnvDenylist...), nil, name, args...)
+}
+
+func commandOutput(ctx context.Context, name string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	err := cmd.Run()
+	return out.String(), err
+}
+
+func tailForError(text string) string {
+	text = strings.TrimSpace(text)
+	const limit = 4096
+	if len(text) <= limit {
+		return text
+	}
+	return text[len(text)-limit:]
+}
+
+func parseFreezeIntervals(text string, duration float64) []mediaInterval {
+	startRE := regexp.MustCompile(`freeze_start:\s*([0-9]+(?:\.[0-9]+)?)`)
+	endRE := regexp.MustCompile(`freeze_end:\s*([0-9]+(?:\.[0-9]+)?)`)
+	var intervals []mediaInterval
+	var current *float64
+	for _, line := range strings.Split(text, "\n") {
+		if match := startRE.FindStringSubmatch(line); len(match) == 2 {
+			value, _ := strconv.ParseFloat(match[1], 64)
+			current = &value
+		}
+		if match := endRE.FindStringSubmatch(line); len(match) == 2 && current != nil {
+			value, _ := strconv.ParseFloat(match[1], 64)
+			intervals = append(intervals, mediaInterval{Start: *current, End: value})
+			current = nil
+		}
+	}
+	if current != nil && duration > *current {
+		intervals = append(intervals, mediaInterval{Start: *current, End: duration})
+	}
+	return normalizeIntervals(intervals, duration)
+}
+
+func normalizeIntervals(intervals []mediaInterval, duration float64) []mediaInterval {
+	clean := make([]mediaInterval, 0, len(intervals))
+	for _, interval := range intervals {
+		start := math.Max(0, math.Min(duration, interval.Start))
+		end := math.Max(0, math.Min(duration, interval.End))
+		if end > start {
+			clean = append(clean, mediaInterval{Start: start, End: end})
+		}
+	}
+	sort.Slice(clean, func(i, j int) bool {
+		if clean[i].Start == clean[j].Start {
+			return clean[i].End < clean[j].End
+		}
+		return clean[i].Start < clean[j].Start
+	})
+	merged := make([]mediaInterval, 0, len(clean))
+	for _, interval := range clean {
+		if len(merged) == 0 || interval.Start > merged[len(merged)-1].End {
+			merged = append(merged, interval)
+			continue
+		}
+		if interval.End > merged[len(merged)-1].End {
+			merged[len(merged)-1].End = interval.End
+		}
+	}
+	return merged
+}
+
+type motionPreviewPlan struct {
+	Segments []mediaInterval
+	Trimmed  bool
+	Note     string
+}
+
+func motionPreviewSegments(duration float64, freezes []mediaInterval, padding, minDuration time.Duration) motionPreviewPlan {
+	if duration <= 0 {
+		return motionPreviewPlan{Note: "invalid-duration"}
+	}
+	freezes = normalizeIntervals(freezes, duration)
+	active := nonFrozenIntervals(duration, freezes)
+	if len(active) == 0 {
+		return motionPreviewPlan{Segments: []mediaInterval{{Start: 0, End: duration}}, Note: "no-motion-detected"}
+	}
+	segments := paddedMotionSegments(active, duration, math.Max(0, padding.Seconds()))
+	targetDuration := math.Min(duration, math.Max(0, minDuration.Seconds()))
+	if intervalsDuration(segments) < targetDuration {
+		low := math.Max(0, padding.Seconds())
+		high := low + duration
+		for range 48 {
+			mid := (low + high) / 2
+			if intervalsDuration(paddedMotionSegments(active, duration, mid)) < targetDuration {
+				low = mid
+			} else {
+				high = mid
+			}
+		}
+		segments = paddedMotionSegments(active, duration, high)
+	}
+	return motionPreviewPlan{Segments: segments, Trimmed: duration-intervalsDuration(segments) > 0.05}
+}
+
+func paddedMotionSegments(active []mediaInterval, duration, padding float64) []mediaInterval {
+	segments := make([]mediaInterval, 0, len(active))
+	for _, interval := range active {
+		segments = append(segments, mediaInterval{Start: interval.Start - padding, End: interval.End + padding})
+	}
+	return normalizeIntervals(segments, duration)
+}
+
+func intervalsDuration(intervals []mediaInterval) float64 {
+	total := 0.0
+	for _, interval := range intervals {
+		total += interval.End - interval.Start
+	}
+	return total
+}
+
+func previewResultSegments(intervals []mediaInterval) []mediaPreviewSegment {
+	segments := make([]mediaPreviewSegment, len(intervals))
+	for i, interval := range intervals {
+		segments[i] = mediaPreviewSegment{
+			StartSeconds: roundMillis(interval.Start),
+			EndSeconds:   roundMillis(interval.End),
+		}
+	}
+	return segments
+}
+
+func nonFrozenIntervals(duration float64, freezes []mediaInterval) []mediaInterval {
+	var active []mediaInterval
+	pos := 0.0
+	for _, frozen := range freezes {
+		if frozen.Start > pos {
+			active = append(active, mediaInterval{Start: pos, End: frozen.Start})
+		}
+		if frozen.End > pos {
+			pos = frozen.End
+		}
+	}
+	if pos < duration {
+		active = append(active, mediaInterval{Start: pos, End: duration})
+	}
+	return active
+}
+
+func formatMediaSeconds(value float64) string {
+	return strconv.FormatFloat(value, 'f', 3, 64)
+}
+
+func roundMillis(value float64) float64 {
+	return math.Round(value*1000) / 1000
+}

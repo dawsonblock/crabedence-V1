@@ -1,0 +1,21 @@
+{
+  "name": "@crabedence/nemo",
+  "version": "0.53.2",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./contracts": "./contracts/index.ts",
+    "./reference-kernel": "./reference-kernel/index.ts",
+    "./adapters/crabedence": "./adapters/crabedence/index.ts"
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^26.5.0",
+    "ajv": "^8.17.1",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11"
+  }
+}
