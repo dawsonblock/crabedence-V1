@@ -23,8 +23,7 @@
  */
 import { createHash, timingSafeEqual } from "node:crypto";
 
-import type { CapabilityDescriptor, ExecutionClass, ExecutionRoute } from "../contracts/index";
-import { VerifiedCapabilityCatalog } from "./kernel";
+import type { ExecutionClass, ExecutionRoute } from "../contracts/index";
 
 /** RegistryDescriptor is the canonical envelope descriptor shape. */
 export interface RegistryDescriptor {
@@ -129,11 +128,21 @@ function parseDescriptors(value: unknown): RegistryDescriptor[] {
 }
 
 /**
- * loadCatalogFromSnapshot verifies the registry envelope and builds a
- * capability catalog from the verified bytes.
+ * loadRegistrySnapshot verifies the registry envelope and returns the
+ * descriptors it covers.
+ *
+ * Verification happens here, in one place: base64-decode, SHA-256,
+ * constant-time compare, and only then parse. The descriptors returned are
+ * therefore provably the bytes the authoritative registry digested, and a
+ * payload that does not match its digest fails closed.
+ *
+ * This returns descriptors, not a catalog. A catalog would be a second
+ * classification — the kernel used to build one and derive routes from it
+ * (see finding 8 in the transfer plan). Routing is the registry's, and the
+ * Rust `EffectRouter` resolves it from these same descriptors.
  */
-export function loadCatalogFromSnapshot(raw: unknown): {
-  catalog: VerifiedCapabilityCatalog;
+export function loadRegistrySnapshot(raw: unknown): {
+  descriptors: RegistryDescriptor[];
   registrySha256: string;
 } {
   const envelope = parseRegistryEnvelope(raw);
@@ -152,21 +161,8 @@ export function loadCatalogFromSnapshot(raw: unknown): {
     throw new SnapshotError(`registry snapshot payload is not valid JSON: ${(error as Error).message}`);
   }
 
-  const descriptors = parseDescriptors(parsed);
-  // Verification happens inside the catalog factory: no code path
-  // produces a verified catalog without a passing digest comparison.
-  const catalog = VerifiedCapabilityCatalog.fromVerifiedPayload(payload, envelope.registry_sha256);
-  for (const descriptor of descriptors) {
-    const kernelDescriptor: CapabilityDescriptor = {
-      id: descriptor.id,
-      schema: descriptor.schema ?? { type: "object" },
-      executionClass: descriptor.execution_class,
-      executionRoute: descriptor.execution_route,
-      descriptorVersion: descriptor.descriptor_version,
-      adapter: descriptor.adapter_id,
-      authorityPolicy: descriptor.authority_policy?.id ?? descriptor.id,
-    };
-    catalog.register(kernelDescriptor);
-  }
-  return { catalog, registrySha256: envelope.registry_sha256 };
+  return {
+    descriptors: parseDescriptors(parsed),
+    registrySha256: envelope.registry_sha256,
+  };
 }

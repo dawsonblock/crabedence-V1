@@ -27,7 +27,7 @@ architecture and the ordered work required to reach it.
 | Crabedence already exports a verifiable registry envelope | `Registry.Envelope()` in `internal/capability/registry_digest.go`; `serve-exec` writes `capabilities.json` (0600, atomic) next to the socket (`internal/execution/serve.go`) |
 | The ABI and its strict parsing rules are frozen | `docs/spec/capability-invocation-abi.md` |
 | A cross-language conformance corpus exists | `internal/execution/testdata/invocation-abi-conformance/vectors.json` |
-| A TypeScript compatibility kernel exists and is the executable spec | `nemo/reference-kernel/snapshot.ts` (verify-then-parse), `nemo/adapters/crabedence/` |
+| The TypeScript compatibility kernel was the executable spec, and is now retired | what remains: `nemo/registry-snapshot/snapshot.ts` (verify-then-parse), `nemo/contracts/`, `nemo/adapters/crabedence/` |
 | NEMO's backend seam already matches the kernel's vocabulary | `crates/executor/src/lib.rs`: `ExecutionBackend`, `ExecutionRequest`, `ExecutionResult`, `EffectExecutionError`, `state_for_error`, `ReconciliationProvider` (feature `unstable-hardening`) |
 | NEMO's `ExecutionClass` is identical to Crabedence's | `Pure/Read/Mutation/Critical` in both |
 | No reconciliation call exists over the socket | `internal/reconcile/` is the kernel's internal engine; the socket ABI exposes invocation only |
@@ -45,10 +45,10 @@ excludes `target/`, caches, `node_modules`, and editor state.
 | 1 — bridge | Done | `runtimes/nemo-relay/bridges/nemo-crabedence/`: `abi.rs`, `transport.rs`, `capability_snapshot.rs`, `outcome_mapping.rs`, `execution_port.rs`; 56 unit tests, 1 corpus conformance test, 5 schema-binding tests, 5 env-gated live tests |
 | 2 — trust enforcement | Partial | Bridge-level invariants enforced and tested (unregistered capability, class mismatch, route mismatch, no policy field on the wire), and the bridge's tests, lints, and formatting now run in CI (`nemo-bridge` job in `.github/workflows/ci.yml`). The end-to-end CI invariant still needs NEMO's `BackendRouter` wiring, which is not done |
 | 3 — conformance | Partial | The Rust validator matches the shared corpus exactly (11 accepted, 32 rejected) and the live kernel's refusal phrases match the Rust validator's word-for-word. The full release-gate scenario list is not complete |
-| — reference kernel | Done | `nemo/kernel/` renamed to `nemo/reference-kernel/` with a README stating its role and the known divergence; export key and all references updated; 155 TypeScript tests pass |
+| — reference kernel | Retired | Renamed to `nemo/registry-snapshot/`, decoupled from the loader, then deleted once the suite passed without it; the README now records where each removed behavior lives |
 | — canonical schema | Done | `schemas/capability-invocation-v1.json` describes the frozen wire contract; Go, TypeScript, and Rust each carry a test that binds their implementation to it, so a field added on one side and not the others fails CI |
 | — effect router | Done at the routing layer | `runtimes/nemo-relay/bridges/nemo-effect-router/`: `EffectRouter` resolves the path from the verified **route** (not the class, which is what NeMo Relay's own router uses), fails closed on an unwired read path, and holds the effect-isolation invariant. 7 routing tests and 6 isolation tests, including one that runs against a live registry |
-| 4 — retire the TS kernel | Not started | `nemo/reference-kernel/` is retained as the executable specification |
+| 4 — retire the TS kernel | Done | The kernel is deleted. `nemo/` holds the ABI contracts and validator, the registry-snapshot loader, and the adapter and client. 119 tests across 9 files pass |
 
 Verification actually run:
 
@@ -169,6 +169,32 @@ grant — committed a mutation with `SUCCEEDED` and receipt version 3 evidence.
    Crabedence reading its own store credential, not ambient inheritance into a
    plugin. Removing it would remove the exporter.
 
+8. **The reference kernel derived execution routes locally, and its comment
+   claimed a parity that did not hold.** `defaultExecutionRoute(executionClass)`
+   was documented as mirroring the Go registry's `DefaultExecutionRoute` — "the
+   same policy function". It does not. The Go table is keyed on the *assurance
+   profile* (`NONE` → LOCAL, `STANDARD` → DIRECT, `DURABLE` and
+   `HIGH_ASSURANCE` → CRABEDENCE); the TypeScript one was keyed on the
+   *execution class* (`PURE` → LOCAL, `READ` → DIRECT, otherwise CRABEDENCE).
+   For a `READ` + `HIGH_ASSURANCE` capability they disagree outright: the
+   registry routes it to the kernel, and the local table routed it to the
+   direct path.
+
+   Latent in production, because a verified snapshot always carries a pinned
+   route — but reachable through `CapabilityCatalog`, and precisely what the
+   trust model forbids: "the kernel must resolve descriptors from the
+   authoritative registry and route on the trusted `execution_route`, never on
+   a separately maintained classification."
+
+   Fixed by deletion rather than correction. `defaultExecutionRoute` and the
+   `??` fallback are gone, and `register` refuses a descriptor that declares no
+   route. There is no second classification left to drift, and the Rust
+   `EffectRouter` already behaves this way — an unregistered capability or an
+   unpinned route fails closed — so the two sides now agree by construction.
+   Seventeen test descriptors were given explicit routes (four in
+   `kernel.test.ts`, five in `schema.test.ts`, eight in `adversarial.test.ts`),
+   and the test that asserted the old fallback now asserts the refusal.
+
 ## Consolidation roadmap
 
 The transfer is one part of a larger consolidation. This table maps the
@@ -180,7 +206,7 @@ replacement is proven.
 | --- | --- |
 | 0 — freeze architectural ownership | Done: the ownership matrix is a repository invariant in ADR-003 §1 |
 | 1 — repository layout | Done for the transfer: `runtimes/nemo-relay/` with its Cargo workspace intact and the Go module untouched. The root-level `bridges/` directory does not exist; the bridge lives inside the NEMO workspace because Cargo refuses a workspace member outside the workspace root (see Packaging decision) |
-| 2 — freeze the TS NEMO as the reference implementation | Done: `nemo/reference-kernel/` |
+| 2 — freeze the TS NEMO as the reference implementation | Done: `nemo/registry-snapshot/` |
 | 3 — freeze one capability invocation ABI | Done for the frozen contract: `schemas/capability-invocation-v1.json`, bound by tests in all three implementations. The sketched additions are a breaking change — see finding 5 |
 | 4 — Rust bridge | Done |
 | 5 — preserve uncertainty semantics | Done |
@@ -189,7 +215,7 @@ replacement is proven.
 | 8 — native plugin isolation and credential containment | Done for the inheritance path: the MCP environment allowlist no longer forwards credential material, and the plugin host, native loader, and integration crates are credential-free — both asserted in CI. Limits are recorded in finding 7 |
 | 9 — demote the overlapping NEMO subsystems | Done for the dependency graph, which is the step that must come first: `nemo-relay`, `types`, `adaptive`, `plugin`, `plugin-protocol`, `plugin-proto`, `plugin-host`, `native-abi`, `worker`, `worker-proto`, and `pii-redaction` depend on none of `authority`, `ledger`, `executor`, `effect-runtime`, or `effect-qualification`. `scripts/check-nemo-runtime-dependencies.sh` enforces it in CI and fails closed (verified by falsification). The integration crates do depend on `executor` — and therefore `ledger` — because the `ExecutionBackend` seam lives there; that exception is deliberate and recorded. Marking the crates deprecated, moving their interoperability tests, and deleting them is the follow-up |
 | 10 — one authority chain for qualification | Not started |
-| 11 — remove the TS mini-kernel | Not started, and correctly gated. The reference kernel carries 150 tests covering catalog resolution, schema validation, framing, snapshot verification, and adversarial cases; the Rust path covers the ABI, the snapshot, framing, and outcome mapping, but not the kernel's catalog and schema behavior. Deleting it now would delete the specification rather than a duplicate |
+| 11 — remove the TS mini-kernel | Done: the kernel is deleted and the suite is green. What remains under `nemo/` is the ABI contracts and their validator, the registry-snapshot loader, and the Crabedence adapter and client — the "lightweight TypeScript packages where they are useful as clients" this phase asked to keep |
 | 12–13 — provider SDK and generated code | Not started. This is a refactor of ~80 provider packages under `internal/providers/` and cannot be completed without changing provider dispatch semantics; the plan's own caution ("do not force providers into one generic abstraction where semantics differ") is the reason to do it incrementally |
 | 14 — shrink the trusted computing base | Not started (measurement) |
 | 15 — cross-language golden vectors | Partial: the invocation corpus, the schema binding, and the outcome corpus are shared and enforced in all three languages; the receipt, digest, and snapshot vector families are not |
@@ -211,9 +237,9 @@ The consolidation's own completion criteria, against the current state:
 | 6 | Native plugins cannot directly reach provider credentials | Met for the inheritance path: the MCP environment allowlist no longer forwards credential material (finding 7), the plugin host, native loader, and integration crates are credential-free, and both halves are asserted in CI. Two limits are stated rather than implied: `HOME` still permits reading `~/.aws/credentials`, and NeMo Relay's own S3 observability exporter holds an operator-configured credential |
 | 7 | NEMO and Crabedence share protocol golden vectors | Met for invocation, schema, and outcomes: the ABI corpus, the schema binding, and the outcome corpus are all shared and enforced across Go, TypeScript, and Rust. Receipt and digest vector families are still uncovered |
 | 8 | Restart and crash tests prove no duplicate consequential effects | Met for the property that matters: a repeated idempotency key replays rather than duplicating, verified against the live kernel across a full service restart with a fresh planner process. The wider crash and partition matrix is still not exercised from the NEMO side |
-| 9 | The old TypeScript kernel is no longer required | Not met, deliberately: it is still the only executable specification for kernel catalog and schema behavior |
+| 9 | The old TypeScript kernel is no longer required | Met: the kernel is deleted. `kernel.ts`, `schema.ts`, and `testing.ts` are gone along with their two test files; the loader survives as `nemo/registry-snapshot/`, verifies on its own, and returns descriptors rather than a catalog. The suite went from 168 tests across 11 files to 119 across 9, and the difference is exactly the removed kernel behavior plus its duplicated admission tests — every one of which the Go suite covers by name |
 | 10 | NEMO's duplicate runtime is absent from the production dependency graph | Met: asserted in CI |
-| 11 | Provider common infrastructure has begun moving into a shared SDK | Not met |
+| 11 | Provider common infrastructure has begun moving into a shared SDK | Substantially met, and the remainder is specific. `internal/providers/shared` (28 source files, 5,858 lines) is that SDK and every provider except the `all` aggregator imports it — all 81. The 102 raw `&http.Client{}` constructions turned out to be legitimate per-provider transport configuration and should not be collapsed. The real duplication is that 17 providers reimplement `shared.SecureHTTPClient`'s origin-pinned redirect hardening instead of calling it; migrating them is bounded and mechanical once each site's behavior is confirmed, and is deliberately left for its own change |
 | 12 | A CI assertion proves no consequential bypass path exists | Met: `tests/effect_isolation.rs` and `tests/routing.rs` run in the `NEMO integration` job |
 | 13 | Release artifacts identify exact NEMO and Crabedence source revisions | Met: the release evidence generator runs `cmd/nemo-runtime-digest` and writes `nemo-runtime.json` and `nemo-runtime.sha256` into the bundle, which `SHA256SUMS`, the manifest digest, and the attestation already cover. The Crabedence revision is bound by the source commit and the registry digest; the NEMO revision is now bound too. The frozen gate registry is untouched — the digest is evidence, not a new gate |
 | 14 | Security qualification passes for the shipping binaries | Not a NEMO-transfer deliverable, and stated as such rather than left ambiguous. The repository's shipping binaries are Go, and their security qualification is the existing typed release-gate set (`scripts/lib/qualification-gates.sh`, `release-qualification.yml`), which is frozen and managed by the repository's own release process — not something the transfer should extend by inventing gates. What the transfer contributes is the NEMO-side security assertions, which run in CI (`tests/effect_isolation.rs`, `tests/routing.rs`, the credential and dependency-graph checks) and are now bound into release evidence by blocker 13. Wiring those checks into the typed gate set is a release-engineering change, gated by that process |
@@ -224,7 +250,7 @@ The consolidation's own completion criteria, against the current state:
 crabedence/
 ├── cmd/                      # unchanged
 ├── internal/                 # unchanged (kernel, registry, effect fabric)
-├── nemo/                     # TS compatibility kernel — retained until Phase 4
+├── nemo/                     # ABI contracts, snapshot loader, adapter and client
 ├── runtimes/
 │   ├── aws-lambda-microvm/   # unchanged
 │   └── nemo-relay/           # FULL NEMO, upstream tree preserved
@@ -296,7 +322,7 @@ tiny crate. One responsibility per module:
 | --- | --- |
 | `abi.rs` | The strict invocation-ABI scanner (rules R1–R8), a Rust mirror of the Go parser and the NEMO TypeScript validator. Added beyond the original sketch because the transport must refuse to emit a request the kernel would refuse, and because the conformance corpus is only meaningful when all three implementations scan it. |
 | `transport.rs` | Length-prefixed JSON client for the Unix socket: 4-byte big-endian length, 4 MiB cap, canonical default socket resolution matching `crabbox serve-exec`/`crabbox invoke`. A failure before the request frame is fully transmitted is a definitive pre-dispatch failure; a lost or late response after transmission is `UNKNOWN`. |
-| `capability_snapshot.rs` | Envelope loader: read `capabilities.json`, base64-decode, SHA-256, constant-time compare, and only then parse descriptors. Fail closed on any mismatch. Rust mirror of `nemo/reference-kernel/snapshot.ts`. |
+| `capability_snapshot.rs` | Envelope loader: read `capabilities.json`, base64-decode, SHA-256, constant-time compare, and only then parse descriptors. Fail closed on any mismatch. Rust mirror of `nemo/registry-snapshot/snapshot.ts`. |
 | `execution_port.rs` | `NemoCrabedenceExecutionPort` implementing `nemo_relay_executor::unstable::ExecutionBackend`. Maps `ExecutionRequest` → ABI request; deliberately drops `route_digest`, `registration_digest`, policy material, and never sends route/provider/assurance/receipt fields. |
 | `outcome_mapping.rs` | Response → `ExecutionResult` / `EffectExecutionError` per the table in ADR-003 §6, so `state_for_error` classifies identically to the kernel. `IN_FLIGHT` maps to `UNKNOWN`. |
 
@@ -343,7 +369,7 @@ go test ./internal/execution/... ./internal/capability/...
 
 ## Phase 3 — conformance and release gate (partial)
 
-Deliverable: the Rust bridge and the TypeScript compatibility kernel accept and
+Deliverable: the Rust bridge and the TypeScript implementations accept and
 reject identically, and the release gate passes.
 
 - Run `internal/execution/testdata/invocation-abi-conformance/vectors.json`
@@ -371,7 +397,7 @@ Crabedence restart, NEMO restart, both restarted
 
 Only after the full NEMO runtime passes the same behavioral tests:
 
-- Delete `nemo/reference-kernel/` and the adapter's kernel-side duplication.
+- Delete `nemo/registry-snapshot/` and the adapter's kernel-side duplication.
 - Retain the lightweight TypeScript client: Node applications still need to
   invoke Crabedence, and the client is not the kernel.
 
@@ -380,6 +406,104 @@ Only after the full NEMO runtime passes the same behavioral tests:
 ```sh
 scripts/check-docs.sh
 ```
+
+## The two remaining blockers, resolved
+
+Both were investigated against the code, and both came out smaller than the
+plan claimed. Blocker 9 is **done** — the kernel is deleted and the suite is
+green. Blocker 11 is **substantially already met**; what remains is one bounded
+assessment.
+
+### Blocker 9 — retired
+
+Status: **done.** `kernel.ts`, `schema.ts`, and `testing.ts` are deleted, along
+with `kernel.test.ts` and `schema.test.ts`; `snapshot.ts` survives and was
+renamed with its directory to `nemo/registry-snapshot/`. The suite went from
+168 tests across 11 files to 119 across 9, and the difference is exactly the
+removed kernel behavior and its duplicated admission tests.
+
+The work was sequenced as agreed: the loader was decoupled first and the suite
+verified green *without* the kernel in the path, and only then were the files
+removed. The loader now verifies on its own — `loadRegistrySnapshot` returns
+verified descriptors rather than a catalog, so nothing downstream can derive a
+route from it.
+
+Why it was safe, kept as the record of the decision:
+
+| Behavior | Cover after deletion |
+| --- | --- |
+| Capability lookup | Go service (`CAPABILITY_NOT_FOUND`) and the Rust router, which fails closed |
+| Execution-class immutability | Go admission denies a mismatch; the Rust port refuses locally too |
+| Idempotency key for MUTATION/CRITICAL | The Go service requires it at admission |
+| Authority principal required | Go admission (`missing grant_id` → `UNAUTHORIZED`) |
+| Deadline format and expiry | The Rust bridge emits only RFC3339; the service denies after expiry |
+| Argument schema validation | Authoritative server-side; the NEMO-side check was defense in depth |
+| Route resolution | Registry-only on both sides (finding 8) |
+| CRITICAL evidence contract | The Rust `map_outcome(requires_evidence)`, against the shared outcome corpus |
+| Result-schema validation | Removed with the kernel, and inert in production — `resultSchema` never travels in the registry snapshot, so it could only fire for a hand-built test catalog |
+
+The Go tests that carry the admission behavior are named in the
+[registry snapshot loader README](../../nemo/registry-snapshot/README.md).
+
+What remains a *feature* question, not a port: if local execution is ever to
+enforce result contracts, the contract has to travel in the registry snapshot
+first. That is independent of the kernel's existence and is not in scope.
+
+### Blocker 11 — the inventory exists, and the SDK is already there
+
+The sketch proposes `internal/providerkit/`. That package already exists under
+another name: **`internal/providers/shared`** — 28 source files plus tests,
+5,858 lines, imported 256 times. Every provider except the `all` aggregator and
+`shared` itself imports it, so all 81 real providers are already on it.
+
+It covers the sketch's concerns almost exactly:
+
+| Sketch concern | Existing home |
+| --- | --- |
+| lifecycle | `delegated.go`, `direct.go`, `process_supervisor.go`, `process_startup_confirm.go` |
+| observation | `observer.go`, `status.go`, `resource_identity.go` |
+| auth / config | `claim.go`, `claim_scope.go`, `claim_touch.go`, `metadata.go` |
+| errors | `httpresponse.go`, `httpredirect.go`, `operationlock.go` |
+| receipts / identity | `tag_labels.go`, `naming.go`, `resource_identity.go` |
+| redaction | `redact.go` |
+| conformance | `doctor.go`, plus per-capability tests |
+
+And the provider contract is deliberately finer-grained than the sketch:
+`internal/cli/provider_backend.go` declares `Provider` plus dozens of opt-in
+capability interfaces, each documenting why it is separate — for example
+`ReleaseLeaseOutcomeBackend` exists only for providers "with retained or
+asynchronous release semantics". Collapsing that into one `Provider` interface
+would make every provider implement operations it does not have.
+
+So blocker 11 is **substantially already met**, and the remainder is now
+specific. The 102 raw `&http.Client{}` constructions were assessed: they are
+legitimate per-provider transport configuration, not boilerplate — a
+control-plane client with a timeout beside a data-plane client without one, or
+a custom transport. They should not be collapsed.
+
+The duplication that *is* real is next to them. `shared/httpredirect.go`
+exports `SecureHTTPClient`, which "returns a copy of source whose
+`CheckRedirect` refuses redirects leaving the trusted origin, preserves
+source's `CheckRedirect`, and applies net/http's default 10-redirect cap".
+**Seventeen providers reimplement that themselves** rather than call it:
+
+```text
+awslambdamicrovm, azuredynamicsessions, blaxel, boxd,
+cloudflaredynamicworkers, fastapicloud, githubcodespaces, islo, morph,
+nomad, opensandbox, ovh, ... (17 total)
+```
+
+Redirect hardening written seventeen times is seventeen chances to get it
+subtly wrong, and a fix to one does not reach the others. The shared helper
+already accepts a provider-specific refusal error via `newError`, so the
+provider-specific parts have a home.
+
+Migrating them is deliberately **not** done here. Each site has to be read to
+confirm the shared helper preserves its behavior — a redirect policy is
+security-relevant, and a migration that quietly weakens one provider's origin
+check would be worse than the duplication. The work is bounded and mechanical
+once each site is confirmed: 17 call sites, each with provider tests already
+in place.
 
 ## Open decisions
 

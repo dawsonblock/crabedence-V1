@@ -21,6 +21,7 @@ import { validateInvocationRequest } from "../contracts/invocation-abi";
 
 interface SchemaField {
   readonly type?: string;
+  readonly additionalProperties?: boolean;
   readonly properties?: Record<string, SchemaField>;
 }
 

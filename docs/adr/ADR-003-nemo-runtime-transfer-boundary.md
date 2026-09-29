@@ -33,12 +33,15 @@ they own idempotency. NEMO's overlapping subsystems are not defective;
 they are simply not the authority once the two runtimes share a
 distribution.
 
-The current `nemo/` TypeScript package is a compatibility kernel: it
-already speaks the capability invocation ABI
-(`docs/spec/capability-invocation-abi.md`), verifies the registry
-envelope (`nemo/reference-kernel/snapshot.ts`), and carries cross-language
-conformance tests against the Go kernel. It is the executable
-specification this transfer is checked against.
+The `nemo/` TypeScript package was a compatibility kernel, and it served as
+the executable specification this transfer was checked against: it spoke the
+capability invocation ABI (`docs/spec/capability-invocation-abi.md`),
+verified the registry envelope, and carried cross-language conformance tests
+against the Go kernel. **That kernel has since been retired** — its catalog,
+route table, schema validator, and execution harness are deleted. What
+remains is the ABI contracts and their validator, the registry-snapshot
+loader (`nemo/registry-snapshot/snapshot.ts`), and the Crabedence adapter and
+client. The transfer plan records what replaced each removed behavior.
 
 ## Decision
 
@@ -177,11 +180,21 @@ is asserted by a test in CI, not documented as an intention.
 
 ### 8. Migration sequence
 
-The TypeScript compatibility kernel (`nemo/reference-kernel/`) is retained as the
-executable specification until the full NEMO runtime passes the same
-behavioral tests. Only then is it deleted. The lightweight TypeScript
-client is retained regardless, because Node applications still need a
-way to invoke Crabedence.
+The TypeScript compatibility kernel is retired. It was retained as the
+executable specification until the behaviors it owned were shown to be
+covered: the duplicated admission checks by the Go service's own tests
+(`TestExpiredDeadline`, `TestInvalidDeadline`,
+`TestExecutionServiceMissingIdempotencyKey`,
+`TestExecutionServiceExecutionClassMismatch`,
+`TestExecutionClassRequiresIdempotencyKey`), the CRITICAL evidence contract by
+the Rust bridge's `map_outcome(requires_evidence)`, and route resolution by
+the registry on both sides. The one behavior with no counterpart —
+result-schema validation — was inert in production, because a result schema
+never travels in the registry snapshot.
+
+The lightweight TypeScript client and the registry-snapshot loader are
+retained, because Node applications still need a way to invoke Crabedence and
+to verify the envelope it publishes.
 
 ## Consequences
 

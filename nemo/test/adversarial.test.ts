@@ -37,9 +37,6 @@ import {
   ExecutionApiServer,
   TransportError,
 } from "../adapters/crabedence/index";
-import { CapabilityCatalog, NemoKernel } from "../reference-kernel/index";
-import type { ExecutionPort, KernelExecutionOutcome, KernelExecutionRequest } from "../contracts/index";
-import { createTestKernel } from "../reference-kernel/testing";
 
 // ─── Test helpers ─────────────────────────────────────────────────────
 
@@ -73,24 +70,6 @@ async function waitFor(
 
 const auth = { principal: "alice@example.com", grantId: "grant_123" };
 const wireAuth = { principal: "alice@example.com", grant_id: "grant_123" };
-
-class MockPort implements ExecutionPort {
-  readonly calls: KernelExecutionRequest[] = [];
-  private response: KernelExecutionOutcome;
-
-  constructor(response: KernelExecutionOutcome) {
-    this.response = response;
-  }
-
-  setResponse(response: KernelExecutionOutcome): void {
-    this.response = response;
-  }
-
-  async execute(request: KernelExecutionRequest): Promise<KernelExecutionOutcome> {
-    this.calls.push(request);
-    return this.response;
-  }
-}
 
 // ─── Tests ────────────────────────────────────────────────────────────
 
@@ -348,166 +327,7 @@ describe("Adversarial: Idempotency races", () => {
   });
 });
 
-describe("Adversarial: Kernel admission", () => {
-  it("rejects expired deadline", async () => {
-    const local = new MockPort({ status: "SUCCEEDED" });
-    const remote = new MockPort({ status: "SUCCEEDED" });
-    const catalog = new CapabilityCatalog();
-    catalog.register({
-      id: "test.cap",
-      schema: { type: "object" },
-      executionClass: "READ",
-      adapter: "crabedence",
-      authorityPolicy: "test",
-    });
-    const kernel = createTestKernel(catalog, { local, remote });
-
-    const outcome = await kernel.execute({
-      capabilityId: "test.cap",
-      arguments: {},
-      authority: auth,
-      deadline: "2020-01-01T00:00:00Z", // Expired
-    });
-
-    expect(outcome.status).toBe("DENIED");
-    expect(outcome.error).toContain("expired");
-  });
-
-  it("rejects malformed deadline", async () => {
-    const local = new MockPort({ status: "SUCCEEDED" });
-    const remote = new MockPort({ status: "SUCCEEDED" });
-    const catalog = new CapabilityCatalog();
-    catalog.register({
-      id: "test.cap",
-      schema: { type: "object" },
-      executionClass: "READ",
-      adapter: "crabedence",
-      authorityPolicy: "test",
-    });
-    const kernel = createTestKernel(catalog, { local, remote });
-
-    const outcome = await kernel.execute({
-      capabilityId: "test.cap",
-      arguments: {},
-      authority: auth,
-      deadline: "not-a-date",
-    });
-
-    expect(outcome.status).toBe("DENIED");
-    expect(outcome.error).toContain("invalid deadline");
-  });
-
-  it("rejects missing authority principal", async () => {
-    const local = new MockPort({ status: "SUCCEEDED" });
-    const remote = new MockPort({ status: "SUCCEEDED" });
-    const catalog = new CapabilityCatalog();
-    catalog.register({
-      id: "test.cap",
-      schema: { type: "object" },
-      executionClass: "READ",
-      adapter: "crabedence",
-      authorityPolicy: "test",
-    });
-    const kernel = createTestKernel(catalog, { local, remote });
-
-    const outcome = await kernel.execute({
-      capabilityId: "test.cap",
-      arguments: {},
-      authority: { principal: "", grantId: "grant_123" },
-    });
-
-    expect(outcome.status).toBe("DENIED");
-    expect(outcome.error).toContain("authority");
-  });
-
-  it("CRITICAL success without evidence digest is UNKNOWN, not FAILED", async () => {
-    const local = new MockPort({ status: "SUCCEEDED" });
-    // CRITICAL returns SUCCEEDED but no evidence — post-dispatch
-    // uncertainty: the provider claims the effect happened, so FAILED
-    // would let a planner retry an already-executed side effect.
-    const remote = new MockPort({
-      status: "SUCCEEDED",
-      result: { ok: true },
-      // Missing evidence
-    });
-    const catalog = new CapabilityCatalog();
-    catalog.register({
-      id: "email.send",
-      schema: { type: "object" },
-      executionClass: "CRITICAL",
-      adapter: "crabedence",
-      authorityPolicy: "email.send",
-    });
-    const kernel = createTestKernel(catalog, { local, remote });
-
-    const outcome = await kernel.execute({
-      capabilityId: "email.send",
-      arguments: { to: "bob@example.com" },
-      authority: auth,
-      idempotencyKey: "req_no_evidence",
-    });
-
-    expect(outcome.status).toBe("UNKNOWN");
-    expect(outcome.error).toContain("evidence");
-  });
-
-  it("accepts CRITICAL success WITH evidence", async () => {
-    const local = new MockPort({ status: "SUCCEEDED" });
-    const remote = new MockPort({
-      status: "SUCCEEDED",
-      result: { ok: true },
-      evidence: { digest: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", receiptVersion: 3 },
-      execution: { provider: "test", runId: "run_critical_001" },
-    });
-    const catalog = new CapabilityCatalog();
-    catalog.register({
-      id: "email.send",
-      schema: { type: "object" },
-      executionClass: "CRITICAL",
-      adapter: "crabedence",
-      authorityPolicy: "email.send",
-    });
-    const kernel = createTestKernel(catalog, { local, remote });
-
-    const outcome = await kernel.execute({
-      capabilityId: "email.send",
-      arguments: { to: "bob@example.com" },
-      authority: auth,
-      idempotencyKey: "req_with_evidence",
-    });
-
-    expect(outcome.status).toBe("SUCCEEDED");
-    expect(outcome.evidence?.digest).toBe("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2");
-  });
-
-  it("validates schema (missing required property)", async () => {
-    const local = new MockPort({ status: "SUCCEEDED" });
-    const remote = new MockPort({ status: "SUCCEEDED" });
-    const catalog = new CapabilityCatalog();
-    catalog.register({
-      id: "email.send",
-      schema: {
-        type: "object",
-        required: ["to", "body"],
-      },
-      executionClass: "CRITICAL",
-      adapter: "crabedence",
-      authorityPolicy: "email.send",
-    });
-    const kernel = createTestKernel(catalog, { local, remote });
-
-    const outcome = await kernel.execute({
-      capabilityId: "email.send",
-      arguments: { to: "bob@example.com" }, // Missing "body"
-      authority: auth,
-      idempotencyKey: "req_schema_fail",
-    });
-
-    expect(outcome.status).toBe("DENIED");
-    expect(outcome.error).toContain("schema");
-    expect(outcome.error).toContain("body");
-  });
-
+describe("Adversarial: adapter outcomes and protocol", () => {
   // ─── New tests for hardening 6 audit items ─────────────────────────────
 
   it("handler crash after dispatch returns UNKNOWN, not FAILED", async () => {
@@ -833,68 +653,6 @@ describe("Adversarial: Kernel admission", () => {
     }
   });
 
-  it("CRITICAL with invalid receipt version is UNKNOWN, not FAILED", async () => {
-    const local = new MockPort({ status: "SUCCEEDED" });
-    const remote = new MockPort({
-      status: "SUCCEEDED",
-      evidence: {
-        digest: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
-        receiptVersion: 2, // Wrong — must be 3
-      },
-      execution: { provider: "test", runId: "run_bad_v" },
-    });
-    const catalog = new CapabilityCatalog();
-    catalog.register({
-      id: "email.send",
-      schema: { type: "object" },
-      executionClass: "CRITICAL",
-      adapter: "crabedence",
-      authorityPolicy: "email.send",
-    });
-    const kernel = createTestKernel(catalog, { local, remote });
-
-    const outcome = await kernel.execute({
-      capabilityId: "email.send",
-      arguments: { to: "bob@example.com" },
-      authority: auth,
-      idempotencyKey: "bad_receipt_v",
-    });
-
-    expect(outcome.status).toBe("UNKNOWN");
-    expect(outcome.error).toContain("receiptVersion");
-    expect(outcome.error).toContain("3");
-  });
-
-  it("CRITICAL with short digest is UNKNOWN, not FAILED", async () => {
-    const local = new MockPort({ status: "SUCCEEDED" });
-    const remote = new MockPort({
-      status: "SUCCEEDED",
-      evidence: {
-        digest: "abc123", // Too short — not a valid SHA-256
-        receiptVersion: 3,
-      },
-      execution: { provider: "test", runId: "run_bad_d" },
-    });
-    const catalog = new CapabilityCatalog();
-    catalog.register({
-      id: "email.send",
-      schema: { type: "object" },
-      executionClass: "CRITICAL",
-      adapter: "crabedence",
-      authorityPolicy: "email.send",
-    });
-    const kernel = createTestKernel(catalog, { local, remote });
-
-    const outcome = await kernel.execute({
-      capabilityId: "email.send",
-      arguments: { to: "bob@example.com" },
-      authority: auth,
-      idempotencyKey: "bad_digest",
-    });
-
-    expect(outcome.status).toBe("UNKNOWN");
-    expect(outcome.error).toContain("digest");
-  });
 
   it("canonical JSON: reordered arguments produce same digest", async () => {
     const socketPath = makeTempSocket();

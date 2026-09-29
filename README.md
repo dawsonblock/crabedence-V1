@@ -308,7 +308,7 @@ capability invocation ABI is the stable boundary.
 
 See [Capability Invocation ABI](docs/spec/capability-invocation-abi.md),
 [NEMO contracts](nemo/contracts/execution.ts),
-[NEMO kernel](nemo/reference-kernel/kernel.ts),
+[Registry snapshot](nemo/registry-snapshot/snapshot.ts),
 [Crabedence adapter](nemo/adapters/crabedence/adapter.ts),
 [Go capability registry](internal/capability/registry.go),
 [Go execution service](internal/execution/service.go), and
@@ -868,7 +868,7 @@ Fargate path is documented in
 - **Use the CLI:** [CLI](docs/cli.md), [Commands](docs/commands/README.md), [Features](docs/features/README.md), [Configuration](docs/features/configuration.md)
 - **Effect Fabric:** [Durable execution contract](docs/spec/durable-execution-contract.md), [Operations & qualification](docs/spec/durable-execution-operations.md), [ADR-001 contract freeze](docs/adr/ADR-001-durable-effect-contract-frozen.md), [ADR-002 r13 freeze](docs/adr/ADR-002-durable-effect-r13-contract-freeze.md)
 - **Execution evidence:** [Run evidence spec](docs/spec/run-evidence.md), [Receipts](docs/commands/receipt.md), [Hermetic agent evidence](docs/features/hermetic-agent-evidence.md), [Portable coordinator](docs/features/portable-coordinator.md)
-- **NeMo execution kernel:** [Contracts](nemo/contracts/execution.ts), [Kernel](nemo/reference-kernel/kernel.ts), [Crabedence adapter](nemo/adapters/crabedence/adapter.ts), [Bridge](nemo/adapters/crabedence/bridge.ts)
+- **NeMo execution kernel:** [Contracts](nemo/contracts/execution.ts), [Registry snapshot](nemo/registry-snapshot/snapshot.ts), [Crabedence adapter](nemo/adapters/crabedence/adapter.ts), [Bridge](nemo/adapters/crabedence/bridge.ts)
 - **Integrate editors and agents:** [Integrations](docs/integrations/README.md), [Editors](docs/integrations/editors.md), [AI agents and harnesses](docs/integrations/agents.md)
 - **Choose a provider:** [Providers](docs/providers/README.md), [AWS](docs/providers/aws.md), [Azure](docs/providers/azure.md), [GCP](docs/providers/gcp.md), [Hetzner](docs/providers/hetzner.md), [DigitalOcean](docs/providers/digitalocean.md), [Linode](docs/providers/linode.md), [Hostinger](docs/providers/hostinger.md)
 - **Advanced features:** [Actions hydration](docs/features/actions-hydration.md), [Capsules](docs/features/capsules.md), [Checkpoints](docs/features/checkpoints.md), [Jobs](docs/features/jobs.md), [Pond](docs/features/pond.md)
