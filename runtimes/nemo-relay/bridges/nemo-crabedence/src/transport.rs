@@ -343,24 +343,22 @@ fn read_exact_classified(
 
 /// Reports whether bytes follow a complete frame.
 ///
-/// The service sends exactly one frame per connection, so trailing bytes are a
-/// protocol violation. The check is non-blocking: it never waits for data that
-/// has not already arrived.
+/// The service sends exactly one frame per connection and closes it, so
+/// once a full frame has arrived the only lawful continuation is
+/// end-of-stream. The probe therefore waits under the socket's read
+/// timeout: a healthy peer signals EOF immediately after its frame,
+/// while a non-blocking check could miss trailing bytes that had not
+/// yet arrived and pass a protocol violation off as a clean response.
+/// A peer that never closes still bounds the wait the same way an
+/// unanswered request does; only bytes actually received are reported.
 fn read_trailing_bytes(stream: &UnixStream) -> Option<usize> {
-    if stream.set_nonblocking(true).is_err() {
-        return None;
-    }
-    let mut probe = [0u8; 1];
-    let mut trailing = None;
+    let mut probe = [0u8; 64];
     let mut stream_ref = stream;
     match stream_ref.read(&mut probe) {
-        Ok(0) => {}
-        Ok(count) => trailing = Some(count),
-        Err(error) if error.kind() == ErrorKind::WouldBlock => {}
-        Err(_) => {}
+        Ok(0) => None,
+        Ok(count) => Some(count),
+        Err(_) => None,
     }
-    let _ = stream.set_nonblocking(false);
-    trailing
 }
 
 #[cfg(test)]
