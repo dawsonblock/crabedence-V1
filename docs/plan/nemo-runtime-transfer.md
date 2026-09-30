@@ -122,8 +122,19 @@ grant — committed a mutation with `SUCCEEDED` and receipt version 3 evidence.
    `requires_evidence` rule against a real commit rather than a fixture. It
    passes, with a real evidence digest.
 
-   What remains genuinely uncovered is "NEMO → Crabedence PURE" and "READ" —
-   and **a second correction**: an earlier revision of this finding called that
+   **A third correction, and it shrinks the gap.** "NEMO → Crabedence PURE" is
+   not an uncovered scenario — it is an invalid one. The frozen ABI spec states
+   it outright: "PURE capabilities do not cross the Crabedence execution
+   boundary. They execute in the planner or function hooks layer. PURE is part
+   of the capability vocabulary but not a Crabedence execution path"
+   (`docs/spec/capability-invocation-abi.md`). The gate list carried it as a
+   scenario to satisfy, which no registry entry could ever do; the list is
+   corrected. Only "NEMO → Crabedence READ" remains genuinely uncovered, and it
+   mirrors a real deployment shape (`READ` + `HIGH_ASSURANCE` → `CRABEDENCE`,
+   the `gmail.message.read` example in the trust model).
+
+   On that remaining one — **a second correction**: an earlier revision of this
+   finding called it
    "a registry-coverage gap of one or two descriptors, not a service change".
    Reading the surface shows otherwise. The qualification extension is
    deliberately *singular*: `QualificationRegistryExtensionID` is one constant,
@@ -418,7 +429,10 @@ reject identically, and the release gate passes.
 - The release gate scenarios, all required before the transfer is complete:
 
 ```text
-NEMO → Crabedence PURE / READ / MUTATION / CRITICAL
+NEMO → Crabedence READ / MUTATION / CRITICAL
+  (PURE does not cross: "PURE capabilities do not cross the Crabedence
+   execution boundary ... not a Crabedence execution path"
+   — docs/spec/capability-invocation-abi.md)
 plugin host crash, hang, malformed plugin reply
 plugin registration rejection
 class downgrade attempt, route override attempt
