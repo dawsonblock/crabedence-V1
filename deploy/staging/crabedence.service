@@ -10,6 +10,10 @@ Group=crabedence
 RuntimeDirectory=crabedence
 RuntimeDirectoryMode=0700
 Environment=CRABBOX_MODE=production
+# Root is the trusted local orchestrator: the proofs and the readiness
+# probe run as root and each claim their own principal. Every other UID
+# is refused. Production requires this map — see STAGING.md.
+Environment=CRABEDENCE_PEER_PRINCIPALS=0:*
 Environment=CRABEDENCE_STORE_BACKEND=postgres
 Environment=CRABBOX_REPLICAS=1
 EnvironmentFile=/etc/crabedence/staging.env

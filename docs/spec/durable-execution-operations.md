@@ -169,6 +169,7 @@ dispatching new ones first.
 | Tampered/forged evidence | Receipt binds execution, digest, provider identity, outcome; unsigned digests are not proof | Receipt golden vectors, untrusted-signer tests |
 | Signing-key theft / rotation breaking receipts | Key ring: retired fingerprints stay trusted for historical receipts; revocation fails closed | Rotation test |
 | Each instance mints its own signing identity | Provisioned-key policy: `CRABBOX_REPLICAS > 1` and `CRABBOX_MODE=production` both require an existing `CRABBOX_EVIDENCE_KEY` — auto-generation is development-only; signer creation is crash-durable (file fsync + atomic no-clobber publish + directory fsync, errors fail startup) | Signer-policy tests, durability tests |
+| A local process impersonates another principal | Production requires `CRABEDENCE_PEER_PRINCIPALS`: the kernel-supplied peer UID must map to the claimed principal before admission, and an unmapped UID is refused | Peer-auth policy tests, deployed qualification test |
 | Database credentials stolen | Attacker still cannot mint valid signed receipts without the signer; fencing prevents blind rewrites | — |
 | Clock manipulation | All lease/expiry/authority decisions on database time | DB-time expiry tests |
 | Process death mid-execution | Crash points at every durable boundary; post-dispatch death → `UNKNOWN` reconcilable | SIGKILL process matrix |

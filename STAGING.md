@@ -84,6 +84,10 @@ Group=crabedence
 RuntimeDirectory=crabedence
 RuntimeDirectoryMode=0700
 Environment=CRABBOX_MODE=production
+# Root is the trusted local orchestrator: the proofs and the readiness
+# probe run as root and each claim their own principal. Every other UID
+# is refused. Production requires this map.
+Environment=CRABEDENCE_PEER_PRINCIPALS=0:*
 Environment=CRABEDENCE_STORE_BACKEND=postgres
 Environment=CRABBOX_REPLICAS=1
 EnvironmentFile=/etc/crabedence/staging.env
@@ -144,7 +148,12 @@ qualification component, never expose it off-host or on a production
 deployment.
 
 `CRABBOX_MODE=production` is mandatory: it forbids silent key generation.
-If the evidence key is absent the service must refuse to start.
+If the evidence key is absent the service must refuse to start. Production
+also requires `CRABEDENCE_PEER_PRINCIPALS` — without it every request's
+principal is an unverified claim, and any local process that can reach the
+socket may act as any principal. The staging unit maps root as the trusted
+local orchestrator (`0:*`), because the proofs and the readiness probe run
+as root and each claim their own principal; every other UID is refused.
 
 Do not set `CRABEDENCE_STORE_BACKEND=sqlite` in staging — the point is to
 exercise the production store backend.

@@ -65,6 +65,7 @@ Type=simple
 User=crabedence
 RuntimeDirectory=crabedence
 Environment=CRABBOX_MODE=production
+Environment=CRABEDENCE_PEER_PRINCIPALS=0:*
 Environment=CRABEDENCE_STORE_BACKEND=postgres
 EnvironmentFile=/etc/crabedence/staging.env
 ExecStart=/usr/local/bin/crabbox serve-exec --socket /run/crabedence/execution.sock

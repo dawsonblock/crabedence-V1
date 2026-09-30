@@ -9,7 +9,7 @@ package is operational tooling on `main`.
 
 | File | Purpose |
 |---|---|
-| `crabedence.service` | systemd unit — `RuntimeDirectory`-managed socket, `CRABBOX_MODE=production`, postgres backend, hardened sandbox |
+| `crabedence.service` | systemd unit — `RuntimeDirectory`-managed socket, `CRABBOX_MODE=production` with the root peer map (`CRABEDENCE_PEER_PRINCIPALS=0:*`), postgres backend, hardened sandbox |
 | `staging.env.example` | `/etc/crabedence/staging.env` template — staging-only DSN, provisioned evidence key, optional GitHub adapter |
 | `bootstrap-db.sh` | Idempotent PostgreSQL role/database bootstrap (schema is applied by the service at first boot) |
 | `readiness.sh` | Readiness probe: unit active + socket answers `system.echo` + live registry digest equals `d1de25e9…` |

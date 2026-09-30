@@ -64,6 +64,20 @@ func ParsePeerPrincipalMap(raw string) (PeerPrincipalMap, error) {
 	return m, nil
 }
 
+// validatePeerAuthPolicy enforces the authenticated-principal
+// requirement for production. Without CRABEDENCE_PEER_PRINCIPALS the
+// service keeps the bearer model's claimed principal, which is an
+// unverified attribute: any local process that can reach the socket
+// may act as any principal. Production must therefore declare which
+// UIDs may connect and as whom. Development keeps the optional strict
+// mode.
+func validatePeerAuthPolicy(production bool, peers PeerPrincipalMap) error {
+	if !production || len(peers) > 0 {
+		return nil
+	}
+	return fmt.Errorf("production mode (CRABBOX_MODE=production) requires CRABEDENCE_PEER_PRINCIPALS mapping the kernel-supplied peer UIDs to principals — without it every request's principal is an unverified claim")
+}
+
 // Authorize resolves the authenticated principal for a connection
 // whose peer is uid, given the caller's claimed principal. It returns
 // the principal the request must carry — the mapped principal for an

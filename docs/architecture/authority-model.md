@@ -44,7 +44,7 @@ Two controls carry the trust boundary:
   (`SO_PEERCRED`/`LOCAL_PEERCRED`) to principals, and the claim must
   match the mapping — see *Peer authentication* below.
 
-## Peer authentication (optional strict mode)
+## Peer authentication (required in production, optional elsewhere)
 
 `CRABEDENCE_PEER_PRINCIPALS` upgrades the claimed `principal` into an
 authenticated one. When set — a comma-separated `uid:principal` map —
@@ -60,11 +60,21 @@ admission:
 - on success the authenticated principal **replaces** the claim for
   admission, grant resolution, and the durable execution identity.
 
-Unset, the bearer model above applies unchanged. The map is parsed at
-startup; malformed entries refuse startup rather than silently
-weakening the boundary. A peer map only authenticates the *local*
-caller — a deployment that fronts the socket with a proxy needs that
-proxy to authenticate its own upstream identity instead.
+Unset outside production, the bearer model above applies unchanged.
+Production is stricter: `CRABBOX_MODE=production` refuses to start
+without a nonempty map, because an unverified claim is not an identity —
+any local process that can reach the socket could otherwise act as any
+principal. The map is parsed at startup; malformed entries refuse
+startup rather than silently weakening the boundary. A peer map only
+authenticates the *local* caller — a deployment that fronts the socket
+with a proxy needs that proxy to authenticate its own upstream identity
+instead.
+
+Peer credentials come from the Unix socket (`SO_PEERCRED` on Linux,
+`LOCAL_PEERCRED` on BSD/macOS). A platform without a peer-credential
+mechanism fails closed — peer credentials are unavailable and every
+request is denied — so a production deployment must run on a platform
+that provides one.
 
 ## Grant material is immutable and generation-scoped
 

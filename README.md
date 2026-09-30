@@ -187,7 +187,10 @@ production mode (`CRABBOX_MODE=production`), and any multi-replica deployment
 creates an independent evidence identity. The topology is explicit in
 production — a missing `CRABBOX_TOPOLOGY` is a startup error, never an assumed
 single production replica, and a declaration that contradicts the replica
-count or store backend is refused. Signer
+count or store backend is refused. Production also requires an authenticated
+local identity: `CRABEDENCE_PEER_PRINCIPALS` must map the kernel-supplied
+peer UIDs to principals, because the bearer model's principal is otherwise an
+unverified claim any process running as the service user could make. Signer
 publication is crash-durable — atomic no-clobber write, file sync, directory
 sync — and rotation keeps retired fingerprints in the trusted ring so
 historical receipts remain verifiable.

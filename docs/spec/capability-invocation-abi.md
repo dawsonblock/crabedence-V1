@@ -182,7 +182,9 @@ peer authentication: `CRABEDENCE_PEER_PRINCIPALS` maps Unix peer UIDs
 to principals, the kernel supplies the UID over the socket, and a
 claim that disagrees with the mapping is denied — the authenticated
 principal replaces the claim before admission (see
-`docs/architecture/authority-model.md`). Alternatively, an
+`docs/architecture/authority-model.md`). Production requires it:
+`CRABBOX_MODE=production` refuses to start without a nonempty map,
+because an unverified claim is not an identity. Alternatively, an
 authenticated proxy or a future signed-session authority mechanism can
 front the socket.
 
