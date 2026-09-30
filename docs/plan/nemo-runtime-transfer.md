@@ -602,6 +602,29 @@ the code rather than by the *contract* its callers depend on. The bodies looked
 alike; what differs is which sentinels something matches on and what extra
 policy each provider enforces.
 
+## Known test-environment issues
+
+Two, both diagnosed rather than guessed at. Neither is caused by this transfer,
+and both are recorded so the next run does not re-investigate them.
+
+1. **`internal/cli` fails from this repository layout.** Three tests
+   (`TestCheckpointCaptureBuiltBinaryContract`,
+   `TestRunFailureEvidenceFinalization`,
+   `TestRunCommandKeepOnFailureKeepsLeaseAfterLocalActionsHydrationFailure`)
+   derive their repository root from `git rev-parse --show-toplevel`, which
+   resolves to the wrapper root rather than the subtree. Run the package from a
+   checkout where the subtree *is* the repository root — its CI does, which is
+   why CI is unaffected. See the root README.
+
+2. **`TestServeDeployedQualificationProvider` is load-sensitive.** It fails
+   under `go test ./...` parallelism and passes in isolation in 0.06s (verified
+   with `-run ... -v`, so it is a real pass and not a skip). Its non-test code is
+   untouched by this transfer, and the only changes this transfer makes to
+   `internal/execution` are added test files, so the flake predates it. Fixing
+   it means finding the resource it contends for — a loopback port or a probe
+   deadline — and it is worth fixing, because a suite that fails under its own
+   parallelism trains people to ignore it.
+
 ## Open decisions
 
 1. **Upstream sync cadence** for `runtimes/nemo-relay/` — a pinned upstream
