@@ -226,6 +226,24 @@ type transferManifest struct {
 	LocalModifications []string `json:"local_modifications,omitempty"`
 	// AddedPaths lists the paths that exist only in the vendored tree.
 	AddedPaths []string `json:"added_paths,omitempty"`
+	// Binaries lists the executables the vendored tree must produce, with the
+	// source each is built from. A declared binary whose source is absent is
+	// exactly the defect this inventory exists to catch.
+	Binaries []manifestBinary `json:"binaries,omitempty"`
+}
+
+// manifestBinary is one executable the transfer declares.
+type manifestBinary struct {
+	// Role is what the binary is for: runtime, plugin-host, or qualification.
+	Role string `json:"role"`
+	// Package is the Cargo package that declares the binary.
+	Package string `json:"package"`
+	// Binary is the binary's name.
+	Binary string `json:"binary"`
+	// Source is the entry-point source file, relative to the tree.
+	Source string `json:"source"`
+	// Features are the package features the binary requires, if any.
+	Features []string `json:"features,omitempty"`
 }
 
 // manifestSource is the declared identity of the source copy.
@@ -292,6 +310,13 @@ func verifyManifest(path string) error {
 	fmt.Printf("ok: inventory %d workspace members, %d modifications, %d added paths\n",
 		len(manifest.WorkspaceMembersAdded), len(manifest.LocalModifications), len(manifest.AddedPaths))
 
+	if err := verifyBinaries(path, manifest); err != nil {
+		return err
+	}
+	if len(manifest.Binaries) > 0 {
+		fmt.Printf("ok: %d declared binaries have sources and declarations\n", len(manifest.Binaries))
+	}
+
 	if manifest.Source == nil {
 		return nil
 	}
@@ -336,6 +361,169 @@ func verifyInventory(manifestPath string, manifest transferManifest) error {
 		}
 	}
 	return nil
+}
+
+// verifyBinaries checks every declared binary against the tree: the source
+// exists, the package it belongs to declares it (an explicit `[[bin]]` entry
+// or an auto-discovered `src/bin/<name>.rs`), a declared `[[bin]]` path is the
+// source the manifest names, and every declared feature exists. A manifest
+// that declares a binary the tree cannot build is a release defect, not a
+// documentation nit.
+func verifyBinaries(manifestPath string, manifest transferManifest) error {
+	root := filepath.Clean(manifest.Tree)
+	for _, binary := range manifest.Binaries {
+		source := filepath.Join(manifest.Tree, binary.Source)
+		if !strings.HasPrefix(filepath.Clean(source), root+string(filepath.Separator)) {
+			return fmt.Errorf("%s declares %s with a source outside the tree: %s", manifestPath, binary.Binary, binary.Source)
+		}
+		if info, err := os.Stat(source); err != nil || info.IsDir() {
+			return fmt.Errorf("%s declares the %s binary at %s, but the source does not exist — a declared binary with no source is a release defect",
+				manifestPath, binary.Binary, binary.Source)
+		}
+
+		packageManifest, packageDir, err := packageManifestFor(root, source)
+		if err != nil {
+			return fmt.Errorf("%s declares the %s binary in package %s, but no package manifest declares it: %w",
+				manifestPath, binary.Binary, binary.Package, err)
+		}
+		raw, err := os.ReadFile(packageManifest)
+		if err != nil {
+			return err
+		}
+		text := string(raw)
+		if name := packageName(text); name != binary.Package {
+			return fmt.Errorf("%s declares the %s binary in package %q, but %s declares package %q",
+				manifestPath, binary.Binary, binary.Package, packageManifest, name)
+		}
+
+		declaredPath, declared := declaredBinaryPath(text, binary.Binary)
+		if !declared {
+			// Cargo also auto-discovers src/bin/<name>.rs.
+			auto := filepath.Join(packageDir, "src", "bin", binary.Binary+".rs")
+			if info, err := os.Stat(auto); err != nil || info.IsDir() {
+				return fmt.Errorf("%s declares the %s binary, but %s neither declares a [[bin]] entry for it nor provides %s",
+					manifestPath, binary.Binary, packageManifest, auto)
+			}
+			continue
+		}
+		if declaredPath != "" {
+			packageRelative, err := filepath.Rel(packageDir, source)
+			if err != nil {
+				return err
+			}
+			if filepath.ToSlash(packageRelative) != declaredPath {
+				return fmt.Errorf("%s declares the %s binary at %s, but %s declares its path as %q",
+					manifestPath, binary.Binary, binary.Source, packageManifest, declaredPath)
+			}
+		}
+		for _, feature := range binary.Features {
+			if !packageDeclaresFeature(text, feature) {
+				return fmt.Errorf("%s declares the %s binary with feature %q, but %s declares no such feature",
+					manifestPath, binary.Binary, feature, packageManifest)
+			}
+		}
+	}
+	return nil
+}
+
+// packageManifestFor walks up from a source file to the Cargo.toml of the
+// package that contains it.
+func packageManifestFor(root, source string) (string, string, error) {
+	dir := filepath.Dir(filepath.Clean(source))
+	for {
+		candidate := filepath.Join(dir, "Cargo.toml")
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate, dir, nil
+		}
+		if dir == root {
+			break
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir || !strings.HasPrefix(dir, root+string(filepath.Separator)) {
+			break
+		}
+		dir = parent
+	}
+	return "", "", fmt.Errorf("no Cargo.toml found above %s", source)
+}
+
+// packageName extracts the `name` of a Cargo.toml's [package] section.
+func packageName(manifest string) string {
+	inPackage := false
+	for _, line := range strings.Split(manifest, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "[") {
+			inPackage = trimmed == "[package]"
+			continue
+		}
+		if !inPackage {
+			continue
+		}
+		if value, ok := strings.CutPrefix(trimmed, "name"); ok {
+			value = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(value), "="))
+			return strings.Trim(value, `"`)
+		}
+	}
+	return ""
+}
+
+// declaredBinaryPath returns the package-relative path a Cargo.toml declares
+// for a [[bin]] with the given name, and whether it declares one at all.
+func declaredBinaryPath(manifest, binary string) (string, bool) {
+	section := ""
+	var block []string
+	declaredPath, declared := "", false
+	flush := func() {
+		if section != "[[bin]]" {
+			return
+		}
+		name, path := "", ""
+		for _, line := range block {
+			trimmed := strings.TrimSpace(line)
+			if value, ok := strings.CutPrefix(trimmed, "name"); ok {
+				name = strings.Trim(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(value), "=")), `"`)
+			}
+			if value, ok := strings.CutPrefix(trimmed, "path"); ok {
+				path = strings.Trim(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(value), "=")), `"`)
+			}
+		}
+		if name == binary {
+			declared = true
+			declaredPath = path
+		}
+	}
+	for _, line := range strings.Split(manifest, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "[") {
+			flush()
+			section = trimmed
+			block = nil
+			continue
+		}
+		block = append(block, line)
+	}
+	flush()
+	return declaredPath, declared
+}
+
+// packageDeclaresFeature reports whether a Cargo.toml's [features] section
+// declares the feature.
+func packageDeclaresFeature(manifest, feature string) bool {
+	inFeatures := false
+	for _, line := range strings.Split(manifest, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "[") {
+			inFeatures = trimmed == "[features]"
+			continue
+		}
+		if !inFeatures || trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if name, _, found := strings.Cut(trimmed, "="); found && strings.TrimSpace(name) == feature {
+			return true
+		}
+	}
+	return false
 }
 
 // membersArray matches the workspace manifest's `members = [...]` array,

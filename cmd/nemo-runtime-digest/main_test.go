@@ -297,6 +297,80 @@ func TestManifestInventoryMustMatchTheTree(t *testing.T) {
 	}
 }
 
+// binaryTree is a synthetic workspace with an explicitly declared binary, an
+// auto-discovered one, and a package feature.
+func binaryTree(t *testing.T) string {
+	t.Helper()
+	return writeTree(t, map[string]string{
+		"Cargo.toml":                          "[workspace]\nmembers = [\n    \"crates/one\",\n    \"crates/two\",\n]\n\n[workspace.package]\nversion = \"1.2.3\"\n",
+		"crates/one/Cargo.toml":               "[package]\nname = \"nemo-one\"\nversion = \"1.2.3\"\n\n[[bin]]\nname = \"nemo-one-host\"\npath = \"src/main.rs\"\n\n[features]\nunstable-thing = []\n",
+		"crates/one/src/main.rs":              "fn main() {}\n",
+		"crates/one/src/lib.rs":               "pub fn one() {}\n",
+		"crates/two/Cargo.toml":               "[package]\nname = \"nemo-two\"\nversion = \"1.2.3\"\n",
+		"crates/two/src/bin/nemo-two-tool.rs": "fn main() {}\n",
+	})
+}
+
+func TestManifestBinariesMustHaveSourcesAndDeclarations(t *testing.T) {
+	root := binaryTree(t)
+	declaration := declarationFor(t, root)
+	declaration.Binaries = []manifestBinary{
+		{Role: "runtime", Package: "nemo-one", Binary: "nemo-one-host", Source: "crates/one/src/main.rs"},
+		{Role: "plugin-host", Package: "nemo-two", Binary: "nemo-two-tool", Source: "crates/two/src/bin/nemo-two-tool.rs"},
+		{Role: "qualification", Package: "nemo-one", Binary: "nemo-one-host", Source: "crates/one/src/main.rs", Features: []string{"unstable-thing"}},
+	}
+	path := filepath.Join(t.TempDir(), "nemo-transfer-manifest.json")
+	writeManifestFile(t, path, declaration)
+	if err := verifyManifest(path); err != nil {
+		t.Fatalf("declared binaries with sources and declarations must verify: %v", err)
+	}
+
+	cases := []struct {
+		name    string
+		binary  manifestBinary
+		wantErr string
+	}{
+		{
+			name:    "source absent",
+			binary:  manifestBinary{Role: "runtime", Package: "nemo-one", Binary: "nemo-one-host", Source: "crates/one/src/bin/missing.rs"},
+			wantErr: "does not exist",
+		},
+		{
+			name:    "source exists but nothing declares the binary",
+			binary:  manifestBinary{Role: "runtime", Package: "nemo-one", Binary: "nemo-undeclared", Source: "crates/one/src/lib.rs"},
+			wantErr: "neither declares a [[bin]] entry",
+		},
+		{
+			name:    "declared path disagrees with the manifest",
+			binary:  manifestBinary{Role: "runtime", Package: "nemo-one", Binary: "nemo-one-host", Source: "crates/one/src/lib.rs"},
+			wantErr: "declares its path as",
+		},
+		{
+			name:    "package does not match the source's package",
+			binary:  manifestBinary{Role: "runtime", Package: "nemo-two", Binary: "nemo-one-host", Source: "crates/one/src/main.rs"},
+			wantErr: "declares package",
+		},
+		{
+			name:    "feature the package does not declare",
+			binary:  manifestBinary{Role: "qualification", Package: "nemo-one", Binary: "nemo-one-host", Source: "crates/one/src/main.rs", Features: []string{"unstable-absent"}},
+			wantErr: "declares no such feature",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			declaration.Binaries = []manifestBinary{tc.binary}
+			writeManifestFile(t, path, declaration)
+			err := verifyManifest(path)
+			if err == nil {
+				t.Fatal("the declaration must fail verification")
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error = %q, want substring %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestManifestSourceAbsenceIsReportedNotFailed(t *testing.T) {
 	root := baseTree(t)
 	declaration := declarationFor(t, root)

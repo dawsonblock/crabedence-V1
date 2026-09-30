@@ -30,5 +30,38 @@
   "added_paths": [
     "bridges/",
     "TRANSFER-PROVENANCE.md"
+  ],
+  "binaries": [
+    {
+      "role": "runtime",
+      "package": "nemo-crabedence-runtime",
+      "binary": "nemo-crabedence-runtime",
+      "source": "bridges/nemo-crabedence-runtime/src/main.rs"
+    },
+    {
+      "role": "plugin-host",
+      "package": "nemo-relay-native-loader",
+      "binary": "nemo-plugin-host",
+      "source": "crates/native-loader/src/bin/nemo-plugin-host.rs"
+    },
+    {
+      "role": "qualification",
+      "package": "nemo-relay-ledger",
+      "binary": "nemo-effect-schema",
+      "source": "crates/ledger/src/bin/nemo_effect_schema.rs",
+      "features": [
+        "unstable-postgres"
+      ]
+    },
+    {
+      "role": "qualification",
+      "package": "nemo-relay-ledger",
+      "binary": "nemo-postgres-crash-fixture",
+      "source": "crates/ledger/src/bin/postgres_crash_fixture.rs",
+      "features": [
+        "unstable-postgres",
+        "unstable-hardening-testkit"
+      ]
+    }
   ]
 }

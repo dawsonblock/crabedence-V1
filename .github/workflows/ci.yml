@@ -180,11 +180,19 @@ jobs:
         run: scripts/check-nemo-credential-isolation.sh
 
       # The vendored tree must match its declared transfer manifest — digest,
-      # file count, version, exclusion set, and inventory. The declaration
-      # lives outside the tree it covers, so it can be self-consistent; a tree
-      # change without a regenerated declaration fails here.
+      # file count, version, exclusion set, inventory, and the declared
+      # binaries' sources. The declaration lives outside the tree it covers,
+      # so it can be self-consistent; a tree change without a regenerated
+      # declaration fails here.
       - name: Verify the NEMO transfer manifest
         run: scripts/check-nemo-transfer-manifest.sh
+
+      # Every binary the manifest declares must actually compile. The plugin
+      # host and both ledger fixtures were declared by their packages but
+      # absent from the vendored copy once, and nothing built them, so nothing
+      # failed — this step is the check that would have caught it.
+      - name: Build the declared NEMO binaries
+        run: scripts/build-nemo-binaries.sh
 
       # The reference side. These suites — the conformance corpus, the
       # adversarial cases, framing, snapshot verification, and the schema
