@@ -1,0 +1,188 @@
+name: NEMO Distribution
+
+# The bound, per-target NEMO-CONTROL release roots — produced and qualified on
+# runners that can actually execute each target. One macOS machine cannot
+# produce or run the Linux artifacts (the Rust components need the target's
+# linker and the qualification runs the shipped binaries), so every leg runs
+# where its target is native: darwin_amd64 cross-builds on the Apple Silicon
+# runner and qualifies under Rosetta — the same path proven locally.
+#
+# This workflow produces and qualifies artifacts; it does not publish. The
+# credential-free candidate contract (scripts/release-provenance.mjs) pins the
+# crabbox archive inventory, so NEMO artifacts travel as their own bound
+# family — each tarball carries the component manifest that verifies it
+# exhaustively — and publication is the separate proof-gated operation.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Ref to build (defaults to the triggering ref)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nemo-distribution-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-qualify:
+    name: "nemo-control ${{ matrix.target }}"
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: darwin_arm64
+            runner: macos-15
+            rust_target: aarch64-apple-darwin
+            translated: "false"
+          - target: darwin_amd64
+            runner: macos-15
+            rust_target: x86_64-apple-darwin
+            translated: "true"
+          - target: linux_amd64
+            runner: ubuntu-latest
+            rust_target: x86_64-unknown-linux-gnu
+            translated: "false"
+          - target: linux_arm64
+            runner: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-gnu
+            translated: "false"
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
+      # Mirrors the NEMO integration job; bump both together when the vendored
+      # runtime moves. On the darwin_amd64 leg the declared rust_target is the
+      # cross std the assembler's preflight requires; elsewhere it is the
+      # host default and installing it is a no-op.
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          toolchain: 1.96.1
+          target: ${{ matrix.rust_target }}
+
+      - name: Install Rosetta for translated qualification
+        if: matrix.translated == 'true'
+        run: sudo softwareupdate --install-rosetta --agree-to-license
+
+      - name: Resolve the distribution version
+        id: resolve
+        shell: bash
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="$(cat VERSION)"
+          fi
+          # VERSION is the single version source — a tag cut against a tree
+          # that disagrees names artifacts the source does not claim.
+          declared="$(cat VERSION)"
+          [ "$declared" = "$version" ] || {
+            echo "VERSION declares $declared but this build is $version" >&2
+            exit 1
+          }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # Release profile — this is the release pipeline. The assembler verifies
+      # the root and writes the component manifest binding every shipped byte.
+      - name: Assemble and verify the distribution root
+        env:
+          NEMO_DIST_TARGET: ${{ matrix.target }}
+          NEMO_DIST_VERSION: ${{ steps.resolve.outputs.version }}
+        run: scripts/build-nemo-distribution.sh
+
+      - name: Pack the verified root
+        shell: bash
+        run: |
+          root="dist/nemo-control_${{ steps.resolve.outputs.version }}_${{ matrix.target }}"
+          [ -d "$root" ] || { echo "assembler produced no root at $root" >&2; exit 1; }
+          tar -C "$root" -czf "$root.tar.gz" .
+
+      # A translated host cannot load a host-arch fixture: the qualification
+      # probe must be built for the artifact's own architecture.
+      - name: Build the fixture for the target architecture
+        if: matrix.translated == 'true'
+        working-directory: runtimes/nemo-relay
+        run: |
+          cargo build --quiet --locked \
+            --manifest-path crates/core/tests/fixtures/native_intercept_plugin/Cargo.toml \
+            --target-dir target/test-plugin-fixtures \
+            --target ${{ matrix.rust_target }}
+
+      - name: Qualify the packed artifact
+        shell: bash
+        env:
+          NEMO_QUALIFY_HOST: ${{ matrix.translated == 'true' && matrix.target || '' }}
+          NEMO_E2E_FIXTURE: ${{ matrix.translated == 'true' && format('runtimes/nemo-relay/target/test-plugin-fixtures/{0}/debug/libnemo_relay_native_intercept_fixture.dylib', matrix.rust_target) || '' }}
+        run: >-
+          scripts/test-nemo-installed-distribution.sh
+          "dist/nemo-control_${{ steps.resolve.outputs.version }}_${{ matrix.target }}.tar.gz"
+
+      - name: Upload the qualified artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nemo-control_${{ steps.resolve.outputs.version }}_${{ matrix.target }}
+          path: dist/nemo-control_${{ steps.resolve.outputs.version }}_${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  checksums:
+    name: Release checksums
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: build-qualify
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+
+      - name: Download the qualified artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: nemo-control_*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Write the release checksum manifest
+        shell: bash
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="$(cat VERSION)"
+          fi
+          cd artifacts
+          ls nemo-control_*.tar.gz | LC_ALL=C sort > expected.txt
+          [ "$(wc -l < expected.txt)" -eq 4 ] || {
+            echo "expected four qualified tarballs, got:" >&2
+            cat expected.txt >&2
+            exit 1
+          }
+          sha256sum nemo-control_*.tar.gz | LC_ALL=C sort -k2 > "nemo-control_${version}_SHA256SUMS"
+          cat "nemo-control_${version}_SHA256SUMS"
+
+      - name: Upload the checksum manifest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nemo-control_SHA256SUMS
+          path: artifacts/nemo-control_*_SHA256SUMS
+          if-no-files-found: error

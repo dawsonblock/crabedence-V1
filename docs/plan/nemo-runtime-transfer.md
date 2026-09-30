@@ -864,11 +864,19 @@ Done and proven on the release path (`scripts/build-nemo-distribution.sh`,
 The subtree is synced — `crabedence-V1` carries this work at
 `f161bc5` (PR
 [#30](https://github.com/dawsonblock/crabedence-V1/pull/30), all checks
-green, post-merge `main` green). Still open: release qualification on a
-real tagged build — the per-target matrix needs a runner per OS (Linux
-targets need the target's linker, which macOS cannot supply), and wiring
-`.goreleaser.nemo.yaml` into the tagged candidate producer is a
-release-pipeline decision, not a code change.
+green, post-merge `main` green). Tag-time production is wired:
+`.github/workflows/nemo-distribution.yml` runs on `v*` tags and manual
+dispatch, one leg per target on a runner that natively executes it
+(`darwin_amd64` cross-builds on Apple Silicon and qualifies under
+Rosetta), assembles and verifies the bound root, packs it flat, then runs
+`scripts/test-nemo-installed-distribution.sh` against the packed tarball —
+the same qualification proven locally. A fan-in job writes the
+`nemo-control_<version>_SHA256SUMS` manifest over exactly the four
+qualified tarballs. Still open: publication of those artifacts is the
+separate proof-gated release operation, and the credential-free
+candidate contract (`scripts/release-provenance.mjs`) pins the crabbox
+archive inventory — folding NEMO artifacts into *that* manifest is a
+release-contract decision, not a code change.
 
 ### What the reconnaissance established
 
