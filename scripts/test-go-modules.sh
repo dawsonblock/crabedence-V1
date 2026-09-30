@@ -9,8 +9,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# The vendored NeMo Relay tree is pruned deliberately: its Go binding is a CGo
+# module over the FFI library, which this repository does not build, and the
+# tree's own toolchain (`just test-go` inside it) owns those tests. Discovery
+# here covers this repository's own modules.
 if ! find "$ROOT" \
-  \( -path "$ROOT/.git" -o -path "*/node_modules" -o -path "*/dist" -o -path "*/dist-cloudflare" \) -prune \
+  \( -path "$ROOT/.git" -o -path "*/node_modules" -o -path "*/dist" -o -path "*/dist-cloudflare" \
+     -o -path "$ROOT/runtimes/nemo-relay" \) -prune \
   -o -type f -name go.mod -print0 >"$modules_file"; then
   printf 'failed to discover go.mod files under %s\n' "$ROOT" >&2
   exit 1
