@@ -556,10 +556,10 @@ was read, and the population falls into four categories:
 
 | Category | Providers | Why migration is not a drop-in |
 | --- | --- | --- |
-| Drop-in — **exactly one** | `azuredynamicsessions` (migrated) | It was the only site whose origin comparison already delegated to `shared.SameOrigin` **and** whose body matched the helper's. That is what made it a drop-in, and it is a narrower condition than the shape of the code suggests |
-| Sentinel contracts — **must not** be migrated | `nomad`, `ovh` | Each defines a redirect-limit sentinel that a **consumer matches on**: `errors.Is(err, errNomadRedirectLimit)` and `errors.Is(err, errOVHRedirectLimit)`. The helper's cap message is fixed (`errors.New("stopped after 10 redirects")`), so migrating would replace a matched sentinel with a different value and break that check |
+| Drop-in as written | `azuredynamicsessions` (**migrated**) | Its origin comparison already delegated to `shared.SameOrigin` and its body matched the helper's, so it needed no new option |
+| Sentinel contracts — **migrated** once the helper could express them | `nomad`, `ovh` (**migrated**) | Each defines a redirect-limit sentinel that a consumer matches on (`errors.Is`). The helper's cap message was fixed, so migrating as it stood would have replaced a matched sentinel with a different value. `WithRedirectLimitError` closes that gap, and both now pass their sentinel in |
 | Richer redirect policy | `unikraftcloud`, `scaleway` | `unikraftcloud` additionally enforces path containment (`withinUnikraftCloudAPIPath`) and refuses a method change on a mutation — checks the helper does not make, so migrating would silently drop them. `scaleway` reads a marker header its own transport sets and distinguishes three sentinels (`CrossOrigin`, `Invalid`, `Limit`), then threads a hop count through the request context |
-| Host comparison differs | `sprites`, `islo` | `sprites` compares hosts through `canonicalSpritesHostname` (which strips IPv6 zone identifiers) and its own port helper, **not** `shared.SameOrigin` — so migrating would loosen the comparison that decides whether a redirect may be followed. Its refusal text is also asserted by a test (`strings.Contains(err.Error(), "redirect changed API origin")`), which the helper's `newError` can preserve. `islo` uses its own guard constructor, `isloSameOriginRedirectGuard(baseURL, source.CheckRedirect)` |
+| Host comparison differs | `sprites` (**migrated**), `islo` (not yet read) | `sprites` compares hosts through `canonicalSpritesHostname` (which strips IPv6 zone identifiers) and its own port helper, not `shared.SameOrigin`. `WithHostComparator` closes that gap, so it now passes its own comparison in, and its refusal text — asserted by a test — is preserved through `newError`. `islo` uses its own guard constructor, `isloSameOriginRedirectGuard(baseURL, source.CheckRedirect)`, whose semantics need their own read |
 | Deliberately stricter | `boxd`, `cloudflaredynamicworkers`, `githubcodespaces` | `boxd` refuses every redirect ("boxd API redirects are not allowed"); the other two return `http.ErrUseLastResponse` and follow none. Migrating would **weaken** them by permitting same-origin redirects |
 | Origin-pinned with deliberate unwrapping | `fastapicloud`, `morph`, `railway` | Each unwraps its typed error at the call site, with the comment "net/http wraps CheckRedirect failures with the untrusted Location URL" — they deliberately avoid surfacing the untrusted destination. Migration must preserve that unwrapping |
 | Pinned at the transport | `opensandbox` | `openSandboxRedirectTransport` intercepts the 3xx response and parses `Location` itself. A different mechanism, arguably stronger, and not a `CheckRedirect` site at all |
@@ -571,15 +571,27 @@ error identity in the rest. The real duplication is smaller than the file count
 suggests — **exactly one provider, not sixteen, is drop-in**, and it is
 migrated.
 
-The finding that matters is what this says about the helper rather than the
-providers: `SecureHTTPClient` is **under-parameterized**. It cannot express a
-provider-specific redirect-limit error (its cap message is fixed), and it cannot
-express a provider-specific host comparison (it always uses `shared.SameOrigin`).
-Two of the four categories above exist precisely because of those two gaps. So
-consolidating the rest means **extending the helper's contract first** — accept a
-limit error, accept a host comparator — and migrating afterwards. Doing it in the
-other order is what would have broken the two sentinel consumers and loosened two
-host comparisons.
+The finding that mattered was about the helper rather than the providers:
+`SecureHTTPClient` was **under-parameterized**. It could not express a
+provider-specific redirect-limit error (its cap message was fixed), nor a
+provider-specific host comparison (it always used `shared.SameOrigin`), and two
+of the categories above existed precisely because of those two gaps.
+
+**That is now fixed.** The helper gained `WithRedirectLimitError` and
+`WithHostComparator` — variadic options, so the seven existing callers are
+untouched, and covered by their own tests (defaults unchanged, a sentinel
+survives, a comparator decides, the original hook still wins, the source client
+is not mutated). With those in place the three providers whose only gaps were
+those two are migrated: `nomad` and `ovh` pass their sentinels,
+`sprites` passes its stricter host comparison. All four packages build, vet, and
+test clean.
+
+**Four of sixteen are consolidated.** What remains is not a migration backlog:
+`unikraftcloud` and `scaleway` enforce redirect policy the helper does not model
+(path containment, a method change on a mutation, a transport-set marker header,
+three distinct sentinels), `islo` has not been read, and the other nine differ
+deliberately — three are stricter, three unwrap their errors on purpose, and one
+pins at the transport layer.
 
 This is the same mistake as finding 4, made twice: classifying by the *shape* of
 the code rather than by the *contract* its callers depend on. The bodies looked
