@@ -142,23 +142,31 @@ jobs:
         with:
           node-version: 24
 
+      # The transfer-manifest gate below runs the digest tool, which is Go.
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
       # The Rust side: the ABI bridge (unit tests, the shared conformance
-      # corpus, the schema binding, the trust-boundary assertions) and the
-      # effect router (routing decisions plus the effect-isolation invariant —
-      # no MUTATION or CRITICAL capability can reach a local backend). The
-      # env-gated live suites skip here; they need a running
-      # `crabbox serve-exec`.
+      # corpus, the schema binding, the trust-boundary assertions), the effect
+      # router (routing decisions plus the effect-isolation invariant — no
+      # MUTATION or CRITICAL capability can reach a local backend), and the
+      # runtime instance that composes them, including its invocation-identity
+      # policy: a consequential invocation without a caller-supplied
+      # idempotency key is refused before any dispatch. The env-gated live
+      # suites skip here; they need a running `crabbox serve-exec`.
       - name: Test the NEMO integration crates
         working-directory: runtimes/nemo-relay
-        run: cargo test -p nemo-crabedence-bridge -p nemo-effect-router
+        run: cargo test -p nemo-crabedence-bridge -p nemo-effect-router -p nemo-crabedence-runtime
 
       - name: Lint the NEMO integration crates
         working-directory: runtimes/nemo-relay
-        run: cargo clippy -p nemo-crabedence-bridge -p nemo-effect-router --all-targets -- -D warnings
+        run: cargo clippy -p nemo-crabedence-bridge -p nemo-effect-router -p nemo-crabedence-runtime --all-targets -- -D warnings
 
       - name: Check the NEMO integration crate formatting
         working-directory: runtimes/nemo-relay
-        run: cargo fmt -p nemo-crabedence-bridge -p nemo-effect-router -- --check
+        run: cargo fmt -p nemo-crabedence-bridge -p nemo-effect-router -p nemo-crabedence-runtime -- --check
 
       # The Phase 9 invariant: nothing on the shipping runtime path may depend
       # on the crates whose responsibilities Crabedence owns.
@@ -170,6 +178,13 @@ jobs:
       # upstream exposure paths, which are unresolved (finding 7).
       - name: Check credential isolation
         run: scripts/check-nemo-credential-isolation.sh
+
+      # The vendored tree must match its declared transfer manifest — digest,
+      # file count, version, exclusion set, and inventory. The declaration
+      # lives outside the tree it covers, so it can be self-consistent; a tree
+      # change without a regenerated declaration fails here.
+      - name: Verify the NEMO transfer manifest
+        run: scripts/check-nemo-transfer-manifest.sh
 
       # The reference side. These suites — the conformance corpus, the
       # adversarial cases, framing, snapshot verification, and the schema

@@ -29,12 +29,15 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -71,7 +74,27 @@ type envelope struct {
 func main() {
 	envelopeOnly := flag.Bool("envelope", false, "print the verifiable runtime identity envelope instead of the bare digest")
 	root := flag.String("root", defaultRoot, "the vendored runtime tree to digest")
+	manifestPath := flag.String("manifest", "", "verify the transfer manifest at this path; with -update, rewrite its computed fields (the manifest declares the tree to digest, relative to the repository root)")
+	update := flag.Bool("update", false, "rewrite the manifest's computed fields instead of verifying them")
 	flag.Parse()
+
+	if *manifestPath != "" {
+		var err error
+		if *update {
+			err = updateManifest(*manifestPath)
+		} else {
+			err = verifyManifest(*manifestPath)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "nemo-runtime-digest: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if *update {
+		fmt.Fprintln(os.Stderr, "nemo-runtime-digest: -update requires -manifest")
+		os.Exit(2)
+	}
 
 	identity, err := digestRuntime(*root)
 	if err != nil {
@@ -175,6 +198,213 @@ func fileDigest(path string) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+// transferManifest is the declared identity of the vendored runtime transfer.
+//
+// It lives outside the tree it covers (runtimes/nemo-transfer-manifest.json):
+// a declaration inside the tree would be part of the digest it declares, and a
+// digest of content that contains the digest can never be self-consistent. The
+// computed fields are checked against the tree; the inventory fields are
+// checked structurally by scripts/check-nemo-transfer-manifest.sh.
+type transferManifest struct {
+	// Tree is the vendored runtime tree, relative to the repository root.
+	Tree string `json:"tree"`
+	// RuntimeVersion is the workspace version the tree declares.
+	RuntimeVersion string `json:"runtime_version"`
+	// ShippedTreeSHA256 is the identity of the shipped tree.
+	ShippedTreeSHA256 string `json:"shipped_tree_sha256"`
+	// FileCount is how many source files the digest covers.
+	FileCount int `json:"file_count"`
+	// Excluded names the directories the digest deliberately does not cover.
+	Excluded []string `json:"excluded"`
+	// Source is the development fork the tree was copied from, when declared.
+	Source *manifestSource `json:"source,omitempty"`
+	// WorkspaceMembersAdded lists the workspace members the transfer adds.
+	WorkspaceMembersAdded []string `json:"workspace_members_added,omitempty"`
+	// LocalModifications lists the upstream files the transfer modifies.
+	LocalModifications []string `json:"local_modifications,omitempty"`
+	// AddedPaths lists the paths that exist only in the vendored tree.
+	AddedPaths []string `json:"added_paths,omitempty"`
+}
+
+// manifestSource is the declared identity of the source copy.
+type manifestSource struct {
+	// Path is the source tree, relative to the repository root.
+	Path string `json:"path"`
+	// FileCount is how many files the source tree had when it was copied.
+	FileCount int `json:"file_count"`
+	// SHA256 is the source tree's identity, under the same definition.
+	SHA256 string `json:"sha256"`
+}
+
+func readManifest(path string) (transferManifest, error) {
+	var manifest transferManifest
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return manifest, err
+	}
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		return manifest, fmt.Errorf("%s is not a valid transfer manifest: %w", path, err)
+	}
+	return manifest, nil
+}
+
+// verifyManifest checks the declared identity against the tree it describes.
+// The source tree is only recomputed when it is present: a standalone checkout
+// of this repository does not carry it, and that absence is reported rather
+// than silently skipped.
+func verifyManifest(path string) error {
+	manifest, err := readManifest(path)
+	if err != nil {
+		return err
+	}
+	if manifest.Tree == "" {
+		return fmt.Errorf("%s declares no tree", path)
+	}
+	identity, err := digestRuntime(manifest.Tree)
+	if err != nil {
+		return err
+	}
+
+	var mismatches []string
+	if manifest.RuntimeVersion != identity.RuntimeVersion {
+		mismatches = append(mismatches, fmt.Sprintf("runtime_version: declared %q, computed %q", manifest.RuntimeVersion, identity.RuntimeVersion))
+	}
+	if manifest.ShippedTreeSHA256 != identity.NemoRuntimeSHA256 {
+		mismatches = append(mismatches, fmt.Sprintf("shipped_tree_sha256: declared %s, computed %s", manifest.ShippedTreeSHA256, identity.NemoRuntimeSHA256))
+	}
+	if manifest.FileCount != identity.FileCount {
+		mismatches = append(mismatches, fmt.Sprintf("file_count: declared %d, computed %d", manifest.FileCount, identity.FileCount))
+	}
+	if !slices.Equal(manifest.Excluded, identity.Excluded) {
+		mismatches = append(mismatches, fmt.Sprintf("excluded: declared %v, computed %v", manifest.Excluded, identity.Excluded))
+	}
+	if len(mismatches) > 0 {
+		return fmt.Errorf("%s does not match %s:\n  %s\nregenerate with: go run ./cmd/nemo-runtime-digest -manifest %s -update",
+			manifest.Tree, path, strings.Join(mismatches, "\n  "), path)
+	}
+	fmt.Printf("ok: %s %s (%d files, %s)\n", identity.Tree, identity.NemoRuntimeSHA256, identity.FileCount, identity.RuntimeVersion)
+
+	if err := verifyInventory(path, manifest); err != nil {
+		return err
+	}
+	fmt.Printf("ok: inventory %d workspace members, %d modifications, %d added paths\n",
+		len(manifest.WorkspaceMembersAdded), len(manifest.LocalModifications), len(manifest.AddedPaths))
+
+	if manifest.Source == nil {
+		return nil
+	}
+	if _, err := os.Stat(manifest.Source.Path); err != nil {
+		fmt.Fprintf(os.Stderr, "note: source tree %s is not present; the declared source identity was not recomputed\n", manifest.Source.Path)
+		return nil
+	}
+	source, err := digestRuntime(manifest.Source.Path)
+	if err != nil {
+		return fmt.Errorf("source tree %s: %w", manifest.Source.Path, err)
+	}
+	if source.NemoRuntimeSHA256 != manifest.Source.SHA256 || source.FileCount != manifest.Source.FileCount {
+		return fmt.Errorf("source tree %s does not match its declared identity: declared %s (%d files), computed %s (%d files)\nregenerate with: go run ./cmd/nemo-runtime-digest -manifest %s -update",
+			manifest.Source.Path, manifest.Source.SHA256, manifest.Source.FileCount,
+			source.NemoRuntimeSHA256, source.FileCount, path)
+	}
+	fmt.Printf("ok: source %s %s (%d files)\n", source.Tree, source.NemoRuntimeSHA256, source.FileCount)
+	return nil
+}
+
+// verifyInventory checks the manifest's structural claims against the tree:
+// every declared workspace member is in the vendored Cargo.toml's members
+// list, and every declared modified or added path exists. The digest covers
+// the bytes; this covers the claims the digest cannot express.
+func verifyInventory(manifestPath string, manifest transferManifest) error {
+	if len(manifest.WorkspaceMembersAdded) > 0 {
+		members, err := declaredWorkspaceMembers(manifest.Tree)
+		if err != nil {
+			return err
+		}
+		for _, added := range manifest.WorkspaceMembersAdded {
+			if !slices.Contains(members, added) {
+				return fmt.Errorf("%s declares workspace member %q, but %s/Cargo.toml does not list it",
+					manifestPath, added, manifest.Tree)
+			}
+		}
+	}
+	for _, path := range slices.Concat(manifest.LocalModifications, manifest.AddedPaths) {
+		if _, err := os.Stat(filepath.Join(manifest.Tree, path)); err != nil {
+			return fmt.Errorf("%s declares %q, but %s/%s does not exist",
+				manifestPath, path, manifest.Tree, strings.TrimSuffix(path, "/"))
+		}
+	}
+	return nil
+}
+
+// membersArray matches the workspace manifest's `members = [...]` array,
+// anchored to the start of a line so `default-members` cannot be mistaken
+// for it.
+var membersArray = regexp.MustCompile(`(?m)^members\s*=\s*\[([^\]]*)\]`)
+
+// quotedEntry matches one quoted string inside the members array.
+var quotedEntry = regexp.MustCompile(`"([^"]+)"`)
+
+// declaredWorkspaceMembers extracts the quoted entries of the workspace
+// `members` array from the vendored Cargo.toml.
+func declaredWorkspaceMembers(tree string) ([]string, error) {
+	manifest, err := os.ReadFile(filepath.Join(tree, "Cargo.toml"))
+	if err != nil {
+		return nil, err
+	}
+	block := membersArray.FindSubmatch(manifest)
+	if block == nil {
+		return nil, fmt.Errorf("%s/Cargo.toml declares no members array", tree)
+	}
+	var members []string
+	for _, match := range quotedEntry.FindAllSubmatch(block[1], -1) {
+		members = append(members, string(match[1]))
+	}
+	return members, nil
+}
+
+// updateManifest rewrites the manifest's computed fields from the tree,
+// preserving the inventory fields a human maintains. A missing manifest is
+// created with the computed fields alone.
+func updateManifest(path string) error {
+	manifest, err := readManifest(path)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		manifest = transferManifest{}
+	}
+	if manifest.Tree == "" {
+		manifest.Tree = defaultRoot
+	}
+	identity, err := digestRuntime(manifest.Tree)
+	if err != nil {
+		return err
+	}
+	manifest.RuntimeVersion = identity.RuntimeVersion
+	manifest.ShippedTreeSHA256 = identity.NemoRuntimeSHA256
+	manifest.FileCount = identity.FileCount
+	manifest.Excluded = identity.Excluded
+	if manifest.Source != nil {
+		if _, err := os.Stat(manifest.Source.Path); err == nil {
+			source, err := digestRuntime(manifest.Source.Path)
+			if err != nil {
+				return fmt.Errorf("source tree %s: %w", manifest.Source.Path, err)
+			}
+			manifest.Source.SHA256 = source.NemoRuntimeSHA256
+			manifest.Source.FileCount = source.FileCount
+		}
+	}
+	encoded, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, append(encoded, '\n'), 0o644); err != nil {
+		return err
+	}
+	fmt.Printf("updated: %s — %s %s (%d files, %s)\n", path, identity.Tree, identity.NemoRuntimeSHA256, identity.FileCount, identity.RuntimeVersion)
+	return nil
 }
 
 // workspaceVersion reads the version the vendored workspace declares, so the

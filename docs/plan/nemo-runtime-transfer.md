@@ -1,9 +1,9 @@
 # NEMO Runtime Transfer
 
-Status: Accepted and in progress. Phase 0 (vendoring) and Phase 1 (the bridge)
-are implemented and verified; Phases 2 and 3 are partially implemented; Phase 4
-has not started. This file is the executable plan and the decision record for
-the transfer described in
+Status: Accepted and in progress. Phase 0 (vendoring), Phase 1 (the bridge),
+and Phase 4 (retiring the TypeScript kernel) are implemented and verified;
+Phases 2 and 3 are partially implemented. This file is the executable plan and
+the decision record for the transfer described in
 [ADR-003](../adr/ADR-003-nemo-runtime-transfer-boundary.md).
 
 Read when:
@@ -41,9 +41,9 @@ excludes `target/`, caches, `node_modules`, and editor state.
 
 | Phase | State | Evidence |
 | --- | --- | --- |
-| 0 — vendor | Done | `runtimes/nemo-relay/` (1438 source files, no build artifacts); a recursive diff against the source copy reports exactly two differing files (`Cargo.toml`, `Cargo.lock`); provenance and fingerprint in `runtimes/nemo-relay/TRANSFER-PROVENANCE.md` |
+| 0 — vendor | Done | `runtimes/nemo-relay/` (no build artifacts); a recursive diff against the source copy reports four differing files (`Cargo.toml`, `Cargo.lock`, `crates/cli/src/mcp_environment.rs`, `integrations/coding-agents/codex/.mcp.json`) plus two added paths (`bridges/`, `TRANSFER-PROVENANCE.md`); provenance in `runtimes/nemo-relay/TRANSFER-PROVENANCE.md`, and the shipped identity declared in `runtimes/nemo-transfer-manifest.json`, checked against the tree by `scripts/check-nemo-transfer-manifest.sh` in CI |
 | 1 — bridge | Done | `runtimes/nemo-relay/bridges/nemo-crabedence/`: `abi.rs`, `transport.rs`, `capability_snapshot.rs`, `outcome_mapping.rs`, `execution_port.rs`; 56 unit tests, 1 corpus conformance test, 5 schema-binding tests, 5 env-gated live tests |
-| 2 — trust enforcement | Partial, and advanced. Bridge-level invariants enforced and tested (unregistered capability, class mismatch, route mismatch, no policy field on the wire), the effect-isolation invariant holds at the router, and both run in CI. A **runtime instance** now exists: `bridges/nemo-crabedence-runtime` is a process that verifies the snapshot, resolves the class and route from it, and dispatches through `EffectRouter` — verified end to end (PURE routed locally, MUTATION committed through the kernel with evidence, a missing grant refused as non-retryable, an unregistered capability refused before any socket hop, and a tampered snapshot refused before routing). What is *still* absent is the plugin host: `crates/plugin-host` is not wired to this runtime, so a plugin cannot yet reach the router, which is why the plugin-host gate scenarios remain open. This row previously named NEMO's `BackendRouter` wiring as the remainder, which finding 6 corrected: that composition is not merely unwired, it is the wrong one |
+| 2 — trust enforcement | Partial, and advanced. Bridge-level invariants enforced and tested (unregistered capability, class mismatch, route mismatch, no policy field on the wire), the effect-isolation invariant holds at the router, and both run in CI. A **runtime instance** now exists: `bridges/nemo-crabedence-runtime` is a process that verifies the snapshot, resolves the class and route from it, and dispatches through `EffectRouter` — verified end to end (PURE routed locally, MUTATION committed through the kernel with evidence, a missing grant refused as non-retryable, an unregistered capability refused before any socket hop, and a tampered snapshot refused before routing). What is *still* absent is the plugin host: `crates/plugin-host` is not wired to this runtime, so a plugin cannot yet reach the router, which is why the plugin-host gate scenarios remain open. This row previously named NEMO's `BackendRouter` wiring as the remainder, which finding 6 corrected: that composition is not merely unwired, it is the wrong one. The runtime instance also binds a real invocation identity — unique execution, invocation, and action ids; a caller-supplied idempotency key required for `MUTATION`/`CRITICAL` and namespaced per principal; and canonical argument, descriptor, and route digests — where it previously sent `runtime-{capability}` placeholders |
 | 3 — conformance | Partial | The Rust validator matches the shared invocation corpus exactly (11 accepted, 32 rejected), the live kernel's refusal phrases match word-for-word, and the outcome corpus is shared across Go, TypeScript, and Rust. Covered against the live kernel from the NEMO side: a LOCAL-route refusal, a MUTATION commit with evidence, missing authority (`UNAUTHORIZED`), an unresolvable authority reference (`UNAUTHORIZED`, definitive and non-retryable), an expired authority reference (`UNAUTHORIZED`, definitive and non-retryable), a lost response mapping to `UNKNOWN`, snapshot tampering, same-key replay, and a CRITICAL commit carrying evidence. Two of these need orchestration the Rust test cannot own, so scripts hold the timing and the tests assert only the outcome: `scripts/test-nemo-expired-authority.sh` issues a short-lived grant, lets it lapse, then asserts the refusal; `scripts/test-nemo-restart-idempotency.sh` dispatches twice, restarts the kernel on the same store, dispatches twice again with the same key, and asserts one effect. Neither test sleeps on a clock. Not covered, and each for a stated reason: plugin host crash, hang, malformed reply, and registration rejection have no NEMO plugin host in the integration path — a runtime instance now routes through `EffectRouter`, but `crates/plugin-host` is not wired to it, so there is nothing hosting a plugin to crash or hang; provider crash is qualified Go-side by the kernel's own crash-point matrix, which SIGKILLs real provider processes; CRITICAL is now covered end to end by `scripts/test-nemo-critical-path.sh`, which wires the qualification provider so the bridge's evidence rule meets a real commit; the PURE and READ crossings are not, because the qualification extension adds only CRITICAL and no capability is pinned to the `CRABEDENCE` route for those classes — see finding 4 |
 | — reference kernel | Retired | Renamed to `nemo/registry-snapshot/`, decoupled from the loader, then deleted once the suite passed without it; the README now records where each removed behavior lives |
 | — canonical schema | Done | `schemas/capability-invocation-v1.json` describes the frozen wire contract; Go, TypeScript, and Rust each carry a test that binds their implementation to it, so a field added on one side and not the others fails CI |
@@ -53,12 +53,13 @@ excludes `target/`, caches, `node_modules`, and editor state.
 Verification actually run:
 
 ```sh
-cd runtimes/nemo-relay && cargo test -p nemo-crabedence-bridge -p nemo-effect-router
-cd runtimes/nemo-relay && cargo clippy -p nemo-crabedence-bridge -p nemo-effect-router --all-targets -- -D warnings
-cd runtimes/nemo-relay && cargo fmt -p nemo-crabedence-bridge -p nemo-effect-router -- --check
+cd runtimes/nemo-relay && cargo test -p nemo-crabedence-bridge -p nemo-effect-router -p nemo-crabedence-runtime
+cd runtimes/nemo-relay && cargo clippy -p nemo-crabedence-bridge -p nemo-effect-router -p nemo-crabedence-runtime --all-targets -- -D warnings
+cd runtimes/nemo-relay && cargo fmt -p nemo-crabedence-bridge -p nemo-effect-router -p nemo-crabedence-runtime -- --check
 cd runtimes/nemo-relay && NEMO_CRABEDENCE_LIVE_SOCKET=<socket> \
   NEMO_CRABEDENCE_LIVE_GRANT=<grant> \
   cargo test -p nemo-crabedence-bridge -p nemo-effect-router -- --nocapture
+scripts/check-nemo-transfer-manifest.sh
 go test ./internal/execution/ -count=1
 go test ./internal/cli/ -run 'TestExec' -count=1
 go test ./cmd/nemo-runtime-digest/ -count=1
@@ -306,8 +307,10 @@ crabedence/
 │   └── nemo-relay/           # FULL NEMO, upstream tree preserved
 │       ├── crates/           # core, plugin, plugin-host, native-abi,
 │       │                     # native-loader, adaptive, worker, ...
-│       ├── bridges/
-│       │   └── nemo-crabedence/   # the bridge (workspace member)
+│       ├── bridges/          # the bridge, the router, and the runtime
+│       │   ├── nemo-crabedence/          # the ABI bridge
+│       │   ├── nemo-effect-router/       # route resolution and isolation
+│       │   └── nemo-crabedence-runtime/  # the runtime instance
 │       ├── python/
 │       ├── integrations/
 │       └── security/
@@ -335,9 +338,12 @@ appears, it can live at the repository root as a standalone crate; the
 NEMO bridge cannot.
 
 Upstream NEMO updates remain a pull: the vendored tree differs from upstream
-only by the `bridges/nemo-crabedence` entry in the workspace `members` list and
-that new directory. Re-applying both after an upstream refresh is the
-documented update procedure.
+by the three `bridges/*` entries in the workspace `members` list, those
+directories, the MCP credential patch, and `TRANSFER-PROVENANCE.md`. The
+manifest's `local_modifications` and `added_paths` inventory is the full list,
+and `scripts/check-nemo-transfer-manifest.sh` refuses a tree that drifted from
+it. Re-applying those after an upstream refresh is the documented update
+procedure.
 
 ## Phase 0 — vendor the NEMO runtime (done)
 
@@ -446,13 +452,14 @@ provider crash
 Crabedence restart, NEMO restart, both restarted
 ```
 
-## Phase 4 — retire the TypeScript kernel (not started)
+## Phase 4 — retire the TypeScript kernel (done)
 
-Only after the full NEMO runtime passes the same behavioral tests:
+Done once the full NEMO runtime passed the same behavioral tests. The record
+of the decision and its coverage is in "Blocker 9 — retired" below.
 
-- Delete `nemo/registry-snapshot/` and the adapter's kernel-side duplication.
-- Retain the lightweight TypeScript client: Node applications still need to
-  invoke Crabedence, and the client is not the kernel.
+- The kernel is deleted; `nemo/registry-snapshot/` survives as the loader.
+- The lightweight TypeScript client is retained: Node applications still need
+  to invoke Crabedence, and the client is not the kernel.
 
 ## Verification for this document
 
