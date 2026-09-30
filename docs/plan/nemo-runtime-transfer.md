@@ -346,6 +346,24 @@ and `scripts/check-nemo-transfer-manifest.sh` refuses a tree that drifted from
 it. Re-applying those after an upstream refresh is the documented update
 procedure.
 
+### Platform scope: Linux and macOS for the integrated runtime
+
+The integrated path — the bridge transport and the runtime instance — is
+Unix-only, deliberately, and the first integrated release is scoped to Linux
+and macOS. `transport.rs` speaks a Unix-domain socket with no fallback, so a
+Windows build fails to compile rather than silently selecting a weaker
+transport, and the service's authenticated-identity leg
+(`CRABEDENCE_PEER_PRINCIPALS`) reads peer credentials the same way and fails
+closed on platforms without them.
+
+Windows remains a supported Crabbox CLI target — the CLI talks to remote
+runners there — but it is not part of the integrated runtime path. Two things
+must exist before it can be: a Windows transport (named pipes) with equivalent
+peer authentication and framing semantics, and NEMO's native plugin
+isolation, which deliberately refuses Windows today. Neither is on this
+transfer's critical path; the unwired plugin host (Phase 2) is the earlier
+gap.
+
 ## Phase 0 — vendor the NEMO runtime (done)
 
 Deliverable: `runtimes/nemo-relay/` containing the full NEMO source, workspace
