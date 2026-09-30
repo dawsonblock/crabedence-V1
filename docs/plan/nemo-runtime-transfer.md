@@ -122,10 +122,26 @@ grant — committed a mutation with `SUCCEEDED` and receipt version 3 evidence.
    `requires_evidence` rule against a real commit rather than a fixture. It
    passes, with a real evidence digest.
 
-   What remains genuinely uncovered is "NEMO → Crabedence PURE" and "READ": the
-   qualification extension adds only CRITICAL, so a PURE or READ capability
-   pinned to the `CRABEDENCE` route has no representative to dispatch. That is a
-   registry-coverage gap of one or two descriptors, not a service change.
+   What remains genuinely uncovered is "NEMO → Crabedence PURE" and "READ" —
+   and **a second correction**: an earlier revision of this finding called that
+   "a registry-coverage gap of one or two descriptors, not a service change".
+   Reading the surface shows otherwise. The qualification extension is
+   deliberately *singular*: `QualificationRegistryExtensionID` is one constant,
+   `RegisterQualificationCapabilities` refuses to register anything that would
+   replace a release descriptor, and `QualificationRegistryExtensions` returns a
+   one-element record that `cmd/registry-digest` writes into
+   `qualification-registry-extensions.json`. That record is bound into release
+   evidence and validated by the release gates, so adding PURE and READ
+   descriptors would change a release-evidence artifact and the qualification
+   registry digest. It is a qualification-policy decision, not a fixture.
+
+   It is also a smaller hole than the gate list implies. The property those
+   scenarios exist to prove — that the **route**, not the class, chooses the
+   path — is already covered at the layer that decides it: `tests/routing.rs`
+   pins a `READ` capability pinned to `CRABEDENCE` crossing the kernel, and a
+   `PURE` capability pinned `LOCAL` staying home. What is absent is a live
+   capability to dispatch those two classes over the wire, which is why the gap
+   is stated rather than closed.
 5. **The sketched ABI additions would be a breaking change.** The consolidation
    sketch proposes a request carrying `abi_version` and `request_id` with
    `principal` and `authority_ref` at the top level. The frozen contract has no
