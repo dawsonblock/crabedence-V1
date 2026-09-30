@@ -173,7 +173,9 @@ case "$(uname -s 2>/dev/null || true)" in
   Darwin) fixture_name="libnemo_relay_native_intercept_fixture.dylib" ;;
   *) fixture_name="libnemo_relay_native_intercept_fixture.so" ;;
 esac
-library="runtimes/nemo-relay/target/test-plugin-fixtures/debug/$fixture_name"
+# The fixture must match the host's architecture — a translated host needs a
+# translated plugin (NEMO_E2E_FIXTURE for cross-arch qualification).
+library="${NEMO_E2E_FIXTURE:-runtimes/nemo-relay/target/test-plugin-fixtures/debug/$fixture_name}"
 [[ -x "$host_bin" && -f "$library" ]] \
   || fail "the plugin host or the fixture library is missing"
 
