@@ -108,6 +108,15 @@ fi
 cargo_target_args=()
 rust_out_dir="runtimes/nemo-relay/target/$target_dir"
 if [[ "$target" != "$host_target" ]]; then
+  # Preflight: the pinned toolchain must carry the target's std, and crates
+  # with vendored C (ring, aws-lc) still need the target's linker on PATH —
+  # that is a system toolchain, not something this script installs.
+  if command -v rustup >/dev/null 2>&1; then
+    pinned_toolchain="$(cd runtimes/nemo-relay && rustup show active-toolchain | awk '{print $1}')"
+    rustup target list --installed --toolchain "$pinned_toolchain" 2>/dev/null | grep -qx "$rust_target" \
+      || { printf 'FAIL: target %s is not installed for toolchain %s.\n       Fix: rustup target add %s --toolchain %s\n' \
+           "$rust_target" "$pinned_toolchain" "$rust_target" "$pinned_toolchain" >&2; exit 1; }
+  fi
   cargo_target_args=(--target "$rust_target")
   rust_out_dir="runtimes/nemo-relay/target/$rust_target/$target_dir"
 fi
