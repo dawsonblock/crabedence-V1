@@ -556,10 +556,10 @@ was read, and the population falls into four categories:
 
 | Category | Providers | Why migration is not a drop-in |
 | --- | --- | --- |
-| Structurally equivalent — **corrected to two** | `azuredynamicsessions` (migrated), `sprites` | These two build their refusal text inline and use the generic cap message, so the helper's `newError` covers them exactly |
+| Drop-in — **exactly one** | `azuredynamicsessions` (migrated) | It was the only site whose origin comparison already delegated to `shared.SameOrigin` **and** whose body matched the helper's. That is what made it a drop-in, and it is a narrower condition than the shape of the code suggests |
 | Sentinel contracts — **must not** be migrated | `nomad`, `ovh` | Each defines a redirect-limit sentinel that a **consumer matches on**: `errors.Is(err, errNomadRedirectLimit)` and `errors.Is(err, errOVHRedirectLimit)`. The helper's cap message is fixed (`errors.New("stopped after 10 redirects")`), so migrating would replace a matched sentinel with a different value and break that check |
 | Richer redirect policy | `unikraftcloud`, `scaleway` | `unikraftcloud` additionally enforces path containment (`withinUnikraftCloudAPIPath`) and refuses a method change on a mutation — checks the helper does not make, so migrating would silently drop them. `scaleway` reads a marker header its own transport sets and distinguishes three sentinels (`CrossOrigin`, `Invalid`, `Limit`), then threads a hop count through the request context |
-| Not yet read | `islo` | Uses its own guard constructor, `isloSameOriginRedirectGuard(baseURL, source.CheckRedirect)` — already factored, and its semantics need their own read before any judgement |
+| Host comparison differs | `sprites`, `islo` | `sprites` compares hosts through `canonicalSpritesHostname` (which strips IPv6 zone identifiers) and its own port helper, **not** `shared.SameOrigin` — so migrating would loosen the comparison that decides whether a redirect may be followed. Its refusal text is also asserted by a test (`strings.Contains(err.Error(), "redirect changed API origin")`), which the helper's `newError` can preserve. `islo` uses its own guard constructor, `isloSameOriginRedirectGuard(baseURL, source.CheckRedirect)` |
 | Deliberately stricter | `boxd`, `cloudflaredynamicworkers`, `githubcodespaces` | `boxd` refuses every redirect ("boxd API redirects are not allowed"); the other two return `http.ErrUseLastResponse` and follow none. Migrating would **weaken** them by permitting same-origin redirects |
 | Origin-pinned with deliberate unwrapping | `fastapicloud`, `morph`, `railway` | Each unwraps its typed error at the call site, with the comment "net/http wraps CheckRedirect failures with the untrusted Location URL" — they deliberately avoid surfacing the untrusted destination. Migration must preserve that unwrapping |
 | Pinned at the transport | `opensandbox` | `openSandboxRedirectTransport` intercepts the 3xx response and parses `Location` itself. A different mechanism, arguably stronger, and not a `CheckRedirect` site at all |
@@ -568,8 +568,18 @@ So the earlier claim that this is "bounded and mechanical" was wrong, and the
 correction matters: a bulk migration would weaken three providers, **break the
 error contracts of two**, silently drop redirect policy in two more, and change
 error identity in the rest. The real duplication is smaller than the file count
-suggests — **two providers, not sixteen, are drop-in**, and one of them is
+suggests — **exactly one provider, not sixteen, is drop-in**, and it is
 migrated.
+
+The finding that matters is what this says about the helper rather than the
+providers: `SecureHTTPClient` is **under-parameterized**. It cannot express a
+provider-specific redirect-limit error (its cap message is fixed), and it cannot
+express a provider-specific host comparison (it always uses `shared.SameOrigin`).
+Two of the four categories above exist precisely because of those two gaps. So
+consolidating the rest means **extending the helper's contract first** — accept a
+limit error, accept a host comparator — and migrating afterwards. Doing it in the
+other order is what would have broken the two sentinel consumers and loosened two
+host comparisons.
 
 This is the same mistake as finding 4, made twice: classifying by the *shape* of
 the code rather than by the *contract* its callers depend on. The bodies looked
