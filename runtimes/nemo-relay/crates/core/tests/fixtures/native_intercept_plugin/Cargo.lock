@@ -186,6 +186,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "nemo-relay-native-abi"
+version = "0.9.1-rc.4"
+
+[[package]]
 name = "nemo-relay-native-intercept-fixture"
 version = "0.0.0"
 dependencies = [
@@ -193,10 +197,6 @@ dependencies = [
  "serde_json",
  "tokio",
 ]
-
-[[package]]
-name = "nemo-relay-native-abi"
-version = "0.9.1-rc.4"
 
 [[package]]
 name = "nemo-relay-plugin"

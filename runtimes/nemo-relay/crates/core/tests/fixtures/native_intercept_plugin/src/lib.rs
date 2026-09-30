@@ -228,16 +228,21 @@ impl NativePlugin for InterceptPlugin {
                 }
             },
         )?;
-        // The class that wraps the call rather than answering one. It marks the
-        // arguments it passes downstream and the result that comes back, so both
-        // halves of a continuation are visible from the caller: the request
-        // marker proves the rewritten arguments reached the downstream call, and
-        // the result marker proves the downstream answer came back to the plugin.
+        // The class that wraps the call rather than answering one. It is
+        // always registered — the wrap itself is the proof the middleware ran:
+        // nothing downstream executes except through the continuation it holds.
+        // What "arg_marks" gates is the marker it writes into the *arguments*
+        // (a strict-schema capability cannot carry extra keys), never the one
+        // it writes into the result the call returned.
+        let arg_marks = config
+            .get("arg_marks")
+            .and_then(Json::as_bool)
+            .unwrap_or(true);
         ctx.register_tool_execution_intercept("fixture_intercept_execution", 0, {
-            |_name, args, next| {
+            move |_name, args, next| {
                 Box::pin(async move {
                     let mut args = args;
-                    if let Json::Object(object) = &mut args {
+                    if arg_marks && let Json::Object(object) = &mut args {
                         object.insert(EXECUTION_REQUEST_MARKER.into(), json!(true));
                     }
                     // Three shapes the boundary has to carry, chosen by the
@@ -278,17 +283,19 @@ impl NativePlugin for InterceptPlugin {
                     // A mark the intercept asks the *call's* owner to emit, rather
                     // than one it emits itself: the call lives in the kernel, so
                     // the request has to travel back with the outcome.
-                    Ok(ToolExecutionInterceptOutcome::from(result).with_pending_mark(
-                        PendingMarkSpec::builder()
-                            .name(EXECUTION_PENDING_MARK)
-                            .category(EventCategory::custom())
-                            .category_profile(CategoryProfile {
-                                subtype: Some("fixture.intercept.tool_execution".into()),
-                                ..CategoryProfile::default()
-                            })
-                            .data(json!({ "source": "fixture_intercept_execution" }))
-                            .build(),
-                    ))
+                    Ok(
+                        ToolExecutionInterceptOutcome::from(result).with_pending_mark(
+                            PendingMarkSpec::builder()
+                                .name(EXECUTION_PENDING_MARK)
+                                .category(EventCategory::custom())
+                                .category_profile(CategoryProfile {
+                                    subtype: Some("fixture.intercept.tool_execution".into()),
+                                    ..CategoryProfile::default()
+                                })
+                                .data(json!({ "source": "fixture_intercept_execution" }))
+                                .build(),
+                        ),
+                    )
                 })
             }
         })?;
@@ -336,22 +343,24 @@ impl NativePlugin for InterceptPlugin {
             .unwrap_or(false)
         {
             ctx.register_llm_sanitize_request_guardrail(
-            "fixture_llm_sanitize_request",
-            0,
-            |mut request, context| async move {
-                let resolved = match context.resolve_codec() {
-                    Some(codec) => match codec.decode(&request) {
-                        Ok(annotated) => annotated.model.unwrap_or_else(|| "decoded".to_string()),
-                        Err(error) => format!("codec failed: {error}"),
-                    },
-                    None => "no codec".to_string(),
-                };
-                if let Json::Object(content) = &mut request.content {
-                    content.insert(LLM_SANITIZE_REQUEST_MARKER.into(), json!(true));
-                    content.insert(LLM_SANITIZE_CODEC_MARKER.into(), json!(resolved));
-                }
-                Ok(Some(request))
-            },
+                "fixture_llm_sanitize_request",
+                0,
+                |mut request, context| async move {
+                    let resolved = match context.resolve_codec() {
+                        Some(codec) => match codec.decode(&request) {
+                            Ok(annotated) => {
+                                annotated.model.unwrap_or_else(|| "decoded".to_string())
+                            }
+                            Err(error) => format!("codec failed: {error}"),
+                        },
+                        None => "no codec".to_string(),
+                    };
+                    if let Json::Object(content) = &mut request.content {
+                        content.insert(LLM_SANITIZE_REQUEST_MARKER.into(), json!(true));
+                        content.insert(LLM_SANITIZE_CODEC_MARKER.into(), json!(resolved));
+                    }
+                    Ok(Some(request))
+                },
             )?;
             ctx.register_llm_sanitize_response_guardrail(
                 "fixture_llm_sanitize_response",
@@ -382,19 +391,33 @@ impl NativePlugin for InterceptPlugin {
         {
             register_event_sanitizer_failures(ctx, sanitizer_log(config))?;
         }
-        ctx.register_tool_request_intercept(
-            "fixture_intercept_rewrite",
-            0,
-            false,
-            |_name, mut args| {
-                Box::pin(async move {
-                    if let Json::Object(object) = &mut args {
-                        object.insert(REWRITE_MARKER.into(), json!(true));
-                    }
-                    Ok(args)
-                })
-            },
-        )
+        // The request-side marker is how a test sees the rewrite cross the
+        // boundary — and it is gated, because the mark is what makes it
+        // visible: a strict-schema capability cannot carry extra keys, so a
+        // composition that needs the call's args kept clean (a committed
+        // mutation through the managed chain) activates the component with
+        // "arg_marks": false. The default is on, so every existing caller
+        // keeps its marks.
+        if config
+            .get("arg_marks")
+            .and_then(Json::as_bool)
+            .unwrap_or(true)
+        {
+            ctx.register_tool_request_intercept(
+                "fixture_intercept_rewrite",
+                0,
+                false,
+                |_name, mut args| {
+                    Box::pin(async move {
+                        if let Json::Object(object) = &mut args {
+                            object.insert(REWRITE_MARKER.into(), json!(true));
+                        }
+                        Ok(args)
+                    })
+                },
+            )?;
+        }
+        Ok(())
     }
 }
 

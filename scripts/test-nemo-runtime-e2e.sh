@@ -135,4 +135,136 @@ set -e
   || fail "the refusal must say the capability is unregistered: $out"
 pass "unregistered capability refused before routing"
 
-printf 'runtime e2e: six checks passed\n'
+# ─── The joined path: a real plugin host mediating managed invocations ──────
+#
+# The runtime starts the real `nemo-plugin-host` child under the deployment's
+# isolation policy, loads and activates the intercept fixture, installs the
+# registration proxies into its own chains, and runs managed invocations whose
+# middleware executes in the child. The frozen model: plugins are middleware
+# only — they may inspect, deny, or rewrite arguments; the capability, class,
+# route, authority, and identity stay the runtime's.
+printf 'building the plugin host and the fixture plugin…\n'
+(
+  cd runtimes/nemo-relay
+  cargo build --quiet -p nemo-relay-native-loader
+  cargo build --quiet --locked \
+    --manifest-path crates/core/tests/fixtures/native_intercept_plugin/Cargo.toml \
+    --target-dir target/test-plugin-fixtures
+)
+host_bin="runtimes/nemo-relay/target/debug/nemo-plugin-host"
+case "$(uname -s 2>/dev/null || true)" in
+  Darwin) fixture_name="libnemo_relay_native_intercept_fixture.dylib" ;;
+  *) fixture_name="libnemo_relay_native_intercept_fixture.so" ;;
+esac
+library="runtimes/nemo-relay/target/test-plugin-fixtures/debug/$fixture_name"
+[[ -x "$host_bin" && -f "$library" ]] \
+  || fail "the plugin host or the fixture library is missing"
+
+# Stage the fixture beside a manifest, the way a deployment ships one.
+plugin_dir="$work_dir/plugin"
+mkdir -p "$plugin_dir"
+install -m 0644 "$library" "$plugin_dir/$(basename "$library")"
+relay_version="$(sed -n 's/^version = "\(.*\)"/\1/p' runtimes/nemo-relay/Cargo.toml | head -1)"
+cat > "$plugin_dir/relay-plugin.toml" <<TOML
+manifest_version = 1
+
+[plugin]
+id = "fixture_intercept"
+kind = "rust_dynamic"
+
+[compat]
+relay = "=$relay_version"
+native_api = "1"
+
+[defaults]
+enabled = false
+
+[capabilities]
+items = ["plugin_native"]
+
+[load]
+library = "$(basename "$library")"
+symbol = "nemo_relay_native_intercept_fixture"
+TOML
+export NEMO_RELAY_PLUGIN_HOST="$host_bin"
+pass "plugin host and fixture staged"
+
+# 7. A managed PURE invocation through the plugin: the chain's request and
+#    execution intercepts rewrite the arguments inside the child process, the
+#    binding proves original → effective, and the FunctionHooks backend — the
+#    real NEMO local path — answers. No Crabedence involvement for LOCAL.
+out="$(run_runtime --plugin "$plugin_dir" --plugin-id fixture_intercept \
+  --component fixture_intercept --capability system.echo \
+  --arguments '{"probe":"joined"}')" \
+  || fail "the joined PURE invocation must succeed: $out"
+printf '%s' "$out" | jq -e '
+    .status=="SUCCEEDED"
+    and .result.backend=="function-hooks" and .result.local==true
+    and .result.arguments.native_intercept==true
+    and .result.arguments.native_intercept_execution_request==true
+    and .result.arguments.probe=="joined"
+    and .plugin.process_id != null
+    and (.identity.middleware_set_digest != null)
+    and .identity.original_args_digest != .attempts[0].effective_args_digest
+    and (.attempts | length) == 1' >/dev/null \
+  || fail "the joined PURE invocation did not prove middleware + function hooks: $out"
+pass "PURE mediated by the child's middleware, executed by the function-hook backend"
+
+# 8. A MUTATION through the same chain. The counter's argument schema is
+#    closed, so the plugin runs with its argument markers off — its execution
+#    intercept still wraps the call, and the marker it writes into the *result*
+#    is the proof the child's middleware held the continuation around the
+#    Crabedence dispatch without altering the request.
+counter_joined="runtime-e2e-joined-$$"
+key_joined="runtime-e2e-joined-key-$$"
+out="$(run_runtime --plugin "$plugin_dir" --plugin-id fixture_intercept \
+  --component fixture_intercept \
+  --plugin-config '{"arg_marks":false}' \
+  --capability test.counter.increment \
+  --arguments "{\"counter\":\"$counter_joined\",\"by\":1}" \
+  --idempotency-key "$key_joined" --grant runtime-e2e-grant)" \
+  || fail "the joined MUTATION must commit: $out"
+printf '%s' "$out" | jq -e '
+    .status=="SUCCEEDED" and .result.value==1
+    and .native_intercept_execution==true
+    and (.receipt_digest != null)
+    and .plugin.process_id != null
+    and (.attempts | length) == 1' >/dev/null \
+  || fail "the joined MUTATION did not commit with evidence: $out"
+pass "MUTATION through plugin middleware committed with a receipt"
+
+# 9. The same logical action replays through the same chain: a second external
+#    effect would read 2.
+out="$(run_runtime --plugin "$plugin_dir" --plugin-id fixture_intercept \
+  --component fixture_intercept \
+  --plugin-config '{"arg_marks":false}' \
+  --capability test.counter.increment \
+  --arguments "{\"counter\":\"$counter_joined\",\"by\":1}" \
+  --idempotency-key "$key_joined" --grant runtime-e2e-grant)" \
+  || fail "the replay must answer from the durable record: $out"
+printf '%s' "$out" | jq -e '
+    .status=="SUCCEEDED" and .result.value==1
+    and .native_intercept_execution==true' >/dev/null \
+  || fail "a repeated key duplicated the effect: $out"
+pass "the repeated logical action replayed (still value 1)"
+
+# 10. The same durable key with different arguments is an identity conflict —
+#     never a second effect.
+out="$(run_runtime --capability test.counter.increment \
+  --arguments "{\"counter\":\"$counter_joined\",\"by\":99}" \
+  --idempotency-key "$key_joined" --grant runtime-e2e-grant || true)"
+printf '%s' "$out" | jq -e '.status=="FAILED" and (.code | test("IDEMPOTENCY"))' >/dev/null \
+  || fail "same key with different arguments must be an identity conflict: $out"
+pass "same durable key + changed arguments → identity conflict"
+
+# 11. Adversarial: middleware that answers without ever reaching the dispatch
+#     is refused — a capability result that did not cross the router is not
+#     evidence of execution.
+out="$(run_runtime --plugin "$plugin_dir" --plugin-id fixture_intercept \
+  --component fixture_intercept --capability system.echo \
+  --arguments '{"skip_next":true}' || true)"
+printf '%s' "$out" | jq -e '.status=="FAILED" and .code=="DISPATCH_BYPASSED"' >/dev/null \
+  || fail "a plugin-replaced dispatch must fail closed: $out"
+pass "middleware bypass of the routed dispatch refused"
+
+printf 'runtime e2e: twelve checks passed\n'

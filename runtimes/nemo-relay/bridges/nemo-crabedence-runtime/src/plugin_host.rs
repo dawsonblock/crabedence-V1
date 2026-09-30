@@ -28,14 +28,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use nemo_relay::plugin::execution::{PluginExecutionBackend, PluginManager};
-use nemo_relay_plugin_host::continuations::Continuations;
 use nemo_relay_plugin_host::isolation_policy::NativeIsolationPolicy;
 use nemo_relay_plugin_host::off_path::{ObservabilityPolicy, OffPathPluginExecutor};
-use nemo_relay_plugin_host::proxy::{ProxyContext, install};
+use nemo_relay_plugin_host::proxy::{ProxyContext, RegistrationProxies, install};
 use nemo_relay_plugin_host::supervisor::{PluginHostSupervisorConfig, ProcessPluginBackend};
 use nemo_relay_plugin_protocol::{
     PROTOCOL_VERSION, PluginActivateRequest, PluginArtifactIdentity, PluginComponentConfiguration,
-    PluginExecutionContext, PluginLoadRequest,
+    PluginDescriptor, PluginExecutionContext, PluginLoadRequest,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -60,6 +59,8 @@ pub struct PluginOptions {
     pub plugin_id: String,
     /// The component kind to activate, as the plugin declares it.
     pub component: String,
+    /// The component's activation configuration (`{}` when unset).
+    pub component_config: String,
     /// The tool to call through the chain, when one was asked for.
     pub tool: Option<String>,
     /// The tool call's arguments.
@@ -72,14 +73,59 @@ pub struct PluginOptions {
     pub isolation: NativeIsolationPolicy,
 }
 
-/// Host the plugin and, when asked, run one managed tool call through it.
-pub fn host(options: &PluginOptions) -> Result<Value, String> {
-    let runtime = tokio::runtime::Runtime::new()
-        .map_err(|error| format!("the plugin host needs an async runtime: {error}"))?;
-    runtime.block_on(host_async(options))
+/// An active plugin-host session.
+///
+/// The proxies keep the plugin's registrations installed in this process's
+/// chains and the manager keeps the host child alive. The session is scoped:
+/// dropping it removes the registrations and ends the child, so a plugin's
+/// callbacks cannot outlive the runtime that installed them.
+pub struct PluginSession {
+    /// The activated component's descriptor — the plugin's identity and the
+    /// registrations it installed.
+    pub descriptor: PluginDescriptor,
+    /// The host child's process id, when the host reports one.
+    pub process_id: Option<u32>,
+    /// The digest naming the active middleware set — which plugin, at which
+    /// artifact identity, installed which registrations. A bound invocation
+    /// records it, so evidence can prove which plugin set mediated the request.
+    pub middleware_set_digest: String,
+    /// Held, not read: the manager owns the backend, so the session's lifetime
+    /// is the host child's.
+    _manager: Arc<PluginManager>,
+    /// Held, not read: dropping the proxies is what removes the plugin's
+    /// registrations from this process's chains.
+    _proxies: RegistrationProxies,
 }
 
-async fn host_async(options: &PluginOptions) -> Result<Value, String> {
+/// The middleware-set digest for one activated plugin.
+///
+/// Sorted registration ids, so the digest is the set rather than the order the
+/// host happened to report it in.
+fn middleware_set_digest(descriptor: &PluginDescriptor) -> Result<String, String> {
+    let mut registrations: Vec<&str> = descriptor
+        .registrations
+        .iter()
+        .map(|registration| registration.registration_id.as_str())
+        .collect();
+    registrations.sort_unstable();
+    crate::canonical_digest(&json!({
+        "plugin_id": descriptor.plugin_id,
+        "plugin_version": descriptor.plugin_version,
+        "manifest_digest": descriptor.manifest_digest,
+        "negotiated_abi_version": descriptor.negotiated_abi_version,
+        "registrations": registrations,
+    }))
+}
+
+/// Open a plugin-host session: launch the child under the deployment's
+/// isolation policy, load and activate the artifact, and install the
+/// registration proxies into this process's chains.
+///
+/// Failing to open fails closed — a required middleware that cannot be
+/// composed is not quietly absent from the chain; the caller decides whether
+/// the invocation proceeds at all, and this composition's answer is that it
+/// does not.
+pub async fn open(options: &PluginOptions) -> Result<PluginSession, String> {
     let artifact = resolve_artifact(&options.artifact)?;
     let artifact_ref = artifact.to_string_lossy();
     let (manifest_sha256, library_sha256) =
@@ -113,7 +159,7 @@ async fn host_async(options: &PluginOptions) -> Result<Value, String> {
                 discovery: false,
                 components: vec![PluginComponentConfiguration {
                     kind: options.component.clone(),
-                    config_json: "{}".to_string(),
+                    config_json: options.component_config.clone(),
                 }],
             },
             context(options),
@@ -135,6 +181,12 @@ async fn host_async(options: &PluginOptions) -> Result<Value, String> {
     // composition owns, and installing the proxies is what puts the plugin's
     // registrations into this process's chains.
     let binding = backend.runtime_binding_digest().to_owned();
+    // The continuations must be the session's own: when the child's intercept
+    // calls `next`, the host asks the runtime service the backend started, and
+    // that service looks the continuation up in the registry the backend
+    // created at launch. Parking into a different registry would leave the
+    // continuation reachable to nothing.
+    let continuations = backend.continuations();
     let manager = Arc::new(PluginManager::new(Arc::new(backend)));
     let off_path = Arc::new(
         OffPathPluginExecutor::start(&ObservabilityPolicy {
@@ -143,13 +195,33 @@ async fn host_async(options: &PluginOptions) -> Result<Value, String> {
         })
         .map_err(|error| format!("the off-path runtime did not start: {error}"))?,
     );
-    let proxy_context = ProxyContext::new(manager, binding, OFF_PATH_BUDGET_MILLIS)
+    let proxy_context = ProxyContext::new(Arc::clone(&manager), binding, OFF_PATH_BUDGET_MILLIS)
         .with_observability_budget(OFF_PATH_BUDGET_MILLIS)
         .with_off_path_executor(off_path)
-        .with_continuations(Arc::new(Continuations::new()));
+        .with_continuations(continuations);
     let proxies = install(proxy_context, &descriptor, loaded.handle.clone()).map_err(|error| {
         format!("this runtime cannot serve what the plugin registered: {error}")
     })?;
+
+    let middleware_set_digest = middleware_set_digest(&descriptor)?;
+    Ok(PluginSession {
+        descriptor,
+        process_id,
+        middleware_set_digest,
+        _manager: manager,
+        _proxies: proxies,
+    })
+}
+
+/// Host the plugin and, when asked, run one managed tool call through it.
+pub fn host(options: &PluginOptions) -> Result<Value, String> {
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|error| format!("the plugin host needs an async runtime: {error}"))?;
+    runtime.block_on(host_async(options))
+}
+
+async fn host_async(options: &PluginOptions) -> Result<Value, String> {
+    let session = open(options).await?;
 
     // A managed call, under the trusted budget a runtime publishes for an
     // action: without one the proxy refuses, because a registration reached
@@ -171,17 +243,18 @@ async fn host_async(options: &PluginOptions) -> Result<Value, String> {
         }
     };
 
-    // Dropping the proxies removes the registrations from this process's
-    // chains, and dropping the manager kills the host: a plugin's callbacks
-    // cannot outlive the runtime that installed them.
-    drop(proxies);
-
-    Ok(json!({
+    let report = json!({
         "status": if options.tool.is_some() { "INVOKED" } else { "HOSTED" },
-        "host": { "process_id": process_id },
-        "plugin": serde_json::to_value(&descriptor).map_err(|error| error.to_string())?,
+        "host": { "process_id": session.process_id },
+        "plugin": serde_json::to_value(&session.descriptor).map_err(|error| error.to_string())?,
+        "middleware_set_digest": session.middleware_set_digest,
         "tool_call": tool_call,
-    }))
+    });
+    // Dropping the session removes the registrations from this process's
+    // chains and ends the host: a plugin's callbacks cannot outlive the
+    // runtime that installed them.
+    drop(session);
+    Ok(report)
 }
 
 /// The supervisor configuration this composition publishes. The host ships
@@ -241,6 +314,7 @@ mod tests {
             artifact: PathBuf::from("/nonexistent/plugin"),
             plugin_id: "test_plugin".to_string(),
             component: "test".to_string(),
+            component_config: "{}".to_string(),
             tool: None,
             arguments: json!({}),
             runtime_binding_digest: "digest".to_string(),
