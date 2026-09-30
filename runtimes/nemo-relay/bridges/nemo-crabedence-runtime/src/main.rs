@@ -391,6 +391,19 @@ fn run_plugin_mode(options: &Options, artifact: &Path) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // The deployment's isolation policy resolves here, through the same
+    // `from_environment()` the other NEMO bindings use: an unset variable
+    // selects the documented trusted-process default, a malformed value fails
+    // startup before a host exists, and a requested confinement this build
+    // cannot honor is refused by the supervisor rather than silently dropped.
+    let isolation =
+        match nemo_relay_plugin_host::isolation_policy::NativeIsolationPolicy::from_environment() {
+            Ok(isolation) => isolation,
+            Err(message) => {
+                eprintln!("nemo-crabedence-runtime: {message}");
+                return ExitCode::from(2);
+            }
+        };
     let plugin_options = plugin_host::PluginOptions {
         artifact: artifact.to_path_buf(),
         plugin_id: plugin_id.to_string(),
@@ -398,6 +411,7 @@ fn run_plugin_mode(options: &Options, artifact: &Path) -> ExitCode {
         tool: options.tool.clone(),
         arguments: options.arguments.clone(),
         runtime_binding_digest: binding,
+        isolation,
     };
     match plugin_host::host(&plugin_options) {
         Ok(report) => {

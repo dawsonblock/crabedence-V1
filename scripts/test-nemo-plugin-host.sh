@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 # Prove the plugin-host composition end to end, from the runtime binary.
 #
-# Phase 1 of the plugin-host workstream (docs/plan/nemo-runtime-transfer.md):
-# the runtime starts the real `nemo-plugin-host` child, loads a native plugin
+# The runtime starts the real `nemo-plugin-host` child, loads a native plugin
 # through it, activates the component — its register callbacks run where its
 # library is, in the child — installs the proxies the registrations report, and
 # runs one managed tool call whose chain reaches the plugin's registration
 # inside the child. The plugin's rewrite coming back is the proof that the
 # process boundary served the call, not an in-process stand-in.
 #
-# Nothing here routes a capability: a plugin cannot today request one — what a
-# plugin registers is middleware and observability — so the mediation between a
-# plugin effect request and the router is Phase 2's new protocol surface. This
-# script proves the host composition only.
+# The trailing checks prove the deployment's isolation policy is honored:
+# NEMO_RELAY_NATIVE_ISOLATION resolves through the same from_environment()
+# path the other bindings use — unset selects the documented default the run
+# above exercised, malformed fails startup, and an unhonorable policy fails
+# closed. Under the frozen integration-closure model plugins are middleware
+# only; nothing here routes a capability.
 #
 # Usage: scripts/test-nemo-plugin-host.sh
 set -euo pipefail
@@ -95,5 +96,26 @@ pass "the plugin's registration executed in the host process"
 printf '%s' "$out" | jq -e '(.plugin.registrations | length) >= 1' >/dev/null \
   || fail "the activation reported no registrations: $out"
 pass "activation reported the plugin's registrations"
+
+# The isolation-policy gates (integration closure): the run above proves the
+# documented default — NEMO_RELAY_NATIVE_ISOLATION was unset — and the two
+# cases below prove the resolution cannot be bypassed or silently weakened.
+printf 'checking the isolation policy gates…\n'
+
+if NEMO_RELAY_NATIVE_ISOLATION=not-a-policy "$runtime_bin" --plugin "$work_dir" \
+    --plugin-id fixture_intercept --component fixture_intercept 2>"$work_dir/err"; then
+  fail "a malformed isolation policy did not fail startup"
+fi
+grep -q "NEMO_RELAY_NATIVE_ISOLATION" "$work_dir/err" \
+  || fail "the malformed-policy failure did not name the variable: $(cat "$work_dir/err")"
+pass "a malformed isolation policy fails startup"
+
+if NEMO_RELAY_NATIVE_ISOLATION=restricted-macos "$runtime_bin" --plugin "$work_dir" \
+    --plugin-id fixture_intercept --component fixture_intercept 2>"$work_dir/err"; then
+  fail "an unhonorable isolation policy did not fail closed"
+fi
+grep -q "restricted-macos" "$work_dir/err" \
+  || fail "the unhonorable-policy failure did not name the policy: $(cat "$work_dir/err")"
+pass "an unhonorable isolation policy fails closed"
 
 printf 'plugin host: composition proven end to end\n'

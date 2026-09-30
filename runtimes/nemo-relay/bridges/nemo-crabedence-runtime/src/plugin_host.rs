@@ -11,12 +11,14 @@
 //! the result proves the process boundary end to end.
 //!
 //! What this module deliberately does **not** do: turn a plugin request into an
-//! `EffectRouter` request. A plugin cannot today ask for a capability — what a
-//! plugin registers is middleware and observability, and `RuntimeRegistrationKind`
-//! has no callable kind — so the mediation between a plugin effect request and
-//! the router is new protocol surface, not a wiring gap. That is Phase 2 of the
-//! workstream recorded in `docs/plan/nemo-runtime-transfer.md`, together with
-//! the canonical invocation envelope it will use.
+//! `EffectRouter` request. Under the integration-closure plan that boundary is
+//! permanent, not deferred — plugins are middleware only, and there is no
+//! plugin-effect protocol: a plugin may inspect, deny, sanitize, or rewrite the
+//! arguments of a managed invocation whose capability the runtime has already
+//! chosen, and it can never name a capability, class, route, authority,
+//! principal, or identity. `RuntimeRegistrationKind` having no callable kind is
+//! the shape the plan depends on, not a gap to close. See the "Integration
+//! closure" section of `docs/plan/nemo-runtime-transfer.md`.
 //!
 //! What it also does not do: link the host. `nemo-plugin-host` is started as a
 //! process; the native loader is never linked into this binary, which is the
@@ -27,6 +29,7 @@ use std::sync::Arc;
 
 use nemo_relay::plugin::execution::{PluginExecutionBackend, PluginManager};
 use nemo_relay_plugin_host::continuations::Continuations;
+use nemo_relay_plugin_host::isolation_policy::NativeIsolationPolicy;
 use nemo_relay_plugin_host::off_path::{ObservabilityPolicy, OffPathPluginExecutor};
 use nemo_relay_plugin_host::proxy::{ProxyContext, install};
 use nemo_relay_plugin_host::supervisor::{PluginHostSupervisorConfig, ProcessPluginBackend};
@@ -63,6 +66,10 @@ pub struct PluginOptions {
     pub arguments: Value,
     /// The runtime binding the host session must claim.
     pub runtime_binding_digest: String,
+    /// How contained the host process must be. The caller resolves this
+    /// through `NativeIsolationPolicy::from_environment()` — this module does
+    /// not substitute a default for a deployment's stated policy.
+    pub isolation: NativeIsolationPolicy,
 }
 
 /// Host the plugin and, when asked, run one managed tool call through it.
@@ -79,10 +86,7 @@ async fn host_async(options: &PluginOptions) -> Result<Value, String> {
         nemo_relay::plugin::dynamic::plugin_artifact_identity(&artifact_ref)
             .map_err(|error| format!("the plugin artifact could not be approved: {error}"))?;
 
-    // The host ships beside this binary; `NEMO_RELAY_PLUGIN_HOST` names another
-    // one for a deployment that installs it elsewhere.
-    let config =
-        PluginHostSupervisorConfig::beside_this_executable(options.runtime_binding_digest.clone());
+    let config = supervisor_config(options);
     let backend = ProcessPluginBackend::launch(config)
         .await
         .map_err(|error| format!("the plugin host did not start: {error}"))?;
@@ -180,6 +184,19 @@ async fn host_async(options: &PluginOptions) -> Result<Value, String> {
     }))
 }
 
+/// The supervisor configuration this composition publishes. The host ships
+/// beside this binary; `NEMO_RELAY_PLUGIN_HOST` names another one for a
+/// deployment that installs it elsewhere. The isolation policy is the one the
+/// caller resolved from the deployment — never the supervisor's implicit
+/// default — so a confinement requirement that cannot be honored fails the
+/// launch rather than silently serving a weaker host.
+fn supervisor_config(options: &PluginOptions) -> PluginHostSupervisorConfig {
+    PluginHostSupervisorConfig {
+        isolation: options.isolation,
+        ..PluginHostSupervisorConfig::beside_this_executable(options.runtime_binding_digest.clone())
+    }
+}
+
 /// The context every operation in this session carries.
 fn context(options: &PluginOptions) -> PluginExecutionContext {
     PluginExecutionContext {
@@ -213,4 +230,71 @@ fn resolve_artifact(path: &Path) -> Result<PathBuf, String> {
         ));
     }
     Ok(path.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn options(isolation: NativeIsolationPolicy) -> PluginOptions {
+        PluginOptions {
+            artifact: PathBuf::from("/nonexistent/plugin"),
+            plugin_id: "test_plugin".to_string(),
+            component: "test".to_string(),
+            tool: None,
+            arguments: json!({}),
+            runtime_binding_digest: "digest".to_string(),
+            isolation,
+        }
+    }
+
+    #[test]
+    fn the_supervisor_config_carries_the_resolved_policy() {
+        // The composition must publish exactly the policy it was given: a
+        // config that ignored `options.isolation` and fell back to the
+        // supervisor's implicit default would be a silent downgrade.
+        for policy in [
+            NativeIsolationPolicy::TrustedProcess,
+            NativeIsolationPolicy::RestrictedMacOS,
+        ] {
+            assert_eq!(supervisor_config(&options(policy)).isolation, policy);
+        }
+    }
+
+    #[test]
+    fn an_unhonorable_policy_fails_closed() {
+        // `host_executable` is the check `spawn` applies before a process
+        // exists; the resolved policy reaches it through this composition's
+        // config. Neither input is bundled here, so the restricted policy is
+        // unhonorable on every platform — macOS builds lack the bundle, other
+        // platforms lack the platform — and the answer must be a refusal.
+        let config = supervisor_config(&options(NativeIsolationPolicy::RestrictedMacOS));
+        let result = config
+            .isolation
+            .host_executable(&config.executable, Path::new("/nonexistent/runtime"));
+        let error = result.expect_err("an unhonorable policy must be refused");
+        assert!(
+            error.to_string().contains("restricted-macos"),
+            "the refusal must name the policy: {error}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_policy_spelling_is_rejected() {
+        // `from_environment()` delegates to `parse` for a configured value, so
+        // this is the gate a misspelled deployment hits before a host exists.
+        let error = NativeIsolationPolicy::parse("sandboxed").unwrap_err();
+        assert!(
+            error.contains("NEMO_RELAY_NATIVE_ISOLATION"),
+            "the error must name the variable a deployer can fix: {error}"
+        );
+    }
+
+    #[test]
+    fn the_documented_default_is_trusted_process() {
+        assert_eq!(
+            NativeIsolationPolicy::default(),
+            NativeIsolationPolicy::TrustedProcess
+        );
+    }
 }
