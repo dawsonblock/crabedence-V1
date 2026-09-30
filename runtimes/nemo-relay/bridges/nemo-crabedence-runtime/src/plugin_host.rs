@@ -42,6 +42,41 @@ use uuid::Uuid;
 /// The budget a managed call runs under, and the window the proxies inherit.
 const MANAGED_CALL_BUDGET_MILLIS: u64 = 30_000;
 
+/// The deployment knob for that budget. A managed call's deadline bounds the
+/// middleware it crosses — a plugin that holds a call past it fails the call —
+/// so a deployment that needs a tighter bound sets it here rather than
+/// rebuilding. Malformed values fail startup, like every other env-resolved
+/// setting in this composition.
+const MANAGED_CALL_BUDGET_ENV: &str = "NEMO_RELAY_MANAGED_CALL_BUDGET_MS";
+
+/// The budget every managed call in this composition runs under: the
+/// documented default, or the deployment's override.
+///
+/// Resolved from the environment at the CLI boundary, the same place the
+/// isolation policy resolves — a bad value is a startup failure, not a call
+/// that surprises with the wrong deadline.
+pub(crate) fn managed_call_budget() -> Result<nemo_relay::api::runtime::ExecutionBudget, String> {
+    let millis =
+        managed_call_budget_millis(std::env::var(MANAGED_CALL_BUDGET_ENV).ok().as_deref())?;
+    Ok(nemo_relay::api::runtime::ExecutionBudget::new(
+        nemo_relay::api::runtime::budget_now_unix_ms() + millis,
+        millis,
+    ))
+}
+
+/// The deadline in milliseconds: the default, or the deployment's value.
+fn managed_call_budget_millis(value: Option<&str>) -> Result<u64, String> {
+    match value {
+        None => Ok(MANAGED_CALL_BUDGET_MILLIS),
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(millis) if millis > 0 => Ok(millis),
+            _ => Err(format!(
+                "{MANAGED_CALL_BUDGET_ENV} is not a positive millisecond count: {raw:?}"
+            )),
+        },
+    }
+}
+
 /// The off-path runtime's own budget, for registrations whose answer is
 /// published rather than returned.
 const OFF_PATH_BUDGET_MILLIS: u64 = 5_000;
@@ -229,10 +264,8 @@ async fn host_async(options: &PluginOptions) -> Result<Value, String> {
     let tool_call = match &options.tool {
         None => Value::Null,
         Some(tool) => {
-            let budget = nemo_relay::api::runtime::ExecutionBudget::new(
-                nemo_relay::api::runtime::budget_now_unix_ms() + MANAGED_CALL_BUDGET_MILLIS,
-                MANAGED_CALL_BUDGET_MILLIS,
-            );
+            let budget = managed_call_budget()
+                .map_err(|error| format!("the managed call's budget: {error}"))?;
             let arguments = options.arguments.clone();
             let rewritten = nemo_relay::api::runtime::with_execution_budget(budget, async move {
                 nemo_relay::api::tool::tool_request_intercepts(tool, arguments).await
@@ -370,5 +403,27 @@ mod tests {
             NativeIsolationPolicy::default(),
             NativeIsolationPolicy::TrustedProcess
         );
+    }
+
+    #[test]
+    fn the_managed_call_budget_defaults_to_the_documented_window() {
+        assert_eq!(managed_call_budget_millis(None), Ok(30_000));
+    }
+
+    #[test]
+    fn the_managed_call_budget_honors_a_deployment_override() {
+        assert_eq!(managed_call_budget_millis(Some("2500")), Ok(2_500));
+    }
+
+    #[test]
+    fn a_malformed_managed_call_budget_fails_resolution() {
+        for bad in ["", "soon", "-1", "0", "1.5"] {
+            let error = managed_call_budget_millis(Some(bad))
+                .expect_err("a malformed budget must be refused");
+            assert!(
+                error.contains("NEMO_RELAY_MANAGED_CALL_BUDGET_MS"),
+                "the error must name the variable a deployer can fix: {error}"
+            );
+        }
     }
 }

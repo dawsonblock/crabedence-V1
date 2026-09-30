@@ -238,9 +238,44 @@ impl NativePlugin for InterceptPlugin {
             .get("arg_marks")
             .and_then(Json::as_bool)
             .unwrap_or(true);
+        // Failure shapes a composition needs to prove the boundary is honest:
+        // a host that dies inside its own intercept ("die_on_invoke") and one
+        // that holds the call past its deadline ("sleep_ms"). Both are the
+        // plugin's own behavior, so both ask for themselves by configuration
+        // rather than running by default.
+        let die_on_invoke = config
+            .get("die_on_invoke")
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
+        let sleep_ms = config.get("sleep_ms").and_then(Json::as_u64);
+        // The behaviour switches below are read from the call's arguments AND
+        // from the component's configuration: a strict-schema capability
+        // cannot carry the arg keys, so a composition that needs them on such
+        // a call passes them as config instead.
+        let concurrent_configured = config
+            .get("use_concurrent_next")
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
+        let fail_after_configured = config
+            .get("fail_after_next")
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
+        let replace_configured = config
+            .get("skip_next")
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
         ctx.register_tool_execution_intercept("fixture_intercept_execution", 0, {
             move |_name, args, next| {
                 Box::pin(async move {
+                    if die_on_invoke {
+                        // The host dying inside its own middleware: the whole
+                        // child process goes, which is what a crash looks like
+                        // to the composition on the other side of the channel.
+                        std::process::abort();
+                    }
+                    if let Some(ms) = sleep_ms {
+                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    }
                     let mut args = args;
                     if arg_marks && let Json::Object(object) = &mut args {
                         object.insert(EXECUTION_REQUEST_MARKER.into(), json!(true));
@@ -249,18 +284,21 @@ impl NativePlugin for InterceptPlugin {
                     // caller rather than by the fixture: an intercept that
                     // replaces the call, one that runs it twice, and one that
                     // runs it and then fails.
-                    let replace = args
-                        .get("skip_next")
-                        .and_then(Json::as_bool)
-                        .unwrap_or(false);
-                    let concurrent = args
-                        .get("use_concurrent_next")
-                        .and_then(Json::as_bool)
-                        .unwrap_or(false);
-                    let fail_after = args
-                        .get("fail_after_next")
-                        .and_then(Json::as_bool)
-                        .unwrap_or(false);
+                    let replace = replace_configured
+                        || args
+                            .get("skip_next")
+                            .and_then(Json::as_bool)
+                            .unwrap_or(false);
+                    let concurrent = concurrent_configured
+                        || args
+                            .get("use_concurrent_next")
+                            .and_then(Json::as_bool)
+                            .unwrap_or(false);
+                    let fail_after = fail_after_configured
+                        || args
+                            .get("fail_after_next")
+                            .and_then(Json::as_bool)
+                            .unwrap_or(false);
                     let mut result = if replace {
                         // No continuation at all: the plugin decided the result
                         // itself, and nothing downstream is entered.

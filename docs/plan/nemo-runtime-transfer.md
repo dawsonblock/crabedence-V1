@@ -43,7 +43,7 @@ excludes `target/`, caches, `node_modules`, and editor state.
 | --- | --- | --- |
 | 0 — vendor | Done | `runtimes/nemo-relay/` (no build artifacts); a recursive diff against the source copy reports four differing files (`Cargo.toml`, `Cargo.lock`, `crates/cli/src/mcp_environment.rs`, `integrations/coding-agents/codex/.mcp.json`) plus two added paths (`bridges/`, `TRANSFER-PROVENANCE.md`); provenance in `runtimes/nemo-relay/TRANSFER-PROVENANCE.md`, and the shipped identity declared in `runtimes/nemo-transfer-manifest.json`, checked against the tree by `scripts/check-nemo-transfer-manifest.sh` in CI. The manifest also declares the binaries the tree must produce — the runtime, the plugin host, and both ledger fixtures — and `scripts/build-nemo-binaries.sh` compiles them in CI, so a declared binary whose source is absent fails the build instead of shipping incomplete |
 | 1 — bridge | Done | `runtimes/nemo-relay/bridges/nemo-crabedence/`: `abi.rs`, `transport.rs`, `capability_snapshot.rs`, `outcome_mapping.rs`, `execution_port.rs`; 56 unit tests, 1 corpus conformance test, 5 schema-binding tests, 5 env-gated live tests |
-| 2 — trust enforcement | Partial, and advanced. Bridge-level invariants enforced and tested (unregistered capability, class mismatch, route mismatch, no policy field on the wire), the effect-isolation invariant holds at the router, and both run in CI. A **runtime instance** now exists: `bridges/nemo-crabedence-runtime` is a process that verifies the snapshot, resolves the class and route from it, and dispatches through `EffectRouter` — verified end to end (PURE routed locally, MUTATION committed through the kernel with evidence, a missing grant refused as non-retryable, an unregistered capability refused before any socket hop, and a tampered snapshot refused before routing). What is *still* absent is the plugin host: `crates/plugin-host` is not wired to this runtime, so a plugin cannot yet reach the router, which is why the plugin-host gate scenarios remain open. State, precisely: **partial** — the safety prerequisites are done (invocation identity, the plugin-path dependency and socket invariants, the router's class and route refusals), and the host boundary of the composition is now proven from the runtime binary (`--plugin` hosts a real plugin and a managed call reaches its registration inside the child; `scripts/test-nemo-plugin-host.sh`), while the joined chain — a managed invocation crossing plugin middleware into `EffectRouter` — is open; the "Integration closure" section below is the frozen plan, and it deliberately drops the earlier plugin-effect-request design in favor of plugins-as-middleware-only. This row previously named NEMO's `BackendRouter` wiring as the remainder, which finding 6 corrected: that composition is not merely unwired, it is the wrong one. The runtime instance also binds a real invocation identity — unique execution, invocation, and action ids; a caller-supplied idempotency key required for `MUTATION`/`CRITICAL` and namespaced per principal; and canonical argument, descriptor, and route digests — where it previously sent `runtime-{capability}` placeholders. `scripts/test-nemo-runtime-e2e.sh` drives the binary against a live service and asserts all of it: a `MUTATION` without a key is refused before dispatch (exit 2), a `PURE` capability routes locally, a granted `MUTATION` commits with evidence, the same key replays rather than duplicating, an ungranted `MUTATION` is a definitive `UNAUTHORIZED`, and an unregistered capability is refused before any socket hop |
+| 2 — trust enforcement | Partial, and advanced. Bridge-level invariants enforced and tested (unregistered capability, class mismatch, route mismatch, no policy field on the wire), the effect-isolation invariant holds at the router, and both run in CI. A **runtime instance** now exists: `bridges/nemo-crabedence-runtime` is a process that verifies the snapshot, resolves the class and route from it, and dispatches through `EffectRouter` — verified end to end (PURE routed locally, MUTATION committed through the kernel with evidence, a missing grant refused as non-retryable, an unregistered capability refused before any socket hop, and a tampered snapshot refused before routing). The plugin host is now wired to this runtime: `--plugin` starts the real `nemo-plugin-host` child under the deployment's isolation policy, installs its registration proxies, and runs the managed invocation through them into `EffectRouter` — the joined chain the plan requires, proven by `scripts/test-nemo-plugin-host.sh` and the joined section of `scripts/test-nemo-runtime-e2e.sh` (PURE mediated by the child's middleware and executed by the function-hook backend; a MUTATION through the same chain committed with a receipt; replay, identity-conflict, bypass, and fail-closed host/artifact/activation/crash/timeout cases all asserted). State, precisely: **partial** — the joined chain and the safety prerequisites are proven on the real binaries, while the release-side hardening (items 12–20) remains open; the "Integration closure" section below is the frozen plan, and it deliberately drops the earlier plugin-effect-request design in favor of plugins-as-middleware-only. This row previously named NEMO's `BackendRouter` wiring as the remainder, which finding 6 corrected: that composition is not merely unwired, it is the wrong one. The runtime instance also binds a real invocation identity — unique execution, invocation, and action ids; a caller-supplied idempotency key required for `MUTATION`/`CRITICAL` and namespaced per principal; and canonical argument, descriptor, and route digests — where it previously sent `runtime-{capability}` placeholders. `scripts/test-nemo-runtime-e2e.sh` drives the binary against a live service and asserts all of it: a `MUTATION` without a key is refused before dispatch (exit 2), a `PURE` capability routes locally, a granted `MUTATION` commits with evidence, the same key replays rather than duplicating, an ungranted `MUTATION` is a definitive `UNAUTHORIZED`, and an unregistered capability is refused before any socket hop |
 | 3 — conformance | Partial | The Rust validator matches the shared invocation corpus exactly (11 accepted, 32 rejected), the live kernel's refusal phrases match word-for-word, and the outcome corpus is shared across Go, TypeScript, and Rust. Covered against the live kernel from the NEMO side: a LOCAL-route refusal, a MUTATION commit with evidence, missing authority (`UNAUTHORIZED`), an unresolvable authority reference (`UNAUTHORIZED`, definitive and non-retryable), an expired authority reference (`UNAUTHORIZED`, definitive and non-retryable), a lost response mapping to `UNKNOWN`, snapshot tampering, same-key replay, and a CRITICAL commit carrying evidence. Two of these need orchestration the Rust test cannot own, so scripts hold the timing and the tests assert only the outcome: `scripts/test-nemo-expired-authority.sh` issues a short-lived grant, lets it lapse, then asserts the refusal; `scripts/test-nemo-restart-idempotency.sh` dispatches twice, restarts the kernel on the same store, dispatches twice again with the same key, and asserts one effect. Neither test sleeps on a clock. Not covered, and each for a stated reason: plugin host crash, hang, malformed reply, and registration rejection have no NEMO plugin host in the integration path — a runtime instance now routes through `EffectRouter`, but `crates/plugin-host` is not wired to it, so there is nothing hosting a plugin to crash or hang; provider crash is qualified Go-side by the kernel's own crash-point matrix, which SIGKILLs real provider processes; CRITICAL is now covered end to end by `scripts/test-nemo-critical-path.sh`, which wires the qualification provider so the bridge's evidence rule meets a real commit; the PURE and READ crossings are not, because the qualification extension adds only CRITICAL and no capability is pinned to the `CRABEDENCE` route for those classes — see finding 4 |
 | — reference kernel | Retired | Renamed to `nemo/registry-snapshot/`, decoupled from the loader, then deleted once the suite passed without it; the README now records where each removed behavior lives |
 | — canonical schema | Done | `schemas/capability-invocation-v1.json` describes the frozen wire contract; Go, TypeScript, and Rust each carry a test that binds their implementation to it, so a field added on one side and not the others fails CI |
@@ -771,6 +771,58 @@ installed-artifact qualification
         ↓
 RC
 ```
+
+### Progress against the items
+
+Done and proven on the real binaries (`scripts/test-nemo-runtime-e2e.sh`,
+`scripts/test-nemo-plugin-host.sh`, and the runtime's own unit suite):
+
+- **Item 2** — the isolation policy resolves through
+  `NativeIsolationPolicy::from_environment()` at the CLI boundary; malformed
+  and unhonorable values fail the composition on the real binary.
+- **Items 3–4** — the invocation binds in two stages: a pre-middleware
+  identity (invocation, logical-action, and first-attempt execution ids;
+  principal, capability, registry, runtime-binding, and original-argument
+  digests; the consequential idempotency key) and a per-attempt bound context
+  (effective-argument digest plus a fresh execution id). The logical key is
+  stable across retries, each attempt is distinct, and the same key with
+  different effective arguments is an identity conflict.
+- **Item 5** — `LocalEchoBackend` is gone; `LOCAL` dispatches through the real
+  `FunctionHooksExecutionBackend`, and a capability with no registered hook
+  fails closed.
+- **Items 6–8** — `--plugin` and `--capability` compose one chain: the real
+  host child is loaded, activated, and proxied; the managed tool chain runs
+  its middleware inside the child; the dispatch callback binds the effective
+  arguments and routes through `EffectRouter`. A chain that finishes without
+  reaching the routed dispatch fails closed as `DISPATCH_BYPASSED`, and the
+  report carries the chain's final answer while the dispatch verdict always
+  owns status, receipt, retryability, and reconciliation. Two composition
+  defects this surfaced are fixed: proxied continuations now park in the
+  registry the backend's runtime service serves, and the fixture's argument
+  markers are gated so strict-schema capabilities can still prove mediation
+  via the result mark.
+- **Item 9** — `test.counter.increment` commits through the full chain
+  (plugin host → managed chain → router → Crabedence) with a receipt; the
+  logical action replays without a second effect; the same key under changed
+  arguments is an `IDEMPOTENCY` conflict.
+- **Item 10** — declared plugins are *required* middleware, and the RC has no
+  optional-plugin path: a missing host binary, an unloadable artifact, an
+  unactivatable component, a host that dies inside its own middleware, and a
+  middleware that outruns the managed-call budget each fail the invocation —
+  none continues unmediated. `NEMO_RELAY_MANAGED_CALL_BUDGET_MS` is the
+  deployment knob for the deadline; malformed values fail startup.
+- **Item 11 (partial)** — the joined layer cannot alter the dispatch
+  boundary: a middleware failure *after* dispatch records
+  `post_dispatch_middleware_error` while the committed verdict stands, and a
+  concurrent continuation is two real attempts that commit once under the
+  logical key. Post-dispatch UNKNOWN, restart reconciliation, expired
+  authority, and the CRITICAL evidence path are covered by the service-level
+  suites (`test-nemo-restart-idempotency.sh`, `test-nemo-expired-authority.sh`,
+  `test-nemo-critical-path.sh`, and the post-dispatch qualification gate).
+
+Still open on this plan: items 12–20 — the live CI lanes, the composition
+hardening (item 13), and the release-side identity, distribution, and
+installed-artifact work.
 
 ### What the reconnaissance established
 

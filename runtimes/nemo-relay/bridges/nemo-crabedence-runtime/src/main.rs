@@ -77,7 +77,7 @@ use nemo_crabedence_bridge::capability_snapshot::{
 use nemo_crabedence_bridge::execution_port::NemoCrabedenceExecutionPort;
 use nemo_crabedence_bridge::transport::{ExecutionSocketClient, default_socket_path};
 use nemo_effect_router::EffectRouter;
-use nemo_relay::api::runtime::{ExecutionBudget, budget_now_unix_ms, with_execution_budget};
+use nemo_relay::api::runtime::with_execution_budget;
 use nemo_relay::api::tool::{ToolCallExecuteParams, ToolExecutionResult, tool_call_execute};
 use nemo_relay::error::FlowError;
 use nemo_relay_executor::unstable::{
@@ -91,14 +91,6 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 mod plugin_host;
-
-/// The budget a managed invocation runs under.
-///
-/// The plugin session needs one: a proxied registration reached outside a
-/// managed action has no deadline to inherit, and a caller without a deadline
-/// is how a hung child becomes an unbounded wait. It bounds the whole managed
-/// call, dispatch included.
-const MANAGED_CALL_BUDGET_MILLIS: u64 = 30_000;
 
 /// The application-owned function behind a `LOCAL`-routed capability.
 ///
@@ -705,10 +697,13 @@ async fn dispatch_managed(
     let attempts: Arc<Mutex<Vec<AttemptRecord>>> = Arc::new(Mutex::new(Vec::new()));
     let attempt_counter = Arc::new(AtomicU64::new(0));
     let identity = Arc::new(identity);
-    let budget = ExecutionBudget::new(
-        budget_now_unix_ms() + MANAGED_CALL_BUDGET_MILLIS,
-        MANAGED_CALL_BUDGET_MILLIS,
-    );
+    let budget = match plugin_host::managed_call_budget() {
+        Ok(budget) => budget,
+        Err(message) => {
+            eprintln!("nemo-crabedence-runtime: {message}");
+            return ExitCode::from(2);
+        }
+    };
     let call = {
         let router = Arc::clone(&router);
         let identity = Arc::clone(&identity);
@@ -850,6 +845,16 @@ fn report(
                         object.insert(key.to_string(), value.clone());
                     }
                 }
+            }
+            // A dispatch that recorded its outcome is authoritative — but a
+            // middleware failure after it still happened, and hiding it would
+            // make the report less than the truth. The verdict fields stay the
+            // dispatch's; this is the evidence that the chain erred anyway.
+            if let Err(error) = &call {
+                object.insert(
+                    "post_dispatch_middleware_error".into(),
+                    json!(error.to_string()),
+                );
             }
             object.insert("identity".into(), identity_evidence);
             object.insert("attempts".into(), json!(attempts_evidence));

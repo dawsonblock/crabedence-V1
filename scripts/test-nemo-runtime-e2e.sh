@@ -267,4 +267,130 @@ printf '%s' "$out" | jq -e '.status=="FAILED" and .code=="DISPATCH_BYPASSED"' >/
   || fail "a plugin-replaced dispatch must fail closed: $out"
 pass "middleware bypass of the routed dispatch refused"
 
-printf 'runtime e2e: twelve checks passed\n'
+# ─── Fail-closed plugin composition ─────────────────────────────────────────
+#
+# A declared plugin is required middleware — for the integration RC there is
+# no "optional" plugin path. If the host cannot be launched, the artifact
+# cannot load, the component cannot activate, or the middleware dies or hangs
+# mid-call, the invocation fails; it never continues unmediated.
+
+# 12. Missing host binary: the deployment names a host that does not exist.
+set +e
+out="$(NEMO_RELAY_PLUGIN_HOST="$work_dir/no-such-host" run_runtime \
+  --plugin "$plugin_dir" --plugin-id fixture_intercept \
+  --component fixture_intercept --capability system.echo \
+  --arguments '{"probe":"missing-host"}' 2>&1)"
+status=$?
+set -e
+[[ $status -ne 0 ]] || fail "a missing plugin host must fail the invocation: $out"
+printf '%s' "$out" | grep -qi 'host' \
+  || fail "the refusal must name the host: $out"
+pass "missing plugin host fails the invocation"
+
+# 13. Invalid artifact: a manifest that names a library the deployment does
+#     not ship.
+bad_plugin_dir="$work_dir/plugin-bad"
+mkdir -p "$bad_plugin_dir"
+sed 's|^library = .*|library = "missing-library.so"|' \
+  "$plugin_dir/relay-plugin.toml" > "$bad_plugin_dir/relay-plugin.toml"
+set +e
+out="$(run_runtime --plugin "$bad_plugin_dir" --plugin-id fixture_intercept \
+  --component fixture_intercept --capability system.echo \
+  --arguments '{"probe":"bad-artifact"}' 2>&1)"
+status=$?
+set -e
+[[ $status -ne 0 ]] || fail "an unloadable artifact must fail the invocation: $out"
+pass "invalid plugin artifact fails the invocation"
+
+# 14. Activation failure: the plugin is asked for a component it does not have.
+set +e
+out="$(run_runtime --plugin "$plugin_dir" --plugin-id fixture_intercept \
+  --component no.such.component --capability system.echo \
+  --arguments '{"probe":"bad-component"}' 2>&1)"
+status=$?
+set -e
+[[ $status -ne 0 ]] || fail "an unactivatable component must fail the invocation: $out"
+pass "activation failure fails the invocation"
+
+# 15. Host death inside its own middleware: the child aborts mid-call. The
+#     invocation fails — a dead plugin is a failed call, never a chain that
+#     quietly continued without it.
+set +e
+out="$(run_runtime --plugin "$plugin_dir" --plugin-id fixture_intercept \
+  --component fixture_intercept \
+  --plugin-config '{"die_on_invoke":true}' --capability system.echo \
+  --arguments '{"probe":"crash"}' 2>&1)"
+status=$?
+set -e
+[[ $status -ne 0 ]] || fail "a host that dies mid-call must fail the invocation: $out"
+printf '%s' "$out" | jq -e '.status=="FAILED" and (.attempts | length) == 0' >/dev/null \
+  || fail "a crashed host must not produce a dispatch: $out"
+pass "plugin host death mid-call fails the invocation"
+
+# 16. Middleware that runs the continuation and *then* fails: the dispatch
+#     verdict stays authoritative — a committed effect is not relabeled by a
+#     middleware error, and the report still records that the chain erred.
+counter_fail_after="runtime-e2e-failafter-$$"
+out="$(run_runtime --plugin "$plugin_dir" --plugin-id fixture_intercept \
+  --component fixture_intercept \
+  --plugin-config '{"arg_marks":false,"fail_after_next":true}' --capability test.counter.increment \
+  --arguments "{\"counter\":\"$counter_fail_after\",\"by\":1}" \
+  --idempotency-key "runtime-e2e-failafter-key-$$" --grant runtime-e2e-grant)" \
+  || fail "a post-dispatch middleware error must not uncommit the effect: $out"
+printf '%s' "$out" | jq -e '
+    .status=="SUCCEEDED" and .result.value==1
+    and (.receipt_digest != null)
+    and (.post_dispatch_middleware_error | length) > 0
+    and (.attempts | length) == 1' >/dev/null \
+  || fail "the dispatch verdict must survive a post-dispatch middleware failure: $out"
+pass "post-dispatch middleware failure cannot relabel a committed effect"
+
+# 17. Concurrent continuation: the ABI lets an intercept fan its continuation
+#     out — each call is a real dispatch attempt under the same logical key,
+#     and the durable record turns the second into a replay. Two attempts, one
+#     effect.
+counter_concurrent="runtime-e2e-concurrent-$$"
+out="$(run_runtime --plugin "$plugin_dir" --plugin-id fixture_intercept \
+  --component fixture_intercept \
+  --plugin-config '{"arg_marks":false,"use_concurrent_next":true}' --capability test.counter.increment \
+  --arguments "{\"counter\":\"$counter_concurrent\",\"by\":1}" \
+  --idempotency-key "runtime-e2e-concurrent-key-$$" --grant runtime-e2e-grant)" \
+  || fail "a concurrent continuation must still commit exactly once: $out"
+printf '%s' "$out" | jq -e '
+    .status=="SUCCEEDED" and .result.value==1
+    and (.attempts | length) == 2
+    and ([.attempts[].status] | all(. == "SUCCEEDED"))
+    and (.attempts[0].execution_id != .attempts[1].execution_id)' >/dev/null \
+  || fail "two attempts under one logical key must produce one effect: $out"
+pass "concurrent continuation: two attempts, one durable effect"
+
+# 18. Middleware timeout: a plugin that holds the call past the managed
+#     deadline fails the invocation — the deadline is the deployment's bound
+#     on how long middleware may hold a call.
+set +e
+out="$(NEMO_RELAY_MANAGED_CALL_BUDGET_MS=2000 run_runtime \
+  --plugin "$plugin_dir" --plugin-id fixture_intercept \
+  --component fixture_intercept \
+  --plugin-config '{"sleep_ms":15000}' --capability system.echo \
+  --arguments '{"probe":"timeout"}' 2>&1)"
+status=$?
+set -e
+[[ $status -ne 0 ]] || fail "a middleware that outruns the budget must fail: $out"
+printf '%s' "$out" | jq -e '.status=="FAILED" and (.attempts | length) == 0' >/dev/null \
+  || fail "a timed-out chain must not dispatch: $out"
+pass "middleware timeout fails the invocation before dispatch"
+
+# 19. Malformed deployment configuration fails startup, like every other
+#     env-resolved setting in this composition.
+set +e
+out="$(NEMO_RELAY_MANAGED_CALL_BUDGET_MS=soon run_runtime \
+  --plugin "$plugin_dir" --plugin-id fixture_intercept \
+  --component fixture_intercept --capability system.echo \
+  --arguments '{"probe":"bad-budget"}' 2>&1)"
+status=$?
+set -e
+[[ $status -ne 0 && "$out" == *"NEMO_RELAY_MANAGED_CALL_BUDGET_MS"* ]] \
+  || fail "a malformed call budget must name the variable: $out"
+pass "malformed managed-call budget fails startup"
+
+printf 'runtime e2e: nineteen checks passed\n'
