@@ -29,7 +29,8 @@ members = [
     "crates/node",
     # Crabedence integration
     "bridges/nemo-crabedence",
-    "bridges/nemo-effect-router"
+    "bridges/nemo-effect-router",
+    "bridges/nemo-crabedence-runtime"
 ]
 exclude = [".tmp", ".uv-cache"]
 resolver = "2"
