@@ -556,16 +556,25 @@ was read, and the population falls into four categories:
 
 | Category | Providers | Why migration is not a drop-in |
 | --- | --- | --- |
-| Structurally equivalent | `azuredynamicsessions`, `nomad`, `ovh`, `sprites`, `unikraftcloud`, `islo`, `scaleway` | Each carries a **provider-specific error** — `errNomadCrossOriginRedirect`, `errNomadRedirectLimit`, `errOVHCrossOriginRedirect`, `&unikraftCloudRedirectError{}`, scaleway's sentinel with its body-close path. `SecureHTTPClient`'s `newError` covers the cross-origin refusal but **not** a provider-specific redirect-limit error: its cap message is fixed, so migration would change error identity that tests may assert |
+| Structurally equivalent — **corrected to two** | `azuredynamicsessions` (migrated), `sprites` | These two build their refusal text inline and use the generic cap message, so the helper's `newError` covers them exactly |
+| Sentinel contracts — **must not** be migrated | `nomad`, `ovh` | Each defines a redirect-limit sentinel that a **consumer matches on**: `errors.Is(err, errNomadRedirectLimit)` and `errors.Is(err, errOVHRedirectLimit)`. The helper's cap message is fixed (`errors.New("stopped after 10 redirects")`), so migrating would replace a matched sentinel with a different value and break that check |
+| Richer redirect policy | `unikraftcloud`, `scaleway` | `unikraftcloud` additionally enforces path containment (`withinUnikraftCloudAPIPath`) and refuses a method change on a mutation — checks the helper does not make, so migrating would silently drop them. `scaleway` reads a marker header its own transport sets and distinguishes three sentinels (`CrossOrigin`, `Invalid`, `Limit`), then threads a hop count through the request context |
+| Not yet read | `islo` | Uses its own guard constructor, `isloSameOriginRedirectGuard(baseURL, source.CheckRedirect)` — already factored, and its semantics need their own read before any judgement |
 | Deliberately stricter | `boxd`, `cloudflaredynamicworkers`, `githubcodespaces` | `boxd` refuses every redirect ("boxd API redirects are not allowed"); the other two return `http.ErrUseLastResponse` and follow none. Migrating would **weaken** them by permitting same-origin redirects |
 | Origin-pinned with deliberate unwrapping | `fastapicloud`, `morph`, `railway` | Each unwraps its typed error at the call site, with the comment "net/http wraps CheckRedirect failures with the untrusted Location URL" — they deliberately avoid surfacing the untrusted destination. Migration must preserve that unwrapping |
 | Pinned at the transport | `opensandbox` | `openSandboxRedirectTransport` intercepts the 3xx response and parses `Location` itself. A different mechanism, arguably stronger, and not a `CheckRedirect` site at all |
 
 So the earlier claim that this is "bounded and mechanical" was wrong, and the
-correction matters: a bulk migration would weaken three providers and change
-error identity in seven. The real duplication is smaller than the file count
-suggests, and what remains is a per-provider decision about whether the shared
-helper's fixed cap message and error shape are acceptable — not a sweep.
+correction matters: a bulk migration would weaken three providers, **break the
+error contracts of two**, silently drop redirect policy in two more, and change
+error identity in the rest. The real duplication is smaller than the file count
+suggests — **two providers, not sixteen, are drop-in**, and one of them is
+migrated.
+
+This is the same mistake as finding 4, made twice: classifying by the *shape* of
+the code rather than by the *contract* its callers depend on. The bodies looked
+alike; what differs is which sentinels something matches on and what extra
+policy each provider enforces.
 
 ## Open decisions
 
