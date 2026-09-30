@@ -616,23 +616,26 @@ and both are recorded so the next run does not re-investigate them.
    checkout where the subtree *is* the repository root — its CI does, which is
    why CI is unaffected. See the root README.
 
-2. **`TestServeDeployedQualificationProvider` fails under `go test ./...` and
-   passes in isolation.** Verified: a real pass, not a skip (`-run ... -v`
-   shows `--- PASS`); 0.06s in isolation; passes again under `-cpu 1`, twice. So
-   it is not CPU-count sensitivity.
+2. **`TestServeDeployedQualificationProvider` is intermittent.** Observed
+   failing once under `go test ./...`; a second full-suite run passed the
+   package (`ok … 24.057s`, 100 packages ok, only the `internal/cli` failures
+   below). It does not reproduce in isolation, under `-cpu 1`, or on demand.
 
-   **An earlier revision of this note guessed the cause — "a loopback port or a
-   probe deadline" — and that guess is wrong.** The test uses `t.TempDir()` and
-   an ephemeral `httptest` port, so nothing is fixed to collide with, and it
-   fails in **0.32s**, well inside its own 10-second socket-wait deadline. A
-   fast failure points at the steps before the service starts: opening SQLite,
-   issuing the grant, or the process-global `t.Setenv` calls.
+   This note has been wrong twice and the corrections are worth keeping:
 
-   What is established: it is not caused by this transfer (the package's
-   non-test code is untouched here, and the only changes made to
-   `internal/execution` are added test files). What is *not* established is the
-   cause, because the failure message from a full-suite run has not been
-   captured. That message is the next step, not another guess.
+   - it first asserted the cause was "a loopback port or a probe deadline".
+     **Wrong** — the test uses `t.TempDir()` and an ephemeral `httptest` port,
+     and it failed in 0.32s, well inside its own 10-second socket-wait deadline.
+   - it then said it "fails under `go test ./...`". **Too strong** — it failed
+     once and passed on the next full run, so it is intermittent rather than
+     reproducible.
+
+   What is established: not caused by this transfer (the package's non-test code
+   is untouched here and the only changes made to `internal/execution` are added
+   test files). What is not established: the cause, because the failure message
+   has not been captured. Capturing it means catching a failing run — a
+   `-count` loop under load — and that is the next step rather than another
+   guess.
 
 ## Open decisions
 
