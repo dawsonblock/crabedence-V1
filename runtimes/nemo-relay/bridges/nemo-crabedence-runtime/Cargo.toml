@@ -21,3 +21,6 @@ nemo-crabedence-bridge = { path = "../nemo-crabedence" }
 nemo-effect-router = { path = "../nemo-effect-router" }
 nemo-relay-executor = { workspace = true, features = ["unstable-hardening"] }
 serde_json = "1"
+serde_json_canonicalizer = "0.3"
+sha2 = "0.11"
+uuid = { workspace = true, features = ["v7"] }

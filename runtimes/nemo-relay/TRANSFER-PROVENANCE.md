@@ -56,9 +56,22 @@ go run ./cmd/nemo-runtime-digest -envelope
 ```
 
 The tool's digest is the same definition as the shell command above, verified
-to agree byte-for-byte, so either can be used to check the other. Current
-value: `c54315a76a804e8062d52bd3e785ea56d228a6377139034b2401d3f89447bc3e`
-(1455 files, runtime version `0.9.1-rc.4`).
+to agree byte-for-byte, so either can be used to check the other.
+
+The shipped value is declared in `runtimes/nemo-transfer-manifest.json` — one
+level above this tree — and checked against the tree by
+`scripts/check-nemo-transfer-manifest.sh` in CI. The declaration lives outside
+the tree deliberately: a digest of a tree that contains the declaration can
+never be self-consistent, because writing the value changes the digest it
+declares. The same manifest declares the source identity above, and the check
+recomputes it whenever the source copy is present. Verify with:
+
+```sh
+go run ./cmd/nemo-runtime-digest -manifest runtimes/nemo-transfer-manifest.json
+```
+
+After a deliberate change to this tree, regenerate the declaration with the
+same command plus `-update`, then commit the manifest with the change.
 
 ## Local modifications
 
@@ -67,8 +80,8 @@ differing files — every other file is byte-identical:
 
 | File | Difference |
 | --- | --- |
-| `Cargo.toml` | two added workspace members: `bridges/nemo-crabedence` and `bridges/nemo-effect-router` |
-| `Cargo.lock` | the two crate entries and their dependency edges |
+| `Cargo.toml` | three added workspace members: `bridges/nemo-crabedence`, `bridges/nemo-effect-router`, and `bridges/nemo-crabedence-runtime` |
+| `Cargo.lock` | the three crate entries and their dependency edges |
 | `crates/cli/src/mcp_environment.rs` | security patch: the MCP environment allowlist no longer forwards credential material (see below) |
 | `integrations/coding-agents/codex/.mcp.json` | regenerated to match the patched allowlist; a checked-in test asserts the two agree |
 
@@ -101,10 +114,13 @@ Plus additions that are not upstream files:
   execution port;
 - `bridges/nemo-effect-router/` — the effect router: resolves the execution
   path from the verified registry and holds the effect-isolation invariant;
+- `bridges/nemo-crabedence-runtime/` — the runtime instance: verifies the
+  snapshot, resolves the class and route from it, binds a per-invocation
+  identity, and dispatches through `EffectRouter`;
 - this file.
 
-Both crates are authored in the Crabedence repository and licensed Apache-2.0
-under the workspace license.
+The bridge crates are authored in the Crabedence repository and licensed
+Apache-2.0 under the workspace license.
 
 Re-applying those edits after an upstream refresh is the documented update
 procedure (see `docs/plan/nemo-runtime-transfer.md` in the Crabedence

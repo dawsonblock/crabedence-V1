@@ -29,10 +29,17 @@
 //! Usage:
 //!
 //! ```text
-//! nemo-effect-runtime --capability <id> [--arguments <json>] [--principal <id>]
-//!                     [--grant <authority-ref>] [--idempotency-key <key>]
-//!                     [--socket <path>] [--snapshot <path>]
+//! nemo-crabedence-runtime --capability <id> [--arguments <json>] [--principal <id>]
+//!                         [--grant <authority-ref>] [--idempotency-key <key>]
+//!                         [--socket <path>] [--snapshot <path>]
 //! ```
+//!
+//! `--idempotency-key` is required for `MUTATION` and `CRITICAL` capabilities.
+//! It is the caller's logical-action key: stable across retries of one action,
+//! unique across distinct actions. The runtime namespaces it per principal —
+//! the same construction the kernel applies — so two principals cannot collide
+//! on one key, and a capability-derived default, which would name every
+//! invocation the same operation, is refused.
 //!
 //! The outcome is printed as JSON on stdout: `{"status": "SUCCEEDED", ...}` or
 //! `{"status": "FAILED", "code": ..., "retryable": ..., ...}`, with `UNKNOWN`
@@ -41,7 +48,9 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use nemo_crabedence_bridge::capability_snapshot::{RegistryExecutionClass, load_catalog_from_path};
+use nemo_crabedence_bridge::capability_snapshot::{
+    RegistryDescriptor, RegistryExecutionClass, load_catalog_from_path,
+};
 use nemo_crabedence_bridge::execution_port::NemoCrabedenceExecutionPort;
 use nemo_crabedence_bridge::transport::{ExecutionSocketClient, default_socket_path};
 use nemo_effect_router::EffectRouter;
@@ -50,6 +59,8 @@ use nemo_relay_executor::unstable::{
     ExecutionRequest, ExecutionResult, OutcomeCertainty, RuntimeIdentity,
 };
 use serde_json::json;
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 /// The placeholder local executor for `LOCAL`-routed capabilities.
 ///
@@ -80,12 +91,19 @@ struct Options {
     arguments: serde_json::Value,
     principal: String,
     grant: Option<String>,
-    idempotency_key: String,
+    idempotency_key: Option<String>,
     socket: PathBuf,
     snapshot: PathBuf,
 }
 
 fn parse_options() -> Result<Options, String> {
+    parse_options_from(std::env::args().skip(1))
+}
+
+fn parse_options_from<I>(mut args: I) -> Result<Options, String>
+where
+    I: Iterator<Item = String>,
+{
     let mut capability = None;
     let mut arguments = json!({});
     let mut principal = "alice@example.com".to_string();
@@ -94,7 +112,6 @@ fn parse_options() -> Result<Options, String> {
     let mut socket = None;
     let mut snapshot = None;
 
-    let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
         match flag.as_str() {
@@ -120,9 +137,9 @@ fn parse_options() -> Result<Options, String> {
             .join("capabilities.json")
     });
     let capability = capability.ok_or("--capability is required")?;
-    // The key is the caller's, but it must not be empty for a durable route.
-    let idempotency_key = idempotency_key.unwrap_or_else(|| format!("runtime-{capability}"));
-
+    // The key stays the caller's and stays absent when they gave none. Whether
+    // one is required depends on the registered class, which is resolved from
+    // the verified registry after this parse — see `request_for`.
     Ok(Options {
         capability,
         arguments,
@@ -148,42 +165,150 @@ const fn execution_class_of(class: RegistryExecutionClass) -> ExecutionClass {
     }
 }
 
-fn request_for(options: &Options, class: ExecutionClass) -> ExecutionRequest {
-    let capability = &options.capability;
-    ExecutionRequest {
+/// The runtime identity this binary executes under.
+///
+/// The id names this binary, not NeMo Relay's own `nemo-effect-runtime` crate:
+/// diagnostics, receipts, and evidence should agree with the executable a
+/// caller actually ran.
+fn runtime_identity(principal: &str) -> RuntimeIdentity {
+    RuntimeIdentity {
+        principal_id: principal.to_string(),
+        tenant_id: None,
+        runtime_id: "nemo-crabedence-runtime".to_string(),
+        environment: "runtime".to_string(),
+        session_id: None,
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// SHA-256 over the RFC 8785 canonical JSON of a value.
+///
+/// Canonical, so two spellings of the same JSON — `{"a":1,"b":2}` and
+/// `{"b":2,"a":1}` — digest identically. This is the definition the kernel
+/// uses for its own argument and binding digests.
+fn canonical_digest(value: &serde_json::Value) -> Result<String, String> {
+    let bytes = serde_json_canonicalizer::to_vec(value)
+        .map_err(|error| format!("canonicalizing an identity input failed: {error}"))?;
+    Ok(sha256_hex(&bytes))
+}
+
+/// The namespace the kernel applies to a caller's logical-action key.
+///
+/// Scoped by tenant and principal, so the same key from two principals is two
+/// operations, and stable for one principal, so a retry of the same action
+/// replays rather than duplicating. This mirrors the kernel's own
+/// construction, because this runtime stands in for the kernel on the path
+/// that reaches the router.
+fn scoped_idempotency_key(runtime: &RuntimeIdentity, request_id: &str) -> Result<String, String> {
+    canonical_digest(&json!({
+        "tenant_id": runtime.tenant_id,
+        "principal_id": runtime.principal_id,
+        "request_id": request_id,
+    }))
+}
+
+/// Builds the bound request for one invocation, with the identity every layer
+/// downstream sees.
+///
+/// Identifiers are minted per invocation (UUIDv7, the kernel's own choice) and
+/// the idempotency key is the caller's logical-action key — required for
+/// `MUTATION` and `CRITICAL`, and the action id for `PURE` and `READ`, exactly
+/// as the kernel binds them. The digests are computed over the verified
+/// descriptor and the canonical arguments. None of this crosses Crabedence's
+/// ABI, which carries only the capability, its arguments, authority material,
+/// an idempotency key, and a deadline.
+fn request_for(
+    options: &Options,
+    class: ExecutionClass,
+    descriptor: &RegistryDescriptor,
+    registry_digest: &str,
+) -> Result<ExecutionRequest, String> {
+    let runtime = runtime_identity(&options.principal);
+    let execution_id = Uuid::now_v7().to_string();
+    let action_id = Uuid::now_v7().to_string();
+    let idempotency_key = match class {
+        ExecutionClass::Mutation | ExecutionClass::Critical => {
+            let request_id = options.idempotency_key.as_deref().ok_or_else(|| {
+                format!(
+                    "--idempotency-key is required for {class:?} capabilities: it is the caller's logical-action key, and a capability-derived default would name every invocation the same operation"
+                )
+            })?;
+            scoped_idempotency_key(&runtime, request_id)?
+        }
+        ExecutionClass::Pure | ExecutionClass::Read => action_id.clone(),
+    };
+
+    let args_digest = canonical_digest(&options.arguments)?;
+    let registration_digest = canonical_digest(
+        &serde_json::to_value(descriptor)
+            .map_err(|error| format!("serializing the verified descriptor failed: {error}"))?,
+    )?;
+    let route_digest = canonical_digest(&json!({
+        "execution_route": descriptor.execution_route.as_str(),
+        "assurance_profile": descriptor.assurance_profile,
+    }))?;
+    let runtime_binding_digest = canonical_digest(&json!({
+        "runtime_id": runtime.runtime_id,
+        "environment": runtime.environment,
+        "session_id": runtime.session_id,
+    }))?;
+
+    // The verified snapshot carries no registry-assigned admission identity or
+    // policy epoch — those belong to NeMo Relay's own registry, and this
+    // snapshot is Crabedence's. They are bound to verified registry content
+    // instead of left as constants, so they move when the registry moves and
+    // never claim an identity the registry did not issue.
+    let admission_id = format!(
+        "admission-{}",
+        registration_digest
+            .get(..16)
+            .unwrap_or(&registration_digest)
+    );
+    let policy_version = descriptor
+        .policy_revision
+        .as_deref()
+        .map(str::trim)
+        .filter(|revision| !revision.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("descriptor-v{}", descriptor.descriptor_version));
+    let policy_epoch = registry_digest.to_string();
+
+    Ok(ExecutionRequest {
         identity: ExecutionIdentity {
-            execution_id: format!("runtime-{capability}"),
-            invocation_id: format!("runtime-{capability}"),
-            action_id: format!("runtime-{capability}"),
-            idempotency_key: options.idempotency_key.clone(),
-            runtime: RuntimeIdentity {
-                principal_id: options.principal.clone(),
-                tenant_id: None,
-                runtime_id: "nemo-effect-runtime".to_string(),
-                environment: "runtime".to_string(),
-                session_id: None,
-            },
-            runtime_binding_digest: "runtime-binding".to_string(),
+            execution_id: execution_id.clone(),
+            invocation_id: execution_id,
+            action_id,
+            idempotency_key,
+            runtime,
+            runtime_binding_digest,
             capability: CapabilityIdentity {
-                capability_id: capability.clone(),
-                capability_generation: 1,
-                registration_digest: "registration".to_string(),
+                capability_id: options.capability.clone(),
+                capability_generation: u64::from(descriptor.descriptor_version),
+                registration_digest,
                 execution_class: class,
-                operation: capability.clone(),
-                route_digest: "route".to_string(),
+                operation: options.capability.clone(),
+                route_digest,
             },
-            admission_id: "admission".to_string(),
-            policy_version: "1".to_string(),
-            policy_epoch: "1".to_string(),
-            args_digest: "args".to_string(),
+            admission_id,
+            policy_version,
+            policy_epoch,
+            args_digest,
             grant_digest: None,
             approval_reference: None,
+            // This binary declares no deadline: the port omits it from the ABI
+            // and Crabedence applies its own bound.
             deadline_unix_ms: 0,
         },
         args: options.arguments.clone(),
         grant: options.grant.clone(),
         trace_id: None,
-    }
+    })
 }
 
 fn main() -> ExitCode {
@@ -221,6 +346,17 @@ fn main() -> ExitCode {
     };
     let class = execution_class_of(descriptor.execution_class);
 
+    // Identity first, and fail closed: a consequential invocation without a
+    // caller-supplied logical-action key is refused before any dispatch, not
+    // given a default that would collide across distinct actions.
+    let request = match request_for(&options, class, descriptor, catalog.registry_sha256()) {
+        Ok(request) => request,
+        Err(message) => {
+            eprintln!("nemo-crabedence-runtime: {message}");
+            return ExitCode::from(2);
+        }
+    };
+
     let router = EffectRouter::new(
         catalog,
         LocalEchoBackend,
@@ -238,7 +374,6 @@ fn main() -> ExitCode {
         }),
     );
 
-    let request = request_for(&options, class);
     match router.execute(&request) {
         Ok(result) => {
             println!(
@@ -275,5 +410,225 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nemo_crabedence_bridge::capability_snapshot::{RegistryDescriptor, RegistryExecutionRoute};
+
+    fn descriptor(
+        class: RegistryExecutionClass,
+        route: RegistryExecutionRoute,
+        descriptor_version: u32,
+    ) -> RegistryDescriptor {
+        RegistryDescriptor {
+            id: "test.counter.increment".to_string(),
+            descriptor_version,
+            policy_revision: None,
+            execution_class: class,
+            assurance_profile: "DURABLE".to_string(),
+            execution_route: route,
+            schema: None,
+            authority_policy: None,
+            adapter_id: "test".to_string(),
+        }
+    }
+
+    fn options(principal: &str, idempotency_key: Option<&str>) -> Options {
+        Options {
+            capability: "test.counter.increment".to_string(),
+            arguments: json!({"amount": 1}),
+            principal: principal.to_string(),
+            grant: None,
+            idempotency_key: idempotency_key.map(str::to_string),
+            socket: PathBuf::from("/tmp/execution.sock"),
+            snapshot: PathBuf::from("/tmp/capabilities.json"),
+        }
+    }
+
+    fn request(class: ExecutionClass, options: &Options) -> ExecutionRequest {
+        let registered = match class {
+            ExecutionClass::Pure => RegistryExecutionClass::Pure,
+            ExecutionClass::Read => RegistryExecutionClass::Read,
+            ExecutionClass::Mutation => RegistryExecutionClass::Mutation,
+            ExecutionClass::Critical => RegistryExecutionClass::Critical,
+        };
+        request_for(
+            options,
+            class,
+            &descriptor(registered, RegistryExecutionRoute::Crabedence, 1),
+            "registry-digest",
+        )
+        .expect("the request must bind")
+    }
+
+    #[test]
+    fn mutation_and_critical_require_a_caller_supplied_key() {
+        for class in [ExecutionClass::Mutation, ExecutionClass::Critical] {
+            let error = request_for(
+                &options("alice@example.com", None),
+                class,
+                &descriptor(
+                    RegistryExecutionClass::Mutation,
+                    RegistryExecutionRoute::Crabedence,
+                    1,
+                ),
+                "registry-digest",
+            )
+            .expect_err("a consequential invocation without a key must be refused");
+            assert!(error.contains("--idempotency-key"), "got: {error}");
+        }
+    }
+
+    #[test]
+    fn pure_and_read_bind_the_action_id_as_the_key() {
+        for class in [ExecutionClass::Pure, ExecutionClass::Read] {
+            let bound = request(class, &options("alice@example.com", None));
+            assert_eq!(bound.identity.idempotency_key, bound.identity.action_id);
+            assert!(!bound.identity.idempotency_key.is_empty());
+        }
+    }
+
+    #[test]
+    fn one_logical_action_yields_one_scoped_key_across_invocations() {
+        let first = request(
+            ExecutionClass::Mutation,
+            &options("alice@example.com", Some("send-001")),
+        );
+        let second = request(
+            ExecutionClass::Mutation,
+            &options("alice@example.com", Some("send-001")),
+        );
+        assert_eq!(
+            first.identity.idempotency_key,
+            second.identity.idempotency_key
+        );
+        assert_ne!(first.identity.execution_id, second.identity.execution_id);
+        assert_ne!(first.identity.action_id, second.identity.action_id);
+
+        let other_action = request(
+            ExecutionClass::Mutation,
+            &options("alice@example.com", Some("send-002")),
+        );
+        assert_ne!(
+            first.identity.idempotency_key,
+            other_action.identity.idempotency_key
+        );
+
+        let other_principal = request(
+            ExecutionClass::Mutation,
+            &options("bob@example.com", Some("send-001")),
+        );
+        assert_ne!(
+            first.identity.idempotency_key,
+            other_principal.identity.idempotency_key
+        );
+    }
+
+    #[test]
+    fn invocation_ids_are_unique_and_the_invocation_id_is_the_execution_id() {
+        let bound = request(ExecutionClass::Read, &options("alice@example.com", None));
+        assert_eq!(bound.identity.invocation_id, bound.identity.execution_id);
+        assert_ne!(bound.identity.execution_id, bound.identity.action_id);
+    }
+
+    #[test]
+    fn argument_digests_are_canonical_and_content_sensitive() {
+        let mut left = options("alice@example.com", Some("send-001"));
+        left.arguments = json!({"b": 1, "a": 2});
+        let mut right = options("alice@example.com", Some("send-001"));
+        right.arguments = json!({"a": 2, "b": 1});
+        let mut changed = options("alice@example.com", Some("send-001"));
+        changed.arguments = json!({"a": 2, "b": 2});
+
+        let left = request(ExecutionClass::Mutation, &left);
+        let right = request(ExecutionClass::Mutation, &right);
+        let changed = request(ExecutionClass::Mutation, &changed);
+        assert_eq!(left.identity.args_digest, right.identity.args_digest);
+        assert_ne!(left.identity.args_digest, changed.identity.args_digest);
+        assert_eq!(left.identity.args_digest.len(), 64);
+    }
+
+    #[test]
+    fn descriptor_digests_track_the_verified_descriptor() {
+        let base = request_for(
+            &options("alice@example.com", Some("send-001")),
+            ExecutionClass::Mutation,
+            &descriptor(
+                RegistryExecutionClass::Mutation,
+                RegistryExecutionRoute::Crabedence,
+                1,
+            ),
+            "registry-digest",
+        )
+        .expect("the request must bind");
+        let next_version = request_for(
+            &options("alice@example.com", Some("send-001")),
+            ExecutionClass::Mutation,
+            &descriptor(
+                RegistryExecutionClass::Mutation,
+                RegistryExecutionRoute::Crabedence,
+                2,
+            ),
+            "registry-digest",
+        )
+        .expect("the request must bind");
+        assert_ne!(
+            base.identity.capability.registration_digest,
+            next_version.identity.capability.registration_digest
+        );
+        assert_ne!(
+            base.identity.admission_id,
+            next_version.identity.admission_id
+        );
+
+        let other_route = request_for(
+            &options("alice@example.com", Some("send-001")),
+            ExecutionClass::Mutation,
+            &descriptor(
+                RegistryExecutionClass::Mutation,
+                RegistryExecutionRoute::Direct,
+                1,
+            ),
+            "registry-digest",
+        )
+        .expect("the request must bind");
+        assert_ne!(
+            base.identity.capability.route_digest,
+            other_route.identity.capability.route_digest
+        );
+    }
+
+    #[test]
+    fn the_runtime_id_names_this_binary() {
+        let bound = request(ExecutionClass::Pure, &options("alice@example.com", None));
+        assert_eq!(bound.identity.runtime.runtime_id, "nemo-crabedence-runtime");
+        assert_eq!(bound.identity.runtime_binding_digest.len(), 64);
+    }
+
+    #[test]
+    fn option_parsing_keeps_the_key_absent_when_the_caller_gave_none() {
+        let parsed = parse_options_from(
+            ["--capability", "system.echo"]
+                .iter()
+                .map(|argument| argument.to_string()),
+        )
+        .expect("the options must parse");
+        assert_eq!(parsed.idempotency_key, None);
+
+        let parsed = parse_options_from(
+            [
+                "--capability",
+                "system.echo",
+                "--idempotency-key",
+                "send-001",
+            ]
+            .iter()
+            .map(|argument| argument.to_string()),
+        )
+        .expect("the options must parse");
+        assert_eq!(parsed.idempotency_key.as_deref(), Some("send-001"));
     }
 }

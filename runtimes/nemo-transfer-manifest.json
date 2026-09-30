@@ -1,0 +1,34 @@
+{
+  "tree": "runtimes/nemo-relay",
+  "runtime_version": "0.9.1-rc.4",
+  "shipped_tree_sha256": "2954660a292cf37cd3bf3c5551363c0ea2f27b479cc214688c3235be910bb884",
+  "file_count": 1457,
+  "excluded": [
+    ".git",
+    ".uv-cache",
+    ".venv",
+    "__pycache__",
+    "node_modules",
+    "target"
+  ],
+  "source": {
+    "path": "../NEMO-feat-native-plugin-isolation",
+    "file_count": 1438,
+    "sha256": "050a9cae3f9eeb4f4f0f34f89ccafd7617d93b4c7e051fe08f3a1d7d0c5e59fa"
+  },
+  "workspace_members_added": [
+    "bridges/nemo-crabedence",
+    "bridges/nemo-effect-router",
+    "bridges/nemo-crabedence-runtime"
+  ],
+  "local_modifications": [
+    "Cargo.toml",
+    "Cargo.lock",
+    "crates/cli/src/mcp_environment.rs",
+    "integrations/coding-agents/codex/.mcp.json"
+  ],
+  "added_paths": [
+    "bridges/",
+    "TRANSFER-PROVENANCE.md"
+  ]
+}

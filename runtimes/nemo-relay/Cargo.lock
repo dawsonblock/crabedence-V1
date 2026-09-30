@@ -1786,6 +1786,9 @@ dependencies = [
  "nemo-effect-router",
  "nemo-relay-executor",
  "serde_json",
+ "serde_json_canonicalizer",
+ "sha2",
+ "uuid",
 ]
 
 [[package]]
