@@ -239,7 +239,7 @@ The consolidation's own completion criteria, against the current state:
 | 8 | Restart and crash tests prove no duplicate consequential effects | Met for the property that matters: a repeated idempotency key replays rather than duplicating, verified against the live kernel across a full service restart with a fresh planner process. The wider crash and partition matrix is still not exercised from the NEMO side |
 | 9 | The old TypeScript kernel is no longer required | Met: the kernel is deleted. `kernel.ts`, `schema.ts`, and `testing.ts` are gone along with their two test files; the loader survives as `nemo/registry-snapshot/`, verifies on its own, and returns descriptors rather than a catalog. The suite went from 168 tests across 11 files to 119 across 9, and the difference is exactly the removed kernel behavior plus its duplicated admission tests — every one of which the Go suite covers by name |
 | 10 | NEMO's duplicate runtime is absent from the production dependency graph | Met: asserted in CI |
-| 11 | Provider common infrastructure has begun moving into a shared SDK | Substantially met, and the remainder is specific. `internal/providers/shared` (28 source files, 5,858 lines) is that SDK and every provider except the `all` aggregator imports it — all 81. The 102 raw `&http.Client{}` constructions turned out to be legitimate per-provider transport configuration and should not be collapsed. The real duplication is that 17 providers reimplement `shared.SecureHTTPClient`'s origin-pinned redirect hardening instead of calling it; migrating them is bounded and mechanical once each site's behavior is confirmed, and is deliberately left for its own change |
+| 11 | Provider common infrastructure has begun moving into a shared SDK | Substantially met. `internal/providers/shared` (28 source files, 5,858 lines) is that SDK and every provider except the `all` aggregator imports it — all 81. The 102 raw `&http.Client{}` constructions are legitimate per-provider transport configuration and should not be collapsed. Sixteen providers implement redirect handling themselves; reading each one showed four distinct categories, three of which **must not** be migrated to `shared.SecureHTTPClient` — one refuses all redirects, two follow none, three need their deliberate error unwrapping preserved, and one pins at the transport layer. See the classification above |
 | 12 | A CI assertion proves no consequential bypass path exists | Met: `tests/effect_isolation.rs` and `tests/routing.rs` run in the `NEMO integration` job |
 | 13 | Release artifacts identify exact NEMO and Crabedence source revisions | Met: the release evidence generator runs `cmd/nemo-runtime-digest` and writes `nemo-runtime.json` and `nemo-runtime.sha256` into the bundle, which `SHA256SUMS`, the manifest digest, and the attestation already cover. The Crabedence revision is bound by the source commit and the registry digest; the NEMO revision is now bound too. The frozen gate registry is untouched — the digest is evidence, not a new gate |
 | 14 | Security qualification passes for the shipping binaries | Not a NEMO-transfer deliverable, and stated as such rather than left ambiguous. The repository's shipping binaries are Go, and their security qualification is the existing typed release-gate set (`scripts/lib/qualification-gates.sh`, `release-qualification.yml`), which is frozen and managed by the repository's own release process — not something the transfer should extend by inventing gates. What the transfer contributes is the NEMO-side security assertions, which run in CI (`tests/effect_isolation.rs`, `tests/routing.rs`, the credential and dependency-graph checks) and are now bound into release evidence by blocker 13. Wiring those checks into the typed gate set is a release-engineering change, gated by that process |
@@ -485,7 +485,7 @@ The duplication that *is* real is next to them. `shared/httpredirect.go`
 exports `SecureHTTPClient`, which "returns a copy of source whose
 `CheckRedirect` refuses redirects leaving the trusted origin, preserves
 source's `CheckRedirect`, and applies net/http's default 10-redirect cap".
-**Seventeen providers reimplement that themselves** rather than call it:
+**Sixteen providers implement redirect handling themselves** rather than call it:
 
 ```text
 awslambdamicrovm, azuredynamicsessions, blaxel, boxd,
@@ -498,12 +498,21 @@ subtly wrong, and a fix to one does not reach the others. The shared helper
 already accepts a provider-specific refusal error via `newError`, so the
 provider-specific parts have a home.
 
-Migrating them is deliberately **not** done here. Each site has to be read to
-confirm the shared helper preserves its behavior — a redirect policy is
-security-relevant, and a migration that quietly weakens one provider's origin
-check would be worse than the duplication. The work is bounded and mechanical
-once each site is confirmed: 17 call sites, each with provider tests already
-in place.
+**Migrating them is not mechanical, and a bulk pass would be wrong.** Each site
+was read, and the population falls into four categories:
+
+| Category | Providers | Why migration is not a drop-in |
+| --- | --- | --- |
+| Structurally equivalent | `azuredynamicsessions`, `nomad`, `ovh`, `sprites`, `unikraftcloud`, `islo`, `scaleway` | Each carries a **provider-specific error** — `errNomadCrossOriginRedirect`, `errNomadRedirectLimit`, `errOVHCrossOriginRedirect`, `&unikraftCloudRedirectError{}`, scaleway's sentinel with its body-close path. `SecureHTTPClient`'s `newError` covers the cross-origin refusal but **not** a provider-specific redirect-limit error: its cap message is fixed, so migration would change error identity that tests may assert |
+| Deliberately stricter | `boxd`, `cloudflaredynamicworkers`, `githubcodespaces` | `boxd` refuses every redirect ("boxd API redirects are not allowed"); the other two return `http.ErrUseLastResponse` and follow none. Migrating would **weaken** them by permitting same-origin redirects |
+| Origin-pinned with deliberate unwrapping | `fastapicloud`, `morph`, `railway` | Each unwraps its typed error at the call site, with the comment "net/http wraps CheckRedirect failures with the untrusted Location URL" — they deliberately avoid surfacing the untrusted destination. Migration must preserve that unwrapping |
+| Pinned at the transport | `opensandbox` | `openSandboxRedirectTransport` intercepts the 3xx response and parses `Location` itself. A different mechanism, arguably stronger, and not a `CheckRedirect` site at all |
+
+So the earlier claim that this is "bounded and mechanical" was wrong, and the
+correction matters: a bulk migration would weaken three providers and change
+error identity in seven. The real duplication is smaller than the file count
+suggests, and what remains is a per-provider decision about whether the shared
+helper's fixed cap message and error shape are acceptable — not a sweep.
 
 ## Open decisions
 
