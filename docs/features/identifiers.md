@@ -17,13 +17,16 @@ across them.
 Canonical lease IDs look like:
 
 ```text
-cbx_abcdef123456
+cbx_abcdef1234567890abcdef1234567890
 ```
 
-The format is fixed: the literal `cbx_` prefix followed by 12 lowercase hex
-characters. `newLeaseID` mints one from 6 random bytes, and the regex
-`^cbx_[a-f0-9]{12}$` (`isCanonicalLeaseID`) decides whether a value is a
-canonical ID; anything that fails the pattern is treated as a slug.
+The format is the literal `cbx_` prefix followed by 32 lowercase hex
+characters — 16 random bytes, minted by `newLeaseID`. The 12-character form
+(`cbx_abcdef123456`) minted by earlier versions remains canonical, and
+`isCanonicalLeaseID` (`^cbx_(?:[a-f0-9]{12}|[a-f0-9]{32})$`) accepts both
+widths; anything that fails the pattern is treated as a slug, so a canonical
+ID never falls back to slug resolution. Fixed-ID automation may supply either
+width.
 
 The CLI normally mints a provisional lease ID before calling the broker. A
 broker may return a different final ID, in which case the CLI moves the local
@@ -109,6 +112,27 @@ Crabbox-created machines also carry a `crabbox=true` marker label. `crabbox list
 and `crabbox cleanup` discover machines by that marker and then read the `lease`
 label to map a provider machine back to a Crabbox lease.
 
+### Rollout
+
+Upgrading is order-independent for readers: current code accepts both widths, so
+a new CLI, coordinator, or provider adapter recognizes every existing 12-hex
+lease. The reverse does not hold — components from releases before v0.53.2
+recognize only the 12-character form:
+
+- an older CLI treats a 32-hex `cbx_` value as a slug, so `--id cbx_<32 hex>`
+  cannot resolve it;
+- an older coordinator rejects it as an input lease ID (`invalid_lease_id`), and
+  its provider ownership and cleanup guards do not recognize it, which can leave
+  a provider resource stranded.
+
+Do not roll the CLI or coordinator back below v0.53.2 while 32-hex leases exist.
+Release or stop those leases with a current CLI first, or re-issue them; leases
+that were already 12-hex stay usable in either direction.
+
+Run IDs are opaque to lookups, so a 32-hex run record stays addressable by older
+tooling, but anything that pattern-matches the 12-hex form — extraction regexes
+in scripts, log greps — will not match a 32-hex ID.
+
 ## Slug
 
 Slugs are friendly, human-typeable lease names. They look like:
@@ -173,14 +197,17 @@ lease ID with `_` rewritten to `-`).
 Each `crabbox run` gets a run ID:
 
 ```text
-run_abcdef123456
+run_abcdef1234567890abcdef1234567890
 ```
 
-Like lease IDs, run IDs are the `run_` prefix plus 12 lowercase hex characters
-from 6 random bytes. A configured coordinator mints the durable run record; the
-CLI uses that issued ID for execution metadata. Coordinator-free runs mint the
-same shape locally before dispatch. A run ID is stable across a single
-invocation; retrying the same command produces a new run.
+Run IDs are the `run_` prefix plus 32 lowercase hex characters from 16 random
+bytes. A configured coordinator mints the durable run record; the CLI uses that
+issued ID for execution metadata. Coordinator-free runs mint the same shape
+locally before dispatch. A run ID is stable across a single invocation;
+retrying the same command produces a new run. The coordinator refuses to create
+a run under an ID that already owns durable storage — an existing run or an
+in-flight retirement — so a collision re-mints instead of overwriting another
+run's history.
 
 Coordinator-issued IDs are durable handles accepted by `crabbox history`,
 `crabbox events`, `crabbox attach`, `crabbox logs`, and `crabbox results`.

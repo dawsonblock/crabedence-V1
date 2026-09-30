@@ -1,0 +1,124 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://crabedence.dev/schemas/qualification.schema.json",
+  "title": "Crabedence Release Qualification",
+  "description": "Canonical machine-readable qualification record (schema version 2). All release admission decisions derive from this file; gate semantics are enforced by scripts/lib/qualification-gates.sh, which both admission and the standalone verifier consume.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "release_status",
+    "artifact_promotable",
+    "gate_summary",
+    "gates",
+    "invariants",
+    "provenance",
+    "toolchains",
+    "environment"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "enum": [2]
+    },
+    "release_status": {
+      "type": "string",
+      "enum": ["PASS", "FAIL"]
+    },
+    "artifact_promotable": {
+      "type": "boolean"
+    },
+    "gate_summary": {
+      "type": "object",
+      "required": ["total", "passed", "failed", "skipped"],
+      "properties": {
+        "total": { "type": "integer", "minimum": 0 },
+        "passed": { "type": "integer", "minimum": 0 },
+        "failed": { "type": "integer", "minimum": 0 },
+        "skipped": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "gates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["gate_id", "gate_type", "mandatory", "status", "exit_code", "evidence"],
+        "properties": {
+          "gate_id": { "type": "string", "minLength": 1 },
+          "gate_type": {
+            "type": "string",
+            "enum": [
+              "TEST",
+              "BUILD",
+              "STATIC_ANALYSIS",
+              "INTEGRATION",
+              "SECURITY",
+              "FAULT_INJECTION",
+              "REPRODUCIBILITY",
+              "PROVENANCE",
+              "CLEAN_ROOM"
+            ]
+          },
+          "mandatory": { "type": "boolean" },
+          "status": { "type": "string", "enum": ["PASS", "FAIL", "SKIP"] },
+          "exit_code": { "type": "integer" },
+          "tests_executed": { "type": "integer", "minimum": 0 },
+          "tests_failed": { "type": "integer", "minimum": 0 },
+          "duration_ms": { "type": "integer", "minimum": 0 },
+          "evidence": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["file", "sha256"],
+            "properties": {
+              "file": { "type": "string", "minLength": 1 },
+              "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+            }
+          }
+        }
+      }
+    },
+    "invariants": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "description"],
+        "properties": {
+          "id": { "type": "string" },
+          "description": { "type": "string" }
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "required": ["commit", "tree", "branch"],
+      "properties": {
+        "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "tree": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "branch": { "type": "string" },
+        "timestamp": { "type": "string" }
+      }
+    },
+    "toolchains": {
+      "type": "object",
+      "required": ["go", "node", "npm", "git"],
+      "properties": {
+        "go": { "type": "string" },
+        "node": { "type": "string" },
+        "npm": { "type": "string" },
+        "git": { "type": "string" },
+        "postgres_client": { "type": "string" },
+        "worker_package_version": { "type": "string" }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "required": ["os", "os_version", "arch", "date"],
+      "properties": {
+        "os": { "type": "string" },
+        "os_version": { "type": "string" },
+        "arch": { "type": "string" },
+        "date": { "type": "string" }
+      }
+    }
+  }
+}

@@ -115,7 +115,9 @@ tagged_changelog="$WORK/tagged-changelog.md"
 git -C "$ROOT" show "$TAG_COMMIT:CHANGELOG.md" >"$tagged_changelog"
 "$ROOT/scripts/extract-release-notes.sh" "$TAG" \
   <"$tagged_changelog" >"$notes"
-node "$ROOT/scripts/release-provenance.mjs" verify \
+env \
+  CRABBOX_RELEASE_APPLE_SIGNING="$CRABBOX_RELEASE_APPLE_SIGNING" \
+  node "$ROOT/scripts/release-provenance.mjs" verify \
   --dir "$ASSET_DIR" \
   --tag "$TAG" \
   --tag-object "$TAG_OBJECT" \

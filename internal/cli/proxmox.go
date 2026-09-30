@@ -128,9 +128,12 @@ func (c *ProxmoxClient) doEnvelope(ctx context.Context, method, path string, for
 		return err
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024+1))
 	if err != nil {
 		return err
+	}
+	if len(data) > 4*1024*1024 {
+		return fmt.Errorf("proxmox response exceeds %d bytes", 4*1024*1024)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return &ProxmoxError{Method: method, Path: path, StatusCode: resp.StatusCode, Body: summarizeJSON([]byte(c.redactErrorBody(string(data))))}

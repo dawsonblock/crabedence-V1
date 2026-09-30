@@ -358,11 +358,23 @@ exec sh -c "$cmd"
 			}
 			lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
 			var timing map[string]json.RawMessage
-			if err := json.Unmarshal([]byte(lines[len(lines)-1]), &timing); err != nil {
-				t.Fatalf("final timing JSON: %v\n%s", err, stderr.String())
+			found := false
+			var timingLine string
+			for _, line := range lines {
+				var candidate map[string]json.RawMessage
+				if json.Unmarshal([]byte(line), &candidate) == nil {
+					if _, ok := candidate["totalMs"]; ok {
+						timing = candidate
+						timingLine = line
+						found = true
+					}
+				}
+			}
+			if !found {
+				t.Fatalf("timing JSON not found:\n%s", stderr.String())
 			}
 			if string(timing["exitCode"]) != strconv.Itoa(wantCode) || timing["leaseStopped"] != nil || timing["leaseStopError"] != nil {
-				t.Fatalf("retained reused run must omit no-attempt cleanup fields: %s", lines[len(lines)-1])
+				t.Fatalf("retained reused run must omit no-attempt cleanup fields: %s", timingLine)
 			}
 			if len(bundles) != 1 {
 				t.Fatalf("bundles=%v\n%s", bundles, stderr.String())

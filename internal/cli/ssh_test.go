@@ -6079,6 +6079,12 @@ func TestServerProviderKeyUsesOnlyCrabboxLeaseKeys(t *testing.T) {
 	if !validCrabboxProviderKey("crabbox-cbx-123456abcdef") {
 		t.Fatal("expected per-lease provider key to be valid")
 	}
+	if !validCrabboxProviderKey("crabbox-cbx-" + strings.Repeat("a", 32)) {
+		t.Fatal("expected a 32-hex per-lease provider key to be valid")
+	}
+	if validCrabboxProviderKey("crabbox-cbx-" + strings.Repeat("a", 20)) {
+		t.Fatal("non-canonical hex widths must not be treated as per-lease cleanup keys")
+	}
 	if validCrabboxProviderKey("crabbox-steipete") {
 		t.Fatal("shared key must not be treated as per-lease cleanup key")
 	}

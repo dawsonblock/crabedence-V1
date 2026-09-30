@@ -117,6 +117,8 @@ tagged_changelog="$verify_home/tagged-changelog.md"
 git -C "$ROOT" show "$TAG_COMMIT:CHANGELOG.md" >"$tagged_changelog"
 "$ROOT/scripts/extract-release-notes.sh" "$TAG" \
   <"$tagged_changelog" >"$notes"
+body="$verify_home/release-body.md"
+crabbox_release_body_from_notes "$notes" "$TAG" "$TAG_COMMIT" >"$body"
 assets=()
 while IFS= read -r name; do
   assets+=("$ASSET_DIR/$name")
@@ -129,7 +131,7 @@ gh release create "$TAG" \
   --draft \
   --verify-tag \
   --title "$TAG" \
-  --notes-file "$notes" \
+  --notes-file "$body" \
   "${assets[@]}"
 
 gh release view "$TAG" --repo "$CRABBOX_RELEASE_REPOSITORY" \
@@ -140,7 +142,7 @@ gh api --method GET "repos/$CRABBOX_RELEASE_REPOSITORY/releases/$release_id" \
   >"$verify_home/release.json"
 
 EXPECTED_ASSETS=$(crabbox_release_asset_names "${TAG#v}" | LC_ALL=C sort) \
-NOTES_FILE="$notes" \
+NOTES_FILE="$body" \
 RELEASE_FILE="$verify_home/release.json" \
 RELEASE_ID="$release_id" \
 RELEASE_TAG="$TAG" \

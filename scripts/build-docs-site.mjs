@@ -6,7 +6,7 @@ import path from "node:path";
 const root = process.cwd();
 const docsDir = path.join(root, "docs");
 const outDir = path.join(root, "dist", "docs-site");
-const repoEditBase = "https://github.com/openclaw/crabbox/edit/main/docs";
+const repoEditBase = "https://github.com/dawsonblock/crabedence-V1/edit/main/docs";
 const customDomain = "crabbox.sh";
 const providerMetadata = JSON.parse(
   fs.readFileSync(path.join(docsDir, "providers", "provider-metadata.json"), "utf8"),
@@ -596,7 +596,7 @@ function layout({ page, html, toc, prev, next, sectionName }) {
       <label class="search"><span>Search docs</span><input id="doc-search" name="docs-search" type="search" autocomplete="off" spellcheck="false" placeholder="Provider, command, topic…"></label>
       <nav class="sidebar-nav" aria-label="Documentation">${navHtml(page.rel, rootPrefix)}</nav>
       <p class="nav-empty" role="status" aria-live="polite" hidden>No matching pages.</p>
-      <div class="sidebar-foot"><a href="https://github.com/openclaw/crabbox" rel="noopener">GitHub repository</a></div>
+      <div class="sidebar-foot"><a href="https://github.com/dawsonblock/crabedence-V1" rel="noopener">GitHub repository</a></div>
     </aside>
     <main id="main-content" tabindex="-1">
       ${heroBlock}
@@ -615,7 +615,7 @@ function standardHero(page, sectionName, editUrl) {
           <h1>${escapeHtml(page.title)}</h1>
         </div>
         <div class="hero-meta">
-          <a class="repo" href="https://github.com/openclaw/crabbox" rel="noopener">GitHub</a>
+          <a class="repo" href="https://github.com/dawsonblock/crabedence-V1" rel="noopener">GitHub</a>
           <a class="edit" href="${escapeAttr(editUrl)}" rel="noopener">Edit page</a>
         </div>
       </header>`;
@@ -820,7 +820,7 @@ function landingHero(rootPrefix) {
       </aside>
       <section class="home-install" aria-labelledby="home-install-heading">
         <div><p class="eyebrow">Install the CLI</p><h2 id="home-install-heading">One Command to Start.</h2><p>Install Crabbox, choose direct, local, delegated, or team-coordinator access, then run the command your repository already knows.</p><a href="${rootPrefix}getting-started.html">Open the 10-Minute Guide <span aria-hidden="true">→</span></a></div>
-        <pre><code><span>$</span> brew install openclaw/tap/crabbox
+        <pre><code><span>$</span> brew install dawsonblock/tap/crabbox
 <span>$</span> crabbox doctor
 <span>$</span> crabbox run -- pnpm test</code></pre>
       </section>

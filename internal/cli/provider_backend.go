@@ -1282,6 +1282,12 @@ type RunResult struct {
 	LogExcerpt    string
 	ActionsURL    string
 	Artifacts     []RunArtifact
+
+	// StartupConfirm is the structured startup confirmation result, if the
+	// provider performed startup confirmation. It is populated even on
+	// failure, so callers can record startup evidence for provider
+	// qualification.
+	StartupConfirm *StartupConfirmSummary
 }
 
 type RunStatus string
@@ -1404,6 +1410,10 @@ type LeaseTarget struct {
 	LeaseID      string
 	Coordinator  *CoordinatorClient
 	runnerTiming *runnerProviderTiming
+	// StartupConfirm carries the structured startup confirmation result
+	// from providers that perform startup confirmation (Tart, Lume).
+	// nil for providers that don't perform startup confirmation.
+	StartupConfirm *StartupConfirmSummary
 	// Recorded by the validated provider lookup, never inferred from absent SSH.
 	providerRelease *leaseReleaseConfirmation
 }

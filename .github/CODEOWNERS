@@ -1,16 +1,18 @@
 # Protected release workflow and trust policy.
-/.github/CODEOWNERS @openclaw/openclaw-secops
-/.github/release-allowed-signers @openclaw/openclaw-secops
-/.github/workflows/release-assets.yml @openclaw/openclaw-secops
-/.github/workflows/verify-homebrew.yml @openclaw/openclaw-secops
-/.mac-release.env @openclaw/openclaw-secops
-/.goreleaser.yaml @openclaw/openclaw-secops
-/release/records/ @openclaw/openclaw-secops
-/scripts/*release* @openclaw/openclaw-secops
-/scripts/*publish* @openclaw/openclaw-secops
-/scripts/codesign-* @openclaw/openclaw-secops
-/scripts/verify-go-install.sh @openclaw/openclaw-secops
-/scripts/verify-macos-* @openclaw/openclaw-secops
+/.github/CODEOWNERS @dawsonblock
+/.github/release-allowed-signers @dawsonblock
+/.github/workflows/release-assets.yml @dawsonblock
+/.github/workflows/release-check.yml @dawsonblock
+/.github/workflows/release-qualification.yml @dawsonblock
+/.github/workflows/verify-homebrew.yml @dawsonblock
+/.mac-release.env @dawsonblock
+/.goreleaser.yaml @dawsonblock
+/release/records/ @dawsonblock
+/scripts/*release* @dawsonblock
+/scripts/*publish* @dawsonblock
+/scripts/codesign-* @dawsonblock
+/scripts/verify-go-install.sh @dawsonblock
+/scripts/verify-macos-* @dawsonblock
 
 # Every eventually executed Apple VM Mach-O shares this boundary.
-/internal/applevmhelper/ @openclaw/openclaw-secops
+/internal/applevmhelper/ @dawsonblock

@@ -566,7 +566,7 @@ func (c *restClient) doAt(ctx context.Context, httpClient *http.Client, baseURL,
 		return nil, redactError(err)
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
+	data, err := shared.ReadBoundedResponse(resp.Body, shared.MaxControlPlaneResponseBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -652,7 +652,7 @@ func (c *restClient) doMultipartAt(ctx context.Context, baseURL, method, endpoin
 		return nil, redactError(err)
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
+	data, err := shared.ReadBoundedResponse(resp.Body, shared.MaxControlPlaneResponseBytes)
 	if err != nil {
 		return nil, err
 	}

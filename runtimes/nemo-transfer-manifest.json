@@ -1,0 +1,67 @@
+{
+  "tree": "runtimes/nemo-relay",
+  "runtime_version": "0.9.1-rc.4",
+  "shipped_tree_sha256": "e70d34146641154440d2dd236b7f9580f5d1d20aeb911b2d6f14e4be18482fcf",
+  "file_count": 1458,
+  "excluded": [
+    ".git",
+    ".uv-cache",
+    ".venv",
+    "__pycache__",
+    "node_modules",
+    "target"
+  ],
+  "source": {
+    "path": "../NEMO-feat-native-plugin-isolation",
+    "file_count": 1438,
+    "sha256": "050a9cae3f9eeb4f4f0f34f89ccafd7617d93b4c7e051fe08f3a1d7d0c5e59fa"
+  },
+  "workspace_members_added": [
+    "bridges/nemo-crabedence",
+    "bridges/nemo-effect-router",
+    "bridges/nemo-crabedence-runtime"
+  ],
+  "local_modifications": [
+    "Cargo.toml",
+    "Cargo.lock",
+    "crates/cli/src/mcp_environment.rs",
+    "integrations/coding-agents/codex/.mcp.json"
+  ],
+  "added_paths": [
+    "bridges/",
+    "TRANSFER-PROVENANCE.md"
+  ],
+  "binaries": [
+    {
+      "role": "runtime",
+      "package": "nemo-crabedence-runtime",
+      "binary": "nemo-crabedence-runtime",
+      "source": "bridges/nemo-crabedence-runtime/src/main.rs"
+    },
+    {
+      "role": "plugin-host",
+      "package": "nemo-relay-native-loader",
+      "binary": "nemo-plugin-host",
+      "source": "crates/native-loader/src/bin/nemo-plugin-host.rs"
+    },
+    {
+      "role": "qualification",
+      "package": "nemo-relay-ledger",
+      "binary": "nemo-effect-schema",
+      "source": "crates/ledger/src/bin/nemo_effect_schema.rs",
+      "features": [
+        "unstable-postgres"
+      ]
+    },
+    {
+      "role": "qualification",
+      "package": "nemo-relay-ledger",
+      "binary": "nemo-postgres-crash-fixture",
+      "source": "crates/ledger/src/bin/postgres_crash_fixture.rs",
+      "features": [
+        "unstable-postgres",
+        "unstable-hardening-testkit"
+      ]
+    }
+  ]
+}

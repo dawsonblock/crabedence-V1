@@ -551,7 +551,11 @@ func TestRunDoesNotPublishClaimWhenCreationLockIsCanceled(t *testing.T) {
 	}
 	defer unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	// The deadline must outlive sandbox creation so Run deterministically
+	// reaches the held operation lock: a 20ms budget can expire during
+	// setup under load, and then no sandbox exists to roll back and the
+	// assertion below tests nothing.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	_, err = backend.Run(ctx, RunRequest{
 		Repo: Repo{Name: "my-app", Root: tempGitRepo(t)}, NoSync: true, Command: []string{"true"},

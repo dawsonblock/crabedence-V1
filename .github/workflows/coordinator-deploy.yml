@@ -44,7 +44,14 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
           if [ -z "${CLOUDFLARE_API_TOKEN}" ]; then
-            echo "::notice::CLOUDFLARE_API_TOKEN is not set; skipping deploy. Add it to the 'coordinator' environment to activate."
+            echo "::warning::CLOUDFLARE_API_TOKEN is not set; this run did NOT deploy. Add it to the 'coordinator' environment to activate."
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              {
+                echo "### Coordinator deploy SKIPPED"
+                echo
+                echo "No \`CLOUDFLARE_API_TOKEN\` is configured in the \`coordinator\` environment, so this run did not deploy anything. The live coordinator is whatever was deployed last; its \`/v1/health\` \`commit\` field identifies it."
+              } >> "${GITHUB_STEP_SUMMARY}"
+            fi
             echo "ready=false" >> "${GITHUB_OUTPUT}"
           else
             echo "ready=true" >> "${GITHUB_OUTPUT}"
@@ -79,10 +86,22 @@ jobs:
           trap 'rm -f "${SECRETS_FILE}"' EXIT
           node ../scripts/prepare-coordinator-deploy-secrets.mjs
 
+          # Runtime identity: /v1/health must name the exact deployed commit
+          # and the version file it was built from, so production is never
+          # identified by a version number alone.
+          DEPLOY_ARGS=()
+          if [ -n "${GITHUB_SHA:-}" ]; then
+            DEPLOY_ARGS+=(--var "CRABBOX_BUILD_COMMIT:${GITHUB_SHA}")
+          fi
+          BUILD_VERSION="$(tr -d '[:space:]' < ../VERSION)"
+          if [ -n "${BUILD_VERSION}" ]; then
+            DEPLOY_ARGS+=(--var "CRABBOX_BUILD_VERSION:${BUILD_VERSION}")
+          fi
+
           if [ -s "${SECRETS_FILE}" ]; then
-            npm run deploy -- --secrets-file "${SECRETS_FILE}"
+            npm run deploy -- --secrets-file "${SECRETS_FILE}" ${DEPLOY_ARGS[@]+"${DEPLOY_ARGS[@]}"}
           else
-            npm run deploy
+            npm run deploy -- ${DEPLOY_ARGS[@]+"${DEPLOY_ARGS[@]}"}
           fi
 
           if [ "${CLEAR_DAYTONA_SNAPSHOT}" = "true" ]; then

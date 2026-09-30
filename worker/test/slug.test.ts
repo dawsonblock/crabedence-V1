@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   InvalidLeaseSlugError,
+  isCanonicalLeaseID,
   leaseProviderName,
   leaseSlugFromID,
   maxRequestedLeaseSlugLength,
@@ -22,6 +23,18 @@ describe("lease slugs", () => {
     expect(leaseSlugFromID("cbx_000000000001")).toBe("tidal-lobster");
     expect(leaseSlugFromID("cbx_abcdef123456")).toBe("blue-prawn");
     expect(leaseSlugFromID("cbx_deadbeefcafe")).toBe("silver-crab");
+  });
+
+  it("accepts both canonical lease-ID widths", () => {
+    // 12-hex IDs minted by earlier versions and 32-hex IDs minted now are
+    // both canonical; anything else must fall through to slug resolution.
+    expect(isCanonicalLeaseID("cbx_abcdef123456")).toBe(true);
+    expect(isCanonicalLeaseID(`cbx_${"a".repeat(32)}`)).toBe(true);
+    expect(isCanonicalLeaseID("cbx_abcdef12345")).toBe(false);
+    expect(isCanonicalLeaseID(`cbx_${"a".repeat(31)}`)).toBe(false);
+    expect(isCanonicalLeaseID(`cbx_${"a".repeat(33)}`)).toBe(false);
+    expect(isCanonicalLeaseID("cbx_ABCDEF123456")).toBe(false);
+    expect(isCanonicalLeaseID("blue-lobster")).toBe(false);
   });
 
   it("normalizes requested slugs and appends collision suffixes", () => {

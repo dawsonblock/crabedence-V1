@@ -130,14 +130,19 @@ function runPrepare(t, overrides = {}) {
   };
 }
 
-function assertDeploy(event, secrets) {
+function assertDeploy(event, secrets, extra = []) {
   assert.equal(event.command, "npm");
   assert.deepEqual(
     event.args,
-    secrets ? ["run", "deploy", "--", "--secrets-file", event.file] : ["run", "deploy"],
+    secrets
+      ? ["run", "deploy", "--", "--secrets-file", event.file, ...extra]
+      : ["run", "deploy", "--", ...extra],
   );
   assert.deepEqual(event.secrets, secrets);
 }
+
+const buildVersion = fs.readFileSync(path.join(repoRoot, "VERSION"), "utf8").trim();
+const versionArgs = ["--var", `CRABBOX_BUILD_VERSION:${buildVersion}`];
 
 test("artifact-only deploy delivers the bundled pair with the Worker version", (t) => {
   const result = runDeploy(t, {
@@ -145,7 +150,23 @@ test("artifact-only deploy delivers the bundled pair with the Worker version", (
   });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.events.length, 1);
-  assertDeploy(result.events[0], artifactPair);
+  assertDeploy(result.events[0], artifactPair, versionArgs);
+});
+
+test("coordinator deploy publishes the exact build identity", (t) => {
+  const commit = "0123456789abcdef0123456789abcdef01234567";
+  const result = runDeploy(t, {
+    GITHUB_SHA: commit,
+    CRABBOX_ARTIFACTS_CREDENTIALS_JSON: JSON.stringify(artifactPair),
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.events.length, 1);
+  assertDeploy(result.events[0], artifactPair, [
+    "--var",
+    `CRABBOX_BUILD_COMMIT:${commit}`,
+    "--var",
+    `CRABBOX_BUILD_VERSION:${buildVersion}`,
+  ]);
 });
 
 test("coordinator deploy keeps optional credentials with the serialized environment owner", () => {
@@ -194,7 +215,7 @@ for (const [label, env, expected] of [
     assert.equal(deployed.status, 0, deployed.stderr);
     assert.equal(deployed.stdout + deployed.stderr, "");
     assert.equal(deployed.events.length, 1);
-    assertDeploy(deployed.events[0], expected);
+    assertDeploy(deployed.events[0], expected, versionArgs);
   });
 }
 
@@ -262,7 +283,7 @@ for (const withArtifacts of [false, true]) {
     assert.equal(deployed.status, 0, deployed.stderr);
     assert.equal(deployed.stdout + deployed.stderr, "");
     assert.equal(deployed.events.length, 2);
-    assertDeploy(deployed.events[0], withArtifacts ? artifactPair : undefined);
+    assertDeploy(deployed.events[0], withArtifacts ? artifactPair : undefined, versionArgs);
     assert.deepEqual(deployed.events[1], {
       command: "npx",
       args: ["wrangler", "secret", "bulk"],
@@ -287,7 +308,7 @@ for (const withArtifacts of [false, true]) {
     assert.equal(result.status, 17);
     assert.equal(result.stdout + result.stderr, "");
     assert.equal(result.events.length, 1);
-    assertDeploy(result.events[0], withArtifacts ? artifactPair : undefined);
+    assertDeploy(result.events[0], withArtifacts ? artifactPair : undefined, versionArgs);
   });
 }
 

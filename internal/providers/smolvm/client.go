@@ -414,7 +414,7 @@ func (c *client) doJSONWithClient(ctx context.Context, httpClient *http.Client, 
 	if out == nil {
 		return nil
 	}
-	data, err := io.ReadAll(resp.Body)
+	data, err := shared.ReadBoundedResponse(resp.Body, shared.MaxControlPlaneResponseBytes)
 	if err != nil {
 		return err
 	}

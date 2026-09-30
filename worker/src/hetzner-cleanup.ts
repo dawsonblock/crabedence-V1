@@ -11,6 +11,7 @@ import {
   providerLabelValue,
   workspacePrewarmProviderOwner,
 } from "./provider-labels";
+import { isCanonicalLeaseID } from "./slug";
 import type { HetznerCleanupEvidence, HetznerServer, LeaseRecord } from "./types";
 
 type SaveEvidence = (evidence: HetznerCleanupEvidence) => Promise<void>;
@@ -18,7 +19,7 @@ type SaveEvidence = (evidence: HetznerCleanupEvidence) => Promise<void>;
 function keyOnlyLeaseIdentity(lease: LeaseRecord): boolean {
   return (
     lease.provider === "hetzner" &&
-    /^cbx_[a-f0-9]{12}$/.test(lease.id) &&
+    isCanonicalLeaseID(lease.id) &&
     lease.providerKey === providerKeyForLease(lease.id) &&
     lease.serverID === 0 &&
     lease.cloudID === "" &&
@@ -174,7 +175,7 @@ export async function confirmHetznerServerCleanup(
 ): Promise<void> {
   if (
     lease.provider !== "hetzner" ||
-    !/^cbx_[a-f0-9]{12}$/.test(lease.id) ||
+    !isCanonicalLeaseID(lease.id) ||
     !Number.isSafeInteger(lease.serverID) ||
     lease.serverID <= 0 ||
     (lease.cloudID && lease.cloudID !== String(lease.serverID))

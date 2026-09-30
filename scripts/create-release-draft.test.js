@@ -37,7 +37,7 @@ function fixture(t, options = {}) {
     fs.copyFileSync(path.join(scripts, name), path.join(root, "scripts", name));
   }
   executable(path.join(root, "scripts", "verify-release-source.sh"), "#!/bin/sh\nexit 0\n");
-  for (const name of ["bash", "env", "dirname", "mktemp", "find", "chmod", "rm", "awk", "sort", "shasum", "cmp", "mkdir"]) {
+  for (const name of ["bash", "env", "dirname", "mktemp", "find", "chmod", "rm", "awk", "sort", "shasum", "cmp", "mkdir", "wc", "tr", "cat"]) {
     const tool = execFileSync("/bin/sh", ["-c", 'command -v "$1"', "fixture", name], {
       encoding: "utf8",
     }).trim();

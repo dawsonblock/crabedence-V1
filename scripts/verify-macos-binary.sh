@@ -45,6 +45,56 @@ ACTUAL_ARCH=$(lipo -archs "$BINARY")
   exit 1
 }
 
+if [[ "$CRABBOX_RELEASE_APPLE_SIGNING" == "none" ]]; then
+  # This release contract declares macOS artifacts unsigned and not
+  # notarized. "Unsigned" means no identity-bearing signature: the Mach-O
+  # either has no code signature at all (typical for amd64 builds) or only
+  # the linker-generated adhoc signature the toolchain stamps on every
+  # arm64 Mach-O — Signature=adhoc, linker-signed, no team, no authority,
+  # no secure timestamp. An identity signature or a notarization ticket is
+  # a failure, never a tolerated extra.
+  UNSIGNED_SIGNATURE=$(codesign -dvvv "$BINARY" 2>&1 || true)
+  if ! grep -q 'code object is not signed at all' <<<"$UNSIGNED_SIGNATURE"; then
+    grep -q '^Signature=adhoc$' <<<"$UNSIGNED_SIGNATURE" || {
+      echo "unsigned release policy: binary carries an identity code signature" >&2
+      exit 1
+    }
+    grep -q 'linker-signed' <<<"$UNSIGNED_SIGNATURE" || {
+      echo "unsigned release policy: binary signature was not linker-generated" >&2
+      exit 1
+    }
+    if grep -q '^TeamIdentifier=' <<<"$UNSIGNED_SIGNATURE"; then
+      grep -q '^TeamIdentifier=not set$' <<<"$UNSIGNED_SIGNATURE" || {
+        echo "unsigned release policy: binary carries a team identity" >&2
+        exit 1
+      }
+    fi
+    if grep -q '^Authority=' <<<"$UNSIGNED_SIGNATURE"; then
+      echo "unsigned release policy: binary carries a signing authority" >&2
+      exit 1
+    fi
+    if grep -q '^Timestamp=' <<<"$UNSIGNED_SIGNATURE"; then
+      echo "unsigned release policy: binary carries a secure timestamp" >&2
+      exit 1
+    fi
+  fi
+  # Notarization is asserted through the same codesign surface the signed
+  # path uses — this verifier never invokes a separate ticket tool — so an
+  # unsigned binary must also fail the notarization requirement.
+  if codesign --verify --strict --check-notarization -R=notarized "$BINARY" >/dev/null 2>&1; then
+    echo "unsigned release policy: binary satisfies the notarization requirement" >&2
+    exit 1
+  fi
+  if [[ "$EXECUTE" == 1 ]]; then
+    [[ "$IDENTIFIER" == "$CRABBOX_RELEASE_CLI_IDENTIFIER" ]] || {
+      echo "candidate execution is supported only for the Crabbox CLI" >&2
+      exit 2
+    }
+    env -i LC_ALL=C PATH=/usr/bin:/bin:/usr/sbin:/sbin "$BINARY" --version
+  fi
+  exit 0
+fi
+
 REQUIREMENT=$(crabbox_release_designated_requirement "$IDENTIFIER")
 EXPECTED_REQUIREMENT_CANONICAL=$(csreq -r "=$REQUIREMENT" -t)
 codesign --verify --strict -R="$REQUIREMENT" --verbose=2 "$BINARY"

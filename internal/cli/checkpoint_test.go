@@ -388,7 +388,7 @@ func TestCheckpointRestoreDryRunUsesStoredLeaseTarget(t *testing.T) {
 	if err := app.checkpointRestore(context.Background(), []string{record.ID, "--id", leaseID, "--provider", "aws", "--dry-run"}); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(stdout.String(), `workdir=C:\crabbox\`+leaseID+`\crabbox`) {
+	if !strings.Contains(stdout.String(), `workdir=C:\crabbox\`+leaseID+`\`) {
 		t.Fatalf("stdout=%q", stdout.String())
 	}
 	assertCheckpointLastUsedAt(t, store, record.ID, lastUsedAt)
@@ -664,17 +664,17 @@ func TestCheckpointForkRejectsInvalidFlagCombinations(t *testing.T) {
 		{
 			name: "fixed lease must be canonical",
 			args: []string{"chk_missing", "--lease-id", "cbx_NOT_CANONICAL"},
-			want: "--lease-id must match cbx_<12 lowercase hex characters>",
+			want: "--lease-id must match cbx_<12 or 32 lowercase hex characters>",
 		},
 		{
 			name: "explicitly empty fixed lease fails closed",
 			args: []string{"chk_missing", "--lease-id="},
-			want: "--lease-id must match cbx_<12 lowercase hex characters>",
+			want: "--lease-id must match cbx_<12 or 32 lowercase hex characters>",
 		},
 		{
 			name: "whitespace-only fixed lease fails closed",
 			args: []string{"chk_missing", "--lease-id", "   "},
-			want: "--lease-id must match cbx_<12 lowercase hex characters>",
+			want: "--lease-id must match cbx_<12 or 32 lowercase hex characters>",
 		},
 		{
 			name: "direct parallels snapshots reject fixed leases",

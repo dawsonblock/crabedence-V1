@@ -66,10 +66,10 @@ const forbiddenCredentials = [
 
 function formulaMetadata(checksum = hashes.darwinArm64, arch = "arm64") {
   return { formulae: [{
-    name: "crabbox", full_name: "openclaw/tap/crabbox", tap: "openclaw/tap",
+    name: "crabbox", full_name: "dawsonblock/tap/crabbox", tap: "dawsonblock/tap",
     versions: { stable: "1.2.3" },
     urls: { stable: {
-      url: `https://github.com/openclaw/crabbox/releases/download/v1.2.3/crabbox_1.2.3_darwin_${arch}.tar.gz`,
+      url: `https://github.com/dawsonblock/crabedence-V1/releases/download/v1.2.3/crabbox_1.2.3_darwin_${arch}.tar.gz`,
       checksum,
     } },
   }] };
@@ -243,6 +243,25 @@ case "$binary" in
   */bin/crabbox-apple-vm-helper) identifier=$CRABBOX_RELEASE_HELPER_IDENTIFIER ;;
   *) exit 98 ;;
 esac
+if [[ "$CRABBOX_RELEASE_APPLE_SIGNING" == none ]]; then
+  case "$1" in
+    -dvvv)
+      [[ "$#" == 2 ]] || exit 98
+      ${signatureFailure
+        ? `printf '%s\\\\n' "Identifier=$identifier" 'Authority=Developer ID Application: Example (EXAMPLE0000)' 'TeamIdentifier=EXAMPLE0000' 'CodeDirectory flags=0x10000(runtime)' 'Timestamp=Sep 1, 2026'`
+        : `printf '%s: code object is not signed at all\\\\n' "$binary" >&2\n      exit 1`}
+      ;;
+    --verify)
+      ${signatureFailure
+        ? "exit 0"
+        : notarizationFailure
+          ? '[[ "$*" == *--check-notarization* ]] || exit 1'
+          : "exit 1"}
+      ;;
+    *) exit 98 ;;
+  esac
+  exit 0
+fi
 case "$1" in
   --verify)
     if [[ "$*" == *--check-notarization* ]]; then
@@ -276,19 +295,19 @@ esac
 ${credentialCanary}printf 'brew:%s\\n' "$*" >>${shellQuote(log)}
 case "\${1:-}" in
   tap)
-    [ "$*" = "tap openclaw/tap" ] || exit 80
+    [ "$*" = "tap dawsonblock/tap" ] || exit 80
     ;;
   update)
     [ "\${2:-}" = --force ] || exit 81
     ;;
   info)
-    [ "$*" = "info --json=v2 --formula openclaw/tap/crabbox" ] || exit 82
+    [ "$*" = "info --json=v2 --formula dawsonblock/tap/crabbox" ] || exit 82
     /bin/cat ${shellQuote(formulaPath)}
     ;;
   fetch)
     [ "\${2:-}" = --force ] || exit 83
     [ "\${3:-}" = --formula ] || exit 84
-    [ "\${4:-}" = openclaw/tap/crabbox ] || exit 85
+    [ "\${4:-}" = dawsonblock/tap/crabbox ] || exit 85
     [ "$HOME" = "\${HOMEBREW_CACHE%/cache}/home" ] || exit 86
     [ -d "$HOME" ] && [ -d "$HOMEBREW_CACHE" ] || exit 87
     [ -z "$(/usr/bin/find "$HOMEBREW_CACHE" -mindepth 1 -print -quit)" ] || exit 88
@@ -296,11 +315,11 @@ case "\${1:-}" in
     /usr/bin/touch "$HOMEBREW_CACHE/fetched"
     ;;
   list)
-    [ "$*" = "list --formula openclaw/tap/crabbox" ] || exit 82
+    [ "$*" = "list --formula dawsonblock/tap/crabbox" ] || exit 82
     exit ${alreadyInstalled ? 0 : 1}
     ;;
   install|reinstall)
-    [ "\${2:-}" = openclaw/tap/crabbox ] || exit 82
+    [ "\${2:-}" = dawsonblock/tap/crabbox ] || exit 82
     [ -f "$HOMEBREW_CACHE/fetched" ] || exit 89
     /bin/mkdir -p ${shellQuote(path.join(prefix, "bin"))}
     /bin/cp ${shellQuote(cli)} ${shellQuote(installedCli)}
@@ -308,11 +327,11 @@ case "\${1:-}" in
     ${helperByteMismatch ? `printf '# changed\\n' >>${shellQuote(installedHelper)}` : ""}
     ${corruptInstall};;
   --prefix)
-    [ "$*" = "--prefix openclaw/tap/crabbox" ] || exit 82
+    [ "$*" = "--prefix dawsonblock/tap/crabbox" ] || exit 82
     printf '%s\\n' ${shellQuote(prefix)}
     ;;
   test)
-    [ "$*" = "test openclaw/tap/crabbox" ] || exit 82
+    [ "$*" = "test dawsonblock/tap/crabbox" ] || exit 82
     ;;
   *)
     exit 90
@@ -403,7 +422,7 @@ test("Homebrew verifier checks immutable bytes before credential-free native ins
   const main = source.slice(source.indexOf("main() {"));
   const phase = source.slice(source.indexOf("homebrew_phase() {"), source.indexOf("main() {"));
 
-  assert.match(source, /^FORMULA=openclaw\/tap\/crabbox$/m);
+  assert.match(source, /^FORMULA="\$CRABBOX_RELEASE_TAP\/\$CRABBOX_RELEASE_TAP_FORMULA"$/m);
   assert.match(source, /REQUIRE_PUBLISHABLE=1/);
   assert.match(source, /validate-release-publication\.mjs" public-release/);
   assert.doesNotMatch(source, /public-verifier-run-id|proof ZIP|public-proof|witness|postflight|actions\/runs/);
@@ -489,7 +508,7 @@ test("run-free public validation and freeze bind the complete immutable asset in
     state: "uploaded",
     digest: `sha256:${createHash("sha256").update(files[name]).digest("hex")}`,
     updated_at: "2026-07-10T10:00:00Z",
-    url: `https://api.github.com/repos/openclaw/crabbox/releases/assets/${1000 + index}`,
+    url: `https://api.github.com/repos/dawsonblock/crabedence-V1/releases/assets/${1000 + index}`,
   }));
   const release = {
     id: 123,
@@ -515,7 +534,7 @@ test("run-free public validation and freeze bind the complete immutable asset in
     assetDirectory,
   ];
   const env = {
-    CRABBOX_PUBLISH_REPOSITORY: "openclaw/crabbox",
+    CRABBOX_PUBLISH_REPOSITORY: "dawsonblock/crabedence-V1",
     CRABBOX_PUBLISH_RELEASE_ID: "123",
     CRABBOX_PUBLISH_TAG: "v1.2.3",
     CRABBOX_PUBLISH_TAG_OBJECT: "a".repeat(40),
@@ -535,7 +554,7 @@ printf '## 1.2.3\\n\\nexact notes\\n'
 `);
     writeExecutable(path.join(bin, "curl"), `#!/bin/bash
 set -eu
-[[ "$*" == '--disable --fail --silent --show-error --location --retry 3 --header Accept: application/vnd.github+json --header X-GitHub-Api-Version: 2026-03-10 https://api.github.com/repos/openclaw/crabbox/releases/123' ]] || exit 98
+[[ "$*" == '--disable --fail --silent --show-error --location --retry 3 --header Accept: application/vnd.github+json --header X-GitHub-Api-Version: 2026-03-10 https://api.github.com/repos/dawsonblock/crabedence-V1/releases/123' ]] || exit 98
 /bin/cat ${shellQuote(path.join(root, "release.json"))}
 `);
     const frozen = path.join(root, "frozen");
@@ -571,7 +590,7 @@ set -eu
       { digest: "sha256:" + "0".repeat(64) }, { state: "new" },
       { url: assets[0].url + "?token=x" },
       { url: assets[0].url.replace("github.com", "github.com@evil.test") },
-      { url: assets[0].url.replace("openclaw/crabbox", "other/crabbox") },
+      { url: assets[0].url.replace("dawsonblock/crabedence-V1", "other/crabbox") },
     ]) check({ ...release, assets: [{ ...assets[0], ...patch }, ...assets.slice(1)] },
       /asset|digest/);
     writeJson("release.json", release);
@@ -642,7 +661,7 @@ exit 98
     writeExecutable(path.join(bin, "curl"), `#!/bin/bash
 set -eu
 printf 'fetch\\n' >>${shellQuote(curlLog)}
-[[ "$*" == '--disable --fail --silent --show-error --location --retry 3 https://api.github.com/repos/openclaw/crabbox/releases/tags/v1.2.3' ]] || exit 98
+[[ "$*" == '--disable --fail --silent --show-error --location --retry 3 https://api.github.com/repos/dawsonblock/crabedence-V1/releases/tags/v1.2.3' ]] || exit 98
 [[ ! -f ${shellQuote(fetchFailure)} ]] || exit 22
 /bin/cat ${shellQuote(metadata)}
 `);
@@ -652,7 +671,7 @@ const fs = require("node:fs");
 const args = process.argv.slice(2);
 fs.appendFileSync(${JSON.stringify(dispatchLog)}, JSON.stringify(args) + "\\n");
 for (const name of ${JSON.stringify(forbiddenCredentials)}) assert.ok(!(name in process.env), name);
-assert.deepEqual(args.slice(0, -2), ["workflow", "run", "update-formula.yml", "--repo", "openclaw/homebrew-tap", "--ref", "main", "-f", "formula=crabbox", "-f", "tag=v1.2.3", "-f", "repository=openclaw/crabbox"]);
+assert.deepEqual(args.slice(0, -2), ["workflow", "run", "update-formula.yml", "--repo", "dawsonblock/homebrew-tap", "--ref", "main", "-f", "formula=crabbox", "-f", "tag=v1.2.3", "-f", "repository=dawsonblock/crabedence-V1"]);
 assert.equal(args.at(-2), "-f");
 assert.ok(args.at(-1).startsWith("assets="));
 assert.deepEqual(JSON.parse(args.at(-1).slice(7)), ${JSON.stringify(expectedAssets)});
@@ -727,14 +746,14 @@ test("mocked Homebrew phase proves fresh fetch, frozen bytes, trust, and final e
   assert.match(result.calls, /^verify-source:v1\.2\.3 /m);
   assert.match(result.calls, /^verify-release:v1\.2\.3 /m);
   assert.match(result.calls, /^brew:update --force$/m);
-  assert.match(result.calls, /^brew:fetch --force --formula openclaw\/tap\/crabbox$/m);
-  assert.match(result.calls, /^brew:install openclaw\/tap\/crabbox$/m);
-  assert.match(result.calls, /^verify-macos:org\.openclaw\.crabbox arm64 /m);
+  assert.match(result.calls, /^brew:fetch --force --formula dawsonblock\/tap\/crabbox$/m);
+  assert.match(result.calls, /^brew:install dawsonblock\/tap\/crabbox$/m);
+  assert.match(result.calls, /^verify-macos:io\.github\.dawsonblock\.crabbox arm64 /m);
   assert.match(
     result.calls,
-    /^verify-macos:org\.openclaw\.crabbox\.apple-vm-helper arm64 /m,
+    /^verify-macos:io\.github\.dawsonblock\.crabbox\.apple-vm-helper arm64 /m,
   );
-  assert.match(result.calls, /^brew:test openclaw\/tap\/crabbox$/m);
+  assert.match(result.calls, /^brew:test dawsonblock\/tap\/crabbox$/m);
   assert.ok(result.calls.indexOf("brew:fetch") < result.calls.indexOf("brew:install"));
   assert.ok(result.calls.indexOf("verify-macos:") < result.calls.indexOf("brew:test"));
 });
@@ -750,7 +769,7 @@ test("mocked Homebrew phase rejects installed bytes that differ from the release
 test("mocked Homebrew phase stops when the forced public fetch fails", () => {
   const result = runMockedHomebrewPhase({ fetchFailure: true });
   assert.notEqual(result.status, 0);
-  assert.match(result.calls, /^brew:fetch --force --formula openclaw\/tap\/crabbox$/m);
+  assert.match(result.calls, /^brew:fetch --force --formula dawsonblock\/tap\/crabbox$/m);
   assert.doesNotMatch(result.calls, /^brew:install /m);
   assert.doesNotMatch(result.calls, /^verify-macos:/m);
 });
@@ -758,10 +777,10 @@ test("mocked Homebrew phase stops when the forced public fetch fails", () => {
 test("mocked Homebrew phase propagates native signature verifier failure", () => {
   const result = runMockedHomebrewPhase({ macosVerifierFailure: true });
   assert.notEqual(result.status, 0);
-  assert.match(result.calls, /^verify-macos:org\.openclaw\.crabbox arm64 /m);
+  assert.match(result.calls, /^verify-macos:io\.github\.dawsonblock\.crabbox arm64 /m);
   assert.doesNotMatch(
     result.calls,
-    /^verify-macos:org\.openclaw\.crabbox\.apple-vm-helper arm64 /m,
+    /^verify-macos:io\.github\.dawsonblock\.crabbox\.apple-vm-helper arm64 /m,
   );
   assert.doesNotMatch(result.calls, /^brew:test /m);
 });
@@ -770,19 +789,19 @@ test("mocked Homebrew phase rejects helper embedded-VMD trust mismatch", () => {
   const result = runMockedHomebrewPhase({ releaseTrust: false });
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /wrong embedded VMD trust policy/);
-  assert.match(result.calls, /^verify-macos:org\.openclaw\.crabbox arm64 /m);
+  assert.match(result.calls, /^verify-macos:io\.github\.dawsonblock\.crabbox arm64 /m);
   assert.match(
     result.calls,
-    /^verify-macos:org\.openclaw\.crabbox\.apple-vm-helper arm64 /m,
+    /^verify-macos:io\.github\.dawsonblock\.crabbox\.apple-vm-helper arm64 /m,
   );
-  assert.match(result.calls, /^brew:test openclaw\/tap\/crabbox$/m);
+  assert.match(result.calls, /^brew:test dawsonblock\/tap\/crabbox$/m);
 });
 
 test("mocked Homebrew phase rejects the installed CLI version last", () => {
   const result = runMockedHomebrewPhase({ versionOutput: "1.2.4" });
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /version mismatch: 1\.2\.4/);
-  assert.match(result.calls, /^brew:test openclaw\/tap\/crabbox$/m);
+  assert.match(result.calls, /^brew:test dawsonblock\/tap\/crabbox$/m);
 });
 
 test("six-argument launcher strips arbitrary credentials before all Homebrew and candidate commands", () => {
@@ -794,24 +813,29 @@ test("six-argument launcher strips arbitrary credentials before all Homebrew and
   assert.doesNotMatch(result.stdout + result.stderr, /synthetic-secret-canary/);
 });
 
-test("installed native signature and online notarization gates run before brew test", () => {
+test("unsigned artifacts are proven natively and signed or notarized bytes are rejected", () => {
   const valid = runMockedHomebrewPhase({ useNativeVerifier: true });
   assert.equal(valid.status, 0, valid.stderr);
-  assert.match(valid.calls, /codesign:--verify --strict --check-notarization -R=notarized/);
-  for (const option of ["signatureFailure", "notarizationFailure"]) {
-    const failed = runMockedHomebrewPhase({ useNativeVerifier: true, [option]: true });
-    assert.notEqual(failed.status, 0);
-    assert.match(failed.calls, /codesign:--verify --strict/);
-    assert.doesNotMatch(failed.calls, /brew:test/);
-  }
+  assert.match(valid.calls, /codesign:-dvvv/);
+  assert.match(valid.calls, /codesign:--verify --strict /);
+  assert.match(valid.calls, /codesign:--verify --strict --check-notarization/);
+  const signed = runMockedHomebrewPhase({ useNativeVerifier: true, signatureFailure: true });
+  assert.notEqual(signed.status, 0);
+  assert.match(signed.calls, /codesign:-dvvv/);
+  assert.doesNotMatch(signed.calls, /codesign:--verify/);
+  assert.doesNotMatch(signed.calls, /brew:test/);
+  const notarized = runMockedHomebrewPhase({ useNativeVerifier: true, notarizationFailure: true });
+  assert.notEqual(notarized.status, 0);
+  assert.match(notarized.calls, /codesign:--verify --strict --check-notarization/);
+  assert.doesNotMatch(notarized.calls, /brew:test/);
 });
 
 test("Intel installation omits the helper and an existing install uses reinstall", () => {
   const result = runMockedHomebrewPhase({ nativeArch: "x86_64", alreadyInstalled: true });
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Verified Homebrew v1.2.3 on x86_64/);
-  assert.match(result.calls, /brew:reinstall openclaw\/tap\/crabbox/);
-  assert.match(result.calls, /verify-macos:org.openclaw.crabbox x86_64/);
+  assert.match(result.calls, /brew:reinstall dawsonblock\/tap\/crabbox/);
+  assert.match(result.calls, /verify-macos:io.github.dawsonblock.crabbox x86_64/);
   assert.doesNotMatch(result.calls, /verify-macos:.*apple-vm-helper/);
 });
 
@@ -846,7 +870,7 @@ test("formula metadata accepts maintained content and rejects wrong native ident
     (f) => { f.urls.stable.checksum = "e".repeat(64); },
     (f) => { f.urls.stable.checksum = hashes.darwinArm64.toUpperCase(); },
     (f) => { f.urls.stable.url = f.urls.stable.url.replace("arm64", "amd64"); },
-    (f) => { f.urls.stable.url = f.urls.stable.url.replace("openclaw/crabbox", "other/crabbox"); },
+    (f) => { f.urls.stable.url = f.urls.stable.url.replace("dawsonblock/crabedence-V1", "other/crabbox"); },
     (f) => { f.urls.stable.url += "?download=1"; },
     (f) => { f.urls.stable.url = f.urls.stable.url.replace("github.com", "github.com@evil.test"); },
   ]) {
@@ -884,9 +908,9 @@ test("blocked v0.37.0 record stops before the mocked brew executable", () => {
 case "$*" in
   "-C ${repoRoot} status --porcelain=v1 --untracked-files=all -- "* | \
   "-C ${repoRoot} diff --quiet ${verifierCommit} -- "*) exit 0 ;;
-  "-C ${repoRoot} remote get-url origin") printf 'https://github.com/openclaw/crabbox\\n' ;;
-  "ls-remote https://github.com/openclaw/crabbox refs/heads/main") printf '${verifierCommit} refs/heads/main\\n' ;;
-  "-C ${repoRoot} -c fetch.writeCommitGraph=false fetch --quiet --no-tags https://github.com/openclaw/crabbox ${verifierCommit}") exit 0 ;;
+  "-C ${repoRoot} remote get-url origin") printf 'https://github.com/dawsonblock/crabedence-V1\\n' ;;
+  "ls-remote https://github.com/dawsonblock/crabedence-V1 refs/heads/main") printf '${verifierCommit} refs/heads/main\\n' ;;
+  "-C ${repoRoot} -c fetch.writeCommitGraph=false fetch --quiet --no-tags https://github.com/dawsonblock/crabedence-V1 ${verifierCommit}") exit 0 ;;
   "-C ${repoRoot} merge-base --is-ancestor ${verifierCommit} ${verifierCommit}" | \
   "-C ${repoRoot} merge-base --is-ancestor ${sourceCommit} ${verifierCommit}") exit 0 ;;
   "-C ${repoRoot} rev-parse HEAD") printf '${verifierCommit}\\n' ;;

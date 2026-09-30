@@ -15,7 +15,7 @@ import {
   sshPublicKeyIdentity,
 } from "./provider-key";
 import { leaseProviderLabels, providerLabelValue } from "./provider-labels";
-import { leaseProviderName } from "./slug";
+import { isCanonicalLeaseID, leaseProviderName } from "./slug";
 import type { Env, HetznerSSHKey, HetznerServer, ProviderMachine } from "./types";
 
 interface HetznerListServersResponse {
@@ -121,7 +121,7 @@ export function hetznerServerOwnedByLease(
 ): boolean {
   const labels = server.labels ?? {};
   if (
-    !/^cbx_[a-f0-9]{12}$/.test(leaseID) ||
+    !isCanonicalLeaseID(leaseID) ||
     labels["crabbox"] !== "true" ||
     labels["created_by"] !== "crabbox" ||
     labels["lease"] !== leaseID

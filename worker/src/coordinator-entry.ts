@@ -23,6 +23,7 @@ import {
   pairingRequestBodyBytes,
 } from "./pairing";
 import { runtimeAdapterProxyPath, runtimeAdapterRelayMethodAllowed } from "./runtime-adapter-relay";
+import { buildIdentity } from "./runtime-identity";
 import { timingSafeEqual } from "./timing-safe";
 import type { Env } from "./types";
 
@@ -51,7 +52,10 @@ export async function prepareCoordinatorRequest(
 ): Promise<PreparedCoordinatorRequest> {
   const url = new URL(request.url);
   if (request.method === "GET" && url.pathname === "/v1/health") {
-    return { response: json({ ok: true, service: "crabbox-coordinator" }), authenticated: false };
+    return {
+      response: json({ ok: true, service: "crabbox-coordinator", ...buildIdentity(env) }),
+      authenticated: false,
+    };
   }
   if (request.method === "GET" && url.pathname === "/") {
     return {

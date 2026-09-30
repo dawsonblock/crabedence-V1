@@ -12,35 +12,35 @@
       "exitCode": 0,
       "log": [
         {
-          "text": "o",
-          "count": 1
+          "count": 1,
+          "text": "o"
         },
         {
-          "text": "k",
-          "count": 1
+          "count": 1,
+          "text": "k"
         },
         {
-          "text": "\n",
-          "count": 1
+          "count": 1,
+          "text": "\n"
         }
       ],
       "logChunks": [
         {
+          "count": 1,
           "parts": [
             {
-              "text": "o",
-              "count": 1
+              "count": 1,
+              "text": "o"
             },
             {
-              "text": "k",
-              "count": 1
+              "count": 1,
+              "text": "k"
             },
             {
-              "text": "\n",
-              "count": 1
+              "count": 1,
+              "text": "\n"
             }
-          ],
-          "count": 1
+          ]
         }
       ],
       "logTruncated": false,
@@ -81,83 +81,83 @@
       "exitCode": 0,
       "log": [
         {
-          "text": "c",
-          "count": 1
+          "count": 1,
+          "text": "c"
         },
         {
-          "text": "a",
-          "count": 1
+          "count": 1,
+          "text": "a"
         },
         {
-          "text": "f",
-          "count": 1
+          "count": 1,
+          "text": "f"
         },
         {
-          "text": "é",
-          "count": 1
+          "count": 1,
+          "text": "é"
         },
         {
-          "text": " ",
-          "count": 1
+          "count": 1,
+          "text": " "
         },
         {
-          "text": "€",
-          "count": 1
+          "count": 1,
+          "text": "€"
         },
         {
-          "text": " ",
-          "count": 1
+          "count": 1,
+          "text": " "
         },
         {
-          "text": "😀",
-          "count": 1
+          "count": 1,
+          "text": "😀"
         },
         {
-          "text": "\n",
-          "count": 1
+          "count": 1,
+          "text": "\n"
         }
       ],
       "logChunks": [
         {
+          "count": 1,
           "parts": [
             {
-              "text": "c",
-              "count": 1
+              "count": 1,
+              "text": "c"
             },
             {
-              "text": "a",
-              "count": 1
+              "count": 1,
+              "text": "a"
             },
             {
-              "text": "f",
-              "count": 1
+              "count": 1,
+              "text": "f"
             },
             {
-              "text": "é",
-              "count": 1
+              "count": 1,
+              "text": "é"
             },
             {
-              "text": " ",
-              "count": 1
+              "count": 1,
+              "text": " "
             },
             {
-              "text": "€",
-              "count": 1
+              "count": 1,
+              "text": "€"
             },
             {
-              "text": " ",
-              "count": 1
+              "count": 1,
+              "text": " "
             },
             {
-              "text": "😀",
-              "count": 1
+              "count": 1,
+              "text": "😀"
             },
             {
-              "text": "\n",
-              "count": 1
+              "count": 1,
+              "text": "\n"
             }
-          ],
-          "count": 1
+          ]
         }
       ],
       "logTruncated": false,
@@ -198,43 +198,43 @@
       "exitCode": 0,
       "log": [
         {
-          "text": "o",
-          "count": 1
+          "count": 1,
+          "text": "o"
         },
         {
-          "text": "k",
-          "count": 1
+          "count": 1,
+          "text": "k"
         },
         {
-          "text": "�",
-          "count": 7
+          "count": 7,
+          "text": "�"
         },
         {
-          "text": "\n",
-          "count": 1
+          "count": 1,
+          "text": "\n"
         }
       ],
       "logChunks": [
         {
+          "count": 1,
           "parts": [
             {
-              "text": "o",
-              "count": 1
+              "count": 1,
+              "text": "o"
             },
             {
-              "text": "k",
-              "count": 1
+              "count": 1,
+              "text": "k"
             },
             {
-              "text": "�",
-              "count": 7
+              "count": 7,
+              "text": "�"
             },
             {
-              "text": "\n",
-              "count": 1
+              "count": 1,
+              "text": "\n"
             }
-          ],
-          "count": 1
+          ]
         }
       ],
       "logTruncated": true,
@@ -279,28 +279,28 @@
       "exitCode": 0,
       "log": [
         {
-          "text": "a",
-          "count": 65536
+          "count": 65536,
+          "text": "a"
         }
       ],
       "logChunks": [
         {
+          "count": 127,
           "parts": [
             {
-              "text": "a",
-              "count": 65536
+              "count": 65536,
+              "text": "a"
             }
-          ],
-          "count": 127
+          ]
         },
         {
+          "count": 1,
           "parts": [
             {
-              "text": "a",
-              "count": 65535
+              "count": 65535,
+              "text": "a"
             }
-          ],
-          "count": 1
+          ]
         }
       ],
       "logTruncated": true,
@@ -345,28 +345,28 @@
       "exitCode": 0,
       "log": [
         {
-          "text": "a",
-          "count": 65536
+          "count": 65536,
+          "text": "a"
         }
       ],
       "logChunks": [
         {
+          "count": 127,
           "parts": [
             {
-              "text": "a",
-              "count": 65536
+              "count": 65536,
+              "text": "a"
             }
-          ],
-          "count": 127
+          ]
         },
         {
+          "count": 1,
           "parts": [
             {
-              "text": "a",
-              "count": 65535
+              "count": 65535,
+              "text": "a"
             }
-          ],
-          "count": 1
+          ]
         }
       ],
       "logTruncated": true,
@@ -411,28 +411,28 @@
       "exitCode": 0,
       "log": [
         {
-          "text": "a",
-          "count": 65536
+          "count": 65536,
+          "text": "a"
         }
       ],
       "logChunks": [
         {
+          "count": 127,
           "parts": [
             {
-              "text": "a",
-              "count": 65536
+              "count": 65536,
+              "text": "a"
             }
-          ],
-          "count": 127
+          ]
         },
         {
+          "count": 1,
           "parts": [
             {
-              "text": "a",
-              "count": 65534
+              "count": 65534,
+              "text": "a"
             }
-          ],
-          "count": 1
+          ]
         }
       ],
       "logTruncated": true,
@@ -473,28 +473,28 @@
       "exitCode": 0,
       "log": [
         {
-          "text": "�",
-          "count": 21845
+          "count": 21845,
+          "text": "�"
         }
       ],
       "logChunks": [
         {
+          "count": 128,
           "parts": [
             {
-              "text": "�",
-              "count": 21845
+              "count": 21845,
+              "text": "�"
             }
-          ],
-          "count": 128
+          ]
         },
         {
+          "count": 1,
           "parts": [
             {
-              "text": "�",
-              "count": 42
+              "count": 42,
+              "text": "�"
             }
-          ],
-          "count": 1
+          ]
         }
       ],
       "logTruncated": true,
@@ -535,19 +535,19 @@
       "exitCode": 0,
       "log": [
         {
-          "text": "a",
-          "count": 65536
+          "count": 65536,
+          "text": "a"
         }
       ],
       "logChunks": [
         {
+          "count": 128,
           "parts": [
             {
-              "text": "a",
-              "count": 65536
+              "count": 65536,
+              "text": "a"
             }
-          ],
-          "count": 128
+          ]
         }
       ],
       "logTruncated": false,

@@ -48,7 +48,7 @@ unexpected_failure() {
 
 extract_created_identifier() {
   local output="$1"
-  if [[ "$output" =~ (cbx_[a-f0-9]{12}) ]]; then
+  if [[ "$output" =~ (cbx_[a-f0-9]{12,32}) ]]; then
     printf '%s\n' "${BASH_REMATCH[1]}"
     return 0
   fi

@@ -194,6 +194,10 @@ ambiguous. During acquire it:
 5. sends the public key inside the atomic Hostinger setup request;
 6. purchases and sets up a VPS named
    `crabbox-<slug>-<lease-suffix>` unless `hostnamePrefix` changes that prefix;
+   the hostname embeds the full lease ID and must fit Hostinger's 63-character
+   limit, so the slug is shortened to fit; a prefix longer than 28 characters
+   leaves no room for any slug on a newly minted lease and fails with a
+   prefix-length error before the purchase call;
 7. records the paid VPS id in a local claim as soon as Hostinger returns it;
 8. removes the recovery record after the claim is durable;
 9. waits for Hostinger to expose a public IP;

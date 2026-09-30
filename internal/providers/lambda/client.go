@@ -13,6 +13,8 @@ import (
 	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
+
+	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
 type Client struct {
@@ -72,7 +74,7 @@ func (c *Client) do(ctx context.Context, method, path string, body any, out any)
 		return err
 	}
 	defer resp.Body.Close()
-	data, readErr := io.ReadAll(resp.Body)
+	data, readErr := shared.ReadBoundedResponse(resp.Body, shared.MaxControlPlaneResponseBytes)
 	operation := method + " " + path
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return c.decodeAPIError(operation, resp.StatusCode, data, readErr)

@@ -3,7 +3,7 @@ export function providerKeyForLease(leaseID: string): string {
 }
 
 export function leaseIDForProviderKey(providerKey: string): string | undefined {
-  const match = /^crabbox-cbx-([a-f0-9]{12})$/.exec(providerKey);
+  const match = /^crabbox-cbx-([a-f0-9]{12}|[a-f0-9]{32})$/.exec(providerKey);
   return match ? `cbx_${match[1]}` : undefined;
 }
 

@@ -10,7 +10,10 @@ import (
 	"strings"
 )
 
-var canonicalLeaseIDPattern = regexp.MustCompile(`^cbx_[a-f0-9]{12}$`)
+// Canonical lease IDs carry a 32-character hex body (16 random bytes);
+// the 12-character body of IDs minted by earlier versions stays valid so
+// existing leases, claims, and provider resources keep resolving.
+var canonicalLeaseIDPattern = regexp.MustCompile(`^cbx_(?:[a-f0-9]{12}|[a-f0-9]{32})$`)
 
 const maxRequestedLeaseSlugLength = 41
 

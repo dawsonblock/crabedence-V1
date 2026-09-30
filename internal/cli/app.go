@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+
+	"github.com/openclaw/crabbox/internal/execution"
 )
 
 type App struct {
@@ -84,6 +86,8 @@ func (a App) directCommandHelp(ctx context.Context, args []string) (error, bool)
 		return a.prewarm(ctx, helpArgs), true
 	case "run":
 		return a.runCommand(ctx, helpArgs), true
+	case "exec":
+		return a.execCommand(ctx, helpArgs, execution.DefaultClientTimeout), true
 	case "watch":
 		return a.watch(ctx, helpArgs), true
 	case "shard":
@@ -108,6 +112,8 @@ func (a App) directCommandHelp(ctx context.Context, args []string) (error, bool)
 		return a.receipt(ctx, helpArgs), true
 	case "verify":
 		return a.verify(ctx, helpArgs), true
+	case "evidence":
+		return a.evidence(ctx, helpArgs), true
 	case "status":
 		return a.status(ctx, helpArgs), true
 	case "heartbeat":
@@ -213,6 +219,7 @@ Commands:
   results     Show recorded test result summaries
   receipt     Retrieve and verify a signed terminal run receipt
   verify      Verify a signed run receipt
+  evidence    Verify a RunEvidenceV1 document (digest, receipt binding, signature)
   cache       Inspect, purge, warm, or list remote cache volumes
   status      Show lease state; add --wait to block until ready
   heartbeat   Refresh a lease idle deadline and print its state

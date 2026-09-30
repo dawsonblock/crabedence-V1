@@ -69,6 +69,11 @@ actual_notes="$OUTPUT.notes.partial.$$"
 trap 'rm -rf "$notes" "$tagged_changelog" "$actual_notes" "$partial"' EXIT
 git -C "$ROOT" show "$SOURCE_COMMIT:CHANGELOG.md" >"$tagged_changelog"
 "$ROOT/scripts/extract-release-notes.sh" "$TAG" <"$tagged_changelog" >"$notes"
+# The release body is the section verbatim, or the deterministic bound stub
+# when the section exceeds GitHub's body limit.
+crabbox_release_body_from_notes "$notes" "$TAG" "$SOURCE_COMMIT" \
+  >"$notes.body"
+mv "$notes.body" "$notes"
 node - "$release" "$actual_notes" <<'NODE'
 const fs = require('node:fs');
 const release = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));

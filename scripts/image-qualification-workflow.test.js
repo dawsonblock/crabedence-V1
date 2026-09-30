@@ -318,11 +318,11 @@ test("authorization selects one exact same-PR candidate artifact and detects rep
   let producerPath = ".github/workflows/image-qualification.yml@refs/heads/main";
   const environment = {
     GH_TOKEN: "test-token",
-    GITHUB_REPOSITORY: "openclaw/crabbox",
+    GITHUB_REPOSITORY: "dawsonblock/crabedence-V1",
     GITHUB_RUN_ID: "42",
     GITHUB_RUN_ATTEMPT: "1",
     GITHUB_WORKFLOW_REF:
-      "openclaw/crabbox/.github/workflows/image-qualification.yml@refs/heads/main",
+      "dawsonblock/crabedence-V1/.github/workflows/image-qualification.yml@refs/heads/main",
     QUALIFICATION_CANDIDATE_SHA: candidateSha,
     QUALIFICATION_CANDIDATE_ARTIFACT_DIGEST: artifactDigest.slice("sha256:".length),
     QUALIFICATION_CANDIDATE_ARTIFACT_ID: "7",
@@ -343,7 +343,7 @@ test("authorization selects one exact same-PR candidate artifact and detects rep
     if (url.pathname.endsWith("/pulls/1756")) {
       value = {
         state: "open",
-        head: { repo: { full_name: "openclaw/crabbox" }, sha: candidateSha },
+        head: { repo: { full_name: "dawsonblock/crabedence-V1" }, sha: candidateSha },
         base: { sha: workflowSha },
       };
     } else if (url.pathname.endsWith("/commits/main")) {
@@ -354,7 +354,7 @@ test("authorization selects one exact same-PR candidate artifact and detects rep
         run_attempt: 1,
         event: "workflow_dispatch",
         head_sha: workflowSha,
-        head_repository: { full_name: "openclaw/crabbox" },
+        head_repository: { full_name: "dawsonblock/crabedence-V1" },
         path: producerPath,
       };
     } else if (url.pathname.includes("/actions/artifacts/")) {
@@ -379,7 +379,7 @@ test("authorization selects one exact same-PR candidate artifact and detects rep
       artifactId: "7",
       candidateSha,
       number: "1756",
-      repository: "openclaw/crabbox",
+      repository: "dawsonblock/crabedence-V1",
       runId: "42",
       workflowSha,
     });

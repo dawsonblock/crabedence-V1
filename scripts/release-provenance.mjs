@@ -4,13 +4,27 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
-const REPOSITORY = "openclaw/crabbox";
-const TEAM_ID = "FWJYW4S8P8";
-const AUTHORITY = `Developer ID Application: OpenClaw Foundation (${TEAM_ID})`;
-const CLI_ID = "org.openclaw.crabbox";
-const HELPER_ID = "org.openclaw.crabbox.apple-vm-helper";
-const VMD_ID = "org.openclaw.crabbox.apple-vm-vmd";
-const GO_VERSION = "go1.26.4";
+const REPOSITORY = process.env.CRABBOX_RELEASE_REPOSITORY ?? "dawsonblock/crabedence-V1";
+// The declared Apple signing mode. Under `none` the provenance says so
+// explicitly rather than implying a signature the artifacts do not carry.
+const APPLE_SIGNING = process.env.CRABBOX_RELEASE_APPLE_SIGNING ?? "none";
+if (APPLE_SIGNING !== "developer-id" && APPLE_SIGNING !== "none") {
+  throw new Error("CRABBOX_RELEASE_APPLE_SIGNING must be developer-id or none");
+}
+const UNSIGNED = APPLE_SIGNING === "none";
+// The fork declares no Apple identity of its own: developer-id provenance
+// requires the operator to supply both, unsigned provenance requires neither.
+const TEAM_ID = process.env.CRABBOX_RELEASE_TEAM_ID;
+const AUTHORITY = process.env.CRABBOX_RELEASE_AUTHORITY;
+if (!UNSIGNED && (!TEAM_ID || !AUTHORITY)) {
+  throw new Error(
+    "developer-id provenance requires CRABBOX_RELEASE_TEAM_ID and CRABBOX_RELEASE_AUTHORITY",
+  );
+}
+const CLI_ID = "io.github.dawsonblock.crabbox";
+const HELPER_ID = "io.github.dawsonblock.crabbox.apple-vm-helper";
+const VMD_ID = "io.github.dawsonblock.crabbox.apple-vm-vmd";
+const GO_VERSION = "go1.26.5";
 const GORELEASER_VERSION = "2.17.0";
 const CANDIDATE_MANIFEST = ".components/candidate-manifest.json";
 const VMD_COMPONENT = ".components/crabbox-apple-vm-vmd";
@@ -94,14 +108,17 @@ function payloadFor(directory, name, version, embeddedVmd, notaryIds = {}) {
       name: platform === "windows" ? "crabbox.exe" : "crabbox",
       package: "github.com/openclaw/crabbox/cmd/crabbox",
       ...(platform === "darwin"
-        ? {
-            identifier: CLI_ID,
-            teamId: TEAM_ID,
-            hardenedRuntime: true,
-            timestamp: true,
-            notarized: true,
-            notarizationSubmissionId: notaryIds[`cli-${arch}`],
-          }
+        ? UNSIGNED
+          ? { identifier: CLI_ID, signing: "none", notarized: false }
+          : {
+              identifier: CLI_ID,
+              signing: "developer-id",
+              teamId: TEAM_ID,
+              hardenedRuntime: true,
+              timestamp: true,
+              notarized: true,
+              notarizationSubmissionId: notaryIds[`cli-${arch}`],
+            }
         : {}),
     },
   ];
@@ -110,11 +127,16 @@ function payloadFor(directory, name, version, embeddedVmd, notaryIds = {}) {
       name: "crabbox-apple-vm-helper",
       package: "github.com/openclaw/crabbox/cmd/crabbox-apple-vm-helper",
       identifier: HELPER_ID,
-      teamId: TEAM_ID,
-      hardenedRuntime: true,
-      timestamp: true,
-      notarized: true,
-      notarizationSubmissionId: notaryIds["helper-arm64"],
+      ...(UNSIGNED
+        ? { signing: "none", notarized: false }
+        : {
+            signing: "developer-id",
+            teamId: TEAM_ID,
+            hardenedRuntime: true,
+            timestamp: true,
+            notarized: true,
+            notarizationSubmissionId: notaryIds["helper-arm64"],
+          }),
       embeddedVmd,
     });
   }
@@ -409,7 +431,7 @@ function candidateVerify(args) {
 }
 
 function assertEmbeddedVmd(value) {
-  const keys = [
+  const signedKeys = [
     "arch",
     "entitlementsSha256",
     "hardenedRuntime",
@@ -417,33 +439,55 @@ function assertEmbeddedVmd(value) {
     "notarizationSubmissionId",
     "notarized",
     "sha256",
+    "signing",
     "size",
     "teamId",
     "timestamp",
     "trustPolicyVersion",
   ];
+  const unsignedKeys = [
+    "arch",
+    "identifier",
+    "notarized",
+    "sha256",
+    "signing",
+    "size",
+    "trustPolicyVersion",
+  ];
+  const unsignedShape =
+    value &&
+    JSON.stringify(Object.keys(value).sort()) === JSON.stringify(unsignedKeys) &&
+    value.signing === "none" &&
+    value.notarized === false &&
+    value.identifier === VMD_ID;
+  const signedShape =
+    value &&
+    JSON.stringify(Object.keys(value).sort()) === JSON.stringify(signedKeys) &&
+    value.signing === "developer-id" &&
+    value.teamId === TEAM_ID &&
+    value.hardenedRuntime === true &&
+    value.timestamp === true &&
+    value.notarized === true &&
+    isNotaryId(value.notarizationSubmissionId) &&
+    value.entitlementsSha256 === VMD_ENTITLEMENTS_SHA256 &&
+    value.identifier === VMD_ID;
   if (
     !value ||
-    JSON.stringify(Object.keys(value).sort()) !== JSON.stringify(keys) ||
+    (UNSIGNED ? !unsignedShape : !signedShape) ||
     !/^[0-9a-f]{64}$/.test(value.sha256 ?? "") ||
     !Number.isSafeInteger(value.size) ||
     value.size <= 0 ||
-    value.identifier !== VMD_ID ||
-    value.teamId !== TEAM_ID ||
     value.arch !== "arm64" ||
-    value.hardenedRuntime !== true ||
-    value.timestamp !== true ||
-    value.notarized !== true ||
-    !isNotaryId(value.notarizationSubmissionId) ||
-    value.entitlementsSha256 !== VMD_ENTITLEMENTS_SHA256 ||
     value.trustPolicyVersion !== 1
   ) {
-    throw new Error("embedded VMD provenance does not match release trust policy version 1");
+    throw new Error(
+      `embedded VMD provenance does not match the ${APPLE_SIGNING} release trust policy`,
+    );
   }
 }
 
 function write(args) {
-  for (const required of [
+  const required = [
     "dir",
     "tag",
     "tag-object",
@@ -455,17 +499,22 @@ function write(args) {
     "embedded-vmd-sha256",
     "embedded-vmd-size",
     "vmd-entitlements-sha256",
-    "notary-cli-amd64",
-    "notary-cli-arm64",
-    "notary-helper-arm64",
-    "notary-vmd-arm64",
     "packager-go-version",
     "packager-os",
     "packager-arch",
     "packager-xcode-version",
     "packager-xcode-build",
-  ]) {
-    if (!args[required]) throw new Error(`missing --${required}`);
+  ];
+  if (!UNSIGNED) {
+    required.push(
+      "notary-cli-amd64",
+      "notary-cli-arm64",
+      "notary-helper-arm64",
+      "notary-vmd-arm64",
+    );
+  }
+  for (const name of required) {
+    if (!args[name]) throw new Error(`missing --${name}`);
   }
   if (!/^v[0-9]+\.[0-9]+\.[0-9]+$/.test(args.tag)) throw new Error("invalid stable release tag");
   assertSha("tag object", args["tag-object"]);
@@ -487,25 +536,40 @@ function write(args) {
     "helper-arm64": args["notary-helper-arm64"],
     "vmd-arm64": args["notary-vmd-arm64"],
   };
-  if (
+  if (UNSIGNED) {
+    if (Object.values(notaryIds).some(Boolean)) {
+      throw new Error("unsigned releases must not carry notarization submission IDs");
+    }
+  } else if (
     !Object.values(notaryIds).every(isNotaryId) ||
     new Set(Object.values(notaryIds)).size !== 4
   ) {
     throw new Error("notarization submission IDs must be four distinct UUIDs");
   }
-  const embeddedVmd = {
-    sha256: args["embedded-vmd-sha256"],
-    size: embeddedVmdSize,
-    identifier: VMD_ID,
-    teamId: TEAM_ID,
-    arch: "arm64",
-    hardenedRuntime: true,
-    timestamp: true,
-    notarized: true,
-    notarizationSubmissionId: notaryIds["vmd-arm64"],
-    entitlementsSha256: VMD_ENTITLEMENTS_SHA256,
-    trustPolicyVersion: 1,
-  };
+  const embeddedVmd = UNSIGNED
+    ? {
+        sha256: args["embedded-vmd-sha256"],
+        size: embeddedVmdSize,
+        identifier: VMD_ID,
+        arch: "arm64",
+        signing: "none",
+        notarized: false,
+        trustPolicyVersion: 1,
+      }
+    : {
+        sha256: args["embedded-vmd-sha256"],
+        size: embeddedVmdSize,
+        identifier: VMD_ID,
+        teamId: TEAM_ID,
+        arch: "arm64",
+        signing: "developer-id",
+        hardenedRuntime: true,
+        timestamp: true,
+        notarized: true,
+        notarizationSubmissionId: notaryIds["vmd-arm64"],
+        entitlementsSha256: VMD_ENTITLEMENTS_SHA256,
+        trustPolicyVersion: 1,
+      };
   const version = args.tag.slice(1);
   const archives = expectedArchives(version);
   const releaseAssets = [...archives, "checksums.txt", "provenance.json"].sort();
@@ -542,14 +606,21 @@ function write(args) {
     },
     verifier: { commit: args["verifier-commit"] },
     releaseNotes: releaseNotes(args.notes),
-    signaturePolicy: {
-      authority: AUTHORITY,
-      teamId: TEAM_ID,
-      hardenedRuntime: true,
-      timestamp: true,
-      onlineNotarization: true,
-      identifiers: { crabbox: CLI_ID, appleVmHelper: HELPER_ID, appleVmVmd: VMD_ID },
-    },
+    signaturePolicy: UNSIGNED
+      ? {
+          signing: "none",
+          notarized: false,
+          identifiers: { crabbox: CLI_ID, appleVmHelper: HELPER_ID, appleVmVmd: VMD_ID },
+        }
+      : {
+          signing: "developer-id",
+          authority: AUTHORITY,
+          teamId: TEAM_ID,
+          hardenedRuntime: true,
+          timestamp: true,
+          onlineNotarization: true,
+          identifiers: { crabbox: CLI_ID, appleVmHelper: HELPER_ID, appleVmVmd: VMD_ID },
+        },
     producer: {
       manifestSha256: candidate.sha256,
       ...candidate.value.producer,
@@ -605,7 +676,17 @@ function verify(args) {
   assertExactKeys(value.releaseNotes, ["bytes", "sha256"], "release notes provenance");
   assertExactKeys(
     value.signaturePolicy,
-    ["authority", "hardenedRuntime", "identifiers", "onlineNotarization", "teamId", "timestamp"],
+    UNSIGNED
+      ? ["identifiers", "notarized", "signing"]
+      : [
+          "authority",
+          "hardenedRuntime",
+          "identifiers",
+          "onlineNotarization",
+          "signing",
+          "teamId",
+          "timestamp",
+        ],
     "signature policy",
   );
   assertExactKeys(
@@ -634,11 +715,14 @@ function verify(args) {
     value.source?.clean !== true ||
     value.verifier?.commit !== args["verifier-commit"] ||
     JSON.stringify(value.releaseNotes) !== JSON.stringify(releaseNotes(args.notes)) ||
-    value.signaturePolicy?.authority !== AUTHORITY ||
-    value.signaturePolicy?.teamId !== TEAM_ID ||
-    value.signaturePolicy?.hardenedRuntime !== true ||
-    value.signaturePolicy?.timestamp !== true ||
-    value.signaturePolicy?.onlineNotarization !== true ||
+    value.signaturePolicy?.signing !== APPLE_SIGNING ||
+    (UNSIGNED
+      ? value.signaturePolicy?.notarized !== false
+      : value.signaturePolicy?.authority !== AUTHORITY ||
+        value.signaturePolicy?.teamId !== TEAM_ID ||
+        value.signaturePolicy?.hardenedRuntime !== true ||
+        value.signaturePolicy?.timestamp !== true ||
+        value.signaturePolicy?.onlineNotarization !== true) ||
     value.signaturePolicy?.identifiers?.crabbox !== CLI_ID ||
     value.signaturePolicy?.identifiers?.appleVmHelper !== HELPER_ID ||
     value.signaturePolicy?.identifiers?.appleVmVmd !== VMD_ID ||
@@ -673,22 +757,41 @@ function verify(args) {
     if (JSON.stringify(actual) !== JSON.stringify(expected)) {
       throw new Error(`provenance payload mismatch: ${name}`);
     }
-    if (
-      actual.platform === "darwin" &&
-      !actual.binaries.every((entry) =>
-        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
-          entry.notarizationSubmissionId ?? "",
-        ),
-      )
-    ) {
-      throw new Error(`invalid notarization provenance: ${name}`);
-    }
     if (actual.platform === "darwin") {
-      verifiedNotaryIds.push(...actual.binaries.map((entry) => entry.notarizationSubmissionId));
-      if (helperEntry) verifiedNotaryIds.push(helperEntry.embeddedVmd.notarizationSubmissionId);
+      if (UNSIGNED) {
+        if (
+          !actual.binaries.every(
+            (entry) =>
+              entry.signing === "none" &&
+              entry.notarized === false &&
+              entry.notarizationSubmissionId === undefined,
+          )
+        ) {
+          throw new Error(`unsigned provenance claims a signature: ${name}`);
+        }
+      } else {
+        if (
+          !actual.binaries.every((entry) =>
+            /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+              entry.notarizationSubmissionId ?? "",
+            ),
+          )
+        ) {
+          throw new Error(`invalid notarization provenance: ${name}`);
+        }
+        verifiedNotaryIds.push(
+          ...actual.binaries.map((entry) => entry.notarizationSubmissionId),
+        );
+        if (helperEntry) {
+          verifiedNotaryIds.push(helperEntry.embeddedVmd.notarizationSubmissionId);
+        }
+      }
     }
   }
-  if (new Set(verifiedNotaryIds).size !== 4 || verifiedNotaryIds.length !== 4) {
+  if (
+    !UNSIGNED &&
+    (new Set(verifiedNotaryIds).size !== 4 || verifiedNotaryIds.length !== 4)
+  ) {
     throw new Error("notarization provenance must contain four distinct submissions");
   }
 }

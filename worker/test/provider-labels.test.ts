@@ -2,7 +2,13 @@ import { describe, expect, it } from "vitest";
 
 import type { LeaseConfig } from "../src/config";
 import { gcpLabelValue, gcpProviderLabelValue } from "../src/gcp";
-import { leaseProviderLabels, providerMachineOwnedByLease } from "../src/provider-labels";
+import { hetznerKeyOnlyCleanupID } from "../src/hetzner-cleanup";
+import { leaseIDForProviderKey, providerKeyForLease } from "../src/provider-key";
+import {
+  leaseProviderLabels,
+  providerLabelsOwnedByLease,
+  providerMachineOwnedByLease,
+} from "../src/provider-labels";
 import type { LeaseRecord, ProviderMachine } from "../src/types";
 
 describe("provider labels", () => {
@@ -353,5 +359,75 @@ describe("provider labels", () => {
         "aws",
       ),
     ).toBe(false);
+  });
+});
+
+describe("provider key lease mapping", () => {
+  it("round-trips both canonical lease-ID widths", () => {
+    for (const leaseID of ["cbx_abcdef123456", `cbx_${"a".repeat(32)}`]) {
+      expect(leaseIDForProviderKey(providerKeyForLease(leaseID))).toBe(leaseID);
+    }
+    // Anything else is not a Crabbox-owned provider key.
+    expect(leaseIDForProviderKey("crabbox-cbx-abc")).toBeUndefined();
+    expect(leaseIDForProviderKey("crabbox-other-abcdef123456")).toBeUndefined();
+  });
+});
+
+const coexistenceLease = (id: string, slug: string, cloudID: string) => ({
+  id,
+  slug,
+  provider: "aws" as const,
+  cloudID,
+  owner: "alice@example.com",
+});
+
+const coexistenceMachine = (entry: ReturnType<typeof coexistenceLease>) => ({
+  provider: "aws" as const,
+  cloudID: entry.cloudID,
+  labels: {
+    crabbox: "true",
+    created_by: "crabbox",
+    lease: entry.id,
+    owner: "alice_example.com",
+    provider: "aws",
+    slug: entry.slug,
+  },
+});
+
+describe("mixed-generation lease coexistence", () => {
+  it("resolves a legacy 12-hex lease and a current 32-hex lease independently", () => {
+    // The rolling-upgrade case: both generations are live at once, so each
+    // surface must resolve each lease to its own identity and never across.
+    const legacy = coexistenceLease("cbx_abcdef123456", "legacy-lobster", "i-000000000001");
+    const current = coexistenceLease(`cbx_${"a".repeat(32)}`, "current-lobster", "i-000000000002");
+
+    for (const [entry, other] of [
+      [legacy, current],
+      [current, legacy],
+    ] as const) {
+      // Provider ownership: each width owns exactly its own resource.
+      expect(providerMachineOwnedByLease(coexistenceMachine(entry), entry, "aws")).toBe(true);
+      expect(providerMachineOwnedByLease(coexistenceMachine(other), entry, "aws")).toBe(false);
+      // Labels: the stored label map validates back to its own lease only.
+      const labels = coexistenceMachine(entry).labels;
+      expect(providerLabelsOwnedByLease(labels, entry, "aws")).toBe(true);
+      expect(providerLabelsOwnedByLease(labels, other, "aws")).toBe(false);
+      // Lookup: the provider key maps back to the exact ID of its own width.
+      expect(leaseIDForProviderKey(providerKeyForLease(entry.id))).toBe(entry.id);
+      // Cleanup: the key-only cleanup guard accepts either width.
+      expect(
+        hetznerKeyOnlyCleanupID({
+          id: entry.id,
+          provider: "hetzner",
+          providerKey: providerKeyForLease(entry.id),
+          serverID: 0,
+          cloudID: "",
+          state: "failed",
+          provisioningResourceMayExist: false,
+          providerKeyCleanupPending: true,
+          providerKeyCleanupID: "7",
+        } as LeaseRecord),
+      ).toBe(7);
+    }
   });
 });

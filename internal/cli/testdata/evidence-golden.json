@@ -1,0 +1,295 @@
+[
+  {
+    "name": "basic",
+    "evidence": {
+      "command_ms": 3000,
+      "command_text": "npm test",
+      "digest": "724a033bc9ea65bf46bde14011cf07eb0fcab5c809084a3b4eb89f5dfdb384cb",
+      "ended_at": "2026-01-15T12:30:05Z",
+      "evidence_type": "run",
+      "exit_code": 0,
+      "label": "ci",
+      "lease_id": "cbx_abc123",
+      "machine_type": "cpx21",
+      "provider": "hetzner",
+      "run_id": "run_test001",
+      "run_status": "succeeded",
+      "schema_version": 1,
+      "started_at": "2026-01-15T12:30:00Z",
+      "sync_ms": 2000,
+      "total_ms": 5000
+    },
+    "canonical_json": "{\"command_ms\":3000,\"command_text\":\"npm test\",\"digest\":\"\",\"ended_at\":\"2026-01-15T12:30:05Z\",\"evidence_type\":\"run\",\"exit_code\":0,\"label\":\"ci\",\"lease_id\":\"cbx_abc123\",\"machine_type\":\"cpx21\",\"provider\":\"hetzner\",\"run_id\":\"run_test001\",\"run_status\":\"succeeded\",\"schema_version\":1,\"started_at\":\"2026-01-15T12:30:00Z\",\"sync_ms\":2000,\"total_ms\":5000}",
+    "sha256": "724a033bc9ea65bf46bde14011cf07eb0fcab5c809084a3b4eb89f5dfdb384cb",
+    "expected_validation": "pass"
+  },
+  {
+    "name": "html-chars",
+    "evidence": {
+      "command_ms": 1000,
+      "command_text": "grep '\u003croot\u003e' log \u0026\u0026 echo \"a \u0026 b \u003c c\"",
+      "digest": "193c7c60c1f387cdeeae688cfb908f32069eb334d26c1fbce09d881b931c79c2",
+      "ended_at": "2026-01-15T12:30:05Z",
+      "evidence_type": "run",
+      "exit_code": 0,
+      "lease_id": "cbx_html001",
+      "provider": "aws",
+      "run_id": "run_html001",
+      "run_status": "succeeded",
+      "schema_version": 1,
+      "started_at": "2026-01-15T12:30:00Z",
+      "sync_ms": 234,
+      "total_ms": 1234
+    },
+    "canonical_json": "{\"command_ms\":1000,\"command_text\":\"grep '\u003croot\u003e' log \u0026\u0026 echo \\\"a \u0026 b \u003c c\\\"\",\"digest\":\"\",\"ended_at\":\"2026-01-15T12:30:05Z\",\"evidence_type\":\"run\",\"exit_code\":0,\"lease_id\":\"cbx_html001\",\"provider\":\"aws\",\"run_id\":\"run_html001\",\"run_status\":\"succeeded\",\"schema_version\":1,\"started_at\":\"2026-01-15T12:30:00Z\",\"sync_ms\":234,\"total_ms\":1234}",
+    "sha256": "193c7c60c1f387cdeeae688cfb908f32069eb334d26c1fbce09d881b931c79c2",
+    "expected_validation": "pass"
+  },
+  {
+    "name": "unicode",
+    "evidence": {
+      "command_ms": 700,
+      "command_text": "echo \"héllo wörld 🚀 中文 тест\"",
+      "digest": "0cce860b171302ee0fa140561ebe262c150fd9e8b9152f1e7639b49b4b7f1056",
+      "ended_at": "2026-01-15T12:30:05Z",
+      "evidence_type": "run",
+      "exit_code": 0,
+      "label": "生态系-テスト",
+      "lease_id": "cbx_uni001",
+      "machine_type": "m7i.large",
+      "provider": "daytona",
+      "run_id": "run_uni001",
+      "run_status": "succeeded",
+      "schema_version": 1,
+      "started_at": "2026-01-15T12:30:00Z",
+      "sync_ms": 200,
+      "total_ms": 900
+    },
+    "canonical_json": "{\"command_ms\":700,\"command_text\":\"echo \\\"héllo wörld 🚀 中文 тест\\\"\",\"digest\":\"\",\"ended_at\":\"2026-01-15T12:30:05Z\",\"evidence_type\":\"run\",\"exit_code\":0,\"label\":\"生态系-テスト\",\"lease_id\":\"cbx_uni001\",\"machine_type\":\"m7i.large\",\"provider\":\"daytona\",\"run_id\":\"run_uni001\",\"run_status\":\"succeeded\",\"schema_version\":1,\"started_at\":\"2026-01-15T12:30:00Z\",\"sync_ms\":200,\"total_ms\":900}",
+    "sha256": "0cce860b171302ee0fa140561ebe262c150fd9e8b9152f1e7639b49b4b7f1056",
+    "expected_validation": "pass"
+  },
+  {
+    "name": "nested-phases-artifacts",
+    "evidence": {
+      "artifacts": [
+        {
+          "bytes": 2048,
+          "kind": "junit",
+          "path": "test-results.xml",
+          "sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        {
+          "bytes": 65536,
+          "kind": "log",
+          "path": "out.log"
+        }
+      ],
+      "blocked_stage": "user-command",
+      "command_ms": 6000,
+      "command_phases": [
+        {
+          "ms": 5900,
+          "name": "exec"
+        },
+        {
+          "ms": 100,
+          "name": "teardown"
+        }
+      ],
+      "command_text": "pytest -q",
+      "digest": "a23cc4de351e29237061b997f9db6793e9b1ba140935883b9496f12b8dd88d18",
+      "ended_at": "2026-01-15T12:30:08Z",
+      "error_kind": "command-exit",
+      "evidence_type": "run",
+      "exit_code": 1,
+      "lease_id": "cbx_nest001",
+      "provider": "gcp",
+      "retry_likely": "true",
+      "run_id": "run_nest001",
+      "run_status": "failed",
+      "runner_phases": [
+        {
+          "ms": 6000,
+          "name": "command"
+        },
+        {
+          "ms": 300,
+          "name": "cleanup"
+        }
+      ],
+      "schema_version": 1,
+      "started_at": "2026-01-15T12:30:00Z",
+      "sync_ms": 2000,
+      "sync_phases": [
+        {
+          "ms": 1500,
+          "name": "rsync"
+        },
+        {
+          "ms": 500,
+          "name": "git_hydrate"
+        }
+      ],
+      "total_ms": 8000
+    },
+    "canonical_json": "{\"artifacts\":[{\"bytes\":2048,\"kind\":\"junit\",\"path\":\"test-results.xml\",\"sha256\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},{\"bytes\":65536,\"kind\":\"log\",\"path\":\"out.log\"}],\"blocked_stage\":\"user-command\",\"command_ms\":6000,\"command_phases\":[{\"ms\":5900,\"name\":\"exec\"},{\"ms\":100,\"name\":\"teardown\"}],\"command_text\":\"pytest -q\",\"digest\":\"\",\"ended_at\":\"2026-01-15T12:30:08Z\",\"error_kind\":\"command-exit\",\"evidence_type\":\"run\",\"exit_code\":1,\"lease_id\":\"cbx_nest001\",\"provider\":\"gcp\",\"retry_likely\":\"true\",\"run_id\":\"run_nest001\",\"run_status\":\"failed\",\"runner_phases\":[{\"ms\":6000,\"name\":\"command\"},{\"ms\":300,\"name\":\"cleanup\"}],\"schema_version\":1,\"started_at\":\"2026-01-15T12:30:00Z\",\"sync_ms\":2000,\"sync_phases\":[{\"ms\":1500,\"name\":\"rsync\"},{\"ms\":500,\"name\":\"git_hydrate\"}],\"total_ms\":8000}",
+    "sha256": "a23cc4de351e29237061b997f9db6793e9b1ba140935883b9496f12b8dd88d18",
+    "expected_validation": "pass"
+  },
+  {
+    "name": "large-ints",
+    "evidence": {
+      "command_ms": 42000,
+      "command_text": "dd if=/dev/zero of=/tmp/z bs=1M count=8192",
+      "digest": "9b18fa9eb6d174d8c1fc2525cccd0e8fed57f5c9b921e62add21b34466d32238",
+      "ended_at": "2026-01-15T12:30:05Z",
+      "evidence_type": "run",
+      "exit_code": 0,
+      "lease_id": "cbx_big001",
+      "provider": "azure",
+      "run_id": "run_big001",
+      "run_status": "succeeded",
+      "schema_version": 1,
+      "started_at": "2026-01-15T12:30:00Z",
+      "sync_ms": 3000,
+      "sync_transfer_bytes": 9007199254740991,
+      "sync_transfer_files": 9007199254740000,
+      "total_ms": 45000
+    },
+    "canonical_json": "{\"command_ms\":42000,\"command_text\":\"dd if=/dev/zero of=/tmp/z bs=1M count=8192\",\"digest\":\"\",\"ended_at\":\"2026-01-15T12:30:05Z\",\"evidence_type\":\"run\",\"exit_code\":0,\"lease_id\":\"cbx_big001\",\"provider\":\"azure\",\"run_id\":\"run_big001\",\"run_status\":\"succeeded\",\"schema_version\":1,\"started_at\":\"2026-01-15T12:30:00Z\",\"sync_ms\":3000,\"sync_transfer_bytes\":9007199254740991,\"sync_transfer_files\":9007199254740000,\"total_ms\":45000}",
+    "sha256": "9b18fa9eb6d174d8c1fc2525cccd0e8fed57f5c9b921e62add21b34466d32238",
+    "expected_validation": "pass"
+  },
+  {
+    "name": "minimal",
+    "evidence": {
+      "command_ms": 10,
+      "digest": "910e0b1191fa68e5fd23d8386abdaf4073f758198f1812bae322d8abb16a2a08",
+      "evidence_type": "run",
+      "exit_code": 0,
+      "provider": "tart",
+      "run_status": "succeeded",
+      "schema_version": 1,
+      "sync_ms": 0,
+      "total_ms": 10
+    },
+    "canonical_json": "{\"command_ms\":10,\"digest\":\"\",\"evidence_type\":\"run\",\"exit_code\":0,\"provider\":\"tart\",\"run_status\":\"succeeded\",\"schema_version\":1,\"sync_ms\":0,\"total_ms\":10}",
+    "sha256": "910e0b1191fa68e5fd23d8386abdaf4073f758198f1812bae322d8abb16a2a08",
+    "expected_validation": "pass"
+  },
+  {
+    "name": "tampered-total-ms",
+    "evidence": {
+      "command_ms": 3000,
+      "command_text": "npm test",
+      "digest": "724a033bc9ea65bf46bde14011cf07eb0fcab5c809084a3b4eb89f5dfdb384cb",
+      "ended_at": "2026-01-15T12:30:05Z",
+      "evidence_type": "run",
+      "exit_code": 0,
+      "label": "ci",
+      "lease_id": "cbx_abc123",
+      "machine_type": "cpx21",
+      "provider": "hetzner",
+      "run_id": "run_test001",
+      "run_status": "succeeded",
+      "schema_version": 1,
+      "started_at": "2026-01-15T12:30:00Z",
+      "sync_ms": 2000,
+      "total_ms": 5001
+    },
+    "canonical_json": "{\"command_ms\":3000,\"command_text\":\"npm test\",\"digest\":\"\",\"ended_at\":\"2026-01-15T12:30:05Z\",\"evidence_type\":\"run\",\"exit_code\":0,\"label\":\"ci\",\"lease_id\":\"cbx_abc123\",\"machine_type\":\"cpx21\",\"provider\":\"hetzner\",\"run_id\":\"run_test001\",\"run_status\":\"succeeded\",\"schema_version\":1,\"started_at\":\"2026-01-15T12:30:00Z\",\"sync_ms\":2000,\"total_ms\":5001}",
+    "sha256": "a239566d5d893a51bb15add5a7183dc985a5784e04c2a49dbbb5b5a03696bdb7",
+    "expected_validation": "fail",
+    "expected_failure": "evidence digest mismatch"
+  },
+  {
+    "name": "line-separator",
+    "evidence": {
+      "command_ms": 100,
+      "command_text": "echo hello\u2028world",
+      "digest": "05294018bdb16079f171c3845ba68d4e6ba2930c3e15924d9b2915bbc671384a",
+      "ended_at": "2026-01-15T12:30:05Z",
+      "evidence_type": "run",
+      "exit_code": 0,
+      "lease_id": "cbx_sep001",
+      "provider": "aws",
+      "run_id": "run_ls001",
+      "run_status": "succeeded",
+      "schema_version": 1,
+      "started_at": "2026-01-15T12:30:00Z",
+      "sync_ms": 50,
+      "total_ms": 150
+    },
+    "canonical_json": "{\"command_ms\":100,\"command_text\":\"echo hello\\u2028world\",\"digest\":\"\",\"ended_at\":\"2026-01-15T12:30:05Z\",\"evidence_type\":\"run\",\"exit_code\":0,\"lease_id\":\"cbx_sep001\",\"provider\":\"aws\",\"run_id\":\"run_ls001\",\"run_status\":\"succeeded\",\"schema_version\":1,\"started_at\":\"2026-01-15T12:30:00Z\",\"sync_ms\":50,\"total_ms\":150}",
+    "sha256": "05294018bdb16079f171c3845ba68d4e6ba2930c3e15924d9b2915bbc671384a",
+    "expected_validation": "pass"
+  },
+  {
+    "name": "paragraph-separator",
+    "evidence": {
+      "command_ms": 100,
+      "command_text": "echo hello\u2029world",
+      "digest": "427b1bbb5ca6fe20b31c542962375395804ae3500a72028fb9dba1d87b05b6c5",
+      "ended_at": "2026-01-15T12:30:05Z",
+      "evidence_type": "run",
+      "exit_code": 0,
+      "lease_id": "cbx_sep001",
+      "provider": "aws",
+      "run_id": "run_ps001",
+      "run_status": "succeeded",
+      "schema_version": 1,
+      "started_at": "2026-01-15T12:30:00Z",
+      "sync_ms": 50,
+      "total_ms": 150
+    },
+    "canonical_json": "{\"command_ms\":100,\"command_text\":\"echo hello\\u2029world\",\"digest\":\"\",\"ended_at\":\"2026-01-15T12:30:05Z\",\"evidence_type\":\"run\",\"exit_code\":0,\"lease_id\":\"cbx_sep001\",\"provider\":\"aws\",\"run_id\":\"run_ps001\",\"run_status\":\"succeeded\",\"schema_version\":1,\"started_at\":\"2026-01-15T12:30:00Z\",\"sync_ms\":50,\"total_ms\":150}",
+    "sha256": "427b1bbb5ca6fe20b31c542962375395804ae3500a72028fb9dba1d87b05b6c5",
+    "expected_validation": "pass"
+  },
+  {
+    "name": "combined-separators",
+    "evidence": {
+      "command_ms": 100,
+      "command_text": "echo \u2028line1\u2029para2\u2028end",
+      "digest": "d6e1a229dfe20ffb159a8a481e54b4dc55a8271618c28e104138de66a2c6b591",
+      "ended_at": "2026-01-15T12:30:05Z",
+      "evidence_type": "run",
+      "exit_code": 0,
+      "lease_id": "cbx_sep001",
+      "provider": "aws",
+      "run_id": "run_cs001",
+      "run_status": "succeeded",
+      "schema_version": 1,
+      "started_at": "2026-01-15T12:30:00Z",
+      "sync_ms": 50,
+      "total_ms": 150
+    },
+    "canonical_json": "{\"command_ms\":100,\"command_text\":\"echo \\u2028line1\\u2029para2\\u2028end\",\"digest\":\"\",\"ended_at\":\"2026-01-15T12:30:05Z\",\"evidence_type\":\"run\",\"exit_code\":0,\"lease_id\":\"cbx_sep001\",\"provider\":\"aws\",\"run_id\":\"run_cs001\",\"run_status\":\"succeeded\",\"schema_version\":1,\"started_at\":\"2026-01-15T12:30:00Z\",\"sync_ms\":50,\"total_ms\":150}",
+    "sha256": "d6e1a229dfe20ffb159a8a481e54b4dc55a8271618c28e104138de66a2c6b591",
+    "expected_validation": "pass"
+  },
+  {
+    "name": "unicode-escaping",
+    "evidence": {
+      "command_ms": 100,
+      "command_text": "echo \"\u2028\u2029héllo🚀\u2028\"",
+      "digest": "5b82d3a303cd40a56194b57f42f81d7f334ccf849c81c219500ac80d0d09edc3",
+      "ended_at": "2026-01-15T12:30:05Z",
+      "evidence_type": "run",
+      "exit_code": 0,
+      "label": "生态系\u2028テスト",
+      "lease_id": "cbx_sep001",
+      "provider": "aws",
+      "run_id": "run_ue001",
+      "run_status": "succeeded",
+      "schema_version": 1,
+      "started_at": "2026-01-15T12:30:00Z",
+      "sync_ms": 50,
+      "total_ms": 150
+    },
+    "canonical_json": "{\"command_ms\":100,\"command_text\":\"echo \\\"\\u2028\\u2029héllo🚀\\u2028\\\"\",\"digest\":\"\",\"ended_at\":\"2026-01-15T12:30:05Z\",\"evidence_type\":\"run\",\"exit_code\":0,\"label\":\"生态系\\u2028テスト\",\"lease_id\":\"cbx_sep001\",\"provider\":\"aws\",\"run_id\":\"run_ue001\",\"run_status\":\"succeeded\",\"schema_version\":1,\"started_at\":\"2026-01-15T12:30:00Z\",\"sync_ms\":50,\"total_ms\":150}",
+    "sha256": "5b82d3a303cd40a56194b57f42f81d7f334ccf849c81c219500ac80d0d09edc3",
+    "expected_validation": "pass"
+  }
+]

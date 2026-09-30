@@ -511,7 +511,7 @@ crabbox checkpoint fork --provider parallels --parallels-template ubuntu-fast --
 ```
 --keep            Keep the forked lease running (default true).
 --count <n>       Create multiple forked leases (default 1).
---lease-id <id>   Fixed cbx_<12 lowercase hex characters> lease ID for
+--lease-id <id>   Fixed cbx_<12 or 32 lowercase hex characters> lease ID for
                   idempotent external-provider orchestration; native checkpoints
                   only; incompatible with --keep=false, fan-out, --workdir,
                   and commands after --.

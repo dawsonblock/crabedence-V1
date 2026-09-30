@@ -100,8 +100,11 @@ esac
   const lease = "cbx_123456789abc";
   const container = "a".repeat(64);
   const launch = `provisioning provider=local-container lease=${lease} slug=synthetic\n`;
+  const wideLease = `cbx_${"a".repeat(32)}`;
+  const wideLaunch = `provisioning provider=local-container lease=${wideLease} slug=synthetic\n`;
   for (const scenario of [
     { name: "exact", log: launch, ids: container, inspect: true },
+    { name: "32-hex lease", log: wideLaunch, ids: container, inspect: true, lease: wideLease },
     { name: "missing log", log: null, ids: container, inventory: false },
     { name: "no lease", log: "build failed\n", ids: container, inventory: false },
     { name: "multiple leases", log: launch + launch, ids: container, inventory: false },
@@ -128,7 +131,7 @@ esac
       assert.match(
         observed,
         new RegExp(
-          `^ps -aq --no-trunc --filter label=crabbox=true --filter label=provider=local-container --filter label=lease=${lease}\\n`,
+          `^ps -aq --no-trunc --filter label=crabbox=true --filter label=provider=local-container --filter label=lease=${scenario.lease ?? lease}\\n`,
         ),
       );
     if (scenario.inspect) {

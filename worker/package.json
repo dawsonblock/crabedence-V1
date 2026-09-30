@@ -1,6 +1,6 @@
 {
   "name": "@openclaw/crabbox-worker",
-  "version": "0.50.0",
+  "version": "0.53.2",
   "private": true,
   "type": "module",
   "scripts": {
@@ -22,7 +22,7 @@
     "lint": "oxlint --config .oxlintrc.json .",
     "start:node": "node dist-node/server.mjs",
     "test": "vitest run",
-    "test:postgres": "vitest run test/coordinator-parity.live.test.ts"
+    "test:postgres": "vitest run --config vitest.live.config.ts test/coordinator-parity.live.test.ts"
   },
   "dependencies": {
     "@aws-sdk/credential-providers": "^3.1120.0",
@@ -46,7 +46,7 @@
     "oxlint-tsgolint": "^7.0.2001",
     "typescript": "^7.0.2",
     "vitest": "^4.1.11",
-    "wrangler": "^4.127.0"
+    "wrangler": "^4.135.0"
   },
   "engines": {
     "node": ">=22.12.0"

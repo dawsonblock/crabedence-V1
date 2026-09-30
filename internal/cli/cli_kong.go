@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/alecthomas/kong"
+	"github.com/openclaw/crabbox/internal/execution"
 )
 
 type crabboxKongCLI struct {
@@ -20,6 +22,9 @@ type crabboxKongCLI struct {
 	Warmup      warmupKongCmd      `cmd:"" passthrough:"" help:"Lease a box and wait until it is ready."`
 	Prewarm     prewarmKongCmd     `cmd:"" passthrough:"" help:"Lease and hydrate a reusable test-ready box."`
 	Run         runKongCmd         `cmd:"" passthrough:"" help:"Sync the repo, run a remote command, stream output."`
+	Exec        execKongCmd        `cmd:"" passthrough:"" help:"Execute a capability via JSON stdin/stdout (NeMo bridge)."`
+	ServeExec   serveExecKongCmd   `cmd:"" help:"Start the persistent execution service (Unix socket)."`
+	Invoke      invokeKongCmd      `cmd:"" help:"Invoke a capability via the execution service (planner-agnostic client)."`
 	Watch       watchKongCmd       `cmd:"" passthrough:"" help:"Re-run a command on a warm lease when local files change."`
 	Shard       shardKongCmd       `cmd:"" passthrough:"" help:"Fork a checkpoint into parallel shards and merge their test results."`
 	Bench       benchKongCmd       `cmd:"" help:"Record and report local benchmark timings."`
@@ -36,6 +41,7 @@ type crabboxKongCLI struct {
 	Results     resultsKongCmd     `cmd:"" passthrough:"" help:"Show recorded test result summaries."`
 	Receipt     receiptKongCmd     `cmd:"" passthrough:"" help:"Retrieve and verify a signed terminal run receipt."`
 	Verify      verifyKongCmd      `cmd:"" passthrough:"" help:"Verify a signed run receipt."`
+	Evidence    evidenceKongCmd    `cmd:"" passthrough:"" help:"Verify a RunEvidenceV1 document (digest, receipt binding, signature)."`
 	Cache       cacheKongCmd       `cmd:"" help:"Inspect, purge, or warm remote caches."`
 	Status      statusKongCmd      `cmd:"" passthrough:"" help:"Show lease state; add --wait to block until ready."`
 	Heartbeat   heartbeatKongCmd   `cmd:"" passthrough:"" help:"Refresh a lease idle deadline and print its state."`
@@ -86,7 +92,12 @@ func (a App) runKong(ctx context.Context, args []string) (err error) {
 	parser, err := kong.New(&cli,
 		kong.Name("crabbox"),
 		kong.Description("Crabbox leases remote test boxes, syncs your dirty checkout, runs commands, and cleans up."),
-		kong.Vars{"version": currentVersion()},
+		kong.Vars{
+			"version": currentVersion(),
+			// One resolver owns the default socket path so
+			// serve-exec, invoke, and exec cannot drift.
+			"execution_socket": execution.DefaultSocketPath(),
+		},
 		kong.Writers(a.Stdout, a.Stderr),
 		kong.Exit(func(code int) {
 			panic(kongExit{code: code})
@@ -167,6 +178,23 @@ type prewarmKongCmd struct {
 type runKongCmd struct {
 	Args []string `arg:"" optional:""`
 }
+type execKongCmd struct {
+	Args []string `arg:"" optional:""`
+}
+type serveExecKongCmd struct {
+	Socket string `help:"Unix socket path (default: the canonical per-user execution socket)" default:"${execution_socket}"`
+}
+type invokeKongCmd struct {
+	Socket         string        `help:"Unix socket path (default: the canonical per-user execution socket)" default:"${execution_socket}"`
+	Capability     string        `help:"Capability to invoke" required:""`
+	Principal      string        `help:"Requesting principal" required:""`
+	AuthorityRef   string        `help:"Authority reference (e.g. grant ID)"`
+	IdempotencyKey string        `help:"Idempotency key (required for MUTATION/CRITICAL)"`
+	Arguments      string        `help:"Arguments as JSON" default:"{}"`
+	ExecutionClass string        `help:"Execution class assertion (advisory; registry is authoritative)"`
+	Deadline       string        `help:"RFC3339 deadline"`
+	Timeout        time.Duration `help:"Client-side wait for a response; after transmission a timeout is UNKNOWN, never FAILED" default:"30s"`
+}
 type watchKongCmd struct {
 	Args []string `arg:"" optional:""`
 }
@@ -222,6 +250,9 @@ type receiptKongCmd struct {
 	Args []string `arg:"" optional:""`
 }
 type verifyKongCmd struct {
+	Args []string `arg:"" optional:""`
+}
+type evidenceKongCmd struct {
 	Args []string `arg:"" optional:""`
 }
 type portsKongCmd struct {
@@ -657,8 +688,20 @@ func (c *doctorKongCmd) Run(ctx context.Context, app App) error  { return app.do
 func (c *warmupKongCmd) Run(ctx context.Context, app App) error  { return app.warmup(ctx, c.Args) }
 func (c *prewarmKongCmd) Run(ctx context.Context, app App) error { return app.prewarm(ctx, c.Args) }
 func (c *runKongCmd) Run(ctx context.Context, app App) error     { return app.runCommand(ctx, c.Args) }
-func (c *watchKongCmd) Run(ctx context.Context, app App) error   { return app.watch(ctx, c.Args) }
-func (c *shardKongCmd) Run(ctx context.Context, app App) error   { return app.shard(ctx, c.Args) }
+func (c *execKongCmd) Run(ctx context.Context, app App) error {
+	// exec is a passthrough bridge (Kong forbids flags on it); its
+	// client wait is the shared default, which matches the legacy
+	// bridge's own subprocess timeout.
+	return app.execCommand(ctx, c.Args, execution.DefaultClientTimeout)
+}
+func (c *serveExecKongCmd) Run(ctx context.Context, app App) error {
+	return app.serveExecCommand(ctx, c.Socket)
+}
+func (c *invokeKongCmd) Run(ctx context.Context, app App) error {
+	return app.invokeCommand(ctx, c.Socket, c.Capability, c.Principal, c.AuthorityRef, c.IdempotencyKey, c.Arguments, c.ExecutionClass, c.Deadline, c.Timeout)
+}
+func (c *watchKongCmd) Run(ctx context.Context, app App) error { return app.watch(ctx, c.Args) }
+func (c *shardKongCmd) Run(ctx context.Context, app App) error { return app.shard(ctx, c.Args) }
 func (c *benchRunKongCmd) Run(ctx context.Context, app App) error {
 	return app.benchRun(ctx, c.Args)
 }
@@ -679,6 +722,7 @@ func (c *attachKongCmd) Run(ctx context.Context, app App) error    { return app.
 func (c *resultsKongCmd) Run(ctx context.Context, app App) error   { return app.results(ctx, c.Args) }
 func (c *receiptKongCmd) Run(ctx context.Context, app App) error   { return app.receipt(ctx, c.Args) }
 func (c *verifyKongCmd) Run(ctx context.Context, app App) error    { return app.verify(ctx, c.Args) }
+func (c *evidenceKongCmd) Run(ctx context.Context, app App) error  { return app.evidence(ctx, c.Args) }
 func (c *portsKongCmd) Run(ctx context.Context, app App) error     { return app.ports(ctx, c.Args) }
 func (c *cpKongCmd) Run(ctx context.Context, app App) error        { return app.copyCommand(ctx, c.Args) }
 func (c *tunnelKongCmd) Run(ctx context.Context, app App) error    { return app.tunnel(ctx, c.Args) }

@@ -150,7 +150,7 @@ external resources should fall back to `CRABBOX_RUN_ID`, which is always set.
 
 `CRABBOX_RUN_ID` uses the durable coordinator-issued run ID when the run is
 coordinator-backed. Without a coordinator, the CLI generates the same
-`run_<12 lowercase hex characters>` shape before dispatch. The value stays
+`run_<32 lowercase hex characters>` shape before dispatch. The value stays
 fixed across argv, shell, uploaded-script, job, and delegated execution within
 that invocation; a later `crabbox run` gets a new ID.
 

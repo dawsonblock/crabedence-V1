@@ -244,7 +244,7 @@ func TestJobRunInjectsReservedExecutionMetadata(t *testing.T) {
 			t.Fatalf("job command missing %q:\n%s", want, logText)
 		}
 	}
-	if !regexp.MustCompile(`CRABBOX_RUN_ID=.*run_[a-f0-9]{12}`).MatchString(logText) {
+	if !regexp.MustCompile(`CRABBOX_RUN_ID=.*run_[a-f0-9]{32}`).MatchString(logText) {
 		t.Fatalf("job command missing run metadata:\n%s", logText)
 	}
 	invalidate := strings.Index(logText, `/bin/rm -f -- "$meta_dir/sync-fingerprint"`)

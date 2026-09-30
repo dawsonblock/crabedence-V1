@@ -336,6 +336,19 @@ CRABBOX_DEPLOY_SMOKE_URLS="https://$BROKER_HOST/v1/health" \
   scripts/deploy-worker-smoke.sh
 ```
 
+Production deploys are automated by `.github/workflows/coordinator-deploy.yml`,
+which tracks `main` and passes the deployed commit and the `VERSION` file to the
+Worker (`CRABBOX_BUILD_COMMIT` / `CRABBOX_BUILD_VERSION`). `GET /v1/health`
+publishes them as `commit` and `version`:
+
+- `version` names the last released source (`VERSION`, for example `0.53.1`);
+- `commit` names the exact deployed source.
+
+Because `main` deploys ahead of releases, the version alone is not a sufficient
+identity for a running coordinator: treat `commit` as the deployment identity
+and `version` as the release line, and use the commit for rollback and incident
+decisions.
+
 ### Node.js And PostgreSQL
 
 Requirements: Node.js 22.12+, PostgreSQL 13+, one always-on service replica, and
@@ -921,6 +934,26 @@ Record the upstream manifest digest, metadata hashes, native Tart version,
 macOS workload result, and cleanup evidence in the PR. Preserve explicit custom
 image references and never silently fall back to a mutable tag.
 
+## Known Qualification Flakes
+
+These do not indicate a source regression, but they are real signals about
+timing margin and should be replaced with controllable clocks or event
+synchronization where practical. Do not dismiss a repeat of one of these as
+"just flaky" without an isolated rerun on an idle machine.
+
+- `internal/reconcile` — `TestLiveBatchClaimHeartbeatProtectsQueuedRecords`
+  (live PostgreSQL). Failed once during a race run that overlapped the
+  `internal/cli` suite, then passed in isolation in 1.05s and in a clean
+  full-package race run on an idle machine. The test depends on wall-clock
+  scheduling between two workers; under suite load the second worker can
+  steal a queued record whose claim the batch heartbeat should hold.
+- `internal/providers/tart` race group — sits close to the gate's 120s
+  ceiling on slower machines (locally 91-118s against a 120s ceiling; CI
+  measured ~86s on the same code). Marginal, not deterministic.
+- `internal/idempotency` live lease-expiry tests — observed
+  `LEASE_EXPIRED` timing failures under Docker Desktop scheduling on macOS;
+  clean on rerun and in CI.
+
 ## Release Checklist
 
 The authoritative serialized release contract is [Release engineering](RELEASING.md).
@@ -938,7 +971,7 @@ Before creating or reusing a signed release tag:
 
 - Rebase release preparation on the current `main`, restore missing published history from the latest tag while preserving `Unreleased` and other new entries, and verify every published version remains represented.
 - Finalize the `Unreleased` entries maintained as work lands into a versioned, dated release section in `CHANGELOG.md`, with user-facing changes first and contributor thanks / co-author notes intact.
-- Update every package metadata file that carries the project version. The current release surface is `worker/package.json` plus both root package entries in `worker/package-lock.json`; the removed root plugin package must not be recreated.
+- Update `VERSION` — the single version source — together with every file that carries the project version: `worker/package.json`, both root package entries in `worker/package-lock.json`, `nemo/package.json`, and both root entries in `nemo/package-lock.json`; the removed root plugin package must not be recreated. Bump the release identity in `.github/workflows/release-qualification.yml` (`RELEASE_NAME`, `RELEASE_VERSION`) in the same preparation change, so the evidence job describes the release being prepared. `node scripts/verify-version-consistency.mjs --tag vX.Y.Z` must pass before tagging — CI and both release workflows enforce it.
 - `go vet ./...`
 - `go test -race -timeout=20m ./...`
 - `scripts/test-go-modules.sh`
@@ -962,12 +995,13 @@ Then advance sequentially under that authorization as each technical gate passes
    recreate it merely because verifier hardening landed later.
 2. **Local candidate.** Build the exact eight-asset payload described in
    [Release engineering](RELEASING.md#immutable-release-record). Ordinary builds
-   remain credential-free. The macOS producer uses the managed release keychain
-   to sign both native CLI architectures, the Apple Silicon helper, and its
-   embedded VMD as
-   `Developer ID Application: OpenClaw Foundation (FWJYW4S8P8)`, with hardened
-   runtime and secure timestamps, then requires accepted notarization and
-   online `codesign --check-notarization` proof before packaging.
+   remain credential-free, and the declared contract is **unsigned and not
+   notarized** (`CRABBOX_RELEASE_APPLE_SIGNING=none`): `verify-macos-binary.sh`
+   requires the unsigned signature report and rejects identity signatures,
+   authorities, secure timestamps, and notarization tickets, so a signed or
+   notarized macOS artifact fails the gate. Signed Apple publication is a
+   separate contract upgrade gated on provisioning a real Developer ID identity
+   and on a source change to the embedded-VMD runtime trust policy.
 3. **Private draft.** After local verification succeeds, create exactly one
    GitHub draft for the captured pre-existing signed tag. Its title, exact eight
    assets, and body copied byte-for-byte from the tagged `CHANGELOG.md` section
@@ -987,23 +1021,26 @@ Then advance sequentially under that authorization as each technical gate passes
    the release.
 6. **Homebrew update.** Publication establishes eligibility. Explicitly dispatch
    the tap's ordinary `update-formula.yml` with `formula=crabbox`, the tag,
-   `repository=openclaw/crabbox`, and the four-target `assets` JSON constructed
+   `repository=dawsonblock/crabedence-V1`, and the four-target `assets` JSON constructed
    by the runnable [handoff](RELEASING.md#operator-command-sequence). Do not wait
    for public native or Go smoke results. The updater owns all-four URL/hash
    maintenance and preserves maintained formula code. Retry the same handoff
    after a failure; an already-current update is success. Never rebuild,
    recreate a draft, or republish to retry Homebrew. Generic tap reconciliation
    remains a valid fallback.
-7. **Independent channel smokes.** Run public-download/native verification,
-   fresh proxy-only public Go installation, and the installed-Homebrew verifier
-   independently. Homebrew needs only tag, assets, tag object, source commit,
-   verifier commit, and release ID, not public run IDs or proof ZIPs. Before
-   formula evaluation it checks immutable public bytes and static provenance.
-   Tap maintainers own executable Ruby, evaluated only credential-free; native
-   structured metadata must match the exact formula identity, version, URL,
-   and checksum. This is not a Ruby sandbox. Fresh fetch/install or reinstall,
-   installed-byte, signature/notarization, architecture, version, and arm64 VMD
-   trust checks are bounded smokes; they do not authorize unrelated provider mutations.
+7. **Independent channel smokes.** Run public-download/native verification and
+   the installed-Homebrew verifier independently. The public `go install`
+   channel is not available for this fork — the module path resolves upstream —
+   so the hermetic `scripts/verify-go-install.sh` gate before candidate
+   production covers it instead. Homebrew needs only tag, assets, tag object,
+   source commit, verifier commit, and release ID, not public run IDs or proof
+   ZIPs. Before formula evaluation it checks immutable public bytes and static
+   provenance. Tap maintainers own executable Ruby, evaluated only
+   credential-free; native structured metadata must match the exact formula
+   identity, version, URL, and checksum. This is not a Ruby sandbox. Fresh
+   fetch/install or reinstall, installed-byte, declared unsigned-signature,
+   architecture, version, and arm64 VMD trust checks are bounded smokes; they
+   do not authorize unrelated provider mutations.
 8. **Closeout.** Record publication, tap update, and independent smoke results
    (including outstanding failures). Verify release notes match the finalized
    release section in the changelog. Keep later user-visible work under

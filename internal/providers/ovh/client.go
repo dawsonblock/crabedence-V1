@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -251,21 +250,13 @@ func newClientWithConfig(cfg clientConfig) (*Client, error) {
 }
 
 func secureOVHHTTPClient(source *http.Client, trusted *url.URL) *http.Client {
-	client := *source
-	originalCheckRedirect := source.CheckRedirect
-	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		if !sameOVHOrigin(trusted, req.URL) {
-			return errOVHCrossOriginRedirect
-		}
-		if originalCheckRedirect != nil {
-			return originalCheckRedirect(req, via)
-		}
-		if len(via) >= 10 {
-			return errOVHRedirectLimit
-		}
-		return nil
-	}
-	return &client
+	// The origin pin, the preserved hook, and the cap are the shared helper's.
+	// The cross-origin refusal and the redirect-limit sentinel are this
+	// provider's, and both are matched on elsewhere, so they are passed in
+	// rather than reimplemented.
+	return shared.SecureHTTPClient(source, trusted, func(*url.URL) error {
+		return errOVHCrossOriginRedirect
+	}, shared.WithRedirectLimitError(errOVHRedirectLimit))
 }
 
 func sameOVHOrigin(a, b *url.URL) bool {
@@ -415,7 +406,7 @@ func (c *Client) do(ctx context.Context, method, requestPath string, body any, o
 		return sanitizeOVHClientError(err)
 	}
 	defer resp.Body.Close()
-	data, readErr := io.ReadAll(resp.Body)
+	data, readErr := shared.ReadBoundedResponse(resp.Body, shared.MaxControlPlaneResponseBytes)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body := redactSecrets(strings.TrimSpace(string(data)), c.applicationKey, c.applicationSecret, c.consumerKey)
 		if len(body) > 400 {

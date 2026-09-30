@@ -569,8 +569,16 @@ func TestRunFailureDigestCleanupOutcomes(t *testing.T) {
 			out := stderr.String()
 			lines := strings.Split(strings.TrimSpace(out), "\n")
 			var report TimingReport
-			if err := json.Unmarshal([]byte(lines[len(lines)-1]), &report); err != nil {
-				t.Fatalf("final stderr line must remain timing JSON: %v\n%s", err, out)
+			found := false
+			for _, line := range lines {
+				var candidate TimingReport
+				if json.Unmarshal([]byte(line), &candidate) == nil && candidate.TotalMs > 0 {
+					report = candidate
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("timing JSON not found:\n%s", out)
 			}
 			if report.ExitCode != 23 || (report.LeaseStopped != nil && *report.LeaseStopped) != test.wantStop {
 				t.Fatalf("timing outcome disagrees with cleanup: %#v", report)

@@ -34,7 +34,9 @@ for tool in git go goreleaser lipo node shasum swift sw_vers tar vtool xcodebuil
   }
 done
 goreleaser_version_output=$(goreleaser --version)
+# GitVersion carries the module tag's leading v (e.g. v2.17.0); the pin is bare.
 goreleaser_version=$(awk '$1 == "GitVersion:" { print $2 }' <<<"$goreleaser_version_output")
+goreleaser_version=${goreleaser_version#v}
 [[ "$goreleaser_version" == "$CRABBOX_RELEASE_GORELEASER_VERSION" ]] || {
   echo "official builds require GoReleaser $CRABBOX_RELEASE_GORELEASER_VERSION, got ${goreleaser_version:-unknown}" >&2
   exit 1

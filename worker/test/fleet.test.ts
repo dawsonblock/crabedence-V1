@@ -8384,7 +8384,7 @@ describe("fleet lease identity and idle", () => {
     );
     expect(create.status).toBe(202);
     const created = (await create.json()) as { providerResourceId: string };
-    expect(created.providerResourceId).toMatch(/^cbx_[a-f0-9]{12}$/);
+    expect(created.providerResourceId).toMatch(/^cbx_[a-f0-9]{32}$/);
     expect(created).toMatchObject({
       status: "provisioning",
       profile,
@@ -13777,6 +13777,7 @@ describe("fleet lease identity and idle", () => {
         cloudID: lease.cloudID,
         provisioningResourceMayExist: true,
         provisioningFailureRetryable: false,
+        releaseDeletesServer: true,
       });
       expect(unresolved?.cleanupError).toContain(
         "original API, organization, and credential context",
@@ -19172,6 +19173,32 @@ describe("fleet lease identity and idle", () => {
     expect(deleted).toBe("123");
   });
 
+  it("resolves a legacy 12-hex lease and a current 32-hex lease side by side", async () => {
+    const storage = new MemoryStorage();
+    const fleet = testFleet(storage);
+    const legacyID = "cbx_abcdef123456";
+    const currentID = `cbx_${"a".repeat(32)}`;
+    const headers = { "x-crabbox-owner": "owner@example.com", "x-crabbox-org": "example-org" };
+    for (const id of [legacyID, currentID]) {
+      storage.seed(
+        `lease:${id}`,
+        testLease({
+          id,
+          owner: "owner@example.com",
+          org: "example-org",
+          expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+        }),
+      );
+    }
+
+    const legacy = await fleet.fetch(request("GET", `/v1/leases/${legacyID}`, { headers }));
+    const current = await fleet.fetch(request("GET", `/v1/leases/${currentID}`, { headers }));
+    expect(legacy.status).toBe(200);
+    expect(current.status).toBe(200);
+    await expect(legacy.json()).resolves.toMatchObject({ lease: { id: legacyID } });
+    await expect(current.json()).resolves.toMatchObject({ lease: { id: currentID } });
+  });
+
   it("keeps colliding exact org labels isolated across shares, runs, and filters", async () => {
     const storage = new MemoryStorage();
     const fleet = testFleet(storage);
@@ -23456,6 +23483,7 @@ describe("fleet lease identity and idle", () => {
       cloudID: "vm-cbx-abcdef123456",
       cleanupError: "azure delete throttled Authorization: [redacted]",
       releaseDeletesServer: true,
+      expiresAt: expect.any(String),
     });
     expect(failedCleanup?.cleanupError).not.toContain("release-secret");
 
@@ -27035,7 +27063,7 @@ describe("fleet lease identity and idle", () => {
     );
     expect(generated.status).toBe(201);
     const generatedBody = (await generated.json()) as { lease: LeaseRecord };
-    expect(generatedBody.lease.id).toMatch(/^cbx_[a-f0-9]{12}$/);
+    expect(generatedBody.lease.id).toMatch(/^cbx_[a-f0-9]{32}$/);
     expect(creates).toBe(2);
     expect((await storage.list({ prefix: "create-attempt:" })).size).toBe(0);
   });
@@ -28385,7 +28413,7 @@ describe("fleet lease identity and idle", () => {
     const fixedID = "cbx_ca1100000008";
     const registrationID = "cbx_ca1100000009";
     const ordinaryID = "cbx_ca110000000a";
-    const workspaceID = "cbx_ca110000000b";
+    const workspaceID = "cbx_ca110000000b00000000000000000000";
     const canceledTokens = new Map([
       [fixedID, "cat_80000000000000000000000000000008"],
       [registrationID, "cat_80000000000000000000000000000009"],
@@ -28519,9 +28547,9 @@ describe("fleet lease identity and idle", () => {
 
   it("keeps pending and canonical-bound create attempts as global ID blockers", async () => {
     const storage = new MemoryStorage();
-    const pendingID = "cbx_ca110000000c";
-    const boundID = "cbx_ca110000000d";
-    const freeID = "cbx_ca110000000e";
+    const pendingID = "cbx_ca110000000c00000000000000000000";
+    const boundID = "cbx_ca110000000d00000000000000000000";
+    const freeID = "cbx_ca110000000e00000000000000000000";
     storage.seed(`create-attempt:${pendingID}`, {
       version: 1,
       requestedLeaseID: pendingID,
@@ -30905,6 +30933,32 @@ describe("fleet lease identity and idle", () => {
       202,
     );
     expect(refreshes).toBe(1);
+  });
+
+  it("publishes the deployed build identity on /v1/health", async () => {
+    const identified = testFleet(
+      new MemoryStorage(),
+      {},
+      {
+        CRABBOX_BUILD_COMMIT: "0123456789abcdef0123456789abcdef01234567",
+        CRABBOX_BUILD_VERSION: "0.53.1",
+      },
+    );
+    const health = await identified.fetch(request("GET", "/v1/health"));
+    expect(health.status).toBe(200);
+    await expect(health.json()).resolves.toMatchObject({
+      ok: true,
+      commit: "0123456789abcdef0123456789abcdef01234567",
+      version: "0.53.1",
+    });
+
+    // Without the deploy-provided vars the fields are absent, never guessed.
+    const anonymous = testFleet(new MemoryStorage());
+    const anonymousHealth = await anonymous.fetch(request("GET", "/v1/health"));
+    const body = (await anonymousHealth.json()) as Record<string, unknown>;
+    expect(body).toMatchObject({ ok: true });
+    expect(body.commit).toBeUndefined();
+    expect(body.version).toBeUndefined();
   });
 
   it("fails closed without an isolated Code origin while retaining health and bridge tickets", async () => {
@@ -41067,8 +41121,153 @@ describe("fleet run history", () => {
       state: "running",
       eventCount: 1,
     });
-    expect((await storage.list({ prefix: `runlog:${run.id}:finish:` })).size).toBe(0);
+    // The run references no finish log: an uncommitted attempt never makes
+    // the run appear terminal. The bytes stay owned by the durable attempt
+    // until the sweeper retires it.
+    expect(storage.value<RunRecord>(`run:${run.id}`)?.terminalLogPrefix).toBeUndefined();
+    const attempts = await storage.list({ prefix: `terminal-attempt:${run.id}:` });
+    expect(attempts.size).toBe(1);
+    const attempt = [...attempts.values()][0] as { state: string; logPrefix: string };
+    expect(attempt.state).toBe("log_written");
+    expect((await storage.list({ prefix: attempt.logPrefix })).size).toBeGreaterThan(0);
     expect(storage.value(`runevent:${run.id}:000000000002`)).toBeUndefined();
+  });
+
+  it("keeps the terminal attempt recoverable when the terminal transaction fails", async () => {
+    const storage = new MemoryStorage();
+    const fleet = testFleet(storage);
+    const create = await fleet.fetch(
+      request("POST", "/v1/runs", {
+        body: { provider: "aws", command: ["false"] },
+      }),
+    );
+    const { run } = (await create.json()) as { run: RunRecord };
+    const receipt = await testTerminalReceipt({
+      run,
+      exitCode: 1,
+      syncMs: 0,
+      commandMs: 1,
+      log: "failed\n",
+    });
+    // Inject failure on the run event write (inside the transaction,
+    // before the run record write). This tests that the transaction
+    // rolls back both the event and the run record, and the terminal
+    // log is cleaned up.
+    storage.beforePut = async (key) => {
+      if (key.startsWith(`runevent:${run.id}:`)) {
+        throw new Error("injected event write failure");
+      }
+    };
+    const response = await fleet.fetch(
+      request("POST", `/v1/runs/${run.id}/finish`, {
+        body: { exitCode: 1, commandMs: 1, log: "failed\n", receipt },
+      }),
+    );
+    expect(response.status).toBe(500);
+    storage.beforePut = undefined;
+    // Run record remains in running state.
+    expect(storage.value<RunRecord>(`run:${run.id}`)).toMatchObject({
+      state: "running",
+      eventCount: 1,
+    });
+    // The run references no log, the event was not persisted, and the
+    // durable attempt survives for a retry (or for the sweeper to retire).
+    expect(storage.value<RunRecord>(`run:${run.id}`)?.terminalLogPrefix).toBeUndefined();
+    expect(storage.value(`runevent:${run.id}:000000000002`)).toBeUndefined();
+    const attempts = await storage.list({ prefix: `terminal-attempt:${run.id}:` });
+    expect(attempts.size).toBe(1);
+    expect(([...attempts.values()][0] as { state: string }).state).toBe("log_written");
+  });
+
+  it("rejects duplicate terminal finish with different terminal digest", async () => {
+    const storage = new MemoryStorage();
+    const fleet = testFleet(storage);
+    const ownerHeaders = {
+      "x-crabbox-owner": "alice@example.com",
+      "x-crabbox-org": "example-org",
+    };
+    const create = await fleet.fetch(
+      request("POST", "/v1/runs", {
+        headers: ownerHeaders,
+        body: { provider: "aws", command: ["sh", "-c", "exit 0"] },
+      }),
+    );
+    expect(create.status).toBe(201);
+    const { run } = (await create.json()) as { run: RunRecord };
+
+    const log = "done\n";
+    const receipt = await testTerminalReceipt({
+      run,
+      exitCode: 0,
+      syncMs: 0,
+      commandMs: 1,
+      log,
+    });
+    const finishBody = { exitCode: 0, commandMs: 1, log, receipt };
+    const finish = await fleet.fetch(
+      request("POST", `/v1/runs/${run.id}/finish`, { headers: ownerHeaders, body: finishBody }),
+    );
+    expect(finish.status).toBe(200);
+
+    // Submit with different log content — this produces a different
+    // terminalFinishSHA256, so it must conflict (409).
+    const differentLog = "different output\n";
+    const differentReceipt = await testTerminalReceipt({
+      run,
+      exitCode: 0,
+      syncMs: 0,
+      commandMs: 1,
+      log: differentLog,
+    });
+    const conflict = await fleet.fetch(
+      request("POST", `/v1/runs/${run.id}/finish`, {
+        headers: ownerHeaders,
+        body: { exitCode: 0, commandMs: 1, log: differentLog, receipt: differentReceipt },
+      }),
+    );
+    expect(conflict.status).toBe(409);
+    // Original run record is unchanged.
+    expect(storage.value<RunRecord>(`run:${run.id}`)).toMatchObject({
+      state: "succeeded",
+      exitCode: 0,
+    });
+  });
+
+  it("accepts exact duplicate terminal finish with identical fingerprint", async () => {
+    const storage = new MemoryStorage();
+    const fleet = testFleet(storage);
+    const ownerHeaders = {
+      "x-crabbox-owner": "alice@example.com",
+      "x-crabbox-org": "example-org",
+    };
+    const create = await fleet.fetch(
+      request("POST", "/v1/runs", {
+        headers: ownerHeaders,
+        body: { provider: "aws", command: ["sh", "-c", "exit 0"] },
+      }),
+    );
+    expect(create.status).toBe(201);
+    const { run } = (await create.json()) as { run: RunRecord };
+
+    const log = "done\n";
+    const receipt = await testTerminalReceipt({
+      run,
+      exitCode: 0,
+      syncMs: 0,
+      commandMs: 1,
+      log,
+    });
+    const finishBody = { exitCode: 0, commandMs: 1, log, receipt };
+    const finish = await fleet.fetch(
+      request("POST", `/v1/runs/${run.id}/finish`, { headers: ownerHeaders, body: finishBody }),
+    );
+    expect(finish.status).toBe(200);
+
+    // Exact retry with identical content must be idempotent (200).
+    const duplicate = await fleet.fetch(
+      request("POST", `/v1/runs/${run.id}/finish`, { headers: ownerHeaders, body: finishBody }),
+    );
+    expect(duplicate.status).toBe(200);
   });
 
   it("keeps missing terminal receipts ambiguous and rejects unverifiable evidence", async () => {
@@ -41538,7 +41737,9 @@ describe("fleet run history", () => {
         })
       ).size,
     ).toBe(3);
-    expect(storage.transactionPutCounts.at(-1)).toBe(2);
+    // The terminal transaction commits the event, the run record, and the
+    // attempt's consumption — atomically.
+    expect(storage.transactionPutCounts.at(-1)).toBe(3);
 
     const logs = await fleet.fetch(request("GET", `/v1/runs/${run.id}/logs`));
     const logText = await logs.text();
@@ -44500,7 +44701,6 @@ describe("synthetic acknowledgement reliability", () => {
         await alarmRuntime(storage).scheduleAlarm(Date.now() + 1800_000);
         storage.resetListOptions();
         const get = vi.spyOn(storage, "get");
-        const put = vi.spyOn(storage, "put");
         const observedGet = (storage.beforeGet = vi.fn<NonNullable<MemoryStorage["beforeGet"]>>(
           async () => {},
         ));
@@ -44516,9 +44716,14 @@ describe("synthetic acknowledgement reliability", () => {
         );
         expect(release.status).toBe(200);
         expectBoundedAlarmReads(storage, 2);
-        expect.soft(get.mock.calls.length).toBeLessThanOrEqual(6);
-        expect(put).toHaveBeenCalledTimes(1);
-        expect(observedGet.mock.calls.length).toBeLessThanOrEqual(9);
+        // The lease repository reloads the record once per transition to
+        // validate the caller's expectation (incarnation, state, legal
+        // target), so each bound carries exactly one extra read.
+        expect.soft(get.mock.calls.length).toBeLessThanOrEqual(7);
+        // The release now persists inside a storage transaction, so the
+        // write is observed through the storage hook rather than the
+        // top-level put spy; exactly one lease write must still happen.
+        expect(observedGet.mock.calls.length).toBeLessThanOrEqual(10);
         expect(observedPut.mock.calls.filter(([key]) => key.startsWith("lease:"))).toHaveLength(1);
         expect(observedPut).toHaveBeenCalledTimes(2);
         expect(storage.alarm()).toBe(before);

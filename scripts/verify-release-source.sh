@@ -7,6 +7,11 @@ set -euo pipefail
 : "${EXPECTED_TAG_COMMIT:?EXPECTED_TAG_COMMIT is required}"
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# shellcheck source=scripts/release-config.sh
+source "$ROOT/scripts/release-config.sh"
+# The record check below runs in a child process; this script exports the
+# identity deliberately, and only for its own children.
+export CRABBOX_RELEASE_REPOSITORY
 TRUSTED_HEAD=${TRUSTED_HEAD:-HEAD}
 ALLOWED_SIGNERS=${ALLOWED_SIGNERS:-"$ROOT/.github/release-allowed-signers"}
 RELEASE_RECORD=${RELEASE_RECORD:-"$ROOT/release/records/$RELEASE_TAG.json"}
@@ -37,9 +42,16 @@ node - "$RELEASE_RECORD" "$RELEASE_TAG" "$EXPECTED_TAG_OBJECT" "$EXPECTED_TAG_CO
 const fs = require('node:fs');
 const [file, tag, tagObject, sourceCommit, requirePublishable] = process.argv.slice(2);
 const record = JSON.parse(fs.readFileSync(file, 'utf8'));
+// A release record describes where an artifact actually came from. The
+// fork's own releases must carry the configured repository identity; an
+// imported pre-fork release (always blocked) keeps its real upstream
+// origin instead, so the ledger does not rewrite history.
+const identityOk =
+  record.repository === process.env.CRABBOX_RELEASE_REPOSITORY ||
+  (record.publicationStatus === 'blocked' && record.repository === 'openclaw/crabbox');
 if (
   record.schemaVersion !== 1 ||
-  record.repository !== 'openclaw/crabbox' ||
+  !identityOk ||
   record.tag !== tag ||
   record.tagObject !== tagObject ||
   record.sourceCommit !== sourceCommit ||

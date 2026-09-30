@@ -58,7 +58,7 @@ jobs:
           [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || exit 1
           [[ "$VERIFIER_COMMIT" =~ ^[0-9a-f]{40}$ ]] || exit 1
           [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]] || exit 1
-          [[ "$GITHUB_REPOSITORY" == openclaw/crabbox ]] || exit 1
+          [[ "$GITHUB_REPOSITORY" == dawsonblock/crabedence-V1 ]] || exit 1
           expected_ref="refs/heads/$DEFAULT_BRANCH"
           expected_workflow_ref="$GITHUB_REPOSITORY/.github/workflows/verify-homebrew.yml@$expected_ref"
           [[ "$REF_PROTECTED" == true ]] || exit 1
@@ -128,7 +128,7 @@ jobs:
           for asset in "${assets[@]}"; do
             curl --disable --fail --location --retry 3 --silent --show-error \
               --output "$assets_dir/$asset" \
-              "https://github.com/openclaw/crabbox/releases/download/$RELEASE_TAG/$asset"
+              "https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$asset"
           done
 
       - name: Verify public Homebrew install without credentials

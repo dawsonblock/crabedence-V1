@@ -52,6 +52,15 @@ runtime.setOperationRunner((callback) => lifecycleMutex.run(callback));
 await awsDeployment.start();
 await runtime.start(() => coordinator.alarm());
 
+// Coordinator authority is held by the advisory-lock session. If that
+// session dies (network drop, database restart, idle timeout), PostgreSQL
+// has already freed the lock and a replacement replica can start at any
+// moment. Begin an orderly shutdown immediately rather than continuing to
+// mutate coordinator state we no longer own.
+runtime.onAuthorityLost(() => {
+  void shutdown().catch(shutdownFailed);
+});
+
 const server = createServer((request, response) => {
   void activeRequests
     .run(() => handleRequest(request, response))
@@ -64,6 +73,18 @@ const server = createServer((request, response) => {
 async function handleRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
   const cancellation = nodeRequestAbortSignal(request, response);
   try {
+    // Fail closed while coordinator authority is lost: the advisory-lock
+    // session died, so this process no longer owns coordinator state and a
+    // replacement may already be mutating it.
+    if (runtime.lostAuthority()) {
+      await writeResponse(
+        response,
+        Response.json({ error: "coordinator_authority_lost" }, { status: 503 }),
+        true,
+      );
+      request.destroy();
+      return;
+    }
     const requestContext = nodeRequestContext(request);
     const requestMetadata = webRequestFromNode(request, requestContext, cancellation.signal);
     const authContext = { trustedProxy: requestContext.trustedProxy };

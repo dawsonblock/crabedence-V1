@@ -1429,6 +1429,25 @@ describe("Cloudflare Dynamic Workers runner", () => {
     await expect(loader.worker?.request?.text()).resolves.toBe("payload");
   });
 
+  it("mints a canonical run ID when the request omits one", async () => {
+    const loader = new MockLoader();
+    loader.nextResponse = new Response("executed");
+    const { id: _omitted, ...payload } = runPayload();
+    const response = await worker.fetch(
+      authedRequest("/v1/runs", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      }),
+      env(loader),
+      ctx(),
+    );
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { id: string; workerId: string };
+    expect(body.id).toMatch(/^run_[0-9a-f]{32}$/);
+    expect(body.workerId).toBe(body.id);
+  });
+
   it("executes when the best-effort global run index is unavailable", async () => {
     const loader = new MockLoader();
     loader.nextResponse = new Response("executed");

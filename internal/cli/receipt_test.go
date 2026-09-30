@@ -30,6 +30,7 @@ func TestReceiptCommandRecoversCommittedReceiptAfterLostFinishResponse(t *testin
 		EndedAt:           endedAt,
 		LogSHA256:         sha256Digest([]byte(logText)),
 		RetainedLogSHA256: sha256Digest([]byte(logText)),
+		SchemaVersion:     terminalReceiptV2SchemaVersion,
 	})
 	if err != nil {
 		t.Fatal(err)

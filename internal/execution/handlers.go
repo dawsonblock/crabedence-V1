@@ -1,0 +1,91 @@
+package execution
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/openclaw/crabbox/internal/capability"
+	"github.com/openclaw/crabbox/internal/idempotency"
+)
+
+// MultiHandler dispatches to different handlers based on the adapter ID
+// in the capability descriptor.
+type MultiHandler struct {
+	handlers map[string]Handler
+}
+
+// NewMultiHandler creates a handler that dispatches based on adapter ID.
+func NewMultiHandler(handlers map[string]Handler) *MultiHandler {
+	return &MultiHandler{handlers: handlers}
+}
+
+// Execute dispatches to the handler registered for the descriptor's adapter ID.
+func (h *MultiHandler) Execute(ctx context.Context, req Request, desc capability.ResolvedDescriptor) Response {
+	handler, ok := h.handlers[desc.AdapterID]
+	if !ok {
+		// A registered capability whose adapter is not configured is
+		// CAPABILITY_UNAVAILABLE — known, but not executable in this
+		// deployment — never CAPABILITY_NOT_FOUND, and never a routing
+		// change or fallback.
+		return Response{
+			Status:      StatusFailed,
+			FailureCode: string(capability.FailureCapabilityUnavailable),
+			Error: fmt.Sprintf("capability %s requires adapter %q, which is not configured in this deployment (reason=%s)",
+				desc.ID, desc.AdapterID, capability.FailureReasonAdapterNotConfigured),
+		}
+	}
+	return handler.Execute(ctx, req, desc)
+}
+
+// PrepareRecovery routes recovery-locator preparation to the handler
+// registered for adapterID. Handlers implementing
+// idempotency.RecoveryLocatorProvider produce minimal provider-specific
+// locators; handlers that don't return (nil, nil) so DispatchExecutor
+// falls back to the generic metadata-only locator. An unregistered
+// adapter fails closed — the dispatch boundary must not be crossed
+// without recovery coordinates.
+func (h *MultiHandler) PrepareRecovery(ctx context.Context, adapterID string, in idempotency.RecoveryLocatorInput) (*idempotency.RecoveryLocator, error) {
+	handler, ok := h.handlers[adapterID]
+	if !ok {
+		return nil, fmt.Errorf("no handler registered for adapter: %s", adapterID)
+	}
+	provider, ok := handler.(idempotency.RecoveryLocatorProvider)
+	if !ok {
+		return nil, nil
+	}
+	return provider.PrepareRecovery(ctx, in)
+}
+
+// ProviderCapabilities routes capability declarations to the handler
+// registered for adapterID. An unregistered adapter or a handler with
+// no declaration reports zero capabilities — the CRITICAL admission
+// gate fails closed either way.
+func (h *MultiHandler) ProviderCapabilities(adapterID string) ProviderCapabilities {
+	handler, ok := h.handlers[adapterID]
+	if !ok {
+		return ProviderCapabilities{}
+	}
+	if d, ok := handler.(CapabilityDeclarer); ok {
+		return d.ProviderCapabilities(adapterID)
+	}
+	return ProviderCapabilities{}
+}
+
+// Execute implements Handler for DispatchExecutor.
+// It delegates to ExecuteWithIdempotency which handles durable idempotency
+// and dispatch-point semantics.
+func (e *DispatchExecutor) Execute(ctx context.Context, req Request, desc capability.ResolvedDescriptor) Response {
+	return e.ExecuteWithIdempotency(ctx, req, desc)
+}
+
+// Execute implements Handler for FailClosedHandler.
+func (h *FailClosedHandler) Execute(ctx context.Context, req Request, desc capability.ResolvedDescriptor) Response {
+	if desc.ExecutionClass == capability.ClassMutation || desc.ExecutionClass == capability.ClassCritical {
+		return Response{
+			Status:      StatusFailed,
+			FailureCode: string(capability.FailureInternalError),
+			Error:       "durable idempotency unavailable: MUTATION/CRITICAL operations require a database connection",
+		}
+	}
+	return h.inner.Execute(ctx, req, desc)
+}

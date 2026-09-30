@@ -524,7 +524,7 @@ func machineBaseHost(cfg Config) string {
 	return parsed.Host
 }
 
-var machineNamePattern = regexp.MustCompile(`^crabbox-(.+)-([0-9a-f]{12})$`)
+var machineNamePattern = regexp.MustCompile(`^crabbox-(.+)-([0-9a-f]{12}|[0-9a-f]{32})$`)
 
 func isCrabboxMachine(m machineData) bool {
 	return machineNamePattern.MatchString(strings.TrimSpace(m.Name))

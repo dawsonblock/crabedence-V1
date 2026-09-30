@@ -708,7 +708,7 @@ elif mode == "delete" and len(sys.argv) == 4:
     expected_name = sys.argv[3]
     if not UUID_RE.fullmatch(uuid):
         fail("invalid delete UUID")
-    if not re.fullmatch(r"crabbox-ukc-[0-9a-f]{12}", expected_name):
+    if not re.fullmatch(r"crabbox-ukc-(?:[0-9a-f]{12}|[0-9a-f]{32})", expected_name):
         fail("invalid delete name")
     matches = [item for item in read_inventory() if item["uuid"] == uuid and item["name"] == expected_name]
     if len(matches) != 1:
@@ -734,7 +734,7 @@ elif mode == "absent" and len(sys.argv) == 3:
         raise SystemExit(1)
 elif mode == "absent-name" and len(sys.argv) == 3:
     name = sys.argv[2]
-    if not re.fullmatch(r"crabbox-ukc-[0-9a-fA-F]{12}", name):
+    if not re.fullmatch(r"crabbox-ukc-(?:[0-9a-fA-F]{12}|[0-9a-fA-F]{32})", name):
         fail("invalid absence name")
     if not error8_absent(name):
         raise SystemExit(1)
@@ -893,7 +893,7 @@ PY
 
 extract_created_identity() {
   local source="$1"
-  if [[ -z "$created_lease" && "$source" =~ (ukc_[0-9a-fA-F]{12}) ]]; then
+  if [[ -z "$created_lease" && "$source" =~ (ukc_[0-9a-fA-F]{12}|ukc_[0-9a-fA-F]{32}) ]]; then
     created_lease="${BASH_REMATCH[1]}"
   fi
   if [[ -z "$created_uuid" && "$source" =~ instance=([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}) ]]; then
@@ -926,7 +926,7 @@ discover_claim_identity() {
       return 1
     fi
   fi
-  if [[ "$created_lease" =~ ^ukc_[0-9a-fA-F]{12}$ ]]; then
+  if [[ "$created_lease" =~ ^(ukc_[0-9a-fA-F]{12}|ukc_[0-9a-fA-F]{32})$ ]]; then
     expected_name="crabbox-${created_lease//_/-}"
   fi
 }

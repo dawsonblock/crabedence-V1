@@ -52,10 +52,10 @@ VERIFIER_COMMIT=${VERIFIER_COMMIT:-$(git -C "$ROOT" rev-parse HEAD)}
   exit 1
 }
 origin_url=$(git -C "$ROOT" remote get-url origin)
-[[ "$origin_url" == https://github.com/openclaw/crabbox ||
-  "$origin_url" == https://github.com/openclaw/crabbox.git ||
-  "$origin_url" == git@github.com:openclaw/crabbox.git ]] || {
-  echo "release packaging requires the canonical openclaw/crabbox origin" >&2
+[[ "$origin_url" == "https://github.com/$CRABBOX_RELEASE_REPOSITORY" ||
+  "$origin_url" == "https://github.com/$CRABBOX_RELEASE_REPOSITORY.git" ||
+  "$origin_url" == "git@github.com:$CRABBOX_RELEASE_REPOSITORY.git" ]] || {
+  echo "release packaging requires the canonical $CRABBOX_RELEASE_REPOSITORY origin" >&2
   exit 1
 }
 remote_main=$(git -C "$ROOT" ls-remote origin "refs/heads/$CRABBOX_RELEASE_DEFAULT_BRANCH" | awk '{print $1}')
@@ -247,6 +247,12 @@ node "$ROOT/scripts/verify-go-release-binary.mjs" \
 
 sign_and_capture_notary_id() {
   local identifier=$1 arch=$2 binary=$3 output id
+  if [[ "$CRABBOX_RELEASE_APPLE_SIGNING" == "none" ]]; then
+    # This release contract declares macOS artifacts unsigned and not
+    # notarized, and the verifier proves that. Signing here would violate
+    # the contract this pipeline publishes under.
+    return 0
+  fi
   output=$("$ROOT/scripts/codesign-macos.sh" "$identifier" "$arch" "$binary")
   printf '%s\n' "$output" >&2
   id=$(sed -n 's/^Notarization accepted: //p' <<<"$output")
@@ -326,7 +332,11 @@ git -C "$ROOT" show "$TAG_COMMIT:CHANGELOG.md" >"$tagged_changelog"
 "$ROOT/scripts/extract-release-notes.sh" "$TAG" \
   <"$tagged_changelog" >"$notes"
 
-node "$ROOT/scripts/release-provenance.mjs" write \
+env \
+  CRABBOX_RELEASE_APPLE_SIGNING="$CRABBOX_RELEASE_APPLE_SIGNING" \
+  CRABBOX_RELEASE_TEAM_ID="${CRABBOX_RELEASE_TEAM_ID:-}" \
+  CRABBOX_RELEASE_AUTHORITY="${CRABBOX_RELEASE_AUTHORITY:-}" \
+  node "$ROOT/scripts/release-provenance.mjs" write \
   --dir "$PAYLOAD" \
   --tag "$TAG" \
   --tag-object "$TAG_OBJECT" \
@@ -354,7 +364,9 @@ while IFS= read -r name; do
   shasum -a 256 "$PAYLOAD/$name" | awk -v name="$name" '{ print $1 "  " name }' >>"$checksums"
 done < <({ crabbox_release_archive_names "$version"; printf '%s\n' provenance.json; } | LC_ALL=C sort)
 
-node "$ROOT/scripts/release-provenance.mjs" verify \
+env \
+  CRABBOX_RELEASE_APPLE_SIGNING="$CRABBOX_RELEASE_APPLE_SIGNING" \
+  node "$ROOT/scripts/release-provenance.mjs" verify \
   --dir "$PAYLOAD" \
   --tag "$TAG" \
   --tag-object "$TAG_OBJECT" \
@@ -365,5 +377,9 @@ node "$ROOT/scripts/release-provenance.mjs" verify \
 
 mv "$PAYLOAD" "$OUT_DIR"
 PAYLOAD=
-echo "Packaged signed and notarized release payload: $OUT_DIR"
+if [[ "$CRABBOX_RELEASE_APPLE_SIGNING" == "none" ]]; then
+  echo "Packaged unsigned, un-notarized release payload (declared contract): $OUT_DIR"
+else
+  echo "Packaged signed and notarized release payload: $OUT_DIR"
+fi
 echo "Run scripts/verify-release.sh outside the signing wrapper before any draft mutation."

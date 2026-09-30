@@ -384,7 +384,7 @@ func (c *cubesandboxClient) doJSONWithHeaders(ctx context.Context, method, path 
 		return nil, err
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
+	data, err := shared.ReadBoundedResponse(resp.Body, shared.MaxControlPlaneResponseBytes)
 	if err != nil {
 		return nil, err
 	}

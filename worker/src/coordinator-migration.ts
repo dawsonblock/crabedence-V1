@@ -50,7 +50,27 @@ export interface CoordinatorImportPlan {
 export interface CoordinatorImportOptions {
   /** Plan only: validate the document and compare keys without writing. */
   dryRun?: boolean;
-  /** How to treat keys that already exist with different values. */
+  /**
+   * How to treat keys that already exist with different values.
+   *
+   * Conflict semantics (frozen):
+   * - "fail" (default): Global all-or-nothing. All conflicts are detected
+   *   upfront before any write. If any conflict exists, the entire import
+   *   is aborted — no entries are written, no batches are applied. This
+   *   is the only mode that guarantees atomicity across the full import.
+   * - "skip": Conflicting entries are skipped; non-conflicting entries are
+   *   written in batches. Partial application is possible: if a later
+   *   batch fails, earlier batches have already been committed. The result
+   *   reports `written` (successfully applied) and `skipped` (conflicts
+   *   bypassed). Resume by re-running with the same document — already-
+   *   written entries are detected as unchanged.
+   * - "overwrite": Conflicting entries are overwritten with the incoming
+   *   value. Same partial-batch semantics as "skip".
+   *
+   * For "skip" and "overwrite", the import is NOT atomic across batches.
+   * A batch boundary failure leaves earlier batches committed. Use "fail"
+   * when atomicity is required, or run a verification pass afterward.
+   */
   onConflict?: "fail" | "skip" | "overwrite";
   /** Entries per transaction; bounds individual commit size. */
   batchSize?: number;
@@ -74,7 +94,13 @@ export interface CoordinatorImportVerification {
 }
 
 export function canonicalCoordinatorJSON(value: unknown): string {
-  return JSON.stringify(canonicalize(value));
+  // Escape U+2028/U+2029 to match Go's json.Encoder behavior. See
+  // escapeJSONSeparators in run-receipt.ts for the rationale.
+  return escapeJSONSeparators(JSON.stringify(canonicalize(value)));
+}
+
+function escapeJSONSeparators(s: string): string {
+  return s.replaceAll("\u2028", "\\u2028").replaceAll("\u2029", "\\u2029");
 }
 
 function canonicalize(value: unknown): unknown {
@@ -82,7 +108,7 @@ function canonicalize(value: unknown): unknown {
   if (value && typeof value === "object") {
     return Object.fromEntries(
       Object.entries(value as Record<string, unknown>)
-        .toSorted(([left], [right]) => left.localeCompare(right))
+        .toSorted(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
         .map(([key, entry]) => [key, canonicalize(entry)]),
     );
   }
@@ -95,7 +121,7 @@ export async function exportCoordinatorState(
   const records = await storage.list<unknown>();
   const entries: CoordinatorExportEntry[] = await Promise.all(
     [...records]
-      .toSorted(([left], [right]) => left.localeCompare(right))
+      .toSorted(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
       .map(async ([key, value]) => ({
         key,
         value,
@@ -113,7 +139,14 @@ export async function exportCoordinatorState(
 }
 
 async function exportDigest(entries: CoordinatorExportEntry[]): Promise<string> {
-  return sha256Hex(entries.map((entry) => `${entry.key}:${entry.sha256}`).join("\n"));
+  // Sort defensively by key before hashing. Callers already sort, but a
+  // future caller that passes an unsorted array would produce a silently
+  // wrong digest. The comparator is code-point order (matching canonicalize
+  // above) so the digest is deterministic across platforms.
+  const sorted = entries.toSorted((left, right) =>
+    left.key < right.key ? -1 : left.key > right.key ? 1 : 0,
+  );
+  return sha256Hex(sorted.map((entry) => `${entry.key}:${entry.sha256}`).join("\n"));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -168,7 +201,9 @@ export async function validateCoordinatorExport(
     errors.push("entryCount does not match entries length");
   }
   if (errors.length === 0) {
-    const digest = await exportDigest(entries.toSorted((a, b) => a.key.localeCompare(b.key)));
+    const digest = await exportDigest(
+      entries.toSorted((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0)),
+    );
     if (document["digest"] !== digest) {
       errors.push("digest does not match entries");
     }
@@ -181,7 +216,9 @@ export async function validateCoordinatorExport(
       exportedAt: String(document["exportedAt"] ?? ""),
       entryCount: rawEntries.length,
       digest: String(document["digest"]),
-      entries: entries.toSorted((left, right) => left.key.localeCompare(right.key)),
+      entries: entries.toSorted((left, right) =>
+        left.key < right.key ? -1 : left.key > right.key ? 1 : 0,
+      ),
     },
     errors: [],
   };
@@ -251,43 +288,99 @@ export async function importCoordinatorState(
   if (options.dryRun) {
     return { ...plan, applied: false, batches: 0, written: 0, skipped: 0 };
   }
-  const conflictKeys = new Set(plan.conflicts.map((conflict) => conflict.key));
-  const unchangedChecks = await Promise.all(
-    validation.document.entries.map(async (entry) => {
-      if (conflictKeys.has(entry.key)) return { key: entry.key, unchanged: false };
-      const existing = await target.get(entry.key);
-      const unchanged =
-        existing !== undefined &&
-        (await sha256Hex(canonicalCoordinatorJSON(existing))) === entry.sha256;
-      return { key: entry.key, unchanged };
-    }),
-  );
-  const unchangedKeys = new Set(
-    unchangedChecks.filter((check) => check.unchanged).map((check) => check.key),
-  );
-  const pending = validation.document.entries.filter(
-    (entry) =>
-      !unchangedKeys.has(entry.key) && !(onConflict === "skip" && conflictKeys.has(entry.key)),
-  );
   const batchSize = options.batchSize ?? coordinatorImportBatchSize;
+  const entries = validation.document.entries;
   let written = 0;
   let batches = 0;
-  for (let offset = 0; offset < pending.length; offset += batchSize) {
-    const batch = pending.slice(offset, offset + batchSize);
-    // oxlint-disable-next-line eslint/no-await-in-loop -- batches commit sequentially to bound each transaction.
-    await target.transaction(async (transaction) => {
-      await Promise.all(batch.map((entry) => transaction.put(entry.key, entry.value)));
-    });
-    written += batch.length;
-    batches += 1;
+  let skipped = 0;
+  // Enforce the planned state inside each import transaction. The pre-import
+  // plan reads target state outside any transaction; between that read and the
+  // transactional write, another writer could change the target. To close that
+  // TOCTOU gap, each batch transaction re-classifies every entry against the
+  // in-transaction state and applies the conflict policy there, so the write
+  // decision and the write itself commit atomically.
+  try {
+    for (let offset = 0; offset < entries.length; offset += batchSize) {
+      const batch = entries.slice(offset, offset + batchSize);
+      // oxlint-disable-next-line eslint/no-await-in-loop -- batches commit sequentially to bound each transaction.
+      const batchResult = await target.transaction(async (transaction) => {
+        const classified = await Promise.all(
+          batch.map(async (entry) => {
+            const existing = await transaction.get(entry.key);
+            if (existing === undefined) return { entry, action: "write" as const };
+            const existingSha256 = await sha256Hex(canonicalCoordinatorJSON(existing));
+            if (existingSha256 === entry.sha256) return { entry, action: "skip" as const };
+            return { entry, action: "conflict" as const, existingSha256 };
+          }),
+        );
+        const writes: CoordinatorExportEntry[] = [];
+        let batchSkipped = 0;
+        for (const result of classified) {
+          if (result.action === "write") {
+            writes.push(result.entry);
+          } else if (result.action === "skip") {
+            batchSkipped += 1;
+          } else {
+            // result.action === "conflict"
+            if (onConflict === "overwrite") {
+              writes.push(result.entry);
+            } else if (onConflict === "skip") {
+              batchSkipped += 1;
+            } else {
+              // onConflict === "fail": abort the entire import. The transaction
+              // will roll back, leaving no partial writes from this batch.
+              throw new ImportConflictError(result.entry.key, result.existingSha256);
+            }
+          }
+        }
+        await Promise.all(writes.map((entry) => transaction.put(entry.key, entry.value)));
+        return { written: writes.length, skipped: batchSkipped };
+      });
+      written += batchResult.written;
+      skipped += batchResult.skipped;
+      batches += 1;
+    }
+  } catch (error) {
+    if (error instanceof ImportConflictError) {
+      // Earlier batches may have already committed; report honestly.
+      return {
+        ...plan,
+        applied: batches > 0,
+        batches,
+        written,
+        skipped,
+        errors: [
+          ...plan.errors,
+          `import aborted at batch ${batches + 1}: key "${error.key}" changed ` +
+            `between plan and commit (existing sha256: ${error.existingSha256})`,
+        ],
+      };
+    }
+    throw error;
   }
   return {
     ...plan,
     applied: true,
     batches,
     written,
-    skipped: plan.total - written - plan.unchanged,
+    skipped,
   };
+}
+
+/**
+ * Thrown inside an import transaction when `onConflict === "fail"` and a key
+ * has changed between the pre-import plan and the in-transaction write. The
+ * transaction rolls back; the caller surfaces the conflict.
+ */
+export class ImportConflictError extends Error {
+  readonly key: string;
+  readonly existingSha256: string;
+  constructor(key: string, existingSha256: string) {
+    super(`import aborted: key "${key}" changed between plan and commit`);
+    this.name = "ImportConflictError";
+    this.key = key;
+    this.existingSha256 = existingSha256;
+  }
 }
 
 export async function verifyCoordinatorImport(

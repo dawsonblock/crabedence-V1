@@ -156,8 +156,8 @@ jobs:
         run: |
           log="$RUNNER_TEMP/local-container-smoke.log"
           test -f "$log" || exit 0
-          lease="$(sed -nE 's/^provisioning provider=local-container lease=(cbx_[0-9a-f]{12}) .*/\1/p' "$log")"
-          if [[ ! "$lease" =~ ^cbx_[0-9a-f]{12}$ ]]; then
+          lease="$(sed -nE 's/^provisioning provider=local-container lease=(cbx_[0-9a-f]{12,32}) .*/\1/p' "$log")"
+          if [[ ! "$lease" =~ ^cbx_[0-9a-f]{12}$|^cbx_[0-9a-f]{32}$ ]]; then
             echo "No unique smoke lease; skipping container diagnostics"
             exit 0
           fi

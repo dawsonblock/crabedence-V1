@@ -1,0 +1,451 @@
+name: Release Qualification
+
+on:
+  push:
+    branches:
+      # Post-merge the release line is main; release/** covers future
+      # release branches. The named RC6 branch this used to reference is
+      # superseded, so the trigger was inert.
+      - main
+      - release/**
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to qualify (defaults to HEAD)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  GOFLAGS: -mod=readonly -trimpath
+  GOTOOLCHAIN: local
+  # Qualification must execute on exactly this toolchain — never a
+  # substituted or auto-resolved Go 1.26.x. Every Set up Go pins it and
+  # every job asserts `go env GOVERSION` reports it.
+  GO_EXACT_VERSION: '1.26.5'
+
+jobs:
+  # ─── Provenance gate ──────────────────────────────────────────────────
+  provenance:
+    name: Provenance
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      commit: ${{ steps.record.outputs.commit }}
+      tree: ${{ steps.record.outputs.tree }}
+      branch: ${{ steps.record.outputs.branch }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+
+      - name: Verify clean working tree
+        shell: bash
+        run: |
+          if [ -n "$(git status --porcelain --untracked-files=all -- . ':(exclude)dist/')" ]; then
+            echo "ERROR: working tree is not clean"
+            git status --porcelain
+            exit 1
+          fi
+
+      - name: Record source provenance
+        id: record
+        shell: bash
+        run: |
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "tree=$(git rev-parse HEAD^{tree})" >> "$GITHUB_OUTPUT"
+          echo "branch=$(git rev-parse --abbrev-ref HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Verify version consistency
+        shell: bash
+        run: node scripts/verify-version-consistency.mjs
+
+  # ─── Go tests (no race) ───────────────────────────────────────────────
+  go-tests:
+    name: Go tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: provenance
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.provenance.outputs.commit }}
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: ${{ env.GO_EXACT_VERSION }}
+          cache: false
+
+      # go-version selects the installer; GOVERSION is what actually ran.
+      # A wrong toolchain stops the job before it can produce evidence.
+      - name: Assert the exact Go toolchain
+        shell: bash
+        run: |
+          actual="$(go env GOVERSION)"
+          if [ "$actual" != "go${GO_EXACT_VERSION}" ]; then
+            echo "Expected go${GO_EXACT_VERSION}, got $actual" >&2
+            exit 1
+          fi
+          go version
+          go env GOVERSION GOTOOLCHAIN
+
+      - name: Go formatting check
+        run: |
+          mapfile -t files < <(git ls-files '*.go')
+          if [ "${#files[@]}" -gt 0 ]; then
+            diff="$(gofmt -l "${files[@]}")"
+            if [ -n "$diff" ]; then
+              echo "$diff"
+              exit 1
+            fi
+          fi
+
+      - name: Go vet
+        run: go vet ./...
+
+      - name: Go tests (uncached)
+        run: go test -count=1 -timeout=15m ./internal/cli/ ./internal/capability/ ./internal/execution/ ./internal/idempotency/ ./internal/providers/shared/ ./internal/providers/tart/ ./internal/providers/lume/
+
+  # ─── Go race tests ────────────────────────────────────────────────────
+  go-race:
+    name: Go race tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: provenance
+    strategy:
+      fail-fast: false
+      matrix:
+        group:
+          - name: cli
+            packages: ./internal/cli/
+            pattern: "TestTerminalReceipt|TestTerminalLog|TestRunEvidence|TestFinalizeRun|TestEvidence|TestReceiptContract"
+          - name: execution
+            packages: ./internal/capability/ ./internal/execution/ ./internal/idempotency/
+            pattern: ""
+          - name: providers
+            packages: ./internal/providers/tart/ ./internal/providers/lume/ ./internal/providers/shared/
+            pattern: ""
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.provenance.outputs.commit }}
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: ${{ env.GO_EXACT_VERSION }}
+          cache: false
+
+      # go-version selects the installer; GOVERSION is what actually ran.
+      # A wrong toolchain stops the job before it can produce evidence.
+      - name: Assert the exact Go toolchain
+        shell: bash
+        run: |
+          actual="$(go env GOVERSION)"
+          if [ "$actual" != "go${GO_EXACT_VERSION}" ]; then
+            echo "Expected go${GO_EXACT_VERSION}, got $actual" >&2
+            exit 1
+          fi
+          go version
+          go env GOVERSION GOTOOLCHAIN
+
+      - name: Go race tests (${{ matrix.group.name }})
+        run: |
+          if [ -n "${{ matrix.group.pattern }}" ]; then
+            go test -race -count=1 -timeout=20m -run "${{ matrix.group.pattern }}" ${{ matrix.group.packages }}
+          else
+            go test -race -count=1 -timeout=20m ${{ matrix.group.packages }}
+          fi
+
+  # ─── Worker tests ────────────────────────────────────────────────────
+  worker:
+    name: Worker
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: provenance
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.provenance.outputs.commit }}
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: worker/package.json
+          cache: npm
+          cache-dependency-path: worker/package-lock.json
+
+      - name: Install Worker dependencies
+        run: npm ci --prefix worker
+
+      - name: Worker typecheck
+        run: npm run check --prefix worker
+
+      - name: Worker format check
+        run: npm run format:check --prefix worker
+
+      - name: Worker lint
+        run: npm run lint --prefix worker
+
+      - name: Worker tests
+        run: npm test --prefix worker
+
+      - name: Worker build
+        run: npm run build --prefix worker
+
+  # ─── Live PostgreSQL ────────────────────────────────────────────────
+  postgres:
+    name: PostgreSQL fencing + parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: provenance
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          - postgres-authority-fencing.live.test.ts
+          - coordinator-parity.live.test.ts
+    services:
+      postgres:
+        image: postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94
+        env:
+          POSTGRES_USER: crabbox
+          POSTGRES_PASSWORD: crabbox
+          POSTGRES_DB: crabbox_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U crabbox"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CRABBOX_TEST_DATABASE_URL: postgres://crabbox:crabbox@localhost:5432/crabbox_test
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.provenance.outputs.commit }}
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: worker/package.json
+          cache: npm
+          cache-dependency-path: worker/package-lock.json
+
+      - name: Install Worker dependencies
+        run: npm ci --prefix worker
+
+      - name: Live PostgreSQL test (${{ matrix.test }})
+        run: cd worker && npx vitest run --no-file-parallelism --config vitest.live.config.ts test/${{ matrix.test }}
+
+  # ─── NeMo tests ──────────────────────────────────────────────────────
+  nemo:
+    name: NeMo
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: provenance
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.provenance.outputs.commit }}
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: worker/package.json
+          cache: npm
+          cache-dependency-path: nemo/package-lock.json
+
+      - name: Install NeMo dependencies
+        run: npm ci --prefix nemo
+
+      - name: NeMo typecheck
+        run: cd nemo && npx tsc --noEmit
+
+      - name: NeMo tests
+        run: cd nemo && npx vitest run
+
+  # ─── Cross-language conformance ──────────────────────────────────────
+  cross-language:
+    name: Cross-language conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: provenance
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.provenance.outputs.commit }}
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: ${{ env.GO_EXACT_VERSION }}
+          cache: false
+
+      # go-version selects the installer; GOVERSION is what actually ran.
+      # A wrong toolchain stops the job before it can produce evidence.
+      - name: Assert the exact Go toolchain
+        shell: bash
+        run: |
+          actual="$(go env GOVERSION)"
+          if [ "$actual" != "go${GO_EXACT_VERSION}" ]; then
+            echo "Expected go${GO_EXACT_VERSION}, got $actual" >&2
+            exit 1
+          fi
+          go version
+          go env GOVERSION GOTOOLCHAIN
+
+      - name: Cross-language conformance
+        run: go test -count=1 -timeout=60s -run "TestRunEvidenceConformanceCorpus|TestReceiptContractConformance" ./internal/cli/
+
+  # ─── Evidence aggregation ────────────────────────────────────────────
+  evidence:
+    name: Release evidence + admission
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [provenance, go-tests, go-race, worker, postgres, nemo, cross-language]
+    permissions:
+      contents: read
+      attestations: write
+      id-token: write
+    services:
+      postgres:
+        image: postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94
+        env:
+          POSTGRES_USER: crabbox
+          POSTGRES_PASSWORD: crabbox
+          POSTGRES_DB: crabbox_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U crabbox"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CRABBOX_TEST_DATABASE_URL: postgres://crabbox:crabbox@localhost:5432/crabbox_test
+      RELEASE_NAME: crabedence-v0.53.2
+      RELEASE_VERSION: 0.53.2
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.provenance.outputs.commit }}
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: ${{ env.GO_EXACT_VERSION }}
+          cache: false
+
+      # go-version selects the installer; GOVERSION is what actually ran.
+      # A wrong toolchain stops the job before it can produce evidence.
+      - name: Assert the exact Go toolchain
+        shell: bash
+        run: |
+          actual="$(go env GOVERSION)"
+          if [ "$actual" != "go${GO_EXACT_VERSION}" ]; then
+            echo "Expected go${GO_EXACT_VERSION}, got $actual" >&2
+            exit 1
+          fi
+          go version
+          go env GOVERSION GOTOOLCHAIN
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: worker/package.json
+          cache: npm
+          cache-dependency-path: worker/package-lock.json
+
+      - name: Install Worker dependencies
+        run: npm ci --prefix worker
+
+      - name: Install NeMo dependencies
+        run: npm ci --prefix nemo
+
+      - name: Generate release evidence
+        run: bash scripts/generate-release-evidence.sh
+
+      - name: Check release admission
+        run: bash scripts/check-release-admission.sh
+
+      # The evidence is verified BEFORE it is attested: a signature over
+      # an object that fails its own verifier is worse than none.
+      - name: Verify release artifact
+        run: bash scripts/verify-release-artifact.sh --mode qualification
+
+      - name: Extract qualification summary for attestation
+        id: qual_summary
+        run: |
+          echo "release_name=$(jq -r '.release_name // "crabedence-rc"' dist/release-evidence/release-manifest.json)" >> "$GITHUB_OUTPUT"
+          echo "gates=$(jq -r '.qualification.total_gates // 0' dist/release-evidence/release-manifest.json)" >> "$GITHUB_OUTPUT"
+          echo "status=$(jq -r '.status // "UNKNOWN"' dist/release-evidence/release-manifest.json)" >> "$GITHUB_OUTPUT"
+          echo "promotable=$(jq -r '.artifact_promotable // false' dist/release-evidence/release-manifest.json)" >> "$GITHUB_OUTPUT"
+          # Bind the exact evidence-manifest digest into the attestation:
+          # the signature then covers the bundle the predicate describes.
+          echo "evidence_sha256=$(jq -r '.sha256' dist/release-evidence/evidence-manifest.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub artifact attestation
+        id: attestation
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/release-evidence/evidence-manifest.json
+          predicate-type: https://crabedence.dev/attestation/release-qualification/v1
+          predicate: |
+            {
+              "release_name": "${{ steps.qual_summary.outputs.release_name }}",
+              "qualification_gates": ${{ steps.qual_summary.outputs.gates }},
+              "qualification_status": "${{ steps.qual_summary.outputs.status }}",
+              "artifact_promotable": ${{ steps.qual_summary.outputs.promotable }},
+              "evidence_sha256": "${{ steps.qual_summary.outputs.evidence_sha256 }}"
+            }
+
+      # The attestation reference is written OUTSIDE dist/release-evidence/.
+      # An attestation is an external statement about the frozen evidence
+      # object; a reference inside the closure would make the evidence
+      # manifest cover an attestation of that same manifest, which can never
+      # be packaged.
+      - name: Save attestation reference
+        run: |
+          mkdir -p dist/attestation
+          echo '${{ steps.attestation.outputs.attestation-id }}' > dist/attestation/attestation-id.txt
+          echo '${{ steps.attestation.outputs.attestation-url }}' > dist/attestation/attestation-url.txt
+          cat > dist/attestation/attestation.json <<'EOF'
+          {
+            "tool": "github-actions-attest",
+            "attestation_id": "${{ steps.attestation.outputs.attestation-id }}",
+            "attestation_url": "${{ steps.attestation.outputs.attestation-url }}",
+            "subject": "dist/release-evidence/evidence-manifest.json",
+            "predicate_type": "https://crabedence.dev/attestation/release-qualification/v1",
+            "evidence_sha256": "${{ steps.qual_summary.outputs.evidence_sha256 }}",
+            "workflow_run": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+            "commit": "${{ github.sha }}"
+          }
+          EOF
+
+      - name: Upload release evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-evidence
+          path: dist/release-evidence/
+          retention-days: 90

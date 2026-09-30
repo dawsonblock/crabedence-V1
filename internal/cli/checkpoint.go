@@ -1154,7 +1154,7 @@ func (a App) checkpointFork(ctx context.Context, args []string) (err error) {
 	fixedLeaseID := strings.TrimSpace(*requestedLeaseID)
 	if flagWasSet(fs, "lease-id") {
 		if !canonicalLeaseIDPattern.MatchString(fixedLeaseID) {
-			return exit(2, "--lease-id must match cbx_<12 lowercase hex characters>")
+			return exit(2, "--lease-id must match cbx_<12 or 32 lowercase hex characters>")
 		}
 		if *count > 1 {
 			return exit(2, "--lease-id cannot be combined with --count greater than 1")

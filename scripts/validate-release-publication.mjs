@@ -310,7 +310,12 @@ function publicRelease(args) {
       "usage: validate-release-publication.mjs public-release <release> <asset-names> <notes> <asset-directory>",
     );
   }
-  if (metadata.repository !== "openclaw/crabbox" || !/^v[0-9]+\.[0-9]+\.[0-9]+$/.test(metadata.tag)) {
+  const expectedRepository =
+    process.env.CRABBOX_RELEASE_REPOSITORY ?? "dawsonblock/crabedence-V1";
+  if (
+    metadata.repository !== expectedRepository ||
+    !/^v[0-9]+\.[0-9]+\.[0-9]+$/.test(metadata.tag)
+  ) {
     fail("public release requires the canonical repository and stable tag");
   }
   const [releaseFile, namesFile, notesFile, assetDirectory] = args;

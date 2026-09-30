@@ -5,7 +5,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # shellcheck source=scripts/release-config.sh
 source "$ROOT/scripts/release-config.sh"
 
-FORMULA=openclaw/tap/crabbox
+FORMULA="$CRABBOX_RELEASE_TAP/$CRABBOX_RELEASE_TAP_FORMULA"
 SCRIPT_PATH="$ROOT/scripts/verify-homebrew-release.sh"
 PROTECTED_HOMEBREW_TOOLING=(
   .github/release-allowed-signers
@@ -87,6 +87,7 @@ assert_clean_homebrew_environment() {
   while IFS= read -r name; do
     case "$name" in
       CRABBOX_HOMEBREW_CLEAN_CHILD | \
+        CRABBOX_RELEASE_APPLE_SIGNING | \
         CRABBOX_VERIFY_TOOLING_COMMIT | \
         HOME | HOMEBREW_CACHE | HOMEBREW_NO_ANALYTICS | HOMEBREW_NO_AUTO_UPDATE | \
         HOMEBREW_NO_ENV_HINTS | HOMEBREW_NO_INSTALL_CLEANUP | \
@@ -191,7 +192,10 @@ freeze_public_release() {
   local expected_names="$work/expected-assets.txt" notes="$work/expected-notes.md"
   crabbox_release_asset_names "$version" | LC_ALL=C sort >"$expected_names"
   git -C "$ROOT" show "$source_commit:CHANGELOG.md" >"$work/tagged-changelog.md"
-  "$ROOT/scripts/extract-release-notes.sh" "$tag" <"$work/tagged-changelog.md" >"$notes"
+  "$ROOT/scripts/extract-release-notes.sh" "$tag" <"$work/tagged-changelog.md" >"$work/expected-section.md"
+  # The release body is the section verbatim, or the deterministic bound stub
+  # when the section exceeds GitHub's body limit.
+  crabbox_release_body_from_notes "$work/expected-section.md" "$tag" "$source_commit" >"$notes"
 
   find "$asset_dir" -mindepth 1 -maxdepth 1 -exec basename {} \; | LC_ALL=C sort >"$work/actual-assets.txt"
   cmp -s "$expected_names" "$work/actual-assets.txt" || {
@@ -229,15 +233,19 @@ freeze_public_release() {
 
 verify_homebrew_formula() {
   local node_bin=$1 metadata_file=$2 tag=$3 archive_name=$4 archive_sha=$5
-  "$node_bin" - "$metadata_file" "$tag" "$archive_name" "$archive_sha" <<'NODE'
+  env CRABBOX_RELEASE_REPOSITORY="$CRABBOX_RELEASE_REPOSITORY" \
+    CRABBOX_RELEASE_TAP="$CRABBOX_RELEASE_TAP" \
+    CRABBOX_RELEASE_TAP_FORMULA="$CRABBOX_RELEASE_TAP_FORMULA" \
+    "$node_bin" - "$metadata_file" "$tag" "$archive_name" "$archive_sha" <<'NODE'
 const fs = require("node:fs");
 const [file, tag, archive, sha256] = process.argv.slice(2);
 const { formulae } = JSON.parse(fs.readFileSync(file, "utf8"));
 const formula = formulae?.[0];
-const url = `https://github.com/openclaw/crabbox/releases/download/${tag}/${archive}`;
+const url = `https://github.com/${process.env.CRABBOX_RELEASE_REPOSITORY}/releases/download/${tag}/${archive}`;
 if (
   formulae?.length !== 1 || formula?.name !== "crabbox" ||
-  formula.full_name !== "openclaw/tap/crabbox" || formula.tap !== "openclaw/tap" ||
+  formula.full_name !== process.env.CRABBOX_RELEASE_TAP + "/" + process.env.CRABBOX_RELEASE_TAP_FORMULA ||
+  formula.tap !== process.env.CRABBOX_RELEASE_TAP ||
   formula.versions?.stable !== tag.slice(1) || formula.urls?.stable?.url !== url ||
   !/^[0-9a-f]{64}$/.test(sha256) || formula.urls.stable.checksum !== sha256
 ) throw new Error("Homebrew formula metadata does not match the selected release archive");
@@ -305,7 +313,7 @@ homebrew_phase() {
   local archive_sha
   archive_sha=$(sha256_file "$native_archive")
   local metadata_file="$work/formula.json"
-  "$brew_bin" tap openclaw/tap
+  "$brew_bin" tap "$CRABBOX_RELEASE_TAP"
   "$brew_bin" update --force
   # Tap maintainers own executable formulae; metadata is not a Ruby sandbox.
   "$brew_bin" info --json=v2 --formula "$FORMULA" >"$metadata_file"
@@ -479,6 +487,7 @@ main() {
     HOMEBREW_NO_INSTALL_CLEANUP=1 \
     NONINTERACTIVE=1 \
     CRABBOX_HOMEBREW_CLEAN_CHILD=1 \
+    CRABBOX_RELEASE_APPLE_SIGNING="$CRABBOX_RELEASE_APPLE_SIGNING" \
     CRABBOX_VERIFY_TOOLING_COMMIT="$tooling_commit" \
     /bin/bash -c 'source "$1"; shift; homebrew_phase "$@"' \
       crabbox-homebrew-phase "$SCRIPT_PATH" \

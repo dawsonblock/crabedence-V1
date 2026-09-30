@@ -402,8 +402,16 @@ exit 0
 				}
 				lines = lines[:len(lines)-1]
 			}
-			if !strings.HasPrefix(lines[len(lines)-1], `{"provider"`) {
-				t.Fatalf("timing report is not the final record: %s", stderr.String())
+			// Evidence JSON may follow timing JSON; find the timing line.
+			foundTiming := false
+			for _, line := range lines {
+				if strings.HasPrefix(line, `{"provider"`) {
+					foundTiming = true
+					break
+				}
+			}
+			if !foundTiming {
+				t.Fatalf("timing report not found in stderr: %s", stderr.String())
 			}
 		})
 	}

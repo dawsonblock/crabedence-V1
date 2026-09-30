@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"math"
 	"strings"
@@ -12,6 +13,9 @@ type TimingReport struct {
 	Provider           string                   `json:"provider"`
 	LeaseID            string                   `json:"leaseId,omitempty"`
 	Slug               string                   `json:"slug,omitempty"`
+	CommandText        string                   `json:"commandText,omitempty"`
+	StartedAt          time.Time                `json:"startedAt,omitempty"`
+	EndedAt            time.Time                `json:"endedAt,omitempty"`
 	RunnerTotalMs      int64                    `json:"runnerTotalMs,omitempty"`
 	RunnerPhases       []RunnerPhase            `json:"runnerPhases,omitempty"`
 	LeaseMs            int64                    `json:"leaseMs,omitempty"`
@@ -52,6 +56,60 @@ type TimingReport struct {
 
 	LeaseStopped *bool  `json:"leaseStopped,omitempty"`
 	LeaseStopErr string `json:"leaseStopError,omitempty"`
+
+	StartupConfirm *StartupConfirmSummary `json:"startupConfirm,omitempty"`
+}
+
+// StartupConfirmSummary is a portable summary of the startup confirmation
+// result, persisted in the timing report for provider qualification.
+type StartupConfirmSummary struct {
+	Stage         string `json:"stage"`
+	DurationMs    int64  `json:"durationMs"`
+	Ready         bool   `json:"ready"`
+	ProcessExited bool   `json:"processExited,omitempty"`
+	Retryable     bool   `json:"retryable,omitempty"`
+}
+
+// StartupConfirmFailure is a typed error that carries the structured startup
+// confirmation evidence from a failed acquisition. It allows the CLI run
+// path to extract the startup confirm result (stage, duration, outcome)
+// from a wrapped provider error and propagate it into the timing report
+// and RunEvidenceV1, even when the ProcessHandle is discarded on failure.
+//
+// Use errors.As to extract it from a wrapped error chain:
+//
+//	var scf *StartupConfirmFailure
+//	if errors.As(err, &scf) {
+//	    summary := scf.Summary()
+//	}
+type StartupConfirmFailure struct {
+	Stage         string
+	DurationMs    int64
+	Ready         bool
+	ProcessExited bool
+	Retryable     bool
+	Err           error
+}
+
+func (e *StartupConfirmFailure) Error() string {
+	if e.Err != nil {
+		return e.Err.Error()
+	}
+	return fmt.Sprintf("startup confirmation failed at stage %s", e.Stage)
+}
+
+func (e *StartupConfirmFailure) Unwrap() error { return e.Err }
+
+// Summary converts the failure into a StartupConfirmSummary for the
+// timing report and RunEvidenceV1.
+func (e *StartupConfirmFailure) Summary() StartupConfirmSummary {
+	return StartupConfirmSummary{
+		Stage:         e.Stage,
+		DurationMs:    e.DurationMs,
+		Ready:         e.Ready,
+		ProcessExited: e.ProcessExited,
+		Retryable:     e.Retryable,
+	}
 }
 
 type TimingPhase struct {
@@ -67,12 +125,12 @@ type RunnerPhase struct {
 	Opaque        bool   `json:"opaque,omitempty"`
 	Reason        string `json:"reason,omitempty"`
 	Provider      string `json:"provider,omitempty"`
-	LeaseID       string `json:"leaseId,omitempty"`
+	LeaseID       string `json:"lease_id,omitempty"`
 	Slug          string `json:"slug,omitempty"`
-	RunID         string `json:"runId,omitempty"`
-	MachineType   string `json:"machineType,omitempty"`
-	TransferCount int    `json:"transferCount,omitempty"`
-	TransferBytes int64  `json:"transferBytes,omitempty"`
+	RunID         string `json:"run_id,omitempty"`
+	MachineType   string `json:"machine_type,omitempty"`
+	TransferCount int    `json:"transfer_count,omitempty"`
+	TransferBytes int64  `json:"transfer_bytes,omitempty"`
 }
 
 type runnerProviderTiming struct {
@@ -120,6 +178,9 @@ func TimingReportWithRunResult(report TimingReport, result RunResult, err error)
 	}
 	if report.ErrorKind == "" {
 		report.ErrorKind = result.ErrorKind
+	}
+	if result.StartupConfirm != nil && report.StartupConfirm == nil {
+		report.StartupConfirm = result.StartupConfirm
 	}
 	return report
 }

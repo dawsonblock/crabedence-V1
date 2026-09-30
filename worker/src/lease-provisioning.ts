@@ -4,6 +4,11 @@ import {
   type CoordinatorStorageView,
   type ProvisioningDueRecord,
 } from "./coordinator-runtime";
+import {
+  canceledProvisioningClaimLease,
+  canceledProvisioningLease,
+  exhaustedProvisioningLease,
+} from "./lease-lifecycle";
 import type {
   FrozenProvisioningPlan,
   ProviderResumableProvisioning,
@@ -222,16 +227,11 @@ export async function cancelProvisioningOperation(
   if (operation.step.phase === "retained" && !operation.retain) operation.step.phase = "settling";
   operation.step.nextWake = operation.claim?.expiresAt ?? at;
   await putProvisioningOperation(transaction, operation, previous);
-  const released: LeaseRecord = {
-    ...lease,
-    state: "released",
-    releasedAt: new Date(at).toISOString(),
-    endedAt: new Date(at).toISOString(),
-    updatedAt: new Date(at).toISOString(),
-    releaseDeletesServer: !operation.retain,
-    ...(options.keep === undefined ? {} : { keep: options.keep }),
-    provisioningResourceMayExist: true,
-  };
+  const released = canceledProvisioningLease(lease, {
+    retain: operation.retain,
+    keep: options.keep,
+    at,
+  });
   updateCleanupMetadata(released, operation.step.phase, at);
   await transaction.put(`lease:${lease.id}`, released);
   return released;
@@ -345,10 +345,7 @@ export class LeaseProvisioningController {
       const previous = structuredClone(operation);
       if (canceled) operation.canceledAt ??= now;
       if (canceled && lease.state === "provisioning") {
-        lease.state = "released";
-        lease.releaseDeletesServer = true;
-        lease.provisioningResourceMayExist = true;
-        lease.updatedAt = new Date(now).toISOString();
+        canceledProvisioningClaimLease(lease, new Date(now).toISOString());
         updateCleanupMetadata(lease, operation.step.phase, now);
         await transaction.put(`lease:${leaseID}`, lease);
       }
@@ -467,13 +464,7 @@ export class LeaseProvisioningController {
       if (canceled) updateCleanupMetadata(latest, current.step.phase, Date.now());
       if (result.phase === "terminal") {
         await transaction.delete(provisioningMaterialKey(current.operationID));
-        latest.state = canceled ? "released" : "failed";
-        latest.endedAt = new Date().toISOString();
-        latest.updatedAt = latest.endedAt;
-        latest.provisioningResourceMayExist = false;
-        latest.releaseDeletesServer = true;
-        if (!canceled)
-          latest.failureError = "provisioning candidates exhausted after verified cleanup";
+        exhaustedProvisioningLease(latest, { canceled, at: new Date().toISOString() });
       }
       if (canceled || result.phase === "terminal")
         await transaction.put(`lease:${leaseID}`, latest);

@@ -25,7 +25,7 @@ const (
 )
 
 func newLeaseID() (string, error) {
-	var b [6]byte
+	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return "", exit(5, "generate nomad lease id: %v", err)
 	}

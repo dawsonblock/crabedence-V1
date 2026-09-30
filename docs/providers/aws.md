@@ -51,7 +51,7 @@ fallback across instance families.
 
 ### Fixed-ID replay
 
-`warmup --lease-id cbx_<12 lowercase hex>` makes direct AWS acquisition
+`warmup --lease-id cbx_<12 or 32 lowercase hex>` makes direct AWS acquisition
 idempotent across process restarts. Crabbox writes the normalized create intent
 to the ordinary durable lease claim under its existing cross-process lock
 before any provider mutation. Each resolved launch attempt records its exact

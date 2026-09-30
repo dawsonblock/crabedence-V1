@@ -76,6 +76,9 @@ export function publicRunRecord(record: RunRecord): RunRecord {
   delete publicRecord.terminalReceipt;
   delete publicRecord.terminalFinishSHA256;
   delete publicRecord.terminalLogPrefix;
+  // The storage revision is the repository's internal write fence, not
+  // part of the run's public identity.
+  delete publicRecord.storageRevision;
   if (!record.leaseOwners) {
     return publicRecord;
   }

@@ -48,7 +48,16 @@ if [[ "\${1:-}" == "test" ]]; then
   [[ -n "$profile" ]] || exit 64
   {
     printf 'mode: atomic\\n'
-    printf 'github.com/openclaw/crabbox/internal/cli/bootstrap.go:1.1,1.2 1 %s\\n' "\${CRABBOX_FAKE_COVERAGE:?}"
+    for file in \\
+      internal/cli/bootstrap.go \\
+      internal/capability/grant.go \\
+      internal/execution/dispatch.go \\
+      internal/idempotency/store.go \\
+      internal/authority/store.go \\
+      internal/reconcile/reconciler.go \\
+      internal/evidence/signing.go; do
+      printf 'github.com/openclaw/crabbox/%s:1.1,1.2 1 %s\\n' "$file" "\${CRABBOX_FAKE_COVERAGE:?}"
+    done
   } >"$profile"
   sleep "\${CRABBOX_FAKE_GO_DELAY:-0}"
   exit 0
@@ -76,8 +85,9 @@ exit 64
 
 	assert.equal(firstResult.code, 0, firstResult.stderr || firstResult.stdout);
 	assert.equal(secondResult.code, 0, secondResult.stderr || secondResult.stdout);
-	assert.match(firstResult.stdout, /Go core coverage 91\.0% >= 90\.0%/);
-	assert.match(secondResult.stdout, /Go core coverage 97\.0% >= 90\.0%/);
+	assert.match(firstResult.stdout, /coverage gate legacy-cli\s+91\.0% >= 90\.0%/);
+	assert.match(firstResult.stdout, /coverage gate execution-kernel\s+91\.0% >= 70\.0%/);
+	assert.match(secondResult.stdout, /coverage gate legacy-cli\s+97\.0% >= 90\.0%/);
 	const leftovers = await readdir(dir);
 	assert.equal(leftovers.includes("crabbox-go-coverage.out"), false);
 	assert.equal(leftovers.includes("crabbox-go-core-coverage.out"), false);

@@ -296,7 +296,7 @@ collide; durable claims, not name hashes, establish lease ownership.
 
 ### Fixed-ID replay
 
-`warmup --lease-id cbx_<12 lowercase hex>` makes direct Machine0 acquisition
+`warmup --lease-id cbx_<12 or 32 lowercase hex>` makes direct Machine0 acquisition
 idempotent across process restarts. Before `machine0 new`, Crabbox writes the
 normalized create intent and exact create request to the ordinary durable lease
 claim under its existing cross-process lock. The intent is bound to the

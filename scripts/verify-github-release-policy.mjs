@@ -25,10 +25,13 @@ if (!/^v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/.test(tag)) {
 
 const repository = JSON.parse(fs.readFileSync(repositoryFile, "utf8"));
 const rulesets = JSON.parse(fs.readFileSync(rulesetsFile, "utf8"));
-const requiredReleaseWorkflow = {
-  path: ".github/workflows/crabbox-release-check.yml",
-  ref: "refs/heads/main",
-  repository_id: 1304559357,
+// A personal-account repository cannot have organization rulesets, so the
+// merge-gating control is a required status check produced by the protected
+// in-repo release-check workflow (CODEOWNERS keeps the check itself from being
+// redefined by the pull request it gates). Integration 15368 is GitHub Actions.
+const requiredReleaseCheck = {
+  context: "Release Check",
+  integration_id: 15368,
 };
 if (
   repository?.full_name !== expectedRepository ||
@@ -153,32 +156,30 @@ if (!branchHistoryPolicy) {
   );
 }
 
-const branchWorkflowPolicy = rulesets.find((value) => {
+const branchCheckPolicy = rulesets.find((value) => {
   if (
     !exactActiveRuleset(value, "branch") ||
-    value.source_type !== "Organization" ||
-    value.source !== "openclaw" ||
+    value.source_type !== "Repository" ||
+    value.source !== expectedRepository ||
     value.bypass_actors.length !== 0 ||
     !includesBranch(value)
   ) {
     return false;
   }
-  const workflows = rule(value, "workflows")?.parameters;
+  const checks = rule(value, "required_status_checks")?.parameters;
   return (
-    workflows?.do_not_enforce_on_create === false &&
-    Array.isArray(workflows?.workflows) &&
-    workflows.workflows.some(
+    checks?.strict_required_status_checks_policy === true &&
+    Array.isArray(checks?.required_status_checks) &&
+    checks.required_status_checks.some(
       (entry) =>
-        entry?.path === requiredReleaseWorkflow.path &&
-        entry?.ref === requiredReleaseWorkflow.ref &&
-        entry?.repository_id === requiredReleaseWorkflow.repository_id &&
-        entry?.sha == null,
+        entry?.context === requiredReleaseCheck.context &&
+        entry?.integration_id === requiredReleaseCheck.integration_id,
     )
   );
 });
-if (!branchWorkflowPolicy) {
+if (!branchCheckPolicy) {
   fail(
-    "default branch lacks the active no-bypass OpenClaw organization release workflow",
+    "default branch lacks the active no-bypass required Release Check status check",
   );
 }
 
@@ -197,7 +198,7 @@ if (!tagPolicy) {
 process.stdout.write(
   `${JSON.stringify({
     branchHistoryRulesetId: branchHistoryPolicy.id,
-    branchWorkflowRulesetId: branchWorkflowPolicy.id,
+    requiredCheckRulesetId: branchCheckPolicy.id,
     tagRulesetId: tagPolicy.id,
   })}\n`,
 );

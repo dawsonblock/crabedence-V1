@@ -43,13 +43,15 @@ changes under a new version, preserving the original changelog section. See
 > Do not move the tag or weaken the verifier. The runtime fix requires a new
 > signed release tag.
 
-> **Signer registration:** GitHub evaluates SSH tag-signature verification at
-> push time only. Register the tagging machine's SSH key as a GitHub account
-> signing key *before* creating the tag, and confirm the pushed tag reports
-> `verification.verified == true` before producing any candidate. A tag pushed
-> under an unregistered key is permanently unverified; recovering requires
-> replacing the tag under temporarily lifted tag-ruleset enforcement and
-> rebinding the release record's `tagObject`.
+> **Signer registration:** Register the tagging machine's SSH key as a GitHub
+> account *signing* key (authentication keys are a separate list) *before*
+> creating the tag, and confirm the pushed tag reports
+> `verification.verified == true` before producing any candidate. GitHub
+> re-evaluates tag verification when a key is registered afterward, but the
+> release sequence does not depend on that re-evaluation: a tag that stays
+> `unknown_key` can never pass `scripts/publish-release.sh`, and recovering
+> requires replacing the tag under temporarily lifted tag-ruleset enforcement
+> and rebinding the release record's `tagObject`.
 
 A release begins with an annotated signed `vMAJOR.MINOR.PATCH` tag and two
 captured immutable Git identities:
@@ -80,12 +82,12 @@ repository ruleset. Pull-request approval policy is independent of publication:
 no particular approval ruleset or release-team bypass is required, and existing
 GitHub merge protections still apply. An active no-bypass branch ruleset must enforce
 deletion and non-fast-forward protection. The default branch must also be
-covered by the no-bypass OpenClaw organization workflow
-`.github/workflows/crabbox-release-check.yml` from
-`openclaw/release-workflows` repository ID `1304559357` at
-`refs/heads/main`. That protected external workflow owns the credential-free
-macOS release snapshot check, so a Crabbox pull request cannot redefine the
-check that gates its own merge. A separate active no-bypass tag ruleset must
+covered by an active no-bypass repository ruleset requiring the credential-free
+macOS release snapshot check to pass before merge. A personal-account fork
+cannot use organization rulesets, so the equivalent control is a required
+status check plus `CODEOWNERS` protection on the workflow file that produces
+it — a pull request cannot redefine the check that gates its own merge without
+owner review. A separate active no-bypass tag ruleset must
 cover every `refs/tags/v*` release tag and prevent deletion and updates.
 
 GitHub omits ruleset bypass actors from the ordinary workflow token. Configure
@@ -97,9 +99,17 @@ verification, or candidate-execution step receives it.
 ## Local Candidate Production
 
 Ordinary snapshots, CI, Linux builds, and Windows builds are credential-free.
-Production macOS packaging runs locally on a trusted Mac through the shared
-managed-keychain release wrapper. Signing keys and notary credentials remain in
-the local keychain/approved secret store and never enter GitHub Actions or Git.
+This repository's release contract declares macOS artifacts **unsigned and not
+notarized** (`CRABBOX_RELEASE_APPLE_SIGNING=none` in
+`scripts/release-config.sh` and `.mac-release.env`): the fork owns no Apple
+Developer ID identity, so the contract states that honestly instead of carrying
+an identity it cannot prove. `scripts/verify-macos-binary.sh` enforces the
+declaration mechanically — it requires the unsigned signature report, requires
+strict signature verification to fail, and requires the notarization
+requirement to fail, so a signed or notarized artifact is rejected rather than
+tolerated. Signed Apple publication is a separate release-contract upgrade
+(`developer-id` mode), gated on provisioning a real Developer ID identity and
+on a source change to the compiled embedded-VMD runtime trust policy.
 
 Before GoReleaser runs, the credential-free producer calls
 `scripts/verify-go-install.sh` with the actual release tag and peeled source
@@ -121,57 +131,42 @@ archives and the raw VMD, plus the actual Go, GoReleaser, Swift, Xcode, macOS,
 and architecture facts. Treat the printed SHA-256 as a separate handoff value;
 do not re-read or infer it from a replaceable candidate directory.
 
-Pass that exact digest as the required fourth argument to the local signing
-wrapper. The packager stages the complete candidate into a private directory,
-recomputes every manifest-bound fact before it touches the signing key, and
-fails if the explicit digest differs:
-The operator sequence below additionally computes the package script digest
-from the protected verifier commit and makes the managed wrapper execute a
-literal pre-secret digest gate before the repository script receives signing
-or notary credentials.
+Pass that exact digest as the required fourth argument to the packager. The
+packager stages the complete candidate into a private directory, recomputes
+every manifest-bound fact, and fails if the explicit digest differs. Under the
+unsigned contract there are no signing secrets to inject, so packaging runs
+credential-free; the operator sequence below still executes a literal digest
+gate before the repository script runs.
 
-Sign each thin macOS executable with its fixed identifier and this exact
-authority:
-
-```text
-Developer ID Application: OpenClaw Foundation (FWJYW4S8P8)
-```
-
-The signed set includes `crabbox` for `darwin/arm64` and `darwin/amd64`,
+The macOS payload is `crabbox` for `darwin/arm64` and `darwin/amd64`,
 `crabbox-apple-vm-helper` for `darwin/arm64`, and its embedded
-`crabbox-apple-vm-vmd` payload. The VMD uses identifier
-`org.openclaw.crabbox.apple-vm-vmd` and the exact tracked virtualization/network
-entitlements. Each executable must have Team ID `FWJYW4S8P8`, the expected
-designated requirement and architecture, hardened runtime, and a secure
-timestamp. Submit each raw binary with `notarytool --wait`, require an
-`Accepted` result and distinct valid submission ID, then perform the online
-raw-binary check before creating the archive:
+`crabbox-apple-vm-vmd` payload. Each carries a fixed identifier under
+`io.github.dawsonblock.crabbox` as an unsigned label. Provenance records
+`signing: "none"` and `notarized: false` for every macOS artifact; no
+notarization submission IDs exist, and provenance verification rejects them if
+they appear.
 
-The notary profile must live in the same managed, passwordless release
-keychain as the Foundation signing identity. The signer passes that keychain
-explicitly so headless release hosts never fall back to a locked login
-keychain.
+Raw command-line binaries cannot be stapled; under the unsigned contract they
+must carry no signature at all. The Apple VM helper's embedded VMD is still an
+executable trust path: packaging freezes and verifies those exact bytes.
+Official packaging compiles the helper with `vmdembed,vmdrelease`; a bare
+`vmdembed` remains a credential-free development build and is not publishable.
+Protected native verification exports the exact embedded bytes and matches
+their provenance digest.
 
-```sh
-codesign --verify --strict --check-notarization -R=notarized <binary>
-```
+> **Embedded-VMD runtime limitation (unsigned contract):** the helper's runtime
+> trust policy is compiled in. It verifies the embedded VMD's signature
+> authority, Team ID, hardened runtime, timestamp, entitlements, and online
+> notarization at install time, so an unsigned embedded VMD fails closed at
+> runtime. The unsigned packaged artifacts are still correct — bytes,
+> identifiers, architectures, and the declared contract are all verified — but
+> installing the embedded VMD requires the signed-contract upgrade described
+> above. Do not weaken the runtime check to hide this.
 
-Raw command-line binaries cannot be stapled. `stapler` and an `spctl` result are
-not substitutes for the online `codesign` check. The Apple VM helper's embedded
-VMD is also an executable trust path: packaging must freeze and verify that
-payload, and runtime extraction must not replace an accepted Developer ID trust
-decision with an ad-hoc signature. Official packaging compiles the helper with
-`vmdembed,vmdrelease`; a bare `vmdembed` remains a credential-free development
-build and is not publishable. Protected native verification exports the exact
-embedded bytes, matches their provenance digest, and independently checks their
-signature, entitlements, hardened runtime, timestamp, and online notarization.
-
-The signing wrapper never runs candidate code while its managed keychain or
-notary profile is available. It signs the token-free producer outputs, embeds
-the accepted VMD, compiles without release credentials, and stops after static
-packaging proof. Run `scripts/verify-release.sh` only after the signing wrapper
-has returned and removed its credentials; draft creation repeats that clean
-verification before any GitHub token is used.
+Packaging never runs candidate code while credentials are available. It embeds
+the frozen VMD, compiles without release credentials, and stops after static
+packaging proof. Draft creation repeats that clean verification before any
+GitHub token is used.
 
 ## Immutable Release Record
 
@@ -195,10 +190,18 @@ unlisted executables are allowed.
 
 `provenance.json` binds the repository, version, signed tag-object ID, peeled
 source commit, protected verifier commit, exact candidate-manifest digest and
-seven producer inputs, separate producer and packager toolchain facts, macOS
-identifiers, Team ID and authority, native architectures, notarization
-submissions, archive members, and the name, size, and SHA-256 of each payload it
-describes. Its own
+seven producer inputs, separate producer and packager toolchain facts, the
+declared Apple signing mode, macOS identifiers, native architectures, archive
+members, and the name, size, and SHA-256 of each payload it
+describes. Under the unsigned contract every macOS payload records
+`signing: "none"` and `notarized: false`, and carries no Team ID, authority,
+secure timestamp, or notarization submission fields — verification rejects
+signed-mode fields when the declared mode is `none`. "Unsigned" means no
+identity-bearing signature: a payload either has no code signature at all
+(typical for amd64) or only the linker-generated adhoc signature every
+arm64 Mach-O receives at link time; the verifier accepts exactly those two
+states and rejects identity signatures, authorities, secure timestamps,
+and notarization tickets. Its own
 name, size, digest, upload timestamp, and unique GitHub asset ID are captured in
 the immutable draft proof after upload. `checksums.txt` and provenance must not
 form a self-referential digest cycle.
@@ -208,7 +211,11 @@ The GitHub record is exactly one draft selected by numeric release ID, with:
 - tag and title `vX.Y.Z`;
 - `draft=true` and `prerelease=false`;
 - body byte-for-byte equal to the canonical `CHANGELOG.md` section extracted
-  from the tagged source;
+  from the tagged source, or — when the section exceeds GitHub's
+  125000-byte release-body limit — the deterministic bound stub (tag,
+  section heading, source commit, section SHA-256 and byte count) that
+  every gate re-derives identically via
+  `crabbox_release_body_from_notes`;
 - exactly the eight assets above, each with a unique numeric ID, positive size,
   and matching SHA-256 digest.
 
@@ -245,10 +252,11 @@ REQUIRE_PUBLISHABLE=1 \
   scripts/verify-release-source.sh
 ```
 
-The credential-free producer may run without the signing wrapper. Production
-packaging must run on Apple Silicon through the shared managed-keychain wrapper,
-with its approved local codesign/notary configuration already loaded. The
-wrapper returns and removes its credentials before candidate execution:
+The credential-free producer and packager both run without a signing wrapper:
+the unsigned contract carries no Apple credentials to inject. Production
+packaging still runs on Apple Silicon behind the same literal pre-execution
+gate, which verifies the commit identity, a clean tree, the canonical remote,
+and the package-script digest before the repository script runs:
 
 ```sh
 BUILD_OUTPUT=$(scripts/build-release-candidate.sh \
@@ -259,16 +267,14 @@ CANDIDATE_MANIFEST_SHA256=$(printf '%s\n' "$BUILD_OUTPUT" | \
   sed -n 's/^Candidate manifest SHA-256: //p')
 test "${#CANDIDATE_MANIFEST_SHA256}" -eq 64
 
-test "$(git remote get-url origin)" = https://github.com/openclaw/crabbox
+test "$(git remote get-url origin)" = https://github.com/dawsonblock/crabedence-V1
 test "$(git ls-remote origin refs/heads/main | awk '{print $1}')" = "$VERIFIER_COMMIT"
 PACKAGE_SCRIPT_SHA256=$(git --no-pager show \
   "${VERIFIER_COMMIT}:scripts/package-release.sh" | shasum -a 256 | awk '{print $1}')
 test "$(shasum -a 256 scripts/package-release.sh | awk '{print $1}')" = \
   "$PACKAGE_SCRIPT_SHA256"
 
-../agent-scripts/skills/release-mac-app/scripts/mac-release \
-  codesign-run --with-package-secrets -- \
-  /bin/bash -c '
+/bin/bash -c '
     set -euo pipefail
     root=$1
     verifier_commit=$2
@@ -279,8 +285,8 @@ test "$(shasum -a 256 scripts/package-release.sh | awk '{print $1}')" = \
     [[ "$("${git[@]}" -C "$root" rev-parse HEAD)" == "$verifier_commit" ]]
     [[ -z "$("${git[@]}" -C "$root" status --porcelain --untracked-files=all)" ]]
     [[ "$("${git[@]}" -C "$root" remote get-url origin)" == \
-      https://github.com/openclaw/crabbox ]]
-    [[ "$("${git[@]}" ls-remote https://github.com/openclaw/crabbox \
+      https://github.com/dawsonblock/crabedence-V1 ]]
+    [[ "$("${git[@]}" ls-remote https://github.com/dawsonblock/crabedence-V1 \
       refs/heads/main | /usr/bin/awk "{print \$1}")" == "$verifier_commit" ]]
     actual=$(/usr/bin/shasum -a 256 "$script")
     actual=${actual%% *}
@@ -325,7 +331,7 @@ exact run as `DRAFT_VERIFIER_RUN_ID`, then require both native jobs to succeed:
 
 ```sh
 gh workflow run release-assets.yml \
-  --repo openclaw/crabbox \
+  --repo dawsonblock/crabedence-V1 \
   --ref main \
   -f release_id="$RELEASE_ID" \
   -f tag="$TAG" \
@@ -337,7 +343,7 @@ gh workflow run release-assets.yml \
 
 : "${DRAFT_VERIFIER_RUN_ID:?set to the numeric ID of that exact draft run}"
 gh run watch "$DRAFT_VERIFIER_RUN_ID" \
-  --repo openclaw/crabbox --exit-status
+  --repo dawsonblock/crabedence-V1 --exit-status
 ```
 
 After the native draft proof succeeds and the publication checks below pass,
@@ -373,7 +379,7 @@ installed-Homebrew smoke, not this handoff.
   : "${TAG:?}"
   [[ "$TAG" =~ ^v[0-9]+[.][0-9]+[.][0-9]+$ ]] || exit 1
   ASSETS_JSON=$(curl --disable --fail --silent --show-error --location --retry 3 \
-    "https://api.github.com/repos/openclaw/crabbox/releases/tags/$TAG" |
+    "https://api.github.com/repos/dawsonblock/crabedence-V1/releases/tags/$TAG" |
     jq -ce --arg tag "$TAG" '
       (if .tag_name == $tag and .draft == false and .prerelease == false and
          .immutable == true and (.assets | type) == "array"
@@ -389,8 +395,8 @@ installed-Homebrew smoke, not this handoff.
       from_entries
     ')
   gh workflow run update-formula.yml \
-    --repo openclaw/homebrew-tap --ref main \
-    -f formula=crabbox -f tag="$TAG" -f repository=openclaw/crabbox \
+    --repo dawsonblock/homebrew-tap --ref main \
+    -f formula=crabbox -f tag="$TAG" -f repository=dawsonblock/crabedence-V1 \
     -f assets="$ASSETS_JSON"
 )
 ```
@@ -427,7 +433,7 @@ git merge-base --is-ancestor "$VERIFIER_COMMIT" "$WORKFLOW_COMMIT"
 git merge-base --is-ancestor "$TAG_COMMIT" "$VERIFIER_COMMIT"
 
 gh workflow run release-assets.yml \
-  --repo openclaw/crabbox \
+  --repo dawsonblock/crabedence-V1 \
   --ref main \
   -f release_id="$RELEASE_ID" \
   -f tag="$TAG" \
@@ -439,47 +445,18 @@ gh workflow run release-assets.yml \
 
 : "${PUBLIC_VERIFIER_RUN_ID:?set to the numeric ID of that exact public run}"
 gh run watch "$PUBLIC_VERIFIER_RUN_ID" \
-  --repo openclaw/crabbox --exit-status
+  --repo dawsonblock/crabedence-V1 --exit-status
 ```
 
-Independently smoke-test the public source-install channel from the public Go
-module proxy, not from a checkout, local proxy, or direct VCS fallback. Use fresh state and
-require the exact public tag, fork dependency, replacement-free build metadata,
-version, and help surfaces:
-
-```sh
-PUBLIC_GO_INSTALL=$(mktemp -d "${TMPDIR:-/tmp}/crabbox-public-go-install.XXXXXX")
-mkdir -m 700 \
-  "$PUBLIC_GO_INSTALL/home" "$PUBLIC_GO_INSTALL/gopath" \
-  "$PUBLIC_GO_INSTALL/gomodcache" "$PUBLIC_GO_INSTALL/gocache" \
-  "$PUBLIC_GO_INSTALL/bin" "$PUBLIC_GO_INSTALL/tmp" "$PUBLIC_GO_INSTALL/work"
-(
-  cd "$PUBLIC_GO_INSTALL/work"
-  env -i \
-    GOBIN="$PUBLIC_GO_INSTALL/bin" GOCACHE="$PUBLIC_GO_INSTALL/gocache" \
-    GOENV=off GOMODCACHE="$PUBLIC_GO_INSTALL/gomodcache" \
-    GOPATH="$PUBLIC_GO_INSTALL/gopath" GOPROXY=https://proxy.golang.org \
-    GOSUMDB=sum.golang.org GOTOOLCHAIN=local GOWORK=off \
-    HOME="$PUBLIC_GO_INSTALL/home" PATH="$PATH" TMPDIR="$PUBLIC_GO_INSTALL/tmp" \
-    go install "github.com/openclaw/crabbox/cmd/crabbox@$TAG"
-)
-GOTOOLCHAIN=local go version -m -json "$PUBLIC_GO_INSTALL/bin/crabbox" >"$PUBLIC_GO_INSTALL/build.json"
-jq -e --arg version "$TAG" \
-  --arg forkVersion v6.0.3-0.20260817142523-966654abed4a '
-  .Path == "github.com/openclaw/crabbox/cmd/crabbox" and
-  .Main.Path == "github.com/openclaw/crabbox" and
-  .Main.Version == $version and .Main.Replace == null and
-  ([.Deps[] | select(
-    .Path == "github.com/steipete/jsonschema/v6" and
-    .Version == $forkVersion and .Replace == null
-  )] | length == 1) and
-  ([.Deps[] | select(.Replace != null)] | length == 0) and
-  ([.Deps[] | select(.Path == "github.com/santhosh-tekuri/jsonschema/v6")] | length == 0)
-' "$PUBLIC_GO_INSTALL/build.json"
-test "$(cd "$PUBLIC_GO_INSTALL/work" && "$PUBLIC_GO_INSTALL/bin/crabbox" --version)" = "${TAG#v}"
-(cd "$PUBLIC_GO_INSTALL/work" && "$PUBLIC_GO_INSTALL/bin/crabbox" --help >/dev/null 2>&1)
-(cd "$PUBLIC_GO_INSTALL/work" && "$PUBLIC_GO_INSTALL/bin/crabbox" run --help >/dev/null 2>&1)
-```
+The public `go install` channel is not available for this fork. The module
+path declared in `go.mod` is `github.com/openclaw/crabbox`, which the Go module
+proxy resolves against the upstream repository — it can never serve a fork's
+tag, and a public `go install` under that path would return upstream code or
+fail. The hermetic `scripts/verify-go-install.sh` gate still runs before
+candidate production: it builds a complete read-only local module proxy from
+the tagged source and proves a cold, version-suffixed `go install` outside the
+checkout. A public source-install channel requires a module-path change, which
+is a separate contract upgrade, not a release-time decision.
 
 After the tap update, smoke-test installation on both native Apple Silicon and
 native Intel. Download the fixed canonical public inventory (never URLs taken
@@ -491,7 +468,7 @@ PUBLIC_ASSETS=$(mktemp -d "${TMPDIR:-/tmp}/crabbox-public-assets.XXXXXX")
 while IFS= read -r asset; do
   curl --disable --fail --location --retry 3 \
     --output "$PUBLIC_ASSETS/$asset" \
-    "https://github.com/openclaw/crabbox/releases/download/$TAG/$asset"
+    "https://github.com/dawsonblock/crabedence-V1/releases/download/$TAG/$asset"
 done < <(scripts/release-config.sh assets "$TAG")
 ```
 
@@ -507,13 +484,13 @@ inside that child with a fresh `HOME` and cache.
 ```sh
 HOMEBREW_TOOLING_COMMIT=$(git rev-parse HEAD)
 case "$(git remote get-url origin)" in
-  https://github.com/openclaw/crabbox | https://github.com/openclaw/crabbox.git) ;;
+  https://github.com/dawsonblock/crabedence-V1 | https://github.com/dawsonblock/crabedence-V1.git) ;;
   *) false ;;
 esac
-REMOTE_MAIN=$(git ls-remote https://github.com/openclaw/crabbox \
+REMOTE_MAIN=$(git ls-remote https://github.com/dawsonblock/crabedence-V1 \
   refs/heads/main | awk '{print $1}')
 git -c fetch.writeCommitGraph=false fetch --quiet --no-tags \
-  https://github.com/openclaw/crabbox "$REMOTE_MAIN"
+  https://github.com/dawsonblock/crabedence-V1 "$REMOTE_MAIN"
 git merge-base --is-ancestor "$HOMEBREW_TOOLING_COMMIT" "$REMOTE_MAIN"
 git merge-base --is-ancestor "$VERIFIER_COMMIT" "$HOMEBREW_TOOLING_COMMIT"
 git merge-base --is-ancestor "$TAG_COMMIT" "$VERIFIER_COMMIT"
@@ -531,15 +508,17 @@ validation precedes Homebrew. There is no public verifier run ID, proof ZIP,
 witness, or post-candidate API comparison.
 
 Tap maintainers own executable formulae. `brew info --json=v2 --formula
-openclaw/tap/crabbox` evaluates that trusted code only in the credential-free
+dawsonblock/tap/crabbox` evaluates that trusted code only in the credential-free
 environment; its structured metadata must report the exact formula name, full
 name, tap, stable version, selected native URL, and checksum. Harmless maintained
 formula changes and interpolation are accepted. This metadata check is not a
 Ruby sandbox. All-four URL/hash maintenance belongs to the ordinary tap updater.
 
 The verifier performs a fresh public fetch, install or reinstall, exact
-archive-to-install byte comparison, native architecture and Foundation signature
-and online notarization checks, `brew test`, exact version execution, and Apple
+archive-to-install byte comparison, native architecture and the declared
+unsigned-signature checks (unsigned signature report required, strict
+signature verification and notarization requirement both required to fail),
+`brew test`, exact version execution, and Apple
 Silicon helper `vmd-info`. The helper must be present only on arm64 and report
 the provenance-bound VMD trust marker. No raw candidate execution is needed
 before this installed-binary smoke. Protected downstream tooling remains clean
@@ -594,8 +573,9 @@ credentials. The verifier fails if any prohibited credential remains.
 
 Each job verifies the frozen inventory, checksums, provenance, exact archive
 shape, Go build information, source revision and clean-build flag, thin native
-architecture, Foundation signature, hardened runtime, secure timestamp, and
-online notarization. Protected tooling statically locates the one provenance-
+architecture, and the declared unsigned Apple state — every macOS binary must
+carry no signature and no notarization, per `scripts/verify-macos-binary.sh`.
+Protected tooling statically locates the one provenance-
 matched embedded VMD Mach-O without executing the helper, then independently
 verifies it. Static jobs freeze the two immutable proof artifacts first.
 Candidate-controlled code runs only in dependent clean jobs: the arm64 helper
@@ -610,10 +590,12 @@ draft metadata, notes, and every asset record again. Require byte-for-byte
 equality with the frozen proof and require the successful native markers to
 refer to that exact state.
 
-Enable organization-enforced release immutability for this repository before
-the publication gate. The publisher checks the live setting before its sole
+Enable repository-level release immutability for this repository before
+the publication gate — a personal-account repository has no
+organization-enforced mode, so the repository setting is the strongest form
+available. The publisher checks the live setting before its sole
 PATCH, and the publication response plus every public verifier must report
-`immutable=true`. A repository-only or disabled setting blocks publication
+`immutable=true`. A disabled setting blocks publication
 before mutation.
 
 The protected native verifier uses a non-cancelling concurrency key scoped to

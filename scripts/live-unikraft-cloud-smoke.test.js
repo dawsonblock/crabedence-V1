@@ -10,8 +10,11 @@ const smokeScript = path.join(repoRoot, "scripts", "live-unikraft-cloud-smoke.sh
 const bashPath = process.platform === "darwin" ? "/bin/bash" : "bash";
 const existingUUID = "11111111-2222-3333-4444-555555555555";
 const createdUUID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-const createdLease = "ukc_a1b2c3d4e5f6";
-const createdName = "crabbox-ukc-a1b2c3d4e5f6";
+const createdLease = "ukc_0123456789abcdef0123456789abcdef";
+const createdName = "crabbox-ukc-0123456789abcdef0123456789abcdef";
+// The 12-hex width minted by earlier releases must keep working end to end.
+const legacyLease = "ukc_a1b2c3d4e5f6";
+const legacyName = "crabbox-ukc-a1b2c3d4e5f6";
 const temporaryDirectories = new Set();
 
 test.afterEach(() => {
@@ -493,6 +496,79 @@ esac`,
   assert.doesNotMatch(fs.readFileSync(harness.rawCalls, "utf8"), /^delete /m);
 });
 
+test("legacy 12-hex Unikraft leases still complete the exact lifecycle", () => {
+  const harness = prepareHarness(
+    "crabbox-ukc-legacy-width-",
+    `case "$1" in
+  doctor)
+    printf 'auth=ready control_plane=ready inventory=ready\n'
+    ;;
+  warmup)
+    printf '%s' '[{"name":"existing-service","uuid":"${existingUUID}"},{"name":"${legacyName}","uuid":"${createdUUID}"}]\n' >${JSON.stringify("$FAKE_REMOTE")}
+    while [[ "$#" -gt 0 ]]; do
+      if [[ "$1" == "--slug" ]]; then
+        printf '%s' "$2" >${JSON.stringify("$FAKE_SLUG")}
+        shift 2
+        continue
+      fi
+      shift
+    done
+    printf 'leased ${legacyLease} slug=%s provider=unikraft-cloud instance=${createdUUID} state=running fqdn=example.invalid\n' "$(cat ${JSON.stringify("$FAKE_SLUG")})"
+    ;;
+  status)
+    if [[ -f ${JSON.stringify("$FAKE_STOPPED")} ]]; then
+      printf 'instance not found\n' >&2
+      exit 4
+    fi
+    printf '{"id":"${legacyLease}","slug":"%s","provider":"unikraft-cloud","serverId":"${createdUUID}","state":"running","ready":true}\n' "$(cat ${JSON.stringify("$FAKE_SLUG")})"
+    ;;
+  list)
+    if ! grep -q '${createdUUID}' ${JSON.stringify("$FAKE_REMOTE")}; then
+      printf '[]\n'
+    else
+      printf '[{"CloudID":"${createdUUID}","Provider":"unikraft-cloud","name":"${legacyName}","labels":{"lease":"${legacyLease}","slug":"%s"}}]\n' "$(cat ${JSON.stringify("$FAKE_SLUG")})"
+    fi
+    ;;
+  stop)
+    printf '%s' '[{"name":"existing-service","uuid":"${existingUUID}"}]\n' >${JSON.stringify("$FAKE_REMOTE")}
+    : >${JSON.stringify("$FAKE_STOPPED")}
+    ;;
+  *) exit 99 ;;
+esac`,
+  );
+  const stopped = path.join(harness.dir, "stopped");
+  let crabbox = fs.readFileSync(harness.fakeCrabbox, "utf8");
+  crabbox = crabbox
+    .replaceAll('"$FAKE_REMOTE"', JSON.stringify(harness.remote))
+    .replaceAll('"$FAKE_STOPPED"', JSON.stringify(stopped))
+    .replaceAll('"$FAKE_SLUG"', JSON.stringify(harness.slugFile));
+  fs.writeFileSync(harness.fakeCrabbox, crabbox);
+
+  const result = spawnSync(bashPath, [smokeScript], {
+    cwd: repoRoot,
+    env: baseEnv({
+      CRABBOX_BIN: harness.fakeCrabbox,
+      CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_DIR: harness.proofDir,
+      CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_RAW_HELPER: harness.rawHelper,
+      CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_SLUG: "unikraft-cloud-live-smoke-test",
+    }),
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, /classification=live_unikraft_cloud_smoke_passed/);
+  assert.equal(fs.readFileSync(harness.remote, "utf8"), harness.baseline);
+  const calls = fs.readFileSync(harness.calls, "utf8");
+  assert.match(
+    calls,
+    new RegExp(
+      `^status --provider unikraft-cloud --id ${legacyLease} --wait --wait-timeout 300s --json$`,
+      "m",
+    ),
+  );
+  assert.match(calls, new RegExp(`^stop --provider unikraft-cloud ${legacyLease}$`, "m"));
+});
+
 test("deleted status rejects unrelated command failures", () => {
   const harness = prepareHarness(
     "crabbox-ukc-deleted-status-",
@@ -723,8 +799,13 @@ esac`,
       CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_DIR: harness.proofDir,
       CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_RAW_HELPER: harness.rawHelper,
       CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_SLUG: "unikraft-cloud-live-smoke-test",
-      CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_UNCERTAINTY_SECONDS: "5",
-      CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_CLEANUP_TIMEOUT_SECONDS: "10",
+      // These tighten the smoke script's 35s/90s defaults to keep the
+      // suite fast. The full suite runs them under load, so the cleanup
+      // window needs headroom: too tight and a delayed-visibility poll
+      // times out and misclassifies as cleanup_failed. Tests that assert
+      // cleanup DOES fail keep the short window deliberately.
+      CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_UNCERTAINTY_SECONDS: "15",
+      CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_CLEANUP_TIMEOUT_SECONDS: "30",
       FAKE_CLAIM_UUID: "",
       FAKE_DELAY_VISIBILITY_AT: "4",
     }),
@@ -772,8 +853,13 @@ esac`,
       CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_DIR: harness.proofDir,
       CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_RAW_HELPER: harness.rawHelper,
       CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_SLUG: "unikraft-cloud-live-smoke-test",
-      CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_UNCERTAINTY_SECONDS: "5",
-      CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_CLEANUP_TIMEOUT_SECONDS: "10",
+      // These tighten the smoke script's 35s/90s defaults to keep the
+      // suite fast. The full suite runs them under load, so the cleanup
+      // window needs headroom: too tight and a delayed-visibility poll
+      // times out and misclassifies as cleanup_failed. Tests that assert
+      // cleanup DOES fail keep the short window deliberately.
+      CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_UNCERTAINTY_SECONDS: "15",
+      CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_CLEANUP_TIMEOUT_SECONDS: "30",
       FAKE_DELAY_VISIBILITY_AT: "5",
     }),
     encoding: "utf8",
@@ -958,7 +1044,7 @@ esac`,
       CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_DIR: harness.proofDir,
       CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_RAW_HELPER: harness.rawHelper,
       CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_SLUG: "unikraft-cloud-live-smoke-test",
-      CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_CLEANUP_TIMEOUT_SECONDS: "10",
+      CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_CLEANUP_TIMEOUT_SECONDS: "30",
     }),
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -1028,7 +1114,7 @@ esac`,
       CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_DIR: harness.proofDir,
       CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_RAW_HELPER: harness.rawHelper,
       CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_SLUG: "unikraft-cloud-live-smoke-test",
-      CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_CLEANUP_TIMEOUT_SECONDS: "10",
+      CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_CLEANUP_TIMEOUT_SECONDS: "30",
       FAKE_RAW_OWNED_STARTED: ownedStarted,
     }),
     stdio: ["ignore", "pipe", "pipe"],
@@ -1098,7 +1184,7 @@ esac`,
       CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_DIR: harness.proofDir,
       CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_RAW_HELPER: harness.rawHelper,
       CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_SLUG: "unikraft-cloud-live-smoke-test",
-      CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_CLEANUP_TIMEOUT_SECONDS: "10",
+      CRABBOX_UNIKRAFT_CLOUD_LIVE_SMOKE_CLEANUP_TIMEOUT_SECONDS: "30",
     }),
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -1385,6 +1471,15 @@ process.on("SIGTERM", () => server.close(() => process.exit(0)));
     const unownedDelete = raw("delete", createdUUID, "crabbox-ukc-ffffffffffff");
     assert.notEqual(unownedDelete.status, 0);
     assert.doesNotMatch(fs.readFileSync(requestLog, "utf8"), /^DELETE \/v1\/instances$/m);
+    // A legacy 12-hex name must pass the name check and then fail on exact
+    // ownership, so leases minted before the widening stay cleanable.
+    const legacyWidthDelete = raw("delete", createdUUID, legacyName);
+    assert.notEqual(legacyWidthDelete.status, 0);
+    assert.doesNotMatch(legacyWidthDelete.stderr, /invalid delete name/);
+    assert.match(
+      legacyWidthDelete.stderr,
+      /refusing cleanup without exact UUID and name ownership/,
+    );
     fs.writeFileSync(badDeleteNameFile, "1");
     const conflictingDelete = raw("delete", createdUUID, createdName);
     assert.notEqual(conflictingDelete.status, 0);

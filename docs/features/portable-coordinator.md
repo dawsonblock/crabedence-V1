@@ -168,6 +168,61 @@ mutate fleet state stay serialized. Control heartbeats acquire their lifecycle
 transaction in shared fleet code, so Node dispatch does not wrap them in a second
 lock. They remain tracked for shutdown alongside other socket operations.
 
+## Coordinator authority and fencing
+
+The Node coordinator uses PostgreSQL advisory locks to enforce single-writer
+semantics. Two distinct locks cooperate:
+
+- **Session lock** (`pg_advisory_lock(hashtext('crabbox.coordinator'))`): held
+  for the lifetime of the coordinator process. Exactly one coordinator may hold
+  this lock per database. A crashed or killed holder loses its PostgreSQL
+  session, so the lock frees automatically.
+- **Mutation fence** (`pg_advisory_xact_lock(hashtext('crabbox.coordinator.mutation'))`):
+  acquired inside every serializable transaction that mutates authoritative
+  state (`put`, `delete`, `take`, `transaction`). Uses a different key from the
+  session lock because PostgreSQL advisory locks are exclusive across sessions
+  regardless of lock duration; using the same key would deadlock the
+  coordinator's own mutations.
+
+### Authority model
+
+The coordinator's authority model is a **linearizable drain**:
+
+1. A coordinator holds the session lock and is the sole admitted writer.
+2. If the session lock is lost (process crash, network partition, manual
+   `pg_terminate_backend`), the coordinator detects this via the lock client's
+   `onLost` callback and sets `authorityLost = true`.
+3. New mutations from the old coordinator are rejected immediately
+   (`AuthorityLostError`).
+4. Mutations that were already admitted (inside an in-flight fenced
+   transaction) are allowed to commit or roll back. They hold the mutation fence,
+   so no replacement coordinator can mutate until they drain.
+5. A replacement coordinator acquires the session lock and attempts its first
+   mutation. That mutation blocks on the transaction-scoped mutation fence until
+   all in-flight transactions from the old coordinator complete.
+6. Once the old transactions drain, the replacement coordinator's mutation
+   proceeds.
+
+This means:
+
+- **No concurrent state mutation**: the mutation fence serializes all
+  authoritative writes across coordinator failover.
+- **New mutations from the old coordinator fail closed**: `authorityLost` is
+  re-checked after acquiring the fence, so a mutation that was waiting on the
+  fence when authority was lost is aborted.
+- **In-flight transactions may complete after authority transfer**: this is
+  intentional. The old coordinator's in-flight transaction already holds the
+  mutation fence, and forcing it to abort would require either a generation
+  token revalidated at commit or a `pg_terminate_backend` on the old backend.
+  The drain model is safe for database state because the mutation fence
+  guarantees no concurrent writes.
+
+If the system ever needs strict epoch fencing (no old transaction can commit
+after authority transfers to a new coordinator), the implementation would need
+a persisted generation/epoch token revalidated at commit time. The current
+design does not require this because coordinator transactions do not perform
+non-transactional external side effects within the fenced section.
+
 ## WebSockets and shutdown
 
 The Node runtime supports the same control, WebVNC, code, and egress bridge

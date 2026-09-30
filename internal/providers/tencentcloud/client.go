@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -215,7 +214,7 @@ func (c *client) do(ctx context.Context, service, endpoint, action, version, reg
 		return err
 	}
 	defer resp.Body.Close()
-	data, readErr := io.ReadAll(resp.Body)
+	data, readErr := shared.ReadBoundedResponse(resp.Body, shared.MaxControlPlaneResponseBytes)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		if len(data) > 800 {
 			data = data[:800]

@@ -78,7 +78,7 @@ attempt so an interrupted operation can be safely replayed.
 `--slug <slug>` requests a human-chosen slug for a new lease. Crabbox normalizes
 it and may append a short suffix if an active lease already uses that slug.
 
-`--lease-id cbx_<12 lowercase hex>` is the automation idempotency contract for
+`--lease-id cbx_<12 or 32 lowercase hex>` is the automation idempotency contract for
 providers that explicitly support fixed identities. Direct AWS, Machine0, Incus,
 and local-container leases, managed coordinator leases, and explicitly capable
 external providers accept it. Replaying the same normalized create intent
@@ -323,7 +323,7 @@ warmup, because it also dispatches the workflow and waits for the ready marker.
 --type <provider-type>             provider server/instance type
 --market spot|on-demand            capacity market (AWS)
 --slug <slug>                      request a friendly slug for a new lease
---lease-id cbx_<12 lowercase hex> fixed lease ID for idempotent automation
+--lease-id cbx_<12 or 32 lowercase hex> fixed lease ID for idempotent automation
 --pond <name>                      tag this lease into a pond
 --expose <port>                    declare a TCP port reachable over the SSH-mesh plane; repeatable
 --cache-volume [name=]key:path     require a provider-backed cache volume; repeatable

@@ -32,6 +32,7 @@ same order as the CLI help.
 - [results](results.md)
 - [receipt](receipt.md)
 - [verify](verify.md)
+- [evidence](evidence.md)
 - [cache](cache.md)
 - [status](status.md)
 - [heartbeat](heartbeat.md)

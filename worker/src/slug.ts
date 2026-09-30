@@ -86,6 +86,25 @@ export function slugWithCollisionSuffix(base: string, seed: string): string {
   return `${bounded}-${(slugHash(seed) & 0xffff).toString(16).padStart(4, "0")}`;
 }
 
+/**
+ * The canonical lease-ID shape: `cbx_` plus 12 lowercase hex characters
+ * for IDs minted by earlier versions, or 32 (16 random bytes) for current
+ * ones. Anything else is treated as a slug, so both widths must be
+ * accepted or a new ID would resolve as a slug instead of a lease.
+ */
+export function isCanonicalLeaseID(value: string): boolean {
+  return /^cbx_(?:[a-f0-9]{12}|[a-f0-9]{32})$/.test(value);
+}
+
+/**
+ * Whether an optional value is a canonical lease ID — the only form a
+ * persisted lease reference (an event's leaseID, a run's current lease)
+ * may carry.
+ */
+export function validLeaseID(value: string | undefined): value is string {
+  return typeof value === "string" && isCanonicalLeaseID(value);
+}
+
 export function leaseProviderName(leaseID: string, slug: string | undefined): string {
   const normalized = normalizeLeaseSlug(slug);
   return normalized

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { adminGrantVersion } from "../src/auth";
+import { prepareCoordinatorRequest } from "../src/coordinator-entry";
 import {
   CloudflareCoordinatorRuntime,
   coordinatorRequestQueue,
@@ -699,6 +700,25 @@ describe("coordinator runtimes", () => {
 
     releaseTokenExchange();
     await expect(callback).resolves.toMatchObject({ status: 303 });
+  });
+
+  it("publishes the deployed build identity on the entry health route", async () => {
+    const prepared = await prepareCoordinatorRequest(
+      new Request("https://coordinator.test/v1/health"),
+      {
+        CRABBOX_BUILD_COMMIT: "0123456789abcdef0123456789abcdef01234567",
+        CRABBOX_BUILD_VERSION: "0.53.1",
+      } as Env,
+    );
+    expect("response" in prepared).toBe(true);
+    if (!("response" in prepared)) return;
+    expect(prepared.response.status).toBe(200);
+    await expect(prepared.response.json()).resolves.toMatchObject({
+      ok: true,
+      service: "crabbox-coordinator",
+      commit: "0123456789abcdef0123456789abcdef01234567",
+      version: "0.53.1",
+    });
   });
 
   it("runs the fleet coordinator without a Durable Object", async () => {

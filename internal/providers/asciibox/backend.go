@@ -613,7 +613,7 @@ func statusReady(status string) bool {
 	}
 }
 
-var boxNamePattern = regexp.MustCompile(`^crabbox-(.+)-([0-9a-f]{12})$`)
+var boxNamePattern = regexp.MustCompile(`^crabbox-(.+)-([0-9a-f]{12}|[0-9a-f]{32})$`)
 
 func isCrabboxBox(box boxData) bool {
 	return boxNamePattern.MatchString(strings.TrimSpace(box.Name))

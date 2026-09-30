@@ -1,0 +1,75 @@
+{
+  "description": "Shared Go↔TypeScript V2/V3 receipt evidence_sha256 contract corpus. Both runtimes must accept or reject each case identically. V2 = legacy (no evidence binding). V3 = evidence binding mandatory.",
+  "fixtures": [
+    {
+      "name": "v2-no-evidence-pass",
+      "description": "V2 receipt with no evidence_sha256 is valid legacy",
+      "schema_version": 2,
+      "evidence_sha256": null,
+      "expected": "accept"
+    },
+    {
+      "name": "v2-evidence-present-fail",
+      "description": "V2 receipt carrying evidence_sha256 is INVALID",
+      "schema_version": 2,
+      "evidence_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "expected": "reject",
+      "error_contains": "v2 terminal receipt must not contain evidence_sha256"
+    },
+    {
+      "name": "v2-malformed-evidence-fail",
+      "description": "V2 receipt carrying malformed evidence_sha256 is INVALID",
+      "schema_version": 2,
+      "evidence_sha256": "not-a-hex-digest",
+      "expected": "reject",
+      "error_contains": "v2 terminal receipt must not contain evidence_sha256"
+    },
+    {
+      "name": "v3-no-evidence-fail",
+      "description": "V3 receipt with no evidence_sha256 is INVALID",
+      "schema_version": 3,
+      "evidence_sha256": null,
+      "expected": "reject",
+      "error_contains": "v3 terminal receipt must bind evidence_sha256"
+    },
+    {
+      "name": "v3-malformed-evidence-fail",
+      "description": "V3 receipt with malformed evidence_sha256 is INVALID",
+      "schema_version": 3,
+      "evidence_sha256": "not-a-hex-digest",
+      "expected": "reject",
+      "error_contains": "invalid evidence_sha256"
+    },
+    {
+      "name": "v3-valid-evidence-pass",
+      "description": "V3 receipt with valid 64-char lowercase hex evidence_sha256 is valid",
+      "schema_version": 3,
+      "evidence_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "expected": "accept"
+    },
+    {
+      "name": "v3-empty-string-evidence-fail",
+      "description": "V3 receipt with empty-string evidence_sha256 is INVALID",
+      "schema_version": 3,
+      "evidence_sha256": "",
+      "expected": "reject",
+      "error_contains": "v3 terminal receipt must bind evidence_sha256"
+    },
+    {
+      "name": "v3-uppercase-evidence-fail",
+      "description": "V3 receipt with uppercase hex evidence_sha256 is INVALID (must be lowercase)",
+      "schema_version": 3,
+      "evidence_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "expected": "reject",
+      "error_contains": "invalid evidence_sha256"
+    },
+    {
+      "name": "v3-short-evidence-fail",
+      "description": "V3 receipt with 63-char evidence_sha256 is INVALID (must be 64)",
+      "schema_version": 3,
+      "evidence_sha256": "00000000000000000000000000000000000000000000000000000000000000",
+      "expected": "reject",
+      "error_contains": "invalid evidence_sha256"
+    }
+  ]
+}

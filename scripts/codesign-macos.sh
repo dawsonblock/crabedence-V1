@@ -17,6 +17,11 @@ BINARY=$3
 crabbox_release_assert_identifier_arch "$IDENTIFIER" "$ARCH"
 crabbox_release_assert_no_publication_tokens
 
+if [[ "$CRABBOX_RELEASE_APPLE_SIGNING" == "none" ]]; then
+  echo "the unsigned release contract forbids invoking the signer" >&2
+  exit 1
+fi
+
 [[ "$(uname -s)" == Darwin ]] || {
   echo "official macOS release signing must run on macOS" >&2
   exit 1

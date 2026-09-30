@@ -1,5 +1,5 @@
 import type { LeaseConfig } from "./config";
-import { normalizeLeaseSlug } from "./slug";
+import { isCanonicalLeaseID, normalizeLeaseSlug } from "./slug";
 import type { LeaseRecord, Provider, ProviderMachine } from "./types";
 
 type ProviderOwnershipLease = Pick<
@@ -94,7 +94,7 @@ export function providerMachineOwnedByLease(
   labelValue: (value: string) => string = providerLabelValue,
 ): boolean {
   return (
-    /^cbx_[a-f0-9]{12}$/.test(lease.id) &&
+    isCanonicalLeaseID(lease.id) &&
     lease.provider === provider &&
     machine.provider === provider &&
     lease.cloudID.length > 0 &&
@@ -116,7 +116,7 @@ export function providerLabelsOwnedByLease(
         Boolean,
       );
   return (
-    /^cbx_[a-f0-9]{12}$/.test(lease.id) &&
+    isCanonicalLeaseID(lease.id) &&
     slug.length > 0 &&
     providerOwners.length > 0 &&
     lease.provider === provider &&

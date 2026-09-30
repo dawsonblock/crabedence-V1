@@ -1,0 +1,51 @@
+name: Release Check
+
+# Credential-free macOS release snapshot check. The publish gate requires a
+# no-bypass repository ruleset demanding this check context before merge, so a
+# pull request cannot land while the release configuration fails to build.
+# This file is CODEOWNERS-protected: the check cannot be redefined without
+# owner review.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Release Check
+    runs-on: macos-15
+    # The snapshot runs the release build path — the VMD hook and the real
+    # goreleaser configuration — for the host target only (goreleaser build
+    # --single-target). The complete platform matrix and archive pipeline are
+    # proven by the credential-free producer at release time; bounding the
+    # merge gate keeps a cold run inside hosted macOS runner budgets.
+    timeout-minutes: 45
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Cache Go toolchain installs
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/bin
+            ~/go/pkg/mod
+          key: release-check-tools-${{ runner.os }}-${{ runner.arch }}-goreleaser-2.17.0-${{ hashFiles('go.sum') }}
+
+      - name: Credential-free release snapshot
+        run: |
+          set -euo pipefail
+          unset GH_TOKEN GITHUB_TOKEN ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_RUNTIME_TOKEN
+          # Pinned through the Go module checksum database, not a floating install.
+          go install github.com/goreleaser/goreleaser/v2@v2.17.0
+          goreleaser build --snapshot --clean --single-target --config .goreleaser.yaml

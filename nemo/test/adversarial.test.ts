@@ -1,0 +1,939 @@
+/**
+ * Adversarial NEMO tests.
+ *
+ * These tests exercise edge cases that could cause duplicate side
+ * effects, protocol corruption, or incorrect retry behavior:
+ *
+ *   - Unicode request/result (UTF-8 byte length vs string length)
+ *   - Socket close before dispatch (safe retry)
+ *   - Socket close after dispatch (POST_DISPATCH → UNKNOWN for mutations)
+ *   - Two simultaneous identical mutations (atomic reservation)
+ *   - Same idempotency key with different arguments (CONFLICT)
+ *   - Server restart during mutation (UNKNOWN persisted)
+ *   - UNKNOWN replay (returns persisted UNKNOWN, not re-invoked)
+ *   - Malformed response (PROTOCOL error)
+ *   - Oversized frame (rejected)
+ *   - Expired deadline (DENIED)
+ *   - Invalid authority (DENIED)
+ *   - CRITICAL success without evidence (UNKNOWN — post-dispatch
+ *     uncertainty, not failure)
+ */
+
+import { mkdtempSync, rmSync } from "node:fs";
+import { createServer } from "node:net";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+
+import type {
+  ExecutionApiRequest,
+  ExecutionApiResponse,
+  IdempotencyStore,
+} from "../adapters/crabedence/index";
+import {
+  CrabedenceClient,
+  CrabedenceExecutionAdapter,
+  ExecutionApiServer,
+  TransportError,
+} from "../adapters/crabedence/index";
+
+// ─── Test helpers ─────────────────────────────────────────────────────
+
+function makeTempSocket(): string {
+  const dir = mkdtempSync(join(tmpdir(), "nemo-adv-"));
+  return join(dir, "crabedence.sock");
+}
+
+function cleanupSocket(socketPath: string): void {
+  rmSync(socketPath, { recursive: true, force: true });
+}
+
+/**
+ * Bounded wait for an observed condition. Concurrency tests must wait for
+ * a state to actually be observed instead of sleeping — a fixed sleep
+ * races the server under load and is how the concurrent-mutation test
+ * used to flake.
+ */
+async function waitFor(
+  predicate: () => boolean,
+  what: string,
+  timeoutMs = 2000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  throw new Error(`timed out waiting for ${what}`);
+}
+
+const auth = { principal: "alice@example.com", grantId: "grant_123" };
+const wireAuth = { principal: "alice@example.com", grant_id: "grant_123" };
+
+// ─── Tests ────────────────────────────────────────────────────────────
+
+describe("Adversarial: Unicode and framing", () => {
+  let socketPath: string;
+  let server: ExecutionApiServer;
+
+  beforeEach(() => {
+    socketPath = makeTempSocket();
+  });
+
+  afterEach(async () => {
+    if (server) await server.stop();
+    cleanupSocket(socketPath);
+  });
+
+  it("handles Unicode in request arguments (José, emoji, CJK)", async () => {
+    const unicodeArgs = {
+      to: "josé@example.com",
+      name: "José García",
+      emoji: "🎉🚀",
+      cjk: "日本語テスト",
+      smartquotes: "“smart” ‘quotes’",
+    };
+
+    let received: ExecutionApiRequest | null = null;
+    server = new ExecutionApiServer(async (req) => {
+      received = req;
+      return {
+        status: "SUCCEEDED",
+        result: { echo: req.arguments },
+      };
+    }, socketPath);
+    await server.start();
+
+    const client = new CrabedenceClient(socketPath);
+    const resp = await client.execute({
+      capability: "email.send",
+      arguments: unicodeArgs,
+      authority: wireAuth,
+      execution_class: "CRITICAL",
+      idempotency_key: "unicode_001",
+    });
+
+    expect(resp.status).toBe("SUCCEEDED");
+    expect(received).not.toBeNull();
+    expect(received!.arguments).toEqual(unicodeArgs);
+    expect((resp.result as { echo: unknown }).echo).toEqual(unicodeArgs);
+  });
+
+  it("rejects oversized frames", async () => {
+    server = new ExecutionApiServer(async () => ({
+      status: "SUCCEEDED",
+    }), socketPath);
+    await server.start();
+
+    // Create a request larger than 4 MiB
+    const hugeArgs = { data: "x".repeat(5 * 1024 * 1024) };
+    const client = new CrabedenceClient(socketPath);
+
+    await expect(
+      client.execute({
+        capability: "test.huge",
+        arguments: hugeArgs,
+        authority: wireAuth,
+        execution_class: "READ",
+      }),
+    ).rejects.toThrow(/maximum size/);
+  });
+});
+
+describe("Adversarial: Transport ambiguity", () => {
+  let socketPath: string;
+  let server: ExecutionApiServer;
+
+  beforeEach(() => {
+    socketPath = makeTempSocket();
+  });
+
+  afterEach(async () => {
+    if (server) await server.stop();
+    cleanupSocket(socketPath);
+  });
+
+  it("PRE_DISPATCH failure: connection refused (no server)", async () => {
+    // No server started — connection refused
+    const adapter = new CrabedenceExecutionAdapter(
+      new CrabedenceClient(socketPath, 1000),
+    );
+
+    await expect(
+      adapter.execute({
+        capabilityId: "test.read",
+        arguments: {},
+        authority: auth,
+        executionClass: "READ",
+      }),
+    ).rejects.toThrow(TransportError);
+  });
+
+  it("POST_DISPATCH: MUTATION returns UNKNOWN when socket closes after send", async () => {
+    // Server accepts connection but closes immediately after receiving data
+    server = new ExecutionApiServer(async () => {
+      // Simulate: handler hangs (server crash mid-execution)
+      return new Promise<ExecutionApiResponse>(() => {
+        // Never resolves — simulates lost connection
+      });
+    }, socketPath);
+    await server.start();
+
+    // Use a client with short timeout
+    const adapter = new CrabedenceExecutionAdapter(
+      new CrabedenceClient(socketPath, 500),
+    );
+
+    const outcome = await adapter.execute({
+      capabilityId: "email.send",
+      arguments: { to: "bob@example.com" },
+      authority: auth,
+      executionClass: "CRITICAL",
+      idempotencyKey: "post_dispatch_001",
+    });
+
+    // For CRITICAL, POST_DISPATCH failure must be UNKNOWN, not thrown.
+    // (Either timeout or connection close after dispatch.)
+    expect(outcome.status).toBe("UNKNOWN");
+  });
+
+  it("PRE_DISPATCH: READ throws (not converted to UNKNOWN)", async () => {
+    // No server — connection refused, PRE_DISPATCH
+    const adapter = new CrabedenceExecutionAdapter(
+      new CrabedenceClient(socketPath, 500),
+    );
+
+    await expect(
+      adapter.execute({
+        capabilityId: "test.read",
+        arguments: {},
+        authority: auth,
+        executionClass: "READ",
+      }),
+    ).rejects.toThrow(TransportError);
+  });
+});
+
+describe("Adversarial: Idempotency races", () => {
+  let socketPath: string;
+  let server: ExecutionApiServer;
+
+  beforeEach(() => {
+    socketPath = makeTempSocket();
+  });
+
+  afterEach(async () => {
+    if (server) await server.stop();
+    cleanupSocket(socketPath);
+  });
+
+  it("two concurrent identical mutations: one dispatch, convergent transport outcome", async () => {
+    let callCount = 0;
+    let resolveFirst!: () => void;
+    const firstCallBlocked = new Promise<void>((resolve) => {
+      resolveFirst = resolve;
+    });
+
+    server = new ExecutionApiServer(async (req) => {
+      callCount++;
+      if (callCount === 1) {
+        // Block the leader until the follower has demonstrably arrived.
+        await firstCallBlocked;
+      }
+      return {
+        status: "SUCCEEDED",
+        result: { message_id: `msg_${callCount}` },
+        execution: { provider: "gmail", run_id: `run_${callCount}` },
+      };
+    }, socketPath);
+    await server.start();
+
+    const client = new CrabedenceClient(socketPath);
+    const request = {
+      capability: "email.send",
+      arguments: { to: "bob@example.com" },
+      authority: wireAuth,
+      execution_class: "CRITICAL",
+      idempotency_key: "concurrent_001",
+    };
+
+    // Either caller may win the reservation — which socket the server
+    // processes first is a scheduling property, not a contract. Assert
+    // the invariant, never a fixed leader.
+    const promise1 = client.execute(request);
+    const promise2 = client.execute(request);
+
+    // Deterministic rendezvous: release the leader only once the follower
+    // has actually been admitted while the leader is blocked in the
+    // handler.
+    await waitFor(
+      () =>
+        server.observations().filter((o) => o.reservation === "IN_FLIGHT")
+          .length === 1,
+      "the follower to be admitted while the leader is blocked",
+    );
+    resolveFirst();
+
+    const responses = await Promise.all([promise1, promise2]);
+
+    // Exactly one provider dispatch, exactly one terminal outcome; the
+    // other caller observed a truthful in-flight state, never a second
+    // execution and never a fabricated result.
+    expect(callCount).toBe(1);
+    const succeeded = responses.filter((r) => r.status === "SUCCEEDED");
+    const inFlight = responses.filter((r) => r.status === "UNKNOWN");
+    expect(succeeded).toHaveLength(1);
+    expect(inFlight).toHaveLength(1);
+    expect(inFlight[0].error).toContain("in flight");
+    expect(succeeded[0].result).toEqual({ message_id: "msg_1" });
+
+    // The observation log proves the shape: one leader that dispatched,
+    // one follower that observed IN_FLIGHT.
+    const observations = server.observations();
+    expect(observations.filter((o) => o.dispatched)).toHaveLength(1);
+    expect(observations.filter((o) => o.reservation === "NEW")).toHaveLength(1);
+    expect(observations.filter((o) => o.reservation === "IN_FLIGHT")).toHaveLength(1);
+  });
+
+  it("same idempotency key with different arguments is CONFLICT", async () => {
+    server = new ExecutionApiServer(async () => ({
+      status: "SUCCEEDED",
+      result: { ok: true },
+    }), socketPath);
+    await server.start();
+
+    const client = new CrabedenceClient(socketPath);
+
+    const resp1 = await client.execute({
+      capability: "email.send",
+      arguments: { to: "bob@example.com" },
+      authority: wireAuth,
+      execution_class: "CRITICAL",
+      idempotency_key: "conflict_001",
+    });
+
+    const resp2 = await client.execute({
+      capability: "email.send",
+      arguments: { to: "carol@example.com" }, // Different arguments
+      authority: wireAuth,
+      execution_class: "CRITICAL",
+      idempotency_key: "conflict_001",
+    });
+
+    expect(resp1.status).toBe("SUCCEEDED");
+    expect(resp2.status).toBe("DENIED");
+    expect(resp2.error).toContain("different request");
+  });
+});
+
+describe("Adversarial: adapter outcomes and protocol", () => {
+  // ─── New tests for hardening 6 audit items ─────────────────────────────
+
+  it("handler crash after dispatch returns UNKNOWN, not FAILED", async () => {
+    const socketPath = makeTempSocket();
+    cleanupSocket(socketPath);
+
+    const crashHandler = async (_req: ExecutionApiRequest): Promise<ExecutionApiResponse> => {
+      throw new Error("provider crashed after side effect");
+    };
+
+    const server = new ExecutionApiServer(crashHandler, socketPath);
+    await server.start();
+
+    try {
+      const client = new CrabedenceClient(socketPath, 1000);
+      const adapter = new CrabedenceExecutionAdapter(client);
+      const outcome = await adapter.execute({
+        capabilityId: "email.send",
+        arguments: { to: "bob@example.com" },
+        authority: auth,
+        executionClass: "MUTATION",
+        idempotencyKey: "crash_dispatch",
+      });
+
+      // Handler crash after dispatch must return UNKNOWN, not FAILED.
+      // The side effect may have occurred.
+      expect(outcome.status).toBe("UNKNOWN");
+    } finally {
+      await server.stop();
+      cleanupSocket(socketPath);
+    }
+  });
+
+  it("persistence failure after success returns UNKNOWN", async () => {
+    const socketPath = makeTempSocket();
+    cleanupSocket(socketPath);
+
+    const successHandler = async (_req: ExecutionApiRequest): Promise<ExecutionApiResponse> => {
+      return { status: "SUCCEEDED" };
+    };
+
+    // A store that fails on settle()
+    const failingStore: IdempotencyStore = {
+      async reserve() {
+        return { state: "NEW" as const };
+      },
+      async settle() {
+        throw new Error("database write failed");
+      },
+    };
+
+    const server = new ExecutionApiServer(successHandler, socketPath, failingStore);
+    await server.start();
+
+    try {
+      const client = new CrabedenceClient(socketPath, 1000);
+      const adapter = new CrabedenceExecutionAdapter(client);
+      const outcome = await adapter.execute({
+        capabilityId: "email.send",
+        arguments: { to: "bob@example.com" },
+        authority: auth,
+        executionClass: "MUTATION",
+        idempotencyKey: "persist_fail",
+      });
+
+      // Persistence failed after success — must return UNKNOWN, not FAILED.
+      expect(outcome.status).toBe("UNKNOWN");
+    } finally {
+      await server.stop();
+      cleanupSocket(socketPath);
+    }
+  });
+
+  it("EXISTING record with no response fails closed to UNKNOWN", async () => {
+    const socketPath = makeTempSocket();
+    cleanupSocket(socketPath);
+
+    const successHandler = async (_req: ExecutionApiRequest): Promise<ExecutionApiResponse> => {
+      return { status: "SUCCEEDED" };
+    };
+
+    // A store that returns EXISTING with no response (inconsistent state)
+    const brokenStore: IdempotencyStore = {
+      async reserve() {
+        return { state: "EXISTING" as const, response: undefined };
+      },
+      async settle() {
+        // no-op
+      },
+    };
+
+    const server = new ExecutionApiServer(successHandler, socketPath, brokenStore);
+    await server.start();
+
+    try {
+      const client = new CrabedenceClient(socketPath, 1000);
+      const adapter = new CrabedenceExecutionAdapter(client);
+      const outcome = await adapter.execute({
+        capabilityId: "email.send",
+        arguments: { to: "bob@example.com" },
+        authority: auth,
+        executionClass: "MUTATION",
+        idempotencyKey: "broken_existing",
+      });
+
+      // EXISTING with no response must fail closed to UNKNOWN, not re-execute.
+      expect(outcome.status).toBe("UNKNOWN");
+      expect(outcome.error).toContain("reconciliation");
+    } finally {
+      await server.stop();
+      cleanupSocket(socketPath);
+    }
+  });
+
+  it("same key with different grant_id is a conflict", async () => {
+    const socketPath = makeTempSocket();
+    cleanupSocket(socketPath);
+
+    let callCount = 0;
+    const handler = async (req: ExecutionApiRequest): Promise<ExecutionApiResponse> => {
+      callCount++;
+      return { status: "SUCCEEDED" };
+    };
+
+    const server = new ExecutionApiServer(handler, socketPath);
+    await server.start();
+
+    try {
+      const client = new CrabedenceClient(socketPath, 1000);
+      const adapter = new CrabedenceExecutionAdapter(client);
+
+      // First request with grant_123
+      await adapter.execute({
+        capabilityId: "email.send",
+        arguments: { to: "bob@example.com" },
+        authority: { principal: "alice@example.com", grantId: "grant_123" },
+        executionClass: "MUTATION",
+        idempotencyKey: "same_key_diff_grant",
+      });
+
+      // Second request with grant_456 — same key, different grant
+      const outcome2 = await adapter.execute({
+        capabilityId: "email.send",
+        arguments: { to: "bob@example.com" },
+        authority: { principal: "alice@example.com", grantId: "grant_456" },
+        executionClass: "MUTATION",
+        idempotencyKey: "same_key_diff_grant",
+      });
+
+      // Different grant_id means different request digest → CONFLICT
+      expect(outcome2.status).toBe("DENIED");
+      expect(outcome2.error).toContain("different request");
+    } finally {
+      await server.stop();
+      cleanupSocket(socketPath);
+    }
+  });
+
+  it("malformed wire response status is rejected", async () => {
+    const socketPath = makeTempSocket();
+    cleanupSocket(socketPath);
+
+    // Handler returns an invalid status
+    const badHandler = async (_req: ExecutionApiRequest): Promise<ExecutionApiResponse> => {
+      return { status: "BANANA" } as unknown as ExecutionApiResponse;
+    };
+
+    const server = new ExecutionApiServer(badHandler, socketPath);
+    await server.start();
+
+    try {
+      const client = new CrabedenceClient(socketPath, 1000);
+      const adapter = new CrabedenceExecutionAdapter(client);
+
+      await expect(
+        adapter.execute({
+          capabilityId: "test.read",
+          arguments: {},
+          authority: auth,
+          executionClass: "READ",
+        }),
+      ).rejects.toThrow(TransportError);
+    } finally {
+      await server.stop();
+      cleanupSocket(socketPath);
+    }
+  });
+
+  // PROTOCOL is as ambiguous as POST_DISPATCH: the service responded, but
+  // the frame violated the ABI — the request was transmitted, so a
+  // MUTATION/CRITICAL may already have taken effect. The Go client treats
+  // both kinds as ambiguous; the two planners must not disagree about the
+  // same effect.
+  it("PROTOCOL: MUTATION with a malformed status returns UNKNOWN", async () => {
+    const socketPath = makeTempSocket();
+    cleanupSocket(socketPath);
+    const server = new ExecutionApiServer(async () => {
+      return { status: "BANANA" } as unknown as ExecutionApiResponse;
+    }, socketPath);
+    await server.start();
+
+    try {
+      const adapter = new CrabedenceExecutionAdapter(new CrabedenceClient(socketPath, 1000));
+      const outcome = await adapter.execute({
+        capabilityId: "test.mut",
+        arguments: {},
+        authority: auth,
+        executionClass: "MUTATION",
+      });
+
+      expect(outcome.status).toBe("UNKNOWN");
+      expect(outcome.error).toContain("transport failure after dispatch");
+    } finally {
+      await server.stop();
+      cleanupSocket(socketPath);
+    }
+  });
+
+  it("PROTOCOL: MUTATION with malformed JSON returns UNKNOWN", async () => {
+    const socketPath = makeTempSocket();
+    cleanupSocket(socketPath);
+    // A frame the ABI cannot parse: valid length prefix, invalid JSON.
+    const payload = Buffer.from("not json", "utf-8");
+    const header = Buffer.alloc(4);
+    header.writeUInt32BE(payload.byteLength, 0);
+    const frame = Buffer.concat([header, payload]);
+    const server = createServer((socket) => {
+      socket.once("data", () => {
+        socket.write(frame);
+        socket.end();
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(socketPath, () => resolve()));
+
+    try {
+      const adapter = new CrabedenceExecutionAdapter(new CrabedenceClient(socketPath, 1000));
+      const outcome = await adapter.execute({
+        capabilityId: "test.mut",
+        arguments: {},
+        authority: auth,
+        executionClass: "MUTATION",
+      });
+
+      expect(outcome.status).toBe("UNKNOWN");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      cleanupSocket(socketPath);
+    }
+  });
+
+  it("PROTOCOL: MUTATION with an oversized response returns UNKNOWN", async () => {
+    const socketPath = makeTempSocket();
+    cleanupSocket(socketPath);
+    const server = new ExecutionApiServer(async () => ({
+      status: "SUCCEEDED",
+      result: { data: "x".repeat(5 * 1024 * 1024) },
+    }), socketPath);
+    await server.start();
+
+    try {
+      const adapter = new CrabedenceExecutionAdapter(new CrabedenceClient(socketPath, 5000));
+      const outcome = await adapter.execute({
+        capabilityId: "test.mut",
+        arguments: {},
+        authority: auth,
+        executionClass: "MUTATION",
+      });
+
+      expect(outcome.status).toBe("UNKNOWN");
+    } finally {
+      await server.stop();
+      cleanupSocket(socketPath);
+    }
+  });
+
+  it("PROTOCOL: CRITICAL with malformed evidence returns UNKNOWN", async () => {
+    const socketPath = makeTempSocket();
+    cleanupSocket(socketPath);
+    const server = new ExecutionApiServer(async () => ({
+      status: "SUCCEEDED",
+      // A digest the wire ABI refuses: not a 64-character hex string.
+      evidence: { digest: "short" },
+    } as unknown as ExecutionApiResponse), socketPath);
+    await server.start();
+
+    try {
+      const adapter = new CrabedenceExecutionAdapter(new CrabedenceClient(socketPath, 1000));
+      const outcome = await adapter.execute({
+        capabilityId: "test.critical",
+        arguments: {},
+        authority: auth,
+        executionClass: "CRITICAL",
+      });
+
+      expect(outcome.status).toBe("UNKNOWN");
+    } finally {
+      await server.stop();
+      cleanupSocket(socketPath);
+    }
+  });
+
+  it("PROTOCOL: READ still throws instead of inventing UNKNOWN", async () => {
+    const socketPath = makeTempSocket();
+    cleanupSocket(socketPath);
+    const server = new ExecutionApiServer(async () => {
+      return { status: "BANANA" } as unknown as ExecutionApiResponse;
+    }, socketPath);
+    await server.start();
+
+    try {
+      const adapter = new CrabedenceExecutionAdapter(new CrabedenceClient(socketPath, 1000));
+      await expect(
+        adapter.execute({
+          capabilityId: "test.read",
+          arguments: {},
+          authority: auth,
+          executionClass: "READ",
+        }),
+      ).rejects.toThrow(TransportError);
+    } finally {
+      await server.stop();
+      cleanupSocket(socketPath);
+    }
+  });
+
+
+  it("canonical JSON: reordered arguments produce same digest", async () => {
+    const socketPath = makeTempSocket();
+    cleanupSocket(socketPath);
+
+    let callCount = 0;
+    const handler = async (_req: ExecutionApiRequest): Promise<ExecutionApiResponse> => {
+      callCount++;
+      return { status: "SUCCEEDED" };
+    };
+
+    const server = new ExecutionApiServer(handler, socketPath);
+    await server.start();
+
+    try {
+      const client = new CrabedenceClient(socketPath, 1000);
+      const adapter = new CrabedenceExecutionAdapter(client);
+
+      // First request with arguments in one order
+      await adapter.execute({
+        capabilityId: "email.send",
+        arguments: { to: "bob@example.com", body: "hello" },
+        authority: auth,
+        executionClass: "MUTATION",
+        idempotencyKey: "reorder_test",
+      });
+
+      // Second request with arguments in different order — same key
+      const outcome2 = await adapter.execute({
+        capabilityId: "email.send",
+        arguments: { body: "hello", to: "bob@example.com" },
+        authority: auth,
+        executionClass: "MUTATION",
+        idempotencyKey: "reorder_test",
+      });
+
+      // Canonical JSON means reordered keys produce the same digest.
+      // So this should return the existing SUCCEEDED, not CONFLICT.
+      expect(outcome2.status).toBe("SUCCEEDED");
+      expect(callCount).toBe(1); // Handler called once, not twice
+    } finally {
+      await server.stop();
+      cleanupSocket(socketPath);
+    }
+  });
+});
+
+// ─── Additional regression tests from build 4 audit ───────────────────
+
+describe("Adversarial: oversized response rejected", () => {
+  let socketPath: string;
+  let server: ExecutionApiServer;
+
+  beforeEach(() => {
+    socketPath = makeTempSocket();
+  });
+
+  afterEach(async () => {
+    if (server) await server.stop();
+    cleanupSocket(socketPath);
+  });
+
+  it("rejects response exceeding MAX_MESSAGE_BYTES", async () => {
+    // Create a server that returns a response larger than 4 MiB.
+    // The client should reject it as a PROTOCOL error.
+    const hugePayload = "x".repeat(5 * 1024 * 1024); // 5 MiB
+    const handler = async (): Promise<ExecutionApiResponse> => ({
+      status: "SUCCEEDED",
+      result: { data: hugePayload },
+    });
+
+    server = new ExecutionApiServer(handler, socketPath);
+    await server.start();
+
+    const client = new CrabedenceClient(socketPath, 5000);
+    await expect(
+      client.execute({
+        capability: "test.huge",
+        arguments: {},
+        authority: wireAuth,
+      }),
+    ).rejects.toThrow();
+  });
+});
+
+describe("Adversarial: socket permission check", () => {
+  it("server creates socket with 0600 permissions", async () => {
+    const { statSync } = await import("node:fs");
+    const socketPath = makeTempSocket();
+    cleanupSocket(socketPath);
+
+    const handler = async (): Promise<ExecutionApiResponse> => ({
+      status: "SUCCEEDED",
+    });
+    const srv = new ExecutionApiServer(handler, socketPath);
+    await srv.start();
+
+    try {
+      const stat = statSync(socketPath);
+      const mode = stat.mode & 0o777;
+      expect(mode).toBe(0o600);
+    } finally {
+      await srv.stop();
+      cleanupSocket(socketPath);
+    }
+  });
+
+  it("server creates directory with 0700 permissions", async () => {
+    const { statSync } = await import("node:fs");
+    const dir = mkdtempSync(join(tmpdir(), "nemo-perm-"));
+    const socketPath = join(dir, "subdir", "crabedence.sock");
+
+    const handler = async (): Promise<ExecutionApiResponse> => ({
+      status: "SUCCEEDED",
+    });
+    const srv = new ExecutionApiServer(handler, socketPath);
+    await srv.start();
+
+    try {
+      const stat = statSync(join(dir, "subdir"));
+      const mode = stat.mode & 0o777;
+      expect(mode).toBe(0o700);
+    } finally {
+      await srv.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("Adversarial: execution class absent at adapter", () => {
+  let socketPath: string;
+  let server: ExecutionApiServer;
+
+  beforeEach(() => {
+    socketPath = makeTempSocket();
+  });
+
+  afterEach(async () => {
+    if (server) await server.stop();
+    cleanupSocket(socketPath);
+  });
+
+  it("adapter does not invent execution class when absent", async () => {
+    // The adapter should only send execution_class if the caller provides it.
+    // When absent, the wire request should NOT contain execution_class.
+    let receivedClass: string | undefined;
+    const handler = async (req: ExecutionApiRequest): Promise<ExecutionApiResponse> => {
+      receivedClass = req.execution_class;
+      return { status: "SUCCEEDED" };
+    };
+
+    server = new ExecutionApiServer(handler, socketPath);
+    await server.start();
+
+    const client = new CrabedenceClient(socketPath, 5000);
+    const adapter = new CrabedenceExecutionAdapter(client);
+
+    // Execute without executionClass — adapter should not invent one
+    await adapter.execute({
+      capabilityId: "test.read",
+      arguments: {},
+      authority: auth,
+      // executionClass intentionally omitted
+    });
+
+    // The server should NOT have received an execution_class
+    expect(receivedClass).toBeUndefined();
+  });
+});
+
+describe("Adversarial: authority reference malformed", () => {
+  let socketPath: string;
+  let server: ExecutionApiServer;
+
+  beforeEach(() => {
+    socketPath = makeTempSocket();
+  });
+
+  afterEach(async () => {
+    if (server) await server.stop();
+    cleanupSocket(socketPath);
+  });
+
+  it("rejects empty authority_ref", async () => {
+    const handler = async (): Promise<ExecutionApiResponse> => ({
+      status: "SUCCEEDED",
+    });
+
+    server = new ExecutionApiServer(handler, socketPath);
+    await server.start();
+
+    const client = new CrabedenceClient(socketPath, 5000);
+
+    // authority_ref is empty string — server must DENY (not execute, not throw).
+    // DENIED is a terminal status returned as a resolved response.
+    const response = await client.execute({
+      capability: "test.read",
+      arguments: {},
+      authority: { principal: "alice", authority_ref: "" },
+    });
+    expect(response.status).toBe("DENIED");
+  });
+
+  it("rejects whitespace-only authority_ref", async () => {
+    const handler = async (): Promise<ExecutionApiResponse> => ({
+      status: "SUCCEEDED",
+    });
+
+    server = new ExecutionApiServer(handler, socketPath);
+    await server.start();
+
+    const client = new CrabedenceClient(socketPath, 5000);
+
+    const response = await client.execute({
+      capability: "test.read",
+      arguments: {},
+      authority: { principal: "alice", authority_ref: "   " },
+    });
+    expect(response.status).toBe("DENIED");
+  });
+});
+
+describe("Adversarial: non-ASCII evidence and provider fields", () => {
+  let socketPath: string;
+  let server: ExecutionApiServer;
+
+  beforeEach(() => {
+    socketPath = makeTempSocket();
+  });
+
+  afterEach(async () => {
+    if (server) await server.stop();
+    cleanupSocket(socketPath);
+  });
+
+  it("round-trips Unicode in provider and run_id fields", async () => {
+    const unicodeProvider = "提供者-🙂";
+    const unicodeRunId = "run-你好-1234";
+
+    const handler = async (): Promise<ExecutionApiResponse> => ({
+      status: "SUCCEEDED",
+      execution: {
+        provider: unicodeProvider,
+        run_id: unicodeRunId,
+      },
+    });
+
+    server = new ExecutionApiServer(handler, socketPath);
+    await server.start();
+
+    const client = new CrabedenceClient(socketPath, 5000);
+    const response = await client.execute({
+      capability: "test.read",
+      arguments: {},
+      authority: wireAuth,
+    });
+
+    expect(response.status).toBe("SUCCEEDED");
+    expect(response.execution?.provider).toBe(unicodeProvider);
+    expect(response.execution?.run_id).toBe(unicodeRunId);
+  });
+
+  it("round-trips Unicode in error field", async () => {
+    const unicodeError = "失败原因：连接超时 🚫";
+
+    const handler = async (): Promise<ExecutionApiResponse> => ({
+      status: "FAILED",
+      error: unicodeError,
+    });
+
+    server = new ExecutionApiServer(handler, socketPath);
+    await server.start();
+
+    const client = new CrabedenceClient(socketPath, 5000);
+    const response = await client.execute({
+      capability: "test.read",
+      arguments: {},
+      authority: wireAuth,
+    });
+
+    expect(response.status).toBe("FAILED");
+    expect(response.error).toBe(unicodeError);
+  });
+});

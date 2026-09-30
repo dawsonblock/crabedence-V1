@@ -35,7 +35,22 @@ jobs:
           expected="$GITHUB_REPOSITORY/.github/workflows/image-qualification-reaper.yml@refs/heads/$DEFAULT_BRANCH"
           [[ "$GITHUB_WORKFLOW_REF" == "$expected" ]]
           [[ "$(git rev-parse HEAD)" == "$GITHUB_WORKFLOW_SHA" ]]
+      - name: Require qualification configuration
+        id: qualification-config
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$CLOUDFLARE_ACCOUNT_ID" ]]; then
+            echo "Image qualification is not configured for this repository"
+            echo "(the CLOUDFLARE_ACCOUNT_ID repository variable is unset);"
+            echo "there are no qualification runs to recover."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
       - name: Discover, finalize, verify, and retire
+        if: steps.qualification-config.outputs.configured == 'true'
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -43,7 +58,7 @@ jobs:
           QUALIFICATION_PROOF_DIR: ${{ runner.temp }}/image-qualification-reaper-proof
         run: node scripts/image-qualification-control.mjs reap
       - name: Upload bounded reaper evidence
-        if: always()
+        if: always() && steps.qualification-config.outputs.configured == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: image-qualification-reaper-${{ github.run_id }}

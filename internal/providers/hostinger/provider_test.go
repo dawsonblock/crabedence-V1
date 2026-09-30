@@ -435,6 +435,29 @@ func TestAcquireRejectsInvalidGeneratedHostnameBeforePurchase(t *testing.T) {
 	}
 }
 
+func TestAcquireOverlongHostnamePrefixNamesThePrefix(t *testing.T) {
+	isolateHostingerTestState(t)
+	api := &fakeAPI{}
+	cfg := core.Config{Hostinger: core.HostingerConfig{
+		APIToken:       "token",
+		ItemID:         "hostingercom-vps-kvm2-usd-1m",
+		TemplateID:     "2",
+		DataCenterID:   "3",
+		HostnamePrefix: strings.Repeat("a", 29),
+		AllowPurchase:  true,
+	}}
+	backend := NewLeaseBackend(Provider{}.Spec(), cfg, core.Runtime{Stderr: io.Discard}).(*leaseBackend)
+	backend.client = api
+
+	_, err := backend.Acquire(context.Background(), core.AcquireRequest{RequestedSlug: "test"})
+	if err == nil || !strings.Contains(err.Error(), "shorten the configured hostname prefix") {
+		t.Fatalf("Acquire err=%v", err)
+	}
+	if api.purchaseCalls != 0 {
+		t.Fatal("overlong hostname prefix reached purchase")
+	}
+}
+
 func TestAcquireRequiresUsableDefaultPaymentMethod(t *testing.T) {
 	api := &fakeAPI{paymentMethods: []hostingerPaymentMethod{}}
 	cfg := core.Config{Hostinger: core.HostingerConfig{

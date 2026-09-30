@@ -9,10 +9,44 @@ import (
 	"testing"
 )
 
+func TestNewLeaseIDUsesCanonicalFormatAndIsUnique(t *testing.T) {
+	first := newLeaseID()
+	second := newLeaseID()
+	pattern := regexp.MustCompile(`^cbx_[a-f0-9]{32}$`)
+	if !pattern.MatchString(first) || !pattern.MatchString(second) {
+		t.Fatalf("lease IDs must use canonical format: first=%q second=%q", first, second)
+	}
+	if !isCanonicalLeaseID(first) || !isCanonicalLeaseID(second) {
+		t.Fatalf("minted lease IDs must be canonical: first=%q second=%q", first, second)
+	}
+	if first == second {
+		t.Fatalf("lease IDs must be unique: %q", first)
+	}
+}
+
+func TestCanonicalLeaseIDAcceptsBothWidths(t *testing.T) {
+	for _, value := range []string{"cbx_abcdef123456", "cbx_" + strings.Repeat("a", 32)} {
+		if !isCanonicalLeaseID(value) {
+			t.Fatalf("isCanonicalLeaseID(%q)=false, want true", value)
+		}
+	}
+	for _, value := range []string{
+		"cbx_abcdef12345",
+		"cbx_" + strings.Repeat("a", 31),
+		"cbx_" + strings.Repeat("a", 33),
+		"cbx_ABCDEF123456",
+		"blue-lobster",
+	} {
+		if isCanonicalLeaseID(value) {
+			t.Fatalf("isCanonicalLeaseID(%q)=true, want false", value)
+		}
+	}
+}
+
 func TestNewRunIDUsesCanonicalFormatAndIsUnique(t *testing.T) {
 	first := newRunID()
 	second := newRunID()
-	pattern := regexp.MustCompile(`^run_[a-f0-9]{12}$`)
+	pattern := regexp.MustCompile(`^run_[a-f0-9]{32}$`)
 	if !pattern.MatchString(first) || !pattern.MatchString(second) {
 		t.Fatalf("run IDs must use canonical format: first=%q second=%q", first, second)
 	}

@@ -22,7 +22,7 @@ import {
   type ProviderProvisioningCleanupClaim,
 } from "./provider-provisioning";
 import { ProvisioningAttemptHistory } from "./provisioning-attempts";
-import { leaseProviderName } from "./slug";
+import { isCanonicalLeaseID, leaseProviderName } from "./slug";
 import type {
   Env,
   LeaseImageIdentity,
@@ -1435,7 +1435,7 @@ function canonicalGCPMachine(machine: ProviderMachine): boolean {
   const leaseID = machine.labels["lease"] ?? "";
   const slug = machine.labels["slug"] ?? "";
   return (
-    /^cbx_[a-f0-9]{12}$/.test(leaseID) &&
+    isCanonicalLeaseID(leaseID) &&
     slug.length > 0 &&
     machine.name === leaseProviderName(leaseID, slug) &&
     machine.labels["crabbox"] === "true" &&
