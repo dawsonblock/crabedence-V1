@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.53.3 - 2026-09-29
 
 ### NEMO integration — credential isolation, outcome conformance, and release identity
 
@@ -44,7 +44,7 @@
 
 ### Qualification — deterministic lease-heartbeat live test
 
-- The `internal/execution` live lease-heartbeat test now synchronizes on durable state instead of a fixed 400ms sleep: it waits until the original 300ms deadline has passed and the heartbeat has provably renewed the lease (a `LEASE_RENEWED` effect event) before Finalize runs. That removes the sub-second wall-clock race that failed the qualification evidence gate once under CI load.
+- The `internal/execution` live lease-heartbeat test now synchronizes on durable state instead of a fixed 400ms sleep: it waits until the original 300ms deadline has passed and the heartbeat has provably renewed the lease (a `LEASE_RENEWED` effect event) before Finalize runs. That removes the sub-second wall-clock race that failed the qualification evidence gate once under CI load. [PR 23](https://github.com/dawsonblock/crabedence-V1/pull/23)
 
 ## 0.53.2 - 2026-09-29
 
