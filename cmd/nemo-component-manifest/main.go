@@ -28,6 +28,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -65,7 +66,11 @@ type component struct {
 	SHA256 string `json:"sha256"`
 }
 
-// componentManifest is the distribution's bound identity.
+// componentManifest is the distribution's bound identity — the release-root
+// manifest: one canonical record of what the release is (versions, platform,
+// toolchain, qualification identity) and what it carries (every component by
+// SHA-256). Its own digest, in the .sha256 sidecar, is the release-root
+// identity a signature binds and a receipt can cite.
 type componentManifest struct {
 	// Name is the distribution's name.
 	Name string `json:"name"`
@@ -77,8 +82,25 @@ type componentManifest struct {
 	NemoRuntimeSHA256 string `json:"nemo_runtime_sha256"`
 	// CapabilityRegistrySHA256 is the capability policy the runtime serves.
 	CapabilityRegistrySHA256 string `json:"capability_registry_sha256"`
+	// Platform is the distribution's target ("linux_amd64", "darwin_arm64").
+	Platform string `json:"platform"`
+	// Build records the toolchain that produced it — evidence, not a secret.
+	Build buildInfo `json:"build"`
+	// Qualification names the gates this artifact is qualified by: the suite
+	// identities whose pass is part of what this release claims to be.
+	Qualification []string `json:"qualification"`
 	// Components are the bound artifacts, in the distribution's layout.
 	Components []component `json:"components"`
+}
+
+// buildInfo is the toolchain evidence the release records.
+type buildInfo struct {
+	// GoVersion is the Go toolchain's reported version.
+	GoVersion string `json:"go_version,omitempty"`
+	// RustVersion is the Rust toolchain's reported version.
+	RustVersion string `json:"rust_version,omitempty"`
+	// Profile is the cargo build profile the Rust components were built with.
+	Profile string `json:"profile,omitempty"`
 }
 
 // transferDeclaration is the subset of the transfer manifest this tool reads.
@@ -102,6 +124,10 @@ func main() {
 	root := flag.String("root", defaultRoot, "the assembled distribution root")
 	transferPath := flag.String("transfer-manifest", "", "the transfer manifest the distribution carries (default <root>/manifests/nemo-transfer-manifest.json)")
 	crabboxVersion := flag.String("crabbox-version", "", "the Crabbox version the CLI binary came from (required unless -verify)")
+	platform := flag.String("platform", runtime.GOOS+"_"+runtime.GOARCH, "the distribution's target platform (goos_goarch)")
+	rustVersion := flag.String("rust-version", "", "the Rust toolchain version that built the components (evidence)")
+	profile := flag.String("profile", "", "the cargo profile the Rust components were built with (evidence)")
+	qualification := flag.String("qualification", "", "comma-separated gate identities this distribution is qualified by")
 	verify := flag.Bool("verify", false, "verify the existing component manifest instead of writing it")
 	flag.Parse()
 
@@ -120,16 +146,45 @@ func main() {
 		fmt.Fprintln(os.Stderr, "nemo-component-manifest: -crabbox-version is required (read it from VERSION)")
 		os.Exit(2)
 	}
-	if err := writeManifest(*root, *transferPath, *crabboxVersion); err != nil {
+	meta := metadata{
+		Platform: *platform,
+		Build: buildInfo{
+			GoVersion:   runtime.Version(),
+			RustVersion: *rustVersion,
+			Profile:     *profile,
+		},
+		Qualification: splitList(*qualification),
+	}
+	if err := writeManifest(*root, *transferPath, *crabboxVersion, meta); err != nil {
 		fmt.Fprintf(os.Stderr, "nemo-component-manifest: %v\n", err)
 		os.Exit(1)
 	}
 }
 
+// metadata is the release-root identity that cannot be recomputed from the
+// distribution's bytes: which platform it targets, which toolchain produced
+// it, and which gates qualify it.
+type metadata struct {
+	Platform      string
+	Build         buildInfo
+	Qualification []string
+}
+
+// splitList parses a comma-separated list into trimmed, non-empty items.
+func splitList(raw string) []string {
+	var items []string
+	for _, item := range strings.Split(raw, ",") {
+		if trimmed := strings.TrimSpace(item); trimmed != "" {
+			items = append(items, trimmed)
+		}
+	}
+	return items
+}
+
 // writeManifest binds the distribution and writes the manifest and its digest
 // sidecar.
-func writeManifest(root, transferPath, crabboxVersion string) error {
-	manifest, err := buildManifest(root, transferPath, crabboxVersion)
+func writeManifest(root, transferPath, crabboxVersion string, meta metadata) error {
+	manifest, err := buildManifest(root, transferPath, crabboxVersion, meta)
 	if err != nil {
 		return err
 	}
@@ -153,9 +208,11 @@ func writeManifest(root, transferPath, crabboxVersion string) error {
 }
 
 // verifyManifest recomputes the distribution's identity and compares it with
-// the manifest it carries. The Crabbox version cannot be recomputed from the
-// distribution — it names the source release — so it is carried over, not
-// checked.
+// the manifest it carries. The source-level fields — Crabbox version,
+// platform, toolchain, qualification — cannot be recomputed from the
+// distribution's bytes, so they are carried over; every file's content is
+// checked, and the set must be exact: a file the manifest does not declare is
+// a failure, not an oversight the manifest never claimed.
 func verifyManifest(root, transferPath string) error {
 	path := filepath.Join(root, "manifests", "component-manifest.json")
 	raw, err := os.ReadFile(path)
@@ -166,12 +223,35 @@ func verifyManifest(root, transferPath string) error {
 	if err := json.Unmarshal(raw, &declared); err != nil {
 		return fmt.Errorf("%s is not a valid component manifest: %w", path, err)
 	}
-	computed, err := buildManifest(root, transferPath, declared.CrabboxVersion)
+	computed, err := buildManifest(root, transferPath, declared.CrabboxVersion, metadata{
+		Platform:      declared.Platform,
+		Build:         declared.Build,
+		Qualification: declared.Qualification,
+	})
 	if err != nil {
 		return err
 	}
 
 	var mismatches []string
+	// The digest sidecar is the release-root identity: it must say what the
+	// manifest actually hashes to, not just exist.
+	sidecarRaw, err := os.ReadFile(filepath.Join(root, "manifests", "component-manifest.sha256"))
+	if err != nil {
+		mismatches = append(mismatches, fmt.Sprintf("component-manifest.sha256: %v", err))
+	} else {
+		manifestDigest, err := digestFile(path)
+		if err != nil {
+			return err
+		}
+		if declared := strings.TrimSpace(string(sidecarRaw)); declared != manifestDigest {
+			mismatches = append(mismatches, fmt.Sprintf("component-manifest.sha256: declares %s, manifest digests to %s", declared, manifestDigest))
+		}
+	}
+	// Exhaustiveness: every regular file in the distribution is either a
+	// declared component or one of the manifest artifacts themselves.
+	if err := checkExhaustive(root, declared.Components); err != nil {
+		mismatches = append(mismatches, err.Error())
+	}
 	if declared.Name != computed.Name {
 		mismatches = append(mismatches, fmt.Sprintf("name: declared %q, computed %q", declared.Name, computed.Name))
 	}
@@ -201,8 +281,50 @@ func verifyManifest(root, transferPath string) error {
 	return nil
 }
 
+// checkExhaustive fails when the distribution carries a file the manifest
+// does not declare — the manifest artifacts themselves (the JSON and its
+// .sha256 sidecar) are the only exempt files, since a declaration inside the
+// tree it describes could never name them without self-reference.
+func checkExhaustive(root string, components []component) error {
+	declared := make(map[string]bool, len(components))
+	for _, c := range components {
+		declared[c.Path] = true
+	}
+	// The manifest's own artifacts: written after the component list is
+	// computed, so no manifest could ever name them.
+	exempt := map[string]bool{
+		"manifests/component-manifest.json":   true,
+		"manifests/component-manifest.sha256": true,
+	}
+	var undeclared []string
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		if !declared[rel] && !exempt[rel] {
+			undeclared = append(undeclared, rel)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if len(undeclared) > 0 {
+		return fmt.Errorf("the distribution carries files the manifest does not declare: %s", strings.Join(undeclared, ", "))
+	}
+	return nil
+}
+
 // buildManifest computes the distribution's identity from what it carries.
-func buildManifest(root, transferPath, crabboxVersion string) (componentManifest, error) {
+func buildManifest(root, transferPath, crabboxVersion string, meta metadata) (componentManifest, error) {
 	raw, err := os.ReadFile(transferPath)
 	if err != nil {
 		return componentManifest{}, err
@@ -217,6 +339,9 @@ func buildManifest(root, transferPath, crabboxVersion string) (componentManifest
 		CrabboxVersion:     crabboxVersion,
 		NemoRuntimeVersion: transfer.RuntimeVersion,
 		NemoRuntimeSHA256:  transfer.ShippedTreeSHA256,
+		Platform:           meta.Platform,
+		Build:              meta.Build,
+		Qualification:      meta.Qualification,
 	}
 
 	// The CLI is the one binary the transfer manifest does not declare: it is

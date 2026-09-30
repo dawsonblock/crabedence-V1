@@ -45,7 +45,12 @@ store="$work_dir/crabedence.db"
 socket="$work_dir/crabedence/execution.sock"
 
 printf 'building the CLI…\n'
-go build -o "$work_dir/crabbox" ./cmd/crabbox
+if [[ -n "${NEMO_E2E_CRABBOX:-}" ]]; then
+  crabbox_bin="$NEMO_E2E_CRABBOX"
+else
+  go build -o "$work_dir/crabbox" ./cmd/crabbox
+  crabbox_bin="$work_dir/crabbox"
+fi
 
 # Issue a grant that lapses shortly. The tool reads the target from the
 # environment, exactly as the service does.
@@ -60,7 +65,7 @@ CRABEDENCE_STORE_PATH="$store" go run ./cmd/issue-grant \
 
 printf 'starting the service…\n'
 CRABEDENCE_STORE_PATH="$store" CRABEDENCE_STORE_BACKEND=sqlite \
-  XDG_RUNTIME_DIR="$work_dir" "$work_dir/crabbox" serve-exec >"$work_dir/serve.log" 2>&1 &
+  XDG_RUNTIME_DIR="$work_dir" "$crabbox_bin" serve-exec >"$work_dir/serve.log" 2>&1 &
 service_pid=$!
 
 for _ in $(seq 1 40); do

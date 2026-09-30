@@ -38,7 +38,12 @@ store="$work_dir/crabedence.db"
 socket="$work_dir/crabedence/execution.sock"
 
 printf 'building the CLI and the qualification provider…\n'
-go build -o "$work_dir/crabbox" ./cmd/crabbox
+if [[ -n "${NEMO_E2E_CRABBOX:-}" ]]; then
+  crabbox_bin="$NEMO_E2E_CRABBOX"
+else
+  go build -o "$work_dir/crabbox" ./cmd/crabbox
+  crabbox_bin="$work_dir/crabbox"
+fi
 go build -o "$work_dir/qual-provider" ./cmd/qual-provider
 
 printf 'starting the qualification provider…\n'
@@ -69,7 +74,7 @@ CRABEDENCE_STORE_PATH="$store" go run ./cmd/issue-grant \
 printf 'starting the service with the qualification extension…\n'
 CRABEDENCE_STORE_PATH="$store" CRABEDENCE_STORE_BACKEND=sqlite \
   CRABEDENCE_QUAL_PROVIDER_URL="$provider_url" \
-  XDG_RUNTIME_DIR="$work_dir" "$work_dir/crabbox" serve-exec \
+  XDG_RUNTIME_DIR="$work_dir" "$crabbox_bin" serve-exec \
   >"$work_dir/serve.log" 2>&1 &
 service_pid=$!
 

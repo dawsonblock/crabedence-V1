@@ -544,6 +544,16 @@ fn run_plugin_mode(options: &Options, artifact: &Path) -> ExitCode {
                 return ExitCode::from(2);
             }
         };
+    // The host-binary pin resolves here too: a qualified distribution sets
+    // NEMO_RELAY_PLUGIN_HOST_SHA256 to the release manifest's declared digest,
+    // so wherever the host resolves from, its content is bound to the release.
+    let host_sha256_pin = match plugin_host::host_sha256_pin() {
+        Ok(pin) => pin,
+        Err(message) => {
+            eprintln!("nemo-crabedence-runtime: {message}");
+            return ExitCode::from(2);
+        }
+    };
     let plugin_options = plugin_host::PluginOptions {
         artifact: artifact.to_path_buf(),
         plugin_id: plugin_id.to_string(),
@@ -556,6 +566,7 @@ fn run_plugin_mode(options: &Options, artifact: &Path) -> ExitCode {
         arguments: options.arguments.clone(),
         runtime_binding_digest: binding,
         isolation,
+        host_sha256_pin: host_sha256_pin.clone(),
     };
     match plugin_host::host(&plugin_options) {
         Ok(report) => {
@@ -638,6 +649,13 @@ async fn dispatch_managed(
                     return ExitCode::from(2);
                 }
             };
+            let host_sha256_pin = match plugin_host::host_sha256_pin() {
+                Ok(pin) => pin,
+                Err(message) => {
+                    eprintln!("nemo-crabedence-runtime: {message}");
+                    return ExitCode::from(2);
+                }
+            };
             match plugin_host::open(&plugin_host::PluginOptions {
                 artifact: artifact.clone(),
                 plugin_id: options.plugin_id.clone().unwrap_or_default(),
@@ -650,6 +668,7 @@ async fn dispatch_managed(
                 arguments: Value::Null,
                 runtime_binding_digest: identity.runtime_binding_digest.clone(),
                 isolation,
+                host_sha256_pin,
             })
             .await
             {
@@ -807,6 +826,11 @@ fn report(
     let plugin_evidence = session.map(|session| {
         json!({
             "process_id": session.process_id,
+            "host": {
+                "executable": session.host.executable,
+                "sha256": session.host.sha256,
+                "pinned": session.host.pinned,
+            },
             "descriptor": session.descriptor,
         })
     });

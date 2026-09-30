@@ -43,12 +43,25 @@ snapshot="$work_dir/crabedence/capabilities.json"
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 pass() { printf 'ok: %s\n' "$*"; }
 
-printf 'building the CLI…\n'
-go build -o "$work_dir/crabbox" ./cmd/crabbox
+# NEMO_E2E_CRABBOX / NEMO_E2E_RUNTIME / NEMO_E2E_PLUGIN_HOST point the suite at
+# already-built binaries — the installed-artifact qualification uses them so
+# the bytes under test are the ones a user unpacks. Unset means build from the
+# workspace.
+if [[ -n "${NEMO_E2E_CRABBOX:-}" ]]; then
+  crabbox_bin="$NEMO_E2E_CRABBOX"
+else
+  printf 'building the CLI…\n'
+  go build -o "$work_dir/crabbox" ./cmd/crabbox
+  crabbox_bin="$work_dir/crabbox"
+fi
 
-printf 'building the runtime instance…\n'
-(cd runtimes/nemo-relay && cargo build -p nemo-crabedence-runtime)
-runtime_bin="runtimes/nemo-relay/target/debug/nemo-crabedence-runtime"
+if [[ -n "${NEMO_E2E_RUNTIME:-}" ]]; then
+  runtime_bin="$NEMO_E2E_RUNTIME"
+else
+  printf 'building the runtime instance…\n'
+  (cd runtimes/nemo-relay && cargo build -p nemo-crabedence-runtime)
+  runtime_bin="runtimes/nemo-relay/target/debug/nemo-crabedence-runtime"
+fi
 
 printf 'issuing a grant for the runtime principal…\n'
 CRABEDENCE_STORE_PATH="$store" go run ./cmd/issue-grant \
@@ -58,7 +71,7 @@ CRABEDENCE_STORE_PATH="$store" go run ./cmd/issue-grant \
 
 printf 'starting the service…\n'
 CRABEDENCE_STORE_PATH="$store" CRABEDENCE_STORE_BACKEND=sqlite \
-  XDG_RUNTIME_DIR="$work_dir" "$work_dir/crabbox" serve-exec \
+  XDG_RUNTIME_DIR="$work_dir" "$crabbox_bin" serve-exec \
   >"$work_dir/serve.log" 2>&1 &
 service_pid=$!
 for _ in $(seq 1 60); do
@@ -143,15 +156,19 @@ pass "unregistered capability refused before routing"
 # middleware executes in the child. The frozen model: plugins are middleware
 # only — they may inspect, deny, or rewrite arguments; the capability, class,
 # route, authority, and identity stay the runtime's.
-printf 'building the plugin host and the fixture plugin…\n'
+host_bin="${NEMO_E2E_PLUGIN_HOST:-runtimes/nemo-relay/target/debug/nemo-plugin-host}"
+printf 'building the fixture plugin%s…\n' \
+  "$([[ -n "${NEMO_E2E_PLUGIN_HOST:-}" ]] && printf ' (host supplied)' || printf ' and the plugin host')"
 (
   cd runtimes/nemo-relay
-  cargo build --quiet -p nemo-relay-native-loader
+  [[ -n "${NEMO_E2E_PLUGIN_HOST:-}" ]] || cargo build --quiet -p nemo-relay-native-loader
+  # The fixture is qualification tooling — the loaded plugin under test — so
+  # it always builds from the workspace; the host executing it is the shipped
+  # binary when NEMO_E2E_PLUGIN_HOST is set.
   cargo build --quiet --locked \
     --manifest-path crates/core/tests/fixtures/native_intercept_plugin/Cargo.toml \
     --target-dir target/test-plugin-fixtures
 )
-host_bin="runtimes/nemo-relay/target/debug/nemo-plugin-host"
 case "$(uname -s 2>/dev/null || true)" in
   Darwin) fixture_name="libnemo_relay_native_intercept_fixture.dylib" ;;
   *) fixture_name="libnemo_relay_native_intercept_fixture.so" ;;
@@ -290,6 +307,62 @@ printf '%s' "$out" | jq -e '.status=="FAILED" and .code=="DISPATCH_BYPASSED"' >/
   || fail "a plugin-replaced dispatch must fail closed: $out"
 pass "middleware bypass of the routed dispatch refused"
 
+# ─── Plugin-host binary binding ─────────────────────────────────────────────
+#
+# The distribution's component manifest declares the host's SHA-256, and a
+# qualified deployment pins it through NEMO_RELAY_PLUGIN_HOST_SHA256. The
+# digest is computed over the executable the supervisor will actually spawn —
+# the override cannot substitute a different host than the one it named.
+
+host_sha256() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    sha256sum "$1" | awk '{print $1}'
+  fi
+}
+pinned_host_digest="$(host_sha256 "$host_bin")"
+
+# 12. The pinned host runs, and its identity is in the evidence.
+out="$(NEMO_RELAY_PLUGIN_HOST_SHA256="$pinned_host_digest" run_runtime \
+  --plugin "$plugin_dir" --plugin-id fixture_intercept \
+  --component fixture_intercept --capability system.echo \
+  --arguments '{"probe":"pinned-host"}')" \
+  || fail "a correctly pinned host must run: $out"
+printf '%s' "$out" | jq -e --arg d "$pinned_host_digest" '
+    .status=="SUCCEEDED"
+    and .plugin.host.pinned==true
+    and .plugin.host.sha256==$d
+    and (.plugin.host.executable | endswith("nemo-plugin-host"))' >/dev/null \
+  || fail "the pinned host's identity is not in the evidence: $out"
+pass "the pinned plugin host ran, its digest recorded in evidence"
+
+# 13. A pin the resolved binary does not satisfy fails the session — the
+#     override chose a host, and the pin proves it is not the released one.
+set +e
+out="$(NEMO_RELAY_PLUGIN_HOST_SHA256="$(printf '0%.0s' $(seq 64))" run_runtime \
+  --plugin "$plugin_dir" --plugin-id fixture_intercept \
+  --component fixture_intercept --capability system.echo \
+  --arguments '{"probe":"wrong-pin"}' 2>&1)"
+status=$?
+set -e
+[[ $status -ne 0 ]] || fail "a wrong host pin must fail the invocation: $out"
+printf '%s' "$out" | grep -q 'NEMO_RELAY_PLUGIN_HOST_SHA256' \
+  || fail "the refusal must name the pin: $out"
+pass "a host digest the pin does not declare fails closed"
+
+# 14. A malformed pin is a deployment error, not a disabled pin.
+set +e
+out="$(NEMO_RELAY_PLUGIN_HOST_SHA256="not-a-digest" run_runtime \
+  --plugin "$plugin_dir" --plugin-id fixture_intercept \
+  --component fixture_intercept --capability system.echo \
+  --arguments '{"probe":"bad-pin"}' 2>&1)"
+status=$?
+set -e
+[[ $status -ne 0 && "$out" == *"NEMO_RELAY_PLUGIN_HOST_SHA256"* ]] \
+  || fail "a malformed pin must name the variable: $out"
+pass "a malformed host pin fails startup"
+
 # ─── Fail-closed plugin composition ─────────────────────────────────────────
 #
 # A declared plugin is required middleware — for the integration RC there is
@@ -297,7 +370,7 @@ pass "middleware bypass of the routed dispatch refused"
 # cannot load, the component cannot activate, or the middleware dies or hangs
 # mid-call, the invocation fails; it never continues unmediated.
 
-# 12. Missing host binary: the deployment names a host that does not exist.
+# 15. Missing host binary: the deployment names a host that does not exist.
 set +e
 out="$(NEMO_RELAY_PLUGIN_HOST="$work_dir/no-such-host" run_runtime \
   --plugin "$plugin_dir" --plugin-id fixture_intercept \
@@ -310,7 +383,7 @@ printf '%s' "$out" | grep -qi 'host' \
   || fail "the refusal must name the host: $out"
 pass "missing plugin host fails the invocation"
 
-# 13. Invalid artifact: a manifest that names a library the deployment does
+# 16. Invalid artifact: a manifest that names a library the deployment does
 #     not ship.
 bad_plugin_dir="$work_dir/plugin-bad"
 mkdir -p "$bad_plugin_dir"
@@ -325,7 +398,7 @@ set -e
 [[ $status -ne 0 ]] || fail "an unloadable artifact must fail the invocation: $out"
 pass "invalid plugin artifact fails the invocation"
 
-# 14. Activation failure: the plugin is asked for a component it does not have.
+# 17. Activation failure: the plugin is asked for a component it does not have.
 set +e
 out="$(run_runtime --plugin "$plugin_dir" --plugin-id fixture_intercept \
   --component no.such.component --capability system.echo \
@@ -335,7 +408,7 @@ set -e
 [[ $status -ne 0 ]] || fail "an unactivatable component must fail the invocation: $out"
 pass "activation failure fails the invocation"
 
-# 15. Host death inside its own middleware: the child aborts mid-call. The
+# 18. Host death inside its own middleware: the child aborts mid-call. The
 #     invocation fails — a dead plugin is a failed call, never a chain that
 #     quietly continued without it.
 set +e
@@ -350,7 +423,7 @@ printf '%s' "$out" | jq -e '.status=="FAILED" and (.attempts | length) == 0' >/d
   || fail "a crashed host must not produce a dispatch: $out"
 pass "plugin host death mid-call fails the invocation"
 
-# 16. Middleware that runs the continuation and *then* fails: the dispatch
+# 19. Middleware that runs the continuation and *then* fails: the dispatch
 #     verdict stays authoritative — a committed effect is not relabeled by a
 #     middleware error, and the report still records that the chain erred.
 counter_fail_after="runtime-e2e-failafter-$$"
@@ -368,7 +441,7 @@ printf '%s' "$out" | jq -e '
   || fail "the dispatch verdict must survive a post-dispatch middleware failure: $out"
 pass "post-dispatch middleware failure cannot relabel a committed effect"
 
-# 17. Concurrent continuation: the ABI lets an intercept fan its continuation
+# 20. Concurrent continuation: the ABI lets an intercept fan its continuation
 #     out — each call is a real dispatch attempt under the same logical key,
 #     and the durable record turns the second into a replay. Two attempts, one
 #     effect.
@@ -387,7 +460,7 @@ printf '%s' "$out" | jq -e '
   || fail "two attempts under one logical key must produce one effect: $out"
 pass "concurrent continuation: two attempts, one durable effect"
 
-# 18. Middleware timeout: a plugin that holds the call past the managed
+# 21. Middleware timeout: a plugin that holds the call past the managed
 #     deadline fails the invocation — the deadline is the deployment's bound
 #     on how long middleware may hold a call.
 set +e
@@ -403,7 +476,7 @@ printf '%s' "$out" | jq -e '.status=="FAILED" and (.attempts | length) == 0' >/d
   || fail "a timed-out chain must not dispatch: $out"
 pass "middleware timeout fails the invocation before dispatch"
 
-# 19. Malformed deployment configuration fails startup, like every other
+# 22. Malformed deployment configuration fails startup, like every other
 #     env-resolved setting in this composition.
 set +e
 out="$(NEMO_RELAY_MANAGED_CALL_BUDGET_MS=soon run_runtime \
@@ -416,4 +489,4 @@ set -e
   || fail "a malformed call budget must name the variable: $out"
 pass "malformed managed-call budget fails startup"
 
-printf 'runtime e2e: twenty checks passed\n'
+printf 'runtime e2e: twenty-three checks passed\n'

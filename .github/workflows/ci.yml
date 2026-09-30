@@ -209,9 +209,11 @@ jobs:
 
       # The distribution must assemble and its component manifest must bind
       # every component it carries: the CLI, the runtime, the plugin host, the
-      # capability schema, the registry envelope, and the transfer manifest.
-      # Debug binaries keep the job fast; the assembly and the binding are the
-      # same either way.
+      # capability schema, the registry envelope, and the transfer manifest —
+      # in a per-target root named nemo-control_<version>_<os>_<arch>, verified
+      # exhaustively (an undeclared file is a failure, and the .sha256 sidecar
+      # must say what the manifest digests to). Debug binaries keep the job
+      # fast; the assembly and the binding are the same either way.
       - name: Assemble the distribution and verify its component manifest
         env:
           NEMO_DIST_PROFILE: debug

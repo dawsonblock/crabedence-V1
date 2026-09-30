@@ -43,7 +43,7 @@ func TestComponentManifestBindsTheShippingSet(t *testing.T) {
 	root := distributionTree(t)
 	transfer := filepath.Join(root, "manifests", "nemo-transfer-manifest.json")
 
-	manifest, err := buildManifest(root, transfer, "9.9.9")
+	manifest, err := buildManifest(root, transfer, "9.9.9", metadata{})
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestComponentManifestFailsClosedOnMissingComponents(t *testing.T) {
 			if err := os.Remove(filepath.Join(root, tc.remove)); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := buildManifest(root, transfer, "9.9.9"); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+			if _, err := buildManifest(root, transfer, "9.9.9", metadata{}); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 				t.Fatalf("error = %v, want substring %q", err, tc.wantErr)
 			}
 		})
@@ -100,7 +100,7 @@ func TestComponentManifestFailsClosedOnMissingComponents(t *testing.T) {
 func TestComponentManifestVerify(t *testing.T) {
 	root := distributionTree(t)
 	transfer := filepath.Join(root, "manifests", "nemo-transfer-manifest.json")
-	if err := writeManifest(root, transfer, "9.9.9"); err != nil {
+	if err := writeManifest(root, transfer, "9.9.9", metadata{}); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 	if err := verifyManifest(root, transfer); err != nil {
@@ -120,11 +120,94 @@ func TestComponentManifestVerify(t *testing.T) {
 	}
 }
 
+func TestComponentManifestRejectsUndeclaredFiles(t *testing.T) {
+	root := distributionTree(t)
+	transfer := filepath.Join(root, "manifests", "nemo-transfer-manifest.json")
+	if err := writeManifest(root, transfer, "9.9.9", metadata{}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := verifyManifest(root, transfer); err != nil {
+		t.Fatalf("a clean distribution must verify: %v", err)
+	}
+
+	// An undeclared file is a failure that names it — the manifest must be
+	// exhaustive, not merely accurate for what it lists.
+	writeFile(t, filepath.Join(root, "bin", "stowaway"), "not-declared\n")
+	err := verifyManifest(root, transfer)
+	if err == nil {
+		t.Fatal("an undeclared file must fail verification")
+	}
+	if !strings.Contains(err.Error(), "bin/stowaway") {
+		t.Fatalf("the failure must name the undeclared file: %v", err)
+	}
+}
+
+func TestComponentManifestVerifiesTheDigestSidecar(t *testing.T) {
+	root := distributionTree(t)
+	transfer := filepath.Join(root, "manifests", "nemo-transfer-manifest.json")
+	if err := writeManifest(root, transfer, "9.9.9", metadata{}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := verifyManifest(root, transfer); err != nil {
+		t.Fatalf("a clean distribution must verify: %v", err)
+	}
+
+	// The release-root identity is the sidecar's claim about the manifest's
+	// digest; a sidecar that says anything else is not the identity.
+	writeFile(t, filepath.Join(root, "manifests", "component-manifest.sha256"), strings.Repeat("0", 64)+"\n")
+	err := verifyManifest(root, transfer)
+	if err == nil {
+		t.Fatal("a wrong sidecar digest must fail verification")
+	}
+	if !strings.Contains(err.Error(), "component-manifest.sha256") {
+		t.Fatalf("the failure must name the sidecar: %v", err)
+	}
+
+	// A missing sidecar is the same class of failure.
+	if err := os.Remove(filepath.Join(root, "manifests", "component-manifest.sha256")); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyManifest(root, transfer); err == nil {
+		t.Fatal("a missing sidecar must fail verification")
+	}
+}
+
+func TestComponentManifestCarriesTheReleaseIdentity(t *testing.T) {
+	root := distributionTree(t)
+	transfer := filepath.Join(root, "manifests", "nemo-transfer-manifest.json")
+	meta := metadata{
+		Platform:      "linux_arm64",
+		Build:         buildInfo{GoVersion: "go-test", RustVersion: "rustc-test", Profile: "release"},
+		Qualification: []string{"runtime-e2e", "critical-path"},
+	}
+	manifest, err := buildManifest(root, transfer, "9.9.9", meta)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if manifest.Platform != "linux_arm64" {
+		t.Fatalf("platform = %q", manifest.Platform)
+	}
+	if manifest.Build.RustVersion != "rustc-test" || manifest.Build.Profile != "release" {
+		t.Fatalf("build metadata: %+v", manifest.Build)
+	}
+	if len(manifest.Qualification) != 2 {
+		t.Fatalf("qualification: %+v", manifest.Qualification)
+	}
+
+	// And the identity round-trips through write+verify.
+	if err := writeManifest(root, transfer, "9.9.9", meta); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := verifyManifest(root, transfer); err != nil {
+		t.Fatalf("the release identity must survive verification: %v", err)
+	}
+}
+
 func TestComponentManifestRefusesAnEmptyShippingSet(t *testing.T) {
 	root := distributionTree(t)
 	transfer := filepath.Join(root, "manifests", "nemo-transfer-manifest.json")
 	writeFile(t, transfer, `{"runtime_version":"1.2.3","shipped_tree_sha256":"d","binaries":[{"role":"qualification","package":"p","binary":"q","source":"s"}]}`+"\n")
-	if _, err := buildManifest(root, transfer, "9.9.9"); err == nil || !strings.Contains(err.Error(), "no shipping binaries") {
+	if _, err := buildManifest(root, transfer, "9.9.9", metadata{}); err == nil || !strings.Contains(err.Error(), "no shipping binaries") {
 		t.Fatalf("error = %v, want a refusal for an empty shipping set", err)
 	}
 }

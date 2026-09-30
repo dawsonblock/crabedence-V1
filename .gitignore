@@ -56,3 +56,4 @@ release-evidence/
 
 # Vite/Vitest local cache (not source)
 .vite/
+goreleaser-dist/

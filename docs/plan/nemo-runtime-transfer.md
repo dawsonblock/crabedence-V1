@@ -820,9 +820,49 @@ Done and proven on the real binaries (`scripts/test-nemo-runtime-e2e.sh`,
   suites (`test-nemo-restart-idempotency.sh`, `test-nemo-expired-authority.sh`,
   `test-nemo-critical-path.sh`, and the post-dispatch qualification gate).
 
-Still open on this plan: items 12–20 — the live CI lanes, the composition
-hardening (item 13), and the release-side identity, distribution, and
-installed-artifact work.
+Done and proven on the release path (`scripts/build-nemo-distribution.sh`,
+`goreleaser release --config .goreleaser.nemo.yaml --snapshot`, and
+`scripts/test-nemo-installed-distribution.sh` on the produced archive):
+
+- **Item 12** — the four live scripts are a single merge-gate step in the
+  NEMO CI job; each is self-contained on SQLite, and a skipped
+  environment-gated test is not part of the gate.
+- **Item 13** — the supervisor's `env_clear()` boundary is proven at the
+  composition level: the fixture writes the environment *names* it sees, and
+  the e2e asserts the child holds only its session socket and credential — no
+  `HOME`, no `CRABEDENCE_*`, no planted probe.
+- **Item 14** — `NEMO_RELAY_PLUGIN_HOST_SHA256` pins the resolved host
+  executable's digest (the same resolution `spawn` applies, so an override
+  cannot smuggle a different binary); a wrong pin and a malformed pin each
+  fail closed, and a correct pin records `executable`/`sha256`/`pinned` in
+  the invocation evidence.
+- **Item 15** — the assembler stamps crabbox with the release ldflags
+  (`-X …internal/cli.version`) and asserts the binary reports the stamped
+  version before binding it; `dev` can no longer ship.
+- **Item 16** — component-manifest verification is exhaustive: an undeclared
+  file in the root is a failure naming it, and the `.sha256` sidecar must say
+  what the manifest digests to.
+- **Item 17** — the component manifest is the release root: component
+  digests, the runtime source digest, the registry digest, both versions,
+  the target platform, the toolchains, and the qualification gates, all
+  bound under the sidecar digest a signature signs.
+- **Item 18** — `NEMO_DIST_TARGET` names the integrated target
+  (`linux_amd64`, `linux_arm64`, `darwin_amd64`, `darwin_arm64`); each gets
+  its own verified root `dist/nemo-control_<version>_<target>`, and Windows
+  is refused by name.
+- **Item 19** — `.goreleaser.nemo.yaml` is downstream of the assembler:
+  GoReleaser builds crabbox per target and the post-build hook runs the
+  assembler against that exact binary, so the archive carries the verified
+  root byte-for-byte (`bin/`, `share/`, `manifests/`) and the checksum pipe
+  sums it. The shipping set has one definition — the manifests.
+- **Item 20** — `scripts/test-nemo-installed-distribution.sh` qualifies the
+  packed artifact: manifest verification, platform and reported-version
+  identity, then the runtime e2e and the authority/restart suites against
+  the shipped binaries with the plugin-host pin taken from the manifest's
+  own declared digest.
+
+Still open: subtree sync of the vendored runtime changes to
+`crabedence-V1`, then release qualification on the real tagged build.
 
 ### What the reconnaissance established
 

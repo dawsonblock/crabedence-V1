@@ -106,6 +106,26 @@ pub struct PluginOptions {
     /// through `NativeIsolationPolicy::from_environment()` — this module does
     /// not substitute a default for a deployment's stated policy.
     pub isolation: NativeIsolationPolicy,
+    /// The digest the executed host binary must carry, when the deployment
+    /// pins one (`NEMO_RELAY_PLUGIN_HOST_SHA256`). A qualified distribution
+    /// sets it from the component manifest so `NEMO_RELAY_PLUGIN_HOST` can
+    /// locate the host without locating a different binary.
+    pub host_sha256_pin: Option<String>,
+}
+
+/// The executed host binary's identity.
+///
+/// The path is the one the isolation policy resolved — under a confinement
+/// policy that is the bundle's executable, not necessarily the configured
+/// path — and the digest is its content, computed at session open.
+pub struct HostIdentity {
+    /// The executable the child was spawned from.
+    pub executable: PathBuf,
+    /// Its SHA-256, hex.
+    pub sha256: String,
+    /// Whether the deployment pinned the digest (`true` means it matched —
+    /// a mismatch never becomes a session).
+    pub pinned: bool,
 }
 
 /// An active plugin-host session.
@@ -124,6 +144,10 @@ pub struct PluginSession {
     /// artifact identity, installed which registrations. A bound invocation
     /// records it, so evidence can prove which plugin set mediated the request.
     pub middleware_set_digest: String,
+    /// The host executable the supervisor resolved and its SHA-256 — the
+    /// binary that actually holds the plugin, which is what a qualified
+    /// deployment's pin binds. Recorded so a receipt can name it.
+    pub host: HostIdentity,
     /// Held, not read: the manager owns the backend, so the session's lifetime
     /// is the host child's.
     _manager: Arc<PluginManager>,
@@ -168,6 +192,11 @@ pub async fn open(options: &PluginOptions) -> Result<PluginSession, String> {
             .map_err(|error| format!("the plugin artifact could not be approved: {error}"))?;
 
     let config = supervisor_config(options);
+    // The binary the child will actually be: the same resolution `spawn`
+    // applies, so the digest and the pin bind what executes, not what was
+    // configured. Under a confinement policy that can be a different path than
+    // `config.executable`.
+    let host = host_identity(&config, options.host_sha256_pin.as_deref())?;
     let backend = ProcessPluginBackend::launch(config)
         .await
         .map_err(|error| format!("the plugin host did not start: {error}"))?;
@@ -243,6 +272,7 @@ pub async fn open(options: &PluginOptions) -> Result<PluginSession, String> {
         descriptor,
         process_id,
         middleware_set_digest,
+        host,
         _manager: manager,
         _proxies: proxies,
     })
@@ -288,6 +318,76 @@ async fn host_async(options: &PluginOptions) -> Result<Value, String> {
     // runtime that installed them.
     drop(session);
     Ok(report)
+}
+
+/// The environment variable a deployment uses to pin the executed host
+/// binary's SHA-256. Qualified mode resolves the host flexibly
+/// (`NEMO_RELAY_PLUGIN_HOST` or beside-this-binary) and then requires its
+/// content to match the release's component manifest, rather than trusting
+/// whichever path resolved.
+const HOST_SHA256_ENV: &str = "NEMO_RELAY_PLUGIN_HOST_SHA256";
+
+/// Resolve the executed host binary's identity and enforce the pin.
+///
+/// The path resolution is the same one `spawn` applies — the isolation policy
+/// decides which executable the child is — so the digest binds what runs. The
+/// pin, when set, is the release's component-manifest value: a host whose
+/// content differs is a deployment error that fails the session, never a
+/// quieter host.
+fn host_identity(
+    config: &PluginHostSupervisorConfig,
+    pin: Option<&str>,
+) -> Result<HostIdentity, String> {
+    let executable = config
+        .isolation
+        .host_executable(
+            &config.executable,
+            &std::env::current_exe()
+                .ok()
+                .and_then(|path| path.parent().map(|parent| parent.to_path_buf()))
+                .unwrap_or_default(),
+        )
+        .map_err(|error| error.to_string())?;
+    let sha256 = std::fs::read(&executable)
+        .map(|bytes| crate::sha256_hex(&bytes))
+        .map_err(|error| {
+            format!(
+                "the plugin host executable '{}' could not be read for its digest: {error}",
+                executable.display()
+            )
+        })?;
+    if let Some(expected) = pin {
+        if !expected.chars().all(|c| c.is_ascii_hexdigit()) || expected.len() != 64 {
+            return Err(format!(
+                "{HOST_SHA256_ENV} is not a SHA-256 hex digest: {expected:?}"
+            ));
+        }
+        if !expected.eq_ignore_ascii_case(&sha256) {
+            return Err(format!(
+                "the plugin host at '{}' digests to {}, but {HOST_SHA256_ENV} requires {} — \
+                 the resolved binary is not the one the release declared",
+                executable.display(),
+                sha256,
+                expected
+            ));
+        }
+    }
+    Ok(HostIdentity {
+        executable,
+        sha256,
+        pinned: pin.is_some(),
+    })
+}
+
+/// The pin a deployment configured, resolved at the CLI boundary.
+pub(crate) fn host_sha256_pin() -> Result<Option<String>, String> {
+    match std::env::var(HOST_SHA256_ENV) {
+        Ok(raw) if !raw.trim().is_empty() => Ok(Some(raw.trim().to_string())),
+        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(format!("{HOST_SHA256_ENV} is not valid text for a digest"))
+        }
+    }
 }
 
 /// The supervisor configuration this composition publishes. The host ships
@@ -352,6 +452,7 @@ mod tests {
             arguments: json!({}),
             runtime_binding_digest: "digest".to_string(),
             isolation,
+            host_sha256_pin: None,
         }
     }
 

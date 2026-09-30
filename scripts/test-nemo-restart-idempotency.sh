@@ -47,7 +47,7 @@ stop_service() {
 
 start_service() {
   CRABEDENCE_STORE_PATH="$store" CRABEDENCE_STORE_BACKEND=sqlite \
-    XDG_RUNTIME_DIR="$work_dir" "$work_dir/crabbox" serve-exec \
+    XDG_RUNTIME_DIR="$work_dir" "$crabbox_bin" serve-exec \
     >>"$work_dir/serve.log" 2>&1 &
   service_pid=$!
   for _ in $(seq 1 40); do
@@ -76,7 +76,12 @@ dispatch_once() {
 }
 
 printf 'building the CLI…\n'
-go build -o "$work_dir/crabbox" ./cmd/crabbox
+if [[ -n "${NEMO_E2E_CRABBOX:-}" ]]; then
+  crabbox_bin="$NEMO_E2E_CRABBOX"
+else
+  go build -o "$work_dir/crabbox" ./cmd/crabbox
+  crabbox_bin="$work_dir/crabbox"
+fi
 
 printf 'issuing a grant…\n'
 CRABEDENCE_STORE_PATH="$store" go run ./cmd/issue-grant \
