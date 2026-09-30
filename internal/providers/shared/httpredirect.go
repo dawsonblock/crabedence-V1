@@ -30,10 +30,24 @@ func effectivePort(value *url.URL) string {
 }
 
 // SecureHTTPClientOption customizes SecureHTTPClient for a provider whose
-// redirect policy needs more than the defaults. Every option exists because a
-// site that implemented this itself needed it; see
-// docs/plan/nemo-runtime-transfer.md for the classification that established
-// the two below.
+// redirect policy needs more than the defaults.
+//
+// What belongs here, and what does not. An option may parameterize this
+// mechanism — the error it returns, the comparison it makes. An option must not
+// change the mechanism: not the order in which the origin check, the preserved
+// hook, and the cap are evaluated; not by adding checks of its own; not by
+// mutating the request. Those are different policies, and a provider that needs
+// one should keep its own guard, as `islo` (cap before hook),
+// `awslambdamicrovm` and `blaxel` (pinned to the request chain rather than a
+// configured origin), `unikraftcloud` (path and method containment), and
+// `scaleway` (a transport-set marker and three sentinels) all do.
+//
+// The line matters because this is a security control with many callers: every
+// mechanism-changing option would be a knob with one consumer, and a reader
+// could no longer tell what the shared behavior is. The duplication worth
+// removing was the mechanism, and it is removed — four providers now call this.
+// The policy that differs is the provider's, and the classification of all
+// sixteen is in docs/plan/nemo-runtime-transfer.md.
 type SecureHTTPClientOption func(*secureHTTPClientConfig)
 
 type secureHTTPClientConfig struct {
