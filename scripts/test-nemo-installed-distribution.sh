@@ -64,7 +64,11 @@ pass "component manifest verifies the unpacked root, exhaustively"
 
 manifest="$root/manifests/component-manifest.json"
 platform="$(jq -r .platform "$manifest")"
-host="$(go env GOOS)_$(go env GOARCH)"
+# NEMO_QUALIFY_HOST declares the architecture the artifact will execute as —
+# a translated host (Rosetta) qualifies a foreign-arch distribution because
+# the shipped binaries genuinely run there; the fixture still has to be built
+# for the artifact's own arch via NEMO_E2E_FIXTURE.
+host="${NEMO_QUALIFY_HOST:-$(go env GOOS)_$(go env GOARCH)}"
 [[ "$platform" == "$host" ]] \
   || fail "this distribution is for $platform, cannot qualify on $host"
 pass "platform $platform matches this host"
