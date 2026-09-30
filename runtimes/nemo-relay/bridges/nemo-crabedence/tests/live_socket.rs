@@ -226,6 +226,38 @@ fn commits_a_mutation_through_the_real_kernel_when_a_grant_is_provided() {
     );
 }
 
+/// An authority reference the kernel cannot resolve is refused definitively.
+///
+/// The kernel resolves `authority_ref` against its authority store. A
+/// reference that does not resolve is an authorization failure, not an
+/// ambiguous outcome: nothing was dispatched, so nothing can have occurred, and
+/// the refusal must not be retryable or reconcilable.
+#[test]
+fn refuses_an_authority_reference_that_does_not_resolve() {
+    let Some(socket) = live_socket() else {
+        return;
+    };
+    let catalog = load_catalog_from_path(&snapshot_path(&socket)).expect("verified");
+    let port = NemoCrabedenceExecutionPort::new(ExecutionSocketClient::new(&socket), catalog);
+
+    let mut request = request_for("test.counter.increment", ExecutionClass::Mutation);
+    request.grant = Some("no-such-grant".to_string());
+    request.identity.idempotency_key = format!("unknown-grant-{}", std::process::id());
+
+    let error = port.execute(&request).unwrap_err();
+    assert_eq!(
+        error.code, "UNAUTHORIZED",
+        "the kernel refuses an unresolvable reference as an authorization failure, got {error}"
+    );
+    assert_eq!(
+        state_for_error(&error),
+        ExecutionState::Failed,
+        "an unresolvable authority reference is definitive, got {error}"
+    );
+    assert!(!error.retryable, "{error}");
+    assert!(!error.reconciliation_required, "{error}");
+}
+
 /// No repeated key may produce a second real-world effect.
 ///
 /// This is the property the whole consolidation exists to preserve, and it is

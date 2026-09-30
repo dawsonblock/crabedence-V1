@@ -44,7 +44,7 @@ excludes `target/`, caches, `node_modules`, and editor state.
 | 0 — vendor | Done | `runtimes/nemo-relay/` (1438 source files, no build artifacts); a recursive diff against the source copy reports exactly two differing files (`Cargo.toml`, `Cargo.lock`); provenance and fingerprint in `runtimes/nemo-relay/TRANSFER-PROVENANCE.md` |
 | 1 — bridge | Done | `runtimes/nemo-relay/bridges/nemo-crabedence/`: `abi.rs`, `transport.rs`, `capability_snapshot.rs`, `outcome_mapping.rs`, `execution_port.rs`; 56 unit tests, 1 corpus conformance test, 5 schema-binding tests, 5 env-gated live tests |
 | 2 — trust enforcement | Partial | Bridge-level invariants enforced and tested (unregistered capability, class mismatch, route mismatch, no policy field on the wire), the effect-isolation invariant holds at the router, and both run in CI (the `NEMO integration` job). What is *not* exercised end to end is a full NEMO runtime instance routing through `EffectRouter` — integration work. This row previously named NEMO's `BackendRouter` wiring as the remainder, which finding 6 corrected: that composition is not merely unwired, it is the wrong one |
-| 3 — conformance | Partial | The Rust validator matches the shared invocation corpus exactly (11 accepted, 32 rejected), the live kernel's refusal phrases match word-for-word, and the outcome corpus is shared across Go, TypeScript, and Rust. Covered against the live kernel from the NEMO side: a LOCAL-route refusal, a MUTATION commit with evidence, missing authority (`UNAUTHORIZED`), a lost response mapping to `UNKNOWN`, snapshot tampering, and same-key replay — the last verified across a service restart by hand rather than in the committed suite. Not covered: plugin host crash and hang, malformed plugin reply, plugin registration rejection, invalid and expired authority, provider crash, NEMO restart, both restarted, and CRITICAL — the built-in registry carries no CRITICAL capability (finding 4) |
+| 3 — conformance | Partial | The Rust validator matches the shared invocation corpus exactly (11 accepted, 32 rejected), the live kernel's refusal phrases match word-for-word, and the outcome corpus is shared across Go, TypeScript, and Rust. Covered against the live kernel from the NEMO side: a LOCAL-route refusal, a MUTATION commit with evidence, missing authority (`UNAUTHORIZED`), an unresolvable authority reference (`UNAUTHORIZED`, definitive and non-retryable), a lost response mapping to `UNKNOWN`, snapshot tampering, and same-key replay — the last verified across a service restart by hand rather than in the committed suite. Not covered: plugin host crash and hang, malformed plugin reply, plugin registration rejection, expired authority, provider crash, NEMO restart, both restarted, and CRITICAL — the built-in registry carries no CRITICAL capability (finding 4) |
 | — reference kernel | Retired | Renamed to `nemo/registry-snapshot/`, decoupled from the loader, then deleted once the suite passed without it; the README now records where each removed behavior lives |
 | — canonical schema | Done | `schemas/capability-invocation-v1.json` describes the frozen wire contract; Go, TypeScript, and Rust each carry a test that binds their implementation to it, so a field added on one side and not the others fails CI |
 | — effect router | Done at the routing layer | `runtimes/nemo-relay/bridges/nemo-effect-router/`: `EffectRouter` resolves the path from the verified **route** (not the class, which is what NeMo Relay's own router uses), fails closed on an unwired read path, and holds the effect-isolation invariant. 7 routing tests and 6 isolation tests, including one that runs against a live registry |
@@ -94,10 +94,16 @@ grant — committed a mutation with `SUCCEEDED` and receipt version 3 evidence.
    the bridge now parses with the shared strict parser
    (`execution.ParseInvocationRequest`), and regression tests cover the
    refusal and the stable field.
-3. **No grant-issuing path for the SQLite backend.** `cmd/issue-grant` opens
-   PostgreSQL only, while the default single-host backend is SQLite
-   (`authority.NewSQLiteStore`). Exercising any grant-required capability
-   locally therefore needs a helper that uses the store directly.
+3. **No grant-issuing path for the SQLite backend — fixed.** `cmd/issue-grant`
+   opened PostgreSQL only, while the default single-host backend is SQLite
+   (`authority.NewSQLiteStore`), so exercising any grant-required capability
+   locally needed a helper that used the store directly. The tool now selects
+   its backend from the environment — `CRABEDENCE_DATABASE_URL` for PostgreSQL,
+   `CRABEDENCE_STORE_PATH` for SQLite, PostgreSQL winning when both are set —
+   which mirrors how `serve-exec` is started, so a grant issued here is
+   resolvable by the service started the same way. Verified end to end: a grant
+   issued by the tool against SQLite was accepted by a running service and
+   committed a mutation through the Rust bridge.
 4. **The built-in registry cannot exercise every gate scenario.** It carries no
    CRITICAL capability, and only one CRABEDENCE-routed mutation
    (`test.counter.increment`); `system.echo` and `system.info` are pinned
@@ -528,10 +534,10 @@ helper's fixed cap message and error shape are acceptable — not a sweep.
 4. **The TypeScript layer's `FAILED` mapping** (finding 1) — **resolved.** The
    adapter honors `definitive_failure`, and the shared outcome corpus pins the
    rule for the TypeScript adapter and the Rust bridge alike.
-5. **Grant issuance on SQLite** (finding 3) — extend `cmd/issue-grant` to the
-   default backend, or document the helper path. Without one of these, the
-   grant-required gate scenarios cannot be exercised on a single-host
-   deployment.
+5. **Grant issuance on SQLite** (finding 3) — **resolved.** `cmd/issue-grant`
+   selects PostgreSQL or the embedded SQLite store from the environment, so the
+   grant-required gate scenarios can be exercised on a single-host deployment
+   without a helper.
 6. **Registry coverage for the gate** (finding 4) — the PURE/READ/CRITICAL
    "NEMO → Crabedence" scenarios need capabilities pinned to the `CRABEDENCE`
    route; the built-in registry has none outside one mutation.

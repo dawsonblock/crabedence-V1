@@ -4,8 +4,16 @@
 // store assigns the generation under a serialized head lock, so callers
 // supply the grant material and read back the assigned generation.
 //
-// The database DSN comes from CRABEDENCE_DATABASE_URL only — never from
-// argv, where it would leak into process listings and shell history.
+// The target database is selected from the environment only — never from
+// argv, where a DSN would leak into process listings and shell history:
+//
+//	CRABEDENCE_DATABASE_URL   PostgreSQL, the clustered backend
+//	CRABEDENCE_STORE_PATH     SQLite, the single-host default
+//
+// PostgreSQL wins when both are set. This mirrors `crabbox serve-exec`, so a
+// grant issued here is resolvable by the service started the same way —
+// including the embedded SQLite default, which previously had no issuing path
+// at all.
 //
 // Usage:
 //
@@ -33,9 +41,16 @@ import (
 	"time"
 
 	"github.com/openclaw/crabbox/internal/authority"
+	"github.com/openclaw/crabbox/internal/capability"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
+	_ "modernc.org/sqlite"
 )
+
+// grantIssuer is the issuing surface both authority stores share.
+type grantIssuer interface {
+	IssueGrantWithConstraints(context.Context, string, string, []string, map[string][]string, time.Time) (*capability.Grant, error)
+}
 
 type capabilityList []string
 
@@ -70,8 +85,18 @@ type config struct {
 	caps        []string
 	constraints map[string][]string
 	expiresAt   time.Time // zero means no expiry
-	dsn         string
+	dsn         string    // PostgreSQL DSN, when backend is backendPostgres
+	sqlitePath  string    // SQLite database file, when backend is backendSQLite
+	backend     backend
 }
+
+// backend is the authority store the grant is issued through.
+type backend string
+
+const (
+	backendPostgres backend = "postgres"
+	backendSQLite   backend = "sqlite"
+)
 
 // loadConfig parses and validates flags + environment. It never accepts
 // a caller-supplied generation: generations are allocated by the
@@ -100,8 +125,13 @@ func loadConfig(argv []string, getenv func(string) string, stderr io.Writer) (co
 	}
 
 	dsn := getenv("CRABEDENCE_DATABASE_URL")
+	sqlitePath := getenv("CRABEDENCE_STORE_PATH")
+	if dsn == "" && sqlitePath == "" {
+		return config{}, fmt.Errorf("set CRABEDENCE_DATABASE_URL (PostgreSQL) or CRABEDENCE_STORE_PATH (SQLite); connection details are read from the environment, never argv")
+	}
+	selected := backendPostgres
 	if dsn == "" {
-		return config{}, fmt.Errorf("CRABEDENCE_DATABASE_URL is not set (DSN is read from the environment, never argv)")
+		selected = backendSQLite
 	}
 
 	var expiry time.Time
@@ -125,7 +155,16 @@ func loadConfig(argv []string, getenv func(string) string, stderr io.Writer) (co
 		id = fmt.Sprintf("grant_%x", b)
 	}
 
-	return config{grantID: id, principal: *principal, caps: caps, constraints: constraints, expiresAt: expiry, dsn: dsn}, nil
+	return config{
+		grantID:     id,
+		principal:   *principal,
+		caps:        caps,
+		constraints: constraints,
+		expiresAt:   expiry,
+		dsn:         dsn,
+		sqlitePath:  sqlitePath,
+		backend:     selected,
+	}, nil
 }
 
 func main() {
@@ -137,7 +176,11 @@ func main() {
 	}
 
 	ctx := context.Background()
-	db, err := sql.Open("pgx", cfg.dsn)
+	driver, target := "pgx", cfg.dsn
+	if cfg.backend == backendSQLite {
+		driver, target = "sqlite", cfg.sqlitePath
+	}
+	db, err := sql.Open(driver, target)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "issue-grant: %v\n", err)
 		os.Exit(1)
@@ -148,7 +191,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	store, err := authority.NewStore(db)
+	var store grantIssuer
+	if cfg.backend == backendSQLite {
+		store, err = authority.NewSQLiteStore(db)
+	} else {
+		store, err = authority.NewStore(db)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "issue-grant: %v\n", err)
 		os.Exit(1)
