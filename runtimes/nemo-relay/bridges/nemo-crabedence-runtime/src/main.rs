@@ -19,12 +19,20 @@
 //! 3. routes: `LOCAL` executes in-process, `CRABEDENCE` crosses the kernel,
 //!    `DIRECT` fails closed until a read path is wired.
 //!
-//! What it does **not** do yet: host plugins. The plugin host
-//! (`crates/plugin-host`) is not wired to this runtime, so a plugin cannot yet
-//! reach the router — which is why the plugin-host gate scenarios remain open.
-//! The local backend is likewise a placeholder standing in for NeMo Relay's
-//! function-hook execution; it exists so the `LOCAL` route has somewhere to go,
-//! and it is labelled as such rather than presented as the real path.
+//! It also hosts a real native plugin when asked (`--plugin`): the host is
+//! started as a process, the artifact is loaded and activated through it, the
+//! registrations are proxied into this process, and an optional managed tool
+//! call runs through NeMo Relay's own chain with the plugin's registration
+//! executing in the child. That is Phase 1 of the plugin-host composition; see
+//! [`plugin_host`] for what it deliberately leaves to Phase 2.
+//!
+//! What it does **not** do yet: turn a plugin request into an `EffectRouter`
+//! request. A plugin cannot today ask for a capability — registrations are
+//! middleware and observability, not callables — so that mediation is new
+//! protocol surface rather than a wiring gap. The local backend is likewise a
+//! placeholder standing in for NeMo Relay's function-hook execution; it exists
+//! so the `LOCAL` route has somewhere to go, and it is labelled as such rather
+//! than presented as the real path.
 //!
 //! Usage:
 //!
@@ -32,6 +40,9 @@
 //! nemo-crabedence-runtime --capability <id> [--arguments <json>] [--principal <id>]
 //!                         [--grant <authority-ref>] [--idempotency-key <key>]
 //!                         [--socket <path>] [--snapshot <path>]
+//!
+//! nemo-crabedence-runtime --plugin <manifest-or-dir> --plugin-id <id>
+//!                         --component <kind> [--tool <name>] [--arguments <json>]
 //! ```
 //!
 //! `--idempotency-key` is required for `MUTATION` and `CRITICAL` capabilities.
@@ -45,7 +56,7 @@
 //! `{"status": "FAILED", "code": ..., "retryable": ..., ...}`, with `UNKNOWN`
 //! kept distinct because it must never be retried.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use nemo_crabedence_bridge::capability_snapshot::{
@@ -61,6 +72,8 @@ use nemo_relay_executor::unstable::{
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
+
+mod plugin_host;
 
 /// The placeholder local executor for `LOCAL`-routed capabilities.
 ///
@@ -87,13 +100,17 @@ impl ExecutionBackend for LocalEchoBackend {
 }
 
 struct Options {
-    capability: String,
+    capability: Option<String>,
     arguments: serde_json::Value,
     principal: String,
     grant: Option<String>,
     idempotency_key: Option<String>,
     socket: PathBuf,
     snapshot: PathBuf,
+    plugin: Option<PathBuf>,
+    plugin_id: Option<String>,
+    component: Option<String>,
+    tool: Option<String>,
 }
 
 fn parse_options() -> Result<Options, String> {
@@ -111,6 +128,10 @@ where
     let mut idempotency_key = None;
     let mut socket = None;
     let mut snapshot = None;
+    let mut plugin = None;
+    let mut plugin_id = None;
+    let mut component = None;
+    let mut tool = None;
 
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
@@ -125,6 +146,10 @@ where
             "--idempotency-key" => idempotency_key = Some(value()?),
             "--socket" => socket = Some(PathBuf::from(value()?)),
             "--snapshot" => snapshot = Some(PathBuf::from(value()?)),
+            "--plugin" => plugin = Some(PathBuf::from(value()?)),
+            "--plugin-id" => plugin_id = Some(value()?),
+            "--component" => component = Some(value()?),
+            "--tool" => tool = Some(value()?),
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -136,7 +161,27 @@ where
             .unwrap_or_else(|| std::path::Path::new("."))
             .join("capabilities.json")
     });
-    let capability = capability.ok_or("--capability is required")?;
+    match (&plugin, &capability) {
+        (Some(_), Some(_)) => {
+            return Err(
+                "--plugin and --capability are separate modes and cannot be combined".to_string(),
+            );
+        }
+        (None, None) => {
+            return Err(
+                "--capability is required (or --plugin for the plugin-host mode)".to_string(),
+            );
+        }
+        _ => {}
+    }
+    if plugin.is_some() {
+        plugin_id
+            .as_deref()
+            .ok_or("--plugin-id is required with --plugin")?;
+        component
+            .as_deref()
+            .ok_or("--component is required with --plugin")?;
+    }
     // The key stays the caller's and stays absent when they gave none. Whether
     // one is required depends on the registered class, which is resolved from
     // the verified registry after this parse — see `request_for`.
@@ -148,6 +193,10 @@ where
         idempotency_key,
         socket,
         snapshot,
+        plugin,
+        plugin_id,
+        component,
+        tool,
     })
 }
 
@@ -198,6 +247,18 @@ fn canonical_digest(value: &serde_json::Value) -> Result<String, String> {
     Ok(sha256_hex(&bytes))
 }
 
+/// The canonical digest binding runtime, environment, and session provenance.
+///
+/// The same construction the kernel uses, so the binding a host session claims
+/// is the binding this runtime publishes.
+fn runtime_binding_digest(runtime: &RuntimeIdentity) -> Result<String, String> {
+    canonical_digest(&json!({
+        "runtime_id": runtime.runtime_id,
+        "environment": runtime.environment,
+        "session_id": runtime.session_id,
+    }))
+}
+
 /// The namespace the kernel applies to a caller's logical-action key.
 ///
 /// Scoped by tenant and principal, so the same key from two principals is two
@@ -225,6 +286,7 @@ fn scoped_idempotency_key(runtime: &RuntimeIdentity, request_id: &str) -> Result
 /// an idempotency key, and a deadline.
 fn request_for(
     options: &Options,
+    capability: &str,
     class: ExecutionClass,
     descriptor: &RegistryDescriptor,
     registry_digest: &str,
@@ -253,11 +315,7 @@ fn request_for(
         "execution_route": descriptor.execution_route.as_str(),
         "assurance_profile": descriptor.assurance_profile,
     }))?;
-    let runtime_binding_digest = canonical_digest(&json!({
-        "runtime_id": runtime.runtime_id,
-        "environment": runtime.environment,
-        "session_id": runtime.session_id,
-    }))?;
+    let runtime_binding_digest = runtime_binding_digest(&runtime)?;
 
     // The verified snapshot carries no registry-assigned admission identity or
     // policy epoch — those belong to NeMo Relay's own registry, and this
@@ -288,11 +346,11 @@ fn request_for(
             runtime,
             runtime_binding_digest,
             capability: CapabilityIdentity {
-                capability_id: options.capability.clone(),
+                capability_id: capability.to_string(),
                 capability_generation: u64::from(descriptor.descriptor_version),
                 registration_digest,
                 execution_class: class,
-                operation: options.capability.clone(),
+                operation: capability.to_string(),
                 route_digest,
             },
             admission_id,
@@ -311,11 +369,66 @@ fn request_for(
     })
 }
 
+/// Run the plugin-host mode: host a real plugin, and run one managed call
+/// through it when a tool was named.
+///
+/// The host session is bound to the runtime identity this process publishes,
+/// so the binding the host verifies is the binding a receipt would name.
+fn run_plugin_mode(options: &Options, artifact: &Path) -> ExitCode {
+    let (Some(plugin_id), Some(component)) =
+        (options.plugin_id.as_deref(), options.component.as_deref())
+    else {
+        eprintln!(
+            "nemo-crabedence-runtime: --plugin-id and --component are required with --plugin"
+        );
+        return ExitCode::from(2);
+    };
+    let runtime = runtime_identity(&options.principal);
+    let binding = match runtime_binding_digest(&runtime) {
+        Ok(binding) => binding,
+        Err(message) => {
+            eprintln!("nemo-crabedence-runtime: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let plugin_options = plugin_host::PluginOptions {
+        artifact: artifact.to_path_buf(),
+        plugin_id: plugin_id.to_string(),
+        component: component.to_string(),
+        tool: options.tool.clone(),
+        arguments: options.arguments.clone(),
+        runtime_binding_digest: binding,
+    };
+    match plugin_host::host(&plugin_options) {
+        Ok(report) => {
+            println!("{report}");
+            ExitCode::SUCCESS
+        }
+        Err(message) => {
+            eprintln!("nemo-crabedence-runtime: {message}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let options = match parse_options() {
         Ok(options) => options,
         Err(message) => {
             eprintln!("nemo-crabedence-runtime: {message}");
+            return ExitCode::from(2);
+        }
+    };
+
+    if let Some(artifact) = options.plugin.as_deref() {
+        return run_plugin_mode(&options, artifact);
+    }
+    let capability = match options.capability.as_deref() {
+        Some(capability) => capability,
+        None => {
+            eprintln!(
+                "nemo-crabedence-runtime: --capability is required (or --plugin for the plugin-host mode)"
+            );
             return ExitCode::from(2);
         }
     };
@@ -334,12 +447,11 @@ fn main() -> ExitCode {
         }
     };
 
-    let descriptor = match catalog.descriptor(&options.capability) {
+    let descriptor = match catalog.descriptor(capability) {
         Some(descriptor) => descriptor,
         None => {
             eprintln!(
-                "nemo-crabedence-runtime: {} is not in the verified registry — no routing metadata exists for it",
-                options.capability
+                "nemo-crabedence-runtime: {capability} is not in the verified registry — no routing metadata exists for it"
             );
             return ExitCode::FAILURE;
         }
@@ -349,7 +461,13 @@ fn main() -> ExitCode {
     // Identity first, and fail closed: a consequential invocation without a
     // caller-supplied logical-action key is refused before any dispatch, not
     // given a default that would collide across distinct actions.
-    let request = match request_for(&options, class, descriptor, catalog.registry_sha256()) {
+    let request = match request_for(
+        &options,
+        capability,
+        class,
+        descriptor,
+        catalog.registry_sha256(),
+    ) {
         Ok(request) => request,
         Err(message) => {
             eprintln!("nemo-crabedence-runtime: {message}");
@@ -438,13 +556,17 @@ mod tests {
 
     fn options(principal: &str, idempotency_key: Option<&str>) -> Options {
         Options {
-            capability: "test.counter.increment".to_string(),
+            capability: Some("test.counter.increment".to_string()),
             arguments: json!({"amount": 1}),
             principal: principal.to_string(),
             grant: None,
             idempotency_key: idempotency_key.map(str::to_string),
             socket: PathBuf::from("/tmp/execution.sock"),
             snapshot: PathBuf::from("/tmp/capabilities.json"),
+            plugin: None,
+            plugin_id: None,
+            component: None,
+            tool: None,
         }
     }
 
@@ -457,6 +579,7 @@ mod tests {
         };
         request_for(
             options,
+            "test.counter.increment",
             class,
             &descriptor(registered, RegistryExecutionRoute::Crabedence, 1),
             "registry-digest",
@@ -469,6 +592,7 @@ mod tests {
         for class in [ExecutionClass::Mutation, ExecutionClass::Critical] {
             let error = request_for(
                 &options("alice@example.com", None),
+                "test.counter.increment",
                 class,
                 &descriptor(
                     RegistryExecutionClass::Mutation,
@@ -555,6 +679,7 @@ mod tests {
     fn descriptor_digests_track_the_verified_descriptor() {
         let base = request_for(
             &options("alice@example.com", Some("send-001")),
+            "test.counter.increment",
             ExecutionClass::Mutation,
             &descriptor(
                 RegistryExecutionClass::Mutation,
@@ -566,6 +691,7 @@ mod tests {
         .expect("the request must bind");
         let next_version = request_for(
             &options("alice@example.com", Some("send-001")),
+            "test.counter.increment",
             ExecutionClass::Mutation,
             &descriptor(
                 RegistryExecutionClass::Mutation,
@@ -586,6 +712,7 @@ mod tests {
 
         let other_route = request_for(
             &options("alice@example.com", Some("send-001")),
+            "test.counter.increment",
             ExecutionClass::Mutation,
             &descriptor(
                 RegistryExecutionClass::Mutation,
@@ -630,5 +757,61 @@ mod tests {
         )
         .expect("the options must parse");
         assert_eq!(parsed.idempotency_key.as_deref(), Some("send-001"));
+    }
+
+    #[test]
+    fn plugin_mode_is_separate_from_capability_routing() {
+        let parse = |arguments: &[&str]| {
+            parse_options_from(arguments.iter().map(|argument| argument.to_string()))
+        };
+
+        // A plugin session needs its artifact, the id to load under, and the
+        // component to activate.
+        assert!(
+            parse(&[
+                "--plugin",
+                "/tmp/plugin",
+                "--plugin-id",
+                "p",
+                "--component",
+                "c"
+            ])
+            .is_ok()
+        );
+        assert!(parse(&["--plugin", "/tmp/plugin"]).is_err());
+        assert!(parse(&["--plugin", "/tmp/plugin", "--plugin-id", "p"]).is_err());
+
+        // The two modes are separate, and neither is assumed.
+        assert!(
+            parse(&[
+                "--plugin",
+                "/tmp/plugin",
+                "--plugin-id",
+                "p",
+                "--component",
+                "c",
+                "--capability",
+                "system.echo",
+            ])
+            .is_err()
+        );
+        assert!(parse(&[]).is_err());
+
+        let parsed = parse(&[
+            "--plugin",
+            "/tmp/plugin",
+            "--plugin-id",
+            "p",
+            "--component",
+            "c",
+            "--tool",
+            "example_tool",
+            "--arguments",
+            "{\"input\":true}",
+        ])
+        .expect("the plugin options must parse");
+        assert_eq!(parsed.capability, None);
+        assert_eq!(parsed.tool.as_deref(), Some("example_tool"));
+        assert_eq!(parsed.arguments["input"], json!(true));
     }
 }

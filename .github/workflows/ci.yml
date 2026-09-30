@@ -204,6 +204,14 @@ jobs:
           NEMO_DIST_PROFILE: debug
         run: scripts/build-nemo-distribution.sh
 
+      # The plugin-host composition, driven from the runtime binary: a real
+      # host process, a real native plugin loaded and activated through it, and
+      # a managed call whose chain reaches the plugin's registration inside the
+      # child. This is Phase 1 of the plugin-host workstream; it proves the
+      # process boundary, not capability mediation.
+      - name: Prove the plugin-host composition
+        run: scripts/test-nemo-plugin-host.sh
+
       # The reference side. These suites — the conformance corpus, the
       # adversarial cases, framing, snapshot verification, and the schema
       # binding — are what the Rust path is compared against, so they have to

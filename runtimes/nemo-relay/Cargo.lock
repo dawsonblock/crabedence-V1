@@ -1784,10 +1784,14 @@ version = "0.9.1-rc.4"
 dependencies = [
  "nemo-crabedence-bridge",
  "nemo-effect-router",
+ "nemo-relay",
  "nemo-relay-executor",
+ "nemo-relay-plugin-host",
+ "nemo-relay-plugin-protocol",
  "serde_json",
  "serde_json_canonicalizer",
  "sha2",
+ "tokio",
  "uuid",
 ]
 
