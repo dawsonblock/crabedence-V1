@@ -365,6 +365,19 @@ isolation, which deliberately refuses Windows today. Neither is on this
 transfer's critical path; the unwired plugin host (Phase 2) is the earlier
 gap.
 
+### DIRECT is deliberately unwired in the first release
+
+The registry pins read capabilities to the `DIRECT` route (`system.info` and
+`github.issue.get` in the built-in set). The router refuses them with
+`CAPABILITY_UNAVAILABLE` — definitive, not retryable, no reconciliation —
+rather than performing an unaudited read, and that refusal is a scope
+decision recorded here rather than an oversight. A read path is wired when it
+can enforce the same admission the service's own `DIRECT` dispatcher does;
+until then `DIRECT` capabilities are not part of the first release's
+supported set, and refusing them is the honest behavior. The routes that are
+wired are covered by `scripts/test-nemo-runtime-e2e.sh`; `DIRECT` is covered
+by the router's own tests as a refusal.
+
 ## Phase 0 — vendor the NEMO runtime (done)
 
 Deliverable: `runtimes/nemo-relay/` containing the full NEMO source, workspace
