@@ -861,8 +861,14 @@ Done and proven on the release path (`scripts/build-nemo-distribution.sh`,
   the shipped binaries with the plugin-host pin taken from the manifest's
   own declared digest.
 
-Still open: subtree sync of the vendored runtime changes to
-`crabedence-V1`, then release qualification on the real tagged build.
+The subtree is synced — `crabedence-V1` carries this work at
+`f161bc5` (PR
+[#30](https://github.com/dawsonblock/crabedence-V1/pull/30), all checks
+green, post-merge `main` green). Still open: release qualification on a
+real tagged build — the per-target matrix needs a runner per OS (Linux
+targets need the target's linker, which macOS cannot supply), and wiring
+`.goreleaser.nemo.yaml` into the tagged candidate producer is a
+release-pipeline decision, not a code change.
 
 ### What the reconnaissance established
 
