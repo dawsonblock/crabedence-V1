@@ -559,7 +559,9 @@ was read, and the population falls into four categories:
 | Drop-in as written | `azuredynamicsessions` (**migrated**) | Its origin comparison already delegated to `shared.SameOrigin` and its body matched the helper's, so it needed no new option |
 | Sentinel contracts — **migrated** once the helper could express them | `nomad`, `ovh` (**migrated**) | Each defines a redirect-limit sentinel that a consumer matches on (`errors.Is`). The helper's cap message was fixed, so migrating as it stood would have replaced a matched sentinel with a different value. `WithRedirectLimitError` closes that gap, and both now pass their sentinel in |
 | Richer redirect policy | `unikraftcloud`, `scaleway` | `unikraftcloud` additionally enforces path containment (`withinUnikraftCloudAPIPath`) and refuses a method change on a mutation — checks the helper does not make, so migrating would silently drop them. `scaleway` reads a marker header its own transport sets and distinguishes three sentinels (`CrossOrigin`, `Invalid`, `Limit`), then threads a hop count through the request context |
-| Host comparison differs | `sprites` (**migrated**), `islo` (not yet read) | `sprites` compares hosts through `canonicalSpritesHostname` (which strips IPv6 zone identifiers) and its own port helper, not `shared.SameOrigin`. `WithHostComparator` closes that gap, so it now passes its own comparison in, and its refusal text — asserted by a test — is preserved through `newError`. `islo` uses its own guard constructor, `isloSameOriginRedirectGuard(baseURL, source.CheckRedirect)`, whose semantics need their own read |
+| Host comparison differs | `sprites` (**migrated**) | `sprites` compares hosts through `canonicalSpritesHostname` (which strips IPv6 zone identifiers) and its own port helper, not `shared.SameOrigin`. `WithHostComparator` closes that gap, so it now passes its own comparison in, and its refusal text — asserted by a test — is preserved through `newError` |
+| **Cap evaluated before the hook** | `islo` | Its guard checks the origin, then the cap, then the preserved hook. The helper does origin, then the hook, then the cap — so a caller-supplied hook wins over the cap there, and migrating would **loosen** islo's cap whenever a caller supplies a redirect hook. Its comparison (a normalized origin string) and its typed errors were both expressible; the ordering is what stops it |
+| **Pinned to the request chain** | `awslambdamicrovm`, `blaxel` | Neither pins to a configured trusted origin. `awslambdamicrovm` compares against `via[0].URL` — the original request — and refuses when `via` is empty; `blaxel` checks the cap first and then compares against the previous hop. Both were missing from an earlier revision of this table, which named fourteen providers and called them sixteen |
 | Deliberately stricter | `boxd`, `cloudflaredynamicworkers`, `githubcodespaces` | `boxd` refuses every redirect ("boxd API redirects are not allowed"); the other two return `http.ErrUseLastResponse` and follow none. Migrating would **weaken** them by permitting same-origin redirects |
 | Origin-pinned with deliberate unwrapping | `fastapicloud`, `morph`, `railway` | Each unwraps its typed error at the call site, with the comment "net/http wraps CheckRedirect failures with the untrusted Location URL" — they deliberately avoid surfacing the untrusted destination. Migration must preserve that unwrapping |
 | Pinned at the transport | `opensandbox` | `openSandboxRedirectTransport` intercepts the 3xx response and parses `Location` itself. A different mechanism, arguably stronger, and not a `CheckRedirect` site at all |
@@ -589,9 +591,11 @@ test clean.
 **Four of sixteen are consolidated.** What remains is not a migration backlog:
 `unikraftcloud` and `scaleway` enforce redirect policy the helper does not model
 (path containment, a method change on a mutation, a transport-set marker header,
-three distinct sentinels), `islo` has not been read, and the other nine differ
-deliberately — three are stricter, three unwrap their errors on purpose, and one
-pins at the transport layer.
+three distinct sentinels), `islo` evaluates its cap before its hook where the
+helper does the reverse, `awslambdamicrovm` and `blaxel` pin to the request
+chain rather than a configured origin, three are deliberately stricter, three
+unwrap their errors on purpose, and one pins at the transport layer. Every one
+of the sixteen is now accounted for.
 
 This is the same mistake as finding 4, made twice: classifying by the *shape* of
 the code rather than by the *contract* its callers depend on. The bodies looked
