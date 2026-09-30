@@ -124,7 +124,14 @@ jobs:
   nemo-bridge:
     name: NEMO integration
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 45 minutes, not 30, because the job now compiles more than the
+    # integration crates: the plugin host's dependency tree (601 crates;
+    # measured at ~1 minute wall on an M-series Mac in an isolated target
+    # directory, so several minutes on a cold two-core runner), the test
+    # plugin fixture (small: the fixture depends only on the plugin SDK), and
+    # the distribution assembly on top of both. The budget only matters when
+    # it is exceeded; the measured additions are the reason it moved.
+    timeout-minutes: 45
 
     steps:
       - name: Check out
@@ -190,7 +197,9 @@ jobs:
       # Every binary the manifest declares must actually compile. The plugin
       # host and both ledger fixtures were declared by their packages but
       # absent from the vendored copy once, and nothing built them, so nothing
-      # failed — this step is the check that would have caught it.
+      # failed — this step is the check that would have caught it. The plugin
+      # host is the expensive one (the job's largest compile); every later
+      # step that needs the host reuses this build.
       - name: Build the declared NEMO binaries
         run: scripts/build-nemo-binaries.sh
 
@@ -208,7 +217,9 @@ jobs:
       # host process, a real native plugin loaded and activated through it, and
       # a managed call whose chain reaches the plugin's registration inside the
       # child. This is Phase 1 of the plugin-host workstream; it proves the
-      # process boundary, not capability mediation.
+      # process boundary, not capability mediation. The runtime and host
+      # binaries come from the steps above; the step adds the test plugin
+      # fixture, which builds in its own small target directory.
       - name: Prove the plugin-host composition
         run: scripts/test-nemo-plugin-host.sh
 
