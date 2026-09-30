@@ -194,6 +194,16 @@ jobs:
       - name: Build the declared NEMO binaries
         run: scripts/build-nemo-binaries.sh
 
+      # The distribution must assemble and its component manifest must bind
+      # every component it carries: the CLI, the runtime, the plugin host, the
+      # capability schema, the registry envelope, and the transfer manifest.
+      # Debug binaries keep the job fast; the assembly and the binding are the
+      # same either way.
+      - name: Assemble the distribution and verify its component manifest
+        env:
+          NEMO_DIST_PROFILE: debug
+        run: scripts/build-nemo-distribution.sh
+
       # The reference side. These suites — the conformance corpus, the
       # adversarial cases, framing, snapshot verification, and the schema
       # binding — are what the Rust path is compared against, so they have to
