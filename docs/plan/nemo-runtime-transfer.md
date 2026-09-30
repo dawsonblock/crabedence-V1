@@ -44,7 +44,7 @@ excludes `target/`, caches, `node_modules`, and editor state.
 | 0 — vendor | Done | `runtimes/nemo-relay/` (1438 source files, no build artifacts); a recursive diff against the source copy reports exactly two differing files (`Cargo.toml`, `Cargo.lock`); provenance and fingerprint in `runtimes/nemo-relay/TRANSFER-PROVENANCE.md` |
 | 1 — bridge | Done | `runtimes/nemo-relay/bridges/nemo-crabedence/`: `abi.rs`, `transport.rs`, `capability_snapshot.rs`, `outcome_mapping.rs`, `execution_port.rs`; 56 unit tests, 1 corpus conformance test, 5 schema-binding tests, 5 env-gated live tests |
 | 2 — trust enforcement | Partial | Bridge-level invariants enforced and tested (unregistered capability, class mismatch, route mismatch, no policy field on the wire), the effect-isolation invariant holds at the router, and both run in CI (the `NEMO integration` job). What is *not* exercised end to end is a full NEMO runtime instance routing through `EffectRouter` — integration work. This row previously named NEMO's `BackendRouter` wiring as the remainder, which finding 6 corrected: that composition is not merely unwired, it is the wrong one |
-| 3 — conformance | Partial | The Rust validator matches the shared invocation corpus exactly (11 accepted, 32 rejected), the live kernel's refusal phrases match word-for-word, and the outcome corpus is shared across Go, TypeScript, and Rust. Covered against the live kernel from the NEMO side: a LOCAL-route refusal, a MUTATION commit with evidence, missing authority (`UNAUTHORIZED`), an unresolvable authority reference (`UNAUTHORIZED`, definitive and non-retryable), an expired authority reference (`UNAUTHORIZED`, definitive and non-retryable), a lost response mapping to `UNKNOWN`, snapshot tampering, and same-key replay. Two of these need orchestration the Rust test cannot own, so scripts hold the timing and the tests assert only the outcome: `scripts/test-nemo-expired-authority.sh` issues a short-lived grant, lets it lapse, then asserts the refusal; `scripts/test-nemo-restart-idempotency.sh` dispatches twice, restarts the kernel on the same store, dispatches twice again with the same key, and asserts one effect. Neither test sleeps on a clock. Not covered, and each for a stated reason: plugin host crash, hang, malformed reply, and registration rejection have no NEMO plugin host in the integration path (blocker 2's remainder is a full runtime instance routing through `EffectRouter`); provider crash is qualified Go-side by the kernel's own crash-point matrix, which SIGKILLs real provider processes; CRITICAL and the PURE/READ crossings cannot be exercised through the bridge at all, because the qualification registry that carries them is digest-only — see finding 4 |
+| 3 — conformance | Partial | The Rust validator matches the shared invocation corpus exactly (11 accepted, 32 rejected), the live kernel's refusal phrases match word-for-word, and the outcome corpus is shared across Go, TypeScript, and Rust. Covered against the live kernel from the NEMO side: a LOCAL-route refusal, a MUTATION commit with evidence, missing authority (`UNAUTHORIZED`), an unresolvable authority reference (`UNAUTHORIZED`, definitive and non-retryable), an expired authority reference (`UNAUTHORIZED`, definitive and non-retryable), a lost response mapping to `UNKNOWN`, snapshot tampering, same-key replay, and a CRITICAL commit carrying evidence. Two of these need orchestration the Rust test cannot own, so scripts hold the timing and the tests assert only the outcome: `scripts/test-nemo-expired-authority.sh` issues a short-lived grant, lets it lapse, then asserts the refusal; `scripts/test-nemo-restart-idempotency.sh` dispatches twice, restarts the kernel on the same store, dispatches twice again with the same key, and asserts one effect. Neither test sleeps on a clock. Not covered, and each for a stated reason: plugin host crash, hang, malformed reply, and registration rejection have no NEMO plugin host in the integration path (blocker 2's remainder is a full runtime instance routing through `EffectRouter`); provider crash is qualified Go-side by the kernel's own crash-point matrix, which SIGKILLs real provider processes; CRITICAL is now covered end to end by `scripts/test-nemo-critical-path.sh`, which wires the qualification provider so the bridge's evidence rule meets a real commit; the PURE and READ crossings are not, because the qualification extension adds only CRITICAL and no capability is pinned to the `CRABEDENCE` route for those classes — see finding 4 |
 | — reference kernel | Retired | Renamed to `nemo/registry-snapshot/`, decoupled from the loader, then deleted once the suite passed without it; the README now records where each removed behavior lives |
 | — canonical schema | Done | `schemas/capability-invocation-v1.json` describes the frozen wire contract; Go, TypeScript, and Rust each carry a test that binds their implementation to it, so a field added on one side and not the others fails CI |
 | — effect router | Done at the routing layer | `runtimes/nemo-relay/bridges/nemo-effect-router/`: `EffectRouter` resolves the path from the verified **route** (not the class, which is what NeMo Relay's own router uses), fails closed on an unwired read path, and holds the effect-isolation invariant. 7 routing tests and 6 isolation tests, including one that runs against a live registry |
@@ -104,27 +104,28 @@ grant — committed a mutation with `SUCCEEDED` and receipt version 3 evidence.
    resolvable by the service started the same way. Verified end to end: a grant
    issued by the tool against SQLite was accepted by a running service and
    committed a mutation through the Rust bridge.
-4. **The built-in registry cannot exercise every gate scenario — and the
-   mechanism that could is digest-only.** It carries no CRITICAL capability, and
-   only one CRABEDENCE-routed mutation (`test.counter.increment`); `system.echo`
-   and `system.info` are pinned `LOCAL` and `DIRECT`. So "NEMO → Crabedence
-   PURE / READ / CRITICAL" has nothing to dispatch.
+4. **The built-in registry cannot exercise every gate scenario — CRITICAL is
+   now covered, PURE/READ are not.** The release registry carries no CRITICAL
+   capability and only one CRABEDENCE-routed mutation
+   (`test.counter.increment`); `system.echo` and `system.info` are pinned
+   `LOCAL` and `DIRECT`.
 
-   The capability that would serve CRITICAL already exists —
-   `qualification.critical.commit`, registered by
-   `RegisterQualificationCapabilities` — but that function's only caller is
-   `cmd/registry-digest`. The qualification registry is built for evidence
-   identity, not for a running service, and there is no env gate that starts
-   `serve-exec` with it. That is deliberate: the extension exists "solely to
-   test the implementation", and the release registry must never advertise such
-   a capability.
+   **Correction.** This finding previously claimed the qualification registry was
+   digest-only with no runtime gate, and that closing CRITICAL would need a new
+   qualification mode on the service. That was wrong. The gate already exists:
+   `CRABEDENCE_QUAL_PROVIDER_URL` wires the external qualification provider
+   (`cmd/qual-provider`) and registers `qualification.critical.commit` as an
+   explicit extension of the release registry, failing closed if the provider is
+   unreachable. `scripts/test-nemo-critical-path.sh` starts that provider and a
+   service using it, issues a grant, and dispatches the CRITICAL capability
+   through the Rust bridge — which is the only check that exercises the bridge's
+   `requires_evidence` rule against a real commit rather than a fixture. It
+   passes, with a real evidence digest.
 
-   Closing this therefore needs a **runtime qualification mode** on the service
-   — a deliberate change to what a running service can serve, which changes that
-   service's registry digest and therefore its evidence identity. It is not
-   made here. Until it is, the Rust bridge's CRITICAL path is covered by unit
-   tests and the shared outcome corpus but never exercised over the wire, and
-   that gap is stated rather than implied.
+   What remains genuinely uncovered is "NEMO → Crabedence PURE" and "READ": the
+   qualification extension adds only CRITICAL, so a PURE or READ capability
+   pinned to the `CRABEDENCE` route has no representative to dispatch. That is a
+   registry-coverage gap of one or two descriptors, not a service change.
 5. **The sketched ABI additions would be a breaking change.** The consolidation
    sketch proposes a request carrying `abi_version` and `request_id` with
    `principal` and `authority_ref` at the top level. The frozen contract has no

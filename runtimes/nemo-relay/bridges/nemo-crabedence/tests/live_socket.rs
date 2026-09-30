@@ -258,6 +258,58 @@ fn refuses_an_authority_reference_that_does_not_resolve() {
     assert!(!error.reconciliation_required, "{error}");
 }
 
+/// A CRITICAL commit carries evidence across the wire, and the bridge accepts it.
+///
+/// The built-in registry has no CRITICAL capability, so this needs the service
+/// started with the qualification extension
+/// (`CRABEDENCE_QUAL_PROVIDER_URL`). It is the only check that exercises the
+/// bridge's `requires_evidence` path against a real commit rather than a
+/// fixture: a CRITICAL `SUCCEEDED` without a valid digest, receipt version 3,
+/// and run id must map to `UNKNOWN`, so an accepted commit proves the whole
+/// evidence contract survived the boundary.
+#[test]
+fn commits_a_critical_mutation_with_evidence() {
+    let Some(socket) = live_socket() else {
+        return;
+    };
+    let Some(grant) = std::env::var_os("NEMO_CRABEDENCE_LIVE_CRITICAL_GRANT") else {
+        eprintln!(
+            "skipping the CRITICAL check: set NEMO_CRABEDENCE_LIVE_CRITICAL_GRANT to a grant \
+             reference for qualification.critical.commit, issued against a service started with \
+             CRABEDENCE_QUAL_PROVIDER_URL"
+        );
+        return;
+    };
+    let catalog = load_catalog_from_path(&snapshot_path(&socket)).expect("verified");
+    let port = NemoCrabedenceExecutionPort::new(ExecutionSocketClient::new(&socket), catalog);
+
+    let mut request = request_for("qualification.critical.commit", ExecutionClass::Critical);
+    request.grant = Some(grant.to_string_lossy().into_owned());
+    request.identity.idempotency_key = format!("critical-{}", std::process::id());
+    // The capability's schema requires `operation` and forbids extras, so the
+    // kernel's own argument validation is exercised here too.
+    request.args = serde_json::json!({ "operation": "nemo-bridge-commit" });
+
+    let result = port
+        .execute(&request)
+        .unwrap_or_else(|error| panic!("the CRITICAL commit must succeed, got {error}"));
+    assert_eq!(
+        result.outcome_certainty,
+        OutcomeCertainty::ConfirmedSuccess,
+        "a committed CRITICAL must be a confirmed success"
+    );
+    let digest = result
+        .receipt_digest
+        .as_deref()
+        .expect("a CRITICAL commit must carry an evidence digest");
+    assert_eq!(
+        digest.len(),
+        64,
+        "the evidence digest is a SHA-256 hex string"
+    );
+    println!("critical commit: evidence digest {}", &digest[..16]);
+}
+
 /// An authority reference that has lapsed is refused definitively.
 ///
 /// Gated separately from the other live checks because it needs a grant that
