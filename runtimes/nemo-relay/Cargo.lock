@@ -1779,6 +1779,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nemo-crabedence-runtime"
+version = "0.9.1-rc.4"
+dependencies = [
+ "nemo-crabedence-bridge",
+ "nemo-effect-router",
+ "nemo-relay-executor",
+ "serde_json",
+]
+
+[[package]]
 name = "nemo-effect-qualification"
 version = "0.9.1-rc.4"
 dependencies = [
