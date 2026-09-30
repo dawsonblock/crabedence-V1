@@ -1,0 +1,450 @@
+---
+title: "Hardened runtime qualification"
+description: "Qualification boundaries and reliability controls in the NeMo Relay 0.9.1 hardened development line."
+position: 8
+---
+{/* SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0 */}
+
+The hardened development line adds runtime controls and qualification evidence
+without treating scaffolding as enforcement. Run
+`scripts/qualification/run.sh` inside the pinned `.devcontainer` to create the
+machine-readable reports in `qualification/`.
+
+The subscriber dispatcher uses a bounded queue with reserved capacity for
+scope, lifecycle, security, authority, and audit events. Lower-priority events
+are dropped with an explicit warning when that reserve is needed; high-priority
+events apply backpressure. Queue counters are available as
+`relay_event_queue_depth`, `relay_event_queue_capacity`,
+`relay_event_queue_high_watermark`, `relay_events_enqueued_total`,
+`relay_events_dropped_total`, and `relay_events_backpressured_total` in the
+Rust, Python, and Node APIs. `flush_subscribers()` remains the graceful drain
+barrier for queued callbacks and terminal publications.
+
+`plugins validate` reports `policy_mode = effective` by default and applies
+secure activation defaults (`required` startup and `signature_required`
+attestation) before evaluating the manifest. Pass `--declared` only when you
+need to inspect configuration without those runtime defaults. `--effective`
+remains accepted for script compatibility.
+
+All asynchronous runtime queues are required to have an explicit capacity and
+overflow policy. The current capacities, producer/consumer ownership, and
+shutdown behavior are tracked in [the queue inventory](../queue-inventory.md).
+The corresponding mutable registries and per-runtime isolation rules are
+tracked in [the runtime global-state inventory](../runtime-global-state.md).
+Telemetry may be dropped with metrics; lifecycle, security, and execution
+traffic uses backpressure or an explicit rejection path. Nested subscriber
+publications are capped as well, so a callback cannot bypass the dispatcher
+bound by emitting an unbounded event storm.
+
+Response-cache identity is explicit and fail-closed. The default session
+partition includes the root scope and trusted policy epoch; principal and
+tenant modes require an immutable `RuntimeIdentity` installed by an
+authentication boundary. Ordinary scope metadata is ignored for cache
+partitioning. Buffered LLM and tool misses use process-local single-flight
+coalescing. Cache writes expose `flush_cache_writes()` and
+`wait_for_cache_idle()` for deterministic shutdown.
+
+Qualification is provenance-bound. The harness writes `source-manifest.json`,
+`source-tree.sha256`, `environment-lock.json`, and lockfile digests before it
+runs checks, then verifies that same source manifest after the checks finish.
+The verifier enumerates the filesystem directly and compares exact entry sets,
+so an entry that the manifest does not list cannot verify: new files, deleted
+files, symlinks replaced by regular files, changed symlink targets, and changed
+mode bits are all hard failures. Symlink targets must stay inside the tree.
+Ignore rules are read from the tree's own `.gitignore` files rather than
+delegated to `git ls-files`, so a Git checkout and an extracted archive with the
+same contents enumerate identically. A source change invalidates the
+certificate rather than inheriting a previous `PASS`; a manifest written under
+the previous flat schema is rejected instead of upgraded. Missing prerequisites
+are recorded as `NOT_RUN` with a reason; they do not become a test failure or an
+implicit pass. A report with any `NOT_RUN` or `INCONCLUSIVE` check remains
+`DEV`/`INCONCLUSIVE` and is not a release certificate.
+
+Promotion is the highest tier whose evidence is actually present:
+`DEV_PASS` (tests passed in a recorded environment), `QUALIFIED_LOCAL` (that
+environment is reproduced exactly on the verifying host), `QUALIFIED_CI` (clean
+checkout on the pinned Linux release environment with a fresh database and the
+full mandatory matrix), `QUALIFIED_FAILURE` (plus fault injection and recovery),
+`PRODUCTION_CANDIDATE` (plus real authority, providers, recovery supervisor,
+isolation, DLP, and HA database evidence, signed), and `PRODUCTION_RELEASE`
+(bound to one exact final artifact). The pinned release environment lives in
+`scripts/qualification/release-environment.json`. A macOS workstation can reach
+`QUALIFIED_LOCAL`; it cannot emit `QUALIFIED_CI` or a production tier, and
+`qualification.json` records the reason each withheld tier was withheld.
+
+Every artifact a run produces is hashed into `evidence-manifest.json`, together
+with a DSSE envelope carrying an in-toto statement. Set
+`NEMO_RELAY_EVIDENCE_SIGN` to request a keyless cosign signature from the ambient
+CI identity and never store a signing key in the repository; an unsigned bundle
+is recorded as `UNSIGNED` and withholds the production tiers. Verify a bundle
+with `just evidence-verify`, the source manifest with `just provenance-check`,
+and the mandatory provenance tests with `just test-qualification-scripts`.
+See [the E3 baseline](../e3-baseline.md) for the current qualification status,
+which is `UNQUALIFIED`.
+
+A valid full qualification also requires live PostgreSQL
+conformance, concurrency, fresh-store restart, and process-kill recovery
+checks. The crash gate kills a child process after the action lock, receipt
+insertion, action update, immediately before commit, and immediately after
+commit. Recovery from a fresh process must observe either the complete
+pre-transaction state or the complete committed state. When a PostgreSQL test
+URL is supplied, the qualification environment record captures the server
+version used for those gates.
+
+Schema verification inspects the physical database rather than the migration
+ledger alone, and it is split so a failure names the fact that failed:
+`verify_migration_history()`, `verify_physical_schema()`,
+`verify_runtime_privileges()`, and the aggregate
+`verify_database_readiness()`. The physical check builds a canonical
+description (`nemo.effect-store.pg.v1`) of the effect-store relations from the
+PostgreSQL catalogs - columns, types, nullability, defaults and generated
+expressions, constraints, indexes and their predicates, and triggers - and
+compares it against the description recorded when the migrations ran. A dropped
+index, a retyped column, a removed `NOT NULL`, a changed generated expression, a
+dropped table, an added trigger, a changed index predicate, or a rewritten
+foreign key fails verification even when `effect_schema_migrations` is
+untouched, and the failure names the object kind that drifted. Object *data*,
+OIDs, and creation order are excluded, so recording the expected description
+inside the schema creates no self-reference.
+
+Migrations own their objects. `0001_effect_store.sql` creates tables and indexes
+without `IF NOT EXISTS`, so a conflicting pre-existing object fails the
+migration instead of being adopted, and a migration refuses to claim a schema
+that already contains relations it does not own. The physical fingerprint is
+computed and recorded inside the migration transaction before the migration
+version is recorded, so a process killed between the DDL and the ledger write
+rolls back both.
+
+Runtime and migration credentials are separate. Production startup calls
+`verify_runtime_privileges`, which fails readiness when the connected role can
+`CREATE` in the effect schema or write to `effect_schema_migrations` or
+`effect_schema_state`. A runtime credential that can rewrite the ledger it
+trusts can hide drift from every later check.
+
+The role check covers the powers that need no grant as well as the ones that
+do. A runtime role is rejected for `SUPERUSER`, `BYPASSRLS`, and `CREATEROLE`,
+and for owning the effect schema or any effect-store relation, because
+ownership conveys powers that an ordinary `GRANT` list never shows.
+
+Readiness also compares the server's settings against a policy instead of only
+reporting them. `DatabaseReadinessPolicy` requires a server at or above the
+qualified major version, a `synchronous_commit` that keeps a committed write
+durable, and a transaction isolation level the runtime accepts, so a database
+running `synchronous_commit = off` no longer passes. Wait timeouts and the
+session time zone are reported but deliberately not enforced: the adapter sets
+statement and lock timeouts on every checked-out session from the action
+budget, so the server defaults are not the binding constraint.
+
+PostgreSQL waits are bounded by the action, not only by a fixed maximum. The
+configured budgets remain upper bounds, and
+`PostgresOperationBudgets::for_remaining` derives
+`lock_timeout = min(configured_lock, remaining / 3)` and
+`statement_timeout = min(configured_statement, remaining)` from the trusted
+remaining action budget. `PostgresEffectStore::with_deadline` returns a handle
+sharing the same pool but carrying a trusted deadline, so every call made
+through it is bounded by what is left of that deadline without changing the
+shared store traits.
+
+The kernel reaches that path for terminal receipt finalization, which is the
+last place a database wait can outlive the action it serves. `EffectStore` has
+a budget-aware finalization form whose default implementation delegates to the
+plain one, so a store that cannot block stays valid, and the PostgreSQL adapter
+overrides it to derive its waits from what is left. When the trusted deadline
+has already passed, the kernel does not call the store at all: it records the
+action as `UNKNOWN` for reconciliation rather than handing over a zero budget
+that would fail inside the transaction it was meant to bound.
+
+The authority, ledger, and executor crates provide experimental kernel
+contracts and adapter boundaries. Production authority enforcement, durable
+action/receipt storage, isolation enforcement, and outbound DLP remain
+external and unconfigured in this development release.
+
+### Trusted computing base budget
+
+`security/tcb.toml` names the crates whose failure could directly violate the
+kernel guarantees and records what they are allowed to reach. It defines two
+tiers, because "code that enforces an invariant" and "code that can subvert one"
+are different questions: the crates that enforce an invariant, and every
+additional crate linked into the same process. Both are measured, since the
+second is the real attack surface until process isolation exists.
+
+`just tcb-report` measures the resolved dependency tree with
+`cargo tree --all-features`, counts source lines and `unsafe` occurrences, and
+fails when a trusted crate reaches a database driver or a foreign-function
+binding, or when any budget grows. Alongside the ceilings, each crate's direct
+and transitive dependency sets are pinned by digest, so swapping a harmless
+package for a dangerous one cannot pass by keeping the count the same. Source
+counts are upper bounds that include inline test modules.
+
+`security/INVARIANTS.md` records the properties the kernel protects and where
+each one is enforced, including the ones that are not yet enforced. It is the
+reference for deciding what may move out of the kernel, since a component earns
+a place there only by enforcing one of those properties. `security/BASELINE.md`
+records the frozen revision and digests the refactor is measured against.
+
+`security/layers.toml` places every workspace crate in a layer, and
+`just layer-report` fails when a dependency points upward. Edges that point the
+wrong way today are recorded as grandfathered, so the check is green on arrival.
+A grandfathered entry that no longer describes a real edge fails too, so the
+layer debt can only shrink and an exception cannot be reused by a later
+regression.
+
+`security/PLUGIN-ISOLATION.md` records the milestone that moves native plugin
+loading across a process boundary. Almost all of the kernel's `unsafe` is the
+native plugin path, and relocating that loader to another crate would leave the
+same code in the same address space, so the milestone is judged on
+`kernel-process unsafe tokens` from `just tcb-report` rather than on crate
+organisation. The message contract already exists in
+`crates/plugin-protocol`; the kernel does not depend on it yet.
+
+## Experimental effect-state contracts
+
+The opt-in kernel contracts use one consequential-effect vocabulary:
+`PROPOSED`, `AUTHORIZED`, `PREPARED`, `DISPATCHING`, `COMMITTED`, `FAILED`,
+`UNKNOWN`, `RECONCILING`, and `CANCELLED`. An external `ActionStore` claims an
+idempotency key in `PROPOSED`; a verified authority grant is bound atomically
+with `PROPOSED → AUTHORIZED`, then the kernel advances the action to
+`PREPARED`. Restarted `AUTHORIZED` and `PREPARED` actions can obtain a fresh
+grant for the same immutable action before continuing; raw arguments are not
+reconstructed from the kernel's action record.
+
+`COMMITTED` is only written after an external execution backend returns a
+receipt that binds the action, idempotency key, runtime identity and
+environment/session binding digest, capability generation, admission, policy,
+route, arguments, and grant. If dispatch may
+have crossed the provider boundary, or if durable receipt/state persistence
+cannot prove a terminal result, the kernel records `UNKNOWN` and returns a
+typed reconciliation-required outcome.
+
+`COMMITTED` and reconciliation-derived `FAILED` both require authoritative
+persisted evidence. An `ActionStatus` distinguishes its last observed durable
+state from an intended state that could not be persisted, and exposes a
+state-specific next action such as retrying authority, resuming pre-dispatch
+work, recovering, reconciling, or returning a receipt. It never presents an
+unpersisted intended state as durable fact.
+
+`MUTATION` and `CRITICAL` invocations require a stable caller `request_id`.
+The kernel scopes that retry identity to the authenticated tenant and
+principal, claims one durable logical action, and returns that real action ID
+on every pending, unknown, or recovery-required outcome. Retrying the same
+request therefore resumes or observes the original action rather than
+silently creating another dispatch. Dispatch and reconciliation transitions
+require a fenced external `ActionLease` containing an owner, generation, and
+expiry. A recovery worker can take over only after that lease expires, so it
+cannot turn a live dispatch into spurious ambiguity. A stale `DISPATCHING`
+action can be recovered only from a fully bound persisted receipt; otherwise
+it becomes `UNKNOWN` and must be reconciled. A stale `RECONCILING` action
+returns to `UNKNOWN` under the same fencing rule. The action record retains
+the highest issued lease generation even after a lease is released, so a later
+owner cannot reuse a previous fencing token. While another lease is live, the
+kernel returns `WAIT_FOR_OWNER` rather than suggesting recovery or redispatch.
+
+### Lease, receipt, and recovery contract
+
+The experimental `ActionStore` contract is the authority for lease time. A
+caller can request a bounded lease duration, but cannot supply `now`, an
+expiry, or any other authoritative timestamp. The store obtains time from its
+own clock and applies `LeaseConfiguration` (default duration, maximum
+duration, and whether renewal is enabled). A renewal is compare-and-swap-like:
+only the exact current owner and fencing generation may renew a still-valid
+lease. An expired or replaced lease returns `LEASE_LOST`; it never gives a
+previous worker renewed authority.
+
+Before dispatch or provider reconciliation, the kernel requests a lease long
+enough to cover the bounded backend deadline plus a safety margin. The store
+may reject that request when its maximum duration cannot cover the work. The
+kernel renews the exact fenced lease immediately before the provider call and
+passes the same deadline to the backend or reconciliation provider. Backends
+must honor that kernel-owned deadline; a synchronous backend that cannot honor
+it is not a valid implementation of this contract. The runtime does not
+promise a background renewal daemon: long-running renewal policy remains
+owned by the external Effect Fabric implementation.
+
+Lease operations return typed outcomes rather than boolean success:
+`ACQUIRED`, `EXPIRED_RECLAIMED`, `HELD_BY_OTHER`, `RENEWED`, and
+`LEASE_LOST`. A `PREPARED` action with a live lease is not available for retry,
+cancellation, or a second executor. Lease expiry grants permission to examine
+evidence and recover; it is not evidence that a previous dispatch did nothing.
+
+`ReceiptStore::finalize` is append-only and accepts only structurally complete
+`COMMITTED` or `FAILED` receipts with a non-empty evidence digest. Receipt identity is canonical: it
+includes the action/security/provider evidence bindings but excludes a local
+receipt ID and collection timestamps, so a recovery worker can replay the
+same provider evidence idempotently. A materially different finalization for
+the same action returns `FINALIZATION_CONFLICT`, records one canonical
+immutable conflict history entry, and must not overwrite the first receipt.
+Repeating that exact contradiction returns `CONFLICT_ALREADY_RECORDED` rather
+than multiplying forensic records. This makes contradictory terminal evidence
+visible to the caller instead of silently rewriting action history. The
+generic state-transition API cannot write `COMMITTED` or externally meaningful
+`FAILED`. `ActionStore::finalize_pre_dispatch_failure` may write only
+`DISPATCHING → FAILED` from a bound proof that dispatch never crossed the
+external effect boundary. It accepts no receipt type. Every receipt-derived
+terminal state, including `COMMITTED`, must use
+`EffectStore::finalize_terminal_receipt` or reconciliation finalization, which
+persists the primary receipt and fenced action transition atomically. Lifecycle
+legality and method legality are separate contracts: `authorize_action` alone may write
+`PROPOSED → AUTHORIZED`; generic transition alone may write
+`AUTHORIZED → PREPARED` or pre-dispatch cancellation; and only a live fenced
+lease may write dispatch, reconciliation, or uncertainty transitions. A
+missing, empty, or whitespace-only grant digest blocks authorization,
+preparation, and terminal-evidence construction.
+
+New `PROPOSED` claims must not carry a grant digest or approval reference;
+only `authorize_action` may attach them. An action-ID collision is a typed
+conflict and must never overwrite an existing durable action.
+
+For a real durable adapter, the kernel consumes one `DurableEffectStore` for
+the entire consequential lifecycle. Terminal receipt persistence and the
+fenced action transition are one `EffectStore::finalize_terminal_receipt`
+operation. The same contract provides an `EvidenceSnapshot` containing the
+action, primary receipt, retained conflicts, and a monotonic evidence revision.
+Writable action or receipt sub-stores are not exposed by the aggregate reference
+implementation, and the lifecycle API has no receipt-finalization operation, so
+receipt-derived terminal writes cannot bypass the transactional boundary.
+
+Post-terminal evidence uses `observe_terminal_evidence`, not terminal
+finalization. Exact evidence is idempotent. Contradictory evidence appends one
+deduplicated conflict and advances the evidence revision without replacing the
+primary receipt or rewriting the terminal action state. Observation cannot
+establish a missing primary receipt; that remains exclusive to fenced
+finalization.
+
+Reconciliation uses `begin_reconciliation` to validate its lease, inspect one
+consistent evidence view, and transition `UNKNOWN → RECONCILING` atomically.
+Terminal or inconclusive completion must present the revision returned by that
+operation. If evidence changed while the provider was queried, completion fails
+closed and the worker reloads evidence before deciding again. Provider calls
+occur between store transactions; implementations must not hold a database
+transaction open across an external request.
+
+`InMemoryEffectStore` makes these ordering rules executable for tests only;
+its deterministic fault injector covers validation, staged receipt insertion,
+action terminalization, revision increment, and commit boundaries. Every
+injected failure must leave the complete pre-transaction snapshot, and the
+one-shot retry must be able to commit the complete terminal snapshot.
+
+The opt-in `unstable-postgres` feature provides `PostgresEffectStore` with a
+bounded connection pool and an idempotent migration for actions, primary
+receipts, and deduplicated conflicts. It locks the action row before lifecycle
+writes, uses `clock_timestamp()` for lease decisions, reads evidence under one
+repeatable-read snapshot, and commits terminal receipt, action state, lease
+release, and evidence revision in one transaction.
+
+Transport construction is explicit and fail-closed. `connect_verified_tls`
+requires a configured CA bundle, TCP hostname verification, and TLS 1.2 or
+newer. `connect_mutual_tls` adds a PKCS #12 client identity. Neither path honors
+a connection-string request to disable TLS. Plaintext is available only through
+`connect_local_socket` on Unix or the deliberately named
+`connect_insecure_local_for_tests`; the latter rejects every TCP host and
+`hostaddr` that is not loopback. There is no generic constructor that can
+silently downgrade a remote connection to plaintext. Certificate, hostname,
+expiry, and plaintext-endpoint behavior can be checked without a live database:
+
+```bash
+just test-postgres-transport-security
+```
+
+These connector tests establish local TLS policy and cryptographic handshake
+behavior. They do not yet qualify a deployed PostgreSQL TLS endpoint, certificate
+rotation, revocation, or the wider E3 distributed failure matrix.
+
+Run the same generic store suite against an isolated disposable schema with:
+
+```bash
+NEMO_RELAY_TEST_POSTGRES_URL='host=/tmp dbname=postgres user=postgres' \
+  just test-postgres-effect-store
+
+# Qualification records these gates separately.
+NEMO_RELAY_TEST_POSTGRES_URL='host=/tmp dbname=postgres user=postgres' \
+  just test-postgres-effect-store-concurrency
+NEMO_RELAY_TEST_POSTGRES_URL='host=/tmp dbname=postgres user=postgres' \
+  just test-postgres-effect-store-restart
+NEMO_RELAY_TEST_POSTGRES_URL='host=/tmp dbname=postgres user=postgres' \
+  just test-postgres-crash-recovery
+NEMO_RELAY_TEST_POSTGRES_URL='host=/tmp dbname=postgres user=postgres' \
+  just test-postgres-kernel-restart
+```
+
+The adapter remains experimental and disabled by default. The process-crash
+gate establishes atomic terminal-state recovery at the named PostgreSQL
+transaction boundaries. It does not establish the wider machine-reboot, OOM,
+network-loss, long-running provider, load, or real-provider crash matrix.
+The separate `nemo-effect-qualification-fixture` constructs the real kernel and
+PostgreSQL store with a qualification-only authority and persistent provider
+simulator. Its process-restart test kills execution after provider commit but
+before terminal receipt persistence, then uses a bounded store-owned candidate
+scan and fenced kernel recovery to reconcile without another provider effect.
+The fixture requires an explicit qualification acknowledgement and permits only
+local test PostgreSQL connections. It is not a production composition root,
+Correct-Once adapter, autonomous recovery service, or general deployment gate.
+
+### Durable runtime composition
+
+`nemo-effect-runtime` is the production composition boundary for deployments
+that supply real Correct-Once and Effect Fabric adapters. It constructs the
+kernel only after validating the stable runtime identity, connecting through a
+local Unix socket or verified TLS/mTLS, and verifying the versioned
+`effect_schema_migrations` ledger. Normal workers never call `migrate()`;
+that method is reserved for a dedicated migration role. Production mode rejects
+plaintext loopback PostgreSQL and identities whose environment is not
+`production`. The profile is not a field a caller sets next to the evidence:
+configurations are built by `production`, `qualification`, or `development`,
+and each constructor pairs its profile with the evidence that justifies it. A
+deployment therefore cannot hold a production identity while declaring a
+profile that skips production admission, and no contradictory combination is
+representable. Every profile then composes the kernel through a checked
+constructor.
+
+The adapter sets bounded pool-acquire, lock, statement, and idle-transaction
+budgets on checked-out PostgreSQL sessions. A timeout after provider dispatch
+still means `UNKNOWN`/reconciliation rather than permission to redispatch.
+This composition crate is not itself a Correct-Once implementation, provider
+registry, recovery scheduler, or production daemon.
+
+Recovery is evidence-aware. It checks persisted conflicts and terminal
+evidence before calling a provider reconciler, then distinguishes a live
+owner, fully bound terminal state, missing terminal evidence after lease
+expiry, and contradictory evidence. A primary receipt paired with a
+non-terminal action is an integrity violation rather than a state-repair path,
+because conforming stores make those writes atomic. Missing evidence remains
+`UNKNOWN` (or becomes recoverable under the external effect policy); it is
+never translated into `FAILED` merely because a worker disappeared. The
+in-memory stores and deterministic clocks are reference implementations for
+these contract tests only. They do not enable production durability.
+
+### Contract conformance testkit
+
+The `unstable-hardening-testkit` feature exposes backend-independent store
+conformance runners. An adapter supplies a fresh aggregate effect store plus a
+controller for its store-owned test clock, then runs the same lifecycle, lease,
+idempotency, immutable-receipt, conflict-history, stale-worker, and
+reconciliation-revision cases as the in-memory reference store. The generic
+mutation matrix exercises representative binding mismatches and asserts that
+rejected input cannot alter durable state or evidence history. Receipt replay
+and conflict tests independently mutate provider request identity, terminal
+state, and evidence digest. This suite is a contract gate; it does not by itself
+qualify production durability.
+
+An action's runtime binding digest canonically covers its stable runtime or
+deployment identity, environment, and session provenance. Deployments using
+durable actions must keep `runtime_id` stable across a process restart; it is
+not a per-process random identifier. Contradictory receipt evidence produces
+`REPAIR_EVIDENCE`, not ordinary reconciliation guidance. It requires an
+operator or the external evidence owner to resolve the integrity conflict.
+
+Retry policy is deliberately conservative: `FAILED` after confirmed
+pre-dispatch failure may be evaluated for a new attempt by the external effect
+system; `UNKNOWN` must never be automatically re-dispatched. An external
+reconciliation provider must resolve it with evidence to `COMMITTED`,
+`FAILED`, or remain `UNKNOWN`. Explicit authority denial cancels the claimed
+action; authority modification cancels it and returns structured constraints
+for a new invocation with a new identity. Effect Fabric owns dispatch and
+provider reconciliation; deployments may supply the opt-in PostgreSQL adapter
+or another conforming durable store for actions, leases, and evidence.
+
+The built-in `nemo_guardrails` component remains available for compatibility and
+is formally deprecated. New deployments should use current guardrail and
+intercept APIs; removal is deferred to the next breaking release with a
+migration notice.

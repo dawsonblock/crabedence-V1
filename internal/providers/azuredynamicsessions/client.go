@@ -441,22 +441,13 @@ func (c *azureDynamicSessionsClient) secureHTTPClient(source *http.Client) *http
 	if source == nil {
 		source = http.DefaultClient
 	}
-	client := *source
 	trusted, _ := url.Parse(c.endpoint)
-	originalCheckRedirect := source.CheckRedirect
-	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		if !sameOriginURL(trusted, req.URL) {
-			return fmt.Errorf("%s refused cross-origin redirect to %s", providerName, req.URL.Redacted())
-		}
-		if originalCheckRedirect != nil {
-			return originalCheckRedirect(req, via)
-		}
-		if len(via) >= 10 {
-			return errors.New("stopped after 10 redirects")
-		}
-		return nil
-	}
-	return &client
+	// The origin pin, the preserved hook, and the 10-redirect cap are the shared
+	// helper's — this was a byte-for-byte copy of it. Only the refusal text is
+	// provider-specific.
+	return shared.SecureHTTPClient(source, trusted, func(dest *url.URL) error {
+		return fmt.Errorf("%s refused cross-origin redirect to %s", providerName, dest.Redacted())
+	})
 }
 
 func (c *azureDynamicSessionsClient) nextURL(next string) (string, error) {

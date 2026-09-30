@@ -5,7 +5,7 @@
   "type": "module",
   "exports": {
     "./contracts": "./contracts/index.ts",
-    "./kernel": "./kernel/index.ts",
+    "./registry-snapshot": "./registry-snapshot/index.ts",
     "./adapters/crabedence": "./adapters/crabedence/index.ts"
   },
   "scripts": {

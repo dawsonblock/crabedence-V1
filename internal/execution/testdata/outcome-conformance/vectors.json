@@ -1,0 +1,146 @@
+{
+  "description": "Shared outcome conformance corpus. Each vector is one raw execution response; the TypeScript reference adapter and the Rust bridge must classify it identically, and the Go kernel's own post-dispatch table must agree for the vectors marked post_dispatch. Expectations are written in each implementation's native vocabulary: nemo_status is what a planner reports (TypeScript asserts it directly), outcome_certainty / dispatch_state / retryable / reconciliation_required are NeMo Relay's contract fields (the Rust bridge asserts them), and kernel_state is the durable state the kernel persists (the Go test asserts it via classifyPostDispatch).",
+  "vectors": [
+    {
+      "name": "succeeded",
+      "response": { "status": "SUCCEEDED", "result": { "ok": true } },
+      "shape": "accept",
+      "post_dispatch": true,
+      "kernel_state": "COMMITTED",
+      "nemo_status": "SUCCEEDED",
+      "outcome_certainty": "CONFIRMED_SUCCESS"
+    },
+    {
+      "name": "succeeded-with-evidence",
+      "response": {
+        "status": "SUCCEEDED",
+        "result": { "message_id": "msg_001" },
+        "evidence": {
+          "digest": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+          "receipt_version": 3
+        },
+        "execution": { "provider": "gmail", "run_id": "run_001" }
+      },
+      "shape": "accept",
+      "post_dispatch": true,
+      "kernel_state": "COMMITTED",
+      "nemo_status": "SUCCEEDED",
+      "outcome_certainty": "CONFIRMED_SUCCESS"
+    },
+    {
+      "name": "failed-definitive",
+      "response": {
+        "status": "FAILED",
+        "failure_code": "EXECUTION_FAILED",
+        "error": "provider rejected the request before dispatch",
+        "definitive_failure": true
+      },
+      "shape": "accept",
+      "post_dispatch": true,
+      "kernel_state": "FAILED",
+      "nemo_status": "FAILED",
+      "outcome_certainty": "CONFIRMED_FAILURE",
+      "dispatch_state": "NOT_DISPATCHED",
+      "retryable": true,
+      "reconciliation_required": false
+    },
+    {
+      "name": "failed-not-definitive",
+      "response": {
+        "status": "FAILED",
+        "failure_code": "EXECUTION_FAILED",
+        "error": "the provider did not confirm whether the effect occurred"
+      },
+      "shape": "accept",
+      "post_dispatch": true,
+      "kernel_state": "UNKNOWN",
+      "nemo_status": "UNKNOWN",
+      "outcome_certainty": "UNKNOWN",
+      "dispatch_state": "DISPATCH_ATTEMPTED",
+      "retryable": false,
+      "reconciliation_required": true
+    },
+    {
+      "name": "denied",
+      "response": {
+        "status": "DENIED",
+        "failure_code": "UNAUTHORIZED",
+        "error": "authority grant revoked"
+      },
+      "shape": "accept",
+      "post_dispatch": false,
+      "nemo_status": "DENIED",
+      "outcome_certainty": "CONFIRMED_FAILURE",
+      "dispatch_state": "NOT_DISPATCHED",
+      "retryable": false,
+      "reconciliation_required": false
+    },
+    {
+      "name": "unknown",
+      "response": {
+        "status": "UNKNOWN",
+        "failure_code": "EXECUTION_UNKNOWN",
+        "error": "lost connectivity after provider call"
+      },
+      "shape": "accept",
+      "post_dispatch": true,
+      "kernel_state": "UNKNOWN",
+      "nemo_status": "UNKNOWN",
+      "outcome_certainty": "UNKNOWN",
+      "dispatch_state": "DISPATCH_ATTEMPTED",
+      "retryable": false,
+      "reconciliation_required": true
+    },
+    {
+      "name": "in-flight",
+      "response": {
+        "status": "IN_FLIGHT",
+        "failure_code": "IN_FLIGHT",
+        "error": "the provider is still working"
+      },
+      "shape": "accept",
+      "post_dispatch": false,
+      "nemo_status": "UNKNOWN",
+      "outcome_certainty": "UNKNOWN",
+      "dispatch_state": "DISPATCH_ATTEMPTED",
+      "retryable": false,
+      "reconciliation_required": true
+    },
+    {
+      "name": "invalid-status",
+      "response": { "status": "MAYBE" },
+      "shape": "reject",
+      "error_contains": "status"
+    },
+    {
+      "name": "error-not-a-string",
+      "response": { "status": "FAILED", "error": 7 },
+      "shape": "reject",
+      "error_contains": "response.error must be a string"
+    },
+    {
+      "name": "definitive-failure-not-a-boolean",
+      "response": { "status": "FAILED", "definitive_failure": "yes" },
+      "shape": "reject",
+      "error_contains": "definitive_failure must be a boolean"
+    },
+    {
+      "name": "evidence-digest-not-hex",
+      "response": {
+        "status": "SUCCEEDED",
+        "evidence": { "digest": "not-a-digest" }
+      },
+      "shape": "reject",
+      "error_contains": "evidence.digest"
+    },
+    {
+      "name": "execution-missing-run-id",
+      "response": {
+        "status": "SUCCEEDED",
+        "execution": { "provider": "gmail" }
+      },
+      "shape": "reject",
+      "error_contains": "execution must have provider and run_id"
+    }
+  ]
+}

@@ -391,6 +391,20 @@ if [ "$(jq -r '.qualification_registry_sha256' "$EVIDENCE_DIR/qualification-regi
   exit 1
 fi
 
+# NeMo Relay runtime identity. A release ships two runtimes, and the source
+# commit identifies only one of them: the registry digest binds the capability
+# policy, and this binds the vendored NeMo Relay tree the distribution carries
+# — including the local integration crates and the MCP credential patch. Both
+# land in the evidence directory, so SHA256SUMS covers them and the manifest
+# digest and attestation carry them.
+go run ./cmd/nemo-runtime-digest -envelope > "$EVIDENCE_DIR/nemo-runtime.json"
+NEMO_RUNTIME_SHA256="$(jq -r '.nemo_runtime_sha256' "$EVIDENCE_DIR/nemo-runtime.json")"
+if [ -z "$NEMO_RUNTIME_SHA256" ] || [ "$NEMO_RUNTIME_SHA256" = "null" ]; then
+  echo "ERROR: NeMo Relay runtime envelope carries no digest — the release cannot bind the runtime it ships" >&2
+  exit 1
+fi
+echo "$NEMO_RUNTIME_SHA256" > "$EVIDENCE_DIR/nemo-runtime.sha256"
+
 # ─── Phase 10-12: Live PostgreSQL gates ────────────────────────────────────
 echo ""
 echo "=== Live PostgreSQL gates ==="

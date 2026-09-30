@@ -11,22 +11,6 @@ import (
 	"github.com/openclaw/crabbox/internal/execution"
 )
 
-// ExecutionRequest is the wire-format request for the `crabbox exec` command.
-type ExecutionRequest struct {
-	Capability     string          `json:"capability"`
-	Arguments      json.RawMessage `json:"arguments"`
-	Authority      ExecutionAuth   `json:"authority"`
-	IdempotencyKey string          `json:"idempotency_key,omitempty"`
-	Deadline       string          `json:"deadline,omitempty"`
-	ExecutionClass string          `json:"execution_class,omitempty"`
-}
-
-// ExecutionAuth is the authority reference in the wire request.
-type ExecutionAuth struct {
-	Principal string `json:"principal"`
-	GrantID   string `json:"grant_id"`
-}
-
 // ExecutionResponse is the wire-format response from `crabbox exec`.
 type ExecutionResponse struct {
 	Status      string                `json:"status"`
@@ -85,32 +69,25 @@ func (a App) execCommand(ctx context.Context, args []string, timeout time.Durati
 		})
 	}
 
-	var req ExecutionRequest
-	if err := json.Unmarshal(data, &req); err != nil {
+	// The stdin request is parsed under the same strict ABI rules the
+	// execution service applies to the socket. A permissive decode here
+	// would silently rewrite what the planner sent — dropping unknown
+	// fields, keeping the last duplicate key, and losing `authority_ref`
+	// in favor of the deprecated `grant_id` alias — so the planner could
+	// not tell that its request had been changed.
+	req, err := execution.ParseInvocationRequest(data)
+	if err != nil {
 		return writeExecResponse(a.Stdout, ExecutionResponse{
 			Status:      "FAILED",
 			FailureCode: string(capability.FailureInvalidRequest),
-			Error:       fmt.Sprintf("failed to parse request: %v", err),
+			Error:       fmt.Sprintf("invalid request: %v", err),
 		})
 	}
 
-	// Build the execution service request (same wire format as invoke).
 	// The wire ABI requires arguments to be a JSON object; a request
 	// without arguments carries the empty object, never null.
-	wireArgs := req.Arguments
-	if len(wireArgs) == 0 {
-		wireArgs = json.RawMessage(`{}`)
-	}
-	execReq := execution.Request{
-		Capability: req.Capability,
-		Arguments:  wireArgs,
-		Authority: execution.RequestAuthority{
-			Principal:    req.Authority.Principal,
-			AuthorityRef: req.Authority.GrantID,
-		},
-		ExecutionClass: req.ExecutionClass,
-		IdempotencyKey: req.IdempotencyKey,
-		Deadline:       req.Deadline,
+	if len(req.Arguments) == 0 {
+		req.Arguments = json.RawMessage(`{}`)
 	}
 
 	// Connect to the persistent execution service and send the request
@@ -118,7 +95,7 @@ func (a App) execCommand(ctx context.Context, args []string, timeout time.Durati
 	// against the dispatch boundary.
 	socketPath := a.defaultExecutionSocketPath()
 	client := execution.NewClient(socketPath, execution.ClientOptions{Timeout: timeout})
-	resp, err := client.Invoke(ctx, execReq)
+	resp, err := client.Invoke(ctx, req)
 	if err != nil {
 		if execution.AmbiguousOutcome(err) {
 			// The request was transmitted; the outcome is unknown.

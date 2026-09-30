@@ -1,0 +1,79 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://crabedence.dev/schemas/capability-invocation-v1.json",
+  "title": "Capability Invocation ABI v1",
+  "description": "The frozen semantic contract between a planning/reasoning runtime and the Crabedence execution kernel. Normative prose: docs/spec/capability-invocation-abi.md. The structural rules (R1-R8: valid UTF-8, exactly one JSON value, root is an object, no duplicate keys, nesting depth <= 64, known fields only, no explicit null for a known field, declared types) are enforced by internal/execution/invocation_abi.go, nemo/contracts/invocation-abi.ts, and runtimes/nemo-relay/bridges/nemo-crabedence/src/abi.rs. All three are bound to this file by tests; a field added here and not there (or the reverse) fails CI. There is deliberately no abi_version field: the semantic contract is enforced by the capability registry, not a version tag on the wire, and an unknown field is refused rather than ignored.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "capability": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Registered capability identifier. The registry resolves everything else about it."
+    },
+    "arguments": {
+      "type": "object",
+      "description": "Arguments for the capability, validated server-side against the registered argument schema under the exact-number JSON Schema model. Omit rather than send null."
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Identity and authorization material. Required at admission: an invocation whose capability pins an authority policy needs a resolvable authority_ref.",
+      "properties": {
+        "principal": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Requesting principal. A claim unless the deployment enables peer authentication (CRABEDENCE_PEER_PRINCIPALS), which maps the Unix peer UID and replaces the claim before admission."
+        },
+        "authority_ref": {
+          "type": "string",
+          "description": "Opaque bearer reference to authority material. Treat as a credential: never log it. The ABI does not prescribe the mechanism (grant today; capability token, workload identity, or signed assertion later)."
+        },
+        "grant_id": {
+          "type": "string",
+          "description": "Deprecated alias for authority_ref, accepted for backward compatibility and mapped to authority_ref when that field is absent."
+        },
+        "authority_generation": {
+          "type": "integer",
+          "minimum": -9223372036854775808,
+          "maximum": 9223372036854775807,
+          "description": "Server-assigned binding of the exact immutable authority material. Accepted from the caller and overwritten by the server from the resolved grant; a caller can neither forge nor omit it."
+        },
+        "authority_digest": {
+          "type": "string",
+          "description": "Server-assigned digest of the resolved grant. Accepted from the caller and overwritten by the server."
+        }
+      }
+    },
+    "execution_class": {
+      "type": "string",
+      "enum": ["PURE", "READ", "MUTATION", "CRITICAL"],
+      "description": "Advisory caller assertion only. The registry's pinned class is authoritative; a mismatch is denied rather than honored."
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Required for MUTATION and CRITICAL capabilities. Durable idempotency is the kernel's, not the planner's."
+    },
+    "deadline": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC3339 timestamp. The request is denied after this time."
+    }
+  },
+  "x-crabedence-server-resolved": [
+    "adapter",
+    "approval_policy",
+    "assurance_level",
+    "assurance_profile",
+    "authority_policy",
+    "evidence",
+    "execution_route",
+    "provider",
+    "receipt_version",
+    "reconciliation_policy",
+    "retry_policy",
+    "risk",
+    "schema"
+  ]
+}

@@ -72,6 +72,12 @@ export interface CrabedenceExecutionResponse {
   readonly status: "SUCCEEDED" | "FAILED" | "DENIED" | "UNKNOWN" | "IN_FLIGHT";
   readonly result?: unknown;
   readonly error?: string;
+  /**
+   * Set by the kernel when a FAILED response asserts that no external effect
+   * occurred. Absent means the kernel could not prove it — which makes the
+   * outcome ambiguous, not failed. See mapWireStatus.
+   */
+  readonly definitive_failure?: boolean;
   readonly evidence?: {
     readonly digest: string;
     readonly receipt_version?: number;
@@ -351,6 +357,17 @@ function validateWireResponse(raw: unknown): CrabedenceExecutionResponse {
     throw new TransportError("response.error must be a string", "PROTOCOL");
   }
 
+  // definitive_failure must be a boolean if present
+  if (
+    obj.definitive_failure !== undefined &&
+    typeof obj.definitive_failure !== "boolean"
+  ) {
+    throw new TransportError(
+      "response.definitive_failure must be a boolean",
+      "PROTOCOL",
+    );
+  }
+
   // evidence must have a valid digest if present
   let evidence: CrabedenceExecutionResponse["evidence"];
   if (obj.evidence !== undefined) {
@@ -392,9 +409,41 @@ function validateWireResponse(raw: unknown): CrabedenceExecutionResponse {
     status: status as CrabedenceExecutionResponse["status"],
     ...(obj.result !== undefined && { result: obj.result }),
     ...(obj.error !== undefined && { error: obj.error as string }),
+    ...(typeof obj.definitive_failure === "boolean" && {
+      definitive_failure: obj.definitive_failure,
+    }),
     ...(evidence && { evidence }),
     ...(execution && { execution }),
   };
+}
+
+/**
+ * Maps a wire status onto the NeMo status the caller sees.
+ *
+ * `IN_FLIGHT` is a valid wire status but not a terminal NeMo status: the
+ * operation is in progress, so the outcome is unknown to the caller.
+ *
+ * A `FAILED` response **without** `definitive_failure: true` is ambiguous, not
+ * failed. The kernel's own post-dispatch decision table
+ * (`classifyPostDispatch` in `internal/execution/dispatch.go`) maps
+ * `FAILED + DefinitiveFailure` to a durable `FAILED` and bare `FAILED` to
+ * `UNKNOWN`, because after the dispatch boundary it cannot prove no effect
+ * occurred. Reporting `FAILED` here would claim more certainty than the kernel
+ * does — and a caller that treats it as definitive may retry an effect that
+ * already happened. The Rust bridge applies the same rule, and the shared
+ * outcome corpus (`internal/execution/testdata/outcome-conformance`) holds
+ * both to it.
+ */
+function mapWireStatus(
+  response: CrabedenceExecutionResponse,
+): KernelExecutionOutcome["status"] {
+  if (response.status === "IN_FLIGHT") {
+    return "UNKNOWN";
+  }
+  if (response.status === "FAILED" && response.definitive_failure !== true) {
+    return "UNKNOWN";
+  }
+  return response.status as KernelExecutionOutcome["status"];
 }
 
 /**
@@ -434,11 +483,7 @@ export class CrabedenceExecutionAdapter implements ExecutionPort {
     try {
       const response = await this.client.execute(wireRequest);
 
-      // IN_FLIGHT is a valid wire status but not a terminal NEMO status.
-      // The operation is in progress — the outcome is unknown to the caller.
-      // Convert to UNKNOWN at the NEMO boundary.
-      const nemoStatus: KernelExecutionOutcome["status"] =
-        response.status === "IN_FLIGHT" ? "UNKNOWN" : (response.status as KernelExecutionOutcome["status"]);
+      const nemoStatus = mapWireStatus(response);
 
       return {
         status: nemoStatus,

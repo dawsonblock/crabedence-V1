@@ -66,6 +66,20 @@ var abiAuthorityFields = map[string]abiFieldType{
 // field identically.
 var abiIntegerLiteral = regexp.MustCompile(`^-?(0|[1-9][0-9]*)$`)
 
+// ParseInvocationRequest parses wire bytes into a Request under the strict
+// ABI rules.
+//
+// A bridge that forwards a planner's request to the execution service must
+// use this rather than a permissive decode. `encoding/json` silently drops
+// unknown fields and keeps the last value for a repeated key, so a request
+// carrying a server-resolved field would be quietly rewritten instead of
+// refused — and the planner would never learn that the field it sent had no
+// effect. A permissive decode also loses the `authority_ref` spelling, which
+// is the stable field; only `grant_id` survives it.
+func ParseInvocationRequest(data []byte) (Request, error) {
+	return parseInvocationRequest(data)
+}
+
 // parseInvocationRequest parses wire bytes into a Request under the
 // strict ABI rules.
 func parseInvocationRequest(data []byte) (Request, error) {

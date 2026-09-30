@@ -90,6 +90,10 @@ func TestLoadServiceConfigFailsClosed(t *testing.T) {
 		{"malformed replica count", func(t *testing.T) { t.Setenv("CRABBOX_REPLICAS", "2x") }, "not a positive integer"},
 		{"unknown topology", func(t *testing.T) { t.Setenv("CRABBOX_TOPOLOGY", "sharded") }, "unknown CRABBOX_TOPOLOGY"},
 		{"production without topology", func(t *testing.T) { t.Setenv("CRABBOX_MODE", "production") }, "must be explicitly declared in production"},
+		{"production without peer authentication", func(t *testing.T) {
+			t.Setenv("CRABBOX_MODE", "production")
+			t.Setenv("CRABBOX_TOPOLOGY", "single")
+		}, "requires CRABEDENCE_PEER_PRINCIPALS"},
 		{"cluster with sqlite", func(t *testing.T) { t.Setenv("CRABBOX_TOPOLOGY", "cluster") }, "cluster requires the shared postgres store backend"},
 		{"single with replicas", func(t *testing.T) {
 			t.Setenv("CRABBOX_TOPOLOGY", "single")
@@ -117,6 +121,31 @@ func TestLoadServiceConfigFailsClosed(t *testing.T) {
 				t.Fatalf("error = %q, want substring %q", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// TestProductionRequiresAuthenticatedPrincipals proves the loader
+// refuses production without a peer map and admits it with one — the
+// declaration the staging unit carries.
+func TestProductionRequiresAuthenticatedPrincipals(t *testing.T) {
+	clearServiceEnv(t)
+	t.Setenv("CRABBOX_MODE", "production")
+	t.Setenv("CRABBOX_TOPOLOGY", "single")
+
+	if _, err := LoadServiceConfig(ServeOptions{}); err == nil || !strings.Contains(err.Error(), "CRABEDENCE_PEER_PRINCIPALS") {
+		t.Fatalf("production without a peer map must fail closed, got %v", err)
+	}
+
+	t.Setenv("CRABEDENCE_PEER_PRINCIPALS", "1000:alice@example.com")
+	cfg, err := LoadServiceConfig(ServeOptions{})
+	if err != nil {
+		t.Fatalf("production with a peer map must load: %v", err)
+	}
+	if !cfg.Production() {
+		t.Fatal("the config must report production mode")
+	}
+	if len(cfg.PeerPrincipals) != 1 || cfg.PeerPrincipals[1000] != "alice@example.com" {
+		t.Fatalf("peer principals = %v, want the declared mapping", cfg.PeerPrincipals)
 	}
 }
 

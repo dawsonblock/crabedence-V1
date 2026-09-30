@@ -1,0 +1,79 @@
+version: 2
+
+project_name: nemo-control
+
+# GoReleaser is downstream of the verified assembler, not a second shipping-set
+# definition. For each target it builds crabbox with the release ldflags; the
+# post-build hook runs scripts/build-nemo-distribution.sh, which installs that
+# exact binary into the target's root, builds the Rust components, writes the
+# component manifest binding ALL of the bytes, and verifies the root. The
+# archive below then carries that verified root — bin/, share/, manifests/ —
+# so what a user unpacks is what the manifest proved.
+#
+# A runner needs the toolchain for every target it is asked to produce:
+# cargo must have the Rust target installed (rustup target add …) and the
+# host must link it. Windows is deliberately absent — no integrated target
+# exists for it.
+#
+# dist/ stays the assembler's directory; GoReleaser's working directory is
+# goreleaser-dist/ so `--clean` cannot wipe the verified roots.
+dist: goreleaser-dist
+
+changelog:
+  disable: true
+
+# Build-only. Publication is a later proof-gated operation on verified drafts.
+release:
+  disable: true
+
+builds:
+  - id: nemo-control
+    main: ./cmd/crabbox
+    binary: bin/crabbox
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    ldflags:
+      - -s -w -X github.com/openclaw/crabbox/internal/cli.version={{ .Version }}
+    targets:
+      - linux_amd64
+      - linux_arm64
+      - darwin_amd64
+      - darwin_arm64
+    hooks:
+      post:
+        # Assemble + verify the whole distribution root for this target
+        # around the binary GoReleaser just built.
+        - cmd: >-
+            env NEMO_DIST_TARGET={{ .Os }}_{{ .Arch }}
+            NEMO_DIST_VERSION={{ .Version }}
+            NEMO_DIST_CRABBOX={{ .Path }}
+            scripts/build-nemo-distribution.sh
+          output: true
+
+archives:
+  - id: nemo-control
+    ids:
+      - nemo-control
+    formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    # Everything the verified root carries besides the crabbox the archive
+    # already holds: the Rust binaries, the schemas, the manifests. The root
+    # is version-exact — the hook names it nemo-control_{{ .Version }}_<target>
+    # — and strip_parent keeps the verified layout flat.
+    files:
+      - src: "dist/nemo-control_{{ .Version }}_{{ .Os }}_{{ .Arch }}/bin/nemo-*"
+        dst: bin/
+        strip_parent: true
+      - src: "dist/nemo-control_{{ .Version }}_{{ .Os }}_{{ .Arch }}/share/*"
+        dst: share/
+        strip_parent: true
+      - src: "dist/nemo-control_{{ .Version }}_{{ .Os }}_{{ .Arch }}/manifests/*"
+        dst: manifests/
+        strip_parent: true
+
+checksum:
+  name_template: "{{ .ProjectName }}_{{ .Version }}_SHA256SUMS"

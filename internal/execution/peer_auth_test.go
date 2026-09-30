@@ -88,6 +88,29 @@ func TestPeerPrincipalMapAuthorize(t *testing.T) {
 	}
 }
 
+func TestPeerAuthPolicyRequiresAuthenticationInProduction(t *testing.T) {
+	// Development keeps the optional strict mode: unset stays the
+	// bearer model, and a configured map is accepted.
+	if err := validatePeerAuthPolicy(false, nil); err != nil {
+		t.Fatalf("development must not require peer authentication: %v", err)
+	}
+	if err := validatePeerAuthPolicy(false, PeerPrincipalMap{501: "alice@example.com"}); err != nil {
+		t.Fatalf("a configured map must satisfy the policy: %v", err)
+	}
+
+	// Production must authenticate the principal, not merely receive it.
+	err := validatePeerAuthPolicy(true, nil)
+	if err == nil {
+		t.Fatal("production without a peer map must fail closed")
+	}
+	if !strings.Contains(err.Error(), "CRABEDENCE_PEER_PRINCIPALS") {
+		t.Fatalf("the refusal must name the configuration: %v", err)
+	}
+	if err := validatePeerAuthPolicy(true, PeerPrincipalMap{0: PeerWildcardPrincipal}); err != nil {
+		t.Fatalf("production with a declared map must satisfy the policy: %v", err)
+	}
+}
+
 // peerAuthService starts a real service on a real Unix socket with the
 // echo capability and the given peer map.
 func peerAuthService(t *testing.T, peerMap PeerPrincipalMap) string {

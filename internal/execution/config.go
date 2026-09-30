@@ -121,6 +121,11 @@ func LoadServiceConfig(opts ServeOptions) (*ServiceConfig, error) {
 	if err != nil {
 		return nil, fmt.Errorf("CRABEDENCE_PEER_PRINCIPALS: %w", err)
 	}
+	// Production must authenticate the principal, not merely receive
+	// it: an unverified claim is any local process's to choose.
+	if err := validatePeerAuthPolicy(productionMode(), peerMap); err != nil {
+		return nil, err
+	}
 	cfg.PeerPrincipals = peerMap
 
 	// The executor-owned provider ceiling applies on top of any caller

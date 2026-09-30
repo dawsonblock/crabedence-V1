@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,6 +24,28 @@ type failObservationStore struct {
 
 func (s failObservationStore) RecordProviderObservation(ctx context.Context, executionID, leaseToken string, leaseGen int, obs idempotency.ProviderObservation) error {
 	return s.err
+}
+
+// renewalObservingStore wraps a real EffectStore and records lease
+// renewal traffic: a renewal that lands after the caller is cancelled
+// is direct proof the heartbeat is durability-owned. Observing the
+// call itself — rather than sampling the expiry column between ticks —
+// removes the sample-phase dependency, and counting attempts alongside
+// successes makes a future failure report whether the heartbeat died
+// or the lease was fenced.
+type renewalObservingStore struct {
+	idempotency.EffectStore
+	attempted atomic.Int64
+	succeeded atomic.Int64
+}
+
+func (s *renewalObservingStore) RenewLease(ctx context.Context, executionID, leaseToken string, leaseGeneration int, duration time.Duration) error {
+	s.attempted.Add(1)
+	err := s.EffectStore.RenewLease(ctx, executionID, leaseToken, leaseGeneration, duration)
+	if err == nil {
+		s.succeeded.Add(1)
+	}
+	return err
 }
 
 // succeedHandler returns a fixed successful response after a delay.
@@ -120,45 +143,52 @@ func TestObservationFailureRecoverySurvivesCallerCancel(t *testing.T) {
 // persisted, a caller disconnect must not stop lease renewal while
 // mandatory post-dispatch persistence is still running.
 //
-// Timing: lease = 300ms (renewal interval = 200ms), provider = 100ms,
-// cancel at provider return. The post-provider verification window is
-// synchronized on durable state rather than a fixed sleep: the hook
-// waits until the ORIGINAL lease deadline has passed and the lease is
-// still valid — which is only possible if the heartbeat renewed it,
-// since renewal is what extends an expiry that has already elapsed.
-// Without a durability-owned heartbeat, renewal stops at the cancel,
-// the lease expires, and Finalize's fenced CAS fails → UNKNOWN.
+// Timing: lease = 1s (renewal interval = 500ms), provider = 100ms,
+// cancel at provider return. The renewal window is the ONLY scheduling
+// slack a heartbeat tick has: the store refuses to renew an expired
+// lease, so a tick that lands after the deadline kills the heartbeat
+// permanently — a starved goroutine missing a 100ms window is exactly
+// how this test kept failing on CI. A 500ms window gives a loaded
+// runner five times that slack.
+//
+// The post-provider verification window waits until the ORIGINAL lease
+// deadline has passed AND a renewal has landed since the hook began —
+// observed through a recording store rather than sampled expiry, so a
+// renewal can never be missed between poll phases. Since the hook runs
+// after the caller was cancelled, that renewal cannot be caller-owned;
+// a caller-owned heartbeat would produce zero further renewals and the
+// bounded wait reports it. The bound stays below the terminalization
+// stage budget (5s) so a genuine failure reports the heartbeat problem
+// instead of dying as a context deadline inside Finalize.
 func TestHeartbeatSurvivesCallerCancelThroughFinalize(t *testing.T) {
-	const leaseDuration = 300 * time.Millisecond
+	const leaseDuration = time.Second
 	store := openExecutorSQLiteStore(t, idempotency.LeaseConfig{
 		DefaultDuration: leaseDuration,
 		MaxDuration:     10 * time.Second,
-		RenewalWindow:   100 * time.Millisecond,
+		RenewalWindow:   500 * time.Millisecond,
 	})
+	wrapped := &renewalObservingStore{EffectStore: store}
 
-	exec := NewDispatchExecutor(succeedHandler{delay: 100 * time.Millisecond}, store)
+	exec := NewDispatchExecutor(succeedHandler{delay: 100 * time.Millisecond}, wrapped)
 
 	key := fmt.Sprintf("hb-cancel-%d", time.Now().UnixNano())
-	// Simulate slow post-provider evidence verification, synchronized on
-	// durable state instead of a fixed sleep: the fixed 400ms sleep this
-	// replaces raced the 200ms renewal interval against CI scheduling —
-	// whenever the renewal landed after Finalize, the fenced CAS failed
-	// and the test failed despite a clean provider success.
 	exec.preFinalizeHook = func() {
-		deadline := time.Now().Add(10 * time.Second)
+		bound := time.Now().Add(4 * time.Second)
+		renewalsAtHookStart := wrapped.succeeded.Load()
 		for {
 			rec, err := store.LookupByKey(context.Background(), "alice@example.com", "test.mut", key)
 			if err == nil && rec.LeaseStartedAt != nil && rec.LeaseExpiresAt != nil {
-				if time.Now().After(rec.LeaseStartedAt.Add(leaseDuration)) {
-					if !rec.LeaseExpiresAt.After(time.Now()) {
-						t.Errorf("lease expired before Finalize: the heartbeat did not keep it alive through verification")
-						return
-					}
+				pastOriginalDeadline := time.Now().After(rec.LeaseStartedAt.Add(leaseDuration))
+				renewedAfterCancel := wrapped.succeeded.Load() > renewalsAtHookStart
+				alive := rec.LeaseExpiresAt.After(time.Now())
+				if pastOriginalDeadline && renewedAfterCancel && alive {
 					return
 				}
 			}
-			if time.Now().After(deadline) {
-				t.Errorf("timed out waiting for the lease to be renewed past its original deadline")
+			if time.Now().After(bound) {
+				t.Errorf("no post-cancel lease renewal landed (renewals attempted=%d succeeded=%d, baseline %d): "+
+					"the heartbeat did not keep the lease alive through verification",
+					wrapped.attempted.Load(), wrapped.succeeded.Load(), renewalsAtHookStart)
 				return
 			}
 			time.Sleep(10 * time.Millisecond)

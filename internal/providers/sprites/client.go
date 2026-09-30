@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -126,21 +125,12 @@ func isSpritesLoopbackHost(hostname string) bool {
 }
 
 func secureSpritesHTTPClient(source *http.Client, origin *url.URL) *http.Client {
-	client := *source
-	checkRedirect := source.CheckRedirect
-	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		if !sameSpritesOrigin(origin, req.URL) {
-			return fmt.Errorf("sprites redirect changed API origin")
-		}
-		if checkRedirect != nil {
-			return checkRedirect(req, via)
-		}
-		if len(via) >= 10 {
-			return errors.New("stopped after 10 redirects")
-		}
-		return nil
-	}
-	return &client
+	// The hook, the cap, and the refusal order are the shared helper's. The host
+	// comparison is this provider's: it canonicalizes hostnames more strictly
+	// than SameOrigin, so passing it in keeps the check exactly as strict.
+	return shared.SecureHTTPClient(source, origin, func(*url.URL) error {
+		return fmt.Errorf("sprites redirect changed API origin")
+	}, shared.WithHostComparator(sameSpritesOrigin))
 }
 
 func sameSpritesOrigin(a, b *url.URL) bool {

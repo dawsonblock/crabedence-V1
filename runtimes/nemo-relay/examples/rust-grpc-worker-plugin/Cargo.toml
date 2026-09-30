@@ -1,0 +1,37 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "nemo-relay-rust-grpc-worker-plugin-example"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Complete Rust grpc-v1 worker example for NeMo Relay"
+
+[workspace]
+
+[dependencies]
+futures-util = "0.3"
+nemo-relay-worker = { version = "0.9.1-rc.4", path = "../../crates/worker" }
+# The worker lane is a feature of each crate that takes part in it, and this
+# composition is one of them: the activation that runs a worker spec lives in the
+# loader now, so the loader has to be built for that lane or it refuses the spec with
+# "requires the 'worker-grpc' feature" — which is what this example's lifecycle test
+# saw until the feature was forwarded here.
+nemo-relay-native-loader = { version = "0.9.1-rc.4", path = "../../crates/native-loader", features = ["worker-grpc"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+nemo-relay = { version = "0.9.1-rc.4", path = "../../crates/core", features = ["worker-grpc"] }
+sha2 = "0.11"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+
+[lib]
+name = "nemo_relay_rust_grpc_worker_plugin_example"
+
+[[bin]]
+name = "nemo-relay-rust-grpc-worker-plugin-example"
+path = "src/main.rs"
