@@ -43,8 +43,8 @@ excludes `target/`, caches, `node_modules`, and editor state.
 | --- | --- | --- |
 | 0 — vendor | Done | `runtimes/nemo-relay/` (1438 source files, no build artifacts); a recursive diff against the source copy reports exactly two differing files (`Cargo.toml`, `Cargo.lock`); provenance and fingerprint in `runtimes/nemo-relay/TRANSFER-PROVENANCE.md` |
 | 1 — bridge | Done | `runtimes/nemo-relay/bridges/nemo-crabedence/`: `abi.rs`, `transport.rs`, `capability_snapshot.rs`, `outcome_mapping.rs`, `execution_port.rs`; 56 unit tests, 1 corpus conformance test, 5 schema-binding tests, 5 env-gated live tests |
-| 2 — trust enforcement | Partial | Bridge-level invariants enforced and tested (unregistered capability, class mismatch, route mismatch, no policy field on the wire), and the bridge's tests, lints, and formatting now run in CI (`nemo-bridge` job in `.github/workflows/ci.yml`). The end-to-end CI invariant still needs NEMO's `BackendRouter` wiring, which is not done |
-| 3 — conformance | Partial | The Rust validator matches the shared corpus exactly (11 accepted, 32 rejected) and the live kernel's refusal phrases match the Rust validator's word-for-word. The full release-gate scenario list is not complete |
+| 2 — trust enforcement | Partial | Bridge-level invariants enforced and tested (unregistered capability, class mismatch, route mismatch, no policy field on the wire), the effect-isolation invariant holds at the router, and both run in CI (the `NEMO integration` job). What is *not* exercised end to end is a full NEMO runtime instance routing through `EffectRouter` — integration work. This row previously named NEMO's `BackendRouter` wiring as the remainder, which finding 6 corrected: that composition is not merely unwired, it is the wrong one |
+| 3 — conformance | Partial | The Rust validator matches the shared invocation corpus exactly (11 accepted, 32 rejected), the live kernel's refusal phrases match word-for-word, and the outcome corpus is shared across Go, TypeScript, and Rust. Covered against the live kernel from the NEMO side: a LOCAL-route refusal, a MUTATION commit with evidence, missing authority (`UNAUTHORIZED`), a lost response mapping to `UNKNOWN`, snapshot tampering, and same-key replay — the last verified across a service restart by hand rather than in the committed suite. Not covered: plugin host crash and hang, malformed plugin reply, plugin registration rejection, invalid and expired authority, provider crash, NEMO restart, both restarted, and CRITICAL — the built-in registry carries no CRITICAL capability (finding 4) |
 | — reference kernel | Retired | Renamed to `nemo/registry-snapshot/`, decoupled from the loader, then deleted once the suite passed without it; the README now records where each removed behavior lives |
 | — canonical schema | Done | `schemas/capability-invocation-v1.json` describes the frozen wire contract; Go, TypeScript, and Rust each carry a test that binds their implementation to it, so a field added on one side and not the others fails CI |
 | — effect router | Done at the routing layer | `runtimes/nemo-relay/bridges/nemo-effect-router/`: `EffectRouter` resolves the path from the verified **route** (not the class, which is what NeMo Relay's own router uses), fails closed on an unwired read path, and holds the effect-isolation invariant. 7 routing tests and 6 isolation tests, including one that runs against a live registry |
@@ -525,10 +525,9 @@ helper's fixed cap message and error shape are acceptable — not a sweep.
 3. **NEMO's `authority`/`ledger` crates** — keep compiling (recorded in
    ADR-003 as non-authoritative) or delete once no build target references
    them. Deletion is a follow-up, not part of this transfer.
-4. **The TypeScript layer's `FAILED` mapping** (finding 1) — correct it to
-   honor `definitive_failure`, so both planners classify the same effect
-   identically. Leaving it makes the compatibility layer the weaker of the
-   two.
+4. **The TypeScript layer's `FAILED` mapping** (finding 1) — **resolved.** The
+   adapter honors `definitive_failure`, and the shared outcome corpus pins the
+   rule for the TypeScript adapter and the Rust bridge alike.
 5. **Grant issuance on SQLite** (finding 3) — extend `cmd/issue-grant` to the
    default backend, or document the helper path. Without one of these, the
    grant-required gate scenarios cannot be exercised on a single-host
