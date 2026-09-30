@@ -258,6 +258,46 @@ fn refuses_an_authority_reference_that_does_not_resolve() {
     assert!(!error.reconciliation_required, "{error}");
 }
 
+/// An authority reference that has lapsed is refused definitively.
+///
+/// Gated separately from the other live checks because it needs a grant that
+/// has already expired, and the issuing tool refuses to mint one in the past —
+/// so the reference has to be issued with a short future expiry and then
+/// allowed to lapse. `scripts/test-nemo-expired-authority.sh` owns that timing;
+/// this test asserts only the refusal, so it never sleeps or races a clock.
+#[test]
+fn refuses_an_expired_authority_reference() {
+    let Some(socket) = live_socket() else {
+        return;
+    };
+    let Some(grant) = std::env::var_os("NEMO_CRABEDENCE_LIVE_EXPIRED_GRANT") else {
+        eprintln!(
+            "skipping the expired-authority check: set NEMO_CRABEDENCE_LIVE_EXPIRED_GRANT to a \
+             grant reference that has already lapsed"
+        );
+        return;
+    };
+    let catalog = load_catalog_from_path(&snapshot_path(&socket)).expect("verified");
+    let port = NemoCrabedenceExecutionPort::new(ExecutionSocketClient::new(&socket), catalog);
+
+    let mut request = request_for("test.counter.increment", ExecutionClass::Mutation);
+    request.grant = Some(grant.to_string_lossy().into_owned());
+    request.identity.idempotency_key = format!("expired-grant-{}", std::process::id());
+
+    let error = port.execute(&request).unwrap_err();
+    assert_eq!(
+        error.code, "UNAUTHORIZED",
+        "a lapsed grant is an authorization failure, got {error}"
+    );
+    assert_eq!(
+        state_for_error(&error),
+        ExecutionState::Failed,
+        "a lapsed grant is definitive — nothing was dispatched, got {error}"
+    );
+    assert!(!error.retryable, "{error}");
+    assert!(!error.reconciliation_required, "{error}");
+}
+
 /// No repeated key may produce a second real-world effect.
 ///
 /// This is the property the whole consolidation exists to preserve, and it is
