@@ -26,6 +26,18 @@ reports/mutation/
 !.mac-release.env
 api.env*
 
+# The vendored NeMo Relay tree ships source under directories named `bin/`
+# (the plugin host and the ledger fixtures) and one toolchain pin named
+# `*.env`. Without these negations the rules above swallow that source
+# silently — which is how five restored files lived in the working tree but
+# never in git, leaving the declared runtime identity unreproducible from a
+# clone. The transfer manifest's digest covers the working tree, so the gate
+# passed while git did not have them; a fresh clone recomputes a different
+# tree and fails closed.
+!runtimes/nemo-relay/**/bin/
+!runtimes/nemo-relay/**/bin/**
+!runtimes/nemo-relay/.github/*.env
+
 # Local planning artifacts from $prepare-plans / $prepare-plans-goals.
 # These are scratch inputs for the current session, not part of the repo.
 PLAN*.md
