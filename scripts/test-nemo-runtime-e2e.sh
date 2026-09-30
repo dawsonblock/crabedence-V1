@@ -257,6 +257,29 @@ printf '%s' "$out" | jq -e '.status=="FAILED" and (.code | test("IDEMPOTENCY"))'
   || fail "same key with different arguments must be an identity conflict: $out"
 pass "same durable key + changed arguments → identity conflict"
 
+# 10b. The authority boundary at the process level: the child's environment is
+#      cleared at spawn, so it carries only the session variables it needs —
+#      never the service's socket, store, runtime dir, home, or any other
+#      variable the parent happens to have. The fixture writes the *names* it
+#      sees (never values), which is what a witness may report.
+env_dump="$work_dir/child-env.txt"
+sentinel="leak-probe-$$"
+CRABEDENCE_LEAK_PROBE="$sentinel" run_runtime --plugin "$plugin_dir" \
+  --plugin-id fixture_intercept --component fixture_intercept \
+  --plugin-config "{\"env_dump\":\"$env_dump\"}" \
+  --capability system.echo --arguments '{"probe":"env-boundary"}' >/dev/null \
+  || fail "the env-boundary invocation must succeed: $out"
+[[ -s "$env_dump" ]] || fail "the child never wrote its environment names"
+grep -qx 'NEMO_RELAY_PLUGIN_HOST_SOCKET' "$env_dump" \
+  || fail "the child is missing its session socket: $(cat "$env_dump")"
+grep -qx 'NEMO_RELAY_PLUGIN_HOST_CREDENTIAL' "$env_dump" \
+  || fail "the child is missing its session credential"
+if grep -qE '^(HOME|XDG_RUNTIME_DIR|CRABEDENCE_|CRABBOX_)' "$env_dump"; then
+  fail "the child inherited environment it must not see: $(grep -E '^(HOME|XDG_RUNTIME_DIR|CRABEDENCE_|CRABBOX_)' "$env_dump")"
+fi
+grep -q "$sentinel" "$env_dump" && fail "the leak probe reached the child"
+pass "the plugin child sees only its session environment"
+
 # 11. Adversarial: middleware that answers without ever reaching the dispatch
 #     is refused — a capability result that did not cross the router is not
 #     evidence of execution.
@@ -393,4 +416,4 @@ set -e
   || fail "a malformed call budget must name the variable: $out"
 pass "malformed managed-call budget fails startup"
 
-printf 'runtime e2e: nineteen checks passed\n'
+printf 'runtime e2e: twenty checks passed\n'

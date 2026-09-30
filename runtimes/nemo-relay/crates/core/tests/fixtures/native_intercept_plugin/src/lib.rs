@@ -204,6 +204,23 @@ impl NativePlugin for InterceptPlugin {
                 }
             })?;
         }
+        // What the child was handed: the *names* of its environment variables,
+        // never the values — a dump is only a witness, and a witness that
+        // carries secrets is a leak. A composition asserts the isolation policy
+        // held by reading which names exist, not by trusting the spawn code
+        // that set them.
+        if let Some(dump) = config.get("env_dump").and_then(|value| value.as_str()) {
+            use std::io::Write;
+            if let Ok(mut file) = std::fs::File::create(dump) {
+                let mut names: Vec<String> = std::env::vars_os()
+                    .filter_map(|(name, _)| name.into_string().ok())
+                    .collect();
+                names.sort();
+                for name in names {
+                    let _ = writeln!(file, "{name}");
+                }
+            }
+        }
         ctx.register_llm_request_intercept(
             "fixture_intercept_llm_rewrite",
             0,

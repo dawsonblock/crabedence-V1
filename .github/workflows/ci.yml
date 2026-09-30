@@ -227,7 +227,22 @@ jobs:
       - name: Prove the plugin-host composition
         run: scripts/test-nemo-plugin-host.sh
 
-      # The reference side. These suites — the conformance corpus, the
+      # The joined chain against a live service — the integration RC's core
+      # gate. Each script builds what it needs (the cargo and Go builds above
+      # make that cheap), starts a real `crabbox serve-exec` on its own socket
+      # and store, and exercises the runtime binary end to end: the managed
+      # PURE call through the plugin child's middleware into the
+      # function-hook backend, the synthetic MUTATION committed through
+      # Crabedence with a receipt, replay and identity-conflict, the
+      # fail-closed plugin composition cases, the CRITICAL evidence path,
+      # expired authority, and restart idempotency. These are merge gates, not
+      # skipped environment probes — each is self-contained on SQLite.
+      - name: Prove the joined chain against a live service
+        run: |
+          scripts/test-nemo-runtime-e2e.sh
+          scripts/test-nemo-critical-path.sh
+          scripts/test-nemo-expired-authority.sh
+          scripts/test-nemo-restart-idempotency.sh
       # adversarial cases, framing, snapshot verification, and the schema
       # binding — are what the Rust path is compared against, so they have to
       # actually run.
