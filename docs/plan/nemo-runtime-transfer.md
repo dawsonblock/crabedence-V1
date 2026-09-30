@@ -43,7 +43,7 @@ excludes `target/`, caches, `node_modules`, and editor state.
 | --- | --- | --- |
 | 0 — vendor | Done | `runtimes/nemo-relay/` (no build artifacts); a recursive diff against the source copy reports four differing files (`Cargo.toml`, `Cargo.lock`, `crates/cli/src/mcp_environment.rs`, `integrations/coding-agents/codex/.mcp.json`) plus two added paths (`bridges/`, `TRANSFER-PROVENANCE.md`); provenance in `runtimes/nemo-relay/TRANSFER-PROVENANCE.md`, and the shipped identity declared in `runtimes/nemo-transfer-manifest.json`, checked against the tree by `scripts/check-nemo-transfer-manifest.sh` in CI. The manifest also declares the binaries the tree must produce — the runtime, the plugin host, and both ledger fixtures — and `scripts/build-nemo-binaries.sh` compiles them in CI, so a declared binary whose source is absent fails the build instead of shipping incomplete |
 | 1 — bridge | Done | `runtimes/nemo-relay/bridges/nemo-crabedence/`: `abi.rs`, `transport.rs`, `capability_snapshot.rs`, `outcome_mapping.rs`, `execution_port.rs`; 56 unit tests, 1 corpus conformance test, 5 schema-binding tests, 5 env-gated live tests |
-| 2 — trust enforcement | Partial, and advanced. Bridge-level invariants enforced and tested (unregistered capability, class mismatch, route mismatch, no policy field on the wire), the effect-isolation invariant holds at the router, and both run in CI. A **runtime instance** now exists: `bridges/nemo-crabedence-runtime` is a process that verifies the snapshot, resolves the class and route from it, and dispatches through `EffectRouter` — verified end to end (PURE routed locally, MUTATION committed through the kernel with evidence, a missing grant refused as non-retryable, an unregistered capability refused before any socket hop, and a tampered snapshot refused before routing). What is *still* absent is the plugin host: `crates/plugin-host` is not wired to this runtime, so a plugin cannot yet reach the router, which is why the plugin-host gate scenarios remain open. This row previously named NEMO's `BackendRouter` wiring as the remainder, which finding 6 corrected: that composition is not merely unwired, it is the wrong one. The runtime instance also binds a real invocation identity — unique execution, invocation, and action ids; a caller-supplied idempotency key required for `MUTATION`/`CRITICAL` and namespaced per principal; and canonical argument, descriptor, and route digests — where it previously sent `runtime-{capability}` placeholders. `scripts/test-nemo-runtime-e2e.sh` drives the binary against a live service and asserts all of it: a `MUTATION` without a key is refused before dispatch (exit 2), a `PURE` capability routes locally, a granted `MUTATION` commits with evidence, the same key replays rather than duplicating, an ungranted `MUTATION` is a definitive `UNAUTHORIZED`, and an unregistered capability is refused before any socket hop |
+| 2 — trust enforcement | Partial, and advanced. Bridge-level invariants enforced and tested (unregistered capability, class mismatch, route mismatch, no policy field on the wire), the effect-isolation invariant holds at the router, and both run in CI. A **runtime instance** now exists: `bridges/nemo-crabedence-runtime` is a process that verifies the snapshot, resolves the class and route from it, and dispatches through `EffectRouter` — verified end to end (PURE routed locally, MUTATION committed through the kernel with evidence, a missing grant refused as non-retryable, an unregistered capability refused before any socket hop, and a tampered snapshot refused before routing). What is *still* absent is the plugin host: `crates/plugin-host` is not wired to this runtime, so a plugin cannot yet reach the router, which is why the plugin-host gate scenarios remain open. State, precisely: **partial** — the safety prerequisites are done (invocation identity, the plugin-path dependency and socket invariants, the router's class and route refusals) and the composition itself is open; the "Plugin-host composition" section below is the workstream. This row previously named NEMO's `BackendRouter` wiring as the remainder, which finding 6 corrected: that composition is not merely unwired, it is the wrong one. The runtime instance also binds a real invocation identity — unique execution, invocation, and action ids; a caller-supplied idempotency key required for `MUTATION`/`CRITICAL` and namespaced per principal; and canonical argument, descriptor, and route digests — where it previously sent `runtime-{capability}` placeholders. `scripts/test-nemo-runtime-e2e.sh` drives the binary against a live service and asserts all of it: a `MUTATION` without a key is refused before dispatch (exit 2), a `PURE` capability routes locally, a granted `MUTATION` commits with evidence, the same key replays rather than duplicating, an ungranted `MUTATION` is a definitive `UNAUTHORIZED`, and an unregistered capability is refused before any socket hop |
 | 3 — conformance | Partial | The Rust validator matches the shared invocation corpus exactly (11 accepted, 32 rejected), the live kernel's refusal phrases match word-for-word, and the outcome corpus is shared across Go, TypeScript, and Rust. Covered against the live kernel from the NEMO side: a LOCAL-route refusal, a MUTATION commit with evidence, missing authority (`UNAUTHORIZED`), an unresolvable authority reference (`UNAUTHORIZED`, definitive and non-retryable), an expired authority reference (`UNAUTHORIZED`, definitive and non-retryable), a lost response mapping to `UNKNOWN`, snapshot tampering, same-key replay, and a CRITICAL commit carrying evidence. Two of these need orchestration the Rust test cannot own, so scripts hold the timing and the tests assert only the outcome: `scripts/test-nemo-expired-authority.sh` issues a short-lived grant, lets it lapse, then asserts the refusal; `scripts/test-nemo-restart-idempotency.sh` dispatches twice, restarts the kernel on the same store, dispatches twice again with the same key, and asserts one effect. Neither test sleeps on a clock. Not covered, and each for a stated reason: plugin host crash, hang, malformed reply, and registration rejection have no NEMO plugin host in the integration path — a runtime instance now routes through `EffectRouter`, but `crates/plugin-host` is not wired to it, so there is nothing hosting a plugin to crash or hang; provider crash is qualified Go-side by the kernel's own crash-point matrix, which SIGKILLs real provider processes; CRITICAL is now covered end to end by `scripts/test-nemo-critical-path.sh`, which wires the qualification provider so the bridge's evidence rule meets a real commit; the PURE and READ crossings are not, because the qualification extension adds only CRITICAL and no capability is pinned to the `CRABEDENCE` route for those classes — see finding 4 |
 | — reference kernel | Retired | Renamed to `nemo/registry-snapshot/`, decoupled from the loader, then deleted once the suite passed without it; the README now records where each removed behavior lives |
 | — canonical schema | Done | `schemas/capability-invocation-v1.json` describes the frozen wire contract; Go, TypeScript, and Rust each carry a test that binds their implementation to it, so a field added on one side and not the others fails CI |
@@ -296,7 +296,7 @@ The consolidation's own completion criteria, against the current state:
 | 12 | A CI assertion proves no consequential bypass path exists | Met: `tests/effect_isolation.rs` and `tests/routing.rs` run in the `NEMO integration` job |
 | 13 | Release artifacts identify exact NEMO and Crabedence source revisions | Met: the release evidence generator runs `cmd/nemo-runtime-digest` and writes `nemo-runtime.json` and `nemo-runtime.sha256` into the bundle, which `SHA256SUMS`, the manifest digest, and the attestation already cover. The Crabedence revision is bound by the source commit and the registry digest; the NEMO revision is now bound too. The frozen gate registry is untouched — the digest is evidence, not a new gate |
 | 14 | Security qualification passes for the shipping binaries | Not a NEMO-transfer deliverable, and stated as such rather than left ambiguous. The repository's shipping binaries are Go, and their security qualification is the existing typed release-gate set (`scripts/lib/qualification-gates.sh`, `release-qualification.yml`), which is frozen and managed by the repository's own release process — not something the transfer should extend by inventing gates. What the transfer contributes is the NEMO-side security assertions, which run in CI (`tests/effect_isolation.rs`, `tests/routing.rs`, the credential and dependency-graph checks) and are now bound into release evidence by blocker 13. Wiring those checks into the typed gate set is a release-engineering change, gated by that process |
-| 15 | The binary distribution carries both runtimes, bound by one component manifest | Partial, and the remainder is release engineering: `scripts/build-nemo-distribution.sh` assembles `bin/` (crabbox, the runtime, the plugin host), `share/` (the capability schema and the registry envelope), and `manifests/` (the transfer manifest plus a component manifest binding every component by SHA-256), and CI assembles and verifies it on every change. The Crabedence release pipeline does not consume it yet — its archives still carry the CLI alone — so the distribution is a verified build step, not yet a released artifact |
+| 15 | The binary distribution carries both runtimes, bound by one component manifest | Partial, and the remainder is release engineering: `scripts/build-nemo-distribution.sh` assembles `bin/` (crabbox, the runtime, the plugin host), `share/` (the capability schema and the registry envelope), and `manifests/` (the transfer manifest plus a component manifest binding every component by SHA-256), and CI assembles and verifies it on every change. The Crabedence release pipeline does not consume it yet — its archives still carry the CLI alone — so the distribution is a verified build step, not yet a released artifact. The adoption shape is decided so the shipping set stays defined in one place: GoReleaser packages the already-verified directory rather than learning the component list itself, the component manifest is the release-root identity (component hashes plus runtime, registry, and build metadata, one digest, signed), and the runtime gains `version --json` so a receipt can cite the exact release that executed an operation |
 
 ## Target layout
 
@@ -677,6 +677,114 @@ and both are recorded so the next run does not re-investigate them.
    has not been captured. Capturing it means catching a failing run — a
    `-count` loop under load — and that is the next step rather than another
    guess.
+
+## Plugin-host composition (open workstream)
+
+This is the remaining critical path. It is deliberately not a "wire two
+structs together" patch: the plugin host is a 17k-line subsystem, and the
+trust architecture is easy to lose by composing it in the wrong order.
+
+Release scope decision, recorded with it: the next release is an **integration
+closure release**. No new providers, no new routing machinery, no new
+authority features, and no additional abstraction layers unless the plugin-host
+integration proves one is necessary. The architecture is sufficient; what
+remains is proof that it survives contact with the real execution path.
+
+Target flow:
+
+```text
+plugin process
+    │  requests an effect (never a route, never authority, never an identity)
+    ▼
+plugin host  ── session, owned by the supervisor
+    │
+    ▼
+NEMO supervisor  ── validates the request against the live invocation
+    │
+    ▼
+EffectRouter ── PURE → local function path · READ → refused · MUTATION/CRITICAL → Crabedence
+```
+
+The invariants the composition must preserve, in the same words the
+implementation should be reviewable against:
+
+- plugin code cannot select the route;
+- plugin code cannot contact Crabedence;
+- plugin code cannot mint authority;
+- plugin code cannot mint trusted execution identity;
+- plugin code cannot decide whether an operation is PURE/MUTATION/CRITICAL.
+
+Only the trusted supervisor turns a plugin request into an EffectRouter
+request.
+
+### One canonical invocation envelope
+
+There are too many adjacent identity concepts across the two trees. The
+cross-boundary state collapses into one envelope — `InvocationContext` —
+holding `execution_id`, `invocation_id`, `action_id`, `principal`,
+`capability`, `args_digest`, `registry_digest`, `runtime_binding_digest`, and
+`attempt`. The plugin never constructs it: the kernel determines the
+capability, canonicalizes the arguments, mints the invocation id, and records
+the registry and runtime bindings before the supervisor hands anything to the
+host. The supervisor then validates every effect request the plugin produces —
+capability registered, invocation still live, requested effect allowed,
+arguments canonical, identity consistent — before the router sees it.
+
+Idempotency follows from the envelope rather than from the capability name:
+the key is derived from the logical invocation (execution, invocation, action,
+capability, canonical arguments), so a retry of one action replays and a
+distinct action cannot collide, and the retry attempt is never part of the
+identity.
+
+### Authority is split, and the names must say so
+
+NEMO's question is "may this invocation request this capability?"; Crabedence's
+is "may this principal perform this consequential operation now?". For
+MUTATION/CRITICAL, NEMO's answer is preliminary admission only — permission to
+ask — and Crabedence's is final. A NEMO-side decision must never become an
+authorization assertion Crabedence trusts. The shim therefore is not called
+`AuthorityBackend`; names like `EffectAdmission`, `EffectEligibility`, or
+`InvocationPolicy` say which half it is.
+
+### What the reconnaissance established
+
+The composition is smaller than the subsystem size suggests, but one phase as
+previously sketched does not map onto the machinery as it exists:
+
+- `FunctionHooksExecutionBackend` already exists and enforces the class
+  boundary (PURE/READ execute, anything else is `BACKEND_CLASS_MISMATCH`), so
+  the "real local backend" has a defined shape.
+- The host composition API exists and is exercised by the crate's own
+  process tests: `ProcessPluginBackend::launch` → `load` → `activate` →
+  `invoke_stream`, with `ProcessLoadedPlugins::load` as the composition that
+  also installs registration proxies. A plugin artifact is a manifest (or a
+  directory containing one) that names the library, and the host binary
+  resolves beside the executable with `NEMO_RELAY_PLUGIN_HOST` as the
+  documented escape hatch.
+- **What a plugin can register is middleware and observability, not
+  callables.** `RuntimeRegistrationKind` is subscribers, guardrails,
+  sanitizers, and intercepts; there is no tool/function registration kind. So
+  "a plugin asks for `test.counter.increment`" is *new protocol surface*, not
+  a wiring gap — Phase 1 must therefore define its PURE operation as a
+  NEMO-managed call with the plugin's middleware executing in the host, and
+  the capability→plugin-callable mapping is a deliberate later addition (or
+  an upstream change) rather than something to fake.
+- The seam to respect: the host is async (tokio, gRPC) while
+  `ExecutionBackend::execute` is synchronous, so the composition needs one
+  bounded blocking bridge — not an async router rewrite.
+
+### Phases
+
+| Phase | Content | State |
+| --- | --- | --- |
+| 1 | Real local backend through the function-hook/plugin machinery, PURE only: host a plugin, its middleware runs in the host, result returns; no plugin effect calls yet | Open |
+| 2 | A synthetic MUTATION from a test plugin through the supervisor to `EffectRouter` and Crabedence, committed with a receipt, normalized result back | Open — needs the mediation surface from the finding above |
+| 3 | Failure injection: plugin crash before/after request, host crash, supervisor crash, Crabedence crash before/after dispatch, dropped response after provider commit, runtime restart — asserting safe failure, `UNKNOWN`, reconciliation, and no duplicate effect on replay | Open |
+| 4 | A real external mutation (`github.issue.create`) as the first end-to-end integrated capability | Open |
+
+Only after Phase 4 is `github.issue.create` an end-to-end integrated
+capability, and only after Phase 3 does the distribution have evidence that
+the assembled system survives the failure modes the kernel already models.
 
 ## Open decisions
 
