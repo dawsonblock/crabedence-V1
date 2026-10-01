@@ -115,17 +115,94 @@ pub struct PluginOptions {
 
 /// The executed host binary's identity.
 ///
-/// The path is the one the isolation policy resolved — under a confinement
-/// policy that is the bundle's executable, not necessarily the configured
-/// path — and the digest is its content, computed at session open.
+/// `executable` is the path the child was spawned from — under the trusted
+/// policy that is a staged copy of the resolved host (see [`stage_host`]),
+/// under a confinement policy it is the bundle's executable — and the digest
+/// is the content of what was executed, computed at session open.
 pub struct HostIdentity {
     /// The executable the child was spawned from.
     pub executable: PathBuf,
+    /// The executable the deployment's resolution named, before any staging.
+    /// Equal to `executable` when nothing was staged.
+    pub resolved: PathBuf,
     /// Its SHA-256, hex.
     pub sha256: String,
     /// Whether the deployment pinned the digest (`true` means it matched —
     /// a mismatch never becomes a session).
     pub pinned: bool,
+    /// Whether the executed binary is a verified staged copy rather than the
+    /// resolved path itself.
+    pub staged: bool,
+}
+
+/// A verified copy of the host executable, in a directory private to this
+/// session.
+///
+/// This is trusted-process mode's answer to hash-then-spawn: hashing a path
+/// and later executing whatever is at that path leaves a window where
+/// replacing the file runs something the digest never covered. The host's
+/// verified bytes are copied to a directory this session creates, the pin is
+/// checked against the copy, and the child is spawned from the copy — so the
+/// digest that was approved is the digest of the file `exec` opens. The
+/// directory is removed when the session ends; a runtime that dies before it
+/// can clean up leaves only inert bytes in a private directory.
+struct StagedHost {
+    /// The private staging directory.
+    dir: PathBuf,
+    /// The staged executable inside it.
+    executable: PathBuf,
+}
+
+impl Drop for StagedHost {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Copy the approved host to a private path the spawn will execute.
+///
+/// The directory's name is unguessable and its mode owner-only, so no other
+/// account can preempt or replace the staged copy — the TOCTOU this closes is
+/// a mutably-writable release directory, not a same-UID attacker, which a
+/// trusted-process deployment already accepts.
+fn stage_host(source: &Path) -> Result<StagedHost, String> {
+    let dir = std::env::temp_dir().join(format!("nemo-plugin-host-{}", Uuid::now_v7().simple()));
+    let executable = dir.join("nemo-plugin-host");
+    let staged = (|| -> Result<(), String> {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir(&dir).map_err(|error| {
+            format!(
+                "the plugin host's staging directory '{}' could not be created: {error}",
+                dir.display()
+            )
+        })?;
+        #[cfg(unix)]
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).map_err(
+            |error| {
+                format!("the plugin host's staging directory could not be made private: {error}")
+            },
+        )?;
+        std::fs::copy(source, &executable).map_err(|error| {
+            format!(
+                "the plugin host '{}' could not be staged for execution: {error}",
+                source.display()
+            )
+        })?;
+        // Read and execute, not write: the staged copy is fixed content.
+        #[cfg(unix)]
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o500)).map_err(
+            |error| format!("the staged plugin host's permissions could not be fixed: {error}"),
+        )?;
+        Ok(())
+    })();
+    match staged {
+        Ok(()) => Ok(StagedHost { dir, executable }),
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&dir);
+            Err(error)
+        }
+    }
 }
 
 /// An active plugin-host session.
@@ -144,6 +221,13 @@ pub struct PluginSession {
     /// artifact identity, installed which registrations. A bound invocation
     /// records it, so evidence can prove which plugin set mediated the request.
     pub middleware_set_digest: String,
+    /// Explicit plugin artifact identities carried into durable mediation
+    /// evidence so operators can inspect them without reversing the set hash.
+    pub plugin_manifest_sha256: String,
+    pub plugin_library_sha256: String,
+    /// Digest of canonical activation configuration; raw configuration can
+    /// contain secrets and is never copied into execution evidence.
+    pub activation_config_sha256: String,
     /// The host executable the supervisor resolved and its SHA-256 — the
     /// binary that actually holds the plugin, which is what a qualified
     /// deployment's pin binds. Recorded so a receipt can name it.
@@ -154,25 +238,92 @@ pub struct PluginSession {
     /// Held, not read: dropping the proxies is what removes the plugin's
     /// registrations from this process's chains.
     _proxies: RegistrationProxies,
+    /// Held, not read: the staged host copy must live exactly as long as the
+    /// child spawned from it — dropping it deletes the running executable's
+    /// file (the process keeps running on Unix, but the path's usefulness to
+    /// an observer ends).
+    _staging: Option<StagedHost>,
 }
 
 /// The middleware-set digest for one activated plugin.
 ///
-/// Sorted registration ids, so the digest is the set rather than the order the
-/// host happened to report it in.
-fn middleware_set_digest(descriptor: &PluginDescriptor) -> Result<String, String> {
-    let mut registrations: Vec<&str> = descriptor
-        .registrations
-        .iter()
-        .map(|registration| registration.registration_id.as_str())
-        .collect();
-    registrations.sort_unstable();
+/// This digest is the composition's answer to "which middleware mediated this
+/// request?", so it binds everything that answer could depend on: the plugin's
+/// verified artifact identity (manifest and library SHA-256), the component
+/// activated and the configuration it was activated with, the complete
+/// registration descriptors — operation, ordering, shape, gating — and the
+/// host executable that ran them. Two sessions that differ in any of those
+/// produce different digests even when their registration ids are the same.
+///
+/// The registration and capability lists are canonicalized and sorted by
+/// their canonical bytes, so the digest names the set rather than the order
+/// the host happened to report it in.
+fn middleware_set_digest(
+    descriptor: &PluginDescriptor,
+    manifest_sha256: &str,
+    library_sha256: &str,
+    component_kind: &str,
+    component_config_json: &str,
+    host_sha256: &str,
+) -> Result<String, String> {
+    let canonical_set = |items: Vec<Value>| -> Result<Vec<Value>, String> {
+        let mut canonical: Vec<Vec<u8>> = items
+            .iter()
+            .map(|item| {
+                serde_json_canonicalizer::to_vec(item).map_err(|error| {
+                    format!("a middleware descriptor could not be canonicalized: {error}")
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        canonical.sort();
+        canonical
+            .iter()
+            .map(|bytes| {
+                serde_json::from_slice::<Value>(bytes).map_err(|error| {
+                    format!("a canonical middleware descriptor did not re-read: {error}")
+                })
+            })
+            .collect()
+    };
+    let registrations = canonical_set(
+        descriptor
+            .registrations
+            .iter()
+            .map(|registration| {
+                serde_json::to_value(registration).map_err(|error| {
+                    format!("a registration descriptor did not serialize: {error}")
+                })
+            })
+            .collect::<Result<_, _>>()?,
+    )?;
+    let capabilities = canonical_set(
+        descriptor
+            .capabilities
+            .iter()
+            .map(|capability| {
+                serde_json::to_value(capability)
+                    .map_err(|error| format!("a capability declaration did not serialize: {error}"))
+            })
+            .collect::<Result<_, _>>()?,
+    )?;
+    let activation_config: Value = serde_json::from_str(component_config_json)
+        .map_err(|error| format!("the activation config is not JSON: {error}"))?;
     crate::canonical_digest(&json!({
-        "plugin_id": descriptor.plugin_id,
-        "plugin_version": descriptor.plugin_version,
-        "manifest_digest": descriptor.manifest_digest,
-        "negotiated_abi_version": descriptor.negotiated_abi_version,
-        "registrations": registrations,
+        "plugins": [{
+            "plugin_id": descriptor.plugin_id,
+            "plugin_version": descriptor.plugin_version,
+            "manifest_digest": descriptor.manifest_digest,
+            "manifest_sha256": manifest_sha256,
+            "library_sha256": library_sha256,
+            "negotiated_abi_version": descriptor.negotiated_abi_version,
+            "activated_component": {
+                "kind": component_kind,
+                "config": activation_config,
+            },
+            "registrations": registrations,
+            "capabilities": capabilities,
+            "host_sha256": host_sha256,
+        }]
     }))
 }
 
@@ -190,13 +341,20 @@ pub async fn open(options: &PluginOptions) -> Result<PluginSession, String> {
     let (manifest_sha256, library_sha256) =
         nemo_relay::plugin::dynamic::plugin_artifact_identity(&artifact_ref)
             .map_err(|error| format!("the plugin artifact could not be approved: {error}"))?;
+    let activation_config: Value = serde_json::from_str(&options.component_config)
+        .map_err(|error| format!("the activation config is not JSON: {error}"))?;
+    let activation_config_sha256 = crate::canonical_digest(&activation_config)?;
 
-    let config = supervisor_config(options);
-    // The binary the child will actually be: the same resolution `spawn`
-    // applies, so the digest and the pin bind what executes, not what was
-    // configured. Under a confinement policy that can be a different path than
-    // `config.executable`.
-    let host = host_identity(&config, options.host_sha256_pin.as_deref())?;
+    let mut config = supervisor_config(options);
+    // The binary the child will actually be: resolved the way `spawn`
+    // resolves it, then for a trusted host staged into private bytes the
+    // spawn itself executes — so the digest and the pin bind the file `exec`
+    // opens, not a path that could be replaced between the check and the
+    // spawn. Under a confinement policy the executed file is the bundle's
+    // signed executable, whose integrity the platform checks at launch;
+    // staging a bare copy of it would strip the signature the confinement
+    // travels with, so it is the one path that is spawned as resolved.
+    let (host, staging) = prepare_host(&mut config, options.host_sha256_pin.as_deref())?;
     let backend = ProcessPluginBackend::launch(config)
         .await
         .map_err(|error| format!("the plugin host did not start: {error}"))?;
@@ -208,8 +366,8 @@ pub async fn open(options: &PluginOptions) -> Result<PluginSession, String> {
                 plugin_id: options.plugin_id.clone(),
                 artifact: artifact_ref.to_string(),
                 identity: PluginArtifactIdentity {
-                    manifest_sha256,
-                    library_sha256,
+                    manifest_sha256: manifest_sha256.clone(),
+                    library_sha256: library_sha256.clone(),
                 },
             },
             context(options),
@@ -267,25 +425,42 @@ pub async fn open(options: &PluginOptions) -> Result<PluginSession, String> {
         format!("this runtime cannot serve what the plugin registered: {error}")
     })?;
 
-    let middleware_set_digest = middleware_set_digest(&descriptor)?;
+    let middleware_set_digest = middleware_set_digest(
+        &descriptor,
+        &manifest_sha256,
+        &library_sha256,
+        &options.component,
+        &options.component_config,
+        &host.sha256,
+    )?;
     Ok(PluginSession {
         descriptor,
         process_id,
         middleware_set_digest,
+        plugin_manifest_sha256: manifest_sha256,
+        plugin_library_sha256: library_sha256,
+        activation_config_sha256,
         host,
         _manager: manager,
         _proxies: proxies,
+        _staging: staging,
     })
 }
 
 /// Host the plugin and, when asked, run one managed tool call through it.
-pub fn host(options: &PluginOptions) -> Result<Value, String> {
+pub fn host(
+    options: &PluginOptions,
+    release: Option<&crate::release::ReleaseIdentity>,
+) -> Result<Value, String> {
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|error| format!("the plugin host needs an async runtime: {error}"))?;
-    runtime.block_on(host_async(options))
+    runtime.block_on(host_async(options, release))
 }
 
-async fn host_async(options: &PluginOptions) -> Result<Value, String> {
+async fn host_async(
+    options: &PluginOptions,
+    release: Option<&crate::release::ReleaseIdentity>,
+) -> Result<Value, String> {
     let session = open(options).await?;
 
     // A managed call, under the trusted budget a runtime publishes for an
@@ -308,9 +483,17 @@ async fn host_async(options: &PluginOptions) -> Result<Value, String> {
 
     let report = json!({
         "status": if options.tool.is_some() { "INVOKED" } else { "HOSTED" },
-        "host": { "process_id": session.process_id },
+        "host": {
+            "process_id": session.process_id,
+            "executable": session.host.executable,
+            "resolved": session.host.resolved,
+            "sha256": session.host.sha256,
+            "pinned": session.host.pinned,
+            "staged": session.host.staged,
+        },
         "plugin": serde_json::to_value(&session.descriptor).map_err(|error| error.to_string())?,
         "middleware_set_digest": session.middleware_set_digest,
+        "release_root_digest": release.map(|release| release.release_root_digest.clone()),
         "tool_call": tool_call,
     });
     // Dropping the session removes the registrations from this process's
@@ -327,18 +510,27 @@ async fn host_async(options: &PluginOptions) -> Result<Value, String> {
 /// whichever path resolved.
 const HOST_SHA256_ENV: &str = "NEMO_RELAY_PLUGIN_HOST_SHA256";
 
-/// Resolve the executed host binary's identity and enforce the pin.
+/// Resolve, stage, digest, and pin the executed host binary.
 ///
 /// The path resolution is the same one `spawn` applies — the isolation policy
-/// decides which executable the child is — so the digest binds what runs. The
-/// pin, when set, is the release's component-manifest value: a host whose
+/// decides which executable the child is — so the digest binds what runs. For
+/// a trusted host the spawned file is a private staged copy of the resolved
+/// path: hashing a path and later executing whatever is at that path leaves a
+/// replacement window, so `config.executable` is rewritten to the staged copy
+/// and the digest is computed over the bytes that will actually run. Under a
+/// confinement policy the executed file is the bundle's signed executable —
+/// staging a bare copy would strip the signature the sandbox travels with —
+/// so it is digested and spawned as resolved, with the signature the platform
+/// itself enforces at `exec`.
+///
+/// The pin, when set, is the release's component-manifest value: a host whose
 /// content differs is a deployment error that fails the session, never a
 /// quieter host.
-fn host_identity(
-    config: &PluginHostSupervisorConfig,
+fn prepare_host(
+    config: &mut PluginHostSupervisorConfig,
     pin: Option<&str>,
-) -> Result<HostIdentity, String> {
-    let executable = config
+) -> Result<(HostIdentity, Option<StagedHost>), String> {
+    let resolved = config
         .isolation
         .host_executable(
             &config.executable,
@@ -348,6 +540,13 @@ fn host_identity(
                 .unwrap_or_default(),
         )
         .map_err(|error| error.to_string())?;
+    let (executable, staging) = if config.isolation.confines_resources() {
+        (resolved.clone(), None)
+    } else {
+        let staged = stage_host(&resolved)?;
+        config.executable = staged.executable.clone();
+        (staged.executable.clone(), Some(staged))
+    };
     let sha256 = std::fs::read(&executable)
         .map(|bytes| crate::sha256_hex(&bytes))
         .map_err(|error| {
@@ -372,21 +571,54 @@ fn host_identity(
             ));
         }
     }
-    Ok(HostIdentity {
-        executable,
-        sha256,
-        pinned: pin.is_some(),
-    })
+    Ok((
+        HostIdentity {
+            executable,
+            resolved,
+            sha256,
+            pinned: pin.is_some(),
+            staged: staging.is_some(),
+        },
+        staging,
+    ))
 }
 
 /// The pin a deployment configured, resolved at the CLI boundary.
-pub(crate) fn host_sha256_pin() -> Result<Option<String>, String> {
+fn host_sha256_pin() -> Result<Option<String>, String> {
     match std::env::var(HOST_SHA256_ENV) {
         Ok(raw) if !raw.trim().is_empty() => Ok(Some(raw.trim().to_string())),
         Ok(_) | Err(std::env::VarError::NotPresent) => Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => {
             Err(format!("{HOST_SHA256_ENV} is not valid text for a digest"))
         }
+    }
+}
+
+/// The digest the executed host must carry.
+///
+/// In a qualified layout the release itself is the pin's source: the
+/// component manifest declares which host bytes the distribution ships, so
+/// the ordinary case needs no environment at all — running the installed
+/// binary is bound to the installed host. Outside a release (a development
+/// tree, a side-by-side install) `NEMO_RELAY_PLUGIN_HOST_SHA256` still
+/// applies. When both exist they must agree: a deployment that pins a
+/// different host than its release declared is a contradiction, not an
+/// override — which one lied is a deployer's question, not the runtime's.
+pub(crate) fn resolve_host_pin(
+    release: Option<&crate::release::ReleaseIdentity>,
+) -> Result<Option<String>, String> {
+    let configured = host_sha256_pin()?;
+    match (release, configured) {
+        (Some(release), Some(pin)) if !pin.eq_ignore_ascii_case(&release.plugin_host_sha256) => {
+            Err(format!(
+                "{HOST_SHA256_ENV} pins {pin} but the release's component manifest declares \
+                 {} for bin/nemo-plugin-host — the two disagree, and resolving which one \
+                 lied is a deployment decision, not a runtime's",
+                release.plugin_host_sha256,
+            ))
+        }
+        (Some(release), _) => Ok(Some(release.plugin_host_sha256.clone())),
+        (None, pin) => Ok(pin),
     }
 }
 

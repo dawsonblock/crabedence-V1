@@ -98,6 +98,16 @@ printf '%s' "$out" | jq -e '.status=="SUCCEEDED" and .result.local==true' >/dev/
   || fail "system.echo did not route locally: $out"
 pass "PURE routed locally"
 
+# 1b. When the bytes under test are an installed distribution, the runtime
+#     must have bound itself to the release root: every report carries the
+#     component-manifest digest it discovered beside its own binary.
+if [[ -n "${NEMO_E2E_EXPECT_RELEASE_ROOT:-}" ]]; then
+  printf '%s' "$out" | jq -e --arg d "$NEMO_E2E_EXPECT_RELEASE_ROOT" '
+      .identity.release.release_root_digest==$d' >/dev/null \
+    || fail "the runtime did not report the release root it shipped in: $out"
+  pass "runtime reports the release-root identity from its component manifest"
+fi
+
 # 2. A consequential invocation without a caller key is refused before
 #    dispatch — no capability-derived default.
 set +e
@@ -224,6 +234,9 @@ printf '%s' "$out" | jq -e '
     and .result.arguments.probe=="joined"
     and .plugin.process_id != null
     and (.identity.middleware_set_digest != null)
+    and (.identity.mediation.plugin_manifest_sha256 | length) == 64
+    and (.identity.mediation.plugin_library_sha256 | length) == 64
+    and (.identity.mediation.activation_config_sha256 | length) == 64
     and .identity.original_args_digest != .attempts[0].effective_args_digest
     and (.attempts | length) == 1' >/dev/null \
   || fail "the joined PURE invocation did not prove middleware + function hooks: $out"
@@ -231,9 +244,10 @@ pass "PURE mediated by the child's middleware, executed by the function-hook bac
 
 # 8. A MUTATION through the same chain. The counter's argument schema is
 #    closed, so the plugin runs with its argument markers off — its execution
-#    intercept still wraps the call, and the marker it writes into the *result*
-#    is the proof the child's middleware held the continuation around the
-#    Crabedence dispatch without altering the request.
+#    intercept still wraps the call, and the marker it writes into the result
+#    it returns is the proof the child's middleware held the continuation
+#    around the Crabedence dispatch. That marked payload is not the report —
+#    the routed outcome is — so it lands in `middleware_result`.
 counter_joined="runtime-e2e-joined-$$"
 key_joined="runtime-e2e-joined-key-$$"
 out="$(run_runtime --plugin "$plugin_dir" --plugin-id fixture_intercept \
@@ -245,7 +259,7 @@ out="$(run_runtime --plugin "$plugin_dir" --plugin-id fixture_intercept \
   || fail "the joined MUTATION must commit: $out"
 printf '%s' "$out" | jq -e '
     .status=="SUCCEEDED" and .result.value==1
-    and .native_intercept_execution==true
+    and .middleware_result.native_intercept_execution==true
     and (.receipt_digest != null)
     and .plugin.process_id != null
     and (.attempts | length) == 1' >/dev/null \
@@ -263,7 +277,7 @@ out="$(run_runtime --plugin "$plugin_dir" --plugin-id fixture_intercept \
   || fail "the replay must answer from the durable record: $out"
 printf '%s' "$out" | jq -e '
     .status=="SUCCEEDED" and .result.value==1
-    and .native_intercept_execution==true' >/dev/null \
+    and .middleware_result.native_intercept_execution==true' >/dev/null \
   || fail "a repeated key duplicated the effect: $out"
 pass "the repeated logical action replayed (still value 1)"
 
@@ -311,10 +325,11 @@ pass "middleware bypass of the routed dispatch refused"
 
 # ─── Plugin-host binary binding ─────────────────────────────────────────────
 #
-# The distribution's component manifest declares the host's SHA-256, and a
-# qualified deployment pins it through NEMO_RELAY_PLUGIN_HOST_SHA256. The
-# digest is computed over the executable the supervisor will actually spawn —
-# the override cannot substitute a different host than the one it named.
+# The distribution's component manifest declares the host's SHA-256 — a
+# qualified layout binds it automatically, and outside a release a deployment
+# pins it through NEMO_RELAY_PLUGIN_HOST_SHA256. The digest is computed over
+# the bytes the supervisor actually spawns — an override cannot substitute a
+# different host than the one it named.
 
 host_sha256() {
   if command -v shasum >/dev/null 2>&1; then
@@ -444,23 +459,28 @@ printf '%s' "$out" | jq -e '
 pass "post-dispatch middleware failure cannot relabel a committed effect"
 
 # 20. Concurrent continuation: the ABI lets an intercept fan its continuation
-#     out — each call is a real dispatch attempt under the same logical key,
-#     and the durable record turns the second into a replay. Two attempts, one
-#     effect.
+#     out, but a consequential operation may dispatch only once — the second
+#     call is refused before it can reach the router. The first routed verdict
+#     stays authoritative, the refusal is evidence, and the middleware error
+#     the second call raised is recorded without relabeling the commit.
 counter_concurrent="runtime-e2e-concurrent-$$"
 out="$(run_runtime --plugin "$plugin_dir" --plugin-id fixture_intercept \
   --component fixture_intercept \
   --plugin-config '{"arg_marks":false,"use_concurrent_next":true}' --capability test.counter.increment \
   --arguments "{\"counter\":\"$counter_concurrent\",\"by\":1}" \
   --idempotency-key "runtime-e2e-concurrent-key-$$" --grant runtime-e2e-grant)" \
-  || fail "a concurrent continuation must still commit exactly once: $out"
+  || fail "a refused second dispatch must not uncommit the first: $out"
 printf '%s' "$out" | jq -e '
     .status=="SUCCEEDED" and .result.value==1
-    and (.attempts | length) == 2
-    and ([.attempts[].status] | all(. == "SUCCEEDED"))
-    and (.attempts[0].execution_id != .attempts[1].execution_id)' >/dev/null \
-  || fail "two attempts under one logical key must produce one effect: $out"
-pass "concurrent continuation: two attempts, one durable effect"
+    and (.receipt_digest != null)
+    and (.attempts | length) == 1
+    and (.refused_dispatches | length) == 1
+    and .refused_dispatches[0].reason=="MULTIPLE_DISPATCH_ATTEMPTS"
+    and .refused_dispatches[0].attempt==2
+    and (.refused_dispatches[0].effective_args_digest | length) == 64
+    and (.post_dispatch_middleware_error | length) > 0' >/dev/null \
+  || fail "a fanned continuation must dispatch once and record the refusal: $out"
+pass "concurrent continuation: first dispatch authoritative, second refused and recorded"
 
 # 21. Middleware timeout: a plugin that holds the call past the managed
 #     deadline fails the invocation — the deadline is the deployment's bound

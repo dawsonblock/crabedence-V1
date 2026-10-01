@@ -324,7 +324,23 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 			Error:       fmt.Sprintf("failed to compute descriptor digest: %v", err),
 		}
 	}
-	digest, err := idempotency.ComputeDigestFromRawWithDescriptor(
+	// Caller-declared middleware provenance: bound into the request
+	// digest so the durable record commits to which middleware set
+	// produced the dispatched arguments, and persisted verbatim at
+	// acquisition. Evidence only — it never selects route, provider,
+	// assurance, or authority.
+	var mediation *idempotency.MediationBinding
+	if req.Mediation != nil {
+		mediation = &idempotency.MediationBinding{
+			MiddlewareSetDigest:    req.Mediation.MiddlewareSetDigest,
+			OriginalArgsDigest:     req.Mediation.OriginalArgsDigest,
+			ReleaseRootDigest:      req.Mediation.ReleaseRootDigest,
+			PluginManifestSHA256:   req.Mediation.PluginManifestSHA256,
+			PluginLibrarySHA256:    req.Mediation.PluginLibrarySHA256,
+			ActivationConfigSHA256: req.Mediation.ActivationConfigSHA256,
+		}
+	}
+	digest, err := idempotency.ComputeDigestFromRawWithMediation(
 		requestDigestProtocolVersion,
 		req.Authority.Principal,
 		req.Capability,
@@ -337,6 +353,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		string(desc.ExecutionRoute),
 		desc.DescriptorVersion,
 		descriptorDigest,
+		mediation,
 	)
 	if err != nil {
 		return Response{
@@ -358,8 +375,8 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		Generation: req.Authority.AuthorityGeneration,
 		Digest:     req.Authority.AuthorityDigest,
 	}
-	acq, err := e.store.AcquireWithAuthority(ctx, req.IdempotencyKey, req.Authority.Principal, req.Capability, digest,
-		authorityBinding, string(desc.ExecutionClass), leaseDuration)
+	acq, err := e.store.AcquireWithMediation(ctx, req.IdempotencyKey, req.Authority.Principal, req.Capability, digest,
+		authorityBinding, mediation, string(desc.ExecutionClass), leaseDuration)
 	if err != nil {
 		return Response{
 			Status:      StatusFailed,

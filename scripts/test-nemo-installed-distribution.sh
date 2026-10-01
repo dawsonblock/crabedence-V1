@@ -81,8 +81,10 @@ declared="$(jq -r .crabbox_version "$manifest")"
   || fail "crabbox reports dev — the release stamp is missing"
 pass "crabbox reports the declared version $reported"
 
-# The plugin-host pin the runtime will enforce is the manifest's own digest —
-# the release's declaration bound into the running system.
+# The plugin-host pin the runtime enforces is the manifest's own digest. It is
+# exported *not*: the shipped runtime discovers the component manifest beside
+# its own binary, verifies it against the sidecar, and binds the host itself —
+# exporting the pin here would leave the auto-binding untested.
 host_sha="$(jq -r '.components[] | select(.path=="bin/nemo-plugin-host") | .sha256' "$manifest")"
 [[ "$host_sha" =~ ^[0-9a-f]{64}$ ]] || fail "the manifest does not bind a plugin-host digest"
 pass "the manifest binds the plugin host at $host_sha"
@@ -90,8 +92,9 @@ pass "the manifest binds the plugin host at $host_sha"
 export NEMO_E2E_CRABBOX="$root/bin/crabbox"
 export NEMO_E2E_RUNTIME="$root/bin/nemo-crabedence-runtime"
 export NEMO_E2E_PLUGIN_HOST="$root/bin/nemo-plugin-host"
-export NEMO_RELAY_PLUGIN_HOST="$root/bin/nemo-plugin-host"
-export NEMO_RELAY_PLUGIN_HOST_SHA256="$host_sha"
+# The e2e suite asserts every report names this release-root digest — proof
+# the runtime bound itself to this manifest rather than running unqualified.
+export NEMO_E2E_EXPECT_RELEASE_ROOT="$(awk '{print $1}' "$root/manifests/component-manifest.sha256")"
 
 # ─── 3. The full chain on shipped bytes ──────────────────────────────────────
 

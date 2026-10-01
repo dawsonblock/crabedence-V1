@@ -962,6 +962,9 @@ impl<A, F, E, ES> Kernel<A, F, E, ES> {
                 args: invocation.args.clone(),
                 grant: None,
                 trace_id: invocation.trace_id.clone(),
+                // The kernel's own managed path asserts no middleware
+                // provenance — its middleware is the kernel itself.
+                mediation: None,
             },
         })
     }

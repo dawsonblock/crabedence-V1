@@ -39,6 +39,12 @@ type Request struct {
 	ExecutionClass string           `json:"execution_class,omitempty"` // advisory; registry is authoritative
 	IdempotencyKey string           `json:"idempotency_key,omitempty"`
 	Deadline       string           `json:"deadline,omitempty"`
+	// Mediation carries caller-declared middleware provenance — the
+	// middleware set that ran and the pre-mediation argument digest.
+	// It is evidence, never a policy input: it binds into the request
+	// digest and is persisted on the durable record, but cannot select
+	// route, provider, assurance, or authority.
+	Mediation *RequestMediation `json:"mediation,omitempty"`
 }
 
 // RequestAuthority carries the principal and authority reference.
@@ -68,6 +74,25 @@ type RequestAuthority struct {
 	// grant-free capabilities).
 	AuthorityGeneration int64  `json:"authority_generation,omitempty"`
 	AuthorityDigest     string `json:"authority_digest,omitempty"`
+}
+
+// RequestMediation is the caller-declared middleware provenance object
+// the NEMO runtime attaches when middleware (including trusted native
+// plugins) mediated the invocation. MiddlewareSetDigest names the exact
+// middleware set that ran — activated plugin identities, registration
+// descriptors, activation configuration, and host identity.
+// OriginalArgsDigest is the canonical digest of the arguments before
+// middleware rewrote them. ReleaseRootDigest names the component
+// manifest of the qualified distribution the runtime shipped in, when
+// it runs inside one. Both required fields mirror the Rust ABI, which
+// rejects a mediation object that omits them.
+type RequestMediation struct {
+	MiddlewareSetDigest    string `json:"middleware_set_digest"`
+	OriginalArgsDigest     string `json:"original_args_digest"`
+	ReleaseRootDigest      string `json:"release_root_digest,omitempty"`
+	PluginManifestSHA256   string `json:"plugin_manifest_sha256,omitempty"`
+	PluginLibrarySHA256    string `json:"plugin_library_sha256,omitempty"`
+	ActivationConfigSHA256 string `json:"activation_config_sha256,omitempty"`
 }
 
 // Response is the wire-format execution response.

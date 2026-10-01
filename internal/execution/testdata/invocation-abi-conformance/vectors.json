@@ -247,6 +247,86 @@
       "wire_b64": "eyJjYXBhYmlsaXR5Ijoic3lzdGVtLmVjaG8iLCJhcmd1bWVudHMiOnt9LCJhdXRob3JpdHkiOnsicHJpbmNpcGFsIjoiYWxpY2X/In19",
       "expected": "reject",
       "error_contains": "UTF-8"
+    },
+    {
+      "name": "mediation-valid",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":{\"principal\":\"alice@example.com\"},\"mediation\":{\"middleware_set_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"original_args_digest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}}",
+      "expected": "accept"
+    },
+    {
+      "name": "mediation-valid-release-root",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":{\"principal\":\"alice@example.com\"},\"mediation\":{\"middleware_set_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"original_args_digest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"release_root_digest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}}",
+      "expected": "accept"
+    },
+    {
+      "name": "mediation-valid-explicit-plugin-identity",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":{\"principal\":\"alice@example.com\"},\"mediation\":{\"middleware_set_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"original_args_digest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"release_root_digest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"plugin_manifest_sha256\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"plugin_library_sha256\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"activation_config_sha256\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"}}",
+      "expected": "accept"
+    },
+    {
+      "name": "mediation-empty-string-digests",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":{\"principal\":\"alice@example.com\"},\"mediation\":{\"middleware_set_digest\":\"\",\"original_args_digest\":\"\"}}",
+      "expected": "accept"
+    },
+    {
+      "name": "unknown-mediation-field",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":{\"principal\":\"alice@example.com\"},\"mediation\":{\"middleware_set_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"original_args_digest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"route\":\"direct\"}}",
+      "expected": "reject",
+      "error_contains": "unknown field"
+    },
+    {
+      "name": "mediation-as-string",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":{\"principal\":\"alice@example.com\"},\"mediation\":\"abc\"}",
+      "expected": "reject",
+      "error_contains": "must be a JSON object"
+    },
+    {
+      "name": "mediation-as-array",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":{\"principal\":\"alice@example.com\"},\"mediation\":[]}",
+      "expected": "reject",
+      "error_contains": "must be a JSON object"
+    },
+    {
+      "name": "null-mediation",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":{\"principal\":\"alice@example.com\"},\"mediation\":null}",
+      "expected": "reject",
+      "error_contains": "null is not accepted"
+    },
+    {
+      "name": "null-middleware-set-digest",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":{\"principal\":\"alice@example.com\"},\"mediation\":{\"middleware_set_digest\":null,\"original_args_digest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}}",
+      "expected": "reject",
+      "error_contains": "null is not accepted"
+    },
+    {
+      "name": "mediation-digest-as-number",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":{\"principal\":\"alice@example.com\"},\"mediation\":{\"middleware_set_digest\":7,\"original_args_digest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}}",
+      "expected": "reject",
+      "error_contains": "must be a JSON string"
+    },
+    {
+      "name": "duplicate-mediation-key",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":{\"principal\":\"alice@example.com\"},\"mediation\":{\"middleware_set_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"middleware_set_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"original_args_digest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}}",
+      "expected": "reject",
+      "error_contains": "duplicate key"
+    },
+    {
+      "name": "mediation-missing-original-args",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":{\"principal\":\"alice@example.com\"},\"mediation\":{\"middleware_set_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}",
+      "expected": "reject",
+      "error_contains": "is required"
+    },
+    {
+      "name": "mediation-missing-middleware-set",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":{\"principal\":\"alice@example.com\"},\"mediation\":{\"original_args_digest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}}",
+      "expected": "reject",
+      "error_contains": "is required"
+    },
+    {
+      "name": "mediation-empty-object",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":{\"principal\":\"alice@example.com\"},\"mediation\":{}}",
+      "expected": "reject",
+      "error_contains": "is required"
     }
   ]
 }

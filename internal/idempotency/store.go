@@ -39,21 +39,29 @@ type Record struct {
 	// permitted this?" without re-resolving grants. Zero means
 	// unversioned authority (in-memory resolvers, grant-free
 	// capabilities).
-	AuthorityGeneration int64           `json:"authority_generation,omitempty"`
-	AuthorityDigest     string          `json:"authority_digest,omitempty"`
-	ExecutionClass      string          `json:"execution_class"`
-	State               State           `json:"state"`
-	Result              json.RawMessage `json:"result,omitempty"`
-	EvidenceDigest      string          `json:"evidence_digest,omitempty"`
-	ReceiptVersion      int             `json:"receipt_version,omitempty"`
-	LeaseOwner          string          `json:"lease_owner,omitempty"`
-	LeaseToken          string          `json:"lease_token,omitempty"`
-	LeaseStartedAt      *time.Time      `json:"lease_started_at,omitempty"`
-	LeaseExpiresAt      *time.Time      `json:"lease_expires_at,omitempty"`
-	LeaseGeneration     int             `json:"lease_generation,omitempty"`
-	ProviderID          string          `json:"provider_id,omitempty"`
-	ProviderRunID       string          `json:"provider_run_id,omitempty"`
-	ProviderStatus      string          `json:"provider_status,omitempty"`
+	AuthorityGeneration int64  `json:"authority_generation,omitempty"`
+	AuthorityDigest     string `json:"authority_digest,omitempty"`
+	// RequestMediation is the caller-declared middleware provenance the
+	// request carried at acquisition — the exact bytes of the ABI
+	// mediation object, bound into request_digest. It is evidence,
+	// never policy: the ledger records it so a receipt can prove which
+	// middleware set produced the dispatched arguments and which
+	// release composed the runtime. NULL when the request crossed no
+	// caller-side middleware boundary.
+	RequestMediation json.RawMessage `json:"request_mediation,omitempty"`
+	ExecutionClass   string          `json:"execution_class"`
+	State            State           `json:"state"`
+	Result           json.RawMessage `json:"result,omitempty"`
+	EvidenceDigest   string          `json:"evidence_digest,omitempty"`
+	ReceiptVersion   int             `json:"receipt_version,omitempty"`
+	LeaseOwner       string          `json:"lease_owner,omitempty"`
+	LeaseToken       string          `json:"lease_token,omitempty"`
+	LeaseStartedAt   *time.Time      `json:"lease_started_at,omitempty"`
+	LeaseExpiresAt   *time.Time      `json:"lease_expires_at,omitempty"`
+	LeaseGeneration  int             `json:"lease_generation,omitempty"`
+	ProviderID       string          `json:"provider_id,omitempty"`
+	ProviderRunID    string          `json:"provider_run_id,omitempty"`
+	ProviderStatus   string          `json:"provider_status,omitempty"`
 	// ProviderResult is the provider's original result payload as
 	// observed at dispatch time — immutable forensic evidence. It is
 	// written only by RecordProviderObservation and
@@ -336,7 +344,7 @@ func (s *Store) checkEpoch(ctx context.Context) error {
 // requires. Startup verifies the migrated schema reaches this version —
 // a database older than the code fails closed rather than running
 // against a partial schema.
-const RequiredSchemaVersion = 11
+const RequiredSchemaVersion = 12
 
 // schemaMigration is one versioned, idempotent schema change. Each
 // migration must be safe to re-run (IF NOT EXISTS / addColumnIfMissing)
@@ -362,6 +370,7 @@ var schemaMigrations = []schemaMigration{
 	{9, "cluster_epoch", migrationClusterEpoch},
 	{10, "result_byte_fidelity", migrationResultByteFidelity},
 	{11, "cluster_recovery_mode", migrationClusterRecoveryMode},
+	{12, "request_mediation", migrationRequestMediation},
 }
 
 func (s *Store) ensureSchema(ctx context.Context) error {
@@ -897,6 +906,16 @@ func migrationClusterRecoveryMode(ctx context.Context, conn *sql.Conn) error {
 	return nil
 }
 
+// migrationRequestMediation adds the caller-declared middleware
+// provenance column. TEXT like the other evidence payloads — the exact
+// mediation bytes are bound into request_digest and projected onto the
+// record; JSONB would rewrite the bytes the verifier needs byte-exact.
+func migrationRequestMediation(ctx context.Context, conn *sql.Conn) error {
+	_, err := conn.ExecContext(ctx,
+		`ALTER TABLE execution_requests ADD COLUMN IF NOT EXISTS request_mediation TEXT`)
+	return err
+}
+
 // ─── Forensic write helpers ──────────────────────────────────────────
 
 // insertEffectEvent appends one event row inside the mutation's
@@ -1031,8 +1050,27 @@ func (s *Store) Acquire(ctx context.Context, key, principal, capability, digest,
 // request are persisted on the record at insert so the ledger can prove
 // which authority material admitted each execution.
 func (s *Store) AcquireWithAuthority(ctx context.Context, key, principal, capability, digest string, authority AuthorityBinding, class string, leaseDuration time.Duration) (*AcquireResult, error) {
+	return s.AcquireWithMediation(ctx, key, principal, capability, digest,
+		authority, nil, class, leaseDuration)
+}
+
+// AcquireWithMediation is AcquireWithAuthority plus the caller-declared
+// middleware provenance: when the request carried a mediation object, its
+// canonical bytes are persisted on the record at insert so the ledger can
+// prove which middleware set produced the dispatched arguments. It is
+// evidence only — never consulted for authorization, routing, or
+// replay decisions.
+func (s *Store) AcquireWithMediation(ctx context.Context, key, principal, capability, digest string, authority AuthorityBinding, mediation *MediationBinding, class string, leaseDuration time.Duration) (*AcquireResult, error) {
 	if err := s.leaseCfg.Validate(leaseDuration); err != nil {
 		return nil, err
+	}
+
+	var mediationJSON []byte
+	if mediation != nil {
+		var err error
+		if mediationJSON, err = json.Marshal(mediation); err != nil {
+			return nil, fmt.Errorf("failed to encode request mediation: %w", err)
+		}
 	}
 
 	leaseToken, err := generateLeaseToken()
@@ -1069,10 +1107,10 @@ func (s *Store) AcquireWithAuthority(ctx context.Context, key, principal, capabi
 			(execution_id, idempotency_key, principal_id, capability_id, request_digest,
 			 grant_id, authority_generation, authority_digest, execution_class, state,
 			 lease_owner, lease_token, lease_started_at, lease_expires_at,
-			 lease_generation, attempt, version, admitted_epoch)
+			 lease_generation, attempt, version, admitted_epoch, request_mediation)
 		SELECT $10, $1, $2, $3, $4, $5, $11, $12, $6, 'PREPARED',
 				$7, $8, clock_timestamp(), clock_timestamp() + make_interval(secs => $9),
-				1, 0, 1, cm.epoch
+				1, 0, 1, cm.epoch, $13
 		FROM cluster_meta cm
 		WHERE cm.id = 1 AND cm.epoch = `+strconv.FormatInt(s.epoch, 10)+` AND NOT cm.recovery_required
 		ON CONFLICT (principal_id, capability_id, idempotency_key) DO NOTHING
@@ -1080,6 +1118,7 @@ func (s *Store) AcquireWithAuthority(ctx context.Context, key, principal, capabi
 	`, key, principal, capability, digest, nullableString(authority.Ref), class,
 		leaseOwner, leaseToken, pgInterval(leaseDuration),
 		genID, authority.Generation, nullableString(authority.Digest),
+		nullableBytes(mediationJSON),
 	).Scan(&executionID, &createdAt)
 
 	if err == nil {
@@ -1111,6 +1150,7 @@ func (s *Store) AcquireWithAuthority(ctx context.Context, key, principal, capabi
 				GrantID:             authority.Ref,
 				AuthorityGeneration: authority.Generation,
 				AuthorityDigest:     authority.Digest,
+				RequestMediation:    json.RawMessage(mediationJSON),
 				ExecutionClass:      class,
 				State:               StatePrepared,
 				LeaseOwner:          leaseOwner,
@@ -2830,7 +2870,8 @@ const selectColumns = `execution_id, idempotency_key, principal_id, capability_i
 	entered_unknown_at, provider_result,
 	COALESCE(authority_generation, 0), COALESCE(authority_digest, ''),
 	COALESCE(provider_evidence_digest, ''), COALESCE(terminal_result_digest, ''),
-	COALESCE(terminal_evidence_digest, ''), COALESCE(admitted_epoch, 0)`
+	COALESCE(terminal_evidence_digest, ''), COALESCE(admitted_epoch, 0),
+	request_mediation`
 
 // selectColumnsER is selectColumns qualified with the `er` alias, for
 // use in UPDATE ... FROM ... RETURNING statements where the FROM clause
@@ -2849,7 +2890,8 @@ const selectColumnsER = `er.execution_id, er.idempotency_key, er.principal_id, e
 	er.entered_unknown_at, er.provider_result,
 	COALESCE(er.authority_generation, 0), COALESCE(er.authority_digest, ''),
 	COALESCE(er.provider_evidence_digest, ''), COALESCE(er.terminal_result_digest, ''),
-	COALESCE(er.terminal_evidence_digest, ''), COALESCE(er.admitted_epoch, 0)`
+	COALESCE(er.terminal_evidence_digest, ''), COALESCE(er.admitted_epoch, 0),
+	er.request_mediation`
 
 // pgInterval converts a Go duration into a PostgreSQL interval
 // expression argument. make_interval(secs => x) accepts arbitrary
@@ -3433,6 +3475,7 @@ func scanRecordsWithReconcile(rows *sql.Rows) ([]*Record, error) {
 		var leaseStartedAt, leaseExpiresAt sql.NullTime
 		var recOwner, lastRecErr sql.NullString
 		var recLeaseExp, nextRecAt, enteredUnknownAt sql.NullTime
+		var requestMediation []byte
 		if err := rows.Scan(
 			&rec.ExecutionID, &rec.IdempotencyKey, &rec.PrincipalID,
 			&rec.CapabilityID, &rec.RequestDigest, &rec.GrantID,
@@ -3449,6 +3492,7 @@ func scanRecordsWithReconcile(rows *sql.Rows) ([]*Record, error) {
 			&rec.AuthorityGeneration, &rec.AuthorityDigest,
 			&rec.ProviderEvidenceDigest, &rec.TerminalResultDigest,
 			&rec.TerminalEvidenceDigest, &rec.AdmittedEpoch,
+			&requestMediation,
 		); err != nil {
 			return nil, err
 		}
@@ -3492,6 +3536,9 @@ func scanRecordsWithReconcile(rows *sql.Rows) ([]*Record, error) {
 		}
 		if len(recoveryLocator) > 0 {
 			rec.RecoveryLocator = json.RawMessage(recoveryLocator)
+		}
+		if len(requestMediation) > 0 {
+			rec.RequestMediation = json.RawMessage(requestMediation)
 		}
 		if recOwner.Valid {
 			rec.ReconcileOwner = recOwner.String

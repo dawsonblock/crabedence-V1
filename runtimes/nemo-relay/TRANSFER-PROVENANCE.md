@@ -58,6 +58,13 @@ go run ./cmd/nemo-runtime-digest -envelope
 The tool's digest is the same definition as the shell command above, verified
 to agree byte-for-byte, so either can be used to check the other.
 
+Both digests are regular-file identities: `find -type f` and the tool's
+`IsRegular` filter hash file contents and paths, and the tree's symlink
+entries (the per-crate `LICENSE` links, `CLAUDE.md`, `integrations/pi/*`)
+are not part of either digest. A distribution cannot hide behind that —
+the component manifest's exhaustive verification refuses a shipped root
+carrying any undeclared entry, symlink or not.
+
 The shipped value is declared in `runtimes/nemo-transfer-manifest.json` — one
 level above this tree — and checked against the tree by
 `scripts/check-nemo-transfer-manifest.sh` in CI. The declaration lives outside

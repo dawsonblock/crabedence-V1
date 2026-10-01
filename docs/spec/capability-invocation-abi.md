@@ -50,6 +50,47 @@ Unix-socket transport binding (see below) uses this exact structure:
 |--------------------|--------|--------------------------------------------------|
 | `execution_class`  | string | Caller assertion; checked against registry. If absent, registry's pinned class is used. Mismatch = DENIED. |
 | `deadline`         | string | RFC3339 timestamp; request is DENIED after this time |
+| `mediation`        | object | Middleware provenance for the request (see below) |
+
+### Mediation object
+
+The `mediation` field carries provenance about the middleware that
+handled the invocation *before* it crossed the ABI — for a runtime like
+NEMO, which middleware/plugin set rewrote the arguments and which
+release composed the call:
+
+```json
+{
+  "middleware_set_digest": "64-char hex SHA-256",
+  "original_args_digest": "64-char hex SHA-256",
+  "release_root_digest": "64-char hex SHA-256",
+  "plugin_manifest_sha256": "64-char hex SHA-256",
+  "plugin_library_sha256": "64-char hex SHA-256",
+  "activation_config_sha256": "64-char hex SHA-256"
+}
+```
+
+- `middleware_set_digest` (required when `mediation` is present):
+  digest of the exact middleware composition that ran — the activated
+  plugin identities, their registration descriptors and activation
+  configuration, and the host executable that served them.
+- `original_args_digest` (required when `mediation` is present):
+  digest of the caller's `arguments` *before* middleware rewrote them.
+  The `arguments` field itself always carries the post-middleware
+  (effective) arguments.
+- `release_root_digest` (optional): digest identifying the qualified
+  release/component manifest the calling runtime shipped in.
+- `plugin_manifest_sha256` and `plugin_library_sha256` (optional): the
+  activated plugin's manifest and exact library bytes.
+- `activation_config_sha256` (optional): the canonical activated-component
+  configuration digest. Raw configuration is not sent because it may contain
+  credentials.
+
+Mediation is evidence, not authorization input. Every present field is bound
+into the durable request identity and persisted on the durable record; the
+terminal receipt signs that request identity. It never selects the capability,
+route, authority, or outcome. A present `mediation` object missing either
+required field is refused.
 
 ### Authority object
 
@@ -118,7 +159,7 @@ before admission — it is never partially interpreted.
 | Root shape | The request must be a JSON object. |
 | Duplicate keys | Refused anywhere in the document — `encoding/json` and `JSON.parse` otherwise silently take the last value. |
 | Nesting depth | At most 64 open containers. |
-| Known fields | Root and `authority` accept only the documented fields. |
+| Known fields | Root, `authority`, and `mediation` accept only the documented fields. |
 | Null | Explicit `null` is refused for every known field; omit the field instead. `null` inside `arguments` is governed by the capability schema. |
 | Types | Known fields carry their declared JSON types. `authority_generation` must be a canonical JSON integer literal (no fraction, exponent, or leading zeros) that fits in a signed 64-bit integer. |
 

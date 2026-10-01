@@ -1,8 +1,8 @@
 {
   "tree": "runtimes/nemo-relay",
   "runtime_version": "0.9.1-rc.4",
-  "shipped_tree_sha256": "e70d34146641154440d2dd236b7f9580f5d1d20aeb911b2d6f14e4be18482fcf",
-  "file_count": 1458,
+  "shipped_tree_sha256": "1757027a359f04804a6232396a149f593982c03f67990168b90486326683f6bd",
+  "file_count": 1459,
   "excluded": [
     ".git",
     ".uv-cache",
@@ -25,6 +25,8 @@
     "Cargo.toml",
     "Cargo.lock",
     "crates/cli/src/mcp_environment.rs",
+    "crates/core/src/kernel.rs",
+    "crates/executor/src/lib.rs",
     "integrations/coding-agents/codex/.mcp.json"
   ],
   "added_paths": [

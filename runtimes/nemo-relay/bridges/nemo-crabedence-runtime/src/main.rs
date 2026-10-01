@@ -83,7 +83,7 @@ use nemo_relay::error::FlowError;
 use nemo_relay_executor::unstable::{
     CapabilityIdentity, DispatchState, EffectExecutionError, ExecutionBackend, ExecutionClass,
     ExecutionIdentity, ExecutionRequest, ExecutionResult, FunctionHooksExecutionBackend,
-    OutcomeCertainty, RuntimeIdentity,
+    OutcomeCertainty, RequestMediation, RuntimeIdentity,
 };
 use nemo_relay_plugin_host::isolation_policy::NativeIsolationPolicy;
 use serde_json::{Value, json};
@@ -91,6 +91,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 mod plugin_host;
+mod release;
 
 /// The application-owned function behind a `LOCAL`-routed capability.
 ///
@@ -473,6 +474,7 @@ fn bind_attempt(
     identity: &InvocationIdentity,
     effective_args: Value,
     attempt: u64,
+    mediation: Option<RequestMediation>,
 ) -> Result<BoundAttempt, String> {
     let effective_args_digest = canonical_digest(&effective_args)?;
     let execution_id = if attempt == 1 {
@@ -503,6 +505,7 @@ fn bind_attempt(
             args: effective_args,
             grant: identity.grant.clone(),
             trace_id: None,
+            mediation,
         },
         execution_id,
         effective_args_digest,
@@ -514,7 +517,11 @@ fn bind_attempt(
 ///
 /// The host session is bound to the runtime identity this process publishes,
 /// so the binding the host verifies is the binding a receipt would name.
-fn run_plugin_mode(options: &Options, artifact: &Path) -> ExitCode {
+fn run_plugin_mode(
+    options: &Options,
+    artifact: &Path,
+    release: Option<&release::ReleaseIdentity>,
+) -> ExitCode {
     let (Some(plugin_id), Some(component)) =
         (options.plugin_id.as_deref(), options.component.as_deref())
     else {
@@ -544,10 +551,12 @@ fn run_plugin_mode(options: &Options, artifact: &Path) -> ExitCode {
                 return ExitCode::from(2);
             }
         };
-    // The host-binary pin resolves here too: a qualified distribution sets
-    // NEMO_RELAY_PLUGIN_HOST_SHA256 to the release manifest's declared digest,
-    // so wherever the host resolves from, its content is bound to the release.
-    let host_sha256_pin = match plugin_host::host_sha256_pin() {
+    // The host-binary pin resolves here too: inside a qualified distribution
+    // the component manifest itself is the pin — the release declares the host
+    // it ships, with no environment variable to remember. Outside one,
+    // NEMO_RELAY_PLUGIN_HOST_SHA256 remains the deployment's pin; when both
+    // exist they must agree.
+    let host_sha256_pin = match plugin_host::resolve_host_pin(release) {
         Ok(pin) => pin,
         Err(message) => {
             eprintln!("nemo-crabedence-runtime: {message}");
@@ -568,7 +577,7 @@ fn run_plugin_mode(options: &Options, artifact: &Path) -> ExitCode {
         isolation,
         host_sha256_pin: host_sha256_pin.clone(),
     };
-    match plugin_host::host(&plugin_options) {
+    match plugin_host::host(&plugin_options, release) {
         Ok(report) => {
             println!("{report}");
             ExitCode::SUCCESS
@@ -590,6 +599,17 @@ struct AttemptRecord {
     /// The outcome's own words, so the exit code can follow the truth of the
     /// last dispatch rather than the chain around it.
     status: &'static str,
+}
+
+/// A continuation call refused before it could reach the router.
+///
+/// Refusals are evidence too: a report that shows one dispatched attempt and
+/// says nothing about the second continuation call would hide that the
+/// middleware tried to dispatch twice.
+struct RefusedDispatch {
+    attempt: u64,
+    effective_args_digest: String,
+    reason: String,
 }
 
 fn outcome_status(result: Result<&ExecutionResult, &EffectExecutionError>) -> &'static str {
@@ -635,6 +655,7 @@ async fn dispatch_managed(
     capability: &str,
     catalog: nemo_crabedence_bridge::capability_snapshot::VerifiedCapabilityCatalog,
     identity: InvocationIdentity,
+    release: Option<&release::ReleaseIdentity>,
 ) -> ExitCode {
     // With `--plugin` the session composes first: the host starts under the
     // deployment's isolation policy and its registrations enter this
@@ -649,7 +670,7 @@ async fn dispatch_managed(
                     return ExitCode::from(2);
                 }
             };
-            let host_sha256_pin = match plugin_host::host_sha256_pin() {
+            let host_sha256_pin = match plugin_host::resolve_host_pin(release) {
                 Ok(pin) => pin,
                 Err(message) => {
                     eprintln!("nemo-crabedence-runtime: {message}");
@@ -691,6 +712,24 @@ async fn dispatch_managed(
             }
         },
     };
+    // The mediation provenance every dispatched attempt carries across the
+    // ABI: which middleware set rewrote the arguments, what the caller's
+    // arguments digested to before it ran, and which release composed this —
+    // evidence the kernel binds into the durable record, never policy.
+    let mediation = RequestMediation {
+        middleware_set_digest: middleware_set_digest.clone(),
+        original_args_digest: identity.original_args_digest.clone(),
+        release_root_digest: release.map(|release| release.release_root_digest.clone()),
+        plugin_manifest_sha256: session
+            .as_ref()
+            .map(|session| session.plugin_manifest_sha256.clone()),
+        plugin_library_sha256: session
+            .as_ref()
+            .map(|session| session.plugin_library_sha256.clone()),
+        activation_config_sha256: session
+            .as_ref()
+            .map(|session| session.activation_config_sha256.clone()),
+    };
 
     let router = Arc::new(EffectRouter::new(
         catalog,
@@ -710,10 +749,15 @@ async fn dispatch_managed(
     ));
 
     // The dispatch runs inside the managed call: the chain's callback binds
-    // the effective arguments and routes them. An execution intercept may call
-    // the continuation more than once — each call is a real dispatch attempt
-    // and is recorded as one.
+    // the effective arguments and routes them. For a consequential capability
+    // — MUTATION or CRITICAL — exactly one continuation may cross the router:
+    // a second call would either replay under the durable key or collide on
+    // identity, and a committed effect followed by a refused retry is the
+    // ambiguity this composition exists to prevent. PURE keeps the flexible
+    // reading — nothing external commits — but every refusal is recorded
+    // either way.
     let attempts: Arc<Mutex<Vec<AttemptRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let refused: Arc<Mutex<Vec<RefusedDispatch>>> = Arc::new(Mutex::new(Vec::new()));
     let attempt_counter = Arc::new(AtomicU64::new(0));
     let identity = Arc::new(identity);
     let budget = match plugin_host::managed_call_budget() {
@@ -727,7 +771,9 @@ async fn dispatch_managed(
         let router = Arc::clone(&router);
         let identity = Arc::clone(&identity);
         let attempts = Arc::clone(&attempts);
+        let refused = Arc::clone(&refused);
         let attempt_counter = Arc::clone(&attempt_counter);
+        let mediation = mediation.clone();
         with_execution_budget(budget, async move {
             tool_call_execute(
                 ToolCallExecuteParams::builder()
@@ -737,30 +783,65 @@ async fn dispatch_managed(
                         let router = Arc::clone(&router);
                         let identity = Arc::clone(&identity);
                         let attempts = Arc::clone(&attempts);
+                        let refused = Arc::clone(&refused);
                         let attempt_counter = Arc::clone(&attempt_counter);
+                        let mediation = mediation.clone();
                         Box::pin(async move {
                             let attempt = attempt_counter.fetch_add(1, Ordering::SeqCst) + 1;
-                            let (outcome, execution_id, effective_args_digest) =
-                                match bind_attempt(&identity, effective_args, attempt) {
-                                    Ok(bound) => {
-                                        let execution_id = bound.execution_id.clone();
-                                        let digest = bound.effective_args_digest.clone();
-                                        (router.execute(&bound.request), execution_id, digest)
-                                    }
-                                    Err(message) => (
-                                        Err(EffectExecutionError {
-                                            code: "BINDING_FAILED".into(),
-                                            dispatch_state: DispatchState::NotDispatched,
-                                            outcome_certainty: OutcomeCertainty::ConfirmedFailure,
-                                            provider_request_id: None,
-                                            retryable: false,
-                                            reconciliation_required: false,
-                                            message,
-                                        }),
-                                        format!("attempt-{attempt}"),
-                                        String::new(),
-                                    ),
-                                };
+                            // One routed dispatch per consequential
+                            // invocation. A second continuation for a
+                            // MUTATION or CRITICAL is refused before the
+                            // router sees it — the first attempt's outcome,
+                            // whatever it was, stands as the only
+                            // authoritative answer.
+                            if attempt > 1
+                                && matches!(
+                                    identity.capability.execution_class,
+                                    ExecutionClass::Mutation | ExecutionClass::Critical
+                                )
+                            {
+                                let effective_args_digest =
+                                    canonical_digest(&effective_args).unwrap_or_default();
+                                refused.lock().unwrap_or_else(|e| e.into_inner()).push(
+                                    RefusedDispatch {
+                                        attempt,
+                                        effective_args_digest,
+                                        reason: "MULTIPLE_DISPATCH_ATTEMPTS".to_string(),
+                                    },
+                                );
+                                return Err(FlowError::Internal(format!(
+                                    "MULTIPLE_DISPATCH_ATTEMPTS: a {:?} invocation permits \
+                                     exactly one routed dispatch; the continuation's call \
+                                     {attempt} was refused before dispatch — the first \
+                                     attempt's outcome stands as authoritative",
+                                    identity.capability.execution_class,
+                                )));
+                            }
+                            let (outcome, execution_id, effective_args_digest) = match bind_attempt(
+                                &identity,
+                                effective_args,
+                                attempt,
+                                Some(mediation),
+                            ) {
+                                Ok(bound) => {
+                                    let execution_id = bound.execution_id.clone();
+                                    let digest = bound.effective_args_digest.clone();
+                                    (router.execute(&bound.request), execution_id, digest)
+                                }
+                                Err(message) => (
+                                    Err(EffectExecutionError {
+                                        code: "BINDING_FAILED".into(),
+                                        dispatch_state: DispatchState::NotDispatched,
+                                        outcome_certainty: OutcomeCertainty::ConfirmedFailure,
+                                        provider_request_id: None,
+                                        retryable: false,
+                                        reconciliation_required: false,
+                                        message,
+                                    }),
+                                    format!("attempt-{attempt}"),
+                                    String::new(),
+                                ),
+                            };
                             let record = AttemptRecord {
                                 attempt,
                                 execution_id,
@@ -787,13 +868,20 @@ async fn dispatch_managed(
         .unwrap_or_else(|e| e.into_inner())
         .drain(..)
         .collect();
+    let refused: Vec<RefusedDispatch> = refused
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .drain(..)
+        .collect();
 
     report(
         identity.as_ref(),
         session.as_ref(),
         &middleware_set_digest,
         attempts,
+        refused,
         call,
+        release,
     )
 }
 
@@ -809,9 +897,11 @@ fn report(
     session: Option<&plugin_host::PluginSession>,
     middleware_set_digest: &str,
     attempts: Vec<AttemptRecord>,
+    refused: Vec<RefusedDispatch>,
     call: Result<ToolExecutionResult, FlowError>,
+    release: Option<&release::ReleaseIdentity>,
 ) -> ExitCode {
-    let identity_evidence = json!({
+    let mut identity_evidence = json!({
         "invocation_id": identity.invocation_id,
         "logical_action_id": identity.logical_action_id,
         "principal_id": identity.runtime.principal_id,
@@ -823,13 +913,35 @@ fn report(
         "middleware_set_digest": middleware_set_digest,
         "idempotency_key": identity.idempotency_key,
     });
+    if let Some(session) = session {
+        identity_evidence["mediation"] = json!({
+            "plugin_manifest_sha256": session.plugin_manifest_sha256,
+            "plugin_library_sha256": session.plugin_library_sha256,
+            "activation_config_sha256": session.activation_config_sha256,
+        });
+    }
+    if let Some(release) = release {
+        // Which integrated distribution composed this invocation: the
+        // component-manifest digest is the release-root identity a receipt can
+        // name, and the fields it carries are what the release bound.
+        identity_evidence["release"] = json!({
+            "release_root_digest": release.release_root_digest,
+            "name": release.name,
+            "platform": release.platform,
+            "crabbox_version": release.crabbox_version,
+            "nemo_runtime_sha256": release.nemo_runtime_sha256,
+            "capability_registry_sha256": release.capability_registry_sha256,
+        });
+    }
     let plugin_evidence = session.map(|session| {
         json!({
             "process_id": session.process_id,
             "host": {
                 "executable": session.host.executable,
+                "resolved": session.host.resolved,
                 "sha256": session.host.sha256,
                 "pinned": session.host.pinned,
+                "staged": session.host.staged,
             },
             "descriptor": session.descriptor,
         })
@@ -845,30 +957,33 @@ fn report(
             })
         })
         .collect();
+    let refused_evidence: Vec<Value> = refused
+        .iter()
+        .map(|refused| {
+            json!({
+                "attempt": refused.attempt,
+                "effective_args_digest": refused.effective_args_digest,
+                "reason": refused.reason,
+            })
+        })
+        .collect();
 
     if let Some(last) = attempts.last() {
-        // The report shows what the chain answered — the result the caller is
-        // actually given, marks and all — but the dispatch's own verdict always
-        // wins the authoritative fields: middleware may shape a result, it may
-        // not relabel what the router recorded.
-        let mut report = match &call {
-            Ok(result) if result.result.is_object() => result.result.clone(),
-            _ => last.outcome.clone(),
+        // The dispatch's own record is the report: status, result, receipt —
+        // everything authoritative is exactly what the router answered, and a
+        // middleware-shaped payload can never relabel a committed effect.
+        // What the chain actually returned, when it differs, is preserved as
+        // `middleware_result`: evidence of what the middleware did rather than
+        // a claim about what the effect produced.
+        let mut report = last.outcome.clone();
+        let middleware_result = match &call {
+            Ok(result) if result.result != report => Some(result.result.clone()),
+            _ => None,
         };
         let object = report.as_object_mut();
         if let Some(object) = object {
-            if let Some(verdict) = last.outcome.as_object() {
-                for key in [
-                    "status",
-                    "code",
-                    "receipt_digest",
-                    "retryable",
-                    "reconciliation_required",
-                ] {
-                    if let Some(value) = verdict.get(key) {
-                        object.insert(key.to_string(), value.clone());
-                    }
-                }
+            if let Some(middleware_result) = middleware_result {
+                object.insert("middleware_result".into(), middleware_result);
             }
             // A dispatch that recorded its outcome is authoritative — but a
             // middleware failure after it still happened, and hiding it would
@@ -879,6 +994,9 @@ fn report(
                     "post_dispatch_middleware_error".into(),
                     json!(error.to_string()),
                 );
+            }
+            if !refused_evidence.is_empty() {
+                object.insert("refused_dispatches".into(), json!(refused_evidence));
             }
             object.insert("identity".into(), identity_evidence);
             object.insert("attempts".into(), json!(attempts_evidence));
@@ -916,18 +1034,19 @@ fn report(
             "middleware answered the invocation without reaching the routed dispatch — a capability result that never crossed the EffectRouter is not evidence of execution".to_string(),
         ),
     };
-    println!(
-        "{}",
-        json!({
-            "status": status,
-            "code": code,
-            "message": message,
-            "retryable": false,
-            "reconciliation_required": false,
-            "identity": identity_evidence,
-            "plugin": plugin_evidence,
-        })
-    );
+    let mut report = json!({
+        "status": status,
+        "code": code,
+        "message": message,
+        "retryable": false,
+        "reconciliation_required": false,
+        "identity": identity_evidence,
+        "plugin": plugin_evidence,
+    });
+    if !refused_evidence.is_empty() {
+        report["refused_dispatches"] = json!(refused_evidence);
+    }
+    println!("{report}");
     ExitCode::FAILURE
 }
 
@@ -940,6 +1059,18 @@ fn main() -> ExitCode {
         }
     };
 
+    // The release this binary shipped in, when it shipped in one: a qualified
+    // layout binds the host pin and the release-root identity this run reports
+    // — and a root that exists but does not verify fails closed rather than
+    // reporting provenance it does not carry.
+    let release = match release::discover() {
+        Ok(release) => release,
+        Err(message) => {
+            eprintln!("nemo-crabedence-runtime: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let capability = match options.capability.as_deref() {
         Some(capability) => capability,
         None => {
@@ -949,7 +1080,7 @@ fn main() -> ExitCode {
                 );
                 return ExitCode::from(2);
             };
-            return run_plugin_mode(&options, artifact);
+            return run_plugin_mode(&options, artifact, release.as_ref());
         }
     };
 
@@ -1003,7 +1134,13 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    runtime.block_on(dispatch_managed(&options, capability, catalog, identity))
+    runtime.block_on(dispatch_managed(
+        &options,
+        capability,
+        catalog,
+        identity,
+        release.as_ref(),
+    ))
 }
 
 #[cfg(test)]
@@ -1064,9 +1201,14 @@ mod tests {
     }
 
     fn request(class: ExecutionClass, options: &Options) -> ExecutionRequest {
-        bind_attempt(&identity(class, options), options.arguments.clone(), 1)
-            .expect("the attempt must bind")
-            .request
+        bind_attempt(
+            &identity(class, options),
+            options.arguments.clone(),
+            1,
+            None,
+        )
+        .expect("the attempt must bind")
+        .request
     }
 
     #[test]
@@ -1137,8 +1279,8 @@ mod tests {
             ExecutionClass::Mutation,
             &options("alice@example.com", Some("send-001")),
         );
-        let first = bind_attempt(&identity, json!({"amount": 1}), 1).expect("bound");
-        let second = bind_attempt(&identity, json!({"amount": 1}), 2).expect("bound");
+        let first = bind_attempt(&identity, json!({"amount": 1}), 1, None).expect("bound");
+        let second = bind_attempt(&identity, json!({"amount": 1}), 2, None).expect("bound");
         assert_eq!(
             first.request.identity.invocation_id,
             second.request.identity.invocation_id
@@ -1169,8 +1311,13 @@ mod tests {
     fn the_binding_proves_original_into_effective_arguments() {
         let options = options("alice@example.com", Some("send-001"));
         let identity = identity(ExecutionClass::Mutation, &options);
-        let bound = bind_attempt(&identity, json!({"amount": 1, "native_intercept": true}), 1)
-            .expect("the attempt must bind");
+        let bound = bind_attempt(
+            &identity,
+            json!({"amount": 1, "native_intercept": true}),
+            1,
+            None,
+        )
+        .expect("the attempt must bind");
 
         // The evidence must show which input became which effective request:
         // the pre-middleware digest is over the caller's arguments, and the
@@ -1251,7 +1398,7 @@ mod tests {
             "registry-digest",
         )
         .expect("the identity must mint");
-        let bound = bind_attempt(&echo, json!({"amount": 1}), 1).expect("bound");
+        let bound = bind_attempt(&echo, json!({"amount": 1}), 1, None).expect("bound");
         let result = local_function_hook(&bound.request).expect("system.echo must answer");
         assert_eq!(result.output["local"], json!(true));
         assert_eq!(result.output["backend"], json!("function-hooks"));

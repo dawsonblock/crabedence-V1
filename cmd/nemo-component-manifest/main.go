@@ -70,7 +70,7 @@ type component struct {
 // manifest: one canonical record of what the release is (versions, platform,
 // toolchain, qualification identity) and what it carries (every component by
 // SHA-256). Its own digest, in the .sha256 sidecar, is the release-root
-// identity a signature binds and a receipt can cite.
+// identity a signature would bind and a receipt can cite.
 type componentManifest struct {
 	// Name is the distribution's name.
 	Name string `json:"name"`

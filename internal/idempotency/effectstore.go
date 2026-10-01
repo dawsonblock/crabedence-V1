@@ -19,6 +19,13 @@ type EffectStore interface {
 	// admitted the request are persisted on the record so the ledger
 	// can prove which authority admitted each execution.
 	AcquireWithAuthority(ctx context.Context, key, principal, capability, digest string, authority AuthorityBinding, class string, leaseDuration time.Duration) (*AcquireResult, error)
+	// AcquireWithMediation is AcquireWithAuthority plus the
+	// caller-declared middleware provenance — the mediation object the
+	// request carried is persisted on the record at insert so the
+	// ledger can prove which middleware set produced the dispatched
+	// arguments. Evidence only; nil mediation means the request crossed
+	// no caller-side middleware boundary.
+	AcquireWithMediation(ctx context.Context, key, principal, capability, digest string, authority AuthorityBinding, mediation *MediationBinding, class string, leaseDuration time.Duration) (*AcquireResult, error)
 	BeginExecution(ctx context.Context, executionID, leaseToken string, leaseGeneration int) error
 	MarkInFlight(ctx context.Context, executionID, leaseToken string, leaseGeneration int, providerID string, recoveryLocator json.RawMessage) error
 	RenewLease(ctx context.Context, executionID, leaseToken string, leaseGeneration int, duration time.Duration) error

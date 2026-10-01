@@ -14,9 +14,9 @@ the findings recorded during implementation.
 Two systems exist and are to become one distribution:
 
 - **NEMO** (NeMo Relay, Rust core with Python and Node.js bindings) is a
-  multi-language agent runtime: scopes, middleware, plugins, an isolated
-  native plugin host, LLM wrapping and routing, a worker protocol, and
-  observability. It ships its own partial implementations of kernel
+  multi-language agent runtime: scopes, middleware, plugins, a separate
+  native plugin host process, LLM wrapping and routing, a worker
+  protocol, and observability. It ships its own partial implementations of kernel
   responsibilities — `crates/authority`, `crates/ledger`,
   `crates/executor`, `crates/effect-runtime`,
   `crates/effect-qualification`.
@@ -92,11 +92,15 @@ status.
 The semantic contract in `docs/spec/capability-invocation-abi.md` is
 frozen and is the only boundary between the two. The request crossing
 that boundary carries capability, arguments, authority material, an
-idempotency key, and a deadline. It never carries execution route,
-provider or adapter selection, assurance profile, approval
-requirements, retry policy, or receipt requirements. A caller-supplied
-`execution_class` is at most an advisory assertion that Crabedence
-checks against its registry and denies on mismatch.
+idempotency key, a deadline, and optional middleware `mediation`
+provenance — the digest of the middleware/plugin set that handled the
+call and of the pre-middleware arguments, which Crabedence binds into
+the durable request identity as evidence. It never carries execution
+route, provider or adapter selection, assurance profile, approval
+requirements, retry policy, or receipt requirements — and mediation
+provenance is evidence, never routing or authorization input. A
+caller-supplied `execution_class` is at most an advisory assertion that
+Crabedence checks against its registry and denies on mismatch.
 
 The transport is the existing length-prefixed JSON Unix-socket binding
 (4-byte big-endian length, 4 MiB maximum). The transport is
@@ -148,6 +152,17 @@ and bypass the kernel:
 
 `native-loader` stays in the plugin host process and is never linked
 into the Crabedence kernel process.
+
+The isolation named here is the *effect path*: no plugin callback can
+become a consequential effect. The process boundary is containment for
+faults — a crashed or hanging plugin takes down its host, not the
+runtime — plus the credential-hygiene boundary, not a sandbox. In the
+integrated distribution, native plugins are trusted operator-installed
+extensions running with the host process's ambient authority; a plugin
+assumed hostile needs the platform confinement level
+(`NEMO_RELAY_NATIVE_ISOLATION=restricted-macos`) where a signed host
+bundle delivers it, and stronger isolation than that is out of scope
+for this release.
 
 ### 6. The uncertainty model is preserved end to end
 

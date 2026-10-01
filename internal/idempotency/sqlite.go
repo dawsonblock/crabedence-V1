@@ -399,6 +399,7 @@ var sqliteSchemaMigrations = []sqliteSchemaMigration{
 	{9, "cluster_epoch_fencing", sqliteMigrationClusterEpoch},
 	{10, "result_byte_fidelity_already_text", nil},
 	{11, "cluster_recovery_mode", sqliteMigrationClusterRecoveryMode},
+	{12, "request_mediation", sqliteMigrationRequestMediation},
 }
 
 func (s *SQLiteStore) ensureSchema(ctx context.Context) error {
@@ -523,6 +524,7 @@ func sqliteMigrationBaseTable(ctx context.Context, tx *sql.Tx) error {
 			entered_unknown_at INTEGER,
 			authority_generation INTEGER,
 			authority_digest TEXT,
+			request_mediation TEXT,
 			UNIQUE(principal_id, capability_id, idempotency_key)
 		)
 	`)
@@ -804,6 +806,36 @@ func sqliteMigrationClusterRecoveryMode(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
+// sqliteMigrationRequestMediation mirrors the PG migration 12: the
+// caller-declared middleware provenance column. Fresh v1 schemas
+// already carry it; existing embedded databases get it added —
+// SQLite has no ADD COLUMN IF NOT EXISTS, so presence is checked via
+// PRAGMA table_info first.
+func sqliteMigrationRequestMediation(ctx context.Context, tx *sql.Tx) error {
+	rows, err := tx.QueryContext(ctx, `PRAGMA table_info(execution_requests)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == "request_mediation" {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `ALTER TABLE execution_requests ADD COLUMN request_mediation TEXT`)
+	return err
+}
+
 // sqliteInsertEffectEvent mirrors insertEffectEvent for the embedded
 // backend: sequence is allocated with MAX+1 inside the mutation's
 // transaction (single-writer BEGIN IMMEDIATE serializes all writers),
@@ -887,8 +919,23 @@ func (s *SQLiteStore) Acquire(ctx context.Context, key, principal, capability, d
 // AcquireWithAuthority is Acquire plus the immutable authority
 // snapshot — see Store.AcquireWithAuthority.
 func (s *SQLiteStore) AcquireWithAuthority(ctx context.Context, key, principal, capability, digest string, authority AuthorityBinding, class string, leaseDuration time.Duration) (*AcquireResult, error) {
+	return s.AcquireWithMediation(ctx, key, principal, capability, digest,
+		authority, nil, class, leaseDuration)
+}
+
+// AcquireWithMediation is AcquireWithAuthority plus the caller-declared
+// middleware provenance — see Store.AcquireWithMediation.
+func (s *SQLiteStore) AcquireWithMediation(ctx context.Context, key, principal, capability, digest string, authority AuthorityBinding, mediation *MediationBinding, class string, leaseDuration time.Duration) (*AcquireResult, error) {
 	if err := s.leaseCfg.Validate(leaseDuration); err != nil {
 		return nil, err
+	}
+
+	var mediationJSON []byte
+	if mediation != nil {
+		var err error
+		if mediationJSON, err = json.Marshal(mediation); err != nil {
+			return nil, fmt.Errorf("failed to encode request mediation: %w", err)
+		}
 	}
 
 	leaseToken, err := generateLeaseToken()
@@ -917,10 +964,11 @@ func (s *SQLiteStore) AcquireWithAuthority(ctx context.Context, key, principal, 
 			(execution_id, idempotency_key, principal_id, capability_id, request_digest,
 			 grant_id, authority_generation, authority_digest, execution_class, state,
 			 lease_owner, lease_token, lease_started_at, lease_expires_at,
-			 lease_generation, attempt, version, created_at, updated_at, admitted_epoch)
+			 lease_generation, attempt, version, created_at, updated_at, admitted_epoch,
+			 request_mediation)
 		SELECT ?10, ?1, ?2, ?3, ?4, ?5, ?11, ?12, ?6, 'PREPARED',
 				?7, ?8, `+sqliteNow+`, `+sqliteNow+` + ?9,
-				1, 0, 1, `+sqliteNow+`, `+sqliteNow+`, cm.epoch
+				1, 0, 1, `+sqliteNow+`, `+sqliteNow+`, cm.epoch, ?13
 		FROM cluster_meta cm
 		WHERE cm.id = 1 AND cm.epoch = `+strconv.FormatInt(s.epoch, 10)+` AND cm.recovery_required = 0
 		ON CONFLICT (principal_id, capability_id, idempotency_key) DO NOTHING
@@ -928,6 +976,7 @@ func (s *SQLiteStore) AcquireWithAuthority(ctx context.Context, key, principal, 
 	`, key, principal, capability, digest, nullableString(authority.Ref), class,
 		leaseOwner, leaseToken, msDuration(leaseDuration),
 		genID, authority.Generation, nullableString(authority.Digest),
+		nullableBytes(mediationJSON),
 	).Scan(&executionID, &createdAtMs)
 
 	if err == nil {
@@ -959,6 +1008,7 @@ func (s *SQLiteStore) AcquireWithAuthority(ctx context.Context, key, principal, 
 				GrantID:             authority.Ref,
 				AuthorityGeneration: authority.Generation,
 				AuthorityDigest:     authority.Digest,
+				RequestMediation:    json.RawMessage(mediationJSON),
 				ExecutionClass:      class,
 				State:               StatePrepared,
 				LeaseOwner:          leaseOwner,
@@ -2691,6 +2741,7 @@ func scanSQLiteRecords(rows *sql.Rows) ([]*Record, error) {
 		var recOwner, lastRecErr sql.NullString
 		var recLeaseExp, nextRecAt, enteredUnknownAt sql.NullInt64
 		var createdAt, updatedAt int64
+		var requestMediation []byte
 		if err := rows.Scan(
 			&rec.ExecutionID, &rec.IdempotencyKey, &rec.PrincipalID,
 			&rec.CapabilityID, &rec.RequestDigest, &rec.GrantID,
@@ -2707,6 +2758,7 @@ func scanSQLiteRecords(rows *sql.Rows) ([]*Record, error) {
 			&rec.AuthorityGeneration, &rec.AuthorityDigest,
 			&rec.ProviderEvidenceDigest, &rec.TerminalResultDigest,
 			&rec.TerminalEvidenceDigest, &rec.AdmittedEpoch,
+			&requestMediation,
 		); err != nil {
 			return nil, err
 		}
@@ -2752,6 +2804,9 @@ func scanSQLiteRecords(rows *sql.Rows) ([]*Record, error) {
 		}
 		if len(recoveryLocator) > 0 {
 			rec.RecoveryLocator = json.RawMessage(recoveryLocator)
+		}
+		if len(requestMediation) > 0 {
+			rec.RequestMediation = json.RawMessage(requestMediation)
 		}
 		if recOwner.Valid {
 			rec.ReconcileOwner = recOwner.String

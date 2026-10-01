@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://crabedence.dev/schemas/capability-invocation-v1.json",
   "title": "Capability Invocation ABI v1",
-  "description": "The frozen semantic contract between a planning/reasoning runtime and the Crabedence execution kernel. Normative prose: docs/spec/capability-invocation-abi.md. The structural rules (R1-R8: valid UTF-8, exactly one JSON value, root is an object, no duplicate keys, nesting depth <= 64, known fields only, no explicit null for a known field, declared types) are enforced by internal/execution/invocation_abi.go, nemo/contracts/invocation-abi.ts, and runtimes/nemo-relay/bridges/nemo-crabedence/src/abi.rs. All three are bound to this file by tests; a field added here and not there (or the reverse) fails CI. There is deliberately no abi_version field: the semantic contract is enforced by the capability registry, not a version tag on the wire, and an unknown field is refused rather than ignored.",
+  "description": "The frozen semantic contract between a planning/reasoning runtime and the Crabedence execution kernel. Normative prose: docs/spec/capability-invocation-abi.md. The structural rules (R1-R9: valid UTF-8, exactly one JSON value, root is an object, no duplicate keys, nesting depth <= 64, known fields only, no explicit null for a known field, declared types) are enforced by internal/execution/invocation_abi.go, nemo/contracts/invocation-abi.ts, and runtimes/nemo-relay/bridges/nemo-crabedence/src/abi.rs. All three are bound to this file by tests; a field added here and not there (or the reverse) fails CI. There is deliberately no abi_version field: the semantic contract is enforced by the capability registry, not a version tag on the wire, and an unknown field is refused rather than ignored.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -59,6 +59,38 @@
       "type": "string",
       "format": "date-time",
       "description": "RFC3339 timestamp. The request is denied after this time."
+    },
+    "mediation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["middleware_set_digest", "original_args_digest"],
+      "description": "Caller-declared middleware provenance — evidence, never a policy input. Present when middleware (including trusted native plugins) mediated the invocation. Its middleware, plugin, activation-config, original-argument, and release identities are bound into the request digest and persisted on the durable record; it cannot select route, provider, assurance, or authority. Raw activation configuration is never sent.",
+      "properties": {
+        "middleware_set_digest": {
+          "type": "string",
+          "description": "Canonical digest naming the exact middleware set that mediated this invocation — activated plugin identities, registration descriptors, activation configuration, and host identity."
+        },
+        "original_args_digest": {
+          "type": "string",
+          "description": "Canonical digest of the caller's arguments before middleware ran, so a mediated request records both what was asked and what was dispatched."
+        },
+        "release_root_digest": {
+          "type": "string",
+          "description": "Component-manifest digest of the qualified distribution the composing runtime shipped in, when it runs inside one."
+        },
+        "plugin_manifest_sha256": {
+          "type": "string",
+          "description": "SHA-256 of the activated plugin manifest, when a plugin mediated the invocation."
+        },
+        "plugin_library_sha256": {
+          "type": "string",
+          "description": "SHA-256 of the exact activated plugin library bytes."
+        },
+        "activation_config_sha256": {
+          "type": "string",
+          "description": "Canonical SHA-256 of the activated component configuration; raw configuration is omitted because it may contain credentials."
+        }
+      }
     }
   },
   "x-crabedence-server-resolved": [

@@ -39,9 +39,19 @@ fn load_schema() -> Value {
 }
 
 /// A structurally valid value for one schema-declared field type.
+/// Objects carry every `required` subfield so the synthesized value
+/// satisfies presence rules like the mediation object's digest pair.
 fn value_for(field: &Value) -> Value {
     match field.get("type").and_then(Value::as_str) {
-        Some("object") => json!({}),
+        Some("object") => {
+            let mut obj = serde_json::Map::new();
+            if let Some(required) = field.get("required").and_then(Value::as_array) {
+                for key in required.iter().filter_map(Value::as_str) {
+                    obj.insert(key.to_string(), value_for(&field["properties"][key]));
+                }
+            }
+            Value::Object(obj)
+        }
         Some("integer") => json!(1),
         _ => json!("x"),
     }
@@ -93,6 +103,38 @@ fn accepts_every_authority_field_the_schema_describes() {
             "authority": { name: value_for(field) },
         });
         assert!(accepts(&wire), "authority.{name} must be accepted: {wire}");
+    }
+}
+
+#[test]
+fn accepts_every_mediation_field_the_schema_describes() {
+    let schema = load_schema();
+    let mediation = &schema["properties"]["mediation"];
+    assert_eq!(mediation["type"], "object");
+    assert_eq!(mediation["additionalProperties"], false);
+    // The schema must declare the two digests the validators require —
+    // a mediation object without both is malformed evidence (R9).
+    let required = mediation["required"]
+        .as_array()
+        .expect("mediation required");
+    for name in ["middleware_set_digest", "original_args_digest"] {
+        assert!(
+            required.iter().any(|r| r == name),
+            "mediation.{name} must be required"
+        );
+    }
+    let properties = mediation["properties"].as_object().expect("mediation");
+    assert!(!properties.is_empty(), "mediation must declare fields");
+    for (name, field) in properties {
+        // Fill the required pair first, then the field under test —
+        // the ABI rejects a mediation object missing either digest.
+        let mut mediation_value = value_for(mediation);
+        mediation_value[name] = value_for(field);
+        let wire = json!({
+            "capability": "system.echo",
+            "mediation": mediation_value,
+        });
+        assert!(accepts(&wire), "mediation.{name} must be accepted: {wire}");
     }
 }
 

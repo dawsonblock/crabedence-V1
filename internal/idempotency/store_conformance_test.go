@@ -822,3 +822,71 @@ func TestStoreConformanceReconciliationBacklog(t *testing.T) {
 		}
 	})
 }
+
+// TestStoreConformanceMediationPersistence covers the middleware-
+// provenance column: AcquireWithMediation persists the caller-declared
+// middleware, plugin, and activation identities on the durable record, Lookup reads it back on
+// every read path, and a request that crossed no middleware boundary
+// stores NULL — the record carries no claim it cannot prove.
+func TestStoreConformanceMediationPersistence(t *testing.T) {
+	eachEffectStore(t, func(t *testing.T, s EffectStore) {
+		ctx := context.Background()
+		mediation := &MediationBinding{
+			MiddlewareSetDigest:    "aa55",
+			OriginalArgsDigest:     "bb66",
+			ReleaseRootDigest:      "cc77",
+			PluginManifestSHA256:   "dd99",
+			PluginLibrarySHA256:    "ee11",
+			ActivationConfigSHA256: "ff22",
+		}
+		digest := confDigest("alice", "cap.mut", `{"q":"x"}`)
+		acq, err := s.AcquireWithMediation(ctx, "k1", "alice", "cap.mut", digest,
+			AuthorityBinding{Ref: "grant-1"}, mediation, "MUTATION", 5*time.Minute)
+		if err != nil || acq.Kind != LeaseAcquired {
+			t.Fatalf("acquire: %v kind=%v", err, acq.Kind)
+		}
+		rec := acq.Record
+		var stored MediationBinding
+		if err := json.Unmarshal(rec.RequestMediation, &stored); err != nil {
+			t.Fatalf("record mediation is not the stored object: %v (%q)", err, rec.RequestMediation)
+		}
+		if stored != *mediation {
+			t.Fatalf("acquired record mediation = %+v, want %+v", stored, *mediation)
+		}
+
+		// The read path preserves it — Lookup and LookupByKey agree.
+		looked, err := s.Lookup(ctx, rec.ExecutionID)
+		if err != nil {
+			t.Fatalf("lookup: %v", err)
+		}
+		var lookedMediation MediationBinding
+		if err := json.Unmarshal(looked.RequestMediation, &lookedMediation); err != nil {
+			t.Fatalf("lookup mediation decode: %v", err)
+		}
+		if lookedMediation != *mediation {
+			t.Fatalf("looked-up mediation = %+v, want %+v", lookedMediation, *mediation)
+		}
+		byKey, err := s.LookupByKey(ctx, "alice", "cap.mut", "k1")
+		if err != nil {
+			t.Fatalf("lookup by key: %v", err)
+		}
+		if string(byKey.RequestMediation) != string(rec.RequestMediation) {
+			t.Fatalf("lookup-by-key mediation = %s, want %s", byKey.RequestMediation, rec.RequestMediation)
+		}
+
+		// A request with no mediation carries NULL — the record does
+		// not fabricate provenance it was never given.
+		acq2, err := s.AcquireWithAuthority(ctx, "k2", "alice", "cap.mut",
+			confDigest("alice", "cap.mut", `{"q":"y"}`), AuthorityBinding{}, "MUTATION", 5*time.Minute)
+		if err != nil || acq2.Kind != LeaseAcquired {
+			t.Fatalf("unmediated acquire: %v kind=%v", err, acq2.Kind)
+		}
+		if len(acq2.Record.RequestMediation) != 0 {
+			t.Fatalf("unmediated record carries mediation %s", acq2.Record.RequestMediation)
+		}
+		plain, _ := s.Lookup(ctx, acq2.Record.ExecutionID)
+		if len(plain.RequestMediation) != 0 {
+			t.Fatalf("unmediated lookup carries mediation %s", plain.RequestMediation)
+		}
+	})
+}

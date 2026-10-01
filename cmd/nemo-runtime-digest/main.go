@@ -13,10 +13,15 @@
 //
 // The digest is computed over the vendored tree's source files, sorted by
 // path, so it changes when the runtime changes and does not change when a
-// build artifact or a working-copy detail does. `-envelope` prints the digest
-// with the exact inputs it covers, in the same idiom as the registry envelope:
-// a consumer verifies what it was given rather than reproducing the
-// computation.
+// build artifact or a working-copy detail does. It is a regular-file
+// identity: only `find -type f` entries are hashed, so symlinks and other
+// non-regular entries — the tree carries a few, like the per-crate LICENSE
+// links — are not part of the digest. Their presence in a shipped root is
+// covered separately: the component manifest's exhaustive check refuses a
+// distribution carrying anything undeclared. `-envelope` prints the digest
+// with the exact inputs it covers, in the same idiom as the registry
+// envelope: a consumer verifies what it was given rather than reproducing
+// the computation.
 //
 // Recompute by hand (the same definition, shell-only):
 //

@@ -44,7 +44,7 @@ excludes `target/`, caches, `node_modules`, and editor state.
 | 0 — vendor | Done | `runtimes/nemo-relay/` (no build artifacts); a recursive diff against the source copy reports four differing files (`Cargo.toml`, `Cargo.lock`, `crates/cli/src/mcp_environment.rs`, `integrations/coding-agents/codex/.mcp.json`) plus two added paths (`bridges/`, `TRANSFER-PROVENANCE.md`); provenance in `runtimes/nemo-relay/TRANSFER-PROVENANCE.md`, and the shipped identity declared in `runtimes/nemo-transfer-manifest.json`, checked against the tree by `scripts/check-nemo-transfer-manifest.sh` in CI. The manifest also declares the binaries the tree must produce — the runtime, the plugin host, and both ledger fixtures — and `scripts/build-nemo-binaries.sh` compiles them in CI, so a declared binary whose source is absent fails the build instead of shipping incomplete |
 | 1 — bridge | Done | `runtimes/nemo-relay/bridges/nemo-crabedence/`: `abi.rs`, `transport.rs`, `capability_snapshot.rs`, `outcome_mapping.rs`, `execution_port.rs`; 56 unit tests, 1 corpus conformance test, 5 schema-binding tests, 5 env-gated live tests |
 | 2 — trust enforcement | Partial, and advanced. Bridge-level invariants enforced and tested (unregistered capability, class mismatch, route mismatch, no policy field on the wire), the effect-isolation invariant holds at the router, and both run in CI. A **runtime instance** now exists: `bridges/nemo-crabedence-runtime` is a process that verifies the snapshot, resolves the class and route from it, and dispatches through `EffectRouter` — verified end to end (PURE routed locally, MUTATION committed through the kernel with evidence, a missing grant refused as non-retryable, an unregistered capability refused before any socket hop, and a tampered snapshot refused before routing). The plugin host is now wired to this runtime: `--plugin` starts the real `nemo-plugin-host` child under the deployment's isolation policy, installs its registration proxies, and runs the managed invocation through them into `EffectRouter` — the joined chain the plan requires, proven by `scripts/test-nemo-plugin-host.sh` and the joined section of `scripts/test-nemo-runtime-e2e.sh` (PURE mediated by the child's middleware and executed by the function-hook backend; a MUTATION through the same chain committed with a receipt; replay, identity-conflict, bypass, and fail-closed host/artifact/activation/crash/timeout cases all asserted). State, precisely: the joined chain, the safety prerequisites, and the release-side hardening (items 12–20) are all proven on the real binaries — what remains open is the multi-target distribution production itself, now wired to run at tag time by `.github/workflows/nemo-distribution.yml` (see row 15); the "Integration closure" section below is the frozen plan, and it deliberately drops the earlier plugin-effect-request design in favor of plugins-as-middleware-only. This row previously named NEMO's `BackendRouter` wiring as the remainder, which finding 6 corrected: that composition is not merely unwired, it is the wrong one. The runtime instance also binds a real invocation identity — unique execution, invocation, and action ids; a caller-supplied idempotency key required for `MUTATION`/`CRITICAL` and namespaced per principal; and canonical argument, descriptor, and route digests — where it previously sent `runtime-{capability}` placeholders. `scripts/test-nemo-runtime-e2e.sh` drives the binary against a live service and asserts all of it: a `MUTATION` without a key is refused before dispatch (exit 2), a `PURE` capability routes locally, a granted `MUTATION` commits with evidence, the same key replays rather than duplicating, an ungranted `MUTATION` is a definitive `UNAUTHORIZED`, and an unregistered capability is refused before any socket hop |
-| 3 — conformance | Partial | The Rust validator matches the shared invocation corpus exactly (11 accepted, 32 rejected), the live kernel's refusal phrases match word-for-word, and the outcome corpus is shared across Go, TypeScript, and Rust. Covered against the live kernel from the NEMO side: a LOCAL-route refusal, a MUTATION commit with evidence, missing authority (`UNAUTHORIZED`), an unresolvable authority reference (`UNAUTHORIZED`, definitive and non-retryable), an expired authority reference (`UNAUTHORIZED`, definitive and non-retryable), a lost response mapping to `UNKNOWN`, snapshot tampering, same-key replay, and a CRITICAL commit carrying evidence. Two of these need orchestration the Rust test cannot own, so scripts hold the timing and the tests assert only the outcome: `scripts/test-nemo-expired-authority.sh` issues a short-lived grant, lets it lapse, then asserts the refusal; `scripts/test-nemo-restart-idempotency.sh` dispatches twice, restarts the kernel on the same store, dispatches twice again with the same key, and asserts one effect. Neither test sleeps on a clock. The plugin-host failure cases are covered against real binaries: `scripts/test-nemo-runtime-e2e.sh` exercises a missing host binary, an unloadable plugin artifact, activation failure, host death mid-call, and middleware timeout — each fails the invocation closed with no dispatch — and `scripts/test-nemo-plugin-host.sh` proves a malformed or unhonorable isolation policy fails startup. Malformed reply and registration rejection are covered at the Rust unit level (`crates/plugin-host`), not end to end; provider crash is qualified Go-side by the kernel's own crash-point matrix, which SIGKILLs real provider processes; CRITICAL is covered end to end by `scripts/test-nemo-critical-path.sh`, which wires the qualification provider so the bridge's evidence rule meets a real commit; the PURE and READ crossings are not, because the qualification extension adds only CRITICAL and no capability is pinned to the `CRABEDENCE` route for those classes — see finding 4 |
+| 3 — conformance | Partial | The Rust validator matches the shared invocation corpus exactly (14 accepted, 42 rejected), the live kernel's refusal phrases match word-for-word, and the outcome corpus is shared across Go, TypeScript, and Rust. Covered against the live kernel from the NEMO side: a LOCAL-route refusal, a MUTATION commit with evidence, missing authority (`UNAUTHORIZED`), an unresolvable authority reference (`UNAUTHORIZED`, definitive and non-retryable), an expired authority reference (`UNAUTHORIZED`, definitive and non-retryable), a lost response mapping to `UNKNOWN`, snapshot tampering, same-key replay, and a CRITICAL commit carrying evidence. Two of these need orchestration the Rust test cannot own, so scripts hold the timing and the tests assert only the outcome: `scripts/test-nemo-expired-authority.sh` issues a short-lived grant, lets it lapse, then asserts the refusal; `scripts/test-nemo-restart-idempotency.sh` dispatches twice, restarts the kernel on the same store, dispatches twice again with the same key, and asserts one effect. Neither test sleeps on a clock. The plugin-host failure cases are covered against real binaries: `scripts/test-nemo-runtime-e2e.sh` exercises a missing host binary, an unloadable plugin artifact, activation failure, host death mid-call, and middleware timeout — each fails the invocation closed with no dispatch — and `scripts/test-nemo-plugin-host.sh` proves a malformed or unhonorable isolation policy fails startup. Malformed reply and registration rejection are covered at the Rust unit level (`crates/plugin-host`), not end to end; provider crash is qualified Go-side by the kernel's own crash-point matrix, which SIGKILLs real provider processes; CRITICAL is covered end to end by `scripts/test-nemo-critical-path.sh`, which wires the qualification provider so the bridge's evidence rule meets a real commit; the PURE and READ crossings are not, because the qualification extension adds only CRITICAL and no capability is pinned to the `CRABEDENCE` route for those classes — see finding 4 |
 | — reference kernel | Retired | Renamed to `nemo/registry-snapshot/`, decoupled from the loader, then deleted once the suite passed without it; the README now records where each removed behavior lives |
 | — canonical schema | Done | `schemas/capability-invocation-v1.json` describes the frozen wire contract; Go, TypeScript, and Rust each carry a test that binds their implementation to it, so a field added on one side and not the others fails CI |
 | — effect router | Done at the routing layer | `runtimes/nemo-relay/bridges/nemo-effect-router/`: `EffectRouter` resolves the path from the verified **route** (not the class, which is what NeMo Relay's own router uses), fails closed on an unwired read path, and holds the effect-isolation invariant. 7 routing tests and 6 isolation tests, including one that runs against a live registry |
@@ -297,7 +297,7 @@ The consolidation's own completion criteria, against the current state:
 | 12 | A CI assertion proves no consequential bypass path exists | Met: `tests/effect_isolation.rs` and `tests/routing.rs` run in the `NEMO integration` job |
 | 13 | Release artifacts identify exact NEMO and Crabedence source revisions | Met: the release evidence generator runs `cmd/nemo-runtime-digest` and writes `nemo-runtime.json` and `nemo-runtime.sha256` into the bundle, which `SHA256SUMS`, the manifest digest, and the attestation already cover. The Crabedence revision is bound by the source commit and the registry digest; the NEMO revision is now bound too. The frozen gate registry is untouched — the digest is evidence, not a new gate |
 | 14 | Security qualification passes for the shipping binaries | Not a NEMO-transfer deliverable, and stated as such rather than left ambiguous. The repository's shipping binaries are Go, and their security qualification is the existing typed release-gate set (`scripts/lib/qualification-gates.sh`, `release-qualification.yml`), which is frozen and managed by the repository's own release process — not something the transfer should extend by inventing gates. What the transfer contributes is the NEMO-side security assertions, which run in CI (`tests/effect_isolation.rs`, `tests/routing.rs`, the credential and dependency-graph checks) and are now bound into release evidence by blocker 13. Wiring those checks into the typed gate set is a release-engineering change, gated by that process |
-| 15 | The binary distribution carries both runtimes, bound by one component manifest | Met on the production side: `scripts/build-nemo-distribution.sh` assembles `bin/` (crabbox, the runtime, the plugin host), `share/` (the capability schema and the registry envelope), and `manifests/` (the transfer manifest plus a component manifest binding every component by SHA-256), CI assembles and verifies it on every change, and `nemo-distribution.yml` now builds and *qualifies* each target on tag push — the shipped bytes run the full installed-artifact suite on a runner native to that target. What remains is release engineering: the credential-free candidate manifest still carries the CLI archives alone, so publication of these artifacts rides the separate proof-gated step, not this workflow. The component manifest is the release-root identity (component hashes plus runtime, registry, and build metadata, one digest, signed) |
+| 15 | The binary distribution carries both runtimes, bound by one component manifest | Met on the production side: `scripts/build-nemo-distribution.sh` assembles `bin/` (crabbox, the runtime, the plugin host), `share/` (the capability schema and the registry envelope), and `manifests/` (the transfer manifest plus a component manifest binding every component by SHA-256), CI assembles and verifies it on every change, and `nemo-distribution.yml` now builds and *qualifies* each target on tag push — the shipped bytes run the full installed-artifact suite on a runner native to that target. What remains is release engineering: the credential-free candidate manifest still carries the CLI archives alone, so publication of these artifacts rides the separate proof-gated step, not this workflow. The component manifest is the release-root identity (component hashes plus runtime, registry, and build metadata, one digest, bound by its `.sha256` sidecar — the value a release signature would cover) |
 
 ## Target layout
 
@@ -719,6 +719,20 @@ can return can redirect the effect. The capability→plugin-callable mapping
 that earlier sketches contemplated is dead design — it would be an
 authority-adjacent protocol without need.
 
+The trust posture is stated plainly because the mechanism names invite a
+stronger reading than the first release delivers: **a native plugin is a
+trusted, operator-installed extension.** Process separation gives crash and
+hang containment (a plugin that dies takes down its host, not the runtime),
+the session environment is scrubbed to the variables the session needs, and
+the executed host bytes are pinned to the release's declared digest. What it
+is *not* is a sandbox: under the default `trusted-process` policy the host
+inherits the account's ambient authority, and no claim is made that a
+malicious plugin running as the same UID is contained. A deployment that
+needs the platform's boundary sets `NEMO_RELAY_NATIVE_ISOLATION` to a
+confinement policy a signed host bundle can honor (today:
+`restricted-macos`), and anything stronger — a VM boundary for code assumed
+hostile — is out of scope for this release by design.
+
 ### The closure items, in critical-path order
 
 | # | Item | Gate |
@@ -793,13 +807,15 @@ Done and proven on the real binaries (`scripts/test-nemo-runtime-e2e.sh`,
   host child is loaded, activated, and proxied; the managed tool chain runs
   its middleware inside the child; the dispatch callback binds the effective
   arguments and routes through `EffectRouter`. A chain that finishes without
-  reaching the routed dispatch fails closed as `DISPATCH_BYPASSED`, and the
-  report carries the chain's final answer while the dispatch verdict always
-  owns status, receipt, retryability, and reconciliation. Two composition
-  defects this surfaced are fixed: proxied continuations now park in the
-  registry the backend's runtime service serves, and the fixture's argument
-  markers are gated so strict-schema capabilities can still prove mediation
-  via the result mark.
+  reaching the routed dispatch fails closed as `DISPATCH_BYPASSED`. The
+  dispatch verdict owns the report — status, receipt, retryability, and
+  reconciliation — and a chain payload that differs from the routed
+  outcome is recorded as `middleware_result` evidence rather than
+  relabeling it. Two composition defects this surfaced are fixed:
+  proxied continuations now park in the registry the backend's runtime
+  service serves, and the fixture's argument markers are gated so
+  strict-schema capabilities can still prove mediation via the result
+  mark.
 - **Item 9** — `test.counter.increment` commits through the full chain
   (plugin host → managed chain → router → Crabedence) with a receipt; the
   logical action replays without a second effect; the same key under changed
@@ -813,8 +829,9 @@ Done and proven on the real binaries (`scripts/test-nemo-runtime-e2e.sh`,
 - **Item 11 (partial)** — the joined layer cannot alter the dispatch
   boundary: a middleware failure *after* dispatch records
   `post_dispatch_middleware_error` while the committed verdict stands, and a
-  concurrent continuation is two real attempts that commit once under the
-  logical key. Post-dispatch UNKNOWN, restart reconciliation, expired
+  consequential continuation may dispatch only once — a second call is
+  refused `MULTIPLE_DISPATCH_ATTEMPTS` before the router and recorded in
+  `refused_dispatches` evidence. Post-dispatch UNKNOWN, restart reconciliation, expired
   authority, and the CRITICAL evidence path are covered by the service-level
   suites (`test-nemo-restart-idempotency.sh`, `test-nemo-expired-authority.sh`,
   `test-nemo-critical-path.sh`, and the post-dispatch qualification gate).
@@ -830,11 +847,21 @@ Done and proven on the release path (`scripts/build-nemo-distribution.sh`,
   composition level: the fixture writes the environment *names* it sees, and
   the e2e asserts the child holds only its session socket and credential — no
   `HOME`, no `CRABEDENCE_*`, no planted probe.
-- **Item 14** — `NEMO_RELAY_PLUGIN_HOST_SHA256` pins the resolved host
-  executable's digest (the same resolution `spawn` applies, so an override
-  cannot smuggle a different binary); a wrong pin and a malformed pin each
-  fail closed, and a correct pin records `executable`/`sha256`/`pinned` in
-  the invocation evidence.
+- **Item 14** — the executed host binary is pinned to its declared digest.
+  In a qualified layout the runtime discovers `manifests/component-manifest.json`
+  beside its own binary, verifies it against the `.sha256` sidecar, and takes
+  the pin from the manifest itself — running the installed binary binds the
+  installed host with no environment at all. Outside a release,
+  `NEMO_RELAY_PLUGIN_HOST_SHA256` carries the pin, and the two disagreeing
+  fails closed rather than choosing one. Under the trusted-process policy the
+  resolved host is first staged to a private session directory and the staged
+  copy is what is hashed, pinned, and spawned, so the approved digest covers
+  the bytes `exec` opens — no hash-to-spawn replacement window; under a
+  confinement policy the bundle's signed executable is digested and spawned
+  as resolved, because staging a bare copy would strip the signature the
+  confinement travels with. A wrong pin and a malformed pin each fail closed,
+  and the session records `executable`/`resolved`/`sha256`/`pinned`/`staged`
+  in the invocation evidence.
 - **Item 15** — the assembler stamps crabbox with the release ldflags
   (`-X …internal/cli.version`) and asserts the binary reports the stamped
   version before binding it; `dev` can no longer ship.
@@ -844,7 +871,9 @@ Done and proven on the release path (`scripts/build-nemo-distribution.sh`,
 - **Item 17** — the component manifest is the release root: component
   digests, the runtime source digest, the registry digest, both versions,
   the target platform, the toolchains, and the qualification gates, all
-  bound under the sidecar digest a signature signs.
+  bound under the sidecar digest — the identity a release signature would
+  cover (signing is the release operation, not a property the manifest
+  claims of itself).
 - **Item 18** — `NEMO_DIST_TARGET` names the integrated target
   (`linux_amd64`, `linux_arm64`, `darwin_amd64`, `darwin_arm64`); each gets
   its own verified root `dist/nemo-control_<version>_<target>`, and Windows
@@ -857,8 +886,9 @@ Done and proven on the release path (`scripts/build-nemo-distribution.sh`,
 - **Item 20** — `scripts/test-nemo-installed-distribution.sh` qualifies the
   packed artifact: manifest verification, platform and reported-version
   identity, then the runtime e2e and the authority/restart suites against
-  the shipped binaries with the plugin-host pin taken from the manifest's
-  own declared digest.
+  the shipped binaries. The suite deliberately exports *no* host pin: the
+  shipped runtime binds itself to the manifest it verifies, and every report
+  is asserted to carry the release-root digest the sidecar declares.
 
 The subtree is synced — `crabedence-V1` carries this work at
 `f161bc5` (PR

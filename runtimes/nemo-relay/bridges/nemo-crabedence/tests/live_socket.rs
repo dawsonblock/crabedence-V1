@@ -85,6 +85,7 @@ fn request_for(capability: &str, class: ExecutionClass) -> ExecutionRequest {
         args: serde_json::json!({ "counter": "live", "by": 1 }),
         grant: None,
         trace_id: None,
+        mediation: None,
     }
 }
 
