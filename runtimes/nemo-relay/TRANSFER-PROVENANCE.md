@@ -83,13 +83,22 @@ same command plus `-update`, then commit the manifest with the change.
 ## Local modifications
 
 A recursive diff between the source copy and this directory reports these
-differing files — every other file is byte-identical:
+differing files — every other file is byte-identical. This list is not
+asserted by hand alone: when the source copy is present,
+`cmd/nemo-runtime-digest` computes the actual delta and requires the
+manifest's `local_modifications`, `added_paths`, and `removed_paths` to equal
+it exactly, so an undocumented change fails the transfer gate rather than
+riding along inside the tree digest.
 
 | File | Difference |
 | --- | --- |
 | `Cargo.toml` | three added workspace members: `bridges/nemo-crabedence`, `bridges/nemo-effect-router`, and `bridges/nemo-crabedence-runtime` |
 | `Cargo.lock` | the three crate entries and their dependency edges |
 | `crates/cli/src/mcp_environment.rs` | security patch: the MCP environment allowlist no longer forwards credential material (see below) |
+| `crates/core/src/kernel.rs` | sets `mediation: None` on the kernel's own managed-path request — the kernel's middleware is the kernel itself, so it asserts no plugin provenance |
+| `crates/core/tests/fixtures/native_intercept_plugin/Cargo.lock` | lockfile regenerated (package entry ordering) |
+| `crates/core/tests/fixtures/native_intercept_plugin/src/lib.rs` | fixture extended for the isolation and composition tests: an `env_dump` witness that records which environment *names* (never values) the confined child saw, `arg_marks` gating for strict-schema calls, and `die_on_invoke`/`sleep_ms`/concurrency fault-injection switches |
+| `crates/executor/src/lib.rs` | adds the `RequestMediation` provenance type and the `mediation` field on `ExecutionRequest` — the evidence object the composing runtime binds into the request |
 | `integrations/coding-agents/codex/.mcp.json` | regenerated to match the patched allowlist; a checked-in test asserts the two agree |
 
 ### Security patch: MCP environment credentials

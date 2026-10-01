@@ -1,7 +1,7 @@
 {
   "tree": "runtimes/nemo-relay",
   "runtime_version": "0.9.1-rc.4",
-  "shipped_tree_sha256": "1757027a359f04804a6232396a149f593982c03f67990168b90486326683f6bd",
+  "shipped_tree_sha256": "f9e7bd71b0a9a96d3aa90df64a2ec03b6500968e3d8475f0b650cd92234be81e",
   "file_count": 1459,
   "excluded": [
     ".git",
@@ -22,16 +22,18 @@
     "bridges/nemo-crabedence-runtime"
   ],
   "local_modifications": [
-    "Cargo.toml",
     "Cargo.lock",
+    "Cargo.toml",
     "crates/cli/src/mcp_environment.rs",
     "crates/core/src/kernel.rs",
+    "crates/core/tests/fixtures/native_intercept_plugin/Cargo.lock",
+    "crates/core/tests/fixtures/native_intercept_plugin/src/lib.rs",
     "crates/executor/src/lib.rs",
     "integrations/coding-agents/codex/.mcp.json"
   ],
   "added_paths": [
-    "bridges/",
-    "TRANSFER-PROVENANCE.md"
+    "TRANSFER-PROVENANCE.md",
+    "bridges/"
   ],
   "binaries": [
     {

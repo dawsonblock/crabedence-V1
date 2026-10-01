@@ -33,6 +33,25 @@ use crate::host_location;
 /// CLI and all language bindings.
 pub const NATIVE_ISOLATION_ENV: &str = "NEMO_RELAY_NATIVE_ISOLATION";
 
+/// Environment variable the policy uses to ask a host binary whether it can
+/// confine here.
+///
+/// Linux confinement is self-applied by the host, so the only honest probe is
+/// to run the binary itself and see whether the confined child survives the
+/// checks. The probe variable is read before anything else the binary does.
+pub const CONFINEMENT_PROBE_ENV: &str = "NEMO_RELAY_PLUGIN_HOST_PROBE";
+
+/// The probe value [`CONFINEMENT_PROBE_ENV`] carries.
+pub const CONFINEMENT_PROBE_VALUE: &str = "confinement";
+
+/// The line the confined probe prints once every denial it attempted held.
+///
+/// The check is the record, not the exit status: a binary that ignores the
+/// environment — a shell builtin standing in, a stale host — also exits
+/// success, and only this line distinguishes "confined and verified" from
+/// "ran and did nothing".
+pub const CONFINEMENT_PROBE_ACK: &str = "NEMO_RELAY_PROBE_CONFINED";
+
 /// Whether the end-to-end approved artifact load path is qualified for restriction.
 ///
 /// The confined host stages to a deterministic path beneath its app container.
@@ -54,7 +73,10 @@ pub enum NativeIsolationPolicy {
     /// Crash and hang containment, the resource ceilings in
     /// [`crate::limits::PluginHostLimits`], and the kernel-side boundary — the
     /// loader is not in this process and the session is authenticated. The plugin
-    /// keeps the account's ambient authority.
+    /// keeps the account's ambient authority: its filesystem, its network, its
+    /// credentials. This is process isolation, not security isolation — a plugin
+    /// that is not trusted to run with the account's authority does not belong
+    /// under this policy.
     #[default]
     TrustedProcess,
     /// The host runs inside the platform's own resource confinement.
@@ -66,6 +88,22 @@ pub enum NativeIsolationPolicy {
     /// signature, which is why a restricted host is a bundle rather than a bare
     /// executable.
     RestrictedMacOS,
+    /// The host confines itself with the kernel's own mechanisms.
+    ///
+    /// On Linux the host enters a user namespace and new mount, network, IPC,
+    /// UTS and PID namespaces before a plugin byte exists in the process, then
+    /// applies a Landlock filesystem allow-list and a seccomp filter that takes
+    /// back the escape surface the namespaces granted. The result is a boundary
+    /// rather than a courtesy: no outbound network, no process table beyond its
+    /// own, and filesystem reach limited to what the session needs — staged
+    /// artifacts, the sockets it serves, and the libraries a plugin links.
+    ///
+    /// It is a namespace sandbox rather than a virtual machine, so the residual
+    /// risk is the Linux syscall surface itself; that is the boundary the
+    /// seccomp deny-list narrows. Where unprivileged user namespaces are
+    /// unavailable or AppArmor-restricted, the policy refuses to start rather
+    /// than run unconfined.
+    RestrictedLinux,
 }
 
 /// Something a restricted host cannot be started without.
@@ -81,6 +119,11 @@ pub enum RestrictionRequirement {
     BundledHost,
     /// Approved artifact bytes delivered over the session rather than as a path.
     StagedArtifactTransfer,
+    /// The platform the namespace confinement is written for.
+    Linux,
+    /// The kernel must let this binary create user namespaces, which is where
+    /// every other namespace comes from.
+    UserNamespaces,
 }
 
 impl RestrictionRequirement {
@@ -96,6 +139,14 @@ impl RestrictionRequirement {
                 "this build cannot complete an approved artifact transfer and native load \
                  inside the confined host"
             }
+            Self::Linux => "the platform is not Linux, where this confinement is defined",
+            Self::UserNamespaces => {
+                "the confinement probe could not enter a user namespace — the kernel may \
+                 disable unprivileged user namespaces (kernel.unprivileged_userns_clone) or \
+                 mediate them per-binary through AppArmor \
+                 (kernel.apparmor_restrict_unprivileged_userns), which needs a profile granting \
+                 the host binary the userns permission"
+            }
         }
     }
 }
@@ -106,6 +157,7 @@ impl NativeIsolationPolicy {
         match self {
             Self::TrustedProcess => "trusted-process",
             Self::RestrictedMacOS => "restricted-macos",
+            Self::RestrictedLinux => "restricted-linux",
         }
     }
 
@@ -114,8 +166,9 @@ impl NativeIsolationPolicy {
         match value {
             "trusted-process" => Ok(Self::TrustedProcess),
             "restricted-macos" => Ok(Self::RestrictedMacOS),
+            "restricted-linux" => Ok(Self::RestrictedLinux),
             other => Err(format!(
-                "{NATIVE_ISOLATION_ENV} has unsupported value '{other}'; expected 'trusted-process' or 'restricted-macos'"
+                "{NATIVE_ISOLATION_ENV} has unsupported value '{other}'; expected 'trusted-process', 'restricted-macos' or 'restricted-linux'"
             )),
         }
     }
@@ -133,51 +186,99 @@ impl NativeIsolationPolicy {
         }
     }
 
-    /// Whether a host started under this policy is confined by the platform.
+    /// Whether a host started under this policy is confined rather than only
+    /// separated into its own process.
     pub const fn confines_resources(self) -> bool {
+        matches!(self, Self::RestrictedMacOS | Self::RestrictedLinux)
+    }
+
+    /// Whether the confinement is carried by the executable's signature.
+    ///
+    /// App Sandbox follows the bytes the signature covers, so a signed bundle
+    /// must be exec'd as itself — staging a private copy would strip the
+    /// entitlement the sandbox travels with. Linux confinement is applied by
+    /// the process at startup instead, which means a staged private copy keeps
+    /// it — and the staged copy is what closes the window between digesting a
+    /// path and executing it.
+    pub const fn confinement_from_signature(self) -> bool {
         matches!(self, Self::RestrictedMacOS)
     }
 
     /// What this policy needs that the deployment does not have.
     ///
-    /// `bundle` is the bundled host found beside the runtime, if one is there.
-    /// The empty answer means the policy can be honored.
-    pub fn unmet_requirements(self, bundle: Option<&Path>) -> Vec<RestrictionRequirement> {
-        if !self.confines_resources() {
-            return Vec::new();
+    /// `candidate` is the confined host executable that would be started — the
+    /// bundle's executable under `restricted-macos`, the resolved host under
+    /// `restricted-linux`, where it is also the probe the requirement check
+    /// runs. The empty answer means the policy can be honored.
+    pub fn unmet_requirements(self, candidate: Option<&Path>) -> Vec<RestrictionRequirement> {
+        match self {
+            Self::TrustedProcess => Vec::new(),
+            Self::RestrictedMacOS => {
+                let mut unmet = Vec::new();
+                if !cfg!(target_os = "macos") {
+                    unmet.push(RestrictionRequirement::MacOS);
+                }
+                if candidate.is_none() {
+                    unmet.push(RestrictionRequirement::BundledHost);
+                }
+                if !RESTRICTED_ARTIFACT_LOAD_QUALIFIED {
+                    unmet.push(RestrictionRequirement::StagedArtifactTransfer);
+                }
+                unmet
+            }
+            Self::RestrictedLinux => {
+                let mut unmet = Vec::new();
+                if !cfg!(target_os = "linux") {
+                    unmet.push(RestrictionRequirement::Linux);
+                } else if !linux_confinement_available(candidate) {
+                    unmet.push(RestrictionRequirement::UserNamespaces);
+                }
+                if !RESTRICTED_ARTIFACT_LOAD_QUALIFIED {
+                    unmet.push(RestrictionRequirement::StagedArtifactTransfer);
+                }
+                unmet
+            }
         }
-        let mut unmet = Vec::new();
-        if !cfg!(target_os = "macos") {
-            unmet.push(RestrictionRequirement::MacOS);
-        }
-        if bundle.is_none() {
-            unmet.push(RestrictionRequirement::BundledHost);
-        }
-        if !RESTRICTED_ARTIFACT_LOAD_QUALIFIED {
-            unmet.push(RestrictionRequirement::StagedArtifactTransfer);
-        }
-        unmet
     }
 
     /// The executable to start under this policy: the host it names, or why not.
     ///
-    /// The two policies start different artifacts. A trusted host is whichever
+    /// The policies start different artifacts. A trusted host is whichever
     /// executable the deployment named or installed — the rule in
     /// [`crate::host_location`] is unchanged, and an override stays authoritative
-    /// even when it names nothing that exists. A restricted host has to be a
-    /// bundled one, because the confinement is a property of the bundle's
+    /// even when it names nothing that exists. A restricted macOS host has to be
+    /// a bundled one, because the confinement is a property of the bundle's
     /// signature: a path the caller resolved is used when it is already that
     /// shape, the bundle installed beside the runtime is used when it is not, and
     /// a deployment that offers neither is refused rather than started — running
-    /// a bare executable here would be a host without the confinement the policy
-    /// states.
+    /// a bare executable there would be a host without the confinement the policy
+    /// states. A restricted Linux host is the resolved executable, because the
+    /// confinement is applied by the binary at startup rather than carried by its
+    /// packaging; what is refused there is a machine the binary cannot confine
+    /// itself on.
     pub fn host_executable(
         self,
         resolved: &Path,
         beside: &Path,
     ) -> Result<PathBuf, PluginProtocolError> {
-        if !self.confines_resources() {
-            return Ok(resolved.to_path_buf());
+        match self {
+            Self::TrustedProcess => return Ok(resolved.to_path_buf()),
+            Self::RestrictedLinux => {
+                let unmet = self.unmet_requirements(Some(resolved));
+                if !unmet.is_empty() {
+                    let reasons = unmet
+                        .iter()
+                        .map(|requirement| requirement.message())
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    return Err(refused(format!(
+                        "the '{}' policy cannot be honored here: {reasons}",
+                        self.as_str()
+                    )));
+                }
+                return Ok(resolved.to_path_buf());
+            }
+            Self::RestrictedMacOS => {}
         }
         if !cfg!(target_os = "macos") {
             return Err(refused(format!(
@@ -230,22 +331,81 @@ impl NativeIsolationPolicy {
         Ok(executable)
     }
 
-    /// Verify that a restricted macOS bundle's signed properties match the
-    /// boundary this policy promises before the supervisor starts it.
+    /// Verify that a confinement the signature must carry is actually there.
+    ///
+    /// For `restricted-macos` the sandbox is a property of the bundle's
+    /// signature, so the supervisor checks it before the child exists. For
+    /// `restricted-linux` there is nothing a signature could carry — the host
+    /// confines itself at startup — and the executable's identity is bound by
+    /// the component-manifest pin the composition already applies. Trusted
+    /// process has no confinement to verify.
     pub fn verify_host_signature(self, executable: &Path) -> Result<(), PluginProtocolError> {
-        if !self.confines_resources() {
-            return Ok(());
-        }
-        #[cfg(target_os = "macos")]
-        {
-            verify_restricted_host_signature(executable)
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = executable;
-            Err(refused(RestrictionRequirement::MacOS.message().into()))
+        match self {
+            Self::TrustedProcess | Self::RestrictedLinux => Ok(()),
+            Self::RestrictedMacOS => {
+                #[cfg(target_os = "macos")]
+                {
+                    verify_restricted_host_signature(executable)
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let _ = executable;
+                    Err(refused(RestrictionRequirement::MacOS.message().into()))
+                }
+            }
         }
     }
+}
+
+/// Whether the named host can apply the Linux confinement here.
+///
+/// The honest check is to run it: spawning the candidate with the probe
+/// environment makes the binary attempt every step of the sandbox — namespaces,
+/// uid mapping, Landlock, seccomp — in a confined child that proves the denials
+/// and prints the ack. An executable that is missing, stale, or blocked by
+/// kernel policy fails the same way: no ack on a successful exit.
+#[cfg(target_os = "linux")]
+fn linux_confinement_available(candidate: Option<&Path>) -> bool {
+    let Some(candidate) = candidate else {
+        return false;
+    };
+    let output = std::process::Command::new(candidate)
+        .env(CONFINEMENT_PROBE_ENV, CONFINEMENT_PROBE_VALUE)
+        .env(
+            "NEMO_RELAY_PLUGIN_HOST_SOCKET",
+            std::env::temp_dir().join("nemo-probe").join("s"),
+        )
+        .output();
+    match output {
+        Ok(output) => {
+            let confined = output.status.success()
+                && String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| line.trim() == CONFINEMENT_PROBE_ACK);
+            // The probe's stderr is the difference between "the kernel refused"
+            // and "the binary was wrong": a deployment told only that the probe
+            // failed could chase a sysctl for a month when the answer was a
+            // stale host binary.
+            if !confined {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stderr = stderr.trim();
+                if !stderr.is_empty() {
+                    eprintln!("restricted-linux confinement probe failed: {stderr}");
+                }
+            }
+            confined
+        }
+        Err(error) => {
+            eprintln!("restricted-linux confinement probe could not run: {error}");
+            false
+        }
+    }
+}
+
+/// The same function on platforms where the answer is known without asking.
+#[cfg(not(target_os = "linux"))]
+fn linux_confinement_available(_candidate: Option<&Path>) -> bool {
+    false
 }
 
 #[cfg(target_os = "macos")]
@@ -438,9 +598,56 @@ mod tests {
             NativeIsolationPolicy::parse("restricted-macos").expect("restricted policy"),
             NativeIsolationPolicy::RestrictedMacOS
         );
+        assert_eq!(
+            NativeIsolationPolicy::parse("restricted-linux").expect("linux restricted policy"),
+            NativeIsolationPolicy::RestrictedLinux
+        );
         let error = NativeIsolationPolicy::parse("restricted").expect_err("unknown spelling");
         assert!(error.contains(NATIVE_ISOLATION_ENV));
         assert!(error.contains("trusted-process"));
+        assert!(error.contains("restricted-linux"));
+    }
+
+    #[test]
+    fn confined_policies_are_confined_but_only_macos_is_signature_bound() {
+        assert!(!NativeIsolationPolicy::TrustedProcess.confines_resources());
+        assert!(NativeIsolationPolicy::RestrictedMacOS.confines_resources());
+        assert!(NativeIsolationPolicy::RestrictedLinux.confines_resources());
+        // The staged-copy path is wrong only where the signature is what
+        // confines; everywhere else the copy keeps the boundary.
+        assert!(NativeIsolationPolicy::RestrictedMacOS.confinement_from_signature());
+        assert!(!NativeIsolationPolicy::RestrictedLinux.confinement_from_signature());
+        assert!(!NativeIsolationPolicy::TrustedProcess.confinement_from_signature());
+    }
+
+    #[test]
+    fn a_linux_restricted_host_is_the_resolved_binary_when_confinement_holds() {
+        // The policy cannot prove confinement from a path — the binary proves
+        // it by probing itself. A path that does not exist fails the probe on
+        // every platform, so the refusal is the expected answer wherever this
+        // test runs; on a Linux host the message additionally explains the
+        // user-namespace knobs a deployer would check.
+        let beside = temporary_directory("linux");
+        let missing = beside.join("nemo-plugin-host");
+
+        let unmet = NativeIsolationPolicy::RestrictedLinux.unmet_requirements(Some(&missing));
+        let resolved = NativeIsolationPolicy::RestrictedLinux.host_executable(&missing, &beside);
+
+        std::fs::remove_dir_all(&beside).ok();
+        if cfg!(target_os = "linux") {
+            assert!(
+                unmet.contains(&RestrictionRequirement::UserNamespaces),
+                "a host that cannot be probed cannot promise confinement: {unmet:?}"
+            );
+        } else {
+            assert!(unmet.contains(&RestrictionRequirement::Linux));
+        }
+        let error = resolved.expect_err("a host that cannot confine must be refused");
+        assert!(
+            error.failure.message.contains("restricted-linux"),
+            "the refusal names the policy a deployment selected: {}",
+            error.failure.message
+        );
     }
 
     #[test]

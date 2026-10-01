@@ -517,11 +517,13 @@ const HOST_SHA256_ENV: &str = "NEMO_RELAY_PLUGIN_HOST_SHA256";
 /// a trusted host the spawned file is a private staged copy of the resolved
 /// path: hashing a path and later executing whatever is at that path leaves a
 /// replacement window, so `config.executable` is rewritten to the staged copy
-/// and the digest is computed over the bytes that will actually run. Under a
-/// confinement policy the executed file is the bundle's signed executable —
-/// staging a bare copy would strip the signature the sandbox travels with —
-/// so it is digested and spawned as resolved, with the signature the platform
-/// itself enforces at `exec`.
+/// and the digest is computed over the bytes that will actually run. A
+/// signature-bound confinement (restricted-macos) is the exception: staging a
+/// bare copy would strip the signature the sandbox travels with, so the
+/// bundle's executable is digested and spawned as resolved. The Linux policy
+/// confines the host at startup rather than through a signature, so it keeps
+/// the staged copy — the confinement survives the copy and the digest window
+/// does not.
 ///
 /// The pin, when set, is the release's component-manifest value: a host whose
 /// content differs is a deployment error that fails the session, never a
@@ -540,7 +542,7 @@ fn prepare_host(
                 .unwrap_or_default(),
         )
         .map_err(|error| error.to_string())?;
-    let (executable, staging) = if config.isolation.confines_resources() {
+    let (executable, staging) = if config.isolation.confinement_from_signature() {
         (resolved.clone(), None)
     } else {
         let staged = stage_host(&resolved)?;
@@ -696,6 +698,7 @@ mod tests {
         for policy in [
             NativeIsolationPolicy::TrustedProcess,
             NativeIsolationPolicy::RestrictedMacOS,
+            NativeIsolationPolicy::RestrictedLinux,
         ] {
             assert_eq!(supervisor_config(&options(policy)).isolation, policy);
         }

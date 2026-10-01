@@ -57,9 +57,10 @@ const MARK_QUEUE_CAPACITY: &str = "NEMO_RELAY_PLUGIN_HOST_MARK_QUEUE";
 /// Pending marks a host holds when nothing said otherwise.
 const DEFAULT_MARK_QUEUE_CAPACITY: usize = 1024;
 
+#[cfg(target_os = "macos")]
 const RESTRICTED_IPC_PREFIX: &str = "NEMO_RELAY_RESTRICTED_IPC";
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn restricted_ipc_paths() -> Result<(PathBuf, PathBuf), String> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::DirBuilderExt;
@@ -91,16 +92,60 @@ fn restricted_ipc_paths() -> Result<(PathBuf, PathBuf), String> {
 
 /// Run the Unix-domain socket host implementation.
 pub fn run() -> ExitCode {
-    let restricted = match std::env::var(ISOLATION).as_deref() {
-        Ok("trusted-process") | Err(_) => false,
-        Ok("restricted-macos") => true,
+    // The confinement probe answers a deployment question, not a session one:
+    // it runs without an isolation value because the policy that asks it is the
+    // one deciding whether this binary can confine at all.
+    #[cfg(target_os = "linux")]
+    if std::env::var(crate::linux_sandbox::PROBE_ENV).as_deref()
+        == Ok(crate::linux_sandbox::PROBE_VALUE)
+    {
+        return crate::linux_sandbox::probe();
+    }
+    let (restricted, restricted_ipc) = match std::env::var(ISOLATION).as_deref() {
+        Ok("trusted-process") | Err(_) => (false, false),
+        Ok("restricted-macos") => (true, true),
+        Ok("restricted-linux") => {
+            #[cfg(target_os = "linux")]
+            {
+                // Confinement is applied before anything else in this process —
+                // before the runtime exists, before a plugin byte is read. The
+                // session directory is the filesystem the host may still write,
+                // so it is derived before the sandbox makes the rest of the
+                // filesystem unreachable.
+                let Some(socket) = std::env::var_os(SOCKET).map(PathBuf::from) else {
+                    eprintln!(
+                        "{SOCKET} is not set: a confined host needs the session directory to know what it may still write"
+                    );
+                    return ExitCode::from(2);
+                };
+                let Some(allowed_root) = socket.parent().map(PathBuf::from) else {
+                    eprintln!(
+                        "{SOCKET} '{}' has no session directory",
+                        socket.display()
+                    );
+                    return ExitCode::from(2);
+                };
+                if let Err(error) = crate::linux_sandbox::enter(&allowed_root, None) {
+                    eprintln!("restricted-linux confinement could not be applied: {error}");
+                    return ExitCode::from(1);
+                }
+                (true, false)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                eprintln!(
+                    "'restricted-linux' confinement is defined for Linux only; this platform cannot honor it"
+                );
+                return ExitCode::from(2);
+            }
+        }
         Ok(other) => {
             eprintln!("{ISOLATION} has unsupported value '{other}'");
             return ExitCode::from(2);
         }
     };
-    let (socket, kernel_socket) = if restricted {
-        #[cfg(unix)]
+    let (socket, kernel_socket) = if restricted_ipc {
+        #[cfg(target_os = "macos")]
         {
             match restricted_ipc_paths() {
                 Ok((host, kernel)) => {
@@ -132,9 +177,9 @@ pub fn run() -> ExitCode {
                 }
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(not(target_os = "macos"))]
         {
-            eprintln!("restricted-macos requires Unix-domain sockets");
+            eprintln!("restricted-macos requires the macOS sandbox container");
             return ExitCode::from(2);
         }
     } else {
@@ -143,6 +188,25 @@ pub fn run() -> ExitCode {
             return ExitCode::from(2);
         };
         (socket, std::env::var_os(KERNEL_SOCKET).map(PathBuf::from))
+    };
+    // A confined host cannot dial its kernel: `connect` answers EPERM under
+    // its filter. The supervisor therefore hands it the channel as an
+    // inherited descriptor, announced through this variable rather than a
+    // path. A path the host was given and a descriptor it was not are both
+    // rejected below as inconsistent configuration.
+    let kernel_fd = match std::env::var("NEMO_RELAY_KERNEL_FD") {
+        Ok(value) => match value.parse::<std::os::unix::io::RawFd>() {
+            Ok(fd) if fd >= 0 => Some(fd),
+            _ => {
+                eprintln!("NEMO_RELAY_KERNEL_FD is not a descriptor number: {value}");
+                return ExitCode::from(2);
+            }
+        },
+        Err(std::env::VarError::NotPresent) => None,
+        Err(_) => {
+            eprintln!("NEMO_RELAY_KERNEL_FD is not valid Unicode");
+            return ExitCode::from(2);
+        }
     };
     let credential = std::env::var(CREDENTIAL).unwrap_or_default();
     if credential.is_empty() {
@@ -247,15 +311,35 @@ pub fn run() -> ExitCode {
         // stream, so this process forwards them rather than emitting them into a
         // runtime whose subscribers nobody reads. A host started without one
         // emits them locally, which is all a host outside a kernel can do.
-        let forwarding = match (kernel_socket, std::env::var(KERNEL_CREDENTIAL)) {
-            (None, Err(std::env::VarError::NotPresent)) => None,
-            (Some(endpoint), Ok(kernel_credential)) if !kernel_credential.is_empty() => {
-                match nemo_relay_plugin_host::runtime_service::connect_to_kernel(
-                    &endpoint,
-                    config.maximum_frame_bytes,
-                )
-                .await
-                {
+        let forwarding = match (kernel_socket, kernel_fd, std::env::var(KERNEL_CREDENTIAL)) {
+            (None, None, Err(std::env::VarError::NotPresent)) => None,
+            (endpoint, channel_fd, Ok(kernel_credential))
+                if !kernel_credential.is_empty() && (endpoint.is_some() != channel_fd.is_some()) =>
+            {
+                let reconnect_endpoint = endpoint.clone();
+                let channel_desc = match (&endpoint, &channel_fd) {
+                    (Some(endpoint), None) => format!("'{}'", endpoint.display()),
+                    (None, Some(raw_fd)) => format!("descriptor {raw_fd}"),
+                    _ => unreachable!("the arm guards on exactly one channel being given"),
+                };
+                let connected = match (endpoint, channel_fd) {
+                    (Some(endpoint), None) => {
+                        nemo_relay_plugin_host::runtime_service::connect_to_kernel(
+                            &endpoint,
+                            config.maximum_frame_bytes,
+                        )
+                        .await
+                    }
+                    (None, Some(raw_fd)) => {
+                        nemo_relay_plugin_host::runtime_service::connect_to_kernel_fd(
+                            raw_fd,
+                            config.maximum_frame_bytes,
+                        )
+                        .await
+                    }
+                    _ => unreachable!("the arm guards on exactly one channel being given"),
+                };
+                match connected {
                     Ok(mut client) => {
                         // The same connection serves both callbacks: the marks a
                         // plugin raises and the continuation of a call it wraps.
@@ -267,8 +351,14 @@ pub fn run() -> ExitCode {
                         )
                         // Remembering the endpoint is what lets a caller on another runtime
                         // — the codec bridge, whose thread blocks on the answer — open its
-                        // own connection there instead of waiting on this runtime's tasks.
-                        .map(|callbacks| callbacks.with_reconnect(endpoint.clone(), config.maximum_frame_bytes))
+                        // own connection there instead of waiting on this runtime's tasks. A
+                        // descriptor channel cannot be re-dialed, so it remembers none.
+                        .map(|callbacks| match reconnect_endpoint {
+                            Some(endpoint) => {
+                                callbacks.with_reconnect(endpoint, config.maximum_frame_bytes)
+                            }
+                            None => callbacks,
+                        })
                         .map_err(|error| {
                             eprintln!("{KERNEL_CREDENTIAL} is unusable: {error}");
                             ExitCode::from(2)
@@ -323,26 +413,35 @@ pub fn run() -> ExitCode {
                         Some((sender, callbacks))
                     }
                     Err(error) => {
-                        eprintln!(
-                            "failed to reach the kernel at '{}': {error}",
-                            endpoint.display()
-                        );
+                        eprintln!("failed to reach the kernel at {channel_desc}: {error}");
                         return ExitCode::from(2);
                     }
                 }
             }
-            (Some(endpoint), _) => {
+            (Some(endpoint), None, _) => {
                 eprintln!(
                     "{KERNEL_SOCKET} is set to '{}' but {KERNEL_CREDENTIAL} is missing or empty",
                     endpoint.display()
                 );
                 return ExitCode::from(2);
             }
-            (None, Ok(_)) => {
-                eprintln!("{KERNEL_CREDENTIAL} is set but {KERNEL_SOCKET} is missing");
+            (None, Some(_), _) => {
+                eprintln!(
+                    "NEMO_RELAY_KERNEL_FD is set but {KERNEL_CREDENTIAL} is missing or empty"
+                );
                 return ExitCode::from(2);
             }
-            (None, Err(std::env::VarError::NotUnicode(_))) => {
+            (Some(_), Some(_), _) => {
+                eprintln!(
+                    "{KERNEL_SOCKET} and NEMO_RELAY_KERNEL_FD are both set: the kernel channel must be exactly one"
+                );
+                return ExitCode::from(2);
+            }
+            (None, None, Ok(_)) => {
+                eprintln!("{KERNEL_CREDENTIAL} is set but no kernel channel was given");
+                return ExitCode::from(2);
+            }
+            (None, None, Err(std::env::VarError::NotUnicode(_))) => {
                 eprintln!("{KERNEL_CREDENTIAL} is not valid Unicode");
                 return ExitCode::from(2);
             }

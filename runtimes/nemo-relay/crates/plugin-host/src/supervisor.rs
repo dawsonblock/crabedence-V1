@@ -250,6 +250,26 @@ impl PluginHostSupervisor {
                 })?,
             )
         };
+        // The confined Linux host cannot connect anywhere: its seccomp filter
+        // answers `connect` with EPERM, so the kernel callback channel has to
+        // exist before the sandbox does. The supervisor connects to the
+        // listener it just bound and hands the child the connected descriptor;
+        // the callback executor accepts it like any other connection when it
+        // starts serving. The path itself is never given to the confined host.
+        #[cfg(unix)]
+        let kernel_channel = if config.isolation
+            == crate::isolation_policy::NativeIsolationPolicy::RestrictedLinux
+        {
+            Some(
+                std::os::unix::net::UnixStream::connect(&kernel_endpoint).map_err(|error| {
+                    unavailable(format!(
+                        "failed to open the kernel channel the confined host is handed: {error}"
+                    ))
+                })?,
+            )
+        } else {
+            None
+        };
         let mut command = Command::new(&executable);
         // The bounds the child runs under, applied between `fork` and `exec`.
         // This is the only point at which they can be applied and the only point
@@ -258,12 +278,28 @@ impl PluginHostSupervisor {
         #[cfg(unix)]
         {
             let limits = config.limits;
+            // The kernel channel descriptor has to survive `exec`: it is opened
+            // CLOEXEC by the std socket call and the confined child's only copy
+            // of it is the descriptor it inherits.
+            let channel_fd = kernel_channel
+                .as_ref()
+                .map(|stream| std::os::unix::io::AsRawFd::as_raw_fd(stream));
             // Safety: the closure runs in the forked child before `exec`, and
-            // calls `setrlimit` (and, on Linux, `prctl`) and nothing else: it
-            // allocates nothing, takes no locks, and returns only an error the
-            // spawn reports.
+            // calls `setrlimit` (and, on Linux, `prctl` and `fcntl`) and nothing
+            // else: it allocates nothing, takes no locks, and returns only an
+            // error the spawn reports.
             unsafe {
-                command.pre_exec(move || crate::limits::apply(&limits));
+                command.pre_exec(move || {
+                    if let Some(fd) = channel_fd {
+                        let descriptor = rustix::fd::BorrowedFd::borrow_raw(fd);
+                        if let Err(error) =
+                            rustix::io::fcntl_setfd(descriptor, rustix::io::FdFlags::empty())
+                        {
+                            return Err(error.into());
+                        }
+                    }
+                    crate::limits::apply(&limits)
+                });
             }
         }
         // A filtered environment: the child gets what it needs to be this host
@@ -277,7 +313,6 @@ impl PluginHostSupervisor {
             )
             .env("NEMO_RELAY_PLUGIN_HOST_SOCKET", &socket)
             .env("NEMO_RELAY_PLUGIN_HOST_CREDENTIAL", &credential)
-            .env("NEMO_RELAY_KERNEL_SOCKET", &kernel_endpoint)
             .env("NEMO_RELAY_KERNEL_CREDENTIAL", &kernel_credential)
             .env(
                 "NEMO_RELAY_PLUGIN_HOST_BINDING",
@@ -305,6 +340,51 @@ impl PluginHostSupervisor {
             })
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
+        if config.isolation
+            == crate::isolation_policy::NativeIsolationPolicy::RestrictedLinux
+        {
+            // The confined host's HOME is a directory inside its own session:
+            // staging and scratch land in the one place the filesystem
+            // allow-list leaves writable, and nothing the account owns is
+            // visible under the name HOME suggests.
+            let home = socket_dir.join("home");
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            builder.create(&home).map_err(|error| {
+                unavailable(format!(
+                    "failed to create the confined host's home '{}': {error}",
+                    home.display()
+                ))
+            })?;
+            command.env("HOME", &home);
+        }
+        // Which kernel channel the child is offered depends on what it may do
+        // once confined: a confined Linux host gets a descriptor it inherits —
+        // its `connect` is dead — and everything else gets the path it dials.
+        #[cfg(unix)]
+        if config.isolation
+            == crate::isolation_policy::NativeIsolationPolicy::RestrictedLinux
+        {
+            let Some(stream) = kernel_channel.as_ref() else {
+                return Err(unavailable(
+                    "the confined host's kernel channel was not prepared",
+                ));
+            };
+            command.env(
+                "NEMO_RELAY_KERNEL_FD",
+                std::os::unix::io::AsRawFd::as_raw_fd(stream).to_string(),
+            );
+        } else {
+            command.env("NEMO_RELAY_KERNEL_SOCKET", &kernel_endpoint);
+        }
+        #[cfg(not(unix))]
+        {
+            command.env("NEMO_RELAY_KERNEL_SOCKET", &kernel_endpoint);
+        }
         let child = command.spawn().map_err(|error| {
             // A host that is not there is a deployment that received a runtime
             // without the executable that makes isolation possible, so the
@@ -330,6 +410,11 @@ impl PluginHostSupervisor {
                 executable.display(),
             ))
         })?;
+        // The kernel channel's other end belongs to the child now: the
+        // supervisor's copy of the descriptor is closed, and the connection the
+        // callback executor will accept lives on in the confined host.
+        #[cfg(unix)]
+        drop(kernel_channel);
         let process_id = child.id();
         let mut child = child;
         // Held, not used: the host reads it, and what it observes is the moment
@@ -1048,9 +1133,9 @@ impl PluginExecutionBackend for ProcessPluginBackend {
         context: PluginExecutionContext,
     ) -> PluginExecutionFuture<'a, PluginLoadResponse> {
         Box::pin(async move {
-            if self.config.isolation
-                == crate::isolation_policy::NativeIsolationPolicy::RestrictedMacOS
-            {
+            if self.config.isolation.confines_resources() {
+                // A confined host cannot open a path the kernel hands it — the
+                // artifact has to arrive over the authenticated session instead.
                 request.artifact = self.transfer_artifact(&request, &context).await?;
             }
             let budget = Self::budget(&context, now_unix_ms()?)?;
