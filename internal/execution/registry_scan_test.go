@@ -33,8 +33,8 @@ func TestBuiltInRegistryPassesStartupScan(t *testing.T) {
 	if err != nil {
 		t.Fatalf("report: %v", err)
 	}
-	if report.Total != 7 {
-		t.Fatalf("built-in registry total = %d, want 7", report.Total)
+	if report.Total != 11 {
+		t.Fatalf("built-in registry total = %d, want 11", report.Total)
 	}
 	if report.Digest == "" {
 		t.Fatal("registry digest must be non-empty")

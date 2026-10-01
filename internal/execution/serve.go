@@ -64,10 +64,18 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	// before this point.
 	var githubHandler *GitHubIssueHandler
 	var githubCommentHandler *GitHubCommentHandler
+	var githubIssueCloseHandler *GitHubIssueCloseHandler
+	var githubIssueUpdateHandler *GitHubIssueUpdateHandler
+	var githubPullCreateHandler *GitHubPullCreateHandler
+	var githubPullMergeHandler *GitHubPullMergeHandler
 	var githubReads *GitHubReads
 	if cfg.GitHubEnabled {
 		githubHandler = NewGitHubIssueHandler(cfg.GitHubAPIURL, cfg.GitHubToken)
 		githubCommentHandler = NewGitHubCommentHandler(cfg.GitHubAPIURL, cfg.GitHubToken)
+		githubIssueCloseHandler = NewGitHubIssueCloseHandler(cfg.GitHubAPIURL, cfg.GitHubToken)
+		githubIssueUpdateHandler = NewGitHubIssueUpdateHandler(cfg.GitHubAPIURL, cfg.GitHubToken)
+		githubPullCreateHandler = NewGitHubPullCreateHandler(cfg.GitHubAPIURL, cfg.GitHubToken)
+		githubPullMergeHandler = NewGitHubPullMergeHandler(cfg.GitHubAPIURL, cfg.GitHubToken)
 		// The observational read shares the provider identity and
 		// configuration with the mutation adapter.
 		githubReads = NewGitHubReads(cfg.GitHubAPIURL, cfg.GitHubToken)
@@ -253,7 +261,14 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 		// The github adapter fronts several durable capabilities — the
 		// mux keeps one adapter identity in evidence while dispatching on
 		// the capability.
-		handlers["github"] = &githubAdapter{issue: githubHandler, comment: githubCommentHandler}
+		handlers["github"] = &githubAdapter{
+			issue:       githubHandler,
+			comment:     githubCommentHandler,
+			issueClose:  githubIssueCloseHandler,
+			issueUpdate: githubIssueUpdateHandler,
+			pullCreate:  githubPullCreateHandler,
+			pullMerge:   githubPullMergeHandler,
+		}
 	}
 	if qualAdapter != nil {
 		handlers[QualificationAdapterID] = qualAdapter
@@ -373,6 +388,10 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 		if githubHandler != nil {
 			worker.RegisterResolver("github.issue.create", providerGate.ObserveResolver("github", githubHandler))
 			worker.RegisterResolver("github.issue.comment", providerGate.ObserveResolver("github", githubCommentHandler))
+			worker.RegisterResolver("github.issue.close", providerGate.ObserveResolver("github", githubIssueCloseHandler))
+			worker.RegisterResolver("github.issue.update", providerGate.ObserveResolver("github", githubIssueUpdateHandler))
+			worker.RegisterResolver("github.pr.create", providerGate.ObserveResolver("github", githubPullCreateHandler))
+			worker.RegisterResolver("github.pr.merge", providerGate.ObserveResolver("github", githubPullMergeHandler))
 		}
 		if qualAdapter != nil {
 			worker.RegisterResolver(QualificationCapabilityID, providerGate.ObserveResolver(QualificationAdapterID, qualAdapter))

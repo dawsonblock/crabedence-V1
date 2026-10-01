@@ -305,7 +305,8 @@ Built-in capabilities:
 - `system.echo` (PURE) — returns arguments as echo result
 - `system.info` (READ) — returns system information (goes through remote port)
 - `test.counter.increment` (MUTATION) — harmless mutation with idempotency
-- `github.issue.create` / `github.issue.comment` (MUTATION) — durable GitHub issue operations (when a GitHub adapter is configured)
+- `github.issue.create` / `github.issue.comment` / `github.issue.close` / `github.issue.update` (MUTATION) — durable GitHub issue operations (when a GitHub adapter is configured)
+- `github.pr.create` / `github.pr.merge` (MUTATION) — durable GitHub pull-request operations (when a GitHub adapter is configured)
 - `github.issue.get` / `github.issue.list` (READ) — bounded GitHub issue reads over the DIRECT route (when a GitHub adapter is configured)
 - `qualification.critical.commit` (CRITICAL) — release-gate qualification commits, registered only when `CRABEDENCE_QUAL_PROVIDER_URL` wires the qualification provider
 

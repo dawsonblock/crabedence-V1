@@ -398,6 +398,32 @@ func truncate(s string, n int) string {
 	return s[:n]
 }
 
+// githubRepoParts validates and splits an "owner/name" repository
+// coordinate. Both segments must be non-empty and the name must not
+// contain another separator.
+func githubRepoParts(repo string) (owner, name string, err error) {
+	owner, name, ok := strings.Cut(repo, "/")
+	if !ok || owner == "" || name == "" || strings.Contains(name, "/") {
+		return "", "", fmt.Errorf("repo must be \"owner/name\", got %q", repo)
+	}
+	return owner, name, nil
+}
+
+// githubTransportDefinitive reports whether a transport error provably
+// occurred before any request bytes reached the provider. Only
+// connection-refused and DNS failures are no-effect proofs — resets,
+// timeouts, and mid-request drops are ambiguous because the request may
+// have been fully received before the failure.
+func githubTransportDefinitive(err error) bool {
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return true
+	}
+	// A DNS failure — including a resolution timeout — means no
+	// connection was attempted, so no request bytes left.
+	var dnsErr *net.DNSError
+	return errors.As(err, &dnsErr)
+}
+
 // RegisterGitHubIssueCapability registers github.issue.create.
 func RegisterGitHubIssueCapability(reg *capability.Registry) error {
 	return reg.Register(capability.CapabilityDescriptor{

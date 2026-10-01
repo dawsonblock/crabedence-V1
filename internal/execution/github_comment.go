@@ -388,8 +388,12 @@ func RegisterGitHubCommentCapability(reg *capability.Registry) error {
 // dispatch — and a capability the adapter does not know fails closed
 // rather than falling through to whichever handler answered first.
 type githubAdapter struct {
-	issue   *GitHubIssueHandler
-	comment *GitHubCommentHandler
+	issue       *GitHubIssueHandler
+	comment     *GitHubCommentHandler
+	issueClose  *GitHubIssueCloseHandler
+	issueUpdate *GitHubIssueUpdateHandler
+	pullCreate  *GitHubPullCreateHandler
+	pullMerge   *GitHubPullMergeHandler
 }
 
 func (a *githubAdapter) handlerFor(capabilityID string) (Handler, error) {
@@ -398,6 +402,14 @@ func (a *githubAdapter) handlerFor(capabilityID string) (Handler, error) {
 		return a.issue, nil
 	case "github.issue.comment":
 		return a.comment, nil
+	case "github.issue.close":
+		return a.issueClose, nil
+	case "github.issue.update":
+		return a.issueUpdate, nil
+	case "github.pr.create":
+		return a.pullCreate, nil
+	case "github.pr.merge":
+		return a.pullMerge, nil
 	default:
 		return nil, fmt.Errorf("adapter github has no handler for capability %q", capabilityID)
 	}

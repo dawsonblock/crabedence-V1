@@ -19,6 +19,10 @@ github.issue.get
 github.issue.list
 github.issue.create
 github.issue.comment
+github.issue.close
+github.issue.update
+github.pr.create
+github.pr.merge
 ```
 
 The registry digest is identical on two machines running the same
