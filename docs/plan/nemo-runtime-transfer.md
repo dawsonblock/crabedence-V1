@@ -346,8 +346,12 @@ by the three `bridges/*` entries in the workspace `members` list, those
 directories, the MCP credential patch, and `TRANSFER-PROVENANCE.md`. The
 manifest's `local_modifications` and `added_paths` inventory is the full list,
 and `scripts/check-nemo-transfer-manifest.sh` refuses a tree that drifted from
-it. Re-applying those after an upstream refresh is the documented update
-procedure.
+it. The record's delta table is not maintained by hand: `-update` regenerates
+the marker-delimited block inside `TRANSFER-PROVENANCE.md` before digesting
+the tree, and verification fails when the block no longer renders the
+manifest's declared sets — the human record and the machine record cannot
+silently diverge. Re-applying those after an upstream refresh is the
+documented update procedure.
 
 ### Platform scope: Linux and macOS for the integrated runtime
 
@@ -366,18 +370,25 @@ peer authentication and framing semantics, and NEMO's native plugin
 isolation, which deliberately refuses Windows today. Neither is on this
 transfer's critical path.
 
-### DIRECT is deliberately unwired in the first release
+### DIRECT crosses the socket to the service's own read path
 
-The registry pins read capabilities to the `DIRECT` route (`system.info` and
-`github.issue.get` in the built-in set). The router refuses them with
-`CAPABILITY_UNAVAILABLE` — definitive, not retryable, no reconciliation —
-rather than performing an unaudited read, and that refusal is a scope
-decision recorded here rather than an oversight. A read path is wired when it
-can enforce the same admission the service's own `DIRECT` dispatcher does;
-until then `DIRECT` capabilities are not part of the first release's
-supported set, and refusing them is the honest behavior. The routes that are
-wired are covered by `scripts/test-nemo-runtime-e2e.sh`; `DIRECT` is covered
-by the router's own tests as a refusal.
+The registry pins read capabilities to the `DIRECT` route (`system.info`,
+`github.issue.get`, and `github.issue.list` in the built-in set). The runtime dispatches them over the
+same socket as `CRABEDENCE` — the request carries no route field, so the
+service's `RouteDispatcher` resolves the route from *its* registry and hands
+the call to `DirectReadRegistry` (READ-only re-check, schema validation,
+bounded runtime and payload, audit record, no durable ledger). The wire does
+not carry policy, so a caller cannot ask for DIRECT; the registry decides at
+both ends.
+
+The router still re-checks the registration invariant before dispatching:
+`DIRECT` pinned to `MUTATION`/`CRITICAL` or to `DURABLE`/`HIGH_ASSURANCE`
+fails closed with `EXECUTION_ROUTE_MISMATCH` rather than riding the
+non-durable route, and the port mirrors the same check on the wire boundary
+for a snapshot the router never saw. `scripts/test-nemo-runtime-e2e.sh`
+proves the joined path end-to-end: `system.info` answers with the service's
+read payload and no durable receipt, while `pure.local` still executes
+in-process.
 
 ## Phase 0 — vendor the NEMO runtime (done)
 
@@ -889,6 +900,29 @@ Done and proven on the release path (`scripts/build-nemo-distribution.sh`,
   the shipped binaries. The suite deliberately exports *no* host pin: the
   shipped runtime binds itself to the manifest it verifies, and every report
   is asserted to carry the release-root digest the sidecar declares.
+  Qualification then emits a bound attestation
+  (`cmd/nemo-qualification-attestation`): `<artifact>.qualification.json`
+  records the gates that ran, the source commit they ran at, the qualifying
+  host, and the recomputed digests of the component manifest, the transfer
+  manifest, and the packed archive — and the suite verifies the record
+  against the bytes before reporting success. The checksum fan-in job
+  re-checks that each uploaded attestation binds the tarball it traveled
+  with and records only passes. Signing the attestation is the release
+  step's concern; the record is what a signature would cover.
+* **Release-origin authentication.** `component-manifest.sha256` — the
+  release-root identity — is SSH-signed in the `nemo-control-release`
+  namespace when `NEMO_RELEASE_SIGNING_KEY` is provisioned, and the
+  resulting `component-manifest.sha256.sig` ships inside the artifact
+  (it joins the manifest's own files in the exhaustive check's exempt set:
+  it signs the sidecar that binds the manifest, so no manifest could ever
+  declare it). `nemo-component-manifest -verify -allowed-signers
+  .github/release-allowed-signers -signer-identity
+  dawsonblock@users.noreply.github.com` authenticates the signature under
+  the maintainer's principal; the installed-distribution suite requires it
+  whenever `NEMO_RELEASE_ALLOWED_SIGNERS` + `NEMO_RELEASE_SIGNER` are set,
+  and refuses a `.sig` it cannot authenticate. The checksum fan-in signs
+  `SHA256SUMS` with the same key and verifies the signature before upload.
+  Cosign remains the deferred second signature; SSH covers origin today.
 
 The subtree is synced — `crabedence-V1` carries this work at
 `f161bc5` (PR

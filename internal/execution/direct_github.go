@@ -46,48 +46,93 @@ func NewGitHubReads(baseURL, token string) *GitHubReads {
 	}
 }
 
+// githubReadAuthority is the authority policy every GitHub DIRECT read
+// shares: the adapter always attaches the configured GitHub token, so a
+// read can see whatever the service credential can — including private
+// repositories. It is therefore NOT a public read: it requires a grant
+// like the mutation leg, scoped to repositories through the repo
+// constraint.
+func githubReadAuthority() capability.AuthorityPolicy {
+	return capability.AuthorityPolicy{
+		ID:            "github.read",
+		GrantRequired: true,
+		ResourceArguments: map[string]string{
+			"repo": "repo",
+		},
+	}
+}
+
 // RegisterGitHubReadCapabilities registers the DIRECT read capabilities.
 func RegisterGitHubReadCapabilities(reg *capability.Registry) error {
-	return reg.Register(capability.CapabilityDescriptor{
-		ID:             "github.issue.get",
-		ExecutionClass: capability.ClassRead,
-		AdapterID:      "github",
-		AuthorityPolicy: capability.AuthorityPolicy{
-			// The adapter always attaches the configured GitHub token,
-			// so this read can see whatever the service credential can —
-			// including private repositories. It is therefore NOT a
-			// public read: it requires a grant like the mutation leg,
-			// scoped to repositories through the repo constraint.
-			ID:            "github.read",
-			GrantRequired: true,
-			ResourceArguments: map[string]string{
-				"repo": "repo",
-			},
-		},
-		Schema: json.RawMessage(`{
-			"type": "object",
-			"required": ["repo", "number"],
-			"properties": {
-				"repo":   {
-					"type": "string",
-					"minLength": 3,
-					"maxLength": 200,
-					"description": "Repository as owner/name"
+	for _, desc := range []capability.CapabilityDescriptor{
+		{
+			ID:              "github.issue.get",
+			ExecutionClass:  capability.ClassRead,
+			AdapterID:       "github",
+			AuthorityPolicy: githubReadAuthority(),
+			Schema: json.RawMessage(`{
+				"type": "object",
+				"required": ["repo", "number"],
+				"properties": {
+					"repo":   {
+						"type": "string",
+						"minLength": 3,
+						"maxLength": 200,
+						"description": "Repository as owner/name"
+					},
+					"number": {
+						"type": "integer",
+						"minimum": 1,
+						"description": "Issue number"
+					}
 				},
-				"number": {
-					"type": "integer",
-					"minimum": 1,
-					"description": "Issue number"
-				}
-			},
-			"additionalProperties": false
-		}`),
-	})
+				"additionalProperties": false
+			}`),
+		},
+		{
+			ID:              "github.issue.list",
+			ExecutionClass:  capability.ClassRead,
+			AdapterID:       "github",
+			AuthorityPolicy: githubReadAuthority(),
+			Schema: json.RawMessage(`{
+				"type": "object",
+				"required": ["repo"],
+				"properties": {
+					"repo":  {
+						"type": "string",
+						"minLength": 3,
+						"maxLength": 200,
+						"description": "Repository as owner/name"
+					},
+					"state": {
+						"type": "string",
+						"enum": ["open", "closed", "all"],
+						"description": "Issue state filter (default open)"
+					},
+					"limit": {
+						"type": "integer",
+						"minimum": 1,
+						"maximum": 50,
+						"description": "Maximum issues returned (default 30, capped at 50)"
+					}
+				},
+				"additionalProperties": false
+			}`),
+		},
+	} {
+		if err := reg.Register(desc); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // RegisterGitHubReads binds the GitHub read implementations.
 func RegisterGitHubReads(registry *DirectReadRegistry, reads *GitHubReads) error {
-	return registry.Register("github.issue.get", reads.IssueGet)
+	if err := registry.Register("github.issue.get", reads.IssueGet); err != nil {
+		return err
+	}
+	return registry.Register("github.issue.list", reads.IssueList)
 }
 
 // IssueGet reads one issue: GET /repos/{owner}/{repo}/issues/{number}.
@@ -167,5 +212,115 @@ func (g *GitHubReads) IssueGet(ctx context.Context, call CallContext) (json.RawM
 		"author":     issue.User.Login,
 		"created_at": issue.CreatedAt,
 		"updated_at": issue.UpdatedAt,
+	})
+}
+
+// maxIssueListResults is the server-side ceiling on the projected issue
+// list — the schema already bounds `limit` to 50, and the adapter never
+// exceeds the schema's own contract.
+const maxIssueListResults = 50
+
+// IssueList lists a repository's issues: GET /repos/{owner}/{repo}/issues
+// with the caller's state filter and a bounded page size. The result is
+// the same bounded projection as a single get, capped by the caller's
+// limit — never the raw provider page.
+func (g *GitHubReads) IssueList(ctx context.Context, call CallContext) (json.RawMessage, error) {
+	var args struct {
+		Repo  string `json:"repo"`
+		State string `json:"state"`
+		Limit int    `json:"limit"`
+	}
+	if err := json.Unmarshal(call.Arguments, &args); err != nil {
+		return nil, fmt.Errorf("invalid arguments: %w", err)
+	}
+	owner, name, ok := strings.Cut(args.Repo, "/")
+	if !ok || owner == "" || name == "" || strings.Contains(name, "/") {
+		return nil, errors.New("repo must be owner/name")
+	}
+	state := args.State
+	if state == "" {
+		state = "open"
+	}
+	if state != "open" && state != "closed" && state != "all" {
+		return nil, fmt.Errorf("state must be open, closed, or all — got %q", args.State)
+	}
+	limit := args.Limit
+	if limit == 0 {
+		limit = 30
+	}
+	if limit < 1 || limit > maxIssueListResults {
+		return nil, fmt.Errorf("limit must be 1..%d, got %d", maxIssueListResults, args.Limit)
+	}
+
+	endpoint := fmt.Sprintf("%s/repos/%s/%s/issues?state=%s&per_page=%d",
+		g.baseURL, url.PathEscape(owner), url.PathEscape(name), state, limit)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build github request: %w", err)
+	}
+	request.Header.Set("Accept", "application/vnd.github+json")
+	request.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	if g.token != "" {
+		request.Header.Set("Authorization", "Bearer "+g.token)
+	}
+
+	response, err := g.client.Do(request)
+	if err != nil {
+		return nil, fmt.Errorf("github read failed: %w", err)
+	}
+	defer response.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxDirectReadBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read github response: %w", err)
+	}
+	if len(body) > maxDirectReadBytes {
+		return nil, fmt.Errorf("github response exceeds %d bytes", maxDirectReadBytes)
+	}
+
+	switch response.StatusCode {
+	case http.StatusOK:
+		// Fall through to the projection.
+	case http.StatusNotFound:
+		return nil, fmt.Errorf("repository %s not found", args.Repo)
+	case http.StatusUnauthorized, http.StatusForbidden:
+		// Never echo the response body — it can carry credential hints.
+		return nil, fmt.Errorf("github denied the read (HTTP %d)", response.StatusCode)
+	default:
+		return nil, fmt.Errorf("github returned HTTP %d", response.StatusCode)
+	}
+
+	var issues []struct {
+		Number    int    `json:"number"`
+		Title     string `json:"title"`
+		State     string `json:"state"`
+		HTMLURL   string `json:"html_url"`
+		CreatedAt string `json:"created_at"`
+		UpdatedAt string `json:"updated_at"`
+		User      struct {
+			Login string `json:"login"`
+		} `json:"user"`
+	}
+	if err := json.Unmarshal(body, &issues); err != nil {
+		return nil, fmt.Errorf("github response was not a JSON array: %w", err)
+	}
+
+	projected := make([]map[string]any, 0, len(issues))
+	for _, issue := range issues {
+		projected = append(projected, map[string]any{
+			"number":     issue.Number,
+			"title":      issue.Title,
+			"state":      issue.State,
+			"html_url":   issue.HTMLURL,
+			"author":     issue.User.Login,
+			"created_at": issue.CreatedAt,
+			"updated_at": issue.UpdatedAt,
+		})
+	}
+	return json.Marshal(map[string]any{
+		"repo":   args.Repo,
+		"state":  state,
+		"issues": projected,
+		"count":  len(projected),
 	})
 }

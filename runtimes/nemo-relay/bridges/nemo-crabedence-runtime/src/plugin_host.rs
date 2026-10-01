@@ -25,16 +25,13 @@
 //! invariant the dependency check asserts.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use nemo_relay::plugin::execution::{PluginExecutionBackend, PluginManager};
+use nemo_relay_plugin_host::ProcessLoadedPlugins;
 use nemo_relay_plugin_host::isolation_policy::NativeIsolationPolicy;
-use nemo_relay_plugin_host::off_path::{ObservabilityPolicy, OffPathPluginExecutor};
-use nemo_relay_plugin_host::proxy::{ProxyContext, RegistrationProxies, install};
-use nemo_relay_plugin_host::supervisor::{PluginHostSupervisorConfig, ProcessPluginBackend};
+use nemo_relay_plugin_host::off_path::ObservabilityPolicy;
+use nemo_relay_plugin_host::supervisor::PluginHostSupervisorConfig;
 use nemo_relay_plugin_protocol::{
-    PROTOCOL_VERSION, PluginActivateRequest, PluginArtifactIdentity, PluginComponentConfiguration,
-    PluginDescriptor, PluginExecutionContext, PluginLoadRequest,
+    PROTOCOL_VERSION, PluginComponentConfiguration, PluginDescriptor, PluginExecutionContext,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -232,12 +229,10 @@ pub struct PluginSession {
     /// binary that actually holds the plugin, which is what a qualified
     /// deployment's pin binds. Recorded so a receipt can name it.
     pub host: HostIdentity,
-    /// Held, not read: the manager owns the backend, so the session's lifetime
-    /// is the host child's.
-    _manager: Arc<PluginManager>,
-    /// Held, not read: dropping the proxies is what removes the plugin's
+    /// Held, not read: the composition owns the backend, so the session's
+    /// lifetime is the host child's, and dropping it removes the plugin's
     /// registrations from this process's chains.
-    _proxies: RegistrationProxies,
+    _loaded: ProcessLoadedPlugins,
     /// Held, not read: the staged host copy must live exactly as long as the
     /// child spawned from it — dropping it deletes the running executable's
     /// file (the process keeps running on Unix, but the path's usefulness to
@@ -355,75 +350,39 @@ pub async fn open(options: &PluginOptions) -> Result<PluginSession, String> {
     // staging a bare copy of it would strip the signature the confinement
     // travels with, so it is the one path that is spawned as resolved.
     let (host, staging) = prepare_host(&mut config, options.host_sha256_pin.as_deref())?;
-    let backend = ProcessPluginBackend::launch(config)
-        .await
-        .map_err(|error| format!("the plugin host did not start: {error}"))?;
-    let process_id = backend.process_id();
-
-    let loaded = backend
-        .load(
-            PluginLoadRequest {
-                plugin_id: options.plugin_id.clone(),
-                artifact: artifact_ref.to_string(),
-                identity: PluginArtifactIdentity {
-                    manifest_sha256: manifest_sha256.clone(),
-                    library_sha256: library_sha256.clone(),
-                },
-            },
-            context(options),
-        )
-        .await
-        .map_err(|error| format!("the plugin did not load: {error}"))?;
-
-    let descriptors = backend
-        .activate(
-            PluginActivateRequest {
-                discovery: false,
-                components: vec![PluginComponentConfiguration {
-                    kind: options.component.clone(),
-                    config_json: options.component_config.clone(),
-                }],
-            },
-            context(options),
-        )
-        .await
-        .map_err(|error| format!("the plugin did not activate: {error}"))?;
-    let descriptor = descriptors
-        .into_iter()
+    // The composition is assembled where it is owned: launch, load, activate,
+    // and proxy install all happen inside `load_with_context`, with this
+    // caller's mediation context — the crabedence binding digest and the
+    // managed-call budget — carried on each lifecycle operation instead of
+    // the session's generated one.
+    let loaded = ProcessLoadedPlugins::load_with_context(
+        config,
+        OFF_PATH_BUDGET_MILLIS,
+        ObservabilityPolicy {
+            budget_millis: OFF_PATH_BUDGET_MILLIS,
+            max_in_flight: 8,
+        },
+        [(options.plugin_id.clone(), artifact_ref.to_string())],
+        [PluginComponentConfiguration {
+            kind: options.component.clone(),
+            config_json: options.component_config.clone(),
+        }],
+        |_, _| context(options),
+    )
+    .await
+    .map_err(|error| format!("the plugin session did not open: {error}"))?;
+    let process_id = loaded.backend().process_id();
+    let descriptor = loaded
+        .descriptors()
+        .iter()
         .find(|descriptor| descriptor.plugin_id == options.plugin_id)
+        .cloned()
         .ok_or_else(|| {
             format!(
                 "the host reported no activation for plugin '{}'",
                 options.plugin_id
             )
         })?;
-
-    // This process's side of the boundary. The manager owns the backend, the
-    // proxy context carries the trusted binding and the off-path runtime the
-    // composition owns, and installing the proxies is what puts the plugin's
-    // registrations into this process's chains.
-    let binding = backend.runtime_binding_digest().to_owned();
-    // The continuations must be the session's own: when the child's intercept
-    // calls `next`, the host asks the runtime service the backend started, and
-    // that service looks the continuation up in the registry the backend
-    // created at launch. Parking into a different registry would leave the
-    // continuation reachable to nothing.
-    let continuations = backend.continuations();
-    let manager = Arc::new(PluginManager::new(Arc::new(backend)));
-    let off_path = Arc::new(
-        OffPathPluginExecutor::start(&ObservabilityPolicy {
-            budget_millis: OFF_PATH_BUDGET_MILLIS,
-            max_in_flight: 8,
-        })
-        .map_err(|error| format!("the off-path runtime did not start: {error}"))?,
-    );
-    let proxy_context = ProxyContext::new(Arc::clone(&manager), binding, OFF_PATH_BUDGET_MILLIS)
-        .with_observability_budget(OFF_PATH_BUDGET_MILLIS)
-        .with_off_path_executor(off_path)
-        .with_continuations(continuations);
-    let proxies = install(proxy_context, &descriptor, loaded.handle.clone()).map_err(|error| {
-        format!("this runtime cannot serve what the plugin registered: {error}")
-    })?;
 
     let middleware_set_digest = middleware_set_digest(
         &descriptor,
@@ -441,8 +400,7 @@ pub async fn open(options: &PluginOptions) -> Result<PluginSession, String> {
         plugin_library_sha256: library_sha256,
         activation_config_sha256,
         host,
-        _manager: manager,
-        _proxies: proxies,
+        _loaded: loaded,
         _staging: staging,
     })
 }

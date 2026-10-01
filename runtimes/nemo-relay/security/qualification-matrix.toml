@@ -375,6 +375,24 @@ enforced_by = [
 note = "The macOS CI lane builds Hardened Runtime bundles and runs a strict-variant test that refuses a plugin with a different Team ID, followed by a third-party-variant test that completes authenticated transfer, staged digest verification, native load and a real registration. The supervisor derives the staged path from kernel-minted session and artifact IDs, walks without following symlinks, rechecks the approved SHA-256 and removes only com.apple.quarantine by file descriptor. The restricted loader loads this container-owned file in place and rechecks its digest after dlopen. The sandbox probe separately confirms filesystem and network denials. CI uses ad hoc identities; same-Team-ID production loading requires Developer ID qualification."
 
 [[claim]]
+id = "restricted-linux-load-completes-inside-namespaces"
+statement = "A restricted-linux host confines itself with user, mount, network, IPC, UTS and PID namespaces plus Landlock and seccomp before any plugin bytes load, completes the authenticated artifact transfer inside that boundary, verifies the staged copy and executes a real registration in a process separate from the kernel."
+status = "enforced"
+enforced_by = [
+  { rust_test = "a_restricted_linux_host_loads_only_the_transferred_approved_copy" },
+]
+note = "The test spawns the real host binary under the restricted-linux policy: the child enters the namespace sandbox, applies Landlock and seccomp, builds its kernel channel on the descriptor the supervisor connected and inherited, then completes handshake, staged transfer, digest verification, load and a registration. On a kernel that cannot create unprivileged user namespaces the test reports the unmet requirement and skips rather than run unconfined; the confinement probe itself is exercised through the requirement check on every run."
+
+[[claim]]
+id = "restricted-linux-fails-closed-when-the-kernel-cannot-confine"
+statement = "A deployment that selects restricted-linux on a host whose kernel cannot deliver the confinement gets a refusal that names the missing requirement, never a host running unconfined."
+status = "enforced"
+enforced_by = [
+  { rust_test = "a_restricted_linux_policy_refuses_a_host_that_cannot_probe" },
+]
+note = "The requirement check runs the host binary's confinement probe — it enters the namespaces, applies Landlock and seccomp, and proves the denials in self_check before acking. A binary that cannot produce the acknowledgement fails the launch. The probe also proves connect() is dead in both directions (inside and outside the Landlock allow-list), because Landlock does not mediate filesystem unix-socket connects on every kernel — the approved kernel channel arrives pre-connected on an inherited descriptor instead."
+
+[[claim]]
 id = "every-hosting-consumer-carries-its-own-host"
 statement = "Every consumer that hosts plugins ships the host in the artifact that carries the binding, so a deployment never looks for one."
 status = "unverified"

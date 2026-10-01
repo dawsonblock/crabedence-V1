@@ -23,8 +23,8 @@
 //!    effective digests, the active middleware set, and the consequential
 //!    idempotency identity — into the request the router sees;
 //! 5. routes through `EffectRouter`: `LOCAL` executes through the function-hook
-//!    backend, `CRABEDENCE` crosses the kernel, `DIRECT` fails closed until a
-//!    read path is wired.
+//!    backend, `CRABEDENCE` crosses the kernel, `DIRECT` crosses the socket to
+//!    the service's own read path.
 //!
 //! A managed call that never reaches the routed dispatch — middleware answered
 //! it instead — is refused: a capability result that did not cross the router
@@ -47,13 +47,20 @@
 //!
 //! ```text
 //! nemo-crabedence-runtime --capability <id> [--arguments <json>] [--principal <id>]
-//!                         [--grant <authority-ref>] [--idempotency-key <key>]
+//!                         [--idempotency-key <key>]
 //!                         [--socket <path>] [--snapshot <path>]
 //!                         [--plugin <manifest-or-dir> --plugin-id <id> --component <kind>]
 //!
 //! nemo-crabedence-runtime --plugin <manifest-or-dir> --plugin-id <id>
 //!                         --component <kind> [--tool <name>] [--arguments <json>]
 //! ```
+//!
+//! No authority reference travels on argv: process arguments are visible
+//! to every account on the host. A grant-required capability normally
+//! carries none at all — the service resolves the authenticated peer
+//! principal's grants itself — and when a specific grant must be named
+//! it arrives through `CRABEDENCE_AUTHORITY_REF`, which unlike argv is
+//! not readable by other accounts.
 //!
 //! `--idempotency-key` is required for `MUTATION` and `CRITICAL` capabilities.
 //! It is the caller's logical-action key: stable across retries of one action,
@@ -150,14 +157,28 @@ fn parse_options() -> Result<Options, String> {
     parse_options_from(std::env::args().skip(1))
 }
 
-fn parse_options_from<I>(mut args: I) -> Result<Options, String>
+fn parse_options_from<I>(args: I) -> Result<Options, String>
 where
     I: Iterator<Item = String>,
+{
+    parse_args(args, |name| std::env::var(name).ok())
+}
+
+fn parse_args<I, E>(mut args: I, env: E) -> Result<Options, String>
+where
+    I: Iterator<Item = String>,
+    E: Fn(&str) -> Option<String>,
 {
     let mut capability = None;
     let mut arguments = json!({});
     let mut principal = "alice@example.com".to_string();
-    let mut grant = None;
+    // Authority never arrives on argv: a grant reference is a bearer
+    // capability and process arguments are visible to every account on
+    // the host. The interim channel is the caller's own environment —
+    // readable by the same account, not by others — and the ordinary
+    // path carries no reference at all, letting the service broker the
+    // authenticated peer principal's grants.
+    let grant = env("CRABEDENCE_AUTHORITY_REF").filter(|reference| !reference.is_empty());
     let mut idempotency_key = None;
     let mut socket = None;
     let mut snapshot = None;
@@ -176,7 +197,14 @@ where
                     .map_err(|error| format!("--arguments must be JSON: {error}"))?
             }
             "--principal" => principal = value()?,
-            "--grant" => grant = Some(value()?),
+            "--grant" => {
+                return Err(
+                    "--grant was removed: authority references do not travel on argv — unset, \
+                     the service brokers the authenticated peer principal's grants, and \
+                     CRABEDENCE_AUTHORITY_REF names a specific one when the caller must"
+                        .to_string(),
+                );
+            }
             "--idempotency-key" => idempotency_key = Some(value()?),
             "--socket" => socket = Some(PathBuf::from(value()?)),
             "--snapshot" => snapshot = Some(PathBuf::from(value()?)),
@@ -1435,6 +1463,60 @@ mod tests {
         )
         .expect("the options must parse");
         assert_eq!(parsed.idempotency_key.as_deref(), Some("send-001"));
+    }
+
+    #[test]
+    fn authority_references_do_not_arrive_on_argv() {
+        // A grant reference is a bearer capability, and process arguments
+        // are visible to every account on the host: the flag is refused
+        // outright rather than deprecated into a warning.
+        let error = match parse_options_from(
+            ["--capability", "system.echo", "--grant", "some-grant"]
+                .iter()
+                .map(|argument| argument.to_string()),
+        ) {
+            Ok(_) => panic!("--grant must not parse"),
+            Err(error) => error,
+        };
+        assert!(error.contains("argv"), "got: {error}");
+        assert!(error.contains("CRABEDENCE_AUTHORITY_REF"), "got: {error}");
+    }
+
+    #[test]
+    fn the_environment_is_the_interim_authority_channel() {
+        // When a caller must name a specific grant — ambiguity, a pinned
+        // delegation — the reference arrives through its own environment,
+        // which other accounts cannot read the way they can read argv.
+        let options = parse_args(
+            ["--capability", "system.echo"]
+                .iter()
+                .map(|argument| argument.to_string()),
+            |name| (name == "CRABEDENCE_AUTHORITY_REF").then(|| "grant-x".to_string()),
+        )
+        .expect("the parse must succeed");
+        assert_eq!(options.grant.as_deref(), Some("grant-x"));
+
+        // An empty or absent channel carries no reference — the ordinary
+        // case, where the service brokers the peer principal's grants.
+        for value in [None, Some(String::new())] {
+            let options = parse_args(
+                ["--capability", "system.echo"]
+                    .iter()
+                    .map(|argument| argument.to_string()),
+                {
+                    let value = value.clone();
+                    move |name| {
+                        if name == "CRABEDENCE_AUTHORITY_REF" {
+                            value.clone()
+                        } else {
+                            None
+                        }
+                    }
+                },
+            )
+            .expect("the parse must succeed");
+            assert_eq!(options.grant, None);
+        }
     }
 
     #[test]

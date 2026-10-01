@@ -17,10 +17,14 @@ section was written):
   child in each direction resolving the call's codec through the kernel. Every attachment
   point the ABI exposes is served, and the match that installs proxies is exhaustive: a
   class added to the ABI fails to compile there rather than being refused at runtime.
-- **Kernel-process unsafe tokens: 26**, measured by `just tcb-report` — down from
-  648 when the loader, the SDK and the ABI left the kernel's process. The loader's
-  288 tokens are budgeted on the host side now, at 288, and the two numbers are
-  recorded rather than one being inferred from the other.
+- **Kernel-process unsafe tokens: 27**, measured by `just tcb-report` — down from
+  648 when the loader, the SDK and the ABI left the kernel's process. The one it
+  gained is the `pre_exec` block that clears `FD_CLOEXEC` on the kernel channel
+  a restricted-linux child inherits, which is the call that has to run between
+  fork and exec. The loader's tokens are budgeted on the host side now, at 310 —
+  the restricted-linux confinement is written against the syscall surface, so its
+  unsafe count is the boundary itself — and the two numbers are recorded rather
+  than one being inferred from the other.
 - **No root reaches the loader at all, on any platform the packages ship on.**
   `just tcb-report` checks the property rather than the progress, for the kernel
   library and for the composition surfaces together: on each of the five targets the
@@ -69,7 +73,7 @@ section was written):
   supervisor compile only on Unix. Selecting a native plugin on Windows returns
   `PluginHostError::UnsupportedPlatform`. The Windows CI lane checks every
   workspace target and compiles every test without running native-plugin tests.
-- **Claims: 36 enforced, 3 asserted and not yet.** Every claim this document makes
+- **Claims: 38 enforced, 3 asserted and not yet.** Every claim this document makes
   is listed with what enforces it in `security/QUALIFICATION-MATRIX.md`, generated
   from `security/qualification-matrix.toml`, and `just qualification-matrix`
   resolves each name against the tree. A test that is renamed or deleted turns that
@@ -86,7 +90,7 @@ paragraph cannot be trusted to do. `just tcb-report` prints the figure this mile
 is judged on:
 
 ```
-kernel-process unsafe tokens: 26
+kernel-process unsafe tokens: 27
 ```
 
 `just tcb-report` checks that figure against the measurement rather than
@@ -661,22 +665,28 @@ kernel. See *The nested codec call inherits the invocation's deadline* below.
    `tokio::net::UnixStream` and `UnixListener` directly, with no `cfg` boundary,
    while `just test-rust` builds the workspace on Windows runners. A named-pipe
    backend behind one transport seam is what closes this; it is not written.
-3. **There is no sandbox.** Address-space and descriptor limits bound what one
-   host takes from the machine. They do not bound what a plugin may read, write
-   or connect to, and there is no seccomp, Landlock, `no_new_privs`-plus-
-   filesystem profile, or network policy. The threat model this code supports is
-   *trusted native plugin, unreliable implementation*; a plugin that is assumed
-   hostile needs the platform mechanisms this document has not adopted.
-   `security/MACOS-RESTRICTED-HOST.md` is where the first of those mechanisms is
-   being adopted: the policy, bundle, authenticated artifact transfer, container-
-   owned IPC and quarantine handoff are in place. The unconfined supervisor derives
-   the approved file's location from kernel-minted IDs, opens it without following
-   symlinks, checks the approved digest again and removes only
-   `com.apple.quarantine` by file descriptor. The restricted loader loads that
-   verified container copy in place and rechecks its digest after `dlopen`, avoiding
-   a second copy outside the sandbox. The signed-bundle macOS process test passes
-   transfer, load and registration; the sandbox probe separately verifies the
-   filesystem and network denials from the same entitlement set.
+3. **`trusted-process` has no sandbox — the restricted policies do.** Under the
+   default policy, address-space and descriptor limits bound what one host takes
+   from the machine. They do not bound what a plugin may read, write or connect
+   to; the threat model that level supports is *trusted native plugin,
+   unreliable implementation*. The restricted policies are the answer for a
+   plugin that is not trusted with the account's ambient authority:
+
+   - `security/MACOS-RESTRICTED-HOST.md` — `restricted-macos` confines the host
+     in an App Sandbox bundle: authenticated artifact transfer, container-owned
+     IPC and the quarantine handoff are in place, the signed-bundle process test
+     passes transfer, load and registration, and the sandbox probe separately
+     verifies the filesystem and network denials from the same entitlement set.
+   - `security/LINUX-RESTRICTED-HOST.md` — `restricted-linux` confines the host
+     with kernel mechanisms it applies to itself before a plugin byte exists:
+     user, mount, network, IPC, UTS and PID namespaces, a Landlock filesystem
+     allow-list, a seccomp deny-list, and a dropped capability bounding set. The
+     kernel callback channel arrives as a connected descriptor because `connect`
+     is dead inside; a kernel that cannot deliver the confinement makes the
+     policy refuse the launch rather than run unconfined.
+
+   Neither is a VM boundary — the residual risk on Linux is the syscall surface
+   the deny-list narrows — and neither changes what `trusted-process` means.
 
 The measurements that decide the milestone live in `just tcb-report`; the
 evidence for the claims above lives in the tests named next to the code, which

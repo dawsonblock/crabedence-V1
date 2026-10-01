@@ -13,9 +13,9 @@
 #
 #   PURE                      → routed locally, no socket hop
 #   MUTATION without a key    → refused before dispatch, exit 2
-#   MUTATION with grant + key → committed with evidence
+#   MUTATION with key, brokered authority → committed with evidence
 #   the same key again        → replayed, exactly one effect
-#   MUTATION without a grant  → UNAUTHORIZED, definitive and non-retryable
+#   MUTATION by a grantless principal → UNAUTHORIZED, definitive and non-retryable
 #   unregistered capability   → refused before any socket hop
 #
 # Usage: scripts/test-nemo-runtime-e2e.sh
@@ -41,7 +41,8 @@ socket="$work_dir/crabedence/execution.sock"
 snapshot="$work_dir/crabedence/capabilities.json"
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
-pass() { printf 'ok: %s\n' "$*"; }
+check_count=0
+pass() { check_count=$((check_count + 1)); printf 'ok: %s\n' "$*"; }
 
 # NEMO_E2E_CRABBOX / NEMO_E2E_RUNTIME / NEMO_E2E_PLUGIN_HOST point the suite at
 # already-built binaries — the installed-artifact qualification uses them so
@@ -70,7 +71,14 @@ CRABEDENCE_STORE_PATH="$store" go run ./cmd/issue-grant \
   --grant-id runtime-e2e-grant >/dev/null
 
 printf 'starting the service…\n'
+# The peer map authenticates this user to claim any principal, which is
+# what lets the invocations below carry no authority reference at all:
+# the service brokers the authenticated principal's grants itself. The
+# wildcard is declared twice, the way production requires it — once in
+# the peer map and once in the trusted-proxy set.
 CRABEDENCE_STORE_PATH="$store" CRABEDENCE_STORE_BACKEND=sqlite \
+  CRABEDENCE_PEER_PRINCIPALS="$(id -u):*" \
+  CRABEDENCE_TRUSTED_PROXY_UIDS="$(id -u)" \
   XDG_RUNTIME_DIR="$work_dir" "$crabbox_bin" serve-exec \
   >"$work_dir/serve.log" 2>&1 &
 service_pid=$!
@@ -98,6 +106,21 @@ printf '%s' "$out" | jq -e '.status=="SUCCEEDED" and .result.local==true' >/dev/
   || fail "system.echo did not route locally: $out"
 pass "PURE routed locally"
 
+# 1c. DIRECT crosses the socket: system.info is pinned READ + DIRECT, so the
+#     runtime dispatches it to the service, whose own dispatcher resolves the
+#     non-durable read route. The answer carries the service's read (system
+#     fields, no `local` marker) and no durable receipt — evidence it crossed
+#     the boundary rather than executing in-process.
+out="$(run_runtime --capability system.info --arguments '{}')" \
+  || fail "the DIRECT read must succeed: $out"
+printf '%s' "$out" | jq -e '
+    .status=="SUCCEEDED"
+    and .result.go_version
+    and (.result.local | not)
+    and (.receipt_digest == null)' >/dev/null \
+  || fail "system.info did not execute over the DIRECT socket path: $out"
+pass "READ pinned DIRECT dispatched over the socket (no durable receipt)"
+
 # 1b. When the bytes under test are an installed distribution, the runtime
 #     must have bound itself to the release root: every report carries the
 #     component-manifest digest it discovered beside its own binary.
@@ -120,33 +143,38 @@ set -e
   || fail "the refusal must name the missing key: $out"
 pass "MUTATION without a key refused before dispatch"
 
-# 3. With a grant and a key it commits, with evidence.
+# 3. With the peer principal holding a grant it commits, with evidence —
+#    the runtime carries no authority reference; the service resolved the
+#    grant for the authenticated principal itself.
 counter="runtime-e2e-$$"
 key="runtime-e2e-key-$$"
 out="$(run_runtime --capability test.counter.increment \
   --arguments "{\"counter\":\"$counter\",\"by\":1}" \
-  --idempotency-key "$key" --grant runtime-e2e-grant)" \
-  || fail "the granted mutation must commit: $out"
+  --idempotency-key "$key")" \
+  || fail "the brokered mutation must commit: $out"
 printf '%s' "$out" | jq -e '.status=="SUCCEEDED" and .result.value==1 and (.receipt_digest != null)' >/dev/null \
   || fail "the mutation did not commit with evidence: $out"
-pass "MUTATION committed with evidence (value 1)"
+pass "MUTATION committed with evidence (value 1, brokered authority)"
 
 # 4. The same logical action replays: a second effect would read 2.
 out="$(run_runtime --capability test.counter.increment \
   --arguments "{\"counter\":\"$counter\",\"by\":1}" \
-  --idempotency-key "$key" --grant runtime-e2e-grant)" \
+  --idempotency-key "$key")" \
   || fail "the replay must answer from the durable record: $out"
 printf '%s' "$out" | jq -e '.status=="SUCCEEDED" and .result.value==1' >/dev/null \
   || fail "a repeated key duplicated the effect: $out"
 pass "the repeated key replayed (still value 1)"
 
-# 5. Without a grant the mutation is denied — definitive, not retryable.
+# 5. A principal holding no grant is denied — definitive, not retryable.
+#    The peer map lets this caller claim any principal, and the brokered
+#    resolution for one holding no grants still answers unauthorized.
 out="$(run_runtime --capability test.counter.increment \
+  --principal mallory@example.com \
   --arguments "{\"counter\":\"$counter\",\"by\":1}" \
   --idempotency-key "${key}-ungranted")" || true
 printf '%s' "$out" | jq -e '.status=="FAILED" and .code=="UNAUTHORIZED" and .retryable==false' >/dev/null \
-  || fail "a mutation without a grant must be a definitive refusal: $out"
-pass "MUTATION without a grant refused (non-retryable)"
+  || fail "a mutation by a grantless principal must be a definitive refusal: $out"
+pass "MUTATION by a principal holding no grant refused (non-retryable)"
 
 # 6. An unregistered capability never reaches the socket.
 set +e
@@ -157,6 +185,17 @@ set -e
 [[ "$out" == *"not in the verified registry"* ]] \
   || fail "the refusal must say the capability is unregistered: $out"
 pass "unregistered capability refused before routing"
+
+# 6b. A registered capability whose adapter this deployment did not wire
+# resolves through the registry (it IS known — the snapshot carries it)
+# and fails at the deployment boundary as CAPABILITY_UNAVAILABLE, not
+# NOT_FOUND and not a route change. The e2e service has no GitHub
+# adapter, so the new DIRECT read exercises exactly that seam.
+out="$(run_runtime --capability github.issue.list \
+  --arguments '{"repo":"example-org/my-app"}')" || true
+printf '%s' "$out" | jq -e '.status=="FAILED" and .code=="CAPABILITY_UNAVAILABLE" and .reconciliation_required==false' >/dev/null \
+  || fail "a registered capability with an unwired adapter must fail unavailable: $out"
+pass "registered capability with unwired adapter fails CAPABILITY_UNAVAILABLE"
 
 # ─── The joined path: a real plugin host mediating managed invocations ──────
 #
@@ -255,7 +294,7 @@ out="$(run_runtime --plugin "$plugin_dir" --plugin-id fixture_intercept \
   --plugin-config '{"arg_marks":false}' \
   --capability test.counter.increment \
   --arguments "{\"counter\":\"$counter_joined\",\"by\":1}" \
-  --idempotency-key "$key_joined" --grant runtime-e2e-grant)" \
+  --idempotency-key "$key_joined")" \
   || fail "the joined MUTATION must commit: $out"
 printf '%s' "$out" | jq -e '
     .status=="SUCCEEDED" and .result.value==1
@@ -273,7 +312,7 @@ out="$(run_runtime --plugin "$plugin_dir" --plugin-id fixture_intercept \
   --plugin-config '{"arg_marks":false}' \
   --capability test.counter.increment \
   --arguments "{\"counter\":\"$counter_joined\",\"by\":1}" \
-  --idempotency-key "$key_joined" --grant runtime-e2e-grant)" \
+  --idempotency-key "$key_joined")" \
   || fail "the replay must answer from the durable record: $out"
 printf '%s' "$out" | jq -e '
     .status=="SUCCEEDED" and .result.value==1
@@ -285,7 +324,7 @@ pass "the repeated logical action replayed (still value 1)"
 #     never a second effect.
 out="$(run_runtime --capability test.counter.increment \
   --arguments "{\"counter\":\"$counter_joined\",\"by\":99}" \
-  --idempotency-key "$key_joined" --grant runtime-e2e-grant || true)"
+  --idempotency-key "$key_joined" || true)"
 printf '%s' "$out" | jq -e '.status=="FAILED" and (.code | test("IDEMPOTENCY"))' >/dev/null \
   || fail "same key with different arguments must be an identity conflict: $out"
 pass "same durable key + changed arguments → identity conflict"
@@ -448,7 +487,7 @@ out="$(run_runtime --plugin "$plugin_dir" --plugin-id fixture_intercept \
   --component fixture_intercept \
   --plugin-config '{"arg_marks":false,"fail_after_next":true}' --capability test.counter.increment \
   --arguments "{\"counter\":\"$counter_fail_after\",\"by\":1}" \
-  --idempotency-key "runtime-e2e-failafter-key-$$" --grant runtime-e2e-grant)" \
+  --idempotency-key "runtime-e2e-failafter-key-$$")" \
   || fail "a post-dispatch middleware error must not uncommit the effect: $out"
 printf '%s' "$out" | jq -e '
     .status=="SUCCEEDED" and .result.value==1
@@ -468,7 +507,7 @@ out="$(run_runtime --plugin "$plugin_dir" --plugin-id fixture_intercept \
   --component fixture_intercept \
   --plugin-config '{"arg_marks":false,"use_concurrent_next":true}' --capability test.counter.increment \
   --arguments "{\"counter\":\"$counter_concurrent\",\"by\":1}" \
-  --idempotency-key "runtime-e2e-concurrent-key-$$" --grant runtime-e2e-grant)" \
+  --idempotency-key "runtime-e2e-concurrent-key-$$")" \
   || fail "a refused second dispatch must not uncommit the first: $out"
 printf '%s' "$out" | jq -e '
     .status=="SUCCEEDED" and .result.value==1
@@ -511,4 +550,4 @@ set -e
   || fail "a malformed call budget must name the variable: $out"
 pass "malformed managed-call budget fails startup"
 
-printf 'runtime e2e: twenty-three checks passed\n'
+printf 'runtime e2e: %d checks passed\n' "$check_count"

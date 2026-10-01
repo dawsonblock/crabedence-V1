@@ -74,13 +74,20 @@ pub fn catalog_for(descriptors: serde_json::Value) -> VerifiedCapabilityCatalog 
     load_catalog_from_snapshot(&envelope).expect("verified catalog")
 }
 
-/// One canonical descriptor with the given class and route.
+/// One canonical descriptor with the given class and route. The assurance
+/// profile defaults to the strongest the route can legally carry — tests
+/// that need a violated descriptor override it afterward.
 pub fn descriptor(id: &str, class: &str, route: &str) -> serde_json::Value {
+    let assurance = match route {
+        "LOCAL" => "NONE",
+        "DIRECT" => "STANDARD",
+        _ => "DURABLE",
+    };
     json!({
         "id": id,
         "descriptor_version": 1,
         "execution_class": class,
-        "assurance_profile": "DURABLE",
+        "assurance_profile": assurance,
         "execution_route": route,
         "authority_policy": { "id": id, "grant_required": false },
         "adapter_id": "test",

@@ -44,6 +44,9 @@ runtime = [
     "nemo-relay-pii-redaction",
 ]
 
+# Vendored integration: compose the lower layers, and nothing composes them.
+bridges = ["nemo-crabedence-bridge", "nemo-effect-router", "nemo-crabedence-runtime"]
+
 # Operator and embedding surfaces.
 surfaces = [
     "nemo-relay-cli",

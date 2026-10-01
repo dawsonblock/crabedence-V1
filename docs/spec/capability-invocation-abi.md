@@ -41,7 +41,7 @@ Unix-socket transport binding (see below) uses this exact structure:
 
 | Field                     | Type   | Required when                          |
 |---------------------------|--------|----------------------------------------|
-| `authority.authority_ref` | string | Capability's authority policy requires authorization |
+| `authority.authority_ref` | string | Capability's authority policy requires authorization *and* the service is not brokering the authenticated principal's grants |
 | `idempotency_key`         | string | Effect class is MUTATION or CRITICAL   |
 
 ### Optional fields
@@ -108,14 +108,20 @@ The `authority` field groups identity and authorization material:
   claimed attribute unless the deployment enables peer authentication
   (`CRABEDENCE_PEER_PRINCIPALS`), in which case it is verified against
   the kernel-supplied Unix peer UID. Authorization derives from
-  resolving `authority_ref` against the principal; the two together
-  are checked by the authority store.
-- `authority_ref` (conditionally required): an unguessable bearer
-  reference to authority material. Crabedence resolves it internally.
-  Possession of the reference is the authorization proof — treat it
-  like a credential: never log it, never expose it to parties that
-  should not hold the authority, and provision it with entropy
-  comparable to a token (the built-in issuer uses 96-bit random IDs).
+  resolving `authority_ref` — or, when the request carries none, from
+  the service brokering the authenticated principal's live grants; in
+  both cases the authority store checks principal and grant together.
+- `authority_ref` (optional): an unguessable bearer reference to
+  authority material. Crabedence resolves it internally. When absent on
+  a grant-required capability, the request must arrive over an
+  authenticated peer channel and the service resolves which of the
+  principal's live grants admits it — exactly one must, or the request
+  is denied. When present, treat it like a credential: never log it,
+  never expose it to parties that should not hold the authority, never
+  place it on process arguments (argv is readable by every account on
+  the host — the `CRABEDENCE_AUTHORITY_REF` environment variable is the
+  caller-side channel), and provision it with entropy comparable to a
+  token (the built-in issuer uses 96-bit random IDs).
 - `grant_id` (deprecated alias): accepted for backward compatibility
   and mapped to `authority_ref` when `authority_ref` is absent.
 
@@ -204,27 +210,41 @@ authority_ref → workload identity (future)
 
 The ABI does not prescribe the authority mechanism.
 
-### Bearer semantics
+### Bearer and brokered semantics
 
-In the current model `authority_ref` is bearer authority: possession
+When `authority_ref` is present it is bearer authority: possession
 of the reference — plus a `principal` matching the resolved material —
-is the complete authorization proof. The planner supplies the
-`principal` string; the execution service does not independently
-authenticate it beyond the authority store's principal match. The
-trust boundary therefore rests on two controls:
+is the complete authorization proof. When it is absent on a
+grant-required capability, authority is *brokered*: the service
+enumerates the authenticated principal's live grants and admits iff
+exactly one covers the capability and its resource constraints (zero
+is denial; more than one is ambiguous denial). Brokered resolution
+exists only under peer authentication — an unverified `principal`
+claim is not an identity the service can broker against, and letting
+it enumerate grants would leak which principals hold authority for
+which capabilities.
+
+The trust boundary therefore rests on three controls:
 
 1. `authority_ref` values are unguessable and treated as secrets —
-   they must never appear in logs, receipts, or metrics.
+   they must never appear in logs, receipts, metrics, or process
+   arguments (argv is world-readable; `CRABEDENCE_AUTHORITY_REF` is
+   the caller-side environment channel for naming a specific grant).
 2. The transport boundary (a `0600` Unix socket today) restricts who
    can present references at all.
+3. Brokered resolution requires the authenticated peer principal —
+   the claim alone is insufficient.
 
 Deployments that need stronger principal authentication can enable
 peer authentication: `CRABEDENCE_PEER_PRINCIPALS` maps Unix peer UIDs
 to principals, the kernel supplies the UID over the socket, and a
 claim that disagrees with the mapping is denied — the authenticated
 principal replaces the claim before admission (see
-`docs/architecture/authority-model.md`). Production requires it:
-`CRABBOX_MODE=production` refuses to start without a nonempty map,
+`docs/architecture/authority-model.md`). A `uid:*` wildcard — a peer
+that may claim any principal — additionally requires the UID to be
+declared in `CRABEDENCE_TRUSTED_PROXY_UIDS`. Production requires the
+map: `CRABBOX_MODE=production` refuses to start without a nonempty
+one, and refuses a wildcard its trusted-proxy list does not cover,
 because an unverified claim is not an identity. Alternatively, an
 authenticated proxy or a future signed-session authority mechanism can
 front the socket.
@@ -364,7 +384,9 @@ When a request arrives, Crabedence:
 2. Resolves the effect class (PURE, READ, MUTATION, CRITICAL).
 3. Resolves the assurance profile (NONE, STANDARD, DURABLE, HIGH_ASSURANCE).
 4. Resolves the argument schema and validates arguments.
-5. Resolves the authority policy and verifies `authority_ref`.
+5. Resolves the authority policy and verifies `authority_ref` — or, for
+   a peer-authenticated request carrying none, resolves which of the
+   principal's live grants admits the request.
 6. Resolves the adapter/provider via server-controlled policy.
 7. Checks idempotency requirements.
 8. Admits or denies.

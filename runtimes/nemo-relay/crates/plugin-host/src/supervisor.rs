@@ -283,7 +283,7 @@ impl PluginHostSupervisor {
             // of it is the descriptor it inherits.
             let channel_fd = kernel_channel
                 .as_ref()
-                .map(|stream| std::os::unix::io::AsRawFd::as_raw_fd(stream));
+                .map(std::os::unix::io::AsRawFd::as_raw_fd);
             // Safety: the closure runs in the forked child before `exec`, and
             // calls `setrlimit` (and, on Linux, `prctl` and `fcntl`) and nothing
             // else: it allocates nothing, takes no locks, and returns only an
@@ -340,9 +340,7 @@ impl PluginHostSupervisor {
             })
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
-        if config.isolation
-            == crate::isolation_policy::NativeIsolationPolicy::RestrictedLinux
-        {
+        if config.isolation == crate::isolation_policy::NativeIsolationPolicy::RestrictedLinux {
             // The confined host's HOME is a directory inside its own session:
             // staging and scratch land in the one place the filesystem
             // allow-list leaves writable, and nothing the account owns is
@@ -366,9 +364,7 @@ impl PluginHostSupervisor {
         // once confined: a confined Linux host gets a descriptor it inherits —
         // its `connect` is dead — and everything else gets the path it dials.
         #[cfg(unix)]
-        if config.isolation
-            == crate::isolation_policy::NativeIsolationPolicy::RestrictedLinux
-        {
+        if config.isolation == crate::isolation_policy::NativeIsolationPolicy::RestrictedLinux {
             let Some(stream) = kernel_channel.as_ref() else {
                 return Err(unavailable(
                     "the confined host's kernel channel was not prepared",

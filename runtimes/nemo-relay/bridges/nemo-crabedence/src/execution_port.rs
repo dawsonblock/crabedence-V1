@@ -90,14 +90,39 @@ impl NemoCrabedenceExecutionPort {
             )
         })?;
 
-        if descriptor.execution_route != RegistryExecutionRoute::Crabedence {
-            return Err(refused_request(
-                "EXECUTION_ROUTE_MISMATCH",
-                format!(
-                    "capability {capability_id} is pinned to route {} — it must not be dispatched through the Crabedence execution kernel",
-                    descriptor.execution_route
-                ),
-            ));
+        match descriptor.execution_route {
+            RegistryExecutionRoute::Crabedence => {}
+            RegistryExecutionRoute::Direct => {
+                // The DIRECT route crosses this socket to the service's
+                // read path. Mirror the registration invariant here: a
+                // snapshot that pinned DIRECT to a consequential class or
+                // an assurance the read path cannot carry is refused before
+                // it reaches the wire.
+                if matches!(
+                    descriptor.execution_class,
+                    RegistryExecutionClass::Mutation | RegistryExecutionClass::Critical
+                ) || matches!(
+                    descriptor.assurance_profile.as_str(),
+                    "DURABLE" | "HIGH_ASSURANCE"
+                ) {
+                    return Err(refused_request(
+                        "EXECUTION_ROUTE_MISMATCH",
+                        format!(
+                            "capability {capability_id} is pinned DIRECT but classified {} with {} assurance — DIRECT carries only non-consequential reads at STANDARD or below",
+                            descriptor.execution_class, descriptor.assurance_profile
+                        ),
+                    ));
+                }
+            }
+            RegistryExecutionRoute::Local => {
+                return Err(refused_request(
+                    "EXECUTION_ROUTE_MISMATCH",
+                    format!(
+                        "capability {capability_id} is pinned to route {} — it must not be dispatched through the Crabedence execution kernel",
+                        descriptor.execution_route
+                    ),
+                ));
+            }
         }
 
         let registered_class = descriptor.execution_class;
@@ -470,6 +495,54 @@ mod tests {
         let request = request_for("system.echo", ExecutionClass::Pure);
         let error = port.build_abi_request(&request).unwrap_err();
         assert_eq!(error.code, "EXECUTION_ROUTE_MISMATCH");
+    }
+
+    #[test]
+    fn builds_a_request_for_a_direct_read() {
+        // DIRECT-pinned capabilities dispatch over this socket — the service
+        // resolves its own read route, the port only checks the pin is legal.
+        let catalog = catalog_for(json!([{
+            "id": "system.info",
+            "descriptor_version": 1,
+            "execution_class": "READ",
+            "assurance_profile": "STANDARD",
+            "execution_route": "DIRECT",
+            "authority_policy": { "id": "system.info", "grant_required": false },
+            "adapter_id": "system-info",
+        }]));
+        let port = port_with_catalog(catalog);
+        let request = request_for("system.info", ExecutionClass::Read);
+        let wire = port.build_abi_request(&request).expect("built");
+        assert_eq!(wire["capability"], "system.info");
+    }
+
+    #[test]
+    fn refuses_a_consequential_direct_pin() {
+        // Registration refuses DIRECT for MUTATION/CRITICAL and for the
+        // assurance profiles the read path cannot carry; the port mirrors it
+        // so a violated snapshot cannot reach the wire.
+        for (class, assurance, wire_class) in [
+            ("MUTATION", "STANDARD", ExecutionClass::Mutation),
+            ("CRITICAL", "STANDARD", ExecutionClass::Critical),
+            ("READ", "DURABLE", ExecutionClass::Read),
+        ] {
+            let catalog = catalog_for(json!([{
+                "id": "sneaky",
+                "descriptor_version": 1,
+                "execution_class": class,
+                "assurance_profile": assurance,
+                "execution_route": "DIRECT",
+                "authority_policy": { "id": "sneaky", "grant_required": false },
+                "adapter_id": "test",
+            }]));
+            let port = port_with_catalog(catalog);
+            let request = request_for("sneaky", wire_class);
+            let error = port.build_abi_request(&request).unwrap_err();
+            assert_eq!(
+                error.code, "EXECUTION_ROUTE_MISMATCH",
+                "{class}/{assurance}"
+            );
+        }
     }
 
     #[test]

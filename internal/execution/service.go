@@ -332,9 +332,10 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 	msgLen := binary.BigEndian.Uint32(lenBuf)
 	if msgLen > maxMessageBytes {
 		s.writeResponse(conn, Response{
-			Status:      StatusFailed,
-			FailureCode: string(capability.FailureInvalidRequest),
-			Error:       "message too large",
+			Status:            StatusFailed,
+			FailureCode:       string(capability.FailureInvalidRequest),
+			Error:             "message too large",
+			DefinitiveFailure: true,
 		}, "")
 		return
 	}
@@ -352,9 +353,10 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 	req, err := parseInvocationRequest(msgBuf)
 	if err != nil {
 		s.writeResponse(conn, Response{
-			Status:      StatusFailed,
-			FailureCode: string(capability.FailureInvalidRequest),
-			Error:       fmt.Sprintf("invalid request: %v", err),
+			Status:            StatusFailed,
+			FailureCode:       string(capability.FailureInvalidRequest),
+			Error:             fmt.Sprintf("invalid request: %v", err),
+			DefinitiveFailure: true,
 		}, "")
 		return
 	}
@@ -413,6 +415,10 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 			s.writeResponse(conn, Response{
 				Status:      StatusFailed,
 				FailureCode: string(capability.FailureCapabilityUnavailable),
+				// The gate runs before dispatch — no handler ran and no
+				// provider was contacted, so no effect is possible for
+				// any execution class. Definitive, not UNKNOWN.
+				DefinitiveFailure: true,
 				Error: fmt.Sprintf("capability %s requires adapter %q, which is not available in this deployment (reason=%s: %s)",
 					req.Capability, desc.AdapterID, status, reason),
 			}, "")
@@ -462,6 +468,24 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 	// Verify authority (grant resolution)
 	var resolvedGrant *capability.Grant
 	if decision.Descriptor.AuthorityPolicy.GrantRequired {
+		// A request that names no authority reference asks the service
+		// to broker the principal's authority. That is only as strong as
+		// the principal's authentication: under the bearer model anyone
+		// who can reach the socket could claim a principal holding
+		// grants, so the brokered path exists only when the peer map
+		// has authenticated who is asking. A caller-supplied reference
+		// remains valid — it must still resolve against the
+		// (authenticated or claimed) principal.
+		if req.Authority.EffectiveAuthorityRef() == "" && s.peerAuth == nil {
+			s.writeResponse(conn, Response{
+				Status:      StatusDenied,
+				FailureCode: string(capability.FailureUnauthorized),
+				Error: "no authority reference supplied and brokered authority requires peer " +
+					"authentication (CRABEDENCE_PEER_PRINCIPALS): without it the principal is an " +
+					"unverified claim the service cannot resolve grants against",
+			}, "")
+			return
+		}
 		grant, fc, reason := s.registry.VerifyAuthority(ctx, capability.AdmissionRequest{
 			Capability: req.Capability,
 			Arguments:  req.Arguments,
@@ -477,6 +501,13 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 			return
 		}
 		resolvedGrant = grant
+		// The resolved grant's identity is server-determined: when the
+		// caller carried no reference, the record binds the grant the
+		// store selected, so the durable execution names the authority
+		// that actually admitted it.
+		if req.Authority.EffectiveAuthorityRef() == "" {
+			req.Authority.AuthorityRef = resolvedGrant.ID
+		}
 	}
 
 	// Bind the verified authority material into the request before
@@ -516,13 +547,16 @@ func (s *Service) writeResponse(conn net.Conn, resp Response, executedClass capa
 
 	if len(payload) > maxMessageBytes {
 		status, failureCode := StatusFailed, capability.FailureInternalError
+		definitive := true
 		if executedClass == capability.ClassMutation || executedClass == capability.ClassCritical {
 			status, failureCode = StatusUnknown, capability.FailureExecutionUnknown
+			definitive = false
 		}
 		payload, err = json.Marshal(Response{
-			Status:      status,
-			FailureCode: string(failureCode),
-			Error:       fmt.Sprintf("response exceeds the %d-byte frame bound", maxMessageBytes),
+			Status:            status,
+			FailureCode:       string(failureCode),
+			Error:             fmt.Sprintf("response exceeds the %d-byte frame bound", maxMessageBytes),
+			DefinitiveFailure: definitive,
 		})
 		if err != nil {
 			log.Printf("execution service: marshal error: %v", err)

@@ -17,7 +17,7 @@ func clearServiceEnv(t *testing.T) {
 		"CRABBOX_GITHUB_TOKEN", "GITHUB_TOKEN", "CRABBOX_GITHUB_ENABLED", "CRABBOX_GITHUB_API_URL",
 		"CRABEDENCE_QUAL_PROVIDER_URL",
 		"CRABBOX_EVIDENCE_KEY", "CRABBOX_EVIDENCE_TRUSTED_SIGNERS",
-		"CRABEDENCE_PEER_PRINCIPALS",
+		"CRABEDENCE_PEER_PRINCIPALS", "CRABEDENCE_TRUSTED_PROXY_UIDS",
 		"CRABEDENCE_PROVIDER_EXECUTION_MAX",
 		"CRABEDENCE_PROVIDER_MAX_CONCURRENT", "CRABEDENCE_PROVIDER_DEGRADED_AFTER",
 		"CRABEDENCE_PROVIDER_OPEN_AFTER", "CRABEDENCE_PROVIDER_OPEN_COOLDOWN",
@@ -107,6 +107,12 @@ func TestLoadServiceConfigFailsClosed(t *testing.T) {
 		}, "cannot exceed CRABEDENCE_PROVIDER_OPEN_AFTER"},
 		{"malformed trusted signer", func(t *testing.T) { t.Setenv("CRABBOX_EVIDENCE_TRUSTED_SIGNERS", "not-a-fingerprint") }, "is not a SHA-256 fingerprint"},
 		{"malformed peer principals", func(t *testing.T) { t.Setenv("CRABEDENCE_PEER_PRINCIPALS", "not-a-uid:alice") }, "CRABEDENCE_PEER_PRINCIPALS"},
+		{"malformed trusted proxies", func(t *testing.T) { t.Setenv("CRABEDENCE_TRUSTED_PROXY_UIDS", "not-a-uid") }, "CRABEDENCE_TRUSTED_PROXY_UIDS"},
+		{"production wildcard without trusted proxy", func(t *testing.T) {
+			t.Setenv("CRABBOX_MODE", "production")
+			t.Setenv("CRABBOX_TOPOLOGY", "single")
+			t.Setenv("CRABEDENCE_PEER_PRINCIPALS", "0:*")
+		}, "CRABEDENCE_TRUSTED_PROXY_UIDS"},
 		{"github enabled without token", func(t *testing.T) { t.Setenv("CRABBOX_GITHUB_ENABLED", "true") }, "no CRABBOX_GITHUB_TOKEN or GITHUB_TOKEN"},
 	}
 	for _, tc := range cases {

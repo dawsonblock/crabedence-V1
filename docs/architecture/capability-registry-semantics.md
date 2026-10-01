@@ -16,7 +16,9 @@ system.echo
 system.info
 test.counter.increment
 github.issue.get
+github.issue.list
 github.issue.create
+github.issue.comment
 ```
 
 The registry digest is identical on two machines running the same
@@ -85,6 +87,10 @@ Availability lives beside the registry, never inside it:
   `assurance_profile`, authority policy, schemas, or digest.
 - An unavailable adapter fails closed at dispatch. It never becomes a
   routing change, a `LOCAL`/`DIRECT` fallback, or a class downgrade.
+- The failure is pre-dispatch and therefore definitive:
+  `FAILED` + `CAPABILITY_UNAVAILABLE` + `definitive_failure` on the wire,
+  never `UNKNOWN` and never `reconciliation_required` — nothing ran, so
+  no effect is possible for any execution class.
 - Enabling an integration does not change the security catalog.
 
 **INV-014**: provider availability cannot modify capability security

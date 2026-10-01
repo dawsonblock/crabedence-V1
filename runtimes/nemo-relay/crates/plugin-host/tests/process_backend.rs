@@ -312,7 +312,8 @@ async fn a_restricted_linux_host_loads_only_the_transferred_approved_copy() {
     if !unmet.is_empty() {
         eprintln!(
             "skipping restricted-linux session test: {}",
-            unmet.iter()
+            unmet
+                .iter()
                 .map(|requirement| requirement.message())
                 .collect::<Vec<_>>()
                 .join("; ")
@@ -1994,6 +1995,47 @@ async fn a_composition_refuses_a_cap_that_would_refuse_every_invocation() {
     {
         Err(error) => error,
         Ok(_) => panic!("a cap of zero would refuse every invocation"),
+    };
+    assert_eq!(error.failure.code, PluginFailureCode::Rejected, "{error:?}");
+}
+
+// `load_with_context` is what a mediating runtime calls when its operations
+// must carry its own identity rather than the session's generated one. A
+// context bound to the wrong runtime has to be refused by the host, not by
+// this side's memory of the rule: the check that matters is the one the
+// operation meets after it has crossed the boundary.
+#[tokio::test]
+async fn a_composition_refuses_a_context_bound_to_another_runtime() {
+    use nemo_relay_plugin_host::ProcessLoadedPlugins;
+
+    let fixture = support::PreparedFixture::write(
+        "fixture_intercept",
+        "nemo-ph-foreign-context",
+        support::intercept_fixture(),
+        "nemo_relay_native_intercept_fixture",
+    );
+    let error = match ProcessLoadedPlugins::load_with_context(
+        host_config(),
+        5_000,
+        nemo_relay_plugin_host::off_path::ObservabilityPolicy {
+            budget_millis: 5_000,
+            max_in_flight: 8,
+        },
+        [("fixture_intercept".to_string(), fixture.artifact())],
+        Vec::new(),
+        |_, operation| PluginExecutionContext {
+            operation_request_id: format!("{operation}-foreign"),
+            protocol_version: PROTOCOL_VERSION,
+            runtime_binding_digest: "a-runtime-this-host-was-never-bound-to".into(),
+            deadline_unix_ms: u64::MAX,
+            remaining_budget_millis: 30_000,
+            max_response_bytes: 1024,
+        },
+    )
+    .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("the host served a context bound to another runtime"),
     };
     assert_eq!(error.failure.code, PluginFailureCode::Rejected, "{error:?}");
 }

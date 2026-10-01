@@ -119,10 +119,7 @@ pub fn run() -> ExitCode {
                     return ExitCode::from(2);
                 };
                 let Some(allowed_root) = socket.parent().map(PathBuf::from) else {
-                    eprintln!(
-                        "{SOCKET} '{}' has no session directory",
-                        socket.display()
-                    );
+                    eprintln!("{SOCKET} '{}' has no session directory", socket.display());
                     return ExitCode::from(2);
                 };
                 if let Err(error) = crate::linux_sandbox::enter(&allowed_root, None) {

@@ -14,6 +14,9 @@ Environment=CRABBOX_MODE=production
 # probe run as root and each claim their own principal. Every other UID
 # is refused. Production requires this map — see STAGING.md.
 Environment=CRABEDENCE_PEER_PRINCIPALS=0:*
+# A wildcard entry may claim any principal — a separately declared
+# privilege, so production requires the UID to appear here too.
+Environment=CRABEDENCE_TRUSTED_PROXY_UIDS=0
 Environment=CRABEDENCE_STORE_BACKEND=postgres
 Environment=CRABBOX_REPLICAS=1
 EnvironmentFile=/etc/crabedence/staging.env

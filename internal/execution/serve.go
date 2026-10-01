@@ -63,9 +63,11 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	// enables it implicitly, and enabling without a token fails closed
 	// before this point.
 	var githubHandler *GitHubIssueHandler
+	var githubCommentHandler *GitHubCommentHandler
 	var githubReads *GitHubReads
 	if cfg.GitHubEnabled {
 		githubHandler = NewGitHubIssueHandler(cfg.GitHubAPIURL, cfg.GitHubToken)
+		githubCommentHandler = NewGitHubCommentHandler(cfg.GitHubAPIURL, cfg.GitHubToken)
 		// The observational read shares the provider identity and
 		// configuration with the mutation adapter.
 		githubReads = NewGitHubReads(cfg.GitHubAPIURL, cfg.GitHubToken)
@@ -248,7 +250,10 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 		"system-info":  infoHandler,
 	}
 	if githubHandler != nil {
-		handlers["github"] = githubHandler
+		// The github adapter fronts several durable capabilities — the
+		// mux keeps one adapter identity in evidence while dispatching on
+		// the capability.
+		handlers["github"] = &githubAdapter{issue: githubHandler, comment: githubCommentHandler}
 	}
 	if qualAdapter != nil {
 		handlers[QualificationAdapterID] = qualAdapter
@@ -367,6 +372,7 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 		worker.RegisterResolver("test.counter.increment", providerGate.ObserveResolver("test-counter", counterHandler))
 		if githubHandler != nil {
 			worker.RegisterResolver("github.issue.create", providerGate.ObserveResolver("github", githubHandler))
+			worker.RegisterResolver("github.issue.comment", providerGate.ObserveResolver("github", githubCommentHandler))
 		}
 		if qualAdapter != nil {
 			worker.RegisterResolver(QualificationCapabilityID, providerGate.ObserveResolver(QualificationAdapterID, qualAdapter))

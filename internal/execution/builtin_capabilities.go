@@ -26,7 +26,8 @@ func RegisterBuiltinCapabilities(registry *capability.Registry) error {
 		{"test.counter.increment", RegisterCounterCapability},
 		{"system.info", RegisterSystemInfoCapability},
 		{"github.issue.create", RegisterGitHubIssueCapability},
-		{"github.issue.get", RegisterGitHubReadCapabilities},
+		{"github.issue.comment", RegisterGitHubCommentCapability},
+		{"github.issue.get+list", RegisterGitHubReadCapabilities},
 	}
 	for _, registration := range registrations {
 		if err := registration.register(registry); err != nil {

@@ -345,6 +345,48 @@ running service prints the same digest in its startup report and exports
 it in `capabilities.json` next to its socket, completing the chain:
 qualified = released = runtime.
 
+## The NEMO distribution
+
+The `nemo-control_<version>_<target>` artifact family is verified the same
+way, against its own proof chain:
+
+```bash
+# 1. The checksum manifest's SSH signature (signed under the maintainer's
+#    release key in the nemo-control-release namespace)
+ssh-keygen -Y verify -f .github/release-allowed-signers \
+  -I dawsonblock@users.noreply.github.com -n nemo-control-release \
+  -s nemo-control_<version>_SHA256SUMS.sig \
+  < nemo-control_<version>_SHA256SUMS
+
+# 2. The tarball's digest against that authenticated manifest
+shasum -a 256 -c nemo-control_<version>_SHA256SUMS \
+  --ignore-missing 2>/dev/null || grep "<target>.tar.gz" \
+  nemo-control_<version>_SHA256SUMS | shasum -a 256 -c -
+
+# 3. Unpack and verify the release root — the component manifest against
+#    every shipped byte (exhaustive: an undeclared file fails), plus its own
+#    release signature over manifests/component-manifest.sha256. The
+#    extractor preflights members and writes only in-directory regular
+#    files, so the tarball cannot place content outside its destination.
+mkdir -p unpack
+go run ./cmd/nemo-archive-extract \
+  -archive nemo-control_<version>_<target>.tar.gz -dest unpack
+go run ./cmd/nemo-component-manifest \
+  -root unpack/nemo-control_<version>_<target> -verify \
+  -allowed-signers .github/release-allowed-signers \
+  -signer-identity dawsonblock@users.noreply.github.com
+
+# 4. The qualification attestation binds this archive's digest and records
+#    only passing gates
+jq -e '.subject.archive_sha256 ==
+  ("'"$(shasum -a 256 nemo-control_<version>_<target>.tar.gz | cut -d' ' -f1)"'")
+  and ([.gates[].result] | all(. == "pass"))' \
+  nemo-control_<version>_<target>.tar.gz.qualification.json
+```
+
+An unsigned `SHA256SUMS` or missing `.sig` means the artifact did not come
+through the release signing step — treat it as unqualified for release use.
+
 ## Summary
 
 If all eight steps pass, the artifact is cryptographically attributable to a

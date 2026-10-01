@@ -260,10 +260,8 @@ pub(crate) fn probe() -> ExitCode {
     // only answer that is honest is the call itself being gone.
     let inside_path = root.join(format!("probe-inside-{}.sock", std::process::id()));
     let inside = std::os::unix::net::UnixListener::bind(&inside_path).ok();
-    let outside_dir = std::env::temp_dir().join(format!(
-        "nemo-probe-outside-{}",
-        std::process::id()
-    ));
+    let outside_dir =
+        std::env::temp_dir().join(format!("nemo-probe-outside-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&outside_dir);
     let outside_path = outside_dir.join("probe-outside.sock");
     let outside = std::os::unix::net::UnixListener::bind(&outside_path).ok();
@@ -310,9 +308,7 @@ fn self_check(
     denied(
         &mut failures,
         "spawning a process",
-        std::process::Command::new("/bin/true")
-            .status()
-            .map(|_| ()),
+        std::process::Command::new("/bin/true").status().map(|_| ()),
     );
     // The confined process cannot connect anywhere: the kernel callback
     // channel arrives as a descriptor the supervisor connected beforehand, so
@@ -326,9 +322,8 @@ fn self_check(
             "connecting to a socket outside the session directory",
             std::os::unix::net::UnixStream::connect(&path).map(|_| ()),
         ),
-        None => failures.push(
-            "the probe could not verify socket confinement: no outside listener".to_string(),
-        ),
+        None => failures
+            .push("the probe could not verify socket confinement: no outside listener".to_string()),
     }
     match &inside_socket {
         Some(path) => denied(
@@ -417,7 +412,9 @@ fn write_proc(entry: &str, contents: &str) -> Result<(), String> {
         Ok(()) => Ok(()),
         // setgroups does not exist on kernels before its introduction; a map
         // without the denial is the unsafe case and still fails below.
-        Err(error) if entry == "setgroups" && error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) if entry == "setgroups" && error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(())
+        }
         Err(error) => Err(format!("could not write {path}: {error}")),
     }
 }
@@ -469,16 +466,66 @@ fn landlock_restrict(allowed_root: &Path, have_proc: bool) -> Result<(), String>
     }
     // Only the rights this kernel knows may be handled.
     let handled: u64 = match abi {
-        1 => EXECUTE | WRITE_FILE | READ_FILE | READ_DIR | REMOVE_DIR | REMOVE_FILE | MAKE_CHAR
-            | MAKE_BLOCK | MAKE_REG | MAKE_SOCK | MAKE_FIFO | MAKE_SYM,
-        2 => EXECUTE | WRITE_FILE | READ_FILE | READ_DIR | REMOVE_DIR | REMOVE_FILE | MAKE_CHAR
-            | MAKE_BLOCK | MAKE_REG | MAKE_SOCK | MAKE_FIFO | MAKE_SYM | REFER,
-        3 | 4 => EXECUTE | WRITE_FILE | READ_FILE | READ_DIR | REMOVE_DIR | REMOVE_FILE
-            | MAKE_CHAR | MAKE_BLOCK | MAKE_REG | MAKE_SOCK | MAKE_FIFO | MAKE_SYM | REFER
-            | TRUNCATE,
+        1 => {
+            EXECUTE
+                | WRITE_FILE
+                | READ_FILE
+                | READ_DIR
+                | REMOVE_DIR
+                | REMOVE_FILE
+                | MAKE_CHAR
+                | MAKE_BLOCK
+                | MAKE_REG
+                | MAKE_SOCK
+                | MAKE_FIFO
+                | MAKE_SYM
+        }
+        2 => {
+            EXECUTE
+                | WRITE_FILE
+                | READ_FILE
+                | READ_DIR
+                | REMOVE_DIR
+                | REMOVE_FILE
+                | MAKE_CHAR
+                | MAKE_BLOCK
+                | MAKE_REG
+                | MAKE_SOCK
+                | MAKE_FIFO
+                | MAKE_SYM
+                | REFER
+        }
+        3 | 4 => {
+            EXECUTE
+                | WRITE_FILE
+                | READ_FILE
+                | READ_DIR
+                | REMOVE_DIR
+                | REMOVE_FILE
+                | MAKE_CHAR
+                | MAKE_BLOCK
+                | MAKE_REG
+                | MAKE_SOCK
+                | MAKE_FIFO
+                | MAKE_SYM
+                | REFER
+                | TRUNCATE
+        }
         _ => {
-            EXECUTE | WRITE_FILE | READ_FILE | READ_DIR | REMOVE_DIR | REMOVE_FILE | MAKE_CHAR
-                | MAKE_BLOCK | MAKE_REG | MAKE_SOCK | MAKE_FIFO | MAKE_SYM | REFER | TRUNCATE
+            EXECUTE
+                | WRITE_FILE
+                | READ_FILE
+                | READ_DIR
+                | REMOVE_DIR
+                | REMOVE_FILE
+                | MAKE_CHAR
+                | MAKE_BLOCK
+                | MAKE_REG
+                | MAKE_SOCK
+                | MAKE_FIFO
+                | MAKE_SYM
+                | REFER
+                | TRUNCATE
                 | IOCTL_DEV
         }
     };
@@ -631,12 +678,7 @@ fn install_seccomp() -> Result<(), String> {
         jf: 0,
         k,
     };
-    let jump = |code: u16, k: u32, jt: u8, jf: u8| libc::sock_filter {
-        code,
-        jt,
-        jf,
-        k,
-    };
+    let jump = |code: u16, k: u32, jt: u8, jf: u8| libc::sock_filter { code, jt, jf, k };
 
     let mut filter = vec![
         // An architecture that is not this build's makes syscall numbers

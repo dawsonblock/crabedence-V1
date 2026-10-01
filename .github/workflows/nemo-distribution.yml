@@ -114,6 +114,30 @@ jobs:
           toolchain: 1.96.1
           target: ${{ matrix.rust_target }}
 
+      # Release-origin authentication: when the release signing key is
+      # provisioned (repository secret NEMO_RELEASE_SSH_SIGNING_KEY, matching
+      # .github/release-allowed-signers), the assembler SSH-signs the
+      # release-root sidecar and the qualification below verifies it under
+      # the maintainer's principal. Runs without the secret stay unsigned —
+      # and the verifier then skips the check rather than demanding a
+      # signature nobody could have produced.
+      - name: Provision the release signing key
+        env:
+          SIGNING_KEY_MATERIAL: ${{ secrets.NEMO_RELEASE_SSH_SIGNING_KEY }}
+        shell: bash
+        run: |
+          if [ -z "$SIGNING_KEY_MATERIAL" ]; then
+            echo "NEMO_RELEASE_SSH_SIGNING_KEY is not set — this artifact will be unsigned"
+            exit 0
+          fi
+          umask 077
+          printf '%s\n' "$SIGNING_KEY_MATERIAL" > "$RUNNER_TEMP/nemo-release-signing-key"
+          {
+            echo "NEMO_RELEASE_SIGNING_KEY=$RUNNER_TEMP/nemo-release-signing-key"
+            echo "NEMO_RELEASE_ALLOWED_SIGNERS=$GITHUB_WORKSPACE/.github/release-allowed-signers"
+            echo "NEMO_RELEASE_SIGNER=dawsonblock@users.noreply.github.com"
+          } >> "$GITHUB_ENV"
+
       # Release profile — this is the release pipeline. The assembler verifies
       # the root and writes the component manifest binding every shipped byte.
       - name: Assemble and verify the distribution root
@@ -127,7 +151,10 @@ jobs:
         run: |
           root="dist/nemo-control_${{ needs.prepare.outputs.version }}_${{ matrix.target }}"
           [ -d "$root" ] || { echo "assembler produced no root at $root" >&2; exit 1; }
-          tar -C "$root" -czf "$root.tar.gz" .
+          # COPYFILE_DISABLE keeps macOS tar from synthesizing ._ AppleDouble
+          # metadata members — the manifest must bind every file the archive
+          # carries, and metadata twins are not declared content.
+          COPYFILE_DISABLE=1 tar -C "$root" -czf "$root.tar.gz" .
 
       - name: Qualify the packed artifact
         shell: bash
@@ -135,11 +162,13 @@ jobs:
           scripts/test-nemo-installed-distribution.sh
           "dist/nemo-control_${{ needs.prepare.outputs.version }}_${{ matrix.target }}.tar.gz"
 
-      - name: Upload the qualified artifact
+      - name: Upload the qualified artifact and its attestation
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: nemo-control_${{ needs.prepare.outputs.version }}_${{ matrix.target }}
-          path: dist/nemo-control_${{ needs.prepare.outputs.version }}_${{ matrix.target }}.tar.gz
+          path: |
+            dist/nemo-control_${{ needs.prepare.outputs.version }}_${{ matrix.target }}.tar.gz
+            dist/nemo-control_${{ needs.prepare.outputs.version }}_${{ matrix.target }}.tar.gz.qualification.json
           if-no-files-found: error
 
   checksums:
@@ -148,6 +177,15 @@ jobs:
     timeout-minutes: 5
     needs: [prepare, build-qualify]
     steps:
+      # The allowed-signers file is release policy — fetch it at the pinned
+      # SHA, not from any artifact download.
+      - name: Check out the allowed-signers file
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+          sparse-checkout: .github/release-allowed-signers
+
       - name: Download the qualified artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -165,12 +203,53 @@ jobs:
             cat expected.txt >&2
             exit 1
           }
+          # Each tarball's qualification attestation must bind these
+          # bytes: the record's archive digest is recomputed here, not
+          # trusted from the upload.
+          for tarball in nemo-control_*.tar.gz; do
+            attestation="$tarball.qualification.json"
+            [ -f "$attestation" ] || { echo "missing attestation for $tarball" >&2; exit 1; }
+            claimed="$(jq -r .subject.archive_sha256 "$attestation")"
+            actual="$(sha256sum "$tarball" | awk '{print $1}')"
+            [ "$claimed" = "$actual" ] || {
+              echo "attestation for $tarball binds $claimed, the artifact digests to $actual" >&2
+              exit 1
+            }
+            [ "$(jq -r '[.gates[].result] | unique | join(",")' "$attestation")" = "pass" ] || {
+              echo "attestation for $tarball records a non-pass gate" >&2
+              exit 1
+            }
+          done
           sha256sum nemo-control_*.tar.gz | LC_ALL=C sort -k2 > "nemo-control_${{ needs.prepare.outputs.version }}_SHA256SUMS"
           cat "nemo-control_${{ needs.prepare.outputs.version }}_SHA256SUMS"
+
+      # Sign the checksum manifest with the same release key — a published
+      # SHA256SUMS is only release-origin evidence once a named signer is
+      # bound to it. Immediately verified: a signature that does not
+      # authenticate the file it claims is a pipeline failure, not an upload.
+      - name: Sign the checksum manifest
+        env:
+          SIGNING_KEY_MATERIAL: ${{ secrets.NEMO_RELEASE_SSH_SIGNING_KEY }}
+        shell: bash
+        run: |
+          cd artifacts
+          sums="nemo-control_${{ needs.prepare.outputs.version }}_SHA256SUMS"
+          if [ -z "$SIGNING_KEY_MATERIAL" ]; then
+            echo "NEMO_RELEASE_SSH_SIGNING_KEY is not set — SHA256SUMS will be unsigned"
+            exit 0
+          fi
+          umask 077
+          printf '%s\n' "$SIGNING_KEY_MATERIAL" > "$RUNNER_TEMP/nemo-release-signing-key"
+          ssh-keygen -Y sign -n nemo-control-release \
+            -f "$RUNNER_TEMP/nemo-release-signing-key" "$sums"
+          ssh-keygen -Y verify \
+            -f "$GITHUB_WORKSPACE/.github/release-allowed-signers" \
+            -I dawsonblock@users.noreply.github.com \
+            -n nemo-control-release -s "$sums.sig" < "$sums"
 
       - name: Upload the checksum manifest
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: nemo-control_SHA256SUMS
-          path: artifacts/nemo-control_*_SHA256SUMS
+          path: artifacts/nemo-control_*_SHA256SUMS*
           if-no-files-found: error

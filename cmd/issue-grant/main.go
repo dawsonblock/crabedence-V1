@@ -24,8 +24,11 @@
 //
 //	{"grant_id":"…","generation":N,"grant_digest":"sha256…",…}
 //
-// Pass grant_id to clients as the authority reference (e.g.
-// `crabbox invoke --authority-ref <grant_id>`).
+// Clients normally carry no reference at all: with peer authentication the
+// service brokers the authenticated principal's grants itself. When a
+// specific grant must be named, pass grant_id through the
+// CRABEDENCE_AUTHORITY_REF environment variable — never on argv, which is
+// readable by every account on the host.
 package main
 
 import (
