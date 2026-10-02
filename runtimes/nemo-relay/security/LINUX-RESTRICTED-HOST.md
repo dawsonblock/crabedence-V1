@@ -176,3 +176,6 @@ HOSTILE      a VM boundary                 (not implemented; a different mechani
 Both process tests run in the plugin-host suite; on a host where unprivileged
 user namespaces are unavailable the load test reports the unmet requirement and
 skips, while the refusal test still asserts that the policy fails closed there.
+A lane that sets `NEMO_RELAY_REQUIRE_RESTRICTED_LINUX` — the linux-amd64 CI
+lane is that designation — turns the unmet requirement into a failure instead,
+so the positive confinement claim cannot be qualified by a skip.

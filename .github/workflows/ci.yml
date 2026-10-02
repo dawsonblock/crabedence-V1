@@ -229,6 +229,23 @@ jobs:
       - name: Prove the plugin-host composition
         run: scripts/test-nemo-plugin-host.sh
 
+      # The restricted-linux positive qualification, on the lane designated
+      # for it: ubuntu-latest is the runner the project expects to create
+      # unprivileged user namespaces, and NEMO_RELAY_REQUIRE_RESTRICTED_LINUX
+      # turns "requirement unmet" from a skip into a failure. The confinement
+      # claim (`restricted-linux-load-completes-inside-namespaces`) is
+      # therefore non-skippable here — if the runner image loses the ability,
+      # this job fails and the lane moves; it does not quietly downgrade to
+      # the fail-closed probe alone (that refusal is separately qualified by
+      # `restricted-linux-fails-closed-when-the-kernel-cannot-confine`).
+      - name: Qualify restricted-linux plugin confinement
+        working-directory: runtimes/nemo-relay
+        env:
+          NEMO_RELAY_REQUIRE_RESTRICTED_LINUX: "1"
+        run: >-
+          cargo test -p nemo-relay-plugin-host --test process_backend
+          a_restricted_linux_host_loads_only_the_transferred_approved_copy
+
       # The joined chain against a live service — the integration RC's core
       # gate. Each script builds what it needs (the cargo and Go builds above
       # make that cheap), starts a real `crabbox serve-exec` on its own socket

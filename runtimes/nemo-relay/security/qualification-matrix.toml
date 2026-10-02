@@ -381,7 +381,7 @@ status = "enforced"
 enforced_by = [
   { rust_test = "a_restricted_linux_host_loads_only_the_transferred_approved_copy" },
 ]
-note = "The test spawns the real host binary under the restricted-linux policy: the child enters the namespace sandbox, applies Landlock and seccomp, builds its kernel channel on the descriptor the supervisor connected and inherited, then completes handshake, staged transfer, digest verification, load and a registration. On a kernel that cannot create unprivileged user namespaces the test reports the unmet requirement and skips rather than run unconfined; the confinement probe itself is exercised through the requirement check on every run."
+note = "The test spawns the real host binary under the restricted-linux policy: the child enters the namespace sandbox, applies Landlock and seccomp, builds its kernel channel on the descriptor the supervisor connected and inherited, then completes handshake, staged transfer, digest verification, load and a registration. On a kernel that cannot create unprivileged user namespaces a development run reports the unmet requirement and skips rather than run unconfined; on the designated linux-amd64 CI lane the suite runs with NEMO_RELAY_REQUIRE_RESTRICTED_LINUX=1, which converts an unmet requirement into a failure, so this claim is proven by execution there and cannot pass on a skip. The separate fail-closed claim below covers the kernel that cannot confine."
 
 [[claim]]
 id = "restricted-linux-fails-closed-when-the-kernel-cannot-confine"

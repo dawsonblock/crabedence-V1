@@ -96,8 +96,10 @@ gate fails on drift between it and the manifest:
 
 | Kind | Path |
 | --- | --- |
+| modified | `.github/workflows/ci_rust.yml` |
 | modified | `Cargo.lock` |
 | modified | `Cargo.toml` |
+| modified | `README.md` |
 | modified | `crates/cli/src/mcp_environment.rs` |
 | modified | `crates/core/src/kernel.rs` |
 | modified | `crates/core/tests/fixtures/native_intercept_plugin/Cargo.lock` |

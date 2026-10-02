@@ -164,6 +164,13 @@ jobs:
             --set ci true
             --set output_dir "${{ github.workspace }}"
           )
+          if [ "${{ matrix.platform }}" = "linux-amd64" ]; then
+            # This lane is the designated restricted-linux qualification
+            # runner: unprivileged user namespaces are expected to work here,
+            # so an unmet confinement requirement fails the suite rather than
+            # skipping the positive confinement claim.
+            export NEMO_RELAY_REQUIRE_RESTRICTED_LINUX=1
+          fi
           if [ "${{ matrix.run_redis_tests }}" = "true" ]; then
             export NEMO_RELAY_RUN_REDIS_TESTS=1
           fi

@@ -292,7 +292,10 @@ async fn a_restricted_bundle_loads_only_the_transferred_approved_copy() {
 /// lane: the approved artifact arrives over the authenticated session, and the
 /// load resolves only its staged copy. A kernel that refuses the namespaces
 /// (a sysctl or AppArmor choice) is a deployment that cannot run the policy,
-/// reported as a skip rather than a failure.
+/// reported as a skip rather than a failure — unless the lane sets
+/// `NEMO_RELAY_REQUIRE_RESTRICTED_LINUX`, which designates a runner known able
+/// to create unprivileged user namespaces and makes an unmet requirement a
+/// hard failure, so the positive qualification can never pass on a skip.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_restricted_linux_host_loads_only_the_transferred_approved_copy() {
@@ -310,14 +313,17 @@ async fn a_restricted_linux_host_loads_only_the_transferred_approved_copy() {
         .isolation
         .unmet_requirements(Some(&config.executable));
     if !unmet.is_empty() {
-        eprintln!(
-            "skipping restricted-linux session test: {}",
-            unmet
-                .iter()
-                .map(|requirement| requirement.message())
-                .collect::<Vec<_>>()
-                .join("; ")
+        let reasons = unmet
+            .iter()
+            .map(|requirement| requirement.message())
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert!(
+            std::env::var_os("NEMO_RELAY_REQUIRE_RESTRICTED_LINUX").is_none(),
+            "this lane is designated restricted-linux capable, so an unmet \
+             requirement is a gate failure, not a skip: {reasons}"
         );
+        eprintln!("skipping restricted-linux session test: {reasons}");
         return;
     }
     let fixture = support::PreparedFixture::write(

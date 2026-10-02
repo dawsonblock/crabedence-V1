@@ -39,6 +39,7 @@ jobs:
     outputs:
       sha: ${{ steps.resolve.outputs.sha }}
       version: ${{ steps.resolve.outputs.version }}
+      signing_required: ${{ steps.resolve.outputs.signing_required }}
     steps:
       - name: Check out
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -68,6 +69,15 @@ jobs:
           }
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          # Tag builds are the protected release path: a tag artifact without
+          # a maintainer signature has no release-origin evidence, so the key
+          # is mandatory there. Manual dispatch stays a development lane where
+          # unsigned artifacts are legitimate.
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "signing_required=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "signing_required=false" >> "$GITHUB_OUTPUT"
+          fi
 
   build-qualify:
     name: "nemo-control ${{ matrix.target }}"
@@ -114,19 +124,25 @@ jobs:
           toolchain: 1.96.1
           target: ${{ matrix.rust_target }}
 
-      # Release-origin authentication: when the release signing key is
-      # provisioned (repository secret NEMO_RELEASE_SSH_SIGNING_KEY, matching
-      # .github/release-allowed-signers), the assembler SSH-signs the
-      # release-root sidecar and the qualification below verifies it under
-      # the maintainer's principal. Runs without the secret stay unsigned —
-      # and the verifier then skips the check rather than demanding a
-      # signature nobody could have produced.
+      # Release-origin authentication: the release signing key (repository
+      # secret NEMO_RELEASE_SSH_SIGNING_KEY, matching
+      # .github/release-allowed-signers) lets the assembler SSH-sign the
+      # release-root sidecar, and the qualification below verifies it under
+      # the maintainer's principal. On the release path (tag builds) the key
+      # is mandatory — an unsigned release artifact carries no origin proof,
+      # so the lane fails rather than shipping one. Manual development runs
+      # may still produce unsigned artifacts, and the verifier then skips the
+      # check rather than demanding a signature nobody could have produced.
       - name: Provision the release signing key
         env:
           SIGNING_KEY_MATERIAL: ${{ secrets.NEMO_RELEASE_SSH_SIGNING_KEY }}
         shell: bash
         run: |
           if [ -z "$SIGNING_KEY_MATERIAL" ]; then
+            if [ "${{ needs.prepare.outputs.signing_required }}" = "true" ]; then
+              echo "NEMO_RELEASE_SSH_SIGNING_KEY is required on the release path — provision the repository secret" >&2
+              exit 1
+            fi
             echo "NEMO_RELEASE_SSH_SIGNING_KEY is not set — this artifact will be unsigned"
             exit 0
           fi
@@ -235,6 +251,10 @@ jobs:
           cd artifacts
           sums="nemo-control_${{ needs.prepare.outputs.version }}_SHA256SUMS"
           if [ -z "$SIGNING_KEY_MATERIAL" ]; then
+            if [ "${{ needs.prepare.outputs.signing_required }}" = "true" ]; then
+              echo "release tags must ship a signed SHA256SUMS — provision NEMO_RELEASE_SSH_SIGNING_KEY" >&2
+              exit 1
+            fi
             echo "NEMO_RELEASE_SSH_SIGNING_KEY is not set — SHA256SUMS will be unsigned"
             exit 0
           fi

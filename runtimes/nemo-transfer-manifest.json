@@ -1,7 +1,7 @@
 {
   "tree": "runtimes/nemo-relay",
   "runtime_version": "0.9.1-rc.4",
-  "shipped_tree_sha256": "756d9c3bb738c0466cfc952339a2548cb5adb3ea028c0eddd2f31b5ac471e7c5",
+  "shipped_tree_sha256": "fa101860cf55136e4c5a5028dea5069e279b463bd77ef5c6feb88c2a0de610c1",
   "file_count": 1461,
   "excluded": [
     ".git",
@@ -14,7 +14,7 @@
   "source": {
     "path": "../NEMO-feat-native-plugin-isolation",
     "file_count": 1438,
-    "sha256": "050a9cae3f9eeb4f4f0f34f89ccafd7617d93b4c7e051fe08f3a1d7d0c5e59fa"
+    "sha256": "5c9f32e82c317eba918936a4e90d9b35cd18e4ee6dcd935397fea3fdb49f9526"
   },
   "workspace_members_added": [
     "bridges/nemo-crabedence",
@@ -22,8 +22,10 @@
     "bridges/nemo-crabedence-runtime"
   ],
   "local_modifications": [
+    ".github/workflows/ci_rust.yml",
     "Cargo.lock",
     "Cargo.toml",
+    "README.md",
     "crates/cli/src/mcp_environment.rs",
     "crates/core/src/kernel.rs",
     "crates/core/tests/fixtures/native_intercept_plugin/Cargo.lock",
