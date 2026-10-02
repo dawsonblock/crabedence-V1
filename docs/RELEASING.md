@@ -88,7 +88,9 @@ cannot use organization rulesets, so the equivalent control is a required
 status check plus `CODEOWNERS` protection on the workflow file that produces
 it — a pull request cannot redefine the check that gates its own merge without
 owner review. A separate active no-bypass tag ruleset must
-cover every `refs/tags/v*` release tag and prevent deletion and updates.
+cover every `refs/tags/v*` release tag and prevent deletion and updates; the
+NEMO distribution family requires the equivalent coverage for `refs/tags/nemo-v*`
+(see "NEMO Distribution Family" below).
 
 GitHub omits ruleset bypass actors from the ordinary workflow token. Configure
 `CRABBOX_RULESET_READ_TOKEN` as a fine-grained repository secret scoped only to
@@ -641,6 +643,83 @@ state. It proves the actual published tag is remotely resolvable, unlike the
 preproduction hermetic fixture. Do not substitute a checkout, `replace`,
 pseudo-version, local proxy, or `,direct` fallback. Record channel smoke failures
 and retry the affected check, not production or publication.
+
+## NEMO Distribution Family
+
+The `nemo-control_*` artifacts are a separate bound release family, not part of
+the `crabbox_*` inventory above. `scripts/release-provenance.mjs` and
+`scripts/publish-release.sh` stay exactly scoped to the eight-file kernel
+release; the family has its own signed tag, its own authorization record, and
+its own proof-gated publisher. Never add `nemo-control_*` names to the kernel
+asset list or the candidate manifest.
+
+The family tag is `nemo-vX.Y.Z`: an annotated signed tag spelling the same
+version as the kernel release it accompanies, created at the same source
+commit after the kernel tag machinery completes:
+
+```sh
+git tag -s "nemo-$TAG" -m "nemo-$TAG" "$TAG_COMMIT"
+git push origin "refs/tags/nemo-$TAG"
+```
+
+The tag annotation must equal the bare `nemo-vX.Y.Z` spelling —
+`scripts/verify-release-source.sh` requires the tag subject to equal the tag —
+and the family tag needs the same signer-registration precondition as `v*`:
+a maintainer SSH key listed in `.github/release-allowed-signers` and registered
+on the account as a signing key. Confirm
+`gh api repos/dawsonblock/crabedence-V1/git/tags/<tag-object> --jq .verification`
+reports `verified` immediately after the push, before building anything.
+
+A separate active no-bypass tag ruleset must cover `refs/tags/nemo-v*` and
+prevent deletion and updates, exactly as `refs/tags/v*` is covered for the
+kernel family. The publisher's policy check fails closed until that coverage
+exists.
+
+`.github/workflows/nemo-distribution.yml` runs on both `v*` and `nemo-v*` tag
+pushes and strips the `nemo-` prefix when naming artifacts, so a family tag
+rebuilds the identical `nemo-control_X.Y.Z_*` inventory. Signing is mandatory
+on every tag push (`signing_required`); only manual `workflow_dispatch` runs
+may produce unsigned output. The family's proof chain is:
+
+- four per-target tarballs, each built and qualified on its native runner;
+- one bound qualification attestation per tarball
+  (`<tarball>.qualification.json`), pinning the archive SHA-256, the source
+  commit, the version, the component/transfer manifest digests, and all-pass
+  gate results;
+- `nemo-control_X.Y.Z_SHA256SUMS` covering exactly the four tarballs;
+- `nemo-control_X.Y.Z_SHA256SUMS.sig`, an SSH signature over the manifest in
+  the `nemo-control-release` namespace by the release signer.
+
+After the distribution run succeeds on the family tag, merge its authorization
+record to `main` — `release/records/nemo-vX.Y.Z.json`, same schema as the
+kernel records with `tag` set to the family spelling — binding the family tag
+object and source commit. Then run the publisher from a clean checkout whose
+`HEAD` is the protected workflow commit that merged the record:
+
+```sh
+scripts/publish-nemo-release.sh \
+  "nemo-$TAG" "$NEMO_TAG_OBJECT" "$TAG_COMMIT" \
+  "$VERIFIER_COMMIT" "$WORKFLOW_COMMIT" \
+  "$NEMO_DIST_RUN_ID" "nemo-$TAG"
+```
+
+The publisher re-verifies the remote signed tag object and peeled commit,
+the ruleset inventory (including `nemo-v*` coverage), the authorization record,
+and protected-tooling cleanliness; binds the supplied run to a successful
+`nemo-distribution.yml` push at the pinned source commit; downloads every run
+artifact by exact GitHub digest; authenticates `SHA256SUMS` under
+`.github/release-allowed-signers` before trusting it; requires each tarball to
+match its signed manifest line and each attestation to bind the same archive
+digest, version, and source commit with every gate passing. It then creates the
+draft on the family tag with a deterministic bound-stub body, uploads exactly
+the ten family assets (four tarballs, four attestations, manifest, signature),
+re-reads the remote inventory by name/size/digest, and publishes with the same
+single-PATCH discipline as the kernel publisher. A release already bound to
+the family tag, a missing or extra asset, an unsigned or mis-signed manifest,
+a mismatched archive digest, a non-pass gate, or a foreign source commit all
+fail closed before mutation.
+
+There is no Homebrew tap for the family; publication is the terminal step.
 
 ## Cancellation And Recovery
 

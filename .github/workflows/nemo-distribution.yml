@@ -16,7 +16,11 @@ name: NEMO Distribution
 on:
   push:
     tags:
+      # v* builds the family alongside the kernel release tag; nemo-v* is the
+      # family's own signed tag — the one scripts/publish-nemo-release.sh
+      # binds when publishing the separate bound artifact family.
       - 'v*'
+      - 'nemo-v*'
   workflow_dispatch:
     inputs:
       ref:
@@ -56,7 +60,10 @@ jobs:
         shell: bash
         run: |
           if [ "${{ github.ref_type }}" = "tag" ]; then
-            version="${GITHUB_REF_NAME#v}"
+            # Strip the family prefix before the bare 'v': nemo-vX.Y.Z builds
+            # the same versioned artifacts as vX.Y.Z.
+            version="${GITHUB_REF_NAME#nemo-v}"
+            version="${version#v}"
           else
             version="$(cat VERSION)"
           fi

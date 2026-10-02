@@ -297,7 +297,7 @@ The consolidation's own completion criteria, against the current state:
 | 12 | A CI assertion proves no consequential bypass path exists | Met: `tests/effect_isolation.rs` and `tests/routing.rs` run in the `NEMO integration` job |
 | 13 | Release artifacts identify exact NEMO and Crabedence source revisions | Met: the release evidence generator runs `cmd/nemo-runtime-digest` and writes `nemo-runtime.json` and `nemo-runtime.sha256` into the bundle, which `SHA256SUMS`, the manifest digest, and the attestation already cover. The Crabedence revision is bound by the source commit and the registry digest; the NEMO revision is now bound too. The frozen gate registry is untouched — the digest is evidence, not a new gate |
 | 14 | Security qualification passes for the shipping binaries | Not a NEMO-transfer deliverable, and stated as such rather than left ambiguous. The repository's shipping binaries are Go, and their security qualification is the existing typed release-gate set (`scripts/lib/qualification-gates.sh`, `release-qualification.yml`), which is frozen and managed by the repository's own release process — not something the transfer should extend by inventing gates. What the transfer contributes is the NEMO-side security assertions, which run in CI (`tests/effect_isolation.rs`, `tests/routing.rs`, the credential and dependency-graph checks) and are now bound into release evidence by blocker 13. Wiring those checks into the typed gate set is a release-engineering change, gated by that process |
-| 15 | The binary distribution carries both runtimes, bound by one component manifest | Met on the production side: `scripts/build-nemo-distribution.sh` assembles `bin/` (crabbox, the runtime, the plugin host), `share/` (the capability schema and the registry envelope), and `manifests/` (the transfer manifest plus a component manifest binding every component by SHA-256), CI assembles and verifies it on every change, and `nemo-distribution.yml` now builds and *qualifies* each target on tag push — the shipped bytes run the full installed-artifact suite on a runner native to that target. What remains is release engineering: the credential-free candidate manifest still carries the CLI archives alone, so publication of these artifacts rides the separate proof-gated step, not this workflow. The component manifest is the release-root identity (component hashes plus runtime, registry, and build metadata, one digest, bound by its `.sha256` sidecar — the value a release signature would cover) |
+| 15 | The binary distribution carries both runtimes, bound by one component manifest | Met on the production side: `scripts/build-nemo-distribution.sh` assembles `bin/` (crabbox, the runtime, the plugin host), `share/` (the capability schema and the registry envelope), and `manifests/` (the transfer manifest plus a component manifest binding every component by SHA-256), CI assembles and verifies it on every change, and `nemo-distribution.yml` now builds and *qualifies* each target on tag push — the shipped bytes run the full installed-artifact suite on a runner native to that target. Publication is the separate bound-family operation described at the end of this document: the `nemo-vX.Y.Z` tag, its `release/records/` authorization, and `scripts/publish-nemo-release.sh` — the credential-free candidate manifest keeps carrying the CLI archives alone, by design. The component manifest is the release-root identity (component hashes plus runtime, registry, and build metadata, one digest, bound by its `.sha256` sidecar — the value a release signature would cover) |
 
 ## Target layout
 
@@ -931,19 +931,28 @@ The subtree is synced — `crabedence-V1` carries this work at
 `f161bc5` (PR
 [#30](https://github.com/dawsonblock/crabedence-V1/pull/30), all checks
 green, post-merge `main` green). Tag-time production is wired:
-`.github/workflows/nemo-distribution.yml` runs on `v*` tags and manual
-dispatch, one leg per target on a runner that natively executes it
+`.github/workflows/nemo-distribution.yml` runs on `v*` and `nemo-v*` tags
+and manual dispatch (signing mandatory on every tag; only manual runs may
+produce unsigned output), one leg per target on a runner that natively
+executes it
 (both darwin arches on the two macOS runner labels, linux_amd64 on
 `ubuntu-latest`, linux_arm64 on the ARM runner), assembles and verifies
 the bound root, packs it flat, then runs
 `scripts/test-nemo-installed-distribution.sh` against the packed tarball —
 the same qualification proven locally. A fan-in job writes the
 `nemo-control_<version>_SHA256SUMS` manifest over exactly the four
-qualified tarballs. Still open: publication of those artifacts is the
-separate proof-gated release operation, and the credential-free
-candidate contract (`scripts/release-provenance.mjs`) pins the crabbox
-archive inventory — folding NEMO artifacts into *that* manifest is a
-release-contract decision, not a code change.
+qualified tarballs and signs it in the `nemo-control-release` namespace.
+Publication is the separate proof-gated operation and is now wired rather
+than open: the artifacts form their own bound family under the dedicated
+signed tag `nemo-vX.Y.Z`, authorized by `release/records/nemo-vX.Y.Z.json`
+and published by `scripts/publish-nemo-release.sh`, which re-verifies the
+signed tag, ruleset coverage for `refs/tags/nemo-v*`, the distribution run,
+the signed checksum manifest, and every attestation-to-archive binding
+before creating and publishing the family release — see "NEMO Distribution
+Family" in `docs/RELEASING.md`. The kernel-side credential-free candidate
+contract (`scripts/release-provenance.mjs`) still pins only the crabbox
+archive inventory; that separation is deliberate — the two families publish
+through their own proof chains and never share an asset list.
 
 ### What the reconnaissance established
 
