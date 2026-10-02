@@ -375,7 +375,7 @@ func RegisterGitHubCommentCapability(reg *capability.Registry) error {
 			"properties": {
 				"repo":   {"type": "string", "description": "owner/name"},
 				"number": {"type": "integer", "minimum": 1, "description": "Issue number"},
-				"body":   {"type": "string", "minLength": 1, "maxLength": 65536}
+				"body":   {"type": "string", "minLength": 1, "maxLength": 65473}
 			},
 			"additionalProperties": false
 		}`),

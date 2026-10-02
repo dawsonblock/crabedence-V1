@@ -692,7 +692,7 @@ func RegisterGitHubPullCreateCapability(reg *capability.Registry) error {
 				"title": {"type": "string", "minLength": 1, "maxLength": 256},
 				"head":  {"type": "string", "minLength": 1, "maxLength": 256, "description": "source branch (\"branch\" or \"owner:branch\")"},
 				"base":  {"type": "string", "minLength": 1, "maxLength": 256, "description": "target branch"},
-				"body":  {"type": "string", "maxLength": 65536},
+				"body":  {"type": "string", "maxLength": 65473},
 				"draft": {"type": "boolean"}
 			},
 			"additionalProperties": false

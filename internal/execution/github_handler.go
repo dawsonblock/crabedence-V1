@@ -447,7 +447,7 @@ func RegisterGitHubIssueCapability(reg *capability.Registry) error {
 			"properties": {
 				"repo":  {"type": "string", "description": "owner/name"},
 				"title": {"type": "string", "minLength": 1, "maxLength": 256},
-				"body":  {"type": "string", "maxLength": 65536}
+				"body":  {"type": "string", "maxLength": 65473}
 			},
 			"additionalProperties": false
 		}`),
