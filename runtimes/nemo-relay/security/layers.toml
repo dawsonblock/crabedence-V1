@@ -15,8 +15,15 @@ version = 1
 
 [layers]
 # Stable vocabulary: identity, fingerprints, execution classes, receipts, and
-# the message contract for plugin execution across a process boundary.
-contracts = ["nemo-relay-types", "nemo-relay-plugin-protocol", "nemo-relay-native-abi"]
+# the message contracts for plugin execution across a process boundary. The
+# worker protocol is a generated contract, not an implementation: the kernel
+# and the worker both speak it, the way both speak the plugin protocol.
+contracts = [
+    "nemo-relay-types",
+    "nemo-relay-plugin-protocol",
+    "nemo-relay-native-abi",
+    "nemo-relay-worker-proto",
+]
 
 # The trusted core. It should know contracts and interfaces, and nothing about
 # PostgreSQL, HTTP, providers, the CLI, or a language binding.
@@ -32,7 +39,6 @@ adapters = [
     "nemo-relay-plugin-host",
     "nemo-relay-plugin-proto",
     "nemo-relay-worker",
-    "nemo-relay-worker-proto",
 ]
 
 # Composition and runtime concerns.
@@ -58,16 +64,7 @@ surfaces = [
 # Verification tooling.
 qualification = ["nemo-effect-qualification"]
 
-# Edges that point upward today and must be deleted by a later milestone.
-#
-# Every one of them starts at the kernel, which is the finding that matters
-# most: it means K-008 through K-014 are enforced in code the kernel does not
-# own. The gate fails when a *new* upward edge appears, so this list can only
-# shrink. Delete an entry when the corresponding edge is removed.
-[grandfathered]
-"nemo-relay" = [
-    "nemo-relay-authority",
-    "nemo-relay-executor",
-    "nemo-relay-ledger",
-    "nemo-relay-worker-proto",
-]
+# No upward edges remain. The durable-effect kernel moved to the crate that owns
+# its composition (nemo-effect-runtime), and the worker protocol contract sits
+# with the other generated message contracts. The gate now fails on any upward
+# edge, because there is no grandfathered edge left for a regression to reuse.

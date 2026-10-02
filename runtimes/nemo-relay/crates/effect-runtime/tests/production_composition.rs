@@ -7,7 +7,7 @@
 //! with anything other than the durable effect store, and a running kernel
 //! cannot have its capability registrations mutated afterwards.
 
-use nemo_relay::kernel::{CapabilityDefinition, CapabilityRegistry, Kernel, KernelError};
+use nemo_effect_runtime::kernel::{CapabilityDefinition, CapabilityRegistry, Kernel, KernelError};
 use nemo_relay_authority::unstable::{
     AuthorityDecision, AuthorityProvider, AuthorityRequest, GrantVerifier, VerifiedGrant,
 };
@@ -137,7 +137,7 @@ fn runtime(environment: &str) -> RuntimeIdentity {
 const NON_PRODUCTION_CONSTRUCTORS: &[&str] = &["new_unchecked_for_tests"];
 
 /// The file that defines the raw constructor, and therefore may mention it.
-const CONSTRUCTOR_DEFINITION: &str = "crates/core/src/kernel.rs";
+const CONSTRUCTOR_DEFINITION: &str = "crates/effect-runtime/src/kernel.rs";
 
 fn production_sources() -> Vec<(String, String)> {
     let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -427,7 +427,7 @@ fn a_verified_transport_composes_a_production_kernel() {
         registry(&[ExecutionClass::Mutation])
             .seal()
             .expect("seal registry"),
-        nemo_relay::kernel::BackendRouter::new(TestAuthority, TestBackend, TestBackend),
+        nemo_effect_runtime::kernel::BackendRouter::new(TestAuthority, TestBackend, TestBackend),
         store,
     )
     .expect("a verified transport with a ready durable store must compose");
@@ -453,7 +453,7 @@ fn production_composition_rejects_a_test_transport_store() {
         registry(&[ExecutionClass::Mutation])
             .seal()
             .expect("seal registry"),
-        nemo_relay::kernel::BackendRouter::new(TestAuthority, TestBackend, TestBackend),
+        nemo_effect_runtime::kernel::BackendRouter::new(TestAuthority, TestBackend, TestBackend),
         fixture.runtime_store(),
     );
     assert!(
@@ -479,7 +479,7 @@ fn production_composition_is_fail_closed() {
     let result = Kernel::new_production(
         runtime("qualification"),
         registry(&[ExecutionClass::Mutation]).seal().expect("seal"),
-        nemo_relay::kernel::BackendRouter::new(TestAuthority, TestBackend, TestBackend),
+        nemo_effect_runtime::kernel::BackendRouter::new(TestAuthority, TestBackend, TestBackend),
         fixture.runtime_store(),
     );
     assert!(matches!(
@@ -495,7 +495,7 @@ fn production_composition_is_fail_closed() {
         registry(&[ExecutionClass::Pure, ExecutionClass::Read])
             .seal()
             .expect("seal"),
-        nemo_relay::kernel::BackendRouter::new(TestAuthority, TestBackend, TestBackend),
+        nemo_effect_runtime::kernel::BackendRouter::new(TestAuthority, TestBackend, TestBackend),
         fixture.runtime_store(),
     );
     assert!(matches!(
@@ -511,7 +511,7 @@ fn production_composition_is_fail_closed() {
     let result = Kernel::new_production(
         runtime("production"),
         registry(&[ExecutionClass::Mutation]).seal().expect("seal"),
-        nemo_relay::kernel::BackendRouter::new(TestAuthority, TestBackend, TestBackend),
+        nemo_effect_runtime::kernel::BackendRouter::new(TestAuthority, TestBackend, TestBackend),
         fixture.owner_store(),
     );
     assert!(

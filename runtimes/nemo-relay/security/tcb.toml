@@ -73,7 +73,10 @@ targets = [
     "x86_64-unknown-linux-musl",
     "aarch64-unknown-linux-musl",
 ]
-roots = ["nemo-relay"]
+# `nemo-effect-runtime` joined the roots when the durable-effect kernel moved
+# into it: the property protects the crate that enforces the invariants, not the
+# crate name, so both the vocabulary crate and the composition crate are asked.
+roots = ["nemo-relay", "nemo-effect-runtime"]
 forbidden = ["libloading", "nemo-relay-native-loader", "nemo-relay-native-abi", "nemo-relay-plugin"]
 
 # The composition surfaces, every one that makes the isolation claim.
@@ -141,13 +144,18 @@ crates = [
     "nemo-relay-authority",
     "nemo-relay-executor",
     "nemo-relay-ledger",
+    # The durable-effect kernel itself: it composes the four crates above and is
+    # where the K-invariant orchestration lives. It sits in this tier rather
+    # than in the kernel crate because composition is above adapters in
+    # security/layers.toml — the same fact the layer gate now enforces with no
+    # exceptions left.
+    "nemo-effect-runtime",
 ]
 
 # Crates that share the kernel's process but do not enforce an invariant.
 # Worker binaries run in their own processes and are deliberately excluded.
 [in_process]
 crates = [
-    "nemo-effect-runtime",
     "nemo-relay-adaptive",
     "nemo-relay-dlp",
     "nemo-relay-isolation",
@@ -191,8 +199,9 @@ crates = [
 # The kernel depends on interfaces, not implementations, so a database driver
 # or a foreign-function binding appearing here means an implementation leaked
 # across the boundary. Measured with `cargo tree --all-features`, these hold
-# today: core reaches `nemo-relay-ledger` for its effect-store contract, but the
-# ledger crate keeps the PostgreSQL driver behind a feature core never enables.
+# today: core reaches no adapter crate at all — the composition that names the
+# ledger and the executor is `nemo-effect-runtime`, one layer up, and the
+# PostgreSQL driver stays behind features only that crate enables.
 #
 # Transport and HTTP packages (`reqwest`, `tonic`, `axum`, `hyper`,
 # `object_store`, `libloading`) are still reachable and are held flat by the
@@ -220,6 +229,11 @@ nemo-relay-types = [
 nemo-relay-authority = ["sqlx", "tokio-postgres", "postgres", "napi", "pyo3"]
 nemo-relay-executor = ["sqlx", "tokio-postgres", "postgres", "napi", "pyo3"]
 nemo-relay-ledger = ["sqlx", "napi", "pyo3"]
+# The composition crate reaches the PostgreSQL driver set by design — it is the
+# boundary that binds `PostgresEffectStore` — so the drivers are absent from its
+# forbidden list. A second database stack or a language-binding framework in its
+# resolved tree is the leak this list still names.
+nemo-effect-runtime = ["sqlx", "deadpool-postgres", "diesel", "napi", "pyo3"]
 
 # Budgets.
 #
@@ -241,14 +255,23 @@ nemo-relay-ledger = ["sqlx", "napi", "pyo3"]
 # Raised to the platform union, not by a dependency: see the measurement note at the
 # top of this file. The one identity this adds is `windows-sys`, a direct dependency the
 # Windows build names and the machine that recorded the entry did not.
-max_direct_dependencies = 39
+#
+# Lowered by three for the durable-effect kernel's move to `nemo-effect-runtime`:
+# the authority, ledger and executor contracts left with it, and what remains is
+# vocabulary and the worker-protocol contract. The ratchet closes downward the
+# same way it opens upward — a dependency that returns has to be reviewed.
+max_direct_dependencies = 36
 # The kernel's dependency set is smaller than it has ever been in this milestone:
 # two direct dependencies (`libloading` and the plugin SDK) and the loader's whole
 # transitive set left with the loader, and the closure no longer reaches the ABI.
 # The digest moved with them, which is the same fact written as an identity.
 #
 # Raised to the platform union; see the measurement note at the top of this file.
-max_transitive_packages = 324
+#
+# Lowered by three for the same move: the three adapter crates took their
+# transitive sets with them when the kernel's composition went to
+# `nemo-effect-runtime`.
+max_transitive_packages = 321
 # Raised for the exact-registration entry points the process boundary calls —
 # `invoke_tool_execution_intercept_registration`,
 # `invoke_llm_execution_intercept_registration`, and the name-retaining registry
@@ -333,7 +356,14 @@ max_transitive_packages = 324
 # path sets — `mediation: None`, with the comment that says the kernel's own
 # middleware is the kernel — because a receipt has to distinguish "no mediation
 # happened" from "none was recorded". No dependency moved and no `unsafe` did.
-max_source_lines = 68007
+#
+# Lowered by more than five thousand lines for the durable-effect kernel's move
+# to `nemo-effect-runtime`: `kernel.rs` and its translation of a plugin failure
+# into the effect vocabulary live with the composition crate now, which is the
+# same change that retired the temporary ceiling below — the recorded target was
+# 67,832 and the measurement landed at 62,715. What is left in this crate is the
+# vocabulary the kernel composes, not the orchestration itself.
+max_source_lines = 62715
 # Raised for the three exact-registration entry points the event sanitize classes
 # need: one public entry per class over a private shared helper, which is how a host
 # is asked to run exactly the registration a proxy names rather than the family.
@@ -341,8 +371,8 @@ max_source_lines = 68007
 # kernel's `unsafe` is now what it contains rather than what it borrowed, and the loader's
 # 288 tokens left with the loader.
 max_unsafe_occurrences = 19
-direct_dependency_digest = "483766a3df5a04ab121691745d7df29714c3cacb5f743deab2802d946b92b993"
-transitive_dependency_digest = "1d12c9d289b245b73f67335223057112cb47f7e1c5de82dbc73d74907ca07eb4"
+direct_dependency_digest = "d269d475ec0b47c22375f9ea0d7d3e2688760c0ca149add1c8dddaaf8ae1fcf8"
+transitive_dependency_digest = "77a0c24d3ef8ec23988b2972635fbc28667c0435512845cad507f99a62209568"
 
 [limits.nemo-relay-types]
 max_direct_dependencies = 7
@@ -506,8 +536,15 @@ max_transitive_packages = 295
 # seccomp filter, the capability drop, and the probe's self-check that proves the
 # denials rather than reporting them. The unsafe growth is the boundary itself:
 # every `unsafe` there is a syscall the confinement is made of.
-max_source_lines = 17636
-max_unsafe_occurrences = 310
+#
+# Raised again for what landed without a matching budget: the confinement
+# review-fix pass in `linux_sandbox.rs` grew the sandbox itself (the same
+# syscall surface the previous raise recorded), and the host binary's
+# fail-closed split of a non-Unicode isolation name added the five lines left
+# over. Both were reviewed in the commits that carried them; this entry records
+# the count rather than pretending the drift never happened.
+max_source_lines = 17979
+max_unsafe_occurrences = 325
 direct_dependency_digest = "25bce267911de589f5a366542d4f8e84ecaef8c4654d812726d195ba90e87861"
 transitive_dependency_digest = "d6e5755cf0c3cbeff82281e73be9006ea21ade44d1f93f0c21feb94fb55976d5"
 
@@ -586,16 +623,26 @@ direct_dependency_digest = "819e4805cffa04c184b80f3cdacbbcd43983a38650a417842ee7
 transitive_dependency_digest = "e0bbdf96638cc171acc2b9f7b95b4a34fb959a94d70849104e345c69c9471f7f"
 
 [limits.nemo-effect-runtime]
-max_direct_dependencies = 3
+# Raised by eight for the durable-effect kernel's arrival from `nemo-relay`:
+# the composition crate now names the authority provider, the plugin contract
+# the kernel's plugin-failure translation speaks, and the six crates' worth of
+# helpers (`serde_json`, `serde_json_canonicalizer`, `sha2`, `uuid`, `chrono`,
+# `thiserror`) the orchestration was already using. No new implementation
+# leaked — the same dependency set simply has an honest owner.
+max_direct_dependencies = 11
 # Raised by one package for the ABI's own crate. Counting is over resolved
 # identities, so splitting one crate into two raises every dependent's number by
 # exactly one while the code reachable through it is unchanged: the digest moves
 # with the identity set, not as the sign of anything new being pulled in.
 # Raised to the platform union; see the measurement note at the top of this file.
 max_transitive_packages = 304
-max_source_lines = 589
+# Raised by more than five thousand for `kernel.rs` itself: the whole durable
+# orchestration — registry sealing, grant binding, action lifecycle, recovery —
+# moved here out of `nemo-relay` unchanged except for crate paths, which is the
+# same move the layer gate records as the last upward edges closing.
+max_source_lines = 5996
 max_unsafe_occurrences = 0
-direct_dependency_digest = "59b383378c3be1f4d7e84e04ad1fc400c2233b2df975f3816d2d5948f5f73f98"
+direct_dependency_digest = "db9987a808521d2a904c52d259442e382e51460bd6a6339ce58b2af64ad371b9"
 transitive_dependency_digest = "e8bf57f38cf9c90ccb884a37f0922163543d06d63a5f910cd9935259c39316d2"
 
 # The in-process plugin backend. Measured from the start so its growth is
@@ -886,20 +933,7 @@ transitive_dependency_digest = "def40582c41999eb264fa47757d39cf17473295e1f24d740
 # budget — are still in place. The loader-removal milestone cannot pass this gate without
 # taking all three of these down with it.
 
-[[temporary]]
-crate = "nemo-relay"
-field = "max_source_lines"
-raised_to = 68007
-target = 67832
-reason = "the native loader and the ABI bridge are still compiled into the kernel"
-introduced = "2514f27..eb975ae"
-must_fall_by = "loader-removal"
-# The value the budget must fall to, not the value it will land on: the target was the
-# ceiling at the time this entry was written minus the 6825 lines of
-# crates/core/src/plugin/dynamic/native.rs, which is the file the milestone moves out of
-# the kernel's dependency closure. That arithmetic is now stale in both directions — the
-# loader has since been split, so `native.rs` is 6760 lines and the artifact vocabulary it
-# set down is another 171 in the same directory — which is why the target was deliberately
-# *not* re-derived when this ceiling was raised. A promise that moved with each measurement
-# would promise nothing; the milestone re-measures the whole thing instead of being handed
-# a number, and the two files above are what it starts from.
+# None remain. The loader-removal entry retired when the durable-effect kernel
+# moved to `nemo-effect-runtime`: the promised target was 67,832 source lines,
+# the crate measured 62,715, and the budget above now records the measurement
+# itself — the ratchet closed instead of outliving the debt it excused.

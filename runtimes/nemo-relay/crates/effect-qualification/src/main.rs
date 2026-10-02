@@ -4,12 +4,12 @@
 //! Qualification-only executable: a real kernel and PostgreSQL effect store
 //! around a persistent, deterministic external-effect simulator.
 
-use nemo_effect_runtime::{
-    DurableRuntime, EffectRuntimeConfig, EffectStoreSettings, PostgresTransport,
-};
-use nemo_relay::kernel::{
+use nemo_effect_runtime::kernel::{
     CapabilityDefinition, CapabilityRegistry, InvocationOutcome, InvocationRequest,
     RecoveryDecision,
+};
+use nemo_effect_runtime::{
+    DurableRuntime, EffectRuntimeConfig, EffectStoreSettings, PostgresTransport,
 };
 use nemo_relay_authority::unstable::{
     AuthorityDecision, AuthorityProvider, AuthorityRequest, GrantVerifier, VerifiedGrant,

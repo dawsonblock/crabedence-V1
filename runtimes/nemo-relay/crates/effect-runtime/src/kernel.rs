@@ -2462,10 +2462,10 @@ const KERNEL_OPERATION_CEILING_MILLIS: u64 = 29_000;
 /// arithmetic is [`ExecutionBudget::narrowed_to`]'s, because that is the only arithmetic
 /// a layer is allowed to do with a budget — a cap can shorten and cannot lengthen.
 fn kernel_deadline_unix_ms() -> u64 {
-    let now = crate::api::runtime::budget_now_unix_ms();
-    let budget = crate::api::runtime::current_execution_budget().map_or_else(
+    let now = nemo_relay::api::runtime::budget_now_unix_ms();
+    let budget = nemo_relay::api::runtime::current_execution_budget().map_or_else(
         || {
-            crate::api::runtime::ExecutionBudget::new(
+            nemo_relay::api::runtime::ExecutionBudget::new(
                 now.saturating_add(KERNEL_OPERATION_CEILING_MILLIS),
                 KERNEL_OPERATION_CEILING_MILLIS,
             )
@@ -2549,6 +2549,69 @@ fn execution_class_name(class: ExecutionClass) -> &'static str {
     }
 }
 
+/// How a plugin invocation failure is described at the effect boundary.
+///
+/// A registration that may have dispatched is an effect that may have happened.
+/// A durable action records that as `UNKNOWN`: not a failure it may retry,
+/// because the plugin may already have reached the external system, and not a
+/// success, because nothing proves one. A registration the runtime refused
+/// *before* the backend never ran, so the same action may be finished as a
+/// definite failure with no reconciliation.
+///
+/// The conversion copies the dispatch state and the certainty the plugin
+/// boundary already established rather than deriving them again from the failure
+/// code. A second derivation would be a second place to get certainty wrong, and
+/// certainty is the value here that must never be softened: the code says what
+/// went wrong, the certainty says whether anyone can still say it did not
+/// happen. `HostCrashed` and `MalformedResponse` are different things to a
+/// plugin author and the same thing to an action deciding whether its effect is
+/// still unaccounted for.
+///
+/// The effect vocabulary lives in this crate rather than the SDK — `UNKNOWN`
+/// means nothing to a build that has no durable action to record it on.
+///
+/// `None` means the error is not a plugin invocation failure, and the caller
+/// classifies it by its own rules rather than by these.
+pub fn plugin_failure_as_effect_error(
+    error: &nemo_relay::error::FlowError,
+) -> Option<nemo_relay_executor::unstable::EffectExecutionError> {
+    use nemo_relay_executor::unstable::{EffectExecutionError, OutcomeCertainty, state_for_error};
+    use nemo_relay_ledger::unstable::ExecutionState;
+
+    let nemo_relay::error::FlowError::PluginInvocation {
+        registration,
+        failure,
+        dispatch,
+        certainty,
+    } = error
+    else {
+        return None;
+    };
+    let mut translated = EffectExecutionError {
+        code: match certainty {
+            OutcomeCertainty::Unknown => "PLUGIN_DISPATCH_UNATTESTED",
+            _ => "PLUGIN_REFUSED_BEFORE_BACKEND",
+        }
+        .to_owned(),
+        dispatch_state: *dispatch,
+        outcome_certainty: *certainty,
+        provider_request_id: None,
+        retryable: false,
+        reconciliation_required: false,
+        message: format!(
+            "plugin registration '{registration}' reported {:?}: {}",
+            failure.code, failure.message
+        ),
+    };
+    // Derived rather than asserted, from the same function the kernel uses to
+    // classify a backend error: the flag has to agree with the state the kernel
+    // will derive from this error, or two readers of one failure would disagree
+    // about whether anyone can still say what happened.
+    translated.reconciliation_required =
+        matches!(state_for_error(&translated), ExecutionState::Unknown);
+    Some(translated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2573,7 +2636,9 @@ mod tests {
     /// cases are three calls under three budgets.
     #[tokio::test]
     async fn a_kernel_operation_runs_under_the_budget_it_inherited() {
-        use crate::api::runtime::{ExecutionBudget, budget_now_unix_ms, with_execution_budget};
+        use nemo_relay::api::runtime::{
+            ExecutionBudget, budget_now_unix_ms, with_execution_budget,
+        };
 
         let now = budget_now_unix_ms();
 
@@ -4071,7 +4136,7 @@ mod tests {
         // The shape a managed call returns when a remote registration entered
         // the backend and the answer was lost: nobody can say the plugin did not
         // reach the external system.
-        let plugin_failure = crate::error::FlowError::PluginInvocation {
+        let plugin_failure = nemo_relay::error::FlowError::PluginInvocation {
             registration: "resize-image".into(),
             failure: nemo_relay_plugin_protocol::PluginFailure {
                 code: nemo_relay_plugin_protocol::PluginFailureCode::HostCrashed,
@@ -4081,7 +4146,7 @@ mod tests {
             certainty: OutcomeCertainty::Unknown,
         };
         *effect.effect_error.lock().unwrap() = Some(
-            crate::plugin::execution::plugin_failure_as_effect_error(&plugin_failure)
+            plugin_failure_as_effect_error(&plugin_failure)
                 .expect("a plugin invocation failure describes an effect"),
         );
 
@@ -4121,7 +4186,7 @@ mod tests {
         // The other half of the same boundary: the runtime refused the call
         // before the plugin ran, which is the one plugin failure that *is* a
         // definite outcome.
-        let plugin_refusal = crate::error::FlowError::PluginInvocation {
+        let plugin_refusal = nemo_relay::error::FlowError::PluginInvocation {
             registration: "resize-image".into(),
             failure: nemo_relay_plugin_protocol::PluginFailure {
                 code: nemo_relay_plugin_protocol::PluginFailureCode::Unavailable,
@@ -4131,7 +4196,7 @@ mod tests {
             certainty: OutcomeCertainty::ConfirmedFailure,
         };
         *effect.effect_error.lock().unwrap() = Some(
-            crate::plugin::execution::plugin_failure_as_effect_error(&plugin_refusal)
+            plugin_failure_as_effect_error(&plugin_refusal)
                 .expect("a plugin invocation failure describes an effect"),
         );
 
@@ -4147,6 +4212,52 @@ mod tests {
             Some(ExecutionState::Failed)
         );
         assert_eq!(effect.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// The two halves of the effect-boundary contract that a kernel test cannot
+    /// see: an error that is not a plugin failure is left alone, and the flag a
+    /// durable reader uses is derived from the state rather than asserted
+    /// separately.
+    #[test]
+    fn only_a_plugin_failure_is_translated_and_its_reconciliation_flag_follows_certainty() {
+        assert!(
+            plugin_failure_as_effect_error(&nemo_relay::error::FlowError::Internal("other".into()))
+                .is_none(),
+            "an error the plugin boundary did not produce has no effect-boundary meaning here"
+        );
+
+        let dispatch_attempted = nemo_relay::error::FlowError::PluginInvocation {
+            registration: "resize-image".into(),
+            failure: nemo_relay_plugin_protocol::PluginFailure {
+                code: nemo_relay_plugin_protocol::PluginFailureCode::MalformedResponse,
+                message: "the answer could not be decoded".into(),
+            },
+            dispatch: nemo_relay_executor::unstable::DispatchState::DispatchAttempted,
+            certainty: OutcomeCertainty::Unknown,
+        };
+        let translated = plugin_failure_as_effect_error(&dispatch_attempted)
+            .expect("a plugin invocation failure describes an effect");
+        assert_eq!(translated.code, "PLUGIN_DISPATCH_UNATTESTED");
+        assert!(translated.reconciliation_required);
+        assert!(!translated.retryable);
+        assert_eq!(
+            translated.dispatch_state,
+            nemo_relay_executor::unstable::DispatchState::DispatchAttempted
+        );
+
+        let refused = nemo_relay::error::FlowError::PluginInvocation {
+            registration: "resize-image".into(),
+            failure: nemo_relay_plugin_protocol::PluginFailure {
+                code: nemo_relay_plugin_protocol::PluginFailureCode::Rejected,
+                message: "the registration was refused".into(),
+            },
+            dispatch: nemo_relay_executor::unstable::DispatchState::NotDispatched,
+            certainty: OutcomeCertainty::ConfirmedFailure,
+        };
+        let translated = plugin_failure_as_effect_error(&refused)
+            .expect("a plugin invocation failure describes an effect");
+        assert_eq!(translated.code, "PLUGIN_REFUSED_BEFORE_BACKEND");
+        assert!(!translated.reconciliation_required);
     }
 
     #[test]

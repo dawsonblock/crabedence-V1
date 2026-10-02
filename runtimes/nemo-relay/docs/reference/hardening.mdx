@@ -184,11 +184,11 @@ a place there only by enforcing one of those properties. `security/BASELINE.md`
 records the frozen revision and digests the refactor is measured against.
 
 `security/layers.toml` places every workspace crate in a layer, and
-`just layer-report` fails when a dependency points upward. Edges that point the
-wrong way today are recorded as grandfathered, so the check is green on arrival.
-A grandfathered entry that no longer describes a real edge fails too, so the
-layer debt can only shrink and an exception cannot be reused by a later
-regression.
+`just layer-report` fails when a dependency points upward. No upward edges
+remain: the durable-effect kernel lives in `nemo-effect-runtime` above its
+adapters, and the worker protocol sits with the other generated message
+contracts, so the gate now runs with no grandfathered exceptions for a
+regression to reuse.
 
 `security/PLUGIN-ISOLATION.md` records the milestone that moves native plugin
 loading across a process boundary. Almost all of the kernel's `unsafe` is the
