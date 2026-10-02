@@ -135,23 +135,24 @@ jobs:
       # secret NEMO_RELEASE_SSH_SIGNING_KEY, matching
       # .github/release-allowed-signers) lets the assembler SSH-sign the
       # release-root sidecar, and the qualification below verifies it under
-      # the maintainer's principal. On the release path (tag builds) the key
-      # is mandatory — an unsigned release artifact carries no origin proof,
-      # so the lane fails rather than shipping one. Manual development runs
-      # may still produce unsigned artifacts, and the verifier then skips the
-      # check rather than demanding a signature nobody could have produced.
+      # the maintainer's principal. The step is gated on signing_required so
+      # the key never enters a run that does not need it: a manual dispatch
+      # may check out an arbitrary ref and run its scripts, so exporting the
+      # key there would hand it to code the release ruleset never vetted.
+      # On the release path (tag builds) the key is mandatory — an unsigned
+      # release artifact carries no origin proof, so the lane fails rather
+      # than shipping one. Manual development runs produce unsigned
+      # artifacts, and the verifier then skips the check rather than
+      # demanding a signature nobody could have produced.
       - name: Provision the release signing key
+        if: needs.prepare.outputs.signing_required == 'true'
         env:
           SIGNING_KEY_MATERIAL: ${{ secrets.NEMO_RELEASE_SSH_SIGNING_KEY }}
         shell: bash
         run: |
           if [ -z "$SIGNING_KEY_MATERIAL" ]; then
-            if [ "${{ needs.prepare.outputs.signing_required }}" = "true" ]; then
-              echo "NEMO_RELEASE_SSH_SIGNING_KEY is required on the release path — provision the repository secret" >&2
-              exit 1
-            fi
-            echo "NEMO_RELEASE_SSH_SIGNING_KEY is not set — this artifact will be unsigned"
-            exit 0
+            echo "NEMO_RELEASE_SSH_SIGNING_KEY is required on the release path — provision the repository secret" >&2
+            exit 1
           fi
           umask 077
           printf '%s\n' "$SIGNING_KEY_MATERIAL" > "$RUNNER_TEMP/nemo-release-signing-key"
@@ -238,6 +239,13 @@ jobs:
               echo "attestation for $tarball binds $claimed, the artifact digests to $actual" >&2
               exit 1
             }
+            # All five declared gates, all passing — an unrelated all-pass
+            # list is not the qualification suite's evidence.
+            [ "$(jq -r '[.gates[].id] | sort | join(",")' "$attestation")" = \
+              "nemo-component-manifest-verify,nemo-critical-path,nemo-expired-authority,nemo-restart-idempotency,nemo-runtime-e2e" ] || {
+              echo "attestation for $tarball does not name the qualification gate set" >&2
+              exit 1
+            }
             [ "$(jq -r '[.gates[].result] | unique | join(",")' "$attestation")" = "pass" ] || {
               echo "attestation for $tarball records a non-pass gate" >&2
               exit 1
@@ -254,7 +262,11 @@ jobs:
       # SHA256SUMS is only release-origin evidence once a named signer is
       # bound to it. Immediately verified: a signature that does not
       # authenticate the file it claims is a pipeline failure, not an upload.
+      # Gated on signing_required so the development lane never touches the
+      # release key and never ships a signed manifest its unsigned artifacts
+      # did not earn.
       - name: Sign the checksum manifest
+        if: needs.prepare.outputs.signing_required == 'true'
         env:
           SIGNING_KEY_MATERIAL: ${{ secrets.NEMO_RELEASE_SSH_SIGNING_KEY }}
         shell: bash
@@ -262,12 +274,8 @@ jobs:
           cd artifacts
           sums="nemo-control_${{ needs.prepare.outputs.version }}_SHA256SUMS"
           if [ -z "$SIGNING_KEY_MATERIAL" ]; then
-            if [ "${{ needs.prepare.outputs.signing_required }}" = "true" ]; then
-              echo "release tags must ship a signed SHA256SUMS — provision NEMO_RELEASE_SSH_SIGNING_KEY" >&2
-              exit 1
-            fi
-            echo "NEMO_RELEASE_SSH_SIGNING_KEY is not set — SHA256SUMS will be unsigned"
-            exit 0
+            echo "release tags must ship a signed SHA256SUMS — provision NEMO_RELEASE_SSH_SIGNING_KEY" >&2
+            exit 1
           fi
           umask 077
           printf '%s\n' "$SIGNING_KEY_MATERIAL" > "$RUNNER_TEMP/nemo-release-signing-key"

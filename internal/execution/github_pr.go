@@ -389,7 +389,11 @@ func (h *GitHubPullMergeHandler) PrepareRecovery(_ context.Context, in idempoten
 	if err != nil {
 		return nil, fmt.Errorf("invalid arguments: %v", err)
 	}
-	ext, _ := json.Marshal(map[string]any{"repo": args.Repo, "number": args.Number})
+	ext, _ := json.Marshal(map[string]any{
+		"repo":         args.Repo,
+		"number":       args.Number,
+		"merge_method": args.MergeMethod,
+	})
 	return &idempotency.RecoveryLocator{
 		Version:        1,
 		ProviderID:     "github",
@@ -570,10 +574,19 @@ func (h *GitHubPullMergeHandler) Resolve(ctx context.Context, rec *idempotency.R
 	if err := json.Unmarshal(respBody, &pr); err != nil {
 		return idempotency.RecoveryResult{}, fmt.Errorf("github pull get unparseable: %w", err)
 	}
+	var ext struct {
+		MergeMethod string `json:"merge_method"`
+	}
+	if len(loc.Extensions) > 0 {
+		_ = json.Unmarshal(loc.Extensions, &ext)
+	}
 	// `merged` is shared current state: a PR merged before — or alongside —
 	// this execution looks identical to one this execution merged. Only a
-	// merged_at inside this record's lifetime can be attributed to it.
-	if pr.Merged && transitionWithinExecution(pr.MergedAt, rec) {
+	// merged_at inside this record's lifetime can be attributed to it, and
+	// only a merge the locator can prove used the requested method.
+	if pr.Merged &&
+		transitionWithinExecution(pr.MergedAt, rec) &&
+		h.mergeMethodProven(ctx, owner, name, pr.MergeCommitSHA, ext.MergeMethod) {
 		runID := pr.MergeCommitSHA
 		if runID == "" {
 			runID = pr.HTMLURL
@@ -599,9 +612,58 @@ func (h *GitHubPullMergeHandler) Resolve(ctx context.Context, rec *idempotency.R
 		Decision:   idempotency.RecoveryUnknown,
 		ProviderID: "github",
 		Result: json.RawMessage(fmt.Sprintf(
-			`{"repo":%q,"pull":%d,"merged":%t,"state_observed":%q,"merged_at":%q}`,
-			repo, number, pr.Merged, pr.State, pr.MergedAt)),
+			`{"repo":%q,"pull":%d,"merged":%t,"state_observed":%q,"merged_at":%q,"merge_method_requested":%q}`,
+			repo, number, pr.Merged, pr.State, pr.MergedAt, ext.MergeMethod)),
 	}, nil
+}
+
+// mergeMethodProven reports whether the observed merge used the method this
+// execution requested. GitHub records no per-merge method field, so the only
+// evidence REST offers is the merge commit's topology: a `merge` request is
+// proven by a merge_commit_sha with two parents, while `squash` and `rebase`
+// both land as ordinary one-parent commits that no later read can separate —
+// a method-specific request whose method cannot be proven stays UNKNOWN for
+// an operator to reconcile rather than committing another actor's topology.
+func (h *GitHubPullMergeHandler) mergeMethodProven(ctx context.Context, owner, name, mergeSHA, requested string) bool {
+	switch requested {
+	case "":
+		return true
+	case "squash", "rebase":
+		return false
+	}
+	if mergeSHA == "" {
+		return false
+	}
+	endpoint := fmt.Sprintf("%s/repos/%s/%s/commits/%s",
+		h.baseURL, url.PathEscape(owner), url.PathEscape(name), url.PathEscape(mergeSHA))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	if h.token != "" {
+		req.Header.Set("Authorization", "Bearer "+h.token)
+	}
+	resp, err := h.client.Do(req)
+	if err != nil {
+		return false
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	var commit struct {
+		Parents []struct {
+			SHA string `json:"sha"`
+		} `json:"parents"`
+	}
+	if err := json.Unmarshal(body, &commit); err != nil {
+		return false
+	}
+	// A "merge" merge is proven by a second parent — the head branch the
+	// merge commit joined.
+	return len(commit.Parents) >= 2
 }
 
 // RegisterGitHubPullCreateCapability registers github.pr.create.

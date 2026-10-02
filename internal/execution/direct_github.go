@@ -220,6 +220,14 @@ func (g *GitHubReads) IssueGet(ctx context.Context, call CallContext) (json.RawM
 // exceeds the schema's own contract.
 const maxIssueListResults = 50
 
+// issueListItemBytes bounds one raw issue entry on the provider page.
+// GitHub caps an issue body near 64 KiB and each entry also carries the
+// author, labels, milestone, and reaction envelope around it, so a page
+// holding even a few large bodies can exceed the fixed DIRECT bound while
+// the projected result stays small — the raw read bound has to scale with
+// the page, not sit at it.
+const issueListItemBytes = 96 * 1024
+
 // IssueList lists a repository's issues: GET /repos/{owner}/{repo}/issues
 // with the caller's state filter and a bounded page size. The result is
 // the same bounded projection as a single get, capped by the caller's
@@ -270,12 +278,16 @@ func (g *GitHubReads) IssueList(ctx context.Context, call CallContext) (json.Raw
 	}
 	defer response.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(response.Body, maxDirectReadBytes+1))
+	readBound := int64(limit) * issueListItemBytes
+	if readBound < maxDirectReadBytes {
+		readBound = maxDirectReadBytes
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, readBound+1))
 	if err != nil {
 		return nil, fmt.Errorf("read github response: %w", err)
 	}
-	if len(body) > maxDirectReadBytes {
-		return nil, fmt.Errorf("github response exceeds %d bytes", maxDirectReadBytes)
+	if int64(len(body)) > readBound {
+		return nil, fmt.Errorf("github response exceeds %d bytes", readBound)
 	}
 
 	switch response.StatusCode {

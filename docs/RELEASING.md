@@ -684,8 +684,9 @@ may produce unsigned output. The family's proof chain is:
 - four per-target tarballs, each built and qualified on its native runner;
 - one bound qualification attestation per tarball
   (`<tarball>.qualification.json`), pinning the archive SHA-256, the source
-  commit, the version, the component/transfer manifest digests, and all-pass
-  gate results;
+  commit, the version, the component/transfer manifest digests, and the exact
+  five-gate set the installed-distribution suite emits — every gate passing,
+  no others present;
 - `nemo-control_X.Y.Z_SHA256SUMS` covering exactly the four tarballs and
   their four qualification attestations — the attestations are signed
   content, not unsigned metadata beside an authenticated archive;
@@ -713,14 +714,15 @@ artifact by exact GitHub digest; authenticates `SHA256SUMS` under
 `.github/release-allowed-signers` before trusting it; requires each tarball
 *and* each attestation file to match its signed manifest line, and each
 attestation's content to bind the same archive digest, version, and source
-commit with every gate passing. It then creates the
+commit with the qualification suite's exact five gates all passing — a subset,
+superset, or unrelated all-pass list is not the suite's evidence. It then creates the
 draft on the family tag with a deterministic bound-stub body, uploads exactly
 the ten family assets (four tarballs, four attestations, manifest, signature),
 re-reads the remote inventory by name/size/digest, and publishes with the same
 single-PATCH discipline as the kernel publisher. A release already bound to
 the family tag, a missing or extra asset, an unsigned or mis-signed manifest,
-a mismatched archive digest, a non-pass gate, or a foreign source commit all
-fail closed before mutation.
+a mismatched archive digest, a non-pass or incomplete gate set, or a foreign
+source commit all fail closed before mutation.
 
 There is no Homebrew tap for the family; publication is the terminal step.
 

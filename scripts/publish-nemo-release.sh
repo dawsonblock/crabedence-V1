@@ -307,6 +307,10 @@ for target in darwin_amd64 darwin_arm64 linux_amd64 linux_arm64; do
     echo "$attestation does not match the signed SHA256SUMS entry" >&2
     exit 1
   }
+  # The gate list must be exactly the set the installed-distribution suite
+  # emits — a subset, superset, or unrelated all-pass list is not the
+  # suite's evidence. The jq program is single-quoted: keep apostrophes
+  # (including inside # comments) out of it.
   jq -e \
     --arg target "$target" \
     --arg version "$version" \
@@ -320,7 +324,13 @@ for target in darwin_amd64 darwin_arm64 linux_amd64 linux_arm64; do
       (.subject.component_manifest_sha256 | test("^[0-9a-f]{64}$")) and
       (.subject.transfer_manifest_sha256 | test("^[0-9a-f]{64}$")) and
       .source.commit == $commit and
-      (.gates | length > 0) and
+      ([.gates[].id] | sort == [
+        "nemo-component-manifest-verify",
+        "nemo-critical-path",
+        "nemo-expired-authority",
+        "nemo-restart-idempotency",
+        "nemo-runtime-e2e"
+      ]) and
       ([.gates[].result] | all(. == "pass"))
     ' "$asset_dir/$attestation" >/dev/null || {
     echo "attestation for $tarball does not bind these bytes at the pinned source" >&2

@@ -130,7 +130,11 @@ func (h *GitHubIssueCloseHandler) PrepareRecovery(_ context.Context, in idempote
 	if err != nil {
 		return nil, fmt.Errorf("invalid arguments: %v", err)
 	}
-	ext, _ := json.Marshal(map[string]any{"repo": args.Repo, "number": args.Number})
+	ext, _ := json.Marshal(map[string]any{
+		"repo":         args.Repo,
+		"number":       args.Number,
+		"state_reason": args.StateReason,
+	})
 	return &idempotency.RecoveryLocator{
 		Version:        1,
 		ProviderID:     "github",
@@ -291,21 +295,34 @@ func (h *GitHubIssueCloseHandler) Resolve(ctx context.Context, rec *idempotency.
 	}
 
 	var issue struct {
-		Number   int    `json:"number"`
-		State    string `json:"state"`
-		HTMLURL  string `json:"html_url"`
-		ClosedAt string `json:"closed_at"`
+		Number      int    `json:"number"`
+		State       string `json:"state"`
+		HTMLURL     string `json:"html_url"`
+		ClosedAt    string `json:"closed_at"`
+		StateReason string `json:"state_reason"`
 	}
 	if err := json.Unmarshal(respBody, &issue); err != nil {
 		return idempotency.RecoveryResult{}, fmt.Errorf("github issue get unparseable: %w", err)
 	}
-	if issue.State == "closed" && transitionWithinExecution(issue.ClosedAt, rec) {
+	// The locator carries the reason this execution requested. A closed
+	// issue whose recorded reason differs was closed by another actor's
+	// operation — not this one's postcondition — however its timestamp
+	// lands. An empty request constraint accepts any closed reason.
+	var ext struct {
+		StateReason string `json:"state_reason"`
+	}
+	if len(loc.Extensions) > 0 {
+		_ = json.Unmarshal(loc.Extensions, &ext)
+	}
+	reasonMatches := ext.StateReason == "" || issue.StateReason == ext.StateReason
+	if issue.State == "closed" && reasonMatches && transitionWithinExecution(issue.ClosedAt, rec) {
 		result, _ := json.Marshal(map[string]any{
 			"issue_number": issue.Number,
 			"issue_url":    issue.HTMLURL,
 			"repo":         repo,
 			"state":        issue.State,
 			"closed_at":    issue.ClosedAt,
+			"state_reason": issue.StateReason,
 		})
 		return idempotency.RecoveryResult{
 			Decision:         idempotency.RecoveryCommitted,
@@ -320,8 +337,8 @@ func (h *GitHubIssueCloseHandler) Resolve(ctx context.Context, rec *idempotency.
 		Decision:   idempotency.RecoveryUnknown,
 		ProviderID: "github",
 		Result: json.RawMessage(fmt.Sprintf(
-			`{"repo":%q,"issue":%d,"state_observed":%q,"closed_at":%q}`,
-			repo, number, issue.State, issue.ClosedAt)),
+			`{"repo":%q,"issue":%d,"state_observed":%q,"closed_at":%q,"state_reason_observed":%q}`,
+			repo, number, issue.State, issue.ClosedAt, issue.StateReason)),
 	}, nil
 }
 

@@ -90,6 +90,8 @@ func TestRejectsEscapesAndUnsafeMembers(t *testing.T) {
 		{"device", testMember{tar.TypeBlock, "dist/dev0", "", ""}, "only directories and regular files"},
 		{"duplicate member", testMember{tar.TypeReg, "a.txt", "", "x"}, "overwrite"},
 		{"file as directory", testMember{tar.TypeReg, "f/inner.txt", "", "x"}, "nested under"},
+		{"directory as file", testMember{tar.TypeReg, "g", "", "x"}, "claimed as a file"},
+		{"explicit dir over file", testMember{tar.TypeDir, "h", "", ""}, "overwrite"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -99,6 +101,14 @@ func TestRejectsEscapesAndUnsafeMembers(t *testing.T) {
 				members = append(members, testMember{tar.TypeReg, "a.txt", "", "first"}, tc.member)
 			case "file as directory":
 				members = append(members, testMember{tar.TypeReg, "f", "", "file"}, tc.member)
+			case "directory as file":
+				// The reverse order: a member nested under g is seen first,
+				// so g is a directory by the time the file member claims it.
+				members = append(members, testMember{tar.TypeReg, "g/inner.txt", "", "nested"}, tc.member)
+			case "explicit dir over file":
+				// The file lands first; the later TypeDir member targets the
+				// same path and must refuse before extraction.
+				members = append(members, testMember{tar.TypeReg, "h", "", "file"}, tc.member)
 			default:
 				members = append(members, tc.member)
 			}

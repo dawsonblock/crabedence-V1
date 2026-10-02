@@ -159,10 +159,13 @@ faults — a crashed or hanging plugin takes down its host, not the
 runtime — plus the credential-hygiene boundary, not a sandbox. In the
 integrated distribution, native plugins are trusted operator-installed
 extensions running with the host process's ambient authority; a plugin
-assumed hostile needs the platform confinement level
-(`NEMO_RELAY_NATIVE_ISOLATION=restricted-macos`) where a signed host
-bundle delivers it, and stronger isolation than that is out of scope
-for this release.
+assumed hostile needs a platform confinement level —
+`NEMO_RELAY_NATIVE_ISOLATION=restricted-macos` where a signed host
+bundle delivers it on macOS, `restricted-linux` where user
+namespaces, Landlock, and seccomp deliver it on Linux — and a plugin
+may also declare `[security] requires_confinement` in its manifest to
+refuse any non-confining host outright. Isolation stronger than the
+restricted platform hosts is out of scope for this release.
 
 ### 6. The uncertainty model is preserved end to end
 

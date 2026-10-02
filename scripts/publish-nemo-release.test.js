@@ -77,6 +77,17 @@ function git(root, ...args) {
   }).trim();
 }
 
+// The installed-distribution suite's gate set — the publisher requires
+// exactly these IDs, so a fixture missing one or inventing another is
+// rejected before the per-gate results are even read.
+const QUALIFICATION_GATES = [
+  "nemo-component-manifest-verify",
+  "nemo-runtime-e2e",
+  "nemo-critical-path",
+  "nemo-expired-authority",
+  "nemo-restart-idempotency",
+].map((id) => ({ id, result: "pass" }));
+
 // A per-target artifact zip holding a tarball and its bound attestation.
 // options can drift the tarball bytes, the attestation record, or add an
 // unexpected member; the map records the bytes a correct SHA256SUMS binds.
@@ -95,10 +106,7 @@ function artifactZip(api, artifactId, target, sourceCommit, tarballBytes, option
       archive_sha256: options.attestationSha ?? sha256(tarballBytes),
     },
     source: { commit: options.attestationCommit ?? sourceCommit },
-    gates: options.gates ?? [
-      { id: "installed-qualification", result: "pass" },
-      { id: "restricted-linux", result: "pass" },
-    ],
+    gates: options.gates ?? QUALIFICATION_GATES,
   };
   const attestationPath = path.join(dir, `${tarballName}.qualification.json`);
   if (options.attestationRaw != null) {
@@ -197,6 +205,7 @@ function prepareFixture({ blockedRecord = false } = {}) {
     "gate-fail": 614,
     "extra-file": 615,
     "attestation-file-drift": 616,
+    "gate-set-drift": 620,
   };
   for (const target of targets) {
     const bytes = Buffer.from(`exact fixture bytes for ${target}\n`);
@@ -219,11 +228,13 @@ function prepareFixture({ blockedRecord = false } = {}) {
     "attestation-sha-drift": {},
     "attestation-commit-drift": {},
     "gate-fail": {},
+    "gate-set-drift": {},
   };
   const driftSumsIds = {
     "attestation-sha-drift": 617,
     "attestation-commit-drift": 618,
     "gate-fail": 619,
+    "gate-set-drift": 621,
   };
   const driftZips = {
     "sums-mismatch": artifactZip(api, driftIds["sums-mismatch"], driftTarget, sourceCommit,
@@ -233,7 +244,18 @@ function prepareFixture({ blockedRecord = false } = {}) {
     "attestation-commit-drift": artifactZip(api, driftIds["attestation-commit-drift"], driftTarget, sourceCommit,
       driftBytes, { attestationCommit: "d".repeat(40), attestationBytes: driftSinks["attestation-commit-drift"] }),
     "gate-fail": artifactZip(api, driftIds["gate-fail"], driftTarget, sourceCommit,
-      driftBytes, { gates: [{ id: "installed-qualification", result: "fail" }], attestationBytes: driftSinks["gate-fail"] }),
+      driftBytes, {
+        gates: QUALIFICATION_GATES.map((gate) =>
+          gate.id === "nemo-restart-idempotency" ? { ...gate, result: "fail" } : gate),
+        attestationBytes: driftSinks["gate-fail"],
+      }),
+    // The suite's identity is its five gates — an attestation naming a
+    // subset (or any other set) must refuse even when every entry passes.
+    "gate-set-drift": artifactZip(api, driftIds["gate-set-drift"], driftTarget, sourceCommit,
+      driftBytes, {
+        gates: QUALIFICATION_GATES.slice(0, 4),
+        attestationBytes: driftSinks["gate-set-drift"],
+      }),
     "extra-file": artifactZip(api, driftIds["extra-file"], driftTarget, sourceCommit,
       driftBytes, { extraFile: "unexpected-member.txt" }),
     // Internally valid but byte-different from what the signed manifest
@@ -252,7 +274,7 @@ function prepareFixture({ blockedRecord = false } = {}) {
             archive_sha256: sha256(driftBytes),
           },
           source: { commit: sourceCommit },
-          gates: [{ id: "installed-qualification", result: "pass" }],
+          gates: QUALIFICATION_GATES,
         })}\n`,
       }),
   };
@@ -558,7 +580,7 @@ else if (endpoint === "repos/${repository}/actions/workflows/${workflowId}") {
   outputFile(process.env.MOCK_MODE === "wrong-workflow" ? "workflow-wrong.json" : "workflow.json");
 }
 else if (endpoint === "repos/${repository}/actions/runs/${runId}/artifacts?per_page=100") {
-  const driftModes = ["sums-mismatch", "attestation-sha-drift", "attestation-commit-drift", "gate-fail", "extra-file", "attestation-file-drift"];
+  const driftModes = ["sums-mismatch", "attestation-sha-drift", "attestation-commit-drift", "gate-fail", "extra-file", "attestation-file-drift", "gate-set-drift"];
   outputFile(
     process.env.MOCK_MODE === "missing-artifact"
       ? "artifacts-missing.json"
@@ -571,8 +593,8 @@ else if (endpoint === "repos/${repository}/actions/runs/${runId}/artifacts?per_p
 }
 else if (endpoint.startsWith("repos/${repository}/actions/artifacts/") && endpoint.endsWith("/zip")) {
   const id = endpoint.split("/")[5];
-  const driftIds = { "sums-mismatch": "611", "attestation-sha-drift": "612", "attestation-commit-drift": "613", "gate-fail": "614", "extra-file": "615", "attestation-file-drift": "616" };
-  const driftSumsIds = { "attestation-sha-drift": "617", "attestation-commit-drift": "618", "gate-fail": "619" };
+  const driftIds = { "sums-mismatch": "611", "attestation-sha-drift": "612", "attestation-commit-drift": "613", "gate-fail": "614", "extra-file": "615", "attestation-file-drift": "616", "gate-set-drift": "620" };
+  const driftSumsIds = { "attestation-sha-drift": "617", "attestation-commit-drift": "618", "gate-fail": "619", "gate-set-drift": "621" };
   let requested = driftIds[process.env.MOCK_MODE] && id === "603" ? driftIds[process.env.MOCK_MODE] : id;
   if (id === "605" && driftSumsIds[process.env.MOCK_MODE]) requested = driftSumsIds[process.env.MOCK_MODE];
   const file = process.env.MOCK_MODE === "unsigned-sums" && id === "605" ? "artifact-6150.zip" : "artifact-" + requested + ".zip";
@@ -681,6 +703,7 @@ for (const [mode, reason] of [
   ["attestation-commit-drift", "does not bind"],
   ["attestation-file-drift", "does not match the signed SHA256SUMS"],
   ["gate-fail", "does not bind"],
+  ["gate-set-drift", "does not bind"],
   ["extra-file", "exactly the tarball and its attestation"],
   ["immutable-disabled", "release immutability"],
   ["existing-release", "already exists"],

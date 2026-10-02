@@ -139,6 +139,44 @@ func TestGitHubIssueCloseResolverObservesState(t *testing.T) {
 	}
 }
 
+func TestGitHubIssueCloseResolverBindsStateReason(t *testing.T) {
+	now := time.Now().UTC()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"number": 7, "state": "closed", "closed_at": %q, "state_reason": "completed", "html_url": "https://github.test/issues/7"}`,
+			now.Format(time.RFC3339))
+	}))
+	defer srv.Close()
+
+	h := NewGitHubIssueCloseHandler(srv.URL, "tok")
+	// The execution required not_planned; the observed close says completed
+	// — another actor's effect, not this one's postcondition.
+	res, err := h.Resolve(context.Background(), &idempotency.Record{
+		CreatedAt: now.Add(-time.Minute),
+		RecoveryLocator: json.RawMessage(
+			`{"external_token":"gh-close-4","resource_ref":"repos/octo/repo/issues/7","extensions":{"repo":"octo/repo","number":7,"state_reason":"not_planned"}}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Decision != idempotency.RecoveryUnknown {
+		t.Fatalf("a close with a different state_reason must stay UNKNOWN, got %s", res.Decision)
+	}
+
+	// The matching reason commits.
+	res, err = h.Resolve(context.Background(), &idempotency.Record{
+		CreatedAt: now.Add(-time.Minute),
+		RecoveryLocator: json.RawMessage(
+			`{"external_token":"gh-close-5","resource_ref":"repos/octo/repo/issues/7","extensions":{"repo":"octo/repo","number":7,"state_reason":"completed"}}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Decision != idempotency.RecoveryCommitted {
+		t.Fatalf("a close with the requested state_reason must commit, got %s", res.Decision)
+	}
+}
+
 func TestGitHubIssueUpdateCommitsProvidedFieldsOnly(t *testing.T) {
 	var gotBody string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -436,6 +474,90 @@ func TestGitHubPullMergeResolverObservesMergedFlag(t *testing.T) {
 	}
 	if res.Decision != idempotency.RecoveryUnknown {
 		t.Fatalf("an unmerged PR must stay UNKNOWN, got %s", res.Decision)
+	}
+}
+
+func TestGitHubPullMergeResolverBindsMergeMethod(t *testing.T) {
+	now := time.Now().UTC()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/pulls/42"):
+			fmt.Fprintf(w, `{"number":42,"merged":true,"merge_commit_sha":"abc123","merged_at":%q,"html_url":"https://github.test/pulls/42"}`,
+				now.Format(time.RFC3339))
+		case strings.HasSuffix(r.URL.Path, "/commits/abc123"):
+			// Two parents — a merge commit, topology only "merge" produces.
+			fmt.Fprint(w, `{"sha":"abc123","parents":[{"sha":"base"},{"sha":"head"}]}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	h := NewGitHubPullMergeHandler(srv.URL, "tok")
+	locator := func(method string) json.RawMessage {
+		return json.RawMessage(fmt.Sprintf(
+			`{"external_token":"gh-merge-m","resource_ref":"repos/octo/repo/pulls/42","extensions":{"repo":"octo/repo","number":42,"merge_method":%q}}`,
+			method))
+	}
+
+	// A merge request is proven by the merge commit's second parent.
+	res, err := h.Resolve(context.Background(), &idempotency.Record{
+		CreatedAt:       now.Add(-time.Minute),
+		RecoveryLocator: locator("merge"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Decision != idempotency.RecoveryCommitted {
+		t.Fatalf("a merge-method request observed as a merge commit must commit, got %s", res.Decision)
+	}
+
+	// REST cannot separate squash from rebase — a method-specific request
+	// for either stays UNKNOWN for an operator to reconcile.
+	for _, method := range []string{"squash", "rebase"} {
+		res, err = h.Resolve(context.Background(), &idempotency.Record{
+			CreatedAt:       now.Add(-time.Minute),
+			RecoveryLocator: locator(method),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.Decision != idempotency.RecoveryUnknown {
+			t.Fatalf("a %q merge the record cannot prove must stay UNKNOWN, got %s", method, res.Decision)
+		}
+	}
+}
+
+func TestGitHubPullMergeResolverRejectsASingleParentMergeClaim(t *testing.T) {
+	now := time.Now().UTC()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/pulls/42"):
+			fmt.Fprintf(w, `{"number":42,"merged":true,"merge_commit_sha":"lin123","merged_at":%q,"html_url":"https://github.test/pulls/42"}`,
+				now.Format(time.RFC3339))
+		case strings.HasSuffix(r.URL.Path, "/commits/lin123"):
+			// One parent — the observed merge was linear, not the merge
+			// commit this execution requested.
+			fmt.Fprint(w, `{"sha":"lin123","parents":[{"sha":"base"}]}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	h := NewGitHubPullMergeHandler(srv.URL, "tok")
+	res, err := h.Resolve(context.Background(), &idempotency.Record{
+		CreatedAt: now.Add(-time.Minute),
+		RecoveryLocator: json.RawMessage(
+			`{"external_token":"gh-merge-lin","resource_ref":"repos/octo/repo/pulls/42","extensions":{"repo":"octo/repo","number":42,"merge_method":"merge"}}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Decision != idempotency.RecoveryUnknown {
+		t.Fatalf("a one-parent merge_commit_sha cannot prove a merge-method request, got %s", res.Decision)
 	}
 }
 

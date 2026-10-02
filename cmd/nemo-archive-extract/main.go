@@ -120,6 +120,7 @@ func preflightMembers(reader *tar.Reader, dest string) ([]member, error) {
 	var members []member
 	seen := make(map[string]bool)
 	files := make(map[string]bool)
+	dirs := make(map[string]bool)
 	for {
 		header, err := reader.Next()
 		if err == io.EOF {
@@ -148,8 +149,17 @@ func preflightMembers(reader *tar.Reader, dest string) ([]member, error) {
 			if files[parent] {
 				return nil, fmt.Errorf("member %q: nested under %q, which a previous member claims as a file", header.Name, parent)
 			}
+			// Every member makes its ancestors directories — whether or not
+			// the archive spells them explicitly — so a later member may not
+			// claim any of them as a file.
+			dirs[parent] = true
 		}
-		if header.Typeflag != tar.TypeDir {
+		if header.Typeflag == tar.TypeDir {
+			dirs[target] = true
+		} else {
+			if dirs[target] {
+				return nil, fmt.Errorf("member %q: claimed as a file, but an earlier member nested beneath it already claimed it as a directory", header.Name)
+			}
 			files[target] = true
 		}
 		headerCopy := *header
