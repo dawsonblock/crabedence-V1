@@ -193,7 +193,7 @@ fn python_worker_process_launch_uses_the_managed_interpreter_and_endpoint_file()
     std::fs::write(
         &interpreter,
         format!(
-            "#!/bin/sh\nprintf '%s\\n%s\\n' \"$0\" \"$NEMO_RELAY_WORKER_ENDPOINT_FILE\" > '{}'\nexit 0\n",
+            "#!/bin/sh\nprintf '%s\\n%s\\n%s\\n' \"$0\" \"$NEMO_RELAY_WORKER_ENDPOINT_FILE\" \"$HOME\" > '{}'\nexit 0\n",
             probe.display()
         ),
     )
@@ -202,6 +202,7 @@ fn python_worker_process_launch_uses_the_managed_interpreter_and_endpoint_file()
     permissions.set_mode(0o755);
     std::fs::set_permissions(&interpreter, permissions).unwrap();
 
+    let activation_dir = temp.path().join("activation");
     let endpoint_file = temp.path().join("worker-endpoint");
     let mut child = spawn_worker_process(WorkerProcessLaunch {
         runtime: WorkerRuntime::Python,
@@ -214,6 +215,7 @@ fn python_worker_process_launch_uses_the_managed_interpreter_and_endpoint_file()
         host_endpoint: "http://127.0.0.1:1",
         worker_endpoint: "http://127.0.0.1:2",
         worker_endpoint_file: Some(&endpoint_file),
+        activation_dir: &activation_dir,
     })
     .unwrap();
     assert!(child.wait().unwrap().success());
@@ -221,6 +223,11 @@ fn python_worker_process_launch_uses_the_managed_interpreter_and_endpoint_file()
     let mut lines = recorded.lines();
     assert_eq!(lines.next(), interpreter.to_str());
     assert_eq!(lines.next(), endpoint_file.to_str());
+    assert_eq!(
+        lines.next().map(std::path::PathBuf::from),
+        Some(activation_dir.join("home")),
+        "the worker must run under the per-activation synthetic home"
+    );
     assert_eq!(lines.next(), None);
 }
 

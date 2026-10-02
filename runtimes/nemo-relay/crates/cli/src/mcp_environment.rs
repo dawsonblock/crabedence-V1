@@ -1,18 +1,52 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Environment names shared by MCP generation and gateway compatibility checks.
+//! Environment names shared by MCP generation and gateway compatibility
+//! checks, plus the synthetic-home isolation applied to managed MCP launches.
+//!
+//! The subprocess environment model has two layers:
+//!
+//! - *Forwarding* (`env_vars`): an allowlist of names the host may pass
+//!   through. Home-pointer variables — `HOME`, `USERPROFILE`, `APPDATA`,
+//!   `LOCALAPPDATA`, and the `XDG_*` roots — are not forwarded: forwarding
+//!   them would let plugin code rediscover the operator's credential files
+//!   through ordinary home-directory lookup.
+//! - *Isolation* (`IsolatedHome`): a managed MCP launch switches to a private
+//!   per-installation home directory at process start. The real user config
+//!   directory is carried through an explicit `NEMO_RELAY_USER_CONFIG_DIR`
+//!   pin, so `config.toml`, `plugins.toml`, bootstrap state and managed
+//!   plugin environments keep resolving where the installation put them —
+//!   while `~/.aws`, `~/.ssh`, `~/.config/gh` and friends resolve into the
+//!   private scratch directory.
 
 use std::collections::BTreeSet;
+use std::ffi::OsString;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
 use crate::installation::generation::{GENERATION_FILE_ENV, GENERATION_TOKEN_ENV};
 
+/// `NEMO_RELAY_MCP_INHERIT_HOME=1` opts a managed launch out of home
+/// isolation: the generated launch contract records the operator's real home
+/// in `MCP_REAL_HOME_ENV` and the subprocess restores it instead of the
+/// synthetic directory. A deployment should only set this for an integration
+/// that genuinely needs ambient user files.
+pub(crate) const MCP_INHERIT_HOME_ENV: &str = "NEMO_RELAY_MCP_INHERIT_HOME";
+
+/// Carries the operator's real home directory in the generated launch
+/// contract so `MCP_INHERIT_HOME_ENV` can restore it on request. This is a
+/// path, not credential material.
+pub(crate) const MCP_REAL_HOME_ENV: &str = "NEMO_RELAY_REAL_HOME";
+
+/// Name of the private directory created inside the user config directory
+/// that serves as `HOME` for managed MCP processes.
+const ISOLATED_HOME_DIR: &str = "mcp-home";
+
 const BASE_MCP_ENV_VARS: &[&str] = &[
     "ALL_PROXY",
     "ANTHROPIC_API_KEY",
-    "APPDATA",
     "AWS_ALLOW_HTTP",
     "AWS_CA_BUNDLE",
     "AWS_DEFAULT_REGION",
@@ -24,10 +58,8 @@ const BASE_MCP_ENV_VARS: &[&str] = &[
     "AWS_ROLE_SESSION_NAME",
     "AWS_SDK_LOAD_CONFIG",
     "AWS_STS_REGIONAL_ENDPOINTS",
-    "HOME",
     "HTTPS_PROXY",
     "HTTP_PROXY",
-    "LOCALAPPDATA",
     "NEMO_RELAY_ANTHROPIC_AUTH_HEADER",
     "NEMO_RELAY_ANTHROPIC_BASE_URL",
     "NEMO_RELAY_GATEWAY_URL",
@@ -58,13 +90,30 @@ const BASE_MCP_ENV_VARS: &[&str] = &[
     "SSL_CERT_FILE",
     "TEMP",
     "TMPDIR",
-    "USERPROFILE",
-    "XDG_CONFIG_HOME",
-    "XDG_RUNTIME_DIR",
     "all_proxy",
     "http_proxy",
     "https_proxy",
     "no_proxy",
+];
+
+/// Names earlier releases forwarded but which must no longer reach an MCP
+/// subprocess through the allowlist.
+///
+/// These stay *previously forwardable* so an install generated before the
+/// synthetic-home boundary existed still validates against the new expected
+/// set — its stale `env_vars` entry is overridden by the enforced isolated
+/// home at process start, so accepting it costs nothing while keeping
+/// upgrades a reinstall rather than a repair.
+const LEGACY_HOME_POINTER_MCP_ENV_VARS: &[&str] = &[
+    "APPDATA",
+    "HOME",
+    "LOCALAPPDATA",
+    "USERPROFILE",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_RUNTIME_DIR",
+    "XDG_STATE_HOME",
 ];
 
 /// Names that must never reach an MCP subprocess.
@@ -80,11 +129,18 @@ const BASE_MCP_ENV_VARS: &[&str] = &[
 /// This list takes precedence over `BASE_MCP_ENV_VARS`: a name that appears in
 /// both is never forwarded.
 ///
-/// Residual, and deliberately not papered over: `HOME` is forwarded, so a
-/// subprocess can still read `~/.aws/credentials` if the operator has one
-/// there. Closing that is a deployment property — run the plugin host without
-/// an ambient credential file — not something this list can do.
+/// Environment filtering alone is not a credential boundary — a subprocess
+/// that can see the real home directory rediscovers `~/.aws/credentials`,
+/// `~/.ssh`, `~/.config/gh` and friends through ordinary home-directory
+/// lookup. That residual is closed by `IsolatedHome`, which replaces the home
+/// pointers this list cannot strip with a private directory before any MCP
+/// work begins.
 const BLOCKED_MCP_ENV_VARS: &[&str] = &[
+    // The managed-MCP config-directory pin is a literal `env` value, never a
+    // forwardable name: forwarding it would hash it into the bootstrap
+    // fingerprint on one side of the boundary only, and the managed/unmanaged
+    // launch asymmetry would look like a foreign gateway.
+    "NEMO_RELAY_USER_CONFIG_DIR",
     "AWS_ACCESS_KEY_ID",
     "AWS_CONFIG_FILE",
     "AWS_CONTAINER_AUTHORIZATION_TOKEN",
@@ -203,6 +259,9 @@ pub(crate) fn previously_forwardable_name_for_platform(name: &str, windows: bool
         && (BASE_MCP_ENV_VARS
             .iter()
             .any(|base| forwarded_names_match_for_platform(name, base, windows))
+            || LEGACY_HOME_POINTER_MCP_ENV_VARS
+                .iter()
+                .any(|legacy| forwarded_names_match_for_platform(name, legacy, windows))
             || prefix_allowed(name, windows))
 }
 
@@ -287,9 +346,253 @@ fn collect_header_env_names(value: &Value, names: &mut BTreeSet<String>, windows
 }
 
 fn collect_config_name(name: &str, names: &mut BTreeSet<String>, windows: bool) {
-    if !name.is_empty() && !blocked(name) {
+    if !name.is_empty() && !blocked(name) && !legacy_home_pointer(name) {
         insert_name(names, name.to_owned(), windows);
     }
+}
+
+/// A private directory that substitutes for the operator's home inside a
+/// managed MCP process tree.
+///
+/// `env_vars` filtering alone is not a credential boundary: a subprocess
+/// that can see the real home directory rediscovers `~/.aws/credentials`,
+/// `~/.ssh`, `~/.config/gh`, cloud CLI state and package-manager tokens
+/// through ordinary home-directory lookup. The isolation layer closes that
+/// residual by creating a private home inside the real user config directory
+/// and pointing `HOME`, `USERPROFILE`, `APPDATA`/`LOCALAPPDATA` and every
+/// `XDG_*` root at it. The real config directory itself stays reachable
+/// through an explicit `NEMO_RELAY_USER_CONFIG_DIR` pin — the one location
+/// managed MCP genuinely needs, carrying `config.toml`, `plugins.toml`,
+/// bootstrap state and managed plugin environments.
+///
+/// The directory is per installation, not per session, because everything
+/// the process tree legitimately needs lives under the pinned config
+/// directory — a shorter-lived home would only be a different scratch space.
+/// Nothing under `root` exists except the standard lookup directories this
+/// type creates, so any file a subprocess finds through `HOME` lookup is one
+/// it placed there itself.
+pub(crate) struct IsolatedHome {
+    root: PathBuf,
+    user_config_dir: Option<PathBuf>,
+}
+
+impl IsolatedHome {
+    /// The managed-MCP home: a private directory inside the real user config
+    /// directory, which stays reachable through the config-directory pin.
+    pub(crate) fn for_managed_mcp(user_config_dir: PathBuf) -> Self {
+        Self {
+            root: user_config_dir.join(ISOLATED_HOME_DIR),
+            user_config_dir: Some(user_config_dir),
+        }
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Creates `root` and the standard home lookup directories inside it,
+    /// owner-only on unix.
+    pub(crate) fn create(&self) -> Result<(), String> {
+        create_private_dir(&self.root)?;
+        for subdir in [
+            ".config",
+            ".cache",
+            ".local/share",
+            ".local/state",
+            ".run",
+            "AppData/Roaming",
+            "AppData/Local",
+        ] {
+            create_private_dir(&self.root.join(subdir))?;
+        }
+        Ok(())
+    }
+
+    /// The environment assignments an isolated process tree should see.
+    ///
+    /// Emitted unconditionally for every platform so the generated launch
+    /// contract and the runtime enforcement agree everywhere; names a
+    /// platform never reads are inert. `NEMO_RELAY_USER_CONFIG_DIR` is
+    /// present only when this home pins a config directory.
+    pub(crate) fn env_pairs(&self) -> Vec<(String, OsString)> {
+        let mut pairs: Vec<(String, OsString)> = [
+            ("HOME", self.root.as_path()),
+            ("USERPROFILE", self.root.as_path()),
+            ("APPDATA", &self.root.join("AppData/Roaming")),
+            ("LOCALAPPDATA", &self.root.join("AppData/Local")),
+            ("XDG_CONFIG_HOME", &self.root.join(".config")),
+            ("XDG_CACHE_HOME", &self.root.join(".cache")),
+            ("XDG_DATA_HOME", &self.root.join(".local/share")),
+            ("XDG_STATE_HOME", &self.root.join(".local/state")),
+            ("XDG_RUNTIME_DIR", &self.root.join(".run")),
+        ]
+        .into_iter()
+        .map(|(name, path)| (name.to_string(), path.as_os_str().to_os_string()))
+        .collect();
+        if let Some(config_dir) = &self.user_config_dir {
+            pairs.push((
+                nemo_relay::plugin::USER_CONFIG_DIR_ENV.to_string(),
+                config_dir.as_os_str().to_os_string(),
+            ));
+        }
+        pairs
+    }
+
+    /// Applies the assignments to this process. Callers must run this before
+    /// the Tokio runtime and application threads exist.
+    pub(crate) fn apply_to_process_env(&self) {
+        for (name, value) in self.env_pairs() {
+            // SAFETY: callers invoke this in `run_cli` before the Tokio
+            // runtime is built, so no other thread observes the process
+            // environment concurrently.
+            unsafe { std::env::set_var(name, value) };
+        }
+    }
+
+    /// Applies the assignments to a spawned command — used by the gateway
+    /// launch boundary and by tests proving what a child can observe without
+    /// mutating this process's environment.
+    pub(crate) fn apply_to_command(&self, command: &mut std::process::Command) {
+        for (name, value) in self.env_pairs() {
+            command.env(name, value);
+        }
+    }
+}
+
+/// The operator's real home directory, when the launch environment exposes
+/// one — the value `NEMO_RELAY_REAL_HOME` records in generated contracts.
+fn real_home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Returns true when the operator explicitly opted the managed launch out of
+/// home isolation (`NEMO_RELAY_MCP_INHERIT_HOME=1`).
+pub(crate) fn inherit_home_requested() -> bool {
+    std::env::var(MCP_INHERIT_HOME_ENV).ok().as_deref() == Some("1")
+}
+
+/// Literal `env` entries `persistent_server` writes into generated MCP
+/// launch contracts, so the isolation boundary is visible in the installed
+/// config — and a host that delivers only literal env already gets the
+/// synthetic home even where a platform quirk would stop runtime
+/// enforcement.
+///
+/// With `NEMO_RELAY_MCP_INHERIT_HOME=1` in the install environment the
+/// contract instead records the opt-out and the real home explicitly — an
+/// operator reading the generated file can see which boundary applies.
+pub(crate) fn managed_home_env_literals() -> serde_json::Map<String, Value> {
+    let mut env = serde_json::Map::new();
+    if inherit_home_requested() {
+        env.insert(MCP_INHERIT_HOME_ENV.to_string(), Value::from("1"));
+        if let Some(home) = real_home_dir() {
+            env.insert(MCP_REAL_HOME_ENV.to_string(), json_path(&home));
+            env.insert("HOME".to_string(), json_path(&home));
+            env.insert("USERPROFILE".to_string(), json_path(&home));
+        }
+        return env;
+    }
+    if let Some(home) = real_home_dir() {
+        env.insert(MCP_REAL_HOME_ENV.to_string(), json_path(&home));
+    }
+    if let Some(config_dir) = crate::configuration::user_config_dir() {
+        for (name, value) in IsolatedHome::for_managed_mcp(config_dir).env_pairs() {
+            env.insert(name, json_path(&value));
+        }
+    }
+    env
+}
+
+fn json_path(value: impl AsRef<std::ffi::OsStr>) -> Value {
+    Value::from(value.as_ref().to_string_lossy().into_owned())
+}
+
+/// `env` keys the generated launch contract owns for the home boundary.
+///
+/// Readiness comparison ignores them — an install generated before the
+/// isolation layer existed, or before a machine moved home directories,
+/// still validates because runtime enforcement overrides stale values at
+/// process start. Anything else in `env` — the bind, the generation fence —
+/// remains exactly compared.
+pub(crate) fn managed_home_literal_names() -> &'static [&'static str] {
+    &[
+        "HOME",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "XDG_RUNTIME_DIR",
+        MCP_INHERIT_HOME_ENV,
+        MCP_REAL_HOME_ENV,
+        nemo_relay::plugin::USER_CONFIG_DIR_ENV,
+    ]
+}
+
+/// Switches a managed MCP launch to its isolated home.
+///
+/// Runs at process entry — before the Tokio runtime exists — so the
+/// assignments are visible to everything the session later resolves or
+/// spawns: the persistent gateway inherits them, config discovery follows
+/// the pinned directory, and any `HOME`-based credential lookup lands in
+/// the empty private tree.
+///
+/// `Ok(None)` means the launch was not managed (the generation fence is
+/// absent) or the operator opted out — in which case the real home recorded
+/// in `NEMO_RELAY_REAL_HOME` is restored when the launch contract carried
+/// the synthetic one. `Ok(Some)` is the synthetic root now assigned as
+/// `HOME`. `Err` fails closed: a managed launch that cannot establish its
+/// private home must not proceed with the ambient one.
+pub(crate) fn enforce_managed_home_isolation() -> Result<Option<PathBuf>, String> {
+    if std::env::var_os(GENERATION_FILE_ENV).is_none()
+        || std::env::var_os(GENERATION_TOKEN_ENV).is_none()
+    {
+        return Ok(None);
+    }
+    if inherit_home_requested() {
+        if let Some(real) = std::env::var_os(MCP_REAL_HOME_ENV).filter(|home| !home.is_empty()) {
+            // SAFETY: pre-runtime, as in apply_to_process_env.
+            unsafe {
+                std::env::set_var("HOME", &real);
+                std::env::set_var("USERPROFILE", &real);
+            }
+        }
+        return Ok(None);
+    }
+    let user_config_dir = crate::configuration::user_config_dir().ok_or_else(|| {
+        "managed MCP home isolation cannot determine the per-user NeMo Relay config directory; set HOME or USERPROFILE".to_string()
+    })?;
+    let home = IsolatedHome::for_managed_mcp(user_config_dir);
+    home.create()?;
+    let root = home.root().to_path_buf();
+    home.apply_to_process_env();
+    Ok(Some(root))
+}
+
+fn create_private_dir(path: &Path) -> Result<(), String> {
+    fs::create_dir_all(path)
+        .map_err(|error| format!("failed to create {}: {error}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("failed to secure {}: {error}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// A name the allowlist must not reintroduce: home-pointer variables are
+/// replaced by the isolated home, so forwarding one would only race the
+/// runtime's own assignment.
+fn legacy_home_pointer(name: &str) -> bool {
+    LEGACY_HOME_POINTER_MCP_ENV_VARS
+        .iter()
+        .any(|legacy| name.eq_ignore_ascii_case(legacy))
 }
 
 #[cfg(test)]
@@ -359,9 +662,7 @@ mod tests {
         let config = serde_json::json!({ "secret_access_key_var": "AWS_SECRET_ACCESS_KEY" });
         let forwarded = forwarded_names_for_platform(std::iter::empty(), Some(&config), false);
         assert!(
-            !forwarded
-                .iter()
-                .any(|name| name == "AWS_SECRET_ACCESS_KEY"),
+            !forwarded.iter().any(|name| name == "AWS_SECRET_ACCESS_KEY"),
             "a config field must not be able to forward a blocked credential"
         );
     }
@@ -377,5 +678,324 @@ mod tests {
                 "{name} is blocked and must not also be allowlisted"
             );
         }
+    }
+
+    /// Home-pointer names must not be forwarded: forwarding them lets plugin
+    /// code rediscover the operator's credential files through ordinary
+    /// home-directory lookup.
+    #[test]
+    fn home_pointer_names_are_not_forwarded() {
+        let environment = LEGACY_HOME_POINTER_MCP_ENV_VARS
+            .iter()
+            .map(|name| (*name).to_string());
+        let forwarded = forwarded_names_for_platform(environment, None, false);
+        for name in LEGACY_HOME_POINTER_MCP_ENV_VARS {
+            assert!(
+                !forwarded.iter().any(|candidate| candidate == name),
+                "{name} must not reach an MCP subprocess"
+            );
+        }
+    }
+
+    /// Installs generated before the isolated-home boundary still validate:
+    /// their stale `env_vars` entries are tolerated as previously forwardable
+    /// because the runtime overrides them at process start anyway.
+    #[test]
+    fn retired_home_pointers_remain_previously_forwardable() {
+        for name in LEGACY_HOME_POINTER_MCP_ENV_VARS {
+            assert!(
+                previously_forwardable_name_for_platform(name, false),
+                "{name} should remain a tolerable historical extra"
+            );
+        }
+    }
+
+    /// A config field naming a home pointer cannot reintroduce it through
+    /// `env_vars` — the isolated home is what the subprocess will see.
+    #[test]
+    fn config_fields_cannot_reintroduce_home_pointers() {
+        let config = serde_json::json!({
+            "header_env": { "X-Home": "HOME" },
+            "secret_access_key_var": "HOME"
+        });
+        let forwarded = forwarded_names_for_platform(std::iter::empty(), Some(&config), false);
+        assert!(
+            !forwarded.iter().any(|name| name == "HOME"),
+            "a config field must not be able to forward a home pointer"
+        );
+    }
+
+    #[test]
+    fn isolated_home_points_every_lookup_at_the_private_root() {
+        let config_dir = PathBuf::from("/config/nemo-relay");
+        let home = IsolatedHome::for_managed_mcp(config_dir.clone());
+        let pairs: std::collections::BTreeMap<String, OsString> =
+            home.env_pairs().into_iter().collect();
+        let root = config_dir.join(ISOLATED_HOME_DIR);
+        for (name, expected) in [
+            ("HOME", root.clone()),
+            ("USERPROFILE", root.clone()),
+            ("APPDATA", root.join("AppData/Roaming")),
+            ("LOCALAPPDATA", root.join("AppData/Local")),
+            ("XDG_CONFIG_HOME", root.join(".config")),
+            ("XDG_CACHE_HOME", root.join(".cache")),
+            ("XDG_DATA_HOME", root.join(".local/share")),
+            ("XDG_STATE_HOME", root.join(".local/state")),
+            ("XDG_RUNTIME_DIR", root.join(".run")),
+            (nemo_relay::plugin::USER_CONFIG_DIR_ENV, config_dir.clone()),
+        ] {
+            assert_eq!(
+                pairs.get(name).map(OsString::as_os_str),
+                Some(expected.as_os_str()),
+                "{name} must resolve inside the isolated home"
+            );
+        }
+        assert_eq!(home.root(), root.as_path());
+    }
+
+    /// The check the old residual comment could not make: a credential file in
+    /// the operator's real home is unreachable through ordinary home-directory
+    /// or XDG lookup once the isolated home applies.
+    #[cfg(unix)]
+    #[test]
+    fn spawned_subprocess_cannot_discover_credentials_in_the_real_home() {
+        let real_home = tempfile::tempdir().expect("fake real home");
+        let config_dir = real_home.path().join(".config").join("nemo-relay");
+        std::fs::create_dir_all(&config_dir).expect("config dir");
+        for credential in [
+            ".aws/credentials",
+            ".ssh/id_rsa",
+            ".config/gh/hosts.yml",
+            ".git-credentials",
+        ] {
+            let path = real_home.path().join(credential);
+            std::fs::create_dir_all(path.parent().expect("credential parent"))
+                .expect("credential parent dir");
+            std::fs::write(&path, b"secret\n").expect("fake credential");
+        }
+
+        let home = IsolatedHome::for_managed_mcp(config_dir);
+        home.create().expect("create isolated home");
+
+        // HOME-based lookup: nothing under the synthetic root exists except
+        // what the isolated home created.
+        let mut home_lookup = std::process::Command::new("/bin/sh");
+        home_lookup
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .arg("-c")
+            .arg(
+                "for f in \"$HOME/.aws/credentials\" \"$HOME/.ssh/id_rsa\" \
+                \"$HOME/.config/gh/hosts.yml\" \"$HOME/.git-credentials\"; do \
+                if [ -f \"$f\" ]; then echo \"found $f\"; exit 1; fi; \
+            done",
+            );
+        home.apply_to_command(&mut home_lookup);
+        let output = home_lookup.output().expect("home lookup probe");
+        assert!(
+            output.status.success(),
+            "subprocess observed real-home credentials: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+
+        // XDG-based lookup hits the same private root.
+        let mut xdg_lookup = std::process::Command::new("/bin/sh");
+        xdg_lookup
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .arg("-c")
+            .arg("[ ! -f \"$XDG_CONFIG_HOME/gh/hosts.yml\" ]");
+        home.apply_to_command(&mut xdg_lookup);
+        assert!(
+            xdg_lookup
+                .output()
+                .expect("xdg lookup probe")
+                .status
+                .success()
+        );
+
+        // The created root is owner-only.
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(home.root())
+            .expect("isolated root metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700, "isolated home must be owner-only");
+    }
+
+    /// The runtime enforcement: a managed launch (the generation fence is
+    /// present) swaps HOME for the private directory and pins the real config
+    /// directory for discovery.
+    #[test]
+    fn managed_launch_switches_to_the_isolated_home() {
+        let base = tempfile::tempdir().expect("home base");
+        let real_home = base.path().join("real-home");
+        let config_dir = base.path().join("config").join("nemo-relay");
+        std::fs::create_dir_all(&config_dir).expect("config dir");
+        let generation = base.path().join("generation");
+        std::fs::write(&generation, b"{}\n").expect("generation file");
+        let _scope = crate::test_support::EnvScope::set(&[
+            ("HOME", Some(real_home.as_os_str())),
+            ("USERPROFILE", None),
+            ("APPDATA", None),
+            ("LOCALAPPDATA", None),
+            ("XDG_CONFIG_HOME", None),
+            ("XDG_CACHE_HOME", Some(std::ffi::OsStr::new("/real/cache"))),
+            ("XDG_DATA_HOME", Some(std::ffi::OsStr::new("/real/data"))),
+            ("XDG_STATE_HOME", Some(std::ffi::OsStr::new("/real/state"))),
+            (
+                "XDG_RUNTIME_DIR",
+                Some(std::ffi::OsStr::new("/run/user/1000")),
+            ),
+            (
+                nemo_relay::plugin::USER_CONFIG_DIR_ENV,
+                Some(config_dir.as_os_str()),
+            ),
+            (GENERATION_FILE_ENV, Some(generation.as_os_str())),
+            (GENERATION_TOKEN_ENV, Some(std::ffi::OsStr::new("token"))),
+            (MCP_INHERIT_HOME_ENV, None),
+            (MCP_REAL_HOME_ENV, None),
+        ]);
+
+        let root = enforce_managed_home_isolation()
+            .expect("isolation should succeed")
+            .expect("a managed launch must isolate");
+
+        assert_eq!(root, config_dir.join(ISOLATED_HOME_DIR));
+        assert_eq!(std::env::var_os("HOME").as_deref(), Some(root.as_os_str()));
+        for name in [
+            "XDG_CONFIG_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+        ] {
+            let value = std::env::var_os(name).expect("xdg assignment");
+            assert!(
+                Path::new(&value).starts_with(&root),
+                "{name} must resolve inside the isolated home, got {value:?}"
+            );
+        }
+        // The pin keeps config discovery on the real directory.
+        assert_eq!(
+            crate::configuration::user_config_dir().expect("config dir"),
+            config_dir
+        );
+    }
+
+    /// An unmanaged `nemo-relay mcp` — no generation fence — keeps whatever
+    /// environment the operator ran it with.
+    #[test]
+    fn unmanaged_launch_keeps_the_ambient_environment() {
+        let _scope = crate::test_support::EnvScope::set(&[
+            (GENERATION_FILE_ENV, None),
+            (GENERATION_TOKEN_ENV, None),
+            (MCP_INHERIT_HOME_ENV, None),
+        ]);
+        let before = std::env::var_os("HOME");
+        assert!(enforce_managed_home_isolation().unwrap().is_none());
+        assert_eq!(std::env::var_os("HOME"), before);
+    }
+
+    /// The documented opt-out: `NEMO_RELAY_MCP_INHERIT_HOME=1` restores the
+    /// real home the generated contract recorded in `NEMO_RELAY_REAL_HOME`.
+    #[test]
+    fn inherit_home_opt_out_restores_the_real_home() {
+        let base = tempfile::tempdir().expect("home base");
+        let real_home = base.path().join("real-home");
+        let synthetic = base.path().join("synthetic");
+        let _scope = crate::test_support::EnvScope::set(&[
+            ("HOME", Some(synthetic.as_os_str())),
+            ("USERPROFILE", Some(synthetic.as_os_str())),
+            (
+                nemo_relay::plugin::USER_CONFIG_DIR_ENV,
+                Some(base.path().as_os_str()),
+            ),
+            (GENERATION_FILE_ENV, Some(std::ffi::OsStr::new("/tmp/gen"))),
+            (GENERATION_TOKEN_ENV, Some(std::ffi::OsStr::new("token"))),
+            (MCP_INHERIT_HOME_ENV, Some(std::ffi::OsStr::new("1"))),
+            (MCP_REAL_HOME_ENV, Some(real_home.as_os_str())),
+        ]);
+        assert!(enforce_managed_home_isolation().unwrap().is_none());
+        assert_eq!(
+            std::env::var_os("HOME").as_deref(),
+            Some(real_home.as_os_str())
+        );
+    }
+
+    /// A managed launch with no way to name the config directory fails closed
+    /// rather than running under the ambient home.
+    #[test]
+    fn managed_launch_without_a_config_dir_fails_closed() {
+        let _scope = crate::test_support::EnvScope::set(&[
+            ("HOME", None),
+            ("USERPROFILE", None),
+            ("XDG_CONFIG_HOME", None),
+            (nemo_relay::plugin::USER_CONFIG_DIR_ENV, None),
+            (GENERATION_FILE_ENV, Some(std::ffi::OsStr::new("/tmp/gen"))),
+            (GENERATION_TOKEN_ENV, Some(std::ffi::OsStr::new("token"))),
+            (MCP_INHERIT_HOME_ENV, None),
+        ]);
+        assert!(
+            enforce_managed_home_isolation().is_err(),
+            "a managed launch that cannot establish its private home must refuse"
+        );
+    }
+
+    /// The generated launch contract carries the boundary in literals: the
+    /// installed file itself shows which home the subprocess gets.
+    #[test]
+    fn generated_env_literals_carry_the_isolation_boundary() {
+        let base = tempfile::tempdir().expect("home base");
+        let real_home = base.path().join("real-home");
+        let config_dir = real_home.join(".config").join("nemo-relay");
+        let _scope = crate::test_support::EnvScope::set(&[
+            ("HOME", Some(real_home.as_os_str())),
+            ("USERPROFILE", None),
+            ("XDG_CONFIG_HOME", None),
+            (nemo_relay::plugin::USER_CONFIG_DIR_ENV, None),
+            (MCP_INHERIT_HOME_ENV, None),
+        ]);
+
+        let env = managed_home_env_literals();
+        let root = config_dir.join(ISOLATED_HOME_DIR);
+        assert_eq!(env["HOME"], serde_json::json!(root.to_string_lossy()));
+        assert_eq!(
+            env["XDG_CONFIG_HOME"],
+            serde_json::json!(root.join(".config").to_string_lossy())
+        );
+        assert_eq!(
+            env[nemo_relay::plugin::USER_CONFIG_DIR_ENV],
+            serde_json::json!(config_dir.to_string_lossy())
+        );
+        assert_eq!(
+            env[MCP_REAL_HOME_ENV],
+            serde_json::json!(real_home.to_string_lossy())
+        );
+    }
+
+    /// An opted-out install records the choice honestly: the literal block
+    /// names the real home instead of pretending isolation applies.
+    #[test]
+    fn opt_out_install_records_the_real_home() {
+        let base = tempfile::tempdir().expect("home base");
+        let real_home = base.path().join("real-home");
+        let _scope = crate::test_support::EnvScope::set(&[
+            ("HOME", Some(real_home.as_os_str())),
+            ("USERPROFILE", None),
+            (MCP_INHERIT_HOME_ENV, Some(std::ffi::OsStr::new("1"))),
+        ]);
+
+        let env = managed_home_env_literals();
+        assert_eq!(env[MCP_INHERIT_HOME_ENV], serde_json::json!("1"));
+        assert_eq!(
+            env[MCP_REAL_HOME_ENV],
+            serde_json::json!(real_home.to_string_lossy())
+        );
+        assert_eq!(env["HOME"], serde_json::json!(real_home.to_string_lossy()));
+        assert!(
+            env.get("XDG_CONFIG_HOME").is_none(),
+            "an opt-out contract must not promise isolated XDG paths"
+        );
     }
 }

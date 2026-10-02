@@ -285,6 +285,22 @@ settings to MCP differently:
   credential variables referenced by user observability configuration.
 - Claude Code supplies its normal plugin MCP environment.
 
+Environment filtering alone is not a credential boundary: a process that can
+see the real `HOME` rediscovers `~/.aws`, `~/.ssh`, `~/.config/gh`, cloud CLI
+state, and package-manager tokens through ordinary home-directory lookup even
+when no credential variable was forwarded. Managed launches therefore run
+under a synthetic private home inside the user Relay configuration
+directory — `HOME`, `USERPROFILE`, `APPDATA`/`LOCALAPPDATA`, and every
+`XDG_*` root point at `<config>/nemo-relay/mcp-home`, while
+`NEMO_RELAY_USER_CONFIG_DIR` pins the real configuration directory so
+`config.toml`, `plugins.toml`, bootstrap state, and managed plugin
+environments keep resolving. The spawned gateway applies the same boundary
+when it starts, so unmanaged launch paths (for example the checked-in
+marketplace manifest) get the same filesystem isolation where plugin code
+actually runs. Setting `NEMO_RELAY_MCP_INHERIT_HOME=1` at install time
+records an explicit opt-out in the generated launch contract; leave it unset
+unless an integration genuinely needs ambient user files.
+
 The long-lived managed sidecar injects a forwarded provider credential only when
 a request carries provider authorization or Relay's private per-user client
 proof. The Codex installer writes a domain-separated HMAC proof into the

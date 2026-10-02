@@ -88,6 +88,16 @@ fn compatible_gateway_is_reused_without_starting_another_process() {
 #[test]
 fn foreign_and_incompatible_listeners_are_never_adopted() {
     crate::test_support::enable_operational_logs();
+    // Pin the environment: acquisition resolves bootstrap state through the
+    // user config directory, which must not drift while another test's
+    // EnvScope owns the process environment.
+    let temp = tempfile::tempdir().unwrap();
+    let _environment = crate::test_support::EnvScope::set(&[
+        ("XDG_CONFIG_HOME", Some(temp.path().as_os_str())),
+        ("HOME", Some(temp.path().as_os_str())),
+        ("USERPROFILE", None),
+        (nemo_relay::plugin::USER_CONFIG_DIR_ENV, None),
+    ]);
     let incompatible = format!(
         "{{\"status\":\"incompatible\",\"service\":\"nemo-relay\",\"version\":\"other\",\"bootstrap_protocol\":{BOOTSTRAP_PROTOCOL_VERSION},\"instance_id\":\"other\"}}"
     );

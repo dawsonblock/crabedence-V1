@@ -39,6 +39,13 @@ use std::process::ExitCode;
 #[doc(hidden)]
 pub fn run_cli() -> ExitCode {
     mcp_environment::remove_unresolved_mcp_placeholders();
+    if let Err(error) = mcp_environment::enforce_managed_home_isolation() {
+        // A managed MCP launch that cannot establish its private home must not
+        // proceed with the ambient one — that is exactly the residual the
+        // isolation layer exists to close.
+        eprintln!("nemo-relay: managed MCP home isolation failed: {error}");
+        return ExitCode::FAILURE;
+    }
     let bootstrap_shutdown_token = take_bootstrap_shutdown_token();
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()

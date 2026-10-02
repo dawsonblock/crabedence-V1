@@ -1503,13 +1503,18 @@ fn plugin_manifests_and_hooks_use_path_based_relay_command() {
     assert_eq!(server["command"], json!("/bin/nemo-relay"));
     assert_eq!(server["args"], json!(["mcp"]));
     assert_eq!(
-        server["env"],
-        json!({
-            "NEMO_RELAY_GATEWAY_BIND": "127.0.0.1:47632",
-            "NEMO_RELAY_MCP_GENERATION_FILE": &generation_fence,
-            "NEMO_RELAY_MCP_GENERATION": TEST_GENERATION_TOKEN
-        })
+        server["env"]["NEMO_RELAY_GATEWAY_BIND"],
+        json!("127.0.0.1:47632")
     );
+    assert_eq!(
+        server["env"]["NEMO_RELAY_MCP_GENERATION_FILE"],
+        json!(&generation_fence)
+    );
+    assert_eq!(
+        server["env"]["NEMO_RELAY_MCP_GENERATION"],
+        json!(TEST_GENERATION_TOKEN)
+    );
+    crate::test_support::assert_managed_home_env(&server["env"]);
     assert_eq!(server["required"], json!(true));
     assert_eq!(server["startup_timeout_sec"], json!(20));
     assert!(

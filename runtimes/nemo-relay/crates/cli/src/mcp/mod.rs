@@ -117,14 +117,14 @@ pub(crate) fn persistent_server(
     let bind = persistent_gateway_bind()?;
     #[cfg(not(feature = "__test-cli-port-override"))]
     let bind = crate::bootstrap::DEFAULT_BIND;
+    let mut env = crate::mcp_environment::managed_home_env_literals();
+    env.insert("NEMO_RELAY_GATEWAY_BIND".to_string(), json!(bind));
+    env.insert(GENERATION_FILE_ENV.to_string(), json!(generation_file));
+    env.insert(GENERATION_TOKEN_ENV.to_string(), json!(generation_token));
     Ok(json!({
         "command": relay,
         "args": LAUNCH_ARGS,
-        "env": {
-            "NEMO_RELAY_GATEWAY_BIND": bind,
-            (GENERATION_FILE_ENV): generation_file,
-            (GENERATION_TOKEN_ENV): generation_token
-        }
+        "env": env,
     }))
 }
 
