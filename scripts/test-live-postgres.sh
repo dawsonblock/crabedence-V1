@@ -129,10 +129,12 @@ start_docker_postgres() {
     --name "$DOCKER_CONTAINER" \
     -p "127.0.0.1:$PG_PORT:5432" \
     -e POSTGRES_USER=postgres \
-    -e POSTGRES_PASSWORD=postgres \
+    -e POSTGRES_HOST_AUTH_METHOD=trust \
     -e POSTGRES_DB="$PG_DB" \
     "$PG_IMAGE" >/dev/null
-  CRABBOX_TEST_DATABASE_URL="postgres://postgres:postgres@127.0.0.1:$PG_PORT/$PG_DB"
+  # Trust auth on a loopback-bound throwaway container — same auth model as
+  # the initdb fallback below, no credential in the URL.
+  CRABBOX_TEST_DATABASE_URL="postgres://postgres@127.0.0.1:$PG_PORT/$PG_DB"
 }
 
 start_local_postgres() {
