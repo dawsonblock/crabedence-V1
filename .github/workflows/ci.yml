@@ -238,6 +238,23 @@ jobs:
       # this job fails and the lane moves; it does not quietly downgrade to
       # the fail-closed probe alone (that refusal is separately qualified by
       # `restricted-linux-fails-closed-when-the-kernel-cannot-confine`).
+      # ubuntu-24.04 mediates user-namespace creation through AppArmor
+      # (kernel.apparmor_restrict_unprivileged_userns=1): unshare succeeds but
+      # the setgroups write is refused for binaries carrying no userns
+      # profile. This lane exists to prove the sandbox on a capable kernel,
+      # so the job provisions the capability on the ephemeral runner rather
+      # than treating the hosted image's default policy as the property under
+      # test. Older images carry the Debian-style gate instead; both knobs are
+      # set when present.
+      - name: Allow unprivileged user namespaces on the qualification lane
+        run: |
+          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          if [ -f /proc/sys/kernel/unprivileged_userns_clone ]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+          sysctl kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone 2>/dev/null || true
       - name: Qualify restricted-linux plugin confinement
         working-directory: runtimes/nemo-relay
         env:
