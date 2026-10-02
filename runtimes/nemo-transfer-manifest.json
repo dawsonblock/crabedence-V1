@@ -1,7 +1,7 @@
 {
   "tree": "runtimes/nemo-relay",
   "runtime_version": "0.9.1-rc.4",
-  "shipped_tree_sha256": "a46cb2b310d603a8af5f3c0dfcdbe5edd7213e72967619f95ab7071fb9f2b473",
+  "shipped_tree_sha256": "f43a0ee9f8f0c2c6c18c881e1d4c470c93aaf87dc5633a26a6d349fd801f7581",
   "file_count": 1461,
   "excluded": [
     ".git",
@@ -37,6 +37,7 @@
     "crates/native-loader/Cargo.toml",
     "crates/native-loader/src/bin/nemo-plugin-host.rs",
     "crates/native-loader/src/bin/unix/nemo-plugin-host.rs",
+    "crates/native-loader/src/service.rs",
     "crates/plugin-host/src/isolation_policy.rs",
     "crates/plugin-host/src/lib.rs",
     "crates/plugin-host/src/runtime_service.rs",

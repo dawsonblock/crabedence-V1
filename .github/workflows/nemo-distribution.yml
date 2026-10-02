@@ -243,7 +243,11 @@ jobs:
               exit 1
             }
           done
-          sha256sum nemo-control_*.tar.gz | LC_ALL=C sort -k2 > "nemo-control_${{ needs.prepare.outputs.version }}_SHA256SUMS"
+          # The attestations go into the signed manifest too: an unsigned
+          # sidecar beside an authenticated archive could be swapped for a
+          # fabricated pass without touching the tarball.
+          sha256sum nemo-control_*.tar.gz nemo-control_*.tar.gz.qualification.json \
+            | LC_ALL=C sort -k2 > "nemo-control_${{ needs.prepare.outputs.version }}_SHA256SUMS"
           cat "nemo-control_${{ needs.prepare.outputs.version }}_SHA256SUMS"
 
       # Sign the checksum manifest with the same release key — a published

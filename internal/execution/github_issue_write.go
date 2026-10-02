@@ -291,19 +291,21 @@ func (h *GitHubIssueCloseHandler) Resolve(ctx context.Context, rec *idempotency.
 	}
 
 	var issue struct {
-		Number  int    `json:"number"`
-		State   string `json:"state"`
-		HTMLURL string `json:"html_url"`
+		Number   int    `json:"number"`
+		State    string `json:"state"`
+		HTMLURL  string `json:"html_url"`
+		ClosedAt string `json:"closed_at"`
 	}
 	if err := json.Unmarshal(respBody, &issue); err != nil {
 		return idempotency.RecoveryResult{}, fmt.Errorf("github issue get unparseable: %w", err)
 	}
-	if issue.State == "closed" {
+	if issue.State == "closed" && transitionWithinExecution(issue.ClosedAt, rec) {
 		result, _ := json.Marshal(map[string]any{
 			"issue_number": issue.Number,
 			"issue_url":    issue.HTMLURL,
 			"repo":         repo,
 			"state":        issue.State,
+			"closed_at":    issue.ClosedAt,
 		})
 		return idempotency.RecoveryResult{
 			Decision:         idempotency.RecoveryCommitted,
@@ -318,7 +320,8 @@ func (h *GitHubIssueCloseHandler) Resolve(ctx context.Context, rec *idempotency.
 		Decision:   idempotency.RecoveryUnknown,
 		ProviderID: "github",
 		Result: json.RawMessage(fmt.Sprintf(
-			`{"repo":%q,"issue":%d,"state_observed":%q}`, repo, number, issue.State)),
+			`{"repo":%q,"issue":%d,"state_observed":%q,"closed_at":%q}`,
+			repo, number, issue.State, issue.ClosedAt)),
 	}, nil
 }
 
@@ -347,6 +350,30 @@ func locatorRepoNumber(loc idempotency.RecoveryLocator, kind string) (string, in
 		}
 	}
 	return repo, number
+}
+
+// providerSkewTolerance bounds the clock disagreement tolerated between
+// this host and the provider when a transition timestamp is compared
+// against the record's creation time.
+const providerSkewTolerance = 30 * time.Second
+
+// transitionWithinExecution reports whether a provider-reported transition
+// timestamp can belong to this execution. Observing shared current state
+// alone proves nothing about which invocation caused it — a transition
+// that predates the record is conclusively *not* this execution's effect,
+// while one inside the window is the strongest attribution the provider's
+// plain resource API offers. A same-window concurrent actor remains
+// indistinguishable, which is why these resolvers stay observational:
+// ambiguous evidence resolves Unknown, never Committed.
+func transitionWithinExecution(transition string, rec *idempotency.Record) bool {
+	if transition == "" || rec == nil || rec.CreatedAt.IsZero() {
+		return false
+	}
+	at, err := time.Parse(time.RFC3339, transition)
+	if err != nil {
+		return false
+	}
+	return !at.Before(rec.CreatedAt.Add(-providerSkewTolerance))
 }
 
 // GitHubIssueUpdateHandler implements the github.issue.update
@@ -663,11 +690,12 @@ func (h *GitHubIssueUpdateHandler) Resolve(ctx context.Context, rec *idempotency
 	}
 
 	var issue struct {
-		Number  int    `json:"number"`
-		Title   string `json:"title"`
-		Body    string `json:"body"`
-		HTMLURL string `json:"html_url"`
-		Labels  []struct {
+		Number    int    `json:"number"`
+		Title     string `json:"title"`
+		Body      string `json:"body"`
+		HTMLURL   string `json:"html_url"`
+		UpdatedAt string `json:"updated_at"`
+		Labels    []struct {
 			Name string `json:"name"`
 		} `json:"labels"`
 		Assignees []struct {
@@ -705,12 +733,17 @@ func (h *GitHubIssueUpdateHandler) Resolve(ctx context.Context, rec *idempotency
 			mismatched = append(mismatched, field)
 		}
 	}
-	if len(mismatched) == 0 {
+	// Matching content alone does not show *this* execution made it so —
+	// the issue may already have carried exactly those values. The provider
+	// timestamp has to place the last transition inside this record's
+	// lifetime before the observed state can be called ours.
+	if len(mismatched) == 0 && transitionWithinExecution(issue.UpdatedAt, rec) {
 		result, _ := json.Marshal(map[string]any{
 			"issue_number": issue.Number,
 			"issue_url":    issue.HTMLURL,
 			"repo":         repo,
 			"fields":       sortedKeys(want),
+			"updated_at":   issue.UpdatedAt,
 		})
 		return idempotency.RecoveryResult{
 			Decision:         idempotency.RecoveryCommitted,
@@ -726,8 +759,8 @@ func (h *GitHubIssueUpdateHandler) Resolve(ctx context.Context, rec *idempotency
 		Decision:   idempotency.RecoveryUnknown,
 		ProviderID: "github",
 		Result: json.RawMessage(fmt.Sprintf(
-			`{"repo":%q,"issue":%d,"fields_mismatched":%s}`,
-			repo, number, mustJSON(mismatched))),
+			`{"repo":%q,"issue":%d,"fields_mismatched":%s,"updated_at":%q}`,
+			repo, number, mustJSON(mismatched), issue.UpdatedAt)),
 	}, nil
 }
 

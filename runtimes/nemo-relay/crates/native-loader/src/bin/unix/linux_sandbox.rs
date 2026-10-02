@@ -180,7 +180,17 @@ pub(crate) fn enter(allowed_root: &Path, cleanup: Option<&Path>) -> Result<(), S
     // inner process is pid 1 of the new namespace; the outer process waits and
     // mirrors its exit, which is also what keeps the supervisor's view honest —
     // kill_on_drop and the startup deadline act on the outer pid while
-    // PDEATHSIG propagates any death of it to the confined child.
+    // PDEATHSIG propagates any death of it to the confined child. The lifeline
+    // pipe covers the race PDEATHSIG cannot: a shim that dies *between* the
+    // fork and the prctl leaves no signal to arm, but the child's poll on the
+    // inherited read end sees the write end already closed.
+    let mut lifeline = [0i32; 2];
+    if unsafe { libc::pipe2(lifeline.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(format!(
+            "could not create the supervisor lifeline: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         return Err(format!(
@@ -189,16 +199,39 @@ pub(crate) fn enter(allowed_root: &Path, cleanup: Option<&Path>) -> Result<(), S
         ));
     }
     if pid > 0 {
+        // The shim holds only the write end: its death — signal, exit, or
+        // kill -9 — closes it and the confined child observes the hangup.
+        unsafe { libc::close(lifeline[0]) };
         wait_shim(pid, cleanup);
     }
 
     // Confined child from here: pid 1 of the new PID namespace.
     unsafe {
+        // This copy of the write end must go first: held open, it would mask
+        // the very hangup the lifeline exists to report.
+        libc::close(lifeline[1]);
         if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
             return Err(format!(
                 "could not bind this host's death to its supervisor's: {}",
                 std::io::Error::last_os_error()
             ));
+        }
+        // The shim's pid is unreachable from inside this PID namespace —
+        // getppid() answers 0 either way — so the lifeline is the only
+        // check that can catch a shim that died before the prctl landed.
+        // Any readiness is anomalous: the shim never writes, so POLLIN is
+        // as much a protocol violation as POLLHUP is a death report.
+        let mut lifeline_poll = libc::pollfd {
+            fd: lifeline[0],
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if libc::poll(&mut lifeline_poll, 1, 0) != 0 {
+            return Err(
+                "the supervisor shim was already gone when the sandbox bound to it — \
+                 refusing to start unsupervised"
+                    .to_string(),
+            );
         }
         // Nobody may ptrace this process or read its memory through /proc even
         // where the credentials would allow it.
@@ -385,22 +418,18 @@ fn self_check(
     // A confined /proc, when it is present at all, shows only this PID
     // namespace: the serving process is its init, so "1" is the only numeric
     // entry that may appear. A withheld /proc is equally confined.
-    match std::fs::read_dir("/proc") {
-        Ok(entries) => {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                if let Some(text) = name.to_str() {
-                    let numeric =
-                        !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
-                    if numeric && text != "1" {
-                        failures.push(format!(
-                            "/proc exposes a process outside the namespace: {text}"
-                        ));
-                    }
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if let Some(text) = name.to_str() {
+                let numeric = !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+                if numeric && text != "1" {
+                    failures.push(format!(
+                        "/proc exposes a process outside the namespace: {text}"
+                    ));
                 }
             }
         }
-        Err(_) => {}
     }
     // The escape surface itself: every number the filter names must come back
     // with the boundary's EPERM rather than the syscall's own answer. The
@@ -449,23 +478,18 @@ fn self_check(
         );
         unsafe { libc::close(datagram) };
     }
-    // The flags the boundary set must still be set: a plugin that could mark
-    // itself dumpable or clear no_new_privs would reopen channels every
-    // denial above assumes closed, and a capability still in the bounding set
-    // is a privilege the drops did not take.
+    // The flags the boundary set must still be set — a plugin that could mark
+    // itself dumpable or clear no_new_privs would reopen channels every denial
+    // above assumes closed — and no capability may survive in any set: the
+    // payload runs in this process without an exec, so a surviving effective
+    // or permitted bit is a live privilege, not a latent one.
     if unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) } != 0 {
         failures.push("the process is still dumpable".to_string());
     }
     if unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) } != 1 {
         failures.push("no_new_privs is not set".to_string());
     }
-    for capability in 0..64 {
-        if unsafe { libc::prctl(libc::PR_CAPBSET_READ, capability, 0, 0, 0) } == 1 {
-            failures.push(format!(
-                "capability {capability} is still in the bounding set"
-            ));
-        }
-    }
+    check_capability_sets(&mut failures);
     if failures.is_empty() {
         let mut out = std::io::stdout().lock();
         let _ = writeln!(out, "{PROBE_ACK}");
@@ -506,63 +530,138 @@ fn denied_syscall(failures: &mut Vec<String>, name: &str, result: i64) {
     }
 }
 
+/// Prove no capability survives in any set the payload could use.
+///
+/// The bounding set governs only what an exec may *regain* — and the payload
+/// never execs, so the sets usable right now are checked directly: `capget`
+/// answers this process's effective, permitted and inheritable without
+/// depending on a /proc the sandbox may have withheld, and the ambient and
+/// bounding sets are probed bit by bit.
+fn check_capability_sets(failures: &mut Vec<String>) {
+    for capability in 0..64 {
+        if unsafe { libc::prctl(libc::PR_CAPBSET_READ, capability, 0, 0, 0) } == 1 {
+            failures.push(format!(
+                "capability {capability} is still in the bounding set"
+            ));
+        }
+    }
+    let capability_header = CapUserHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let mut capability_data = [CapUserData::default(), CapUserData::default()];
+    if unsafe {
+        libc::syscall(
+            libc::SYS_capget,
+            &capability_header,
+            capability_data.as_mut_ptr(),
+        )
+    } != 0
+    {
+        failures.push(format!(
+            "the probe could not read its own capability sets: {}",
+            std::io::Error::last_os_error()
+        ));
+        return;
+    }
+    for (index, word) in capability_data.iter().enumerate() {
+        if word.effective != 0 {
+            failures.push(format!(
+                "effective capability set word {index} is not empty: {:#x}",
+                word.effective
+            ));
+        }
+        if word.permitted != 0 {
+            failures.push(format!(
+                "permitted capability set word {index} is not empty: {:#x}",
+                word.permitted
+            ));
+        }
+        if word.inheritable != 0 {
+            failures.push(format!(
+                "inheritable capability set word {index} is not empty: {:#x}",
+                word.inheritable
+            ));
+        }
+    }
+    for capability in 0..=40 {
+        if unsafe {
+            libc::prctl(
+                libc::PR_CAP_AMBIENT,
+                libc::PR_CAP_AMBIENT_IS_SET,
+                capability,
+                0,
+                0,
+            )
+        } == 1
+        {
+            failures.push(format!(
+                "capability {capability} is still in the ambient set"
+            ));
+        }
+    }
+}
+
 /// What a failure report calls each blocked number.
 ///
 /// The table is advisory — an entry the filter was updated to cover but this
 /// function was not still reports by number, which is the name a deployment
 /// can grep the syscall table for.
+const SYSCALL_NAMES: &[(u32, &str)] = &[
+    (libc::SYS_execve as u32, "execve"),
+    (libc::SYS_execveat as u32, "execveat"),
+    (libc::SYS_ptrace as u32, "ptrace"),
+    (libc::SYS_process_vm_readv as u32, "process_vm_readv"),
+    (libc::SYS_process_vm_writev as u32, "process_vm_writev"),
+    (libc::SYS_connect as u32, "connect"),
+    (libc::SYS_sendmsg as u32, "sendmsg"),
+    (libc::SYS_sendmmsg as u32, "sendmmsg"),
+    (libc::SYS_mount as u32, "mount"),
+    (libc::SYS_umount2 as u32, "umount2"),
+    (libc::SYS_pivot_root as u32, "pivot_root"),
+    (libc::SYS_move_mount as u32, "move_mount"),
+    (libc::SYS_fsopen as u32, "fsopen"),
+    (libc::SYS_fsconfig as u32, "fsconfig"),
+    (libc::SYS_fsmount as u32, "fsmount"),
+    (libc::SYS_fspick as u32, "fspick"),
+    (libc::SYS_open_tree as u32, "open_tree"),
+    (libc::SYS_mount_setattr as u32, "mount_setattr"),
+    (libc::SYS_setns as u32, "setns"),
+    (libc::SYS_unshare as u32, "unshare"),
+    (libc::SYS_chroot as u32, "chroot"),
+    (libc::SYS_kexec_load as u32, "kexec_load"),
+    (libc::SYS_kexec_file_load as u32, "kexec_file_load"),
+    (libc::SYS_init_module as u32, "init_module"),
+    (libc::SYS_finit_module as u32, "finit_module"),
+    (libc::SYS_delete_module as u32, "delete_module"),
+    (libc::SYS_bpf as u32, "bpf"),
+    (libc::SYS_perf_event_open as u32, "perf_event_open"),
+    (libc::SYS_keyctl as u32, "keyctl"),
+    (libc::SYS_add_key as u32, "add_key"),
+    (libc::SYS_request_key as u32, "request_key"),
+    (libc::SYS_name_to_handle_at as u32, "name_to_handle_at"),
+    (libc::SYS_open_by_handle_at as u32, "open_by_handle_at"),
+    (libc::SYS_swapon as u32, "swapon"),
+    (libc::SYS_swapoff as u32, "swapoff"),
+    (libc::SYS_reboot as u32, "reboot"),
+    (libc::SYS_userfaultfd as u32, "userfaultfd"),
+    (libc::SYS_io_uring_setup as u32, "io_uring_setup"),
+    (libc::SYS_io_uring_enter as u32, "io_uring_enter"),
+    (libc::SYS_io_uring_register as u32, "io_uring_register"),
+    (libc::SYS_acct as u32, "acct"),
+    (libc::SYS_quotactl as u32, "quotactl"),
+    (libc::SYS_quotactl_fd as u32, "quotactl_fd"),
+    (libc::SYS_sethostname as u32, "sethostname"),
+    (libc::SYS_setdomainname as u32, "setdomainname"),
+    (libc::SYS_syslog as u32, "syslog"),
+    (libc::SYS_kcmp as u32, "kcmp"),
+];
+
 fn syscall_name(number: u32) -> String {
-    let name = match number {
-        n if n == libc::SYS_execve as u32 => "execve",
-        n if n == libc::SYS_execveat as u32 => "execveat",
-        n if n == libc::SYS_ptrace as u32 => "ptrace",
-        n if n == libc::SYS_process_vm_readv as u32 => "process_vm_readv",
-        n if n == libc::SYS_process_vm_writev as u32 => "process_vm_writev",
-        n if n == libc::SYS_connect as u32 => "connect",
-        n if n == libc::SYS_sendmsg as u32 => "sendmsg",
-        n if n == libc::SYS_sendmmsg as u32 => "sendmmsg",
-        n if n == libc::SYS_mount as u32 => "mount",
-        n if n == libc::SYS_umount2 as u32 => "umount2",
-        n if n == libc::SYS_pivot_root as u32 => "pivot_root",
-        n if n == libc::SYS_move_mount as u32 => "move_mount",
-        n if n == libc::SYS_fsopen as u32 => "fsopen",
-        n if n == libc::SYS_fsconfig as u32 => "fsconfig",
-        n if n == libc::SYS_fsmount as u32 => "fsmount",
-        n if n == libc::SYS_fspick as u32 => "fspick",
-        n if n == libc::SYS_open_tree as u32 => "open_tree",
-        n if n == libc::SYS_mount_setattr as u32 => "mount_setattr",
-        n if n == libc::SYS_setns as u32 => "setns",
-        n if n == libc::SYS_unshare as u32 => "unshare",
-        n if n == libc::SYS_chroot as u32 => "chroot",
-        n if n == libc::SYS_kexec_load as u32 => "kexec_load",
-        n if n == libc::SYS_kexec_file_load as u32 => "kexec_file_load",
-        n if n == libc::SYS_init_module as u32 => "init_module",
-        n if n == libc::SYS_finit_module as u32 => "finit_module",
-        n if n == libc::SYS_delete_module as u32 => "delete_module",
-        n if n == libc::SYS_bpf as u32 => "bpf",
-        n if n == libc::SYS_perf_event_open as u32 => "perf_event_open",
-        n if n == libc::SYS_keyctl as u32 => "keyctl",
-        n if n == libc::SYS_add_key as u32 => "add_key",
-        n if n == libc::SYS_request_key as u32 => "request_key",
-        n if n == libc::SYS_name_to_handle_at as u32 => "name_to_handle_at",
-        n if n == libc::SYS_open_by_handle_at as u32 => "open_by_handle_at",
-        n if n == libc::SYS_swapon as u32 => "swapon",
-        n if n == libc::SYS_swapoff as u32 => "swapoff",
-        n if n == libc::SYS_reboot as u32 => "reboot",
-        n if n == libc::SYS_userfaultfd as u32 => "userfaultfd",
-        n if n == libc::SYS_io_uring_setup as u32 => "io_uring_setup",
-        n if n == libc::SYS_io_uring_enter as u32 => "io_uring_enter",
-        n if n == libc::SYS_io_uring_register as u32 => "io_uring_register",
-        n if n == libc::SYS_acct as u32 => "acct",
-        n if n == libc::SYS_quotactl as u32 => "quotactl",
-        n if n == libc::SYS_quotactl_fd as u32 => "quotactl_fd",
-        n if n == libc::SYS_sethostname as u32 => "sethostname",
-        n if n == libc::SYS_setdomainname as u32 => "setdomainname",
-        n if n == libc::SYS_syslog as u32 => "syslog",
-        n if n == libc::SYS_kcmp as u32 => "kcmp",
-        _ => return format!("syscall {number}"),
-    };
-    format!("syscall {name}")
+    match SYSCALL_NAMES.iter().find(|(n, _)| *n == number) {
+        Some((_, name)) => format!("syscall {name}"),
+        None => format!("syscall {number}"),
+    }
 }
 
 /// The outer half of the fork: wait for the confined child and mirror its exit.
@@ -768,9 +867,7 @@ fn landlock_restrict(allowed_root: &Path, have_proc: bool) -> Result<(), String>
         for directory in ["/usr", "/lib", "/lib64", "/bin", "/sbin"] {
             rules.push((PathBuf::from(directory), read_exec));
         }
-        for directory in ["/etc/ld.so.conf.d"] {
-            rules.push((PathBuf::from(directory), read_only));
-        }
+        rules.push((PathBuf::from("/etc/ld.so.conf.d"), read_only));
         if have_proc {
             rules.push((PathBuf::from("/proc"), read_only));
         }
@@ -923,16 +1020,63 @@ fn install_seccomp() -> Result<(), String> {
     Ok(())
 }
 
-/// Drop the bounding set so no exec of anything — even if one were possible —
-/// could carry a capability the sandbox granted this namespace.
+/// The capability-get/set ABI: a v3 header plus two data words covering the
+/// full capability space. These are stable kernel structures — libc does not
+/// export them, so they are declared here rather than imported.
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+#[repr(C)]
+struct CapUserHeader {
+    version: u32,
+    pid: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CapUserData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+/// Strip every capability set this process carries.
+///
+/// The bounding set alone governs only what an exec may *regain* — and the
+/// confined payload never execs: it is loaded into this very process, so the
+/// effective, permitted and inheritable sets it inherits right now are the
+/// ones it can use. The order matters: every operation here needs
+/// CAP_SETPCAP, so the sets it lives in are cleared last.
 fn drop_capabilities() {
     // CAP_CHECKPOINT_RESTORE, the last defined capability; prctl answers EINVAL
     // for any higher number a kernel does not know, so the loop is safe on
     // older kernels.
     const CAP_LAST_CAP: i32 = 40;
+    // The bounding set first: dropping it needs CAP_SETPCAP, which the capset
+    // below removes.
     for capability in 0..=CAP_LAST_CAP {
         unsafe {
             libc::prctl(libc::PR_CAPBSET_DROP, capability, 0, 0, 0);
         }
+    }
+    // Ambient capabilities re-enter the permitted set on any exec, so they go
+    // before the sets they could re-inflate.
+    unsafe {
+        libc::prctl(
+            libc::PR_CAP_AMBIENT,
+            libc::PR_CAP_AMBIENT_CLEAR_ALL,
+            0,
+            0,
+            0,
+        );
+    }
+    // Effective, permitted and inheritable — version 3 spans all 40 bits of
+    // the capability space across two data words.
+    let header = CapUserHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let data = [CapUserData::default(), CapUserData::default()];
+    unsafe {
+        libc::syscall(libc::SYS_capset, &header, data.as_ptr());
     }
 }

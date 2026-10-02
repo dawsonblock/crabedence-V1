@@ -177,8 +177,23 @@ impl Drop for StagedHost {
 /// account can preempt or replace the staged copy — the TOCTOU this closes is
 /// a mutably-writable release directory, not a same-UID attacker, which a
 /// trusted-process deployment already accepts.
+/// Where a staged host can actually execute.
+///
+/// `/tmp` is mounted `noexec` on a meaningful share of hardened Linux
+/// deployments, and a staged copy that cannot run from where it was staged
+/// fails every plugin session. `XDG_RUNTIME_DIR` is the per-user session
+/// mount — owner-private and exec-capable by convention — so it is preferred
+/// when the platform provides it; the temporary directory is the fallback
+/// everywhere else.
+fn staging_root() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_dir())
+        .unwrap_or_else(std::env::temp_dir)
+}
+
 fn stage_host(source: &Path) -> Result<StagedHost, String> {
-    let dir = std::env::temp_dir().join(format!("nemo-plugin-host-{}", Uuid::now_v7().simple()));
+    let dir = staging_root().join(format!("nemo-plugin-host-{}", Uuid::now_v7().simple()));
     let executable = dir.join("nemo-plugin-host");
     let staged = (|| -> Result<(), String> {
         #[cfg(unix)]
@@ -568,16 +583,25 @@ fn prepare_host(
         pin,
         std::env::var_os(UNPINNED_HOST_ENV).as_deref(),
     )?;
-    let resolved = config
-        .isolation
-        .host_executable(
-            &config.executable,
-            &std::env::current_exe()
-                .ok()
-                .and_then(|path| path.parent().map(|parent| parent.to_path_buf()))
-                .unwrap_or_default(),
-        )
-        .map_err(|error| error.to_string())?;
+    // `restricted-linux` resolves to the configured path unchanged — but its
+    // `host_executable` also *probes* the candidate, and the probe executes
+    // it. Running that answer before the digest check would execute bytes
+    // nothing verified, so the path is taken as configured here and the probe
+    // runs below on the staged, pin-verified copy instead.
+    let resolved = if matches!(config.isolation, NativeIsolationPolicy::RestrictedLinux) {
+        config.executable.clone()
+    } else {
+        config
+            .isolation
+            .host_executable(
+                &config.executable,
+                &std::env::current_exe()
+                    .ok()
+                    .and_then(|path| path.parent().map(|parent| parent.to_path_buf()))
+                    .unwrap_or_default(),
+            )
+            .map_err(|error| error.to_string())?
+    };
     let (executable, staging) = if config.isolation.confinement_from_signature() {
         (resolved.clone(), None)
     } else {
@@ -606,6 +630,24 @@ fn prepare_host(
                 executable.display(),
                 sha256,
                 expected
+            ));
+        }
+    }
+    // The confinement probe is the deferred half of `host_executable` for
+    // `restricted-linux`: it executes its candidate, so it runs only now —
+    // against the staged copy whose digest the pin check just covered —
+    // never against the unverified configured path.
+    if matches!(config.isolation, NativeIsolationPolicy::RestrictedLinux) {
+        let unmet = config.isolation.unmet_requirements(Some(&executable));
+        if !unmet.is_empty() {
+            let reasons = unmet
+                .iter()
+                .map(|requirement| requirement.message())
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(format!(
+                "the '{}' policy cannot be honored here: {reasons}",
+                config.isolation.as_str()
             ));
         }
     }

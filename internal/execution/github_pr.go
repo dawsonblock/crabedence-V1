@@ -564,12 +564,16 @@ func (h *GitHubPullMergeHandler) Resolve(ctx context.Context, rec *idempotency.R
 		Merged         bool   `json:"merged"`
 		State          string `json:"state"`
 		MergeCommitSHA string `json:"merge_commit_sha"`
+		MergedAt       string `json:"merged_at"`
 		HTMLURL        string `json:"html_url"`
 	}
 	if err := json.Unmarshal(respBody, &pr); err != nil {
 		return idempotency.RecoveryResult{}, fmt.Errorf("github pull get unparseable: %w", err)
 	}
-	if pr.Merged {
+	// `merged` is shared current state: a PR merged before — or alongside —
+	// this execution looks identical to one this execution merged. Only a
+	// merged_at inside this record's lifetime can be attributed to it.
+	if pr.Merged && transitionWithinExecution(pr.MergedAt, rec) {
 		runID := pr.MergeCommitSHA
 		if runID == "" {
 			runID = pr.HTMLURL
@@ -580,6 +584,7 @@ func (h *GitHubPullMergeHandler) Resolve(ctx context.Context, rec *idempotency.R
 			"repo":             repo,
 			"merged":           true,
 			"merge_commit_sha": pr.MergeCommitSHA,
+			"merged_at":        pr.MergedAt,
 		})
 		return idempotency.RecoveryResult{
 			Decision:         idempotency.RecoveryCommitted,
@@ -594,7 +599,8 @@ func (h *GitHubPullMergeHandler) Resolve(ctx context.Context, rec *idempotency.R
 		Decision:   idempotency.RecoveryUnknown,
 		ProviderID: "github",
 		Result: json.RawMessage(fmt.Sprintf(
-			`{"repo":%q,"pull":%d,"merged":false,"state_observed":%q}`, repo, number, pr.State)),
+			`{"repo":%q,"pull":%d,"merged":%t,"state_observed":%q,"merged_at":%q}`,
+			repo, number, pr.Merged, pr.State, pr.MergedAt)),
 	}, nil
 }
 

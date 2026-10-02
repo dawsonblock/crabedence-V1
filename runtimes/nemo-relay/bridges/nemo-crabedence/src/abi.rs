@@ -102,6 +102,17 @@ fn check_required_fields(path: &str, fields: Fields, keys: &HashSet<String>) -> 
     Ok(())
 }
 
+/// A mediation digest value in canonical form: 64 lowercase hex characters
+/// naming a SHA-256. Presence of the key alone proves nothing — an empty or
+/// malformed value would persist as evidence while binding no computation,
+/// and the digest identity folds empty fields away entirely.
+fn is_sha256_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn type_error(path: &str, expected: FieldType) -> String {
     match expected {
         FieldType::String => format!("{path} must be a JSON string"),
@@ -160,6 +171,7 @@ impl<'a> Scanner<'a> {
         expected: Option<FieldType>,
         depth: usize,
         child_fields: Fields,
+        digest_field: bool,
     ) -> Result<(), String> {
         let Some(byte) = self.peek() else {
             return Err("invalid JSON: unexpected end of input".to_string());
@@ -201,11 +213,18 @@ impl<'a> Scanner<'a> {
                 self.parse_array(path, depth + 1)
             }
             b'"' => {
-                if self.parse_string().is_none() {
+                let Some(value) = self.parse_string() else {
                     return Err("invalid JSON: invalid string".to_string());
-                }
+                };
                 match expected {
-                    None | Some(FieldType::String) => Ok(()),
+                    None | Some(FieldType::String) => {
+                        if digest_field && !is_sha256_digest(&value) {
+                            return Err(format!(
+                                "{path} must be a 64-character lowercase SHA-256 hex digest"
+                            ));
+                        }
+                        Ok(())
+                    }
                     Some(expected) => Err(type_error(path, expected)),
                 }
             }
@@ -284,7 +303,15 @@ impl<'a> Scanner<'a> {
             } else {
                 Fields::None
             };
-            self.parse_value(&key_path, expected, depth, child_fields)?;
+            // Every known mediation field is a digest field — the unknown
+            // ones were refused above, so `fields` alone names the class.
+            self.parse_value(
+                &key_path,
+                expected,
+                depth,
+                child_fields,
+                fields == Fields::Mediation,
+            )?;
 
             self.skip_whitespace();
             match self.peek() {
@@ -310,7 +337,7 @@ impl<'a> Scanner<'a> {
         loop {
             self.skip_whitespace();
             let element_path = format!("{path}[]");
-            self.parse_value(&element_path, None, depth, Fields::None)?;
+            self.parse_value(&element_path, None, depth, Fields::None, false)?;
             self.skip_whitespace();
             match self.peek() {
                 Some(b',') => {

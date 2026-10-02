@@ -299,6 +299,14 @@ for target in darwin_amd64 darwin_arm64 linux_amd64 linux_arm64; do
     echo "$tarball does not match the signed SHA256SUMS entry" >&2
     exit 1
   }
+  # The attestation itself is covered by the signed manifest — without its
+  # own entry the metadata beside an authentic archive is replaceable.
+  attestation_sha=$(shasum -a 256 "$asset_dir/$attestation" | awk '{print $1}')
+  declared_attestation_sha=$(awk -v name="$attestation" '$2 == name {print $1}' "$sums")
+  [[ -n "$declared_attestation_sha" && "$declared_attestation_sha" == "$attestation_sha" ]] || {
+    echo "$attestation does not match the signed SHA256SUMS entry" >&2
+    exit 1
+  }
   jq -e \
     --arg target "$target" \
     --arg version "$version" \
@@ -320,8 +328,8 @@ for target in darwin_amd64 darwin_arm64 linux_amd64 linux_arm64; do
   }
   assets+=("$asset_dir/$tarball" "$asset_dir/$attestation")
 done
-[[ "$(grep -c . "$sums")" == 4 ]] || {
-  echo "signed SHA256SUMS must bind exactly four tarballs" >&2
+[[ "$(grep -c . "$sums")" == 8 ]] || {
+  echo "signed SHA256SUMS must bind exactly four tarballs and their four attestations" >&2
   exit 1
 }
 assets+=("$sums" "$sig")

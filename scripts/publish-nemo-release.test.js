@@ -100,7 +100,18 @@ function artifactZip(api, artifactId, target, sourceCommit, tarballBytes, option
       { id: "restricted-linux", result: "pass" },
     ],
   };
-  writeJson(path.join(dir, `${tarballName}.qualification.json`), attestation);
+  const attestationPath = path.join(dir, `${tarballName}.qualification.json`);
+  if (options.attestationRaw != null) {
+    fs.writeFileSync(attestationPath, options.attestationRaw);
+  } else {
+    writeJson(attestationPath, attestation);
+  }
+  // The signed checksum manifest binds the attestation bytes too — the
+  // canonical target artifacts hand their exact bytes back for the sums.
+  if (options.attestationBytes) {
+    options.attestationBytes[`${tarballName}.qualification.json`] =
+      fs.readFileSync(attestationPath);
+  }
   if (options.extraFile) fs.writeFileSync(path.join(dir, options.extraFile), "surprise\n");
   const zip = path.join(api, `artifact-${artifactId}.zip`);
   execFileSync("zip", [
@@ -177,6 +188,7 @@ function prepareFixture({ blockedRecord = false } = {}) {
   // variants for the linux_amd64 artifact cover the negative paths.
   const artifactRows = [];
   const tarballBytes = {};
+  const attestationBytes = {};
   const targetArtifactId = (target) => 601 + targets.indexOf(target);
   const driftIds = {
     "sums-mismatch": 611,
@@ -184,11 +196,12 @@ function prepareFixture({ blockedRecord = false } = {}) {
     "attestation-commit-drift": 613,
     "gate-fail": 614,
     "extra-file": 615,
+    "attestation-file-drift": 616,
   };
   for (const target of targets) {
     const bytes = Buffer.from(`exact fixture bytes for ${target}\n`);
     tarballBytes[`nemo-control_${version}_${target}.tar.gz`] = bytes;
-    const zip = artifactZip(api, targetArtifactId(target), target, sourceCommit, bytes);
+    const zip = artifactZip(api, targetArtifactId(target), target, sourceCommit, bytes, { attestationBytes });
     artifactRows.push({
       id: targetArtifactId(target),
       name: `nemo-control_${version}_${target}`,
@@ -199,17 +212,49 @@ function prepareFixture({ blockedRecord = false } = {}) {
   }
   const driftTarget = "linux_amd64";
   const driftBytes = tarballBytes[`nemo-control_${version}_${driftTarget}.tar.gz`];
+  // Content-drift modes keep the artifact attestation bytes: their signed
+  // manifest binds the drifted bytes (a run that honestly signed a bad
+  // attestation), so the publisher's *content* checks are what must refuse.
+  const driftSinks = {
+    "attestation-sha-drift": {},
+    "attestation-commit-drift": {},
+    "gate-fail": {},
+  };
+  const driftSumsIds = {
+    "attestation-sha-drift": 617,
+    "attestation-commit-drift": 618,
+    "gate-fail": 619,
+  };
   const driftZips = {
     "sums-mismatch": artifactZip(api, driftIds["sums-mismatch"], driftTarget, sourceCommit,
       Buffer.from("bytes the signed manifest does not bind\n")),
     "attestation-sha-drift": artifactZip(api, driftIds["attestation-sha-drift"], driftTarget, sourceCommit,
-      driftBytes, { attestationSha: "c".repeat(64) }),
+      driftBytes, { attestationSha: "c".repeat(64), attestationBytes: driftSinks["attestation-sha-drift"] }),
     "attestation-commit-drift": artifactZip(api, driftIds["attestation-commit-drift"], driftTarget, sourceCommit,
-      driftBytes, { attestationCommit: "d".repeat(40) }),
+      driftBytes, { attestationCommit: "d".repeat(40), attestationBytes: driftSinks["attestation-commit-drift"] }),
     "gate-fail": artifactZip(api, driftIds["gate-fail"], driftTarget, sourceCommit,
-      driftBytes, { gates: [{ id: "installed-qualification", result: "fail" }] }),
+      driftBytes, { gates: [{ id: "installed-qualification", result: "fail" }], attestationBytes: driftSinks["gate-fail"] }),
     "extra-file": artifactZip(api, driftIds["extra-file"], driftTarget, sourceCommit,
       driftBytes, { extraFile: "unexpected-member.txt" }),
+    // Internally valid but byte-different from what the signed manifest
+    // binds: without the attestation's own sums entry this substitution is
+    // invisible — fabricated "pass" metadata beside an authentic archive.
+    "attestation-file-drift": artifactZip(api, driftIds["attestation-file-drift"], driftTarget, sourceCommit,
+      driftBytes, {
+        attestationRaw: `${JSON.stringify({
+          attestation_version: 1,
+          subject: {
+            name: "nemo-control",
+            platform: driftTarget,
+            version,
+            component_manifest_sha256: "a".repeat(64),
+            transfer_manifest_sha256: "b".repeat(64),
+            archive_sha256: sha256(driftBytes),
+          },
+          source: { commit: sourceCommit },
+          gates: [{ id: "installed-qualification", result: "pass" }],
+        })}\n`,
+      }),
   };
 
   // The signed checksum manifest artifact: SHA256SUMS plus its real
@@ -217,14 +262,14 @@ function prepareFixture({ blockedRecord = false } = {}) {
   const sumsName = `nemo-control_${version}_SHA256SUMS`;
   const sumsDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemo-sums-"));
   const sumsFile = path.join(sumsDir, sumsName);
+  // The manifest binds every published byte stream — tarballs and the
+  // attestation sidecars alike — matching the workflow's signed inventory.
+  const boundBytes = { ...tarballBytes, ...attestationBytes };
   fs.writeFileSync(
     sumsFile,
-    [...targets]
+    Object.keys(boundBytes)
       .sort()
-      .map((target) => {
-        const name = `nemo-control_${version}_${target}.tar.gz`;
-        return `${sha256(tarballBytes[name])}  ${name}`;
-      })
+      .map((name) => `${sha256(boundBytes[name])}  ${name}`)
       .join("\n") + "\n",
   );
   execFileSync("ssh-keygen", ["-Y", "sign", "-n", "nemo-control-release", "-f", signingKey, sumsFile]);
@@ -235,6 +280,27 @@ function prepareFixture({ blockedRecord = false } = {}) {
   execFileSync("zip", ["-q", "-j", signedZip, path.join(signedDir, sumsName), path.join(signedDir, `${sumsName}.sig`)]);
   const unsignedZip = path.join(api, "artifact-6150.zip");
   execFileSync("zip", ["-q", "-j", unsignedZip, sumsFile]);
+
+  // Content-drift modes sign their drifted attestation honestly: the
+  // manifest authenticates, so refusal has to come from the publisher's
+  // attestation content checks rather than its integrity check.
+  const driftSumsZips = {};
+  for (const [mode, sink] of Object.entries(driftSinks)) {
+    const driftBound = { ...boundBytes, ...sink };
+    const modeDir = fs.mkdtempSync(path.join(os.tmpdir(), `nemo-sums-${mode}-`));
+    const modeSumsFile = path.join(modeDir, sumsName);
+    fs.writeFileSync(
+      modeSumsFile,
+      Object.keys(driftBound)
+        .sort()
+        .map((name) => `${sha256(driftBound[name])}  ${name}`)
+        .join("\n") + "\n",
+    );
+    execFileSync("ssh-keygen", ["-Y", "sign", "-n", "nemo-control-release", "-f", signingKey, modeSumsFile]);
+    const modeZip = path.join(api, `artifact-${driftSumsIds[mode]}.zip`);
+    execFileSync("zip", ["-q", "-j", modeZip, modeSumsFile, `${modeSumsFile}.sig`]);
+    driftSumsZips[mode] = modeZip;
+  }
   artifactRows.push({
     id: 605,
     name: "nemo-control_SHA256SUMS",
@@ -257,9 +323,18 @@ function prepareFixture({ blockedRecord = false } = {}) {
   // endpoint serves it — the failure must come from the family proof checks,
   // not the upstream artifact-integrity gate.
   for (const [mode, driftZip] of Object.entries(driftZips)) {
-    const rows = artifactRows.map((row) => row.id === targetArtifactId(driftTarget)
-      ? { ...row, size_in_bytes: fs.statSync(driftZip).size, digest: `sha256:${sha256(fs.readFileSync(driftZip))}` }
-      : row);
+    const rows = artifactRows.map((row) => {
+      if (row.id === targetArtifactId(driftTarget)) {
+        return { ...row, size_in_bytes: fs.statSync(driftZip).size, digest: `sha256:${sha256(fs.readFileSync(driftZip))}` };
+      }
+      // The mode's own signed checksum manifest is a different zip — its
+      // declared size and digest describe that artifact.
+      if (row.id === 605 && driftSumsZips[mode]) {
+        const sumsZip = driftSumsZips[mode];
+        return { ...row, size_in_bytes: fs.statSync(sumsZip).size, digest: `sha256:${sha256(fs.readFileSync(sumsZip))}` };
+      }
+      return row;
+    });
     writeJson(path.join(api, `artifacts-${mode}.json`), { total_count: rows.length, artifacts: rows });
   }
 
@@ -483,7 +558,7 @@ else if (endpoint === "repos/${repository}/actions/workflows/${workflowId}") {
   outputFile(process.env.MOCK_MODE === "wrong-workflow" ? "workflow-wrong.json" : "workflow.json");
 }
 else if (endpoint === "repos/${repository}/actions/runs/${runId}/artifacts?per_page=100") {
-  const driftModes = ["sums-mismatch", "attestation-sha-drift", "attestation-commit-drift", "gate-fail", "extra-file"];
+  const driftModes = ["sums-mismatch", "attestation-sha-drift", "attestation-commit-drift", "gate-fail", "extra-file", "attestation-file-drift"];
   outputFile(
     process.env.MOCK_MODE === "missing-artifact"
       ? "artifacts-missing.json"
@@ -496,8 +571,10 @@ else if (endpoint === "repos/${repository}/actions/runs/${runId}/artifacts?per_p
 }
 else if (endpoint.startsWith("repos/${repository}/actions/artifacts/") && endpoint.endsWith("/zip")) {
   const id = endpoint.split("/")[5];
-  const driftIds = { "sums-mismatch": "611", "attestation-sha-drift": "612", "attestation-commit-drift": "613", "gate-fail": "614", "extra-file": "615" };
-  const requested = driftIds[process.env.MOCK_MODE] && id === "603" ? driftIds[process.env.MOCK_MODE] : id;
+  const driftIds = { "sums-mismatch": "611", "attestation-sha-drift": "612", "attestation-commit-drift": "613", "gate-fail": "614", "extra-file": "615", "attestation-file-drift": "616" };
+  const driftSumsIds = { "attestation-sha-drift": "617", "attestation-commit-drift": "618", "gate-fail": "619" };
+  let requested = driftIds[process.env.MOCK_MODE] && id === "603" ? driftIds[process.env.MOCK_MODE] : id;
+  if (id === "605" && driftSumsIds[process.env.MOCK_MODE]) requested = driftSumsIds[process.env.MOCK_MODE];
   const file = process.env.MOCK_MODE === "unsigned-sums" && id === "605" ? "artifact-6150.zip" : "artifact-" + requested + ".zip";
   if (!fs.existsSync(path.join(api, file))) process.exit(97);
   outputFile(file);
@@ -602,6 +679,7 @@ for (const [mode, reason] of [
   ["sums-mismatch", "signed SHA256SUMS"],
   ["attestation-sha-drift", "does not bind"],
   ["attestation-commit-drift", "does not bind"],
+  ["attestation-file-drift", "does not match the signed SHA256SUMS"],
   ["gate-fail", "does not bind"],
   ["extra-file", "exactly the tarball and its attestation"],
   ["immutable-disabled", "release immutability"],

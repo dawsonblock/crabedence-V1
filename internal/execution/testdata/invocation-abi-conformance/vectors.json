@@ -266,7 +266,20 @@
     {
       "name": "mediation-empty-string-digests",
       "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":{\"principal\":\"alice@example.com\"},\"mediation\":{\"middleware_set_digest\":\"\",\"original_args_digest\":\"\"}}",
-      "expected": "accept"
+      "expected": "reject",
+      "error_contains": "SHA-256 hex digest"
+    },
+    {
+      "name": "mediation-noncanonical-digest",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":{\"principal\":\"alice@example.com\"},\"mediation\":{\"middleware_set_digest\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"original_args_digest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}}",
+      "expected": "reject",
+      "error_contains": "SHA-256 hex digest"
+    },
+    {
+      "name": "mediation-short-digest",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":{\"principal\":\"alice@example.com\"},\"mediation\":{\"middleware_set_digest\":\"aaaa\",\"original_args_digest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}}",
+      "expected": "reject",
+      "error_contains": "SHA-256 hex digest"
     },
     {
       "name": "unknown-mediation-field",

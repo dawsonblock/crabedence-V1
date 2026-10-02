@@ -1,6 +1,7 @@
 package execution
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -427,17 +428,42 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 			}
 			acquireDigest := digest
 			if !migrated {
-				acquireDigest = legacyDigest
+				// The store refused the migration. A live lease is the
+				// benign refusal: the record keeps its stored identity and
+				// the request is classified under the legacy digest —
+				// in-flight, recovery, or replay — exactly as it was before
+				// descriptor-bound digests existed. A *mediation* mismatch is
+				// different: the recorded mediation is evidence for another
+				// invocation, so the record is not this request's identity at
+				// all — the acquisition must stay a conflict rather than
+				// replay a terminal outcome across a mediation boundary.
+				storedMediation := []byte(nil)
+				if len(acq.Record.RequestMediation) > 0 {
+					storedMediation = []byte(acq.Record.RequestMediation)
+				}
+				var callerMediation []byte
+				if mediation != nil {
+					if encoded, encErr := json.Marshal(mediation); encErr == nil {
+						callerMediation = encoded
+					}
+				}
+				if !bytes.Equal(storedMediation, callerMediation) {
+					acquireDigest = ""
+				} else {
+					acquireDigest = legacyDigest
+				}
 			}
-			if reacq, reErr := e.store.AcquireWithMediation(ctx, req.IdempotencyKey,
-				req.Authority.Principal, req.Capability, acquireDigest, authorityBinding,
-				mediation, string(desc.ExecutionClass), leaseDuration); reErr == nil {
-				acq = reacq
-			} else {
-				return Response{
-					Status:      StatusFailed,
-					FailureCode: string(capability.FailureInternalError),
-					Error:       fmt.Sprintf("idempotency acquire failed: %v", reErr),
+			if acquireDigest != "" {
+				if reacq, reErr := e.store.AcquireWithMediation(ctx, req.IdempotencyKey,
+					req.Authority.Principal, req.Capability, acquireDigest, authorityBinding,
+					mediation, string(desc.ExecutionClass), leaseDuration); reErr == nil {
+					acq = reacq
+				} else {
+					return Response{
+						Status:      StatusFailed,
+						FailureCode: string(capability.FailureInternalError),
+						Error:       fmt.Sprintf("idempotency acquire failed: %v", reErr),
+					}
 				}
 			}
 		}

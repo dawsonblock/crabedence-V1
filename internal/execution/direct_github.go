@@ -297,7 +297,10 @@ func (g *GitHubReads) IssueList(ctx context.Context, call CallContext) (json.Raw
 		HTMLURL   string `json:"html_url"`
 		CreatedAt string `json:"created_at"`
 		UpdatedAt string `json:"updated_at"`
-		User      struct {
+		// The repository-issues API returns pull requests interleaved with
+		// issues; this discriminator is the only thing telling them apart.
+		PullRequest *struct{} `json:"pull_request"`
+		User        struct {
 			Login string `json:"login"`
 		} `json:"user"`
 	}
@@ -307,6 +310,12 @@ func (g *GitHubReads) IssueList(ctx context.Context, call CallContext) (json.Raw
 
 	projected := make([]map[string]any, 0, len(issues))
 	for _, issue := range issues {
+		// A pull request in this listing is not an issue — the capability
+		// enumerates issues, and a PR projected as one would carry a number
+		// that collides with the issue namespace it is not part of.
+		if issue.PullRequest != nil {
+			continue
+		}
 		projected = append(projected, map[string]any{
 			"number":     issue.Number,
 			"title":      issue.Title,

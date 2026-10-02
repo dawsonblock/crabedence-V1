@@ -111,6 +111,7 @@ gate fails on drift between it and the manifest:
 | modified | `crates/native-loader/Cargo.toml` |
 | modified | `crates/native-loader/src/bin/nemo-plugin-host.rs` |
 | modified | `crates/native-loader/src/bin/unix/nemo-plugin-host.rs` |
+| modified | `crates/native-loader/src/service.rs` |
 | modified | `crates/plugin-host/src/isolation_policy.rs` |
 | modified | `crates/plugin-host/src/lib.rs` |
 | modified | `crates/plugin-host/src/runtime_service.rs` |

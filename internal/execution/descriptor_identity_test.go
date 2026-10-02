@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -235,6 +236,52 @@ func TestLegacyRecordExpiredLeaseMigratesThenDispatches(t *testing.T) {
 	if rec.DigestVersion != idempotency.DigestVersionDescriptorBound {
 		t.Fatalf("dispatched record digest_version = %d, want %d",
 			rec.DigestVersion, idempotency.DigestVersionDescriptorBound)
+	}
+}
+
+// TestLegacyRecordMediationMismatchStaysConflict proves the migration
+// path cannot launder identity through the legacy digest: a legacy record
+// (which predates mediation evidence) replayed by a request that carries
+// mediation is a different identity, and must stay a conflict rather than
+// fall back to classifying under the stored digest.
+func TestLegacyRecordMediationMismatchStaysConflict(t *testing.T) {
+	store := openExecutorSQLiteStore(t, idempotency.DefaultLeaseConfig)
+	ctx := context.Background()
+	key := fmt.Sprintf("legacy-mediation-%d", time.Now().UnixNano())
+	args := json.RawMessage(`{"x":1}`)
+
+	legacyDigest, err := idempotency.ComputeDigestFromRawWithAuthority(1,
+		"alice@example.com", "test.mut", args, "grant_x", "MUTATION", 0, "", "DURABLE", "CRABEDENCE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	acq, err := store.AcquireWithAuthority(ctx, key, "alice@example.com", "test.mut", legacyDigest,
+		idempotency.AuthorityBinding{Ref: "grant_x"}, "MUTATION", idempotency.DefaultLeaseConfig.DefaultDuration)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	// Clear the live-lease guard so the store's own mediation comparison is
+	// what refuses the migration — both layers must agree before a record
+	// may be reclassified.
+	if err := store.ExpireLeaseForTest(ctx, acq.Record.ExecutionID); err != nil {
+		t.Fatalf("expire lease: %v", err)
+	}
+
+	exec := NewDispatchExecutor(succeedHandler{delay: time.Millisecond}, store)
+	response := exec.ExecuteWithIdempotency(ctx, Request{
+		Capability:     "test.mut",
+		Arguments:      args,
+		Authority:      RequestAuthority{Principal: "alice@example.com", AuthorityRef: "grant_x"},
+		IdempotencyKey: key,
+		Mediation: &RequestMediation{
+			MiddlewareSetDigest: strings.Repeat("a", 64),
+			OriginalArgsDigest:  strings.Repeat("b", 64),
+		},
+	}, mutationDescriptorV1())
+	if response.Status != StatusDenied ||
+		response.FailureCode != string(capability.FailureIdempotencyConflict) {
+		t.Fatalf("mediation-mismatched legacy record must stay a conflict, got %s: %s",
+			response.Status, response.Error)
 	}
 }
 

@@ -686,7 +686,9 @@ may produce unsigned output. The family's proof chain is:
   (`<tarball>.qualification.json`), pinning the archive SHA-256, the source
   commit, the version, the component/transfer manifest digests, and all-pass
   gate results;
-- `nemo-control_X.Y.Z_SHA256SUMS` covering exactly the four tarballs;
+- `nemo-control_X.Y.Z_SHA256SUMS` covering exactly the four tarballs and
+  their four qualification attestations — the attestations are signed
+  content, not unsigned metadata beside an authenticated archive;
 - `nemo-control_X.Y.Z_SHA256SUMS.sig`, an SSH signature over the manifest in
   the `nemo-control-release` namespace by the release signer.
 
@@ -708,9 +710,10 @@ the ruleset inventory (including `nemo-v*` coverage), the authorization record,
 and protected-tooling cleanliness; binds the supplied run to a successful
 `nemo-distribution.yml` push at the pinned source commit; downloads every run
 artifact by exact GitHub digest; authenticates `SHA256SUMS` under
-`.github/release-allowed-signers` before trusting it; requires each tarball to
-match its signed manifest line and each attestation to bind the same archive
-digest, version, and source commit with every gate passing. It then creates the
+`.github/release-allowed-signers` before trusting it; requires each tarball
+*and* each attestation file to match its signed manifest line, and each
+attestation's content to bind the same archive digest, version, and source
+commit with every gate passing. It then creates the
 draft on the family tag with a deterministic bound-stub body, uploads exactly
 the ten family assets (four tarballs, four attestations, manifest, signature),
 re-reads the remote inventory by name/size/digest, and publishes with the same

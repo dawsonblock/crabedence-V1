@@ -79,6 +79,13 @@ var abiMediationFields = map[string]abiFieldType{
 // field identically.
 var abiIntegerLiteral = regexp.MustCompile(`^-?(0|[1-9][0-9]*)$`)
 
+// abiSHA256Digest is the canonical spelling of a SHA-256 digest. Mediation
+// digests are evidence that must name a real computation — an empty or
+// malformed value would persist as provenance while binding nothing, and
+// digest computation treats an empty field as absent, so a present digest
+// field has to carry the full 64 lowercase hex characters.
+var abiSHA256Digest = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
 // ParseInvocationRequest parses wire bytes into a Request under the strict
 // ABI rules.
 //
@@ -126,6 +133,20 @@ func parseInvocationRequest(data []byte) (Request, error) {
 		}
 		if _, ok := envelope.Mediation["original_args_digest"]; !ok {
 			return req, fmt.Errorf("request.mediation.original_args_digest is required")
+		}
+		// Every digest key carries a declared SHA-256 in canonical form.
+		// The structural scan has already refused null and non-strings, so
+		// each surviving value is a string that must carry the full digest —
+		// an empty field declares evidence it cannot name.
+		for name, raw := range envelope.Mediation {
+			var value string
+			if err := json.Unmarshal(raw, &value); err != nil {
+				continue
+			}
+			if !abiSHA256Digest.MatchString(value) {
+				return req, fmt.Errorf(
+					"request.mediation.%s must be a 64-character lowercase SHA-256 hex digest", name)
+			}
 		}
 	}
 	return req, nil

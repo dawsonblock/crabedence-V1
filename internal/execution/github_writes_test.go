@@ -11,6 +11,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/openclaw/crabbox/internal/capability"
 	"github.com/openclaw/crabbox/internal/idempotency"
@@ -78,10 +79,18 @@ func TestGitHubIssueCloseArgsValidationIsDefinitive(t *testing.T) {
 }
 
 func TestGitHubIssueCloseResolverObservesState(t *testing.T) {
+	now := time.Now().UTC()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if strings.HasSuffix(r.URL.Path, "/issues/7") {
-			fmt.Fprint(w, `{"number": 7, "state": "closed", "html_url": "https://github.test/issues/7"}`)
+			fmt.Fprintf(w, `{"number": 7, "state": "closed", "closed_at": %q, "html_url": "https://github.test/issues/7"}`,
+				now.Format(time.RFC3339))
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/issues/9") {
+			// Closed, but before this record existed — someone else's effect.
+			fmt.Fprintf(w, `{"number": 9, "state": "closed", "closed_at": %q, "html_url": "https://github.test/issues/9"}`,
+				now.Add(-time.Hour).Format(time.RFC3339))
 			return
 		}
 		fmt.Fprint(w, `{"number": 8, "state": "open", "html_url": "https://github.test/issues/8"}`)
@@ -90,6 +99,7 @@ func TestGitHubIssueCloseResolverObservesState(t *testing.T) {
 
 	h := NewGitHubIssueCloseHandler(srv.URL, "tok")
 	res, err := h.Resolve(context.Background(), &idempotency.Record{
+		CreatedAt: now.Add(-time.Minute),
 		RecoveryLocator: json.RawMessage(
 			`{"external_token":"gh-close-1","resource_ref":"repos/octo/repo/issues/7"}`),
 	})
@@ -101,6 +111,20 @@ func TestGitHubIssueCloseResolverObservesState(t *testing.T) {
 	}
 	if res.ProviderRunID != "https://github.test/issues/7" {
 		t.Errorf("expected the issue URL as run ID, got %q", res.ProviderRunID)
+	}
+
+	// A close that predates the record is conclusively not this
+	// execution's — shared state alone must not claim the effect.
+	res, err = h.Resolve(context.Background(), &idempotency.Record{
+		CreatedAt: now.Add(-time.Minute),
+		RecoveryLocator: json.RawMessage(
+			`{"external_token":"gh-close-3","resource_ref":"repos/octo/repo/issues/9"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Decision != idempotency.RecoveryUnknown {
+		t.Fatalf("a close predating the record must stay UNKNOWN, got %s", res.Decision)
 	}
 
 	res, err = h.Resolve(context.Background(), &idempotency.Record{
@@ -187,9 +211,10 @@ func TestGitHubIssueUpdateResolverDigestsObservedState(t *testing.T) {
 	// title_sha256("new title") computed through the same canonical form
 	// the locator uses.
 	want := sha256Hex("new title")
+	updatedAt := time.Now().UTC().Format(time.RFC3339)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"number": 3, "title": "new title", "html_url": "https://github.test/issues/3", "labels": [], "assignees": []}`)
+		fmt.Fprintf(w, `{"number": 3, "title": "new title", "html_url": "https://github.test/issues/3", "labels": [], "assignees": [], "updated_at": %q}`, updatedAt)
 	}))
 	defer srv.Close()
 
@@ -198,6 +223,7 @@ func TestGitHubIssueUpdateResolverDigestsObservedState(t *testing.T) {
 		"repo": "octo/repo", "number": 3, "title_sha256": want,
 	})
 	res, err := h.Resolve(context.Background(), &idempotency.Record{
+		CreatedAt: time.Now().Add(-time.Minute),
 		RecoveryLocator: json.RawMessage(fmt.Sprintf(
 			`{"external_token":"gh-upd-1","resource_ref":"repos/octo/repo/issues/3","extensions":%s}`, ext)),
 	})
@@ -380,7 +406,8 @@ func TestGitHubPullMergeResolverObservesMergedFlag(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if strings.HasSuffix(r.URL.Path, "/pulls/42") {
-			fmt.Fprint(w, `{"number":42,"merged":true,"merge_commit_sha":"abc123","html_url":"https://github.test/pulls/42"}`)
+			fmt.Fprintf(w, `{"number":42,"merged":true,"merge_commit_sha":"abc123","merged_at":%q,"html_url":"https://github.test/pulls/42"}`,
+				time.Now().UTC().Format(time.RFC3339))
 			return
 		}
 		fmt.Fprint(w, `{"number":43,"merged":false,"state":"open","html_url":"https://github.test/pulls/43"}`)
@@ -389,6 +416,7 @@ func TestGitHubPullMergeResolverObservesMergedFlag(t *testing.T) {
 
 	h := NewGitHubPullMergeHandler(srv.URL, "tok")
 	res, err := h.Resolve(context.Background(), &idempotency.Record{
+		CreatedAt: time.Now().Add(-time.Minute),
 		RecoveryLocator: json.RawMessage(
 			`{"external_token":"gh-merge-1","resource_ref":"repos/octo/repo/pulls/42"}`),
 	})
