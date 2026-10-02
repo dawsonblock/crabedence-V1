@@ -146,11 +146,16 @@ func writeManifestFile(t *testing.T, path string, manifest transferManifest) {
 }
 
 // writeProvenanceDoc writes the in-tree provenance record carrying the
-// generated delta block for the declared sets — the same artifact production
+// generated blocks for the declared values — the source-identity block when
+// a source is declared, then the delta block — the same artifact production
 // writes before digesting, so the digest binds the doc that ships.
 func writeProvenanceDoc(t *testing.T, root string, declared transferManifest) {
 	t.Helper()
-	doc := "provenance\n\n" + renderDeltaBlock(declared) + "\n"
+	doc := "provenance\n\n"
+	if declared.Source != nil {
+		doc += renderSourceBlock(*declared.Source) + "\n\n"
+	}
+	doc += renderDeltaBlock(declared) + "\n"
 	path := filepath.Join(root, provenanceDocName)
 	if err := os.WriteFile(path, []byte(doc), 0o644); err != nil {
 		t.Fatal(err)
@@ -406,12 +411,15 @@ func TestManifestBinariesMustHaveSourcesAndDeclarations(t *testing.T) {
 
 func TestManifestSourceAbsenceIsReportedNotFailed(t *testing.T) {
 	root := baseTree(t)
-	declaration := declarationFor(t, root)
-	declaration.Source = &manifestSource{
-		Path:      filepath.Join(t.TempDir(), "absent-source"),
-		FileCount: 1,
-		SHA256:    strings.Repeat("0", 64),
-	}
+	// The doc renders the declared identity even though the tree it describes
+	// is absent — the block binds the declaration, not the on-disk copy.
+	declaration := declaredManifest(t, root, transferManifest{
+		Source: &manifestSource{
+			Path:      filepath.Join(t.TempDir(), "absent-source"),
+			FileCount: 1,
+			SHA256:    strings.Repeat("0", 64),
+		},
+	})
 	path := filepath.Join(t.TempDir(), "nemo-transfer-manifest.json")
 	writeManifestFile(t, path, declaration)
 	if err := verifyManifest(path); err != nil {
@@ -445,13 +453,15 @@ func declarationForPair(t *testing.T, source, vendored string, declared transfer
 	if err != nil {
 		t.Fatal(err)
 	}
-	declaration := declaredManifest(t, vendored, declared)
-	declaration.Source = &manifestSource{
+	// The source identity lands on the declaration before the doc is written:
+	// the record's generated source block renders it, so the tree digest the
+	// declaration fills in covers the rendered value.
+	declared.Source = &manifestSource{
 		Path:      source,
 		FileCount: sourceIdentity.FileCount,
 		SHA256:    sourceIdentity.NemoRuntimeSHA256,
 	}
-	return declaration
+	return declaredManifest(t, vendored, declared)
 }
 
 func TestDeltaVerificationAcceptsTheCompleteDeclaration(t *testing.T) {
@@ -670,5 +680,105 @@ func TestProvenanceDocDriftFailsVerification(t *testing.T) {
 	}
 	if err := verifyManifest(path); err == nil {
 		t.Fatal("a hand-edited tree must fail verification")
+	}
+}
+
+// The source identity used to live in hand-maintained prose; it drifted from
+// the manifest's declared source digest while the gate still passed. The
+// block must render the declaration, and the digest over the tree then binds
+// the rendered value.
+func TestProvenanceDocSourceIdentityIsGenerated(t *testing.T) {
+	source, vendored := transferredPair(t)
+	declaration := declarationForPair(t, source, vendored, transferManifest{
+		LocalModifications: []string{"crates/a/src/lib.rs"},
+		AddedPaths:         []string{"bridges/", "TRANSFER-PROVENANCE.md"},
+		RemovedPaths:       []string{"docs/old.md"},
+	})
+	path := filepath.Join(t.TempDir(), "nemo-transfer-manifest.json")
+	writeManifestFile(t, path, declaration)
+	if err := verifyManifest(path); err != nil {
+		t.Fatalf("the doc generated for this declaration must verify: %v", err)
+	}
+
+	docPath := filepath.Join(vendored, provenanceDocName)
+	doc, err := os.ReadFile(docPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(doc), declaration.Source.SHA256) {
+		t.Fatal("the generated source-identity block must carry the declared digest")
+	}
+
+	// A record whose rendered source identity disagrees with the declaration
+	// is stale even though the delta block still matches. The doc is part of
+	// the digested tree, so the edit must be declared over — a regenerated
+	// manifest carrying a stale block is exactly how the drift shipped.
+	staleDoc := strings.Replace(string(doc), declaration.Source.SHA256, strings.Repeat("0", 64), 1)
+	if staleDoc == string(doc) {
+		t.Fatal("the digest replacement must actually edit the doc")
+	}
+	if err := os.WriteFile(docPath, []byte(staleDoc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	identity, err := digestRuntime(vendored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	declaration.ShippedTreeSHA256 = identity.NemoRuntimeSHA256
+	declaration.FileCount = identity.FileCount
+	writeManifestFile(t, path, declaration)
+	err = verifyManifest(path)
+	if err == nil {
+		t.Fatal("a stale source-identity block must fail verification")
+	}
+	if !strings.Contains(err.Error(), "source-identity") {
+		t.Fatalf("error = %q, want the source-identity block named", err)
+	}
+
+	// -update rewrites the block back to the declared identity.
+	if err := syncProvenanceDoc(vendored, declaration, true); err != nil {
+		t.Fatalf("regenerating the doc: %v", err)
+	}
+	repaired, err := os.ReadFile(docPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(repaired), declaration.Source.SHA256) {
+		t.Fatal("the regenerated block must carry the declared digest again")
+	}
+}
+
+// A manifest that declares no source must not meet a record that claims one:
+// the doc asserting provenance the manifest does not declare is the same
+// class of disagreement as a stale value.
+func TestProvenanceDocSourceBlockWithoutDeclaredSourceFails(t *testing.T) {
+	root := baseTree(t)
+	declaration := declarationFor(t, root)
+	docPath := filepath.Join(root, provenanceDocName)
+	doc, err := os.ReadFile(docPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	extra := strings.Replace(string(doc), deltaBlockBegin,
+		renderSourceBlock(manifestSource{Path: "../elsewhere", FileCount: 1, SHA256: strings.Repeat("1", 64)})+"\n\n"+deltaBlockBegin, 1)
+	if err := os.WriteFile(docPath, []byte(extra), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Re-declare the computed fields over the edited doc so the digest
+	// matches and only the generated-block check can object.
+	identity, err := digestRuntime(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	declaration.ShippedTreeSHA256 = identity.NemoRuntimeSHA256
+	declaration.FileCount = identity.FileCount
+	path := filepath.Join(t.TempDir(), "nemo-transfer-manifest.json")
+	writeManifestFile(t, path, declaration)
+	err = verifyManifest(path)
+	if err == nil {
+		t.Fatal("a source-identity block with no declared source must fail verification")
+	}
+	if !strings.Contains(err.Error(), "declares no source") {
+		t.Fatalf("error = %q, want the undeclared source named", err)
 	}
 }

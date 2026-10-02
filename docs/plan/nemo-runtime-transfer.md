@@ -346,12 +346,12 @@ by the three `bridges/*` entries in the workspace `members` list, those
 directories, the MCP credential patch, and `TRANSFER-PROVENANCE.md`. The
 manifest's `local_modifications` and `added_paths` inventory is the full list,
 and `scripts/check-nemo-transfer-manifest.sh` refuses a tree that drifted from
-it. The record's delta table is not maintained by hand: `-update` regenerates
-the marker-delimited block inside `TRANSFER-PROVENANCE.md` before digesting
-the tree, and verification fails when the block no longer renders the
-manifest's declared sets — the human record and the machine record cannot
-silently diverge. Re-applying those after an upstream refresh is the
-documented update procedure.
+it. The record's delta table and source identity are not maintained by hand:
+`-update` regenerates both marker-delimited blocks inside
+`TRANSFER-PROVENANCE.md` before digesting the tree, and verification fails
+when either block no longer renders the manifest's declaration — the human
+record and the machine record cannot silently diverge. Re-applying those
+after an upstream refresh is the documented update procedure.
 
 ### Platform scope: Linux and macOS for the integrated runtime
 

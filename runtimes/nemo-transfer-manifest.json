@@ -1,7 +1,7 @@
 {
   "tree": "runtimes/nemo-relay",
   "runtime_version": "0.9.1-rc.4",
-  "shipped_tree_sha256": "0a99b505ab7391e966da790354a2979a7c1a8175f625cb5ce175fdbe10c0c89d",
+  "shipped_tree_sha256": "c047c3796fc3badf960aa16da294b1653422e02b3c0a560e5b1f01b0b5e77856",
   "file_count": 1461,
   "excluded": [
     ".git",
