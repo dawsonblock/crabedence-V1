@@ -255,6 +255,10 @@ library = "$(basename "$library")"
 symbol = "nemo_relay_native_intercept_fixture"
 TOML
 export NEMO_RELAY_PLUGIN_HOST="$host_bin"
+# This tree is a development deployment: it names the host by ambient path and
+# has no release manifest or digest to pin its bytes, so it acknowledges the
+# unverified host explicitly — the composition refuses the override otherwise.
+export NEMO_RELAY_PLUGIN_HOST_ALLOW_UNPINNED=1
 pass "plugin host and fixture staged"
 
 # 7. A managed PURE invocation through the plugin: the chain's request and
@@ -549,5 +553,75 @@ set -e
 [[ $status -ne 0 && "$out" == *"NEMO_RELAY_MANAGED_CALL_BUDGET_MS"* ]] \
   || fail "a malformed call budget must name the variable: $out"
 pass "malformed managed-call budget fails startup"
+
+# ─── Trust-class and ambient-override gates ─────────────────────────────────
+#
+# Two rules keep the ambient knobs from becoming ambient authority: an
+# environment variable that names the host must have its bytes pinned or be
+# explicitly acknowledged as development, and an artifact that declares
+# confinement cannot be hosted by a policy that does not confine it.
+
+# 23. The ambient override alone is not enough: unsetting the development
+#     acknowledgement leaves a path nobody pinned, and the composition must
+#     refuse it rather than execute whichever binary the path resolves to.
+set +e
+out="$(
+  unset NEMO_RELAY_PLUGIN_HOST_ALLOW_UNPINNED
+  export NEMO_RELAY_PLUGIN_HOST_SHA256=
+  run_runtime \
+    --plugin "$plugin_dir" --plugin-id fixture_intercept \
+    --component fixture_intercept --capability system.echo \
+    --arguments '{"probe":"unpinned-override"}' 2>&1
+)"
+status=$?
+set -e
+[[ $status -ne 0 ]] || fail "an unpinned ambient override must be refused: $out"
+printf '%s' "$out" | grep -q 'NEMO_RELAY_PLUGIN_HOST_ALLOW_UNPINNED' \
+  || fail "the refusal must name the acknowledgement: $out"
+pass "an ambient host override with nothing pinning it is refused"
+
+# 24. An artifact that requires confinement refuses trusted-process: the
+#     manifest's declaration is inside the digest that approved it, so a
+#     deployment that offers a non-confining policy gets a refusal, not a
+#     silently downgraded host.
+confined_plugin_dir="$work_dir/plugin-confined"
+mkdir -p "$confined_plugin_dir"
+install -m 0644 "$library" "$confined_plugin_dir/$(basename "$library")"
+cat > "$confined_plugin_dir/relay-plugin.toml" <<TOML
+manifest_version = 1
+
+[plugin]
+id = "fixture_intercept"
+kind = "rust_dynamic"
+
+[compat]
+relay = "=$relay_version"
+native_api = "1"
+
+[defaults]
+enabled = false
+
+[capabilities]
+items = ["plugin_native"]
+
+[load]
+library = "$(basename "$library")"
+symbol = "nemo_relay_native_intercept_fixture"
+
+[security]
+requires_confinement = true
+TOML
+
+set +e
+out="$(NEMO_RELAY_NATIVE_ISOLATION=trusted-process run_runtime \
+  --plugin "$confined_plugin_dir" --plugin-id fixture_intercept \
+  --component fixture_intercept --capability system.echo \
+  --arguments '{"probe":"requires-confinement"}' 2>&1)"
+status=$?
+set -e
+[[ $status -ne 0 ]] || fail "a confinement-required plugin must refuse trusted-process: $out"
+printf '%s' "$out" | grep -q 'requires_confinement' \
+  || fail "the refusal must name the manifest's declaration: $out"
+pass "a confinement-required plugin refuses a non-confining policy"
 
 printf 'runtime e2e: %d checks passed\n' "$check_count"

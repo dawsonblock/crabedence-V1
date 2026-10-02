@@ -1,7 +1,7 @@
 {
   "tree": "runtimes/nemo-relay",
   "runtime_version": "0.9.1-rc.4",
-  "shipped_tree_sha256": "fa101860cf55136e4c5a5028dea5069e279b463bd77ef5c6feb88c2a0de610c1",
+  "shipped_tree_sha256": "441b278ec54037f36d67dfef6ee265296f14eba8d927c0bdba4f701a98cc30f7",
   "file_count": 1461,
   "excluded": [
     ".git",
@@ -28,8 +28,11 @@
     "README.md",
     "crates/cli/src/mcp_environment.rs",
     "crates/core/src/kernel.rs",
+    "crates/core/src/plugin/dynamic/artifact.rs",
+    "crates/core/src/plugin/dynamic/manifest.rs",
     "crates/core/tests/fixtures/native_intercept_plugin/Cargo.lock",
     "crates/core/tests/fixtures/native_intercept_plugin/src/lib.rs",
+    "crates/core/tests/unit/plugin_dynamic_tests.rs",
     "crates/executor/src/lib.rs",
     "crates/native-loader/Cargo.toml",
     "crates/native-loader/src/bin/nemo-plugin-host.rs",
@@ -40,6 +43,7 @@
     "crates/plugin-host/src/supervisor.rs",
     "crates/plugin-host/tests/process_backend.rs",
     "crates/plugin-host/tests/support/mod.rs",
+    "docs/build-plugins/package-discoverable-plugins.mdx",
     "integrations/coding-agents/codex/.mcp.json",
     "security/PLUGIN-ISOLATION.md",
     "security/QUALIFICATION-MATRIX.md",

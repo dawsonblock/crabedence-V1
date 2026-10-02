@@ -170,7 +170,9 @@ HOSTILE      a VM boundary                 (not implemented; a different mechani
 |---|---|
 | A restricted policy this kernel cannot deliver is refused before the host starts | `a_restricted_linux_policy_refuses_a_host_that_cannot_probe` |
 | A confined host completes transfer, digest verification, load and registration | `a_restricted_linux_host_loads_only_the_transferred_approved_copy` |
-| The sandbox's denials hold in the confined child itself | the probe's `self_check`, exercised by both tests above through `unmet_requirements` |
+| The sandbox's denials hold in the confined child itself | the probe's `self_check`, exercised by both tests above through `unmet_requirements`: every entry in `BLOCKED_SYSCALLS` must answer `EPERM`, reads and writes outside the Landlock allow-list must refuse (including `/etc/shadow`, `/root`, `/home` and writes to the read-only system tree), a mounted `/proc` may show only the confined init, a `sendto` carrying a destination must refuse, and the `dumpable`/`no_new_privs`/capability-bounding state must still be set |
+| An artifact that declares confinement cannot be hosted unconfined | `security.requires_confinement` in `relay-plugin.toml`, enforced by the runtime composition before a host starts |
+| An ambient `NEMO_RELAY_PLUGIN_HOST` path cannot stand in for a pinned host | the composition refuses an override whose bytes nothing binds unless `NEMO_RELAY_PLUGIN_HOST_ALLOW_UNPINNED=1` acknowledges it as development |
 | The policy spelling, defaults and refusal to fall back | the `isolation_policy` unit tests |
 
 Both process tests run in the plugin-host suite; on a host where unprivileged

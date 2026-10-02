@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use nemo_relay_plugin_host::ProcessLoadedPlugins;
 use nemo_relay_plugin_host::isolation_policy::NativeIsolationPolicy;
 use nemo_relay_plugin_host::off_path::ObservabilityPolicy;
-use nemo_relay_plugin_host::supervisor::PluginHostSupervisorConfig;
+use nemo_relay_plugin_host::supervisor::{EXECUTABLE_ENV, PluginHostSupervisorConfig};
 use nemo_relay_plugin_protocol::{
     PROTOCOL_VERSION, PluginComponentConfiguration, PluginDescriptor, PluginExecutionContext,
 };
@@ -132,6 +132,21 @@ pub struct HostIdentity {
     pub staged: bool,
 }
 
+/// The trust class a session ran under, recorded as evidence.
+///
+/// `policy` is the deployment's resolved `NativeIsolationPolicy` and
+/// `confinement_required` the artifact's own declaration — a receipt that
+/// names both proves a `requires_confinement` plugin ran confined rather than
+/// merely that a deployment asked for confinement.
+pub struct IsolationEvidence {
+    /// The resolved policy, spelled as the deployment spells it.
+    pub policy: &'static str,
+    /// Whether the executed policy confines the plugin's resources.
+    pub confines: bool,
+    /// Whether the artifact declared `security.requires_confinement`.
+    pub confinement_required: bool,
+}
+
 /// A verified copy of the host executable, in a directory private to this
 /// session.
 ///
@@ -229,6 +244,9 @@ pub struct PluginSession {
     /// binary that actually holds the plugin, which is what a qualified
     /// deployment's pin binds. Recorded so a receipt can name it.
     pub host: HostIdentity,
+    /// The isolation policy the session ran under and whether the artifact
+    /// required confinement — the trust-class evidence a report carries.
+    pub isolation: IsolationEvidence,
     /// Held, not read: the composition owns the backend, so the session's
     /// lifetime is the host child's, and dropping it removes the plugin's
     /// registrations from this process's chains.
@@ -333,9 +351,16 @@ fn middleware_set_digest(
 pub async fn open(options: &PluginOptions) -> Result<PluginSession, String> {
     let artifact = resolve_artifact(&options.artifact)?;
     let artifact_ref = artifact.to_string_lossy();
-    let (manifest_sha256, library_sha256) =
-        nemo_relay::plugin::dynamic::plugin_artifact_identity(&artifact_ref)
-            .map_err(|error| format!("the plugin artifact could not be approved: {error}"))?;
+    let details = nemo_relay::plugin::dynamic::plugin_artifact_details(&artifact_ref)
+        .map_err(|error| format!("the plugin artifact could not be approved: {error}"))?;
+    // The artifact carries its own trust floor inside the digest that approved
+    // it: a plugin that requires a confining host policy is refused under
+    // `trusted-process` rather than run unconfined, so a third-party artifact
+    // cannot be silently downgraded by the sandbox being unavailable.
+    let requires_confinement = details.manifest.requires_confinement();
+    enforce_artifact_confinement(&options.plugin_id, requires_confinement, options.isolation)?;
+    let manifest_sha256 = details.manifest_sha256;
+    let library_sha256 = details.library_sha256;
     let activation_config: Value = serde_json::from_str(&options.component_config)
         .map_err(|error| format!("the activation config is not JSON: {error}"))?;
     let activation_config_sha256 = crate::canonical_digest(&activation_config)?;
@@ -400,6 +425,11 @@ pub async fn open(options: &PluginOptions) -> Result<PluginSession, String> {
         plugin_library_sha256: library_sha256,
         activation_config_sha256,
         host,
+        isolation: IsolationEvidence {
+            policy: options.isolation.as_str(),
+            confines: options.isolation.confines_resources(),
+            confinement_required: requires_confinement,
+        },
         _loaded: loaded,
         _staging: staging,
     })
@@ -450,6 +480,11 @@ async fn host_async(
             "staged": session.host.staged,
         },
         "plugin": serde_json::to_value(&session.descriptor).map_err(|error| error.to_string())?,
+        "isolation": {
+            "policy": session.isolation.policy,
+            "confines": session.isolation.confines,
+            "confinement_required": session.isolation.confinement_required,
+        },
         "middleware_set_digest": session.middleware_set_digest,
         "release_root_digest": release.map(|release| release.release_root_digest.clone()),
         "tool_call": tool_call,
@@ -467,6 +502,44 @@ async fn host_async(
 /// content to match the release's component manifest, rather than trusting
 /// whichever path resolved.
 const HOST_SHA256_ENV: &str = "NEMO_RELAY_PLUGIN_HOST_SHA256";
+
+/// The acknowledgement a development deployment gives for an ambient host
+/// override nothing pins.
+///
+/// `NEMO_RELAY_PLUGIN_HOST` names a *path*; a path only identifies content
+/// while something binds it — a release's component manifest, or
+/// `NEMO_RELAY_PLUGIN_HOST_SHA256` directly. Without a pin the override would
+/// execute whichever binary sits at the path, so this composition refuses it
+/// unless the deployment sets this to `1`, which is how development trees and
+/// test fixtures say "the ambient host is the intended one". The variable is
+/// never consulted when a pin exists: a pinned override is already content-
+/// bound, and an unpinned override outside development is refused rather than
+/// quietly trusted.
+const UNPINNED_HOST_ENV: &str = "NEMO_RELAY_PLUGIN_HOST_ALLOW_UNPINNED";
+
+/// Gate the ambient host override on something binding the binary it names.
+///
+/// Separated from `prepare_host` so the rule is testable without touching
+/// process-wide environment state — the inputs are the resolved values, the
+/// environment read happens at the call site.
+fn enforce_host_override(
+    configured: Option<&std::ffi::OsStr>,
+    pin: Option<&str>,
+    unpinned_acknowledged: Option<&std::ffi::OsStr>,
+) -> Result<(), String> {
+    if configured.is_some()
+        && pin.is_none()
+        && !unpinned_acknowledged.is_some_and(|value| *value == *"1")
+    {
+        return Err(format!(
+            "{EXECUTABLE_ENV} selects a plugin host by ambient path, but nothing pins its \
+             bytes — a release pins the host through its component manifest, or \
+             {HOST_SHA256_ENV} pins it directly. For a development deployment, \
+             {UNPINNED_HOST_ENV}=1 acknowledges the unverified host."
+        ));
+    }
+    Ok(())
+}
 
 /// Resolve, stage, digest, and pin the executed host binary.
 ///
@@ -490,6 +563,11 @@ fn prepare_host(
     config: &mut PluginHostSupervisorConfig,
     pin: Option<&str>,
 ) -> Result<(HostIdentity, Option<StagedHost>), String> {
+    enforce_host_override(
+        std::env::var_os(EXECUTABLE_ENV).as_deref(),
+        pin,
+        std::env::var_os(UNPINNED_HOST_ENV).as_deref(),
+    )?;
     let resolved = config
         .isolation
         .host_executable(
@@ -541,6 +619,28 @@ fn prepare_host(
         },
         staging,
     ))
+}
+
+/// The artifact's trust floor, enforced.
+///
+/// `security.requires_confinement` in the manifest is the artifact itself
+/// declaring the weakest host it will run under; a policy that does not
+/// confine resources cannot host it, whatever the deployment's default is —
+/// the requirement is inside the approved manifest's digest, so refusing is
+/// the only honest answer when the selected policy cannot honor it.
+fn enforce_artifact_confinement(
+    plugin_id: &str,
+    requires_confinement: bool,
+    isolation: NativeIsolationPolicy,
+) -> Result<(), String> {
+    if requires_confinement && !isolation.confines_resources() {
+        return Err(format!(
+            "plugin '{plugin_id}' declares security.requires_confinement and the host \
+             policy '{}' does not confine — the artifact refuses to run unconfined",
+            isolation.as_str(),
+        ));
+    }
+    Ok(())
 }
 
 /// The pin a deployment configured, resolved at the CLI boundary.
@@ -689,6 +789,94 @@ mod tests {
             error.contains("NEMO_RELAY_NATIVE_ISOLATION"),
             "the error must name the variable a deployer can fix: {error}"
         );
+    }
+
+    #[test]
+    fn an_unpinned_ambient_override_is_refused() {
+        // `NEMO_RELAY_PLUGIN_HOST` names a path; with no release manifest and
+        // no direct pin nothing binds the bytes at it, so the composition
+        // refuses rather than execute whatever the environment pointed at.
+        let configured = std::ffi::OsStr::new("/somewhere/nemo-plugin-host");
+        let error = enforce_host_override(Some(configured), None, None)
+            .expect_err("an unpinned ambient override must be refused");
+        assert!(
+            error.contains("NEMO_RELAY_PLUGIN_HOST"),
+            "the refusal must name the variable a deployer can fix: {error}"
+        );
+        assert!(
+            error.contains("NEMO_RELAY_PLUGIN_HOST_ALLOW_UNPINNED"),
+            "the refusal must name the development acknowledgement: {error}"
+        );
+    }
+
+    #[test]
+    fn a_pinned_ambient_override_needs_no_acknowledgement() {
+        // Content is bound by the pin wherever the path points — the override
+        // only chooses where the approved bytes are loaded from.
+        let configured = std::ffi::OsStr::new("/somewhere/nemo-plugin-host");
+        let pin = "a".repeat(64);
+        assert!(enforce_host_override(Some(configured), Some(&pin), None).is_ok());
+        // And an explicit acknowledgement is equally valid in a development
+        // tree that has nothing to pin against.
+        assert!(
+            enforce_host_override(Some(configured), None, Some(std::ffi::OsStr::new("1"))).is_ok()
+        );
+        // Anything that is not the acknowledgement spelling is not one.
+        for not_the_flag in ["true", "yes", "0", ""] {
+            assert!(
+                enforce_host_override(
+                    Some(configured),
+                    None,
+                    Some(std::ffi::OsStr::new(not_the_flag))
+                )
+                .is_err(),
+                "the acknowledgement is exactly '1', not {not_the_flag:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_override_never_needs_a_pin_or_an_acknowledgement() {
+        // Beside-the-binary resolution is the deployment's own install
+        // decision, not an ambient path.
+        assert!(enforce_host_override(None, None, None).is_ok());
+    }
+
+    #[test]
+    fn a_confinement_required_plugin_refuses_a_non_confining_policy() {
+        // The manifest's declaration survives inside its approved digest;
+        // `trusted-process` cannot host it no matter how available it is.
+        let error = enforce_artifact_confinement(
+            "untrusted_plugin",
+            true,
+            NativeIsolationPolicy::TrustedProcess,
+        )
+        .expect_err("trusted-process cannot host an artifact that requires confinement");
+        assert!(
+            error.contains("requires_confinement"),
+            "the refusal must name the manifest's declaration: {error}"
+        );
+        assert!(
+            error.contains("trusted-process"),
+            "the refusal must name the policy that failed: {error}"
+        );
+        // Either confined policy honors it — the artifact names a class, not
+        // a platform.
+        for policy in [
+            NativeIsolationPolicy::RestrictedLinux,
+            NativeIsolationPolicy::RestrictedMacOS,
+        ] {
+            assert!(enforce_artifact_confinement("untrusted_plugin", true, policy).is_ok());
+        }
+        // And a plugin that declared nothing accepts whatever the deployment
+        // selected — the floor only tightens.
+        for policy in [
+            NativeIsolationPolicy::TrustedProcess,
+            NativeIsolationPolicy::RestrictedLinux,
+            NativeIsolationPolicy::RestrictedMacOS,
+        ] {
+            assert!(enforce_artifact_confinement("any_plugin", false, policy).is_ok());
+        }
     }
 
     #[test]

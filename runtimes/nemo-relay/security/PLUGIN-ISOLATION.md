@@ -73,7 +73,7 @@ section was written):
   supervisor compile only on Unix. Selecting a native plugin on Windows returns
   `PluginHostError::UnsupportedPlatform`. The Windows CI lane checks every
   workspace target and compiles every test without running native-plugin tests.
-- **Claims: 38 enforced, 3 asserted and not yet.** Every claim this document makes
+- **Claims: 40 enforced, 3 asserted and not yet.** Every claim this document makes
   is listed with what enforces it in `security/QUALIFICATION-MATRIX.md`, generated
   from `security/qualification-matrix.toml`, and `just qualification-matrix`
   resolves each name against the tree. A test that is renamed or deleted turns that

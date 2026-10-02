@@ -348,6 +348,124 @@ fn self_check(
     } else {
         let _ = std::fs::remove_dir(&writable);
     }
+    // Credential discovery and filesystem escape: every path outside the
+    // allow-list must refuse, and a path the allow-list names read-only must
+    // refuse to write. Either refusal shape — EACCES or an absent path — is
+    // the boundary holding; only a completed operation is a failure.
+    denied(
+        &mut failures,
+        "reading the credential database",
+        std::fs::read("/etc/shadow").map(|_| ()),
+    );
+    denied(
+        &mut failures,
+        "listing the superuser's home directory",
+        std::fs::read_dir("/root").map(|_| ()),
+    );
+    denied(
+        &mut failures,
+        "listing other accounts' home directories",
+        std::fs::read_dir("/home").map(|_| ()),
+    );
+    denied(
+        &mut failures,
+        "writing into the read-only system tree",
+        std::fs::write("/etc/ld.so.conf", b"x"),
+    );
+    denied(
+        &mut failures,
+        "writing into the shared library tree",
+        std::fs::write("/usr/lib/nemo-probe-write", b"x"),
+    );
+    denied(
+        &mut failures,
+        "writing a kernel sysctl",
+        std::fs::write("/proc/sys/kernel/hostname", b"escaped"),
+    );
+    // A confined /proc, when it is present at all, shows only this PID
+    // namespace: the serving process is its init, so "1" is the only numeric
+    // entry that may appear. A withheld /proc is equally confined.
+    match std::fs::read_dir("/proc") {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if let Some(text) = name.to_str() {
+                    let numeric =
+                        !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+                    if numeric && text != "1" {
+                        failures.push(format!(
+                            "/proc exposes a process outside the namespace: {text}"
+                        ));
+                    }
+                }
+            }
+        }
+        Err(_) => {}
+    }
+    // The escape surface itself: every number the filter names must come back
+    // with the boundary's EPERM rather than the syscall's own answer. The
+    // calls carry no arguments because the filter denies on the call number
+    // alone — a call that succeeded, or failed for an incidental reason like
+    // a bad descriptor, did not prove the boundary.
+    for &number in BLOCKED_SYSCALLS {
+        denied_syscall(&mut failures, &syscall_name(number), unsafe {
+            libc::syscall(number as libc::c_long, 0, 0, 0, 0, 0, 0)
+        });
+    }
+    // `sendto` is the argument-checked denial: the filter must read the
+    // destination pointer, because the same call without one is a permitted
+    // connected write.
+    let datagram = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    if datagram < 0 {
+        failures.push(format!(
+            "the probe could not create a datagram socket: {}",
+            std::io::Error::last_os_error()
+        ));
+    } else {
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let destination = b"/probe-destination";
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                destination.as_ptr().cast::<libc::c_char>(),
+                addr.sun_path.as_mut_ptr(),
+                destination.len(),
+            );
+        }
+        let sent = unsafe {
+            libc::sendto(
+                datagram,
+                b"x".as_ptr().cast(),
+                1,
+                0,
+                (&addr as *const libc::sockaddr_un).cast(),
+                std::mem::size_of_val(&addr) as libc::socklen_t,
+            )
+        };
+        denied_syscall(
+            &mut failures,
+            "sending a datagram to a named destination (sendto)",
+            sent as i64,
+        );
+        unsafe { libc::close(datagram) };
+    }
+    // The flags the boundary set must still be set: a plugin that could mark
+    // itself dumpable or clear no_new_privs would reopen channels every
+    // denial above assumes closed, and a capability still in the bounding set
+    // is a privilege the drops did not take.
+    if unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        failures.push("the process is still dumpable".to_string());
+    }
+    if unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) } != 1 {
+        failures.push("no_new_privs is not set".to_string());
+    }
+    for capability in 0..64 {
+        if unsafe { libc::prctl(libc::PR_CAPBSET_READ, capability, 0, 0, 0) } == 1 {
+            failures.push(format!(
+                "capability {capability} is still in the bounding set"
+            ));
+        }
+    }
     if failures.is_empty() {
         let mut out = std::io::stdout().lock();
         let _ = writeln!(out, "{PROBE_ACK}");
@@ -366,6 +484,85 @@ fn denied(failures: &mut Vec<String>, name: &str, result: std::io::Result<()>) {
     if result.is_ok() {
         failures.push(format!("{name} was not denied"));
     }
+}
+
+/// A syscall that must fail with the boundary's own answer.
+///
+/// The seccomp filter returns `EPERM` before the call ever runs, so the errno
+/// is the proof: a call that came back with any other error failed for an
+/// incidental reason — a bad file descriptor, a bad flag — which says nothing
+/// about whether the filter saw it, and a call that returned did not fail at
+/// all.
+fn denied_syscall(failures: &mut Vec<String>, name: &str, result: i64) {
+    if result != -1 {
+        failures.push(format!("{name} was not denied"));
+        return;
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() != Some(libc::EPERM) {
+        failures.push(format!(
+            "{name} failed with {error}, not the boundary's EPERM"
+        ));
+    }
+}
+
+/// What a failure report calls each blocked number.
+///
+/// The table is advisory — an entry the filter was updated to cover but this
+/// function was not still reports by number, which is the name a deployment
+/// can grep the syscall table for.
+fn syscall_name(number: u32) -> String {
+    let name = match number {
+        n if n == libc::SYS_execve as u32 => "execve",
+        n if n == libc::SYS_execveat as u32 => "execveat",
+        n if n == libc::SYS_ptrace as u32 => "ptrace",
+        n if n == libc::SYS_process_vm_readv as u32 => "process_vm_readv",
+        n if n == libc::SYS_process_vm_writev as u32 => "process_vm_writev",
+        n if n == libc::SYS_connect as u32 => "connect",
+        n if n == libc::SYS_sendmsg as u32 => "sendmsg",
+        n if n == libc::SYS_sendmmsg as u32 => "sendmmsg",
+        n if n == libc::SYS_mount as u32 => "mount",
+        n if n == libc::SYS_umount2 as u32 => "umount2",
+        n if n == libc::SYS_pivot_root as u32 => "pivot_root",
+        n if n == libc::SYS_move_mount as u32 => "move_mount",
+        n if n == libc::SYS_fsopen as u32 => "fsopen",
+        n if n == libc::SYS_fsconfig as u32 => "fsconfig",
+        n if n == libc::SYS_fsmount as u32 => "fsmount",
+        n if n == libc::SYS_fspick as u32 => "fspick",
+        n if n == libc::SYS_open_tree as u32 => "open_tree",
+        n if n == libc::SYS_mount_setattr as u32 => "mount_setattr",
+        n if n == libc::SYS_setns as u32 => "setns",
+        n if n == libc::SYS_unshare as u32 => "unshare",
+        n if n == libc::SYS_chroot as u32 => "chroot",
+        n if n == libc::SYS_kexec_load as u32 => "kexec_load",
+        n if n == libc::SYS_kexec_file_load as u32 => "kexec_file_load",
+        n if n == libc::SYS_init_module as u32 => "init_module",
+        n if n == libc::SYS_finit_module as u32 => "finit_module",
+        n if n == libc::SYS_delete_module as u32 => "delete_module",
+        n if n == libc::SYS_bpf as u32 => "bpf",
+        n if n == libc::SYS_perf_event_open as u32 => "perf_event_open",
+        n if n == libc::SYS_keyctl as u32 => "keyctl",
+        n if n == libc::SYS_add_key as u32 => "add_key",
+        n if n == libc::SYS_request_key as u32 => "request_key",
+        n if n == libc::SYS_name_to_handle_at as u32 => "name_to_handle_at",
+        n if n == libc::SYS_open_by_handle_at as u32 => "open_by_handle_at",
+        n if n == libc::SYS_swapon as u32 => "swapon",
+        n if n == libc::SYS_swapoff as u32 => "swapoff",
+        n if n == libc::SYS_reboot as u32 => "reboot",
+        n if n == libc::SYS_userfaultfd as u32 => "userfaultfd",
+        n if n == libc::SYS_io_uring_setup as u32 => "io_uring_setup",
+        n if n == libc::SYS_io_uring_enter as u32 => "io_uring_enter",
+        n if n == libc::SYS_io_uring_register as u32 => "io_uring_register",
+        n if n == libc::SYS_acct as u32 => "acct",
+        n if n == libc::SYS_quotactl as u32 => "quotactl",
+        n if n == libc::SYS_quotactl_fd as u32 => "quotactl_fd",
+        n if n == libc::SYS_sethostname as u32 => "sethostname",
+        n if n == libc::SYS_setdomainname as u32 => "setdomainname",
+        n if n == libc::SYS_syslog as u32 => "syslog",
+        n if n == libc::SYS_kcmp as u32 => "kcmp",
+        _ => return format!("syscall {number}"),
+    };
+    format!("syscall {name}")
 }
 
 /// The outer half of the fork: wait for the confined child and mirror its exit.

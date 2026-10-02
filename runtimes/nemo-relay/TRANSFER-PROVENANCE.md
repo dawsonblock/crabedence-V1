@@ -102,8 +102,11 @@ gate fails on drift between it and the manifest:
 | modified | `README.md` |
 | modified | `crates/cli/src/mcp_environment.rs` |
 | modified | `crates/core/src/kernel.rs` |
+| modified | `crates/core/src/plugin/dynamic/artifact.rs` |
+| modified | `crates/core/src/plugin/dynamic/manifest.rs` |
 | modified | `crates/core/tests/fixtures/native_intercept_plugin/Cargo.lock` |
 | modified | `crates/core/tests/fixtures/native_intercept_plugin/src/lib.rs` |
+| modified | `crates/core/tests/unit/plugin_dynamic_tests.rs` |
 | modified | `crates/executor/src/lib.rs` |
 | modified | `crates/native-loader/Cargo.toml` |
 | modified | `crates/native-loader/src/bin/nemo-plugin-host.rs` |
@@ -114,6 +117,7 @@ gate fails on drift between it and the manifest:
 | modified | `crates/plugin-host/src/supervisor.rs` |
 | modified | `crates/plugin-host/tests/process_backend.rs` |
 | modified | `crates/plugin-host/tests/support/mod.rs` |
+| modified | `docs/build-plugins/package-discoverable-plugins.mdx` |
 | modified | `integrations/coding-agents/codex/.mcp.json` |
 | modified | `security/PLUGIN-ISOLATION.md` |
 | modified | `security/QUALIFICATION-MATRIX.md` |
