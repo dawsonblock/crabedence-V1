@@ -21,6 +21,7 @@ import { validateInvocationRequest } from "../contracts/invocation-abi";
 
 interface SchemaField {
   readonly type?: string;
+  readonly pattern?: string;
   readonly additionalProperties?: boolean;
   readonly properties?: Record<string, SchemaField>;
   readonly required?: string[];
@@ -47,8 +48,14 @@ const schema: InvocationSchema = JSON.parse(
  * A structurally valid value for one schema-declared field type.
  * Objects carry every `required` subfield so the synthesized value
  * satisfies presence rules like the mediation object's digest pair.
+ * A declared `pattern` is honored for the digest shape the schema
+ * uses; any other pattern fails here so a new constraint is noticed.
  */
 function valueFor(field: SchemaField): unknown {
+  if (field.pattern !== undefined) {
+    expect(field.pattern).toBe("^[0-9a-f]{64}$");
+    return "0".repeat(64);
+  }
   switch (field.type) {
     case "object": {
       const value: Record<string, unknown> = {};

@@ -41,7 +41,16 @@ fn load_schema() -> Value {
 /// A structurally valid value for one schema-declared field type.
 /// Objects carry every `required` subfield so the synthesized value
 /// satisfies presence rules like the mediation object's digest pair.
+/// A declared `pattern` is honored for the digest shape the schema
+/// uses; any other pattern fails here so a new constraint is noticed.
 fn value_for(field: &Value) -> Value {
+    if let Some(pattern) = field.get("pattern").and_then(Value::as_str) {
+        assert_eq!(
+            pattern, "^[0-9a-f]{64}$",
+            "value_for cannot synthesize pattern {pattern}"
+        );
+        return json!("0".repeat(64));
+    }
     match field.get("type").and_then(Value::as_str) {
         Some("object") => {
             let mut obj = serde_json::Map::new();

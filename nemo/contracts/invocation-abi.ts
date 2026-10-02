@@ -56,6 +56,9 @@ const MEDIATION_FIELDS = new Map<string, FieldType>([
 /** Digests a mediation object must carry — see R9. */
 const MEDIATION_REQUIRED = ["middleware_set_digest", "original_args_digest"];
 
+/** A mediation digest value in canonical form: 64 lowercase hex characters. */
+const SHA256_DIGEST = /^[0-9a-f]{64}$/;
+
 const INTEGER_LITERAL = /^-?(0|[1-9][0-9]*)$/;
 const NUMBER_LITERAL = /^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?$/;
 const INT64_MIN = -(2n ** 63n);
@@ -131,6 +134,7 @@ class InvocationScanner {
     expected: FieldType | null,
     depth: number,
     childFields: Map<string, FieldType> | null = null,
+    digestField = false,
   ): string | null {
     const c = this.peek();
     if (c === "") {
@@ -161,10 +165,19 @@ class InvocationScanner {
       return this.parseArray(path, depth + 1);
     }
     if (c === '"') {
-      if (this.parseString() === null) {
+      const value = this.parseString();
+      if (value === null) {
         return "invalid JSON: invalid string";
       }
-      return expected === null || expected === "string" ? null : typeError(path, expected);
+      if (expected !== null && expected !== "string") {
+        return typeError(path, expected);
+      }
+      // Every known mediation field is a digest field — the unknown ones
+      // were refused above, so the field class alone names the check.
+      if (digestField && !SHA256_DIGEST.test(value)) {
+        return `${path} must be a 64-character lowercase SHA-256 hex digest`;
+      }
+      return null;
     }
     if (c === "t" || c === "f") {
       const literal = c === "t" ? "true" : "false";
@@ -239,7 +252,13 @@ class InvocationScanner {
           : path === "request" && key === "mediation"
             ? MEDIATION_FIELDS
             : null;
-      const error = this.parseValue(keyPath, expected, depth, childFields);
+      const error = this.parseValue(
+        keyPath,
+        expected,
+        depth,
+        childFields,
+        fields === MEDIATION_FIELDS,
+      );
       if (error !== null) {
         return error;
       }

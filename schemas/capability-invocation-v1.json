@@ -68,26 +68,32 @@
       "properties": {
         "middleware_set_digest": {
           "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
           "description": "Canonical digest naming the exact middleware set that mediated this invocation — activated plugin identities, registration descriptors, activation configuration, and host identity."
         },
         "original_args_digest": {
           "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
           "description": "Canonical digest of the caller's arguments before middleware ran, so a mediated request records both what was asked and what was dispatched."
         },
         "release_root_digest": {
           "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
           "description": "Component-manifest digest of the qualified distribution the composing runtime shipped in, when it runs inside one."
         },
         "plugin_manifest_sha256": {
           "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
           "description": "SHA-256 of the activated plugin manifest, when a plugin mediated the invocation."
         },
         "plugin_library_sha256": {
           "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
           "description": "SHA-256 of the exact activated plugin library bytes."
         },
         "activation_config_sha256": {
           "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
           "description": "Canonical SHA-256 of the activated component configuration; raw configuration is omitted because it may contain credentials."
         }
       }
