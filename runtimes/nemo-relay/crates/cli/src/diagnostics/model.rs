@@ -59,6 +59,9 @@ pub(crate) struct ConfigurationInfo {
     pub upstream_auth: UpstreamAuthInfo,
     pub plugin_configs: Vec<ConfigLayer>,
     pub plugin_resolution: Check,
+    /// The native plugin host isolation policy this process would activate,
+    /// reported with the trust class it actually delivers.
+    pub native_plugin_isolation: Check,
     pub resolution: Check,
     pub default_agent: Option<String>,
     pub configured_agents: Vec<String>,

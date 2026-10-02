@@ -73,11 +73,22 @@ section was written):
   supervisor compile only on Unix. Selecting a native plugin on Windows returns
   `PluginHostError::UnsupportedPlatform`. The Windows CI lane checks every
   workspace target and compiles every test without running native-plugin tests.
-- **Claims: 40 enforced, 3 asserted and not yet.** Every claim this document makes
+- **Claims: 41 enforced, 3 asserted and not yet.** Every claim this document makes
   is listed with what enforces it in `security/QUALIFICATION-MATRIX.md`, generated
   from `security/qualification-matrix.toml`, and `just qualification-matrix`
   resolves each name against the tree. A test that is renamed or deleted turns that
   gate red, so a sentence here cannot go on describing something nothing checks.
+- **The hostile class is a named refusal, not a hidden level.** The deployment
+  spellings `hostile`, `hostile-vm` and `vm` are recognised at parse time and
+  refused with the boundary they asked for — a VM-grade backend this build does
+  not provide — rather than rejected as unknown values or silently mapped onto
+  the restricted levels. Every level the runtime does serve reports its trust
+  model as data, and no level claims to separate a plugin from the host process
+  that loaded it: the restricted levels confine the process's reach on the
+  machine, which is a different statement than protecting the process from the
+  code inside it. `nemo-relay doctor` reports the selected policy and its class,
+  and a hostile-class request fails the check rather than showing a selection
+  the runtime would never honor.
   A claim enforced by a recipe also names the workflow that invokes it, so deleting
   the CI step turns the row red instead of leaving a recipe that nothing runs. The
   three claims that are asserted rather than enforced are named there, with why.

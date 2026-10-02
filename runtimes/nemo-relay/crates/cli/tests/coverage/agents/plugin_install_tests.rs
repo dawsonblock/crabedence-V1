@@ -1471,6 +1471,21 @@ fn default_install_dir_follows_platform_conventions() {
     );
 }
 
+/// The env block every generated MCP server entry must carry: the generation
+/// fence that retires stale installs plus the synthetic-home boundary.
+#[track_caller]
+fn assert_generated_mcp_env(server: &serde_json::Value, generation_fence: &Path) {
+    assert_eq!(
+        server["env"]["NEMO_RELAY_MCP_GENERATION_FILE"],
+        json!(generation_fence)
+    );
+    assert_eq!(
+        server["env"]["NEMO_RELAY_MCP_GENERATION"],
+        json!(TEST_GENERATION_TOKEN)
+    );
+    crate::test_support::assert_managed_home_env(&server["env"]);
+}
+
 #[test]
 fn plugin_manifests_and_hooks_use_path_based_relay_command() {
     assert_eq!(
@@ -1506,15 +1521,7 @@ fn plugin_manifests_and_hooks_use_path_based_relay_command() {
         server["env"]["NEMO_RELAY_GATEWAY_BIND"],
         json!("127.0.0.1:47632")
     );
-    assert_eq!(
-        server["env"]["NEMO_RELAY_MCP_GENERATION_FILE"],
-        json!(&generation_fence)
-    );
-    assert_eq!(
-        server["env"]["NEMO_RELAY_MCP_GENERATION"],
-        json!(TEST_GENERATION_TOKEN)
-    );
-    crate::test_support::assert_managed_home_env(&server["env"]);
+    assert_generated_mcp_env(server, &generation_fence);
     assert_eq!(server["required"], json!(true));
     assert_eq!(server["startup_timeout_sec"], json!(20));
     assert!(
@@ -1533,14 +1540,7 @@ fn plugin_manifests_and_hooks_use_path_based_relay_command() {
     assert_eq!(claude_server["command"], json!("/bin/nemo-relay"));
     assert_eq!(claude_server["args"], json!(["mcp"]));
     assert_eq!(claude_server["alwaysLoad"], json!(true));
-    assert_eq!(
-        claude_server["env"]["NEMO_RELAY_MCP_GENERATION_FILE"],
-        json!(&generation_fence)
-    );
-    assert_eq!(
-        claude_server["env"]["NEMO_RELAY_MCP_GENERATION"],
-        json!(TEST_GENERATION_TOKEN)
-    );
+    assert_generated_mcp_env(claude_server, &generation_fence);
     assert_eq!(
         plugin_hooks(
             CodingAgent::Codex,

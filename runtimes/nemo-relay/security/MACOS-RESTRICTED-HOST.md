@@ -53,7 +53,11 @@ The CLI and Python, Node.js, and FFI activation entry points share one policy
 parser. Leave `NEMO_RELAY_NATIVE_ISOLATION` unset for the compatible
 `trusted-process` default, or set it to `restricted-macos` to require the verified
 App Sandbox bundle. Unknown values fail activation; they do not fall back to the
-trusted policy. The setting applies to native plugin hosting in that process.
+trusted policy. The hostile-class spellings — `hostile`, `hostile-vm`, `vm` —
+are recognised and refused by name rather than treated as unknown values: the
+refusal states that the class needs a VM-grade backend this build does not
+provide, and why the restricted levels cannot stand in for it. The setting
+applies to native plugin hosting in that process.
 
 ```sh
 export NEMO_RELAY_NATIVE_ISOLATION=restricted-macos
@@ -70,7 +74,12 @@ export NEMO_RELAY_PLUGIN_HOST_TEAM_ID=TEAMID1234
 That is a narrower claim than "hostile-safe", and the difference is worth stating
 in the same breath. App Sandbox is kernel-enforced confinement of a same-kernel
 process; it materially reduces what a malicious plugin can reach, and it is not
-the boundary for code assumed adversarial. The three levels are:
+the boundary for code assumed adversarial. It also confines the *host process*,
+not the plugin's access to that process: the plugin's code runs inside the
+sandboxed host and shares its memory, its file descriptors and the session
+credential the host answers the kernel with, so a plugin that can corrupt its
+host can act as that host within everything the sandbox permits. The three
+levels are:
 
 ```text
 TRUSTED      ordinary child process

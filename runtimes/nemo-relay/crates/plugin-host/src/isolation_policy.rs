@@ -19,7 +19,21 @@
 //!
 //! Third level, deliberately not a variant: a VM boundary for code assumed
 //! hostile. It is a different mechanism with a different host image, and a
-//! variant nothing can honor would read as a feature.
+//! variant nothing can honor would read as a feature. Its spellings are still
+//! recognised rather than rejected as unknown values, so a deployment that asks
+//! for it gets a refusal that names the boundary it wanted — and the reason the
+//! restricted levels cannot stand in for it — instead of a parse error that
+//! reads like a typo.
+//!
+//! One property every level shares, stated once because it decides what the
+//! restricted levels can claim: the plugin's code runs *inside* the host
+//! process the platform confines. Confinement bounds what that process may
+//! reach on the machine — its filesystem, network, devices and process table —
+//! but it does not separate the plugin from the host process's own state, which
+//! includes its memory, its file descriptors and the session credential it
+//! answers the kernel with. A plugin that can corrupt its host can act as that
+//! host within everything the host is permitted; the boundary a restricted
+//! level draws is around the process, not through it.
 
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
@@ -87,6 +101,10 @@ pub enum NativeIsolationPolicy {
     /// unless a later capability grants it. The confinement is a property of the
     /// signature, which is why a restricted host is a bundle rather than a bare
     /// executable.
+    ///
+    /// The sandbox confines the host process's reach; the plugin still runs
+    /// inside that process and shares its memory, file descriptors and session
+    /// credential. It is not a boundary for code assumed hostile.
     RestrictedMacOS,
     /// The host confines itself with the kernel's own mechanisms.
     ///
@@ -103,7 +121,51 @@ pub enum NativeIsolationPolicy {
     /// seccomp deny-list narrows. Where unprivileged user namespaces are
     /// unavailable or AppArmor-restricted, the policy refuses to start rather
     /// than run unconfined.
+    ///
+    /// The sandbox confines the host process's reach; the plugin still runs
+    /// inside that process and shares its memory, file descriptors and session
+    /// credential. It is not a boundary for code assumed hostile.
     RestrictedLinux,
+}
+
+/// What a selected policy actually delivers, as fields rather than prose.
+///
+/// The fields that read `false` are the honest part: they are the boundary the
+/// deployment does not have, reported as data so a diagnostic cannot describe a
+/// stronger boundary than the runtime enforces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IsolationTrustModel {
+    /// The deployment spelling of the policy this describes.
+    pub policy: &'static str,
+    /// The trust class the policy belongs to: `trusted` or `restricted`.
+    /// `hostile` is never reported here — spellings that name it are refused at
+    /// parse time because no level this build serves is a hostile-code boundary.
+    pub trust_class: &'static str,
+    /// Whether the host process's ambient reach — filesystem, network, devices,
+    /// process table — is confined by the platform.
+    pub confines_ambient_resources: bool,
+    /// Whether plugin code is separated from the host process's own state —
+    /// its memory, file descriptors and the session credential it answers the
+    /// kernel with. `false` for every level this build serves: a plugin shares
+    /// its host's process either way, and confinement bounds the process's
+    /// reach, not the plugin's reach into the process.
+    pub separates_plugin_from_host_process: bool,
+    /// Whether the policy is a defensible boundary for code assumed hostile.
+    /// `false` for every level this build serves; that class needs a VM-grade
+    /// backend, which is why its spellings refuse rather than select.
+    pub hostile_code_boundary: bool,
+    /// One sentence stating what the level does and does not bound, for human
+    /// diagnostic output.
+    pub note: &'static str,
+}
+
+/// Whether a deployment spelling names the hostile-code class.
+///
+/// The class is real even though this build serves none of it: a spelling that
+/// asks for it deserves a refusal about the missing boundary, not an
+/// unsupported-value error that reads like a typo.
+fn is_hostile_spelling(value: &str) -> bool {
+    matches!(value, "hostile" | "hostile-vm" | "vm")
 }
 
 /// Something a restricted host cannot be started without.
@@ -162,11 +224,24 @@ impl NativeIsolationPolicy {
     }
 
     /// Parse one canonical deployment spelling.
+    ///
+    /// Hostile-class spellings are recognised and refused by name rather than
+    /// rejected as unknown values: `hostile`, `hostile-vm` and `vm` name a real
+    /// class of boundary this build does not implement, and the refusal says so
+    /// — including why the restricted levels are not a substitute — instead of
+    /// letting the value read like a misspelling of a mode that exists.
     pub fn parse(value: &str) -> Result<Self, String> {
         match value {
             "trusted-process" => Ok(Self::TrustedProcess),
             "restricted-macos" => Ok(Self::RestrictedMacOS),
             "restricted-linux" => Ok(Self::RestrictedLinux),
+            other if is_hostile_spelling(other) => Err(format!(
+                "{NATIVE_ISOLATION_ENV}={other} asks for a hostile-code boundary this build \
+                 does not provide: that class requires a VM-grade isolation backend, and no \
+                 level here is one — the restricted levels confine a host's ambient reach but \
+                 do not separate the plugin from the host process, its memory or the session \
+                 credential it holds"
+            )),
             other => Err(format!(
                 "{NATIVE_ISOLATION_ENV} has unsupported value '{other}'; expected 'trusted-process', 'restricted-macos' or 'restricted-linux'"
             )),
@@ -190,6 +265,38 @@ impl NativeIsolationPolicy {
     /// separated into its own process.
     pub const fn confines_resources(self) -> bool {
         matches!(self, Self::RestrictedMacOS | Self::RestrictedLinux)
+    }
+
+    /// What this policy actually separates, in a shape callers can report.
+    ///
+    /// Diagnostics and doctor output describe the deployment's boundary from
+    /// this rather than from prose: the fields a level does not deliver are
+    /// reported as `false` here, so no caller can describe a stronger boundary
+    /// than the one the runtime enforces.
+    pub const fn trust_model(self) -> IsolationTrustModel {
+        match self {
+            Self::TrustedProcess => IsolationTrustModel {
+                policy: self.as_str(),
+                trust_class: "trusted",
+                confines_ambient_resources: false,
+                separates_plugin_from_host_process: false,
+                hostile_code_boundary: false,
+                note: "process isolation only: crash containment, bounded execution and \
+                       resource ceilings; the host keeps the account's ambient authority, so \
+                       every plugin it loads requires full trust in that authority",
+            },
+            Self::RestrictedMacOS | Self::RestrictedLinux => IsolationTrustModel {
+                policy: self.as_str(),
+                trust_class: "restricted",
+                confines_ambient_resources: true,
+                separates_plugin_from_host_process: false,
+                hostile_code_boundary: false,
+                note: "the host process's ambient reach is confined — filesystem, network, \
+                       devices and process table — but plugin code still runs inside that \
+                       process and shares its memory, file descriptors and session \
+                       credential; not a boundary for code assumed hostile",
+            },
+        }
     }
 
     /// Whether the confinement is carried by the executable's signature.
@@ -716,6 +823,91 @@ mod tests {
             error.failure.message.contains(host_location::BUNDLE_NAME),
             "the refusal names the bundle that was expected: {}",
             error.failure.message
+        );
+    }
+
+    #[test]
+    fn a_hostile_policy_spelling_is_refused_by_name() {
+        // The class is real even though no level serves it: asking for it is a
+        // deployment decision, not a typo, and the refusal has to say which
+        // boundary was asked for and why nothing here substitutes for it.
+        for spelling in ["hostile", "hostile-vm", "vm"] {
+            let error = NativeIsolationPolicy::parse(spelling).expect_err(spelling);
+            assert!(
+                error.contains("hostile-code boundary"),
+                "the refusal names the class the deployment asked for: {error}"
+            );
+            assert!(
+                error.contains("VM-grade"),
+                "the refusal names the mechanism the class requires: {error}"
+            );
+            assert!(
+                !error.contains("unsupported value"),
+                "a recognised class does not read like a typo: {error}"
+            );
+        }
+        // Unknown spellings still take the generic refusal, which lists the
+        // levels that exist.
+        let error = NativeIsolationPolicy::parse("restricted").expect_err("unknown spelling");
+        assert!(error.contains("unsupported value"));
+        assert!(error.contains("restricted-linux"));
+    }
+
+    #[test]
+    fn the_trust_model_reports_what_no_policy_separates() {
+        // The fields that must stay false are the point of the report: a caller
+        // rendering them cannot describe a boundary stronger than the one the
+        // runtime enforces.
+        for policy in [
+            NativeIsolationPolicy::TrustedProcess,
+            NativeIsolationPolicy::RestrictedMacOS,
+            NativeIsolationPolicy::RestrictedLinux,
+        ] {
+            let model = policy.trust_model();
+            assert_eq!(model.policy, policy.as_str());
+            assert!(
+                !model.separates_plugin_from_host_process,
+                "{} shares its host process with the plugin either way",
+                policy.as_str()
+            );
+            assert!(
+                !model.hostile_code_boundary,
+                "{} is not a boundary for code assumed hostile",
+                policy.as_str()
+            );
+        }
+        assert_eq!(
+            NativeIsolationPolicy::TrustedProcess
+                .trust_model()
+                .trust_class,
+            "trusted"
+        );
+        assert_eq!(
+            NativeIsolationPolicy::RestrictedMacOS
+                .trust_model()
+                .trust_class,
+            "restricted"
+        );
+        assert_eq!(
+            NativeIsolationPolicy::RestrictedLinux
+                .trust_model()
+                .trust_class,
+            "restricted"
+        );
+        assert!(
+            !NativeIsolationPolicy::TrustedProcess
+                .trust_model()
+                .confines_ambient_resources
+        );
+        assert!(
+            NativeIsolationPolicy::RestrictedMacOS
+                .trust_model()
+                .confines_ambient_resources
+        );
+        assert!(
+            NativeIsolationPolicy::RestrictedLinux
+                .trust_model()
+                .confines_ambient_resources
         );
     }
 

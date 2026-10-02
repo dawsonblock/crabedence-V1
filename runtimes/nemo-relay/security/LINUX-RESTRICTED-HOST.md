@@ -58,12 +58,16 @@ export NEMO_RELAY_NATIVE_ISOLATION=restricted-linux
 ```
 
 Unknown values fail activation; they do not fall back to the trusted policy.
-On non-Linux the requirement is `the platform is not Linux`. On Linux where the
-probe cannot run the confined child, the refusal names the mechanism — the
-kernel may deny unprivileged user namespaces outright
-(`kernel.unprivileged_userns_clone`) or mediate them per binary through
-AppArmor (`kernel.apparmor_restrict_unprivileged_userns`, Ubuntu 23.10+),
-which needs a profile granting `nemo-plugin-host` the userns permission.
+The hostile-class spellings — `hostile`, `hostile-vm`, `vm` — are recognised
+and refused by name rather than treated as unknown values: the refusal states
+that the class needs a VM-grade backend this build does not provide, and why
+the restricted levels cannot stand in for it. On non-Linux the requirement is
+`the platform is not Linux`. On Linux where the probe cannot run the confined
+child, the refusal names the mechanism — the kernel may deny unprivileged user
+namespaces outright (`kernel.unprivileged_userns_clone`) or mediate them per
+binary through AppArmor (`kernel.apparmor_restrict_unprivileged_userns`,
+Ubuntu 23.10+), which needs a profile granting `nemo-plugin-host` the userns
+permission.
 
 ## The boundary
 
@@ -151,7 +155,16 @@ which needs a profile granting `nemo-plugin-host` the userns permission.
 This is namespace confinement plus syscall filtering — not a VM boundary. The
 residual risk is the Linux syscall surface itself: a kernel exploit in an
 allowed call is inside the threat model's remaining surface, which is why the
-deny-list narrows it rather than pretending to eliminate it. `trusted-process`
+deny-list narrows it rather than pretending to eliminate it.
+
+The sandbox also confines the *host process*, not the plugin's access to that
+process. The plugin's code runs inside the confined host and shares its memory,
+its file descriptors and the session credential the host answers the kernel
+with — a plugin that can corrupt its host can act as that host within
+everything the host is permitted. Confinement removes what the host may reach
+on the machine; it does not protect the host from the code it loaded.
+
+`trusted-process`
 remains what it always was — crash containment, bounded execution, resource
 ceilings — and is not a security boundary for untrusted code. For code assumed
 adversarial, the boundary to reach is a VM; this level is the one below it.

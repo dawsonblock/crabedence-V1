@@ -102,7 +102,7 @@ pub fn run() -> ExitCode {
         return crate::linux_sandbox::probe();
     }
     let (restricted, restricted_ipc) = match std::env::var(ISOLATION).as_deref() {
-        Ok("trusted-process") | Err(_) => (false, false),
+        Ok("trusted-process") | Err(std::env::VarError::NotPresent) => (false, false),
         Ok("restricted-macos") => (true, true),
         Ok("restricted-linux") => {
             #[cfg(target_os = "linux")]
@@ -138,6 +138,10 @@ pub fn run() -> ExitCode {
         }
         Ok(other) => {
             eprintln!("{ISOLATION} has unsupported value '{other}'");
+            return ExitCode::from(2);
+        }
+        Err(std::env::VarError::NotUnicode(_)) => {
+            eprintln!("{ISOLATION} is not valid Unicode");
             return ExitCode::from(2);
         }
     };

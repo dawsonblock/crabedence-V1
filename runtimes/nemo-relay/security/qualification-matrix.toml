@@ -393,6 +393,16 @@ enforced_by = [
 note = "The requirement check runs the host binary's confinement probe — it enters the namespaces, applies Landlock and seccomp, and proves the denials in self_check before acking. A binary that cannot produce the acknowledgement fails the launch. The probe's syscall pass iterates every entry in BLOCKED_SYSCALLS and requires the boundary's own EPERM — a call that succeeded or failed for an incidental reason proves nothing — so the escape surface (execve, ptrace, setns, unshare, the mount family, bpf, perf, keyrings, module load, io_uring, process-vm access, the addressed-socket sends and the rest) is probed as blocked rather than merely listed. The filesystem pass requires reads and writes outside the Landlock allow-list to refuse, including the credential paths (/etc/shadow, /root, /home) and writes into the read-only system tree; a mounted /proc may show only the namespace's own init. The probe also proves connect() is dead in both directions (inside and outside the Landlock allow-list) and that sendto with a destination is refused while the filter must still read the argument, because Landlock does not mediate filesystem unix-socket connects on every kernel — the approved kernel channel arrives pre-connected on an inherited descriptor instead. Finally the probe asserts the boundary's own flags survived: not dumpable, no_new_privs set, and an empty capability bounding set."
 
 [[claim]]
+id = "hostile-class-requests-refuse-by-name"
+statement = "A deployment that names the hostile-code class — `hostile`, `hostile-vm` or `vm` in NEMO_RELAY_NATIVE_ISOLATION — is refused with a message naming the VM-grade boundary it asked for rather than an unknown-value error or a silently weaker selection, and every level this build does serve reports its trust model as data: no level claims to separate a plugin from the host process that loaded it, and none claims to be a boundary for code assumed hostile."
+status = "enforced"
+enforced_by = [
+  { rust_test = "a_hostile_policy_spelling_is_refused_by_name" },
+  { rust_test = "the_trust_model_reports_what_no_policy_separates" },
+  { rust_test = "native_isolation_check_fails_on_a_hostile_request" },
+]
+
+[[claim]]
 id = "every-hosting-consumer-carries-its-own-host"
 statement = "Every consumer that hosts plugins ships the host in the artifact that carries the binding, so a deployment never looks for one."
 status = "unverified"
