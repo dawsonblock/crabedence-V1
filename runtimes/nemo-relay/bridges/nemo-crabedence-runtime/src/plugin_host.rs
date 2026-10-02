@@ -529,7 +529,7 @@ fn enforce_host_override(
 ) -> Result<(), String> {
     if configured.is_some()
         && pin.is_none()
-        && !unpinned_acknowledged.is_some_and(|value| *value == *"1")
+        && unpinned_acknowledged.is_none_or(|value| *value != *"1")
     {
         return Err(format!(
             "{EXECUTABLE_ENV} selects a plugin host by ambient path, but nothing pins its \
