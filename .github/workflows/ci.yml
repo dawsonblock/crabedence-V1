@@ -481,7 +481,10 @@ jobs:
         image: postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94
         env:
           POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
+          # The service container lives only inside this job's ephemeral
+          # runner on localhost — trust auth keeps credentials out of the
+          # workflow file entirely.
+          POSTGRES_HOST_AUTH_METHOD: trust
           POSTGRES_DB: crabbox_test
         ports:
           - 5432:5432
@@ -530,7 +533,7 @@ jobs:
         run: npm run test:postgres
         working-directory: worker
         env:
-          CRABBOX_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/crabbox_test
+          CRABBOX_TEST_DATABASE_URL: postgres://postgres@localhost:5432/crabbox_test
 
       - name: Build
         run: npm run build
