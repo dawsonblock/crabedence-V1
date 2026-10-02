@@ -188,6 +188,25 @@ that violates one is defective, regardless of test results.
     (`expires_at > NOW()` in PostgreSQL, `unixepoch` in SQLite), not
     the application clock.
 
+12. **Capability-policy identity is bound into the execution
+    identity.** The request digest binds the resolved descriptor
+    version and descriptor digest plus the caller-declared mediation
+    provenance, so a registry policy change — schema, class, assurance,
+    route, authority policy, adapter — is a different execution
+    identity: it conflicts rather than silently reinterpreting a
+    durable record. Records written before this binding existed carry
+    a prefix-format digest and are marked `digest_version = 1`. They
+    upgrade exactly once, on touch: when acquisition conflicts and the
+    stored digest equals the caller's recomputed legacy digest, the
+    store CAS-rewrites `request_digest` to the descriptor-bound
+    identity — but only while the record holds no live lease and its
+    stored mediation equals the caller's. The migration is recorded on
+    the forensic ledger (`DIGEST_MIGRATED`) and is one-time by
+    construction: a descriptor-bound stored digest can never equal a
+    recomputed legacy digest. There is no standing fallback — a record
+    that fails a migration guard keeps its conflict, and a record that
+    has migrated is protected exactly like a fresh one.
+
 ## 1. State vocabulary
 
 ```

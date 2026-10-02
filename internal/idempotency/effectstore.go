@@ -26,6 +26,17 @@ type EffectStore interface {
 	// arguments. Evidence only; nil mediation means the request crossed
 	// no caller-side middleware boundary.
 	AcquireWithMediation(ctx context.Context, key, principal, capability, digest string, authority AuthorityBinding, mediation *MediationBinding, class string, leaseDuration time.Duration) (*AcquireResult, error)
+	// MigrateRequestDigest is the one-time migrate-on-touch for records
+	// written before descriptor/mediation identity was bound
+	// (digest_version = DigestVersionLegacy). The CAS rewrites
+	// request_digest to newDigest only while the stored digest still
+	// equals expectedDigest, the record carries no live lease, and the
+	// stored request_mediation equals the caller's — so the migration
+	// can never reinterpret a record under an identity it did not
+	// provably already have. Returns false without error when a guard
+	// fails; the caller then classifies the record under its stored
+	// legacy identity.
+	MigrateRequestDigest(ctx context.Context, executionID, expectedDigest, newDigest string, mediation *MediationBinding) (bool, error)
 	BeginExecution(ctx context.Context, executionID, leaseToken string, leaseGeneration int) error
 	MarkInFlight(ctx context.Context, executionID, leaseToken string, leaseGeneration int, providerID string, recoveryLocator json.RawMessage) error
 	RenewLease(ctx context.Context, executionID, leaseToken string, leaseGeneration int, duration time.Duration) error

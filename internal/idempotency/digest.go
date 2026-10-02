@@ -250,6 +250,28 @@ func normalizeNumbers(v any) (any, error) {
 	}
 }
 
+// Digest-version vocabulary for stored records (Record.DigestVersion,
+// execution_requests.digest_version). The request-digest ABI itself is
+// additive — each binding tier omits absent fields from the canonical
+// form — so the version on a stored record is provenance, not a format
+// marker: it records the strongest identity tier the record has been
+// verified under.
+const (
+	// DigestVersionLegacy is the provenance of records whose
+	// request_digest predates capability-descriptor and mediation
+	// binding, and of any record whose binding tier is unknown (the
+	// column default). A legacy record may be upgraded exactly once by
+	// MigrateRequestDigest — migrate-on-touch — which CAS-rewrites the
+	// stored digest to the descriptor-bound identity.
+	DigestVersionLegacy = 1
+	// DigestVersionDescriptorBound is the current tier: the stored
+	// request_digest binds the capability descriptor identity and the
+	// caller-declared mediation, so a registry policy change is a new
+	// execution identity rather than a silent reinterpretation of the
+	// durable record.
+	DigestVersionDescriptorBound = 2
+)
+
 // DigestInput is the input to the idempotency digest.
 type DigestInput struct {
 	ProtocolVersion int            `json:"protocol_version"`
