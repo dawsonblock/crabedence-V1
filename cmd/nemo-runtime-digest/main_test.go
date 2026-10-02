@@ -748,6 +748,38 @@ func TestProvenanceDocSourceIdentityIsGenerated(t *testing.T) {
 	}
 }
 
+// A duplicated marker pair would leave a second block past the splice that
+// verification never reads — a stale copy hiding in the record. Both blocks
+// share that failure mode, so the check is on the markers, not the payload.
+func TestProvenanceDocRejectsDuplicateGeneratedBlocks(t *testing.T) {
+	root := baseTree(t)
+	declaration := declarationFor(t, root)
+	docPath := filepath.Join(root, provenanceDocName)
+	doc, err := os.ReadFile(docPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicated := string(doc) + "\n" + renderDeltaBlock(declaration) + "\n"
+	if err := os.WriteFile(docPath, []byte(duplicated), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	identity, err := digestRuntime(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	declaration.ShippedTreeSHA256 = identity.NemoRuntimeSHA256
+	declaration.FileCount = identity.FileCount
+	path := filepath.Join(t.TempDir(), "nemo-transfer-manifest.json")
+	writeManifestFile(t, path, declaration)
+	err = verifyManifest(path)
+	if err == nil {
+		t.Fatal("a duplicated generated block must fail verification")
+	}
+	if !strings.Contains(err.Error(), "duplicate") {
+		t.Fatalf("error = %q, want the duplicate named", err)
+	}
+}
+
 // A manifest that declares no source must not meet a record that claims one:
 // the doc asserting provenance the manifest does not declare is the same
 // class of disagreement as a stale value.

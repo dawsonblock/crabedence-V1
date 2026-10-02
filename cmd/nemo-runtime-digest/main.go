@@ -797,9 +797,13 @@ func renderSourceBlock(source manifestSource) string {
 }
 
 // spliceGenerated replaces doc's marker-delimited block — markers included —
-// with rendered. The block must exist: a record missing the markers cannot
-// be checked at all, which is drift in itself.
+// with rendered. The block must exist exactly once: a record missing the
+// markers cannot be checked at all, and a record carrying a duplicate pair
+// hides a block the splice never reaches — both are drift in themselves.
 func spliceGenerated(doc, begin, end, rendered, name, docPath string) (string, error) {
+	if strings.Count(doc, begin) > 1 || strings.Count(doc, end) > 1 {
+		return "", fmt.Errorf("%s carries duplicate %s markers — run `nemo-runtime-digest -update` after removing the copy", docPath, name)
+	}
 	beginIdx := strings.Index(doc, begin)
 	endIdx := strings.Index(doc, end)
 	if beginIdx < 0 || endIdx < 0 || beginIdx > endIdx {
