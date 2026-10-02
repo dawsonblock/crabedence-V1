@@ -197,6 +197,79 @@ func TestSQLiteRevokeAllGenerations(t *testing.T) {
 	}
 }
 
+// TestSQLiteGrantsForPrincipal verifies the brokered enumeration: a
+// principal's live grants are its latest unrevoked, unexpired
+// generations — superseded, revoked, expired, reissued-away, and
+// another principal's material all stay out of the candidacy.
+func TestSQLiteGrantsForPrincipal(t *testing.T) {
+	db := openSQLite(t)
+	store, err := NewSQLiteStore(db)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	ctx := context.Background()
+
+	hour := time.Hour
+	if _, err := store.IssueGrant(ctx, "live-a", "alice", []string{"cap.a"}, time.Now().Add(hour)); err != nil {
+		t.Fatalf("issue live-a: %v", err)
+	}
+	if _, err := store.IssueGrant(ctx, "live-b", "alice", []string{"cap.b"}, time.Now().Add(hour)); err != nil {
+		t.Fatalf("issue live-b: %v", err)
+	}
+	// Superseded: reissued with a still-valid newer generation.
+	if _, err := store.IssueGrant(ctx, "reissued", "alice", []string{"cap.a"}, time.Now().Add(hour)); err != nil {
+		t.Fatalf("issue reissued gen1: %v", err)
+	}
+	if _, err := store.IssueGrant(ctx, "reissued", "alice", []string{"cap.a", "cap.c"}, time.Now().Add(hour)); err != nil {
+		t.Fatalf("issue reissued gen2: %v", err)
+	}
+	// Reissued away: the latest generation belongs to bob, so alice's
+	// older row must not resurface as her candidate.
+	if _, err := store.IssueGrant(ctx, "moved", "alice", []string{"cap.a"}, time.Now().Add(hour)); err != nil {
+		t.Fatalf("issue moved gen1: %v", err)
+	}
+	if _, err := store.IssueGrant(ctx, "moved", "bob", []string{"cap.a"}, time.Now().Add(hour)); err != nil {
+		t.Fatalf("issue moved gen2: %v", err)
+	}
+	if _, err := store.IssueGrant(ctx, "expired", "alice", []string{"cap.a"}, time.Now().Add(-hour)); err != nil {
+		t.Fatalf("issue expired: %v", err)
+	}
+	if _, err := store.IssueGrant(ctx, "revoked", "alice", []string{"cap.a"}, time.Now().Add(hour)); err != nil {
+		t.Fatalf("issue revoked: %v", err)
+	}
+	if err := store.RevokeGrant(ctx, "revoked"); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	if _, err := store.IssueGrant(ctx, "not-alice", "bob", []string{"cap.a"}, time.Now().Add(hour)); err != nil {
+		t.Fatalf("issue not-alice: %v", err)
+	}
+
+	grants, err := store.GrantsForPrincipal(ctx, "alice")
+	if err != nil {
+		t.Fatalf("enumerate: %v", err)
+	}
+	byID := map[string]*capability.Grant{}
+	for _, g := range grants {
+		if byID[g.ID] != nil {
+			t.Fatalf("grant %s enumerated twice", g.ID)
+		}
+		byID[g.ID] = g
+	}
+	for _, want := range []string{"live-a", "live-b", "reissued"} {
+		if byID[want] == nil {
+			t.Errorf("expected %s in alice's candidacy, got %v", want, grants)
+		}
+	}
+	for _, unwanted := range []string{"moved", "expired", "revoked", "not-alice"} {
+		if byID[unwanted] != nil {
+			t.Errorf("%s must not be a candidate for alice", unwanted)
+		}
+	}
+	if g := byID["reissued"]; g == nil || g.Generation != 2 || !g.HasCapability("cap.c") {
+		t.Errorf("reissued must enumerate its latest generation, got %+v", g)
+	}
+}
+
 // TestSQLiteLegacySchemaMigration verifies that a pre-generation
 // authority_grants table is upgraded: existing rows become generation 1
 // with a backfilled digest and remain resolvable.

@@ -188,6 +188,21 @@ type GrantResolver interface {
 	Resolve(ctx context.Context, grantID string, principal string) (*Grant, error)
 }
 
+// PrincipalGrantResolver enumerates the live grants a principal holds.
+// It is the brokered-authority path: a request that names no authority
+// reference asks the service to find what the authenticated principal's
+// store admits for the capability, rather than presenting a reference
+// it had to be carrying. "Live" means the latest generation, neither
+// revoked nor expired on the store's own clock — a grant that cannot
+// admit anyone never becomes one of the candidates.
+type PrincipalGrantResolver interface {
+	// GrantsForPrincipal returns every live grant issued to the
+	// principal. Callers apply capability coverage, resource
+	// constraints, and ambiguity rules themselves; the resolver's job
+	// is the store's clock and revocation state.
+	GrantsForPrincipal(ctx context.Context, principal string) ([]*Grant, error)
+}
+
 // NoopGrantResolver always returns nil (no grant found).
 // This is the default when no real resolver is configured.
 // It causes all grant-required capabilities to be denied.
@@ -227,4 +242,19 @@ func (r *InMemoryGrantResolver) Resolve(ctx context.Context, grantID string, pri
 		return nil, nil
 	}
 	return g, nil
+}
+
+// GrantsForPrincipal implements PrincipalGrantResolver: the principal's
+// unrevoked grants. Expiry is left to the caller — this resolver has no
+// database clock to be authoritative.
+func (r *InMemoryGrantResolver) GrantsForPrincipal(ctx context.Context, principal string) ([]*Grant, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var out []*Grant
+	for _, g := range r.grants {
+		if g.Principal == principal && !g.Revoked {
+			out = append(out, g)
+		}
+	}
+	return out, nil
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"testing"
 )
@@ -28,6 +29,7 @@ type invocationProp struct {
 	Type                 string                    `json:"type"`
 	AdditionalProperties bool                      `json:"additionalProperties"`
 	Properties           map[string]invocationProp `json:"properties"`
+	Required             []string                  `json:"required"`
 }
 
 func loadInvocationSchema(t *testing.T) invocationSchemaObject {
@@ -106,6 +108,37 @@ func TestInvocationSchemaMatchesTheParser(t *testing.T) {
 	for name := range authority.Properties {
 		if _, ok := abiAuthorityFields[name]; !ok {
 			t.Errorf("the schema describes authority.%s but the parser refuses it", name)
+		}
+	}
+
+	// The mediation object is the third known-field set — caller-declared
+	// middleware provenance. Its schema must declare the two required
+	// digests the parser enforces (R9).
+	mediation, ok := schema.Properties["mediation"]
+	if !ok {
+		t.Fatal("the schema must describe the mediation object")
+	}
+	if mediation.AdditionalProperties {
+		t.Error("the mediation object must refuse unknown fields")
+	}
+	for _, name := range []string{"middleware_set_digest", "original_args_digest"} {
+		if !slices.Contains(mediation.Required, name) {
+			t.Errorf("mediation.%s must be declared required by the schema", name)
+		}
+	}
+	for name, field := range abiMediationFields {
+		described, ok := mediation.Properties[name]
+		if !ok {
+			t.Errorf("the parser accepts mediation.%s but the schema does not describe it", name)
+			continue
+		}
+		if want := schemaTypeOf(field); described.Type != want {
+			t.Errorf("mediation.%s: parser says %s, schema says %s", name, want, described.Type)
+		}
+	}
+	for name := range mediation.Properties {
+		if _, ok := abiMediationFields[name]; !ok {
+			t.Errorf("the schema describes mediation.%s but the parser refuses it", name)
 		}
 	}
 }

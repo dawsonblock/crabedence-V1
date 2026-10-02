@@ -221,7 +221,9 @@ jobs:
         image: postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94
         env:
           POSTGRES_USER: crabbox
-          POSTGRES_PASSWORD: crabbox
+          # Ephemeral service container on this job's runner — trust auth
+          # keeps credentials out of the workflow file.
+          POSTGRES_HOST_AUTH_METHOD: trust
           POSTGRES_DB: crabbox_test
         ports:
           - 5432:5432
@@ -231,7 +233,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     env:
-      CRABBOX_TEST_DATABASE_URL: postgres://crabbox:crabbox@localhost:5432/crabbox_test
+      CRABBOX_TEST_DATABASE_URL: postgres://crabbox@localhost:5432/crabbox_test
     steps:
       - name: Check out
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -331,7 +333,9 @@ jobs:
         image: postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94
         env:
           POSTGRES_USER: crabbox
-          POSTGRES_PASSWORD: crabbox
+          # Ephemeral service container on this job's runner — trust auth
+          # keeps credentials out of the workflow file.
+          POSTGRES_HOST_AUTH_METHOD: trust
           POSTGRES_DB: crabbox_test
         ports:
           - 5432:5432
@@ -341,7 +345,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     env:
-      CRABBOX_TEST_DATABASE_URL: postgres://crabbox:crabbox@localhost:5432/crabbox_test
+      CRABBOX_TEST_DATABASE_URL: postgres://crabbox@localhost:5432/crabbox_test
       RELEASE_NAME: crabedence-v0.53.2
       RELEASE_VERSION: 0.53.2
     steps:

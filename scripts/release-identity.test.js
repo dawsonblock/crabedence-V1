@@ -67,6 +67,7 @@ test("protected signing and packaging tooling carries no upstream identity", () 
     "scripts/validate-release-publication.mjs",
     "scripts/verify-github-release-policy.mjs",
     "scripts/publish-release.sh",
+    "scripts/publish-nemo-release.sh",
     "scripts/create-release-draft.sh",
   ]) {
     const source = read(file);

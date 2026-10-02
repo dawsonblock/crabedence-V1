@@ -78,6 +78,57 @@ pub async fn connect_to_kernel(
         .max_encoding_message_size(maximum_frame_bytes as usize))
 }
 
+/// Adopt the kernel channel a confined host was handed as a descriptor.
+///
+/// A `restricted-linux` host may not `connect` at all — its filter answers the
+/// call with EPERM — so the supervisor opens the channel before the sandbox
+/// exists and the child inherits it. The connector can therefore produce the
+/// stream exactly once: a dropped connection cannot be re-dialed, which is the
+/// same thing the sandbox says about every other socket.
+///
+/// # Errors
+/// Returns the descriptor and registration failures when the handed descriptor
+/// is not a usable stream.
+#[cfg(unix)]
+pub async fn connect_to_kernel_fd(
+    raw_fd: std::os::unix::io::RawFd,
+    maximum_frame_bytes: u32,
+) -> Result<RelayRuntimeClient<Channel>, String> {
+    use std::os::unix::io::FromRawFd;
+
+    // The descriptor came from the supervisor that spawned this host: it is a
+    // connected unix stream, and taking ownership here is what the handoff
+    // means.
+    let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(raw_fd) };
+    stream.set_nonblocking(true).map_err(|error| {
+        format!("the handed kernel channel could not be made non-blocking: {error}")
+    })?;
+    let stream = tokio::net::UnixStream::from_std(stream).map_err(|error| {
+        format!("the handed kernel channel could not be adopted by this runtime: {error}")
+    })?;
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(stream)));
+    let dialed = Endpoint::try_from("http://[::]:50051").map_err(|error| error.to_string())?;
+    let channel = dialed
+        .connect_with_connector(tower::service_fn(move |_| {
+            let slot = std::sync::Arc::clone(&slot);
+            async move {
+                let stream = slot.lock().ok().and_then(|mut held| held.take());
+                match stream {
+                    Some(stream) => Ok(hyper_util::rt::TokioIo::new(stream)),
+                    None => Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "the confined host's kernel channel cannot be re-dialed",
+                    )),
+                }
+            }
+        }))
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(RelayRuntimeClient::new(channel)
+        .max_decoding_message_size(maximum_frame_bytes as usize)
+        .max_encoding_message_size(maximum_frame_bytes as usize))
+}
+
 /// The kernel this host calls back into.
 ///
 /// The calls a plugin makes that are *not* answers to anything: a mark it

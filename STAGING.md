@@ -88,6 +88,9 @@ Environment=CRABBOX_MODE=production
 # probe run as root and each claim their own principal. Every other UID
 # is refused. Production requires this map.
 Environment=CRABEDENCE_PEER_PRINCIPALS=0:*
+# Wildcard peers may claim any principal — a separately declared
+# privilege; production requires the UID here too.
+Environment=CRABEDENCE_TRUSTED_PROXY_UIDS=0
 Environment=CRABEDENCE_STORE_BACKEND=postgres
 Environment=CRABBOX_REPLICAS=1
 EnvironmentFile=/etc/crabedence/staging.env
@@ -116,6 +119,7 @@ complete secret/config inventory:
 | `CRABBOX_GITHUB_API_URL` | unset (real api.github.com) |
 | `CRABEDENCE_QUAL_PROVIDER_URL` | unset on RC1; `http://127.0.0.1:9100` on builds carrying the qualification extension (enables proof 09's deployed tier) |
 | `CRABEDENCE_PEER_PRINCIPALS` | unset (claimed-principal bearer model); set `uid:principal` pairs to enforce kernel-authenticated principals |
+| `CRABEDENCE_TRUSTED_PROXY_UIDS` | unset; comma-separated UIDs permitted to hold `uid:*` wildcard entries — mandatory in production for each wildcard the peer map declares |
 
 Post-RC1 builds only — deployed qualification provider unit
 (`/etc/systemd/system/crabedence-qual-provider.service`), ordered and
@@ -154,6 +158,10 @@ principal is an unverified claim, and any local process that can reach the
 socket may act as any principal. The staging unit maps root as the trusted
 local orchestrator (`0:*`), because the proofs and the readiness probe run
 as root and each claim their own principal; every other UID is refused.
+Because the entry is a wildcard — root may claim any principal — the UID
+must also be declared in `CRABEDENCE_TRUSTED_PROXY_UIDS`: wildcard
+delegation is a separately declared privilege, and a production unit
+without it refuses to start.
 
 Do not set `CRABEDENCE_STORE_BACKEND=sqlite` in staging — the point is to
 exercise the production store backend.

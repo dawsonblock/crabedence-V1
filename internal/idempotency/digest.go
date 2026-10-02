@@ -250,6 +250,28 @@ func normalizeNumbers(v any) (any, error) {
 	}
 }
 
+// Digest-version vocabulary for stored records (Record.DigestVersion,
+// execution_requests.digest_version). The request-digest ABI itself is
+// additive — each binding tier omits absent fields from the canonical
+// form — so the version on a stored record is provenance, not a format
+// marker: it records the strongest identity tier the record has been
+// verified under.
+const (
+	// DigestVersionLegacy is the provenance of records whose
+	// request_digest predates capability-descriptor and mediation
+	// binding, and of any record whose binding tier is unknown (the
+	// column default). A legacy record may be upgraded exactly once by
+	// MigrateRequestDigest — migrate-on-touch — which CAS-rewrites the
+	// stored digest to the descriptor-bound identity.
+	DigestVersionLegacy = 1
+	// DigestVersionDescriptorBound is the current tier: the stored
+	// request_digest binds the capability descriptor identity and the
+	// caller-declared mediation, so a registry policy change is a new
+	// execution identity rather than a silent reinterpretation of the
+	// durable record.
+	DigestVersionDescriptorBound = 2
+)
+
 // DigestInput is the input to the idempotency digest.
 type DigestInput struct {
 	ProtocolVersion int            `json:"protocol_version"`
@@ -285,6 +307,15 @@ type DigestInput struct {
 	// identity existed.
 	DescriptorVersion int    `json:"descriptor_version,omitempty"`
 	DescriptorDigest  string `json:"descriptor_digest,omitempty"`
+	// Mediation binds the caller-declared middleware provenance into
+	// the execution identity: the middleware set that ran, the
+	// pre-mediation argument digest, and the release root that
+	// composed the runtime. It is caller-attested evidence — it never
+	// selects route, provider, or policy. Nil binds nothing (the
+	// binding is additive, not a format change), which is the
+	// compatibility path for requests that crossed no caller-side
+	// middleware boundary.
+	Mediation *MediationBinding `json:"mediation,omitempty"`
 }
 
 // ComputeDigest computes the SHA-256 digest of the canonical JSON
@@ -337,6 +368,28 @@ func ComputeDigest(input DigestInput) (string, error) {
 	if input.DescriptorDigest != "" {
 		canonicalInput["descriptor_digest"] = input.DescriptorDigest
 	}
+	if input.Mediation != nil {
+		mediation := map[string]any{}
+		if input.Mediation.MiddlewareSetDigest != "" {
+			mediation["middleware_set_digest"] = input.Mediation.MiddlewareSetDigest
+		}
+		if input.Mediation.OriginalArgsDigest != "" {
+			mediation["original_args_digest"] = input.Mediation.OriginalArgsDigest
+		}
+		if input.Mediation.ReleaseRootDigest != "" {
+			mediation["release_root_digest"] = input.Mediation.ReleaseRootDigest
+		}
+		if input.Mediation.PluginManifestSHA256 != "" {
+			mediation["plugin_manifest_sha256"] = input.Mediation.PluginManifestSHA256
+		}
+		if input.Mediation.PluginLibrarySHA256 != "" {
+			mediation["plugin_library_sha256"] = input.Mediation.PluginLibrarySHA256
+		}
+		if input.Mediation.ActivationConfigSHA256 != "" {
+			mediation["activation_config_sha256"] = input.Mediation.ActivationConfigSHA256
+		}
+		canonicalInput["mediation"] = mediation
+	}
 	canonical, err := CanonicalJSON(canonicalInput)
 	if err != nil {
 		return "", fmt.Errorf("failed to canonicalize digest input: %w", err)
@@ -368,7 +421,7 @@ func ComputeDigestFromRaw(protocolVersion int, principal, capability string, arg
 // ComputeDigestFromRaw.
 func ComputeDigestFromRawWithAuthority(protocolVersion int, principal, capability string, args json.RawMessage, grantID, class string, authorityGeneration int64, authorityDigest, assuranceProfile, executionRoute string) (string, error) {
 	return computeDigestFromRaw(protocolVersion, principal, capability, args, grantID, class,
-		authorityGeneration, authorityDigest, assuranceProfile, executionRoute, 0, "")
+		authorityGeneration, authorityDigest, assuranceProfile, executionRoute, 0, "", nil)
 }
 
 // ComputeDigestFromRawWithDescriptor is ComputeDigestFromRawWithAuthority
@@ -383,10 +436,22 @@ func ComputeDigestFromRawWithAuthority(protocolVersion int, principal, capabilit
 // for records created before descriptor identity existed.
 func ComputeDigestFromRawWithDescriptor(protocolVersion int, principal, capability string, args json.RawMessage, grantID, class string, authorityGeneration int64, authorityDigest, assuranceProfile, executionRoute string, descriptorVersion int, descriptorDigest string) (string, error) {
 	return computeDigestFromRaw(protocolVersion, principal, capability, args, grantID, class,
-		authorityGeneration, authorityDigest, assuranceProfile, executionRoute, descriptorVersion, descriptorDigest)
+		authorityGeneration, authorityDigest, assuranceProfile, executionRoute, descriptorVersion, descriptorDigest, nil)
 }
 
-func computeDigestFromRaw(protocolVersion int, principal, capability string, args json.RawMessage, grantID, class string, authorityGeneration int64, authorityDigest, assuranceProfile, executionRoute string, descriptorVersion int, descriptorDigest string) (string, error) {
+// ComputeDigestFromRawWithMediation is ComputeDigestFromRawWithDescriptor
+// plus the caller-declared middleware provenance: the mediation object the
+// request carried is bound into the execution identity so a durable record
+// can prove which middleware set produced the dispatched arguments. Nil
+// binds nothing and produces byte-identical digests to
+// ComputeDigestFromRawWithDescriptor — that is the compatibility path for
+// requests that crossed no caller-side middleware boundary.
+func ComputeDigestFromRawWithMediation(protocolVersion int, principal, capability string, args json.RawMessage, grantID, class string, authorityGeneration int64, authorityDigest, assuranceProfile, executionRoute string, descriptorVersion int, descriptorDigest string, mediation *MediationBinding) (string, error) {
+	return computeDigestFromRaw(protocolVersion, principal, capability, args, grantID, class,
+		authorityGeneration, authorityDigest, assuranceProfile, executionRoute, descriptorVersion, descriptorDigest, mediation)
+}
+
+func computeDigestFromRaw(protocolVersion int, principal, capability string, args json.RawMessage, grantID, class string, authorityGeneration int64, authorityDigest, assuranceProfile, executionRoute string, descriptorVersion int, descriptorDigest string, mediation *MediationBinding) (string, error) {
 	dec := json.NewDecoder(strings.NewReader(string(args)))
 	dec.UseNumber()
 	var argsMap map[string]any
@@ -420,6 +485,7 @@ func computeDigestFromRaw(protocolVersion int, principal, capability string, arg
 		ExecutionRoute:      executionRoute,
 		DescriptorVersion:   descriptorVersion,
 		DescriptorDigest:    descriptorDigest,
+		Mediation:           mediation,
 	})
 }
 

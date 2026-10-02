@@ -447,6 +447,67 @@ func (s *SQLiteStore) Resolve(ctx context.Context, grantID string, principal str
 // clock expiry check for this resolver.
 func (s *SQLiteStore) ExpiryIsAuthoritative() bool { return true }
 
+// GrantsForPrincipal implements capability.PrincipalGrantResolver: the
+// brokered-authority path, where the request names no reference and the
+// store answers what the principal holds. Each grant_id contributes its
+// LATEST generation — superseded generations cannot resurface — and only
+// unrevoked, DB-unexpired rows are candidates. Authority material that
+// fails decode or digest verification is an error, never a silently
+// skipped candidate: corruption must deny, not narrow the answer.
+func (s *SQLiteStore) GrantsForPrincipal(ctx context.Context, principal string) ([]*capability.Grant, error) {
+	s.metrics.resolves.Add(1)
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT grant_id, generation, principal, capabilities, constraints, grant_digest,
+		       issued_at, expires_at
+		FROM authority_grants latest
+		WHERE principal = ?1 AND revoked = 0
+		  AND (expires_at IS NULL OR expires_at > `+sqliteNow+`)
+		  AND generation = (
+		      SELECT MAX(generation) FROM authority_grants
+		      WHERE grant_id = latest.grant_id
+		  )
+	`, principal)
+	if err != nil {
+		return nil, fmt.Errorf("authority lookup failed: %w", err)
+	}
+	defer rows.Close()
+
+	var grants []*capability.Grant
+	for rows.Next() {
+		var g capability.Grant
+		var capabilitiesJSON, constraintsJSON string
+		var issuedAt, expiresAt sql.NullInt64
+		if err := rows.Scan(
+			&g.ID, &g.Generation, &g.Principal, &capabilitiesJSON, &constraintsJSON, &g.Digest,
+			&issuedAt, &expiresAt,
+		); err != nil {
+			return nil, fmt.Errorf("authority lookup failed: %w", err)
+		}
+		// issued_at/expires_at are already Unix-millisecond integers —
+		// the exact values the digest binds.
+		if issuedAt.Valid {
+			g.IssuedAt = time.UnixMilli(issuedAt.Int64).UTC()
+		}
+		if expiresAt.Valid {
+			g.ExpiresAt = time.UnixMilli(expiresAt.Int64).UTC()
+		}
+		caps, constraints, err := decodeGrantMaterial(capabilitiesJSON, constraintsJSON)
+		if err != nil {
+			return nil, fmt.Errorf("%w: grant %s generation %d: %v", ErrGrantMaterialUnverified, g.ID, g.Generation, err)
+		}
+		g.Capabilities = caps
+		g.Constraints = constraints
+		if !capability.VerifyGrantDigest(&g) {
+			return nil, fmt.Errorf("%w: grant %s generation %d stored digest does not match its material", ErrGrantMaterialUnverified, g.ID, g.Generation)
+		}
+		grants = append(grants, &g)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("authority lookup failed: %w", err)
+	}
+	return grants, nil
+}
+
 // IssueGrant appends a new immutable generation for grant_id and
 // returns the issued snapshot — never updates an existing row in
 // place. The generation is allocated from the authority_heads row

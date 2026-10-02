@@ -283,6 +283,136 @@ async fn a_restricted_bundle_loads_only_the_transferred_approved_copy() {
     }));
 }
 
+/// Run on Linux where the kernel grants this binary unprivileged user
+/// namespaces.
+///
+/// The confined host sandboxes itself before a plugin byte exists — user,
+/// mount, network, IPC, UTS and PID namespaces, a Landlock allow-list, and a
+/// seccomp deny-list — so the suite's proof is the same contract as the macOS
+/// lane: the approved artifact arrives over the authenticated session, and the
+/// load resolves only its staged copy. A kernel that refuses the namespaces
+/// (a sysctl or AppArmor choice) is a deployment that cannot run the policy,
+/// reported as a skip rather than a failure — unless the lane sets
+/// `NEMO_RELAY_REQUIRE_RESTRICTED_LINUX`, which designates a runner known able
+/// to create unprivileged user namespaces and makes an unmet requirement a
+/// hard failure, so the positive qualification can never pass on a skip.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_restricted_linux_host_loads_only_the_transferred_approved_copy() {
+    use nemo_relay::plugin::dynamic::plugin_artifact_identity;
+    use nemo_relay_plugin_protocol::{
+        PluginActivateRequest, PluginArtifactIdentity, PluginComponentConfiguration,
+        PluginLoadRequest, PluginRegistrationOperation,
+    };
+
+    let _lease = lease_guard().await;
+    let mut config = host_config();
+    config.isolation =
+        nemo_relay_plugin_host::isolation_policy::NativeIsolationPolicy::RestrictedLinux;
+    let unmet = config
+        .isolation
+        .unmet_requirements(Some(&config.executable));
+    if !unmet.is_empty() {
+        let reasons = unmet
+            .iter()
+            .map(|requirement| requirement.message())
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert!(
+            std::env::var_os("NEMO_RELAY_REQUIRE_RESTRICTED_LINUX").is_none(),
+            "this lane is designated restricted-linux capable, so an unmet \
+             requirement is a gate failure, not a skip: {reasons}"
+        );
+        eprintln!("skipping restricted-linux session test: {reasons}");
+        return;
+    }
+    let fixture = support::PreparedFixture::write(
+        "fixture_intercept",
+        "nemo-ph-restricted-linux",
+        support::intercept_fixture(),
+        "nemo_relay_native_intercept_fixture",
+    );
+    let artifact = fixture.artifact();
+    let (manifest_sha256, library_sha256) =
+        plugin_artifact_identity(&artifact).expect("the fixture identity");
+    let backend = ProcessPluginBackend::launch(config)
+        .await
+        .expect("the confined host sandboxes itself and handshakes");
+    assert_ne!(backend.process_id(), Some(std::process::id()));
+
+    let loaded = backend
+        .load(
+            PluginLoadRequest {
+                plugin_id: "fixture_intercept".into(),
+                artifact,
+                identity: PluginArtifactIdentity {
+                    manifest_sha256: manifest_sha256.clone(),
+                    library_sha256,
+                },
+            },
+            context(),
+        )
+        .await
+        .expect("the approved library is transferred, verified and loaded inside the sandbox");
+    assert_eq!(
+        loaded.descriptor.manifest_digest.as_deref(),
+        Some(manifest_sha256.as_str())
+    );
+    let inspected = backend
+        .inspect(
+            nemo_relay_plugin_protocol::PluginInspectRequest {
+                handle: Some(loaded.handle),
+            },
+            context(),
+        )
+        .await
+        .expect("the confined host reports the loaded plugin");
+    assert_eq!(inspected.len(), 1);
+    assert_eq!(inspected[0].plugin_id, "fixture_intercept");
+    let registrations = backend
+        .activate(
+            PluginActivateRequest {
+                discovery: false,
+                components: vec![PluginComponentConfiguration {
+                    kind: "fixture_intercept".into(),
+                    config_json: "{}".into(),
+                }],
+            },
+            context(),
+        )
+        .await
+        .expect("the transferred plugin executes its registration callback");
+    assert!(registrations.iter().any(|descriptor| {
+        descriptor.plugin_id == "fixture_intercept"
+            && descriptor.registrations.iter().any(|registration| {
+                registration.operation == PluginRegistrationOperation::ToolRequestIntercept
+            })
+    }));
+}
+
+/// A host that asked for the confined policy on a kernel that cannot deliver
+/// it must not be started at all — the refused spawn is the guarantee, because
+/// a quiet downgrade would leave the deployment believing a boundary exists.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_restricted_linux_policy_refuses_a_host_that_cannot_probe() {
+    let _lease = lease_guard().await;
+    let mut config = host_config();
+    config.isolation =
+        nemo_relay_plugin_host::isolation_policy::NativeIsolationPolicy::RestrictedLinux;
+    // A file that exists but is not this binary fails the probe exactly as a
+    // missing one does: the ack line is the only answer that counts.
+    config.executable = PathBuf::from("/bin/true");
+    let error = match ProcessPluginBackend::launch(config).await {
+        Err(error) => error,
+        Ok(_) => panic!("a host that cannot confine itself must be refused"),
+    };
+    assert!(
+        error.to_string().contains("restricted-linux"),
+        "the refusal names the policy: {error}"
+    );
+}
+
 /// The strict signature must reject a plugin signed by a different identity.
 #[tokio::test]
 #[ignore = "requires NEMO_RELAY_STRICT_HOST_EXECUTABLE from a strict signed bundle"]
@@ -1871,6 +2001,47 @@ async fn a_composition_refuses_a_cap_that_would_refuse_every_invocation() {
     {
         Err(error) => error,
         Ok(_) => panic!("a cap of zero would refuse every invocation"),
+    };
+    assert_eq!(error.failure.code, PluginFailureCode::Rejected, "{error:?}");
+}
+
+// `load_with_context` is what a mediating runtime calls when its operations
+// must carry its own identity rather than the session's generated one. A
+// context bound to the wrong runtime has to be refused by the host, not by
+// this side's memory of the rule: the check that matters is the one the
+// operation meets after it has crossed the boundary.
+#[tokio::test]
+async fn a_composition_refuses_a_context_bound_to_another_runtime() {
+    use nemo_relay_plugin_host::ProcessLoadedPlugins;
+
+    let fixture = support::PreparedFixture::write(
+        "fixture_intercept",
+        "nemo-ph-foreign-context",
+        support::intercept_fixture(),
+        "nemo_relay_native_intercept_fixture",
+    );
+    let error = match ProcessLoadedPlugins::load_with_context(
+        host_config(),
+        5_000,
+        nemo_relay_plugin_host::off_path::ObservabilityPolicy {
+            budget_millis: 5_000,
+            max_in_flight: 8,
+        },
+        [("fixture_intercept".to_string(), fixture.artifact())],
+        Vec::new(),
+        |_, operation| PluginExecutionContext {
+            operation_request_id: format!("{operation}-foreign"),
+            protocol_version: PROTOCOL_VERSION,
+            runtime_binding_digest: "a-runtime-this-host-was-never-bound-to".into(),
+            deadline_unix_ms: u64::MAX,
+            remaining_budget_millis: 30_000,
+            max_response_bytes: 1024,
+        },
+    )
+    .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("the host served a context bound to another runtime"),
     };
     assert_eq!(error.failure.code, PluginFailureCode::Rejected, "{error:?}");
 }

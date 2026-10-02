@@ -107,22 +107,64 @@ func (r *Registry) VerifyAuthority(ctx context.Context, req AdmissionRequest, re
 		return nil, "", ""
 	}
 
-	if req.GrantID == "" {
-		return nil, FailureUnauthorized, "missing grant_id"
-	}
-
 	if resolver == nil {
 		// No resolver configured — fail closed for grant-required capabilities
 		return nil, FailureUnauthorized, "no grant resolver configured"
 	}
 
-	grant, err := resolver.Resolve(ctx, req.GrantID, req.Principal)
-	if err != nil {
-		return nil, FailureUnauthorized, fmt.Sprintf("grant resolution failed: %v", err)
-	}
-
-	if grant == nil {
-		return nil, FailureUnauthorized, fmt.Sprintf("grant not found or not issued to principal: %s", req.GrantID)
+	var grant *Grant
+	if req.GrantID != "" {
+		resolved, err := resolver.Resolve(ctx, req.GrantID, req.Principal)
+		if err != nil {
+			return nil, FailureUnauthorized, fmt.Sprintf("grant resolution failed: %v", err)
+		}
+		if resolved == nil {
+			return nil, FailureUnauthorized, fmt.Sprintf("grant not found or not issued to principal: %s", req.GrantID)
+		}
+		grant = resolved
+	} else {
+		// The request names no authority reference, so authority is
+		// brokered: the store answers which of the principal's live
+		// grants admits this request, rather than the caller proving
+		// possession of a reference it carried here. Whether the
+		// principal is an authenticated peer identity or a bare claim is
+		// the caller's concern — see the service, which only reaches
+		// this path after peer authentication.
+		broker, ok := resolver.(PrincipalGrantResolver)
+		if !ok {
+			return nil, FailureUnauthorized, "no authority reference was supplied and this resolver does not broker grants for a principal"
+		}
+		candidates, err := broker.GrantsForPrincipal(ctx, req.Principal)
+		if err != nil {
+			return nil, FailureUnauthorized, fmt.Sprintf("brokered grant resolution failed: %v", err)
+		}
+		dbOwnedExpiry := false
+		if ar, ok := resolver.(interface{ ExpiryIsAuthoritative() bool }); ok {
+			dbOwnedExpiry = ar.ExpiryIsAuthoritative()
+		}
+		var admitting []*Grant
+		for _, candidate := range candidates {
+			if candidate.Revoked || !candidate.HasCapability(req.Capability) || (!dbOwnedExpiry && candidate.Expired(time.Now())) {
+				continue
+			}
+			// Constraints narrow what a candidate admits, so they are
+			// part of the candidacy test: two grants where one binds a
+			// dimension this request cannot satisfy are one admitting
+			// grant, not an ambiguity.
+			if len(desc.AuthorityPolicy.ResourceArguments) > 0 {
+				if fc, _ := checkResourceConstraints(desc, req.Arguments, candidate); fc != "" {
+					continue
+				}
+			}
+			admitting = append(admitting, candidate)
+		}
+		if len(admitting) == 0 {
+			return nil, FailureUnauthorized, fmt.Sprintf("no live grant permits %s for this principal", req.Capability)
+		}
+		if len(admitting) > 1 {
+			return nil, FailureUnauthorized, fmt.Sprintf("brokered authority is ambiguous: %d live grants permit %s for this principal — name one explicitly", len(admitting), req.Capability)
+		}
+		grant = admitting[0]
 	}
 
 	// Expiry is evaluated by the resolver's own clock when it declares
@@ -227,19 +269,16 @@ func (r *Registry) Admit(req AdmissionRequest) AdmissionDecision {
 		}
 	}
 
-	// Check authority presence (grant resolution is a separate step)
+	// Check authority presence (grant resolution is a separate step).
+	// A grant-required capability may carry no authority reference at
+	// all: the request then asks the service to broker the principal's
+	// authority, which VerifyAuthority resolves — presence of a
+	// reference is no longer an admission fact.
 	if req.Principal == "" {
 		return AdmissionDecision{
 			Allowed:     false,
 			FailureCode: FailureUnauthorized,
 			Reason:      "missing principal",
-		}
-	}
-	if desc.AuthorityPolicy.GrantRequired && req.GrantID == "" {
-		return AdmissionDecision{
-			Allowed:     false,
-			FailureCode: FailureUnauthorized,
-			Reason:      "missing grant_id",
 		}
 	}
 

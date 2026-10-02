@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Resource-scoped authority: grants carry constraint dimensions
@@ -137,6 +138,141 @@ func TestVerifyAuthorityResourceConstraints(t *testing.T) {
 		Principal: "alice@example.com", GrantID: "grant_wide",
 	}, resolver); fc != FailureUnauthorized {
 		t.Fatalf("non-string resource argument must deny, got %s", fc)
+	}
+}
+
+// The brokered path answers "what does this principal's store admit for
+// this request" when the caller names no reference: exactly one live
+// grant that covers the capability and admits the bound arguments
+// resolves; zero denies; two deny as ambiguous, because an execution
+// must be attributable to exactly one authority's material.
+func TestVerifyAuthorityBrokered(t *testing.T) {
+	r := NewRegistry()
+	if err := r.Register(Descriptor{
+		ID:             "test.issue.create",
+		ExecutionClass: ClassMutation,
+		AdapterID:      "test",
+		AuthorityPolicy: AuthorityPolicy{
+			ID:            "test.issue",
+			GrantRequired: true,
+			ResourceArguments: map[string]string{
+				"repo": "repo",
+			},
+		},
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	resolver := NewInMemoryGrantResolver()
+	resolver.AddGrant(&Grant{
+		ID:           "grant_scoped",
+		Principal:    "alice@example.com",
+		Capabilities: []string{"test.issue.create"},
+		Constraints:  map[string][]string{"repo": {"example-org/my-app"}},
+	})
+	resolver.AddGrant(&Grant{
+		ID:           "grant_wide",
+		Principal:    "alice@example.com",
+		Capabilities: []string{"test.issue.create"},
+	})
+	resolver.AddGrant(&Grant{
+		ID:           "grant_revoked",
+		Principal:    "alice@example.com",
+		Capabilities: []string{"test.issue.create"},
+		Revoked:      true,
+	})
+	resolver.AddGrant(&Grant{
+		ID:           "grant_expired",
+		Principal:    "alice@example.com",
+		Capabilities: []string{"test.issue.create"},
+		ExpiresAt:    time.Now().Add(-time.Hour),
+	})
+	resolver.AddGrant(&Grant{
+		ID:           "grant_other_capability",
+		Principal:    "alice@example.com",
+		Capabilities: []string{"some.other.capability"},
+	})
+	// Mallory holds a covering grant — she is legitimately authorized,
+	// and her grant must never appear in alice's candidacy.
+	resolver.AddGrant(&Grant{
+		ID:           "grant_other_principal",
+		Principal:    "mallory@example.com",
+		Capabilities: []string{"test.issue.create"},
+	})
+
+	req := func(repo string) AdmissionRequest {
+		args, _ := json.Marshal(map[string]string{"repo": repo, "title": "t"})
+		return AdmissionRequest{
+			Capability: "test.issue.create",
+			Arguments:  args,
+			Principal:  "alice@example.com",
+			// No GrantID — the store answers.
+		}
+	}
+
+	// Two grants admit in-scope: ambiguous — the durable record could not
+	// name which authority admitted the execution.
+	if _, fc, reason := r.VerifyAuthority(context.Background(), req("example-org/my-app"), resolver); fc != FailureUnauthorized {
+		t.Fatalf("two admitting grants must refuse as ambiguous, got %s", fc)
+	} else if !strings.Contains(reason, "ambiguous") {
+		t.Fatalf("the refusal should name the ambiguity, got: %s", reason)
+	}
+
+	// Constraints are part of candidacy: for a repo only the wide grant
+	// admits, the scoped grant is not a candidate and the answer is one.
+	grant, fc, reason := r.VerifyAuthority(context.Background(), req("other-org/repo"), resolver)
+	if fc != "" {
+		t.Fatalf("exactly one admitting grant must resolve, got %s: %s", fc, reason)
+	}
+	if grant.ID != "grant_wide" {
+		t.Fatalf("the admitting grant is grant_wide, got %s", grant.ID)
+	}
+
+	// Mallory resolves through her own grant — the enumeration scopes to
+	// the authenticated principal, so her grant is not alice's candidacy
+	// and alice's are not hers.
+	grant, fc, _ = r.VerifyAuthority(context.Background(), AdmissionRequest{
+		Capability: "test.issue.create",
+		Arguments:  req("other-org/repo").Arguments,
+		Principal:  "mallory@example.com",
+	}, resolver)
+	if fc != "" {
+		t.Fatalf("mallory's own grant must admit her, got %s", fc)
+	}
+	if grant.ID != "grant_other_principal" {
+		t.Fatalf("mallory must resolve her own grant, got %s", grant.ID)
+	}
+
+	// A principal holding no grants at all is denied.
+	if _, fc, _ := r.VerifyAuthority(context.Background(), AdmissionRequest{
+		Capability: "test.issue.create",
+		Arguments:  req("other-org/repo").Arguments,
+		Principal:  "nobody@example.com",
+	}, resolver); fc != FailureUnauthorized {
+		t.Fatalf("a grantless principal must deny, got %s", fc)
+	}
+}
+
+// A resolver that cannot enumerate a principal's grants cannot broker:
+// the named-reference path still works, the reference-less one denies.
+func TestVerifyAuthorityBrokeredRequiresEnumeration(t *testing.T) {
+	r := NewRegistry()
+	if err := r.Register(Descriptor{
+		ID:             "test.nogrant",
+		ExecutionClass: ClassMutation,
+		AdapterID:      "test",
+		AuthorityPolicy: AuthorityPolicy{
+			ID:            "test.nogrant",
+			GrantRequired: true,
+		},
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	if _, fc, _ := r.VerifyAuthority(context.Background(), AdmissionRequest{
+		Capability: "test.nogrant", Principal: "alice@example.com",
+	}, NoopGrantResolver{}); fc != FailureUnauthorized {
+		t.Fatalf("a non-enumerating resolver must deny the brokered path, got %s", fc)
 	}
 }
 

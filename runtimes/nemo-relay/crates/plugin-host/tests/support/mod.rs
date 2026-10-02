@@ -99,7 +99,10 @@ impl Drop for PreparedFixture {
 pub fn native_fixture() -> PathBuf {
     fixture_path(
         "NEMO_RELAY_TEST_NATIVE_PLUGIN",
-        "libnemo_relay_plugin_fixture.dylib",
+        &format!(
+            "libnemo_relay_plugin_fixture{}",
+            std::env::consts::DLL_SUFFIX
+        ),
     )
 }
 
@@ -107,7 +110,10 @@ pub fn native_fixture() -> PathBuf {
 pub fn intercept_fixture() -> PathBuf {
     fixture_path(
         "NEMO_RELAY_TEST_NATIVE_INTERCEPT_PLUGIN",
-        "libnemo_relay_native_intercept_fixture.dylib",
+        &format!(
+            "libnemo_relay_native_intercept_fixture{}",
+            std::env::consts::DLL_SUFFIX
+        ),
     )
 }
 

@@ -556,6 +556,40 @@ symbol = "nemo_relay_register_plugin"
 }
 
 #[test]
+fn manifest_security_requires_confinement_defaults_off_and_parses_on() {
+    // The floor is opt-in: an artifact that declares nothing accepts whatever
+    // isolation the deployment selected.
+    let manifest =
+        DynamicPluginManifest::parse_toml(valid_rust_manifest_toml()).expect("parse manifest");
+    assert!(!manifest.requires_confinement());
+    assert_eq!(manifest.security, None);
+
+    // `[security] requires_confinement = true` parses and is reported by the
+    // accessor the composition enforces before it starts a host.
+    let manifest = DynamicPluginManifest::parse_toml(&format!(
+        "{}\n[security]\nrequires_confinement = true\n",
+        valid_rust_manifest_toml()
+    ))
+    .expect("parse manifest with a security block");
+    assert!(manifest.requires_confinement());
+    assert!(
+        manifest
+            .security
+            .expect("the security block parsed")
+            .requires_confinement
+    );
+
+    // An explicit `false` is the same as absent — the declaration only ever
+    // tightens.
+    let manifest = DynamicPluginManifest::parse_toml(&format!(
+        "{}\n[security]\nrequires_confinement = false\n",
+        valid_rust_manifest_toml()
+    ))
+    .expect("parse manifest with requires_confinement = false");
+    assert!(!manifest.requires_confinement());
+}
+
+#[test]
 fn manifest_parse_and_conversion_supports_worker_lane() {
     let manifest =
         DynamicPluginManifest::parse_toml(valid_worker_manifest_toml()).expect("parse manifest");

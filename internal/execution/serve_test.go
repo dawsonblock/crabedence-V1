@@ -88,7 +88,7 @@ func TestServeWritesRegistrySnapshotOnAFreshDirectory(t *testing.T) {
 			ids[id] = true
 		}
 	}
-	for _, want := range []string{"system.echo", "system.info", "test.counter.increment", "github.issue.create", "github.issue.get"} {
+	for _, want := range []string{"system.echo", "system.info", "test.counter.increment", "github.issue.create", "github.issue.comment", "github.issue.get", "github.issue.list", "github.issue.close", "github.issue.update", "github.pr.create", "github.pr.merge"} {
 		if !ids[want] {
 			t.Fatalf("registry snapshot is missing %s (registry membership must not depend on deployment configuration)", want)
 		}

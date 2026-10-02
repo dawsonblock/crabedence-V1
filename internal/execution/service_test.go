@@ -188,6 +188,9 @@ func TestExecutionServiceUnconfiguredAdapterIsUnavailable(t *testing.T) {
 	if !strings.Contains(resp.Error, capability.FailureReasonAdapterNotConfigured) {
 		t.Fatalf("expected reason %s, got %q", capability.FailureReasonAdapterNotConfigured, resp.Error)
 	}
+	if !resp.DefinitiveFailure {
+		t.Fatal("a pre-dispatch availability failure is definitive — nothing ran")
+	}
 }
 
 // TestExecutionServiceConsultsAdapterAvailability pins the deployment
@@ -241,6 +244,9 @@ func TestExecutionServiceConsultsAdapterAvailability(t *testing.T) {
 	}
 	if counter.GetCount("unhealthy") != 0 {
 		t.Fatal("an unavailable adapter must never dispatch")
+	}
+	if !resp.DefinitiveFailure {
+		t.Fatal("nothing dispatched — the failure must be definitive, not UNKNOWN")
 	}
 }
 

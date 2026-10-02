@@ -54,6 +54,10 @@ const (
 	EventAbandonedPreDispatch    = "ABANDONED_PRE_DISPATCH"
 	EventLeaseLost               = "LEASE_LOST"
 	EventClaimLost               = "CLAIM_LOST"
+	// EventDigestMigrated records the one-time migrate-on-touch that
+	// rewrites a legacy (pre-descriptor) record's request_digest to the
+	// descriptor-bound identity — see Store.MigrateRequestDigest.
+	EventDigestMigrated = "DIGEST_MIGRATED"
 )
 
 // Observation kinds recorded in effect_provider_observations.

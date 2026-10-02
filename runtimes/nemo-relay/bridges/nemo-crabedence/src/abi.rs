@@ -49,6 +49,8 @@ enum Fields {
     Root,
     /// The `authority` object: the complete known-field set, nothing else.
     Authority,
+    /// The `mediation` object: the complete known-field set, nothing else.
+    Mediation,
     /// An argument subtree or array: no field set applies.
     None,
 }
@@ -58,7 +60,7 @@ fn root_field(name: &str) -> Option<FieldType> {
         "capability" | "execution_class" | "idempotency_key" | "deadline" => {
             Some(FieldType::String)
         }
-        "arguments" | "authority" => Some(FieldType::Object),
+        "arguments" | "authority" | "mediation" => Some(FieldType::Object),
         _ => None,
     }
 }
@@ -69,6 +71,46 @@ fn authority_field(name: &str) -> Option<FieldType> {
         "authority_generation" => Some(FieldType::Integer),
         _ => None,
     }
+}
+
+fn mediation_field(name: &str) -> Option<FieldType> {
+    match name {
+        "middleware_set_digest"
+        | "original_args_digest"
+        | "release_root_digest"
+        | "plugin_manifest_sha256"
+        | "plugin_library_sha256"
+        | "activation_config_sha256" => Some(FieldType::String),
+        _ => None,
+    }
+}
+
+/// Enforces field presence rules the type map cannot express: a
+/// `mediation` object that omits either required digest is malformed
+/// evidence — the pre-mediation argument digest is what makes the
+/// mediation claim verifiable. Mirrors serde's required-field refusal
+/// on `RequestMediation` and the Go parser's presence probe so all
+/// validators refuse the same input with the same phrase.
+fn check_required_fields(path: &str, fields: Fields, keys: &HashSet<String>) -> Result<(), String> {
+    if fields == Fields::Mediation {
+        for required in ["middleware_set_digest", "original_args_digest"] {
+            if !keys.contains(required) {
+                return Err(format!("{path}.{required} is required"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A mediation digest value in canonical form: 64 lowercase hex characters
+/// naming a SHA-256. Presence of the key alone proves nothing — an empty or
+/// malformed value would persist as evidence while binding no computation,
+/// and the digest identity folds empty fields away entirely.
+fn is_sha256_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn type_error(path: &str, expected: FieldType) -> String {
@@ -129,6 +171,7 @@ impl<'a> Scanner<'a> {
         expected: Option<FieldType>,
         depth: usize,
         child_fields: Fields,
+        digest_field: bool,
     ) -> Result<(), String> {
         let Some(byte) = self.peek() else {
             return Err("invalid JSON: unexpected end of input".to_string());
@@ -170,11 +213,18 @@ impl<'a> Scanner<'a> {
                 self.parse_array(path, depth + 1)
             }
             b'"' => {
-                if self.parse_string().is_none() {
+                let Some(value) = self.parse_string() else {
                     return Err("invalid JSON: invalid string".to_string());
-                }
+                };
                 match expected {
-                    None | Some(FieldType::String) => Ok(()),
+                    None | Some(FieldType::String) => {
+                        if digest_field && !is_sha256_digest(&value) {
+                            return Err(format!(
+                                "{path} must be a 64-character lowercase SHA-256 hex digest"
+                            ));
+                        }
+                        Ok(())
+                    }
                     Some(expected) => Err(type_error(path, expected)),
                 }
             }
@@ -216,7 +266,7 @@ impl<'a> Scanner<'a> {
         self.skip_whitespace();
         if self.peek() == Some(b'}') {
             self.index += 1;
-            return Ok(());
+            return check_required_fields(path, fields, &keys);
         }
         loop {
             self.skip_whitespace();
@@ -239,6 +289,7 @@ impl<'a> Scanner<'a> {
             let expected = match fields {
                 Fields::Root => root_field(&key),
                 Fields::Authority => authority_field(&key),
+                Fields::Mediation => mediation_field(&key),
                 Fields::None => None,
             };
             if fields != Fields::None && expected.is_none() {
@@ -247,10 +298,20 @@ impl<'a> Scanner<'a> {
             let key_path = format!("{path}.{key}");
             let child_fields = if path == "request" && key == "authority" {
                 Fields::Authority
+            } else if path == "request" && key == "mediation" {
+                Fields::Mediation
             } else {
                 Fields::None
             };
-            self.parse_value(&key_path, expected, depth, child_fields)?;
+            // Every known mediation field is a digest field — the unknown
+            // ones were refused above, so `fields` alone names the class.
+            self.parse_value(
+                &key_path,
+                expected,
+                depth,
+                child_fields,
+                fields == Fields::Mediation,
+            )?;
 
             self.skip_whitespace();
             match self.peek() {
@@ -259,7 +320,7 @@ impl<'a> Scanner<'a> {
                 }
                 Some(b'}') => {
                     self.index += 1;
-                    return Ok(());
+                    return check_required_fields(path, fields, &keys);
                 }
                 _ => return Err("invalid JSON: expected ',' or '}'".to_string()),
             }
@@ -276,7 +337,7 @@ impl<'a> Scanner<'a> {
         loop {
             self.skip_whitespace();
             let element_path = format!("{path}[]");
-            self.parse_value(&element_path, None, depth, Fields::None)?;
+            self.parse_value(&element_path, None, depth, Fields::None, false)?;
             self.skip_whitespace();
             match self.peek() {
                 Some(b',') => {

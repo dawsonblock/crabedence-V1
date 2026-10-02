@@ -31,6 +31,11 @@ log = { version = "0.4", features = ["kv"] }
 tracing = { version = "0.1", default-features = false, features = ["std", "log"] }
 tonic = { version = "0.14.2", default-features = false, features = ["codegen", "router", "transport"] }
 
+# The restricted-linux confinement is built from raw kernel calls — namespaces,
+# Landlock, seccomp — and libc is the smallest honest binding to them.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [features]
 # The worker lane: a plugin whose code runs in a process the kernel starts.
 worker-grpc = ["nemo-relay/worker-grpc"]

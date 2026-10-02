@@ -9,9 +9,14 @@
 //! # What the port refuses to send
 //!
 //! The request that crosses the boundary carries the capability, its
-//! arguments, authority material, an idempotency key, and a deadline — and
-//! nothing else. Execution route, provider or adapter selection, assurance
-//! profile, approval requirements, retry policy, and receipt requirements are
+//! arguments, authority material, an idempotency key, a deadline, and — when
+//! the composing runtime crossed a middleware boundary it can attest — a
+//! `mediation` provenance object: which middleware set rewrote the
+//! arguments, the pre-middleware argument digest, and the release-root
+//! identity of the composing runtime. Mediation is caller-asserted evidence
+//! the kernel binds into the durable execution identity; it is never policy.
+//! Execution route, provider or adapter selection, assurance profile,
+//! approval requirements, retry policy, and receipt requirements are
 //! resolved by Crabedence's registry and are never sent.
 //!
 //! The advisory `execution_class` assertion is not sent either. The port
@@ -85,14 +90,39 @@ impl NemoCrabedenceExecutionPort {
             )
         })?;
 
-        if descriptor.execution_route != RegistryExecutionRoute::Crabedence {
-            return Err(refused_request(
-                "EXECUTION_ROUTE_MISMATCH",
-                format!(
-                    "capability {capability_id} is pinned to route {} — it must not be dispatched through the Crabedence execution kernel",
-                    descriptor.execution_route
-                ),
-            ));
+        match descriptor.execution_route {
+            RegistryExecutionRoute::Crabedence => {}
+            RegistryExecutionRoute::Direct => {
+                // The DIRECT route crosses this socket to the service's
+                // read path. Mirror the registration invariant here: a
+                // snapshot that pinned DIRECT to a consequential class or
+                // an assurance the read path cannot carry is refused before
+                // it reaches the wire.
+                if matches!(
+                    descriptor.execution_class,
+                    RegistryExecutionClass::Mutation | RegistryExecutionClass::Critical
+                ) || matches!(
+                    descriptor.assurance_profile.as_str(),
+                    "DURABLE" | "HIGH_ASSURANCE"
+                ) {
+                    return Err(refused_request(
+                        "EXECUTION_ROUTE_MISMATCH",
+                        format!(
+                            "capability {capability_id} is pinned DIRECT but classified {} with {} assurance — DIRECT carries only non-consequential reads at STANDARD or below",
+                            descriptor.execution_class, descriptor.assurance_profile
+                        ),
+                    ));
+                }
+            }
+            RegistryExecutionRoute::Local => {
+                return Err(refused_request(
+                    "EXECUTION_ROUTE_MISMATCH",
+                    format!(
+                        "capability {capability_id} is pinned to route {} — it must not be dispatched through the Crabedence execution kernel",
+                        descriptor.execution_route
+                    ),
+                ));
+            }
         }
 
         let registered_class = descriptor.execution_class;
@@ -146,6 +176,47 @@ impl NemoCrabedenceExecutionPort {
         }
         if let Some(deadline) = deadline_rfc3339(identity.deadline_unix_ms) {
             wire.insert("deadline".to_string(), serde_json::Value::String(deadline));
+        }
+        // Mediation provenance the composing runtime attests — which
+        // middleware set rewrote the arguments, what the caller's arguments
+        // digested to before mediation, and which release composed it. It is
+        // evidence, never policy: the kernel binds it into the durable
+        // execution identity but never routes or authorizes on it.
+        if let Some(mediation) = &request.mediation {
+            let mut object = serde_json::Map::new();
+            object.insert(
+                "middleware_set_digest".to_string(),
+                serde_json::Value::String(mediation.middleware_set_digest.clone()),
+            );
+            object.insert(
+                "original_args_digest".to_string(),
+                serde_json::Value::String(mediation.original_args_digest.clone()),
+            );
+            if let Some(release_root) = &mediation.release_root_digest {
+                object.insert(
+                    "release_root_digest".to_string(),
+                    serde_json::Value::String(release_root.clone()),
+                );
+            }
+            if let Some(manifest_sha256) = &mediation.plugin_manifest_sha256 {
+                object.insert(
+                    "plugin_manifest_sha256".to_string(),
+                    serde_json::Value::String(manifest_sha256.clone()),
+                );
+            }
+            if let Some(library_sha256) = &mediation.plugin_library_sha256 {
+                object.insert(
+                    "plugin_library_sha256".to_string(),
+                    serde_json::Value::String(library_sha256.clone()),
+                );
+            }
+            if let Some(config_sha256) = &mediation.activation_config_sha256 {
+                object.insert(
+                    "activation_config_sha256".to_string(),
+                    serde_json::Value::String(config_sha256.clone()),
+                );
+            }
+            wire.insert("mediation".to_string(), serde_json::Value::Object(object));
         }
         Ok(serde_json::Value::Object(wire))
     }
@@ -308,6 +379,7 @@ mod tests {
             args: json!({ "counter": "c", "by": 1 }),
             grant: Some("grant-1".to_string()),
             trace_id: Some("trace-1".to_string()),
+            mediation: None,
         }
     }
 
@@ -423,6 +495,54 @@ mod tests {
         let request = request_for("system.echo", ExecutionClass::Pure);
         let error = port.build_abi_request(&request).unwrap_err();
         assert_eq!(error.code, "EXECUTION_ROUTE_MISMATCH");
+    }
+
+    #[test]
+    fn builds_a_request_for_a_direct_read() {
+        // DIRECT-pinned capabilities dispatch over this socket — the service
+        // resolves its own read route, the port only checks the pin is legal.
+        let catalog = catalog_for(json!([{
+            "id": "system.info",
+            "descriptor_version": 1,
+            "execution_class": "READ",
+            "assurance_profile": "STANDARD",
+            "execution_route": "DIRECT",
+            "authority_policy": { "id": "system.info", "grant_required": false },
+            "adapter_id": "system-info",
+        }]));
+        let port = port_with_catalog(catalog);
+        let request = request_for("system.info", ExecutionClass::Read);
+        let wire = port.build_abi_request(&request).expect("built");
+        assert_eq!(wire["capability"], "system.info");
+    }
+
+    #[test]
+    fn refuses_a_consequential_direct_pin() {
+        // Registration refuses DIRECT for MUTATION/CRITICAL and for the
+        // assurance profiles the read path cannot carry; the port mirrors it
+        // so a violated snapshot cannot reach the wire.
+        for (class, assurance, wire_class) in [
+            ("MUTATION", "STANDARD", ExecutionClass::Mutation),
+            ("CRITICAL", "STANDARD", ExecutionClass::Critical),
+            ("READ", "DURABLE", ExecutionClass::Read),
+        ] {
+            let catalog = catalog_for(json!([{
+                "id": "sneaky",
+                "descriptor_version": 1,
+                "execution_class": class,
+                "assurance_profile": assurance,
+                "execution_route": "DIRECT",
+                "authority_policy": { "id": "sneaky", "grant_required": false },
+                "adapter_id": "test",
+            }]));
+            let port = port_with_catalog(catalog);
+            let request = request_for("sneaky", wire_class);
+            let error = port.build_abi_request(&request).unwrap_err();
+            assert_eq!(
+                error.code, "EXECUTION_ROUTE_MISMATCH",
+                "{class}/{assurance}"
+            );
+        }
     }
 
     #[test]

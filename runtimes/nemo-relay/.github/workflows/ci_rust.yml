@@ -156,6 +156,23 @@ jobs:
           cargo check --locked --workspace --all-targets
           cargo test --locked --workspace --no-run
 
+      # This lane is the designated restricted-linux qualification runner:
+      # ubuntu-24.04 mediates user-namespace creation through AppArmor
+      # (kernel.apparmor_restrict_unprivileged_userns=1), so unshare succeeds
+      # but the setgroups write is refused for binaries with no userns
+      # profile. The capability is provisioned on the ephemeral runner rather
+      # than treated as a property of the hosted image's default policy.
+      - name: Allow unprivileged user namespaces on the qualification lane
+        if: ${{ matrix.platform == 'linux-amd64' }}
+        run: |
+          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          if [ -f /proc/sys/kernel/unprivileged_userns_clone ]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+          sysctl kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone 2>/dev/null || true
+
       - name: Run Rust tests with coverage
         working-directory: ${{ env.NEMO_RELAY_CI_WORKSPACE }}
         run: |
@@ -164,6 +181,13 @@ jobs:
             --set ci true
             --set output_dir "${{ github.workspace }}"
           )
+          if [ "${{ matrix.platform }}" = "linux-amd64" ]; then
+            # This lane is the designated restricted-linux qualification
+            # runner: unprivileged user namespaces are expected to work here,
+            # so an unmet confinement requirement fails the suite rather than
+            # skipping the positive confinement claim.
+            export NEMO_RELAY_REQUIRE_RESTRICTED_LINUX=1
+          fi
           if [ "${{ matrix.run_redis_tests }}" = "true" ]; then
             export NEMO_RELAY_RUN_REDIS_TESTS=1
           fi

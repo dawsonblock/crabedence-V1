@@ -329,7 +329,11 @@ max_transitive_packages = 324
 # artifact vocabulary, which are the kernel's half of the boundary. The target below is
 # still above this number by less than a hundred lines, which is the honest state: the
 # composition surface grew slightly while the loader was leaving.
-max_source_lines = 68004
+# Raised by three lines for the mediation-provenance field the kernel's managed
+# path sets — `mediation: None`, with the comment that says the kernel's own
+# middleware is the kernel — because a receipt has to distinguish "no mediation
+# happened" from "none was recorded". No dependency moved and no `unsafe` did.
+max_source_lines = 68007
 # Raised for the three exact-registration entry points the event sanitize classes
 # need: one public entry per class over a private shared helper, which is how a host
 # is asked to run exactly the registration a proxy names rather than the family.
@@ -405,7 +409,11 @@ transitive_dependency_digest = "db25e135d081e18c0732e93ac26d6875f10ab545658cee18
 max_direct_dependencies = 4
 # Raised to the platform union; see the measurement note at the top of this file.
 max_transitive_packages = 36
-max_source_lines = 555
+# Raised by the mediation-provenance record: `RequestMediation` and the field
+# that carries it, so an effect the runtime mediated and one it dispatched bare
+# are different receipts rather than the same bytes twice. No dependency moved
+# and no `unsafe` did.
+max_source_lines = 594
 max_unsafe_occurrences = 0
 direct_dependency_digest = "72f88f4f4d1c72fdb4c1a4f56afa48e9bbd07049aa83fc7131636693cf3b1bf5"
 transitive_dependency_digest = "b52f827debb03426ed66bd63234a912a64cebec5b34f9e0de948a776e5ba5032"
@@ -472,7 +480,11 @@ transitive_dependency_digest = "32c66b87cc783b216a5e49aafac47240f7de9c9fbdd31d42
 # Raised by the artifact staging implementation: streaming SHA-256 is a production
 # dependency now, rather than a test-only dependency, because the host verifies the
 # transferred bytes as they arrive and hashes the promoted file again.
-max_direct_dependencies = 17
+# Raised by one for `libc`: the restricted-linux confinement is written against
+# the syscall surface directly — unshare, the Landlock ruleset syscalls, seccomp
+# and prctl have no stable wrapper the lockfile already carried, and a shim crate
+# for a security boundary would be one more thing to review rather than less.
+max_direct_dependencies = 18
 # Raised to the platform union; see the measurement note at the top of this file.
 max_transitive_packages = 295
 # Raised for the bounded artifact staging state machine, streaming service,
@@ -487,9 +499,16 @@ max_transitive_packages = 295
 # IPC implementation. These changes add code to both sides of the trust boundary,
 # which is why the measured count is recorded explicitly; unsafe source remains
 # within its ceiling.
-max_source_lines = 16572
-max_unsafe_occurrences = 288
-direct_dependency_digest = "c8645337cb08161f09d656950e3dd6c785ef92ff9c1f29ba39a8ef39d686f855"
+# Raised for the restricted-linux host: `bin/unix/linux_sandbox.rs` is the
+# confinement the policy names — namespace entry and uid/gid maps, the
+# PID-namespace fork and its wait shim, the best-effort confined /proc with its
+# fail-closed allow-list fallback, the Landlock ruleset, the architecture-checked
+# seccomp filter, the capability drop, and the probe's self-check that proves the
+# denials rather than reporting them. The unsafe growth is the boundary itself:
+# every `unsafe` there is a syscall the confinement is made of.
+max_source_lines = 17636
+max_unsafe_occurrences = 310
+direct_dependency_digest = "25bce267911de589f5a366542d4f8e84ecaef8c4654d812726d195ba90e87861"
 transitive_dependency_digest = "d6e5755cf0c3cbeff82281e73be9006ea21ade44d1f93f0c21feb94fb55976d5"
 
 # The native plugin ABI's own crate — the first staged step of the split, and the
@@ -870,7 +889,7 @@ transitive_dependency_digest = "def40582c41999eb264fa47757d39cf17473295e1f24d740
 [[temporary]]
 crate = "nemo-relay"
 field = "max_source_lines"
-raised_to = 68004
+raised_to = 68007
 target = 67832
 reason = "the native loader and the ABI bridge are still compiled into the kernel"
 introduced = "2514f27..eb975ae"

@@ -91,23 +91,80 @@ func TestPeerPrincipalMapAuthorize(t *testing.T) {
 func TestPeerAuthPolicyRequiresAuthenticationInProduction(t *testing.T) {
 	// Development keeps the optional strict mode: unset stays the
 	// bearer model, and a configured map is accepted.
-	if err := validatePeerAuthPolicy(false, nil); err != nil {
+	if err := validatePeerAuthPolicy(false, nil, nil); err != nil {
 		t.Fatalf("development must not require peer authentication: %v", err)
 	}
-	if err := validatePeerAuthPolicy(false, PeerPrincipalMap{501: "alice@example.com"}); err != nil {
+	if err := validatePeerAuthPolicy(false, PeerPrincipalMap{501: "alice@example.com"}, nil); err != nil {
 		t.Fatalf("a configured map must satisfy the policy: %v", err)
 	}
 
 	// Production must authenticate the principal, not merely receive it.
-	err := validatePeerAuthPolicy(true, nil)
+	err := validatePeerAuthPolicy(true, nil, nil)
 	if err == nil {
 		t.Fatal("production without a peer map must fail closed")
 	}
 	if !strings.Contains(err.Error(), "CRABEDENCE_PEER_PRINCIPALS") {
 		t.Fatalf("the refusal must name the configuration: %v", err)
 	}
-	if err := validatePeerAuthPolicy(true, PeerPrincipalMap{0: PeerWildcardPrincipal}); err != nil {
+	if err := validatePeerAuthPolicy(true, PeerPrincipalMap{501: "alice@example.com"}, nil); err != nil {
 		t.Fatalf("production with a declared map must satisfy the policy: %v", err)
+	}
+}
+
+func TestPeerAuthPolicyWildcardRequiresTrustedProxy(t *testing.T) {
+	wildcard := PeerPrincipalMap{0: PeerWildcardPrincipal, 501: "alice@example.com"}
+
+	// Production: a wildcard peer may claim any principal — that
+	// delegation is a separate privilege, declared by
+	// CRABEDENCE_TRUSTED_PROXY_UIDS, not implied by the map itself.
+	err := validatePeerAuthPolicy(true, wildcard, nil)
+	if err == nil {
+		t.Fatal("a production wildcard without a trusted-proxy declaration must fail closed")
+	}
+	if !strings.Contains(err.Error(), "CRABEDENCE_TRUSTED_PROXY_UIDS") {
+		t.Fatalf("the refusal must name the missing declaration: %v", err)
+	}
+	if err := validatePeerAuthPolicy(true, wildcard, map[uint32]struct{}{0: {}}); err != nil {
+		t.Fatalf("a declared trusted proxy must satisfy the policy: %v", err)
+	}
+	// A wildcard a declared list does not cover is refused in any
+	// mode — a declared allowlist is authoritative.
+	err = validatePeerAuthPolicy(false, wildcard, map[uint32]struct{}{502: {}})
+	if err == nil {
+		t.Fatal("a wildcard outside the declared trusted set must fail")
+	}
+	if !strings.Contains(err.Error(), "uid 0") {
+		t.Fatalf("the refusal must name the uncovered uid: %v", err)
+	}
+	// Outside production with no declared list the wildcard stays the
+	// documented development convenience.
+	if err := validatePeerAuthPolicy(false, wildcard, nil); err != nil {
+		t.Fatalf("development with no trusted list keeps the wildcard convenience: %v", err)
+	}
+	// Exact mappings are never gated — the privilege under test is
+	// claiming arbitrary principals, not authenticating as one.
+	if err := validatePeerAuthPolicy(true, PeerPrincipalMap{501: "alice@example.com"}, map[uint32]struct{}{0: {}}); err != nil {
+		t.Fatalf("an exact-only map needs no trusted-proxy declaration: %v", err)
+	}
+}
+
+func TestParseTrustedProxyUIDs(t *testing.T) {
+	if got, err := ParseTrustedProxyUIDs(""); err != nil || got != nil {
+		t.Fatalf("unset must disable, got %v, %v", got, err)
+	}
+	got, err := ParseTrustedProxyUIDs("0, 501 ,502")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, uid := range []uint32{0, 501, 502} {
+		if _, ok := got[uid]; !ok {
+			t.Fatalf("expected uid %d in %v", uid, got)
+		}
+	}
+	for _, raw := range []string{"abc", "0,-1", "99999999999", ",,,"} {
+		if _, err := ParseTrustedProxyUIDs(raw); err == nil {
+			t.Fatalf("malformed input %q must refuse startup", raw)
+		}
 	}
 }
 

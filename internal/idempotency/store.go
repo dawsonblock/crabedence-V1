@@ -39,21 +39,37 @@ type Record struct {
 	// permitted this?" without re-resolving grants. Zero means
 	// unversioned authority (in-memory resolvers, grant-free
 	// capabilities).
-	AuthorityGeneration int64           `json:"authority_generation,omitempty"`
-	AuthorityDigest     string          `json:"authority_digest,omitempty"`
-	ExecutionClass      string          `json:"execution_class"`
-	State               State           `json:"state"`
-	Result              json.RawMessage `json:"result,omitempty"`
-	EvidenceDigest      string          `json:"evidence_digest,omitempty"`
-	ReceiptVersion      int             `json:"receipt_version,omitempty"`
-	LeaseOwner          string          `json:"lease_owner,omitempty"`
-	LeaseToken          string          `json:"lease_token,omitempty"`
-	LeaseStartedAt      *time.Time      `json:"lease_started_at,omitempty"`
-	LeaseExpiresAt      *time.Time      `json:"lease_expires_at,omitempty"`
-	LeaseGeneration     int             `json:"lease_generation,omitempty"`
-	ProviderID          string          `json:"provider_id,omitempty"`
-	ProviderRunID       string          `json:"provider_run_id,omitempty"`
-	ProviderStatus      string          `json:"provider_status,omitempty"`
+	AuthorityGeneration int64  `json:"authority_generation,omitempty"`
+	AuthorityDigest     string `json:"authority_digest,omitempty"`
+	// RequestMediation is the caller-declared middleware provenance the
+	// request carried at acquisition — the exact bytes of the ABI
+	// mediation object, bound into request_digest. It is evidence,
+	// never policy: the ledger records it so a receipt can prove which
+	// middleware set produced the dispatched arguments and which
+	// release composed the runtime. NULL when the request crossed no
+	// caller-side middleware boundary.
+	RequestMediation json.RawMessage `json:"request_mediation,omitempty"`
+	// DigestVersion records which binding tier produced RequestDigest:
+	// DigestVersionLegacy for records that predate descriptor/mediation
+	// binding (or whose provenance is unknown — the column default), and
+	// DigestVersionDescriptorBound once the record stores the
+	// descriptor-bound identity — written at acquire for new records, or
+	// by MigrateRequestDigest for a legacy record on first touch.
+	// Forensic provenance; the digest value itself remains authoritative.
+	DigestVersion   int             `json:"digest_version"`
+	ExecutionClass  string          `json:"execution_class"`
+	State           State           `json:"state"`
+	Result          json.RawMessage `json:"result,omitempty"`
+	EvidenceDigest  string          `json:"evidence_digest,omitempty"`
+	ReceiptVersion  int             `json:"receipt_version,omitempty"`
+	LeaseOwner      string          `json:"lease_owner,omitempty"`
+	LeaseToken      string          `json:"lease_token,omitempty"`
+	LeaseStartedAt  *time.Time      `json:"lease_started_at,omitempty"`
+	LeaseExpiresAt  *time.Time      `json:"lease_expires_at,omitempty"`
+	LeaseGeneration int             `json:"lease_generation,omitempty"`
+	ProviderID      string          `json:"provider_id,omitempty"`
+	ProviderRunID   string          `json:"provider_run_id,omitempty"`
+	ProviderStatus  string          `json:"provider_status,omitempty"`
 	// ProviderResult is the provider's original result payload as
 	// observed at dispatch time — immutable forensic evidence. It is
 	// written only by RecordProviderObservation and
@@ -336,7 +352,7 @@ func (s *Store) checkEpoch(ctx context.Context) error {
 // requires. Startup verifies the migrated schema reaches this version —
 // a database older than the code fails closed rather than running
 // against a partial schema.
-const RequiredSchemaVersion = 11
+const RequiredSchemaVersion = 13
 
 // schemaMigration is one versioned, idempotent schema change. Each
 // migration must be safe to re-run (IF NOT EXISTS / addColumnIfMissing)
@@ -362,6 +378,8 @@ var schemaMigrations = []schemaMigration{
 	{9, "cluster_epoch", migrationClusterEpoch},
 	{10, "result_byte_fidelity", migrationResultByteFidelity},
 	{11, "cluster_recovery_mode", migrationClusterRecoveryMode},
+	{12, "request_mediation", migrationRequestMediation},
+	{13, "digest_version", migrationDigestVersion},
 }
 
 func (s *Store) ensureSchema(ctx context.Context) error {
@@ -897,6 +915,30 @@ func migrationClusterRecoveryMode(ctx context.Context, conn *sql.Conn) error {
 	return nil
 }
 
+// migrationRequestMediation adds the caller-declared middleware
+// provenance column. TEXT like the other evidence payloads — the exact
+// mediation bytes are bound into request_digest and projected onto the
+// record; JSONB would rewrite the bytes the verifier needs byte-exact.
+func migrationRequestMediation(ctx context.Context, conn *sql.Conn) error {
+	_, err := conn.ExecContext(ctx,
+		`ALTER TABLE execution_requests ADD COLUMN IF NOT EXISTS request_mediation TEXT`)
+	return err
+}
+
+// migrationDigestVersion adds the digest-version provenance column.
+// Existing rows default to DigestVersionLegacy: their request_digest may
+// predate descriptor/mediation binding, so the store treats them as
+// legacy until a migrate-on-touch CAS rewrites their identity. A row
+// that was written by post-descriptor code before this column existed is
+// labeled legacy too, which is inert — the migration CAS requires the
+// stored digest to equal a recomputed legacy-format digest, which a
+// descriptor-bound digest never does.
+func migrationDigestVersion(ctx context.Context, conn *sql.Conn) error {
+	_, err := conn.ExecContext(ctx,
+		`ALTER TABLE execution_requests ADD COLUMN IF NOT EXISTS digest_version INTEGER NOT NULL DEFAULT 1`)
+	return err
+}
+
 // ─── Forensic write helpers ──────────────────────────────────────────
 
 // insertEffectEvent appends one event row inside the mutation's
@@ -1031,8 +1073,27 @@ func (s *Store) Acquire(ctx context.Context, key, principal, capability, digest,
 // request are persisted on the record at insert so the ledger can prove
 // which authority material admitted each execution.
 func (s *Store) AcquireWithAuthority(ctx context.Context, key, principal, capability, digest string, authority AuthorityBinding, class string, leaseDuration time.Duration) (*AcquireResult, error) {
+	return s.AcquireWithMediation(ctx, key, principal, capability, digest,
+		authority, nil, class, leaseDuration)
+}
+
+// AcquireWithMediation is AcquireWithAuthority plus the caller-declared
+// middleware provenance: when the request carried a mediation object, its
+// canonical bytes are persisted on the record at insert so the ledger can
+// prove which middleware set produced the dispatched arguments. It is
+// evidence only — never consulted for authorization, routing, or
+// replay decisions.
+func (s *Store) AcquireWithMediation(ctx context.Context, key, principal, capability, digest string, authority AuthorityBinding, mediation *MediationBinding, class string, leaseDuration time.Duration) (*AcquireResult, error) {
 	if err := s.leaseCfg.Validate(leaseDuration); err != nil {
 		return nil, err
+	}
+
+	var mediationJSON []byte
+	if mediation != nil {
+		var err error
+		if mediationJSON, err = json.Marshal(mediation); err != nil {
+			return nil, fmt.Errorf("failed to encode request mediation: %w", err)
+		}
 	}
 
 	leaseToken, err := generateLeaseToken()
@@ -1069,10 +1130,11 @@ func (s *Store) AcquireWithAuthority(ctx context.Context, key, principal, capabi
 			(execution_id, idempotency_key, principal_id, capability_id, request_digest,
 			 grant_id, authority_generation, authority_digest, execution_class, state,
 			 lease_owner, lease_token, lease_started_at, lease_expires_at,
-			 lease_generation, attempt, version, admitted_epoch)
+			 lease_generation, attempt, version, admitted_epoch, request_mediation,
+			 digest_version)
 		SELECT $10, $1, $2, $3, $4, $5, $11, $12, $6, 'PREPARED',
 				$7, $8, clock_timestamp(), clock_timestamp() + make_interval(secs => $9),
-				1, 0, 1, cm.epoch
+				1, 0, 1, cm.epoch, $13, `+strconv.Itoa(DigestVersionDescriptorBound)+`
 		FROM cluster_meta cm
 		WHERE cm.id = 1 AND cm.epoch = `+strconv.FormatInt(s.epoch, 10)+` AND NOT cm.recovery_required
 		ON CONFLICT (principal_id, capability_id, idempotency_key) DO NOTHING
@@ -1080,6 +1142,7 @@ func (s *Store) AcquireWithAuthority(ctx context.Context, key, principal, capabi
 	`, key, principal, capability, digest, nullableString(authority.Ref), class,
 		leaseOwner, leaseToken, pgInterval(leaseDuration),
 		genID, authority.Generation, nullableString(authority.Digest),
+		nullableBytes(mediationJSON),
 	).Scan(&executionID, &createdAt)
 
 	if err == nil {
@@ -1111,6 +1174,8 @@ func (s *Store) AcquireWithAuthority(ctx context.Context, key, principal, capabi
 				GrantID:             authority.Ref,
 				AuthorityGeneration: authority.Generation,
 				AuthorityDigest:     authority.Digest,
+				RequestMediation:    json.RawMessage(mediationJSON),
+				DigestVersion:       DigestVersionDescriptorBound,
 				ExecutionClass:      class,
 				State:               StatePrepared,
 				LeaseOwner:          leaseOwner,
@@ -1454,6 +1519,83 @@ func (s *Store) markInFlightExpiredAsUnknown(ctx context.Context, rec *Record, a
 	rec.State = StateUnknown
 	rec.Version++
 	s.metrics.unknownEntered.Add(1)
+	return true, nil
+}
+
+// MigrateRequestDigest performs the one-time migrate-on-touch upgrade
+// for a record written before descriptor identity was bound. The CAS
+// rewrites request_digest to the descriptor-bound digest and stamps
+// DigestVersionDescriptorBound, but only while every honesty guard
+// holds:
+//
+//   - the stored digest still equals expectedDigest — the caller must
+//     recompute and prove the legacy identity, so a genuinely different
+//     request can never piggyback on the migration. This also makes the
+//     migration one-time: a migrated record's descriptor-bound digest
+//     can never equal a recomputed legacy-format digest;
+//   - the stored request_mediation equals the caller's mediation —
+//     migration must not rewrite the identity to assert middleware
+//     provenance the record never carried;
+//   - no live lease protects the record — a terminal, UNKNOWN,
+//     abandoned, or expired record may be migrated; one mid-dispatch
+//     keeps its stored identity so the active owner's Finalize receipt
+//     still matches the row.
+//
+// After a successful migration the descriptor binding protects the
+// record exactly like a fresh one: a subsequent registry policy change
+// is an idempotency conflict, not a replay. Returns false without error
+// when a guard fails — the caller then classifies the record under its
+// stored identity (replay, in-flight, recovery) as before.
+func (s *Store) MigrateRequestDigest(ctx context.Context, executionID, expectedDigest, newDigest string, mediation *MediationBinding) (bool, error) {
+	var mediationJSON []byte
+	if mediation != nil {
+		var err error
+		if mediationJSON, err = json.Marshal(mediation); err != nil {
+			return false, fmt.Errorf("failed to encode request mediation: %w", err)
+		}
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `
+		UPDATE execution_requests
+		SET request_digest = $2,
+		    digest_version = `+strconv.Itoa(DigestVersionDescriptorBound)+`,
+		    version = version + 1,
+		    updated_at = clock_timestamp()
+		WHERE execution_id = $1
+		  AND request_digest = $3
+		  AND request_mediation IS NOT DISTINCT FROM $4
+		  AND (state IN ('COMMITTED', 'FAILED', 'DENIED', 'UNKNOWN')
+		       OR lease_expires_at IS NULL
+		       OR lease_expires_at < clock_timestamp())
+		  `+s.epochGuardSQL(),
+		executionID, newDigest, expectedDigest, nullableBytes(mediationJSON))
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if rows == 0 {
+		// Release this connection before the epoch read — a second
+		// pool checkout while our tx is open deadlocks under
+		// MaxOpenConns pressure.
+		tx.Rollback()
+		return false, s.checkEpoch(ctx)
+	}
+	if err := insertEffectEvent(ctx, tx, executionID, effectEvent{
+		eventType: EventDigestMigrated,
+		metadata:  fmt.Sprintf("request_digest migrated to descriptor-bound identity (digest_version %d)", DigestVersionDescriptorBound),
+	}); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
 	return true, nil
 }
 
@@ -2830,7 +2972,8 @@ const selectColumns = `execution_id, idempotency_key, principal_id, capability_i
 	entered_unknown_at, provider_result,
 	COALESCE(authority_generation, 0), COALESCE(authority_digest, ''),
 	COALESCE(provider_evidence_digest, ''), COALESCE(terminal_result_digest, ''),
-	COALESCE(terminal_evidence_digest, ''), COALESCE(admitted_epoch, 0)`
+	COALESCE(terminal_evidence_digest, ''), COALESCE(admitted_epoch, 0),
+	request_mediation, COALESCE(digest_version, 1)`
 
 // selectColumnsER is selectColumns qualified with the `er` alias, for
 // use in UPDATE ... FROM ... RETURNING statements where the FROM clause
@@ -2849,7 +2992,8 @@ const selectColumnsER = `er.execution_id, er.idempotency_key, er.principal_id, e
 	er.entered_unknown_at, er.provider_result,
 	COALESCE(er.authority_generation, 0), COALESCE(er.authority_digest, ''),
 	COALESCE(er.provider_evidence_digest, ''), COALESCE(er.terminal_result_digest, ''),
-	COALESCE(er.terminal_evidence_digest, ''), COALESCE(er.admitted_epoch, 0)`
+	COALESCE(er.terminal_evidence_digest, ''), COALESCE(er.admitted_epoch, 0),
+	er.request_mediation, COALESCE(er.digest_version, 1)`
 
 // pgInterval converts a Go duration into a PostgreSQL interval
 // expression argument. make_interval(secs => x) accepts arbitrary
@@ -3433,6 +3577,7 @@ func scanRecordsWithReconcile(rows *sql.Rows) ([]*Record, error) {
 		var leaseStartedAt, leaseExpiresAt sql.NullTime
 		var recOwner, lastRecErr sql.NullString
 		var recLeaseExp, nextRecAt, enteredUnknownAt sql.NullTime
+		var requestMediation []byte
 		if err := rows.Scan(
 			&rec.ExecutionID, &rec.IdempotencyKey, &rec.PrincipalID,
 			&rec.CapabilityID, &rec.RequestDigest, &rec.GrantID,
@@ -3449,6 +3594,7 @@ func scanRecordsWithReconcile(rows *sql.Rows) ([]*Record, error) {
 			&rec.AuthorityGeneration, &rec.AuthorityDigest,
 			&rec.ProviderEvidenceDigest, &rec.TerminalResultDigest,
 			&rec.TerminalEvidenceDigest, &rec.AdmittedEpoch,
+			&requestMediation, &rec.DigestVersion,
 		); err != nil {
 			return nil, err
 		}
@@ -3492,6 +3638,9 @@ func scanRecordsWithReconcile(rows *sql.Rows) ([]*Record, error) {
 		}
 		if len(recoveryLocator) > 0 {
 			rec.RecoveryLocator = json.RawMessage(recoveryLocator)
+		}
+		if len(requestMediation) > 0 {
+			rec.RequestMediation = json.RawMessage(requestMediation)
 		}
 		if recOwner.Valid {
 			rec.ReconcileOwner = recOwner.String

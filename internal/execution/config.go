@@ -33,6 +33,7 @@ type ServiceConfig struct {
 
 	// Peer authentication and execution budgets.
 	PeerPrincipals   PeerPrincipalMap
+	TrustedProxyUIDs map[uint32]struct{}
 	ExecutorTimeouts ExecutorTimeouts
 	ProviderGate     ProviderGateConfig
 }
@@ -121,12 +122,19 @@ func LoadServiceConfig(opts ServeOptions) (*ServiceConfig, error) {
 	if err != nil {
 		return nil, fmt.Errorf("CRABEDENCE_PEER_PRINCIPALS: %w", err)
 	}
+	trustedProxies, err := ParseTrustedProxyUIDs(os.Getenv("CRABEDENCE_TRUSTED_PROXY_UIDS"))
+	if err != nil {
+		return nil, err
+	}
 	// Production must authenticate the principal, not merely receive
-	// it: an unverified claim is any local process's to choose.
-	if err := validatePeerAuthPolicy(productionMode(), peerMap); err != nil {
+	// it: an unverified claim is any local process's to choose. And a
+	// wildcard mapping — a peer that may claim any principal — is a
+	// stronger privilege than an exact one, gated on its own list.
+	if err := validatePeerAuthPolicy(productionMode(), peerMap, trustedProxies); err != nil {
 		return nil, err
 	}
 	cfg.PeerPrincipals = peerMap
+	cfg.TrustedProxyUIDs = trustedProxies
 
 	// The executor-owned provider ceiling applies on top of any caller
 	// deadline: a provider that exceeds it — including one that ignores
@@ -186,7 +194,7 @@ func (c *ServiceConfig) Report() string {
 	fmt.Fprintf(&b, "  evidence key:     %s\n", c.EvidenceKeySource())
 	fmt.Fprintf(&b, "  github adapter:   %s\n", github)
 	fmt.Fprintf(&b, "  qualification:    %s\n", qualification)
-	fmt.Fprintf(&b, "  peer auth:        %d mapped UIDs\n", len(c.PeerPrincipals))
+	fmt.Fprintf(&b, "  peer auth:        %d mapped UIDs (%d trusted proxies)\n", len(c.PeerPrincipals), len(c.TrustedProxyUIDs))
 	fmt.Fprintf(&b, "  provider ceiling: %s\n", c.ExecutorTimeouts.ProviderExecution)
 	fmt.Fprintf(&b, "  provider gate:    max %d concurrent; degraded after %d consecutive ambiguous outcomes; circuit opens after %d (cooldown %s)\n",
 		c.ProviderGate.MaxConcurrent, c.ProviderGate.DegradedAfter, c.ProviderGate.OpenAfter, c.ProviderGate.OpenCooldown)

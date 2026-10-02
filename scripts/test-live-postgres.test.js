@@ -83,11 +83,12 @@ test("prefers Docker postgres image when the daemon answers", (t) => {
 
   const calls = fs.readFileSync(log, "utf8");
   assert.match(calls, /docker run .*postgres:16/);
+  assert.match(calls, /POSTGRES_HOST_AUTH_METHOD=trust/);
   assert.match(calls, /docker rm -f/);
   assert.doesNotMatch(calls, /initdb/);
 
   const url = fs.readFileSync(out, "utf8");
-  assert.match(url, /^postgres:\/\/postgres:postgres@127\.0\.0\.1:\d+\/crabbox_test$/);
+  assert.match(url, /^postgres:\/\/postgres@127\.0\.0\.1:\d+\/crabbox_test$/);
 });
 
 test("uses an existing CRABBOX_TEST_DATABASE_URL without managing a server", (t) => {

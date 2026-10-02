@@ -13,9 +13,10 @@
  *   R3  the request is a JSON object
  *   R4  no object repeats a key
  *   R5  nesting depth is at most MAX_INVOCATION_DEPTH
- *   R6  root and authority keys are from the known sets
+ *   R6  root, authority, and mediation keys are from the known sets
  *   R7  explicit null is rejected for every known field
  *   R8  known fields carry their declared JSON types
+ *   R9  a present mediation object carries both required digests
  */
 
 export type InvocationValidation = { ok: true } | { ok: false; error: string };
@@ -31,6 +32,7 @@ const ROOT_FIELDS = new Map<string, FieldType>([
   ["execution_class", "string"],
   ["idempotency_key", "string"],
   ["deadline", "string"],
+  ["mediation", "object"],
 ]);
 
 const AUTHORITY_FIELDS = new Map<string, FieldType>([
@@ -40,6 +42,22 @@ const AUTHORITY_FIELDS = new Map<string, FieldType>([
   ["authority_generation", "integer"],
   ["authority_digest", "string"],
 ]);
+
+/** The mediation object's known fields — caller-declared middleware provenance. */
+const MEDIATION_FIELDS = new Map<string, FieldType>([
+  ["middleware_set_digest", "string"],
+  ["original_args_digest", "string"],
+  ["release_root_digest", "string"],
+  ["plugin_manifest_sha256", "string"],
+  ["plugin_library_sha256", "string"],
+  ["activation_config_sha256", "string"],
+]);
+
+/** Digests a mediation object must carry — see R9. */
+const MEDIATION_REQUIRED = ["middleware_set_digest", "original_args_digest"];
+
+/** A mediation digest value in canonical form: 64 lowercase hex characters. */
+const SHA256_DIGEST = /^[0-9a-f]{64}$/;
 
 const INTEGER_LITERAL = /^-?(0|[1-9][0-9]*)$/;
 const NUMBER_LITERAL = /^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?$/;
@@ -55,6 +73,28 @@ export function validateInvocationRequest(bytes: Uint8Array): InvocationValidati
     return { ok: false, error: "request is not valid UTF-8" };
   }
   return new InvocationScanner(text).scan();
+}
+
+/**
+ * checkRequiredFields enforces R9 — the presence rules the field-type
+ * map cannot express. A mediation object that omits either required
+ * digest is malformed evidence: the pre-mediation argument digest is
+ * what makes the mediation claim verifiable. Mirrors the Rust scanner
+ * and the Go parser's presence probe.
+ */
+function checkRequiredFields(
+  path: string,
+  fields: Map<string, FieldType> | null,
+  keys: Set<string>,
+): string | null {
+  if (fields === MEDIATION_FIELDS) {
+    for (const required of MEDIATION_REQUIRED) {
+      if (!keys.has(required)) {
+        return `${path}.${required} is required`;
+      }
+    }
+  }
+  return null;
 }
 
 function typeError(path: string, expected: FieldType): string {
@@ -94,6 +134,7 @@ class InvocationScanner {
     expected: FieldType | null,
     depth: number,
     childFields: Map<string, FieldType> | null = null,
+    digestField = false,
   ): string | null {
     const c = this.peek();
     if (c === "") {
@@ -124,10 +165,19 @@ class InvocationScanner {
       return this.parseArray(path, depth + 1);
     }
     if (c === '"') {
-      if (this.parseString() === null) {
+      const value = this.parseString();
+      if (value === null) {
         return "invalid JSON: invalid string";
       }
-      return expected === null || expected === "string" ? null : typeError(path, expected);
+      if (expected !== null && expected !== "string") {
+        return typeError(path, expected);
+      }
+      // Every known mediation field is a digest field — the unknown ones
+      // were refused above, so the field class alone names the check.
+      if (digestField && !SHA256_DIGEST.test(value)) {
+        return `${path} must be a 64-character lowercase SHA-256 hex digest`;
+      }
+      return null;
     }
     if (c === "t" || c === "f") {
       const literal = c === "t" ? "true" : "false";
@@ -169,7 +219,7 @@ class InvocationScanner {
     this.skipWhitespace();
     if (this.peek() === "}") {
       this.i++;
-      return null;
+      return checkRequiredFields(path, fields, keys);
     }
     for (;;) {
       this.skipWhitespace();
@@ -196,8 +246,19 @@ class InvocationScanner {
       }
       const expected = fields?.get(key) ?? null;
       const keyPath = `${path}.${key}`;
-      const childFields = path === "request" && key === "authority" ? AUTHORITY_FIELDS : null;
-      const error = this.parseValue(keyPath, expected, depth, childFields);
+      const childFields =
+        path === "request" && key === "authority"
+          ? AUTHORITY_FIELDS
+          : path === "request" && key === "mediation"
+            ? MEDIATION_FIELDS
+            : null;
+      const error = this.parseValue(
+        keyPath,
+        expected,
+        depth,
+        childFields,
+        fields === MEDIATION_FIELDS,
+      );
       if (error !== null) {
         return error;
       }
@@ -210,7 +271,7 @@ class InvocationScanner {
       }
       if (c === "}") {
         this.i++;
-        return null;
+        return checkRequiredFields(path, fields, keys);
       }
       return "invalid JSON: expected ',' or '}'";
     }

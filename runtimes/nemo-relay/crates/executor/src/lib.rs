@@ -159,6 +159,39 @@ pub mod unstable {
         pub deadline_unix_ms: u64,
     }
 
+    /// Provenance of the middleware boundary a request crossed, asserted by
+    /// the composing runtime.
+    ///
+    /// Which middleware set mediated the invocation, the digest of the
+    /// caller's arguments before mediation, and the release-root identity of
+    /// the composing runtime when it runs inside a qualified distribution.
+    /// This is evidence, not authority: a backend may bind it into durable
+    /// records and receipts but must never route, authorize, or select an
+    /// effect on it.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct RequestMediation {
+        /// Canonical digest naming the exact middleware set that mediated
+        /// this invocation — the activated plugin identities, their
+        /// registration descriptors, activation configuration, and the host
+        /// executable that ran them.
+        pub middleware_set_digest: String,
+        /// Canonical digest of the caller's arguments before middleware ran,
+        /// so a mediated request records both what was asked and what was
+        /// dispatched.
+        pub original_args_digest: String,
+        /// Release-root identity of the composing runtime — the component
+        /// manifest digest of the qualified distribution it shipped in, when
+        /// it runs inside one.
+        pub release_root_digest: Option<String>,
+        /// SHA-256 of the activated plugin manifest, when present.
+        pub plugin_manifest_sha256: Option<String>,
+        /// SHA-256 of the exact activated plugin library bytes, when present.
+        pub plugin_library_sha256: Option<String>,
+        /// Canonical digest of the activated component configuration. The
+        /// raw configuration is omitted because it may contain credentials.
+        pub activation_config_sha256: Option<String>,
+    }
+
     /// One already-bound invocation crossing the kernel/backend boundary.
     ///
     /// This is a backend wire contract, not a harness-facing request type.
@@ -174,6 +207,11 @@ pub mod unstable {
         pub grant: Option<String>,
         /// Trace identifier used for observability correlation.
         pub trace_id: Option<String>,
+        /// Mediation provenance the composing runtime attests, when the
+        /// request crossed a middleware boundary it can identify. The kernel's
+        /// own managed path leaves this absent — its middleware is the kernel.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub mediation: Option<RequestMediation>,
     }
 
     // Dispatch certainty is contract vocabulary rather than an adapter detail:
@@ -466,6 +504,7 @@ pub mod unstable {
                 args: json!({"value": 1}),
                 grant: None,
                 trace_id: None,
+                mediation: None,
             }
         }
 

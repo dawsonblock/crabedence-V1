@@ -300,11 +300,33 @@ impl ExecutionSocketClient {
                 format!("response frame truncated: {error}"),
             ));
         }
-        if let Some(trailing) = read_trailing_bytes(stream) {
-            return Err(TransportError::new(
-                TransportErrorKind::Protocol,
-                format!("unexpected trailing data after frame ({trailing} bytes)"),
-            ));
+        match read_trailing_bytes(stream) {
+            TrailingState::Eof => {}
+            TrailingState::Bytes(trailing) => {
+                return Err(TransportError::new(
+                    TransportErrorKind::Protocol,
+                    format!("unexpected trailing data after frame ({trailing} bytes)"),
+                ));
+            }
+            TrailingState::Timeout => {
+                return Err(TransportError::new(
+                    TransportErrorKind::Protocol,
+                    format!(
+                        "the peer did not close the connection within {:?} of its response frame — \
+                         the one-frame-per-connection contract is violated and the frame cannot be \
+                         confirmed terminal",
+                        self.response_timeout
+                    ),
+                ));
+            }
+            TrailingState::Io(error) => {
+                return Err(TransportError::new(
+                    TransportErrorKind::Protocol,
+                    format!(
+                        "could not confirm the frame is terminal — the peer holds the connection open and the probe failed: {error}"
+                    ),
+                ));
+            }
         }
         let response: serde_json::Value = serde_json::from_slice(&payload).map_err(|error| {
             TransportError::new(
@@ -341,23 +363,47 @@ fn read_exact_classified(
         })
 }
 
-/// Reports whether bytes follow a complete frame.
+/// What follows a complete response frame.
 ///
 /// The service sends exactly one frame per connection and closes it, so
 /// once a full frame has arrived the only lawful continuation is
-/// end-of-stream. The probe therefore waits under the socket's read
-/// timeout: a healthy peer signals EOF immediately after its frame,
-/// while a non-blocking check could miss trailing bytes that had not
-/// yet arrived and pass a protocol violation off as a clean response.
-/// A peer that never closes still bounds the wait the same way an
-/// unanswered request does; only bytes actually received are reported.
-fn read_trailing_bytes(stream: &UnixStream) -> Option<usize> {
+/// end-of-stream. Every other outcome — bytes, a read timeout, or a read
+/// error — is a contract violation: it means the frame cannot be
+/// confirmed terminal, which is a protocol failure, not a clean answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TrailingState {
+    /// The peer closed after its frame: the contract honored.
+    Eof,
+    /// Bytes followed the complete frame.
+    Bytes(usize),
+    /// The probe waited the socket's read timeout and the peer still
+    /// had not closed — the peer holds a connection the contract says
+    /// must already be closed, so the response cannot be accepted at
+    /// face value.
+    Timeout,
+    /// A read error other than a timeout while probing.
+    Io(String),
+}
+
+/// Determines what follows a complete frame.
+///
+/// The probe waits under the socket's read timeout rather than
+/// sampling once: a healthy peer signals EOF immediately after its
+/// frame, while a non-blocking check could miss trailing bytes that had
+/// not yet arrived and pass a protocol violation off as a clean
+/// response. A peer that never closes bounds the wait the same way an
+/// unanswered request does — and the wait ending in timeout or error is
+/// itself reported, never flattened into `Eof`.
+fn read_trailing_bytes(stream: &UnixStream) -> TrailingState {
     let mut probe = [0u8; 64];
     let mut stream_ref = stream;
     match stream_ref.read(&mut probe) {
-        Ok(0) => None,
-        Ok(count) => Some(count),
-        Err(_) => None,
+        Ok(0) => TrailingState::Eof,
+        Ok(count) => TrailingState::Bytes(count),
+        Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+            TrailingState::Timeout
+        }
+        Err(error) => TrailingState::Io(error.to_string()),
     }
 }
 
@@ -515,6 +561,71 @@ mod tests {
         let client = ExecutionSocketClient::new(&path);
         let error = client.invoke(&valid_request()).unwrap_err();
         assert_eq!(error.kind(), TransportErrorKind::Protocol);
+        server.join().expect("server");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn delayed_trailing_data_is_protocol() {
+        // The frame arrives whole, then a pause, then trailing bytes —
+        // the probe must still catch them: the contract is
+        // one-frame-then-close, and anything after the frame violates it.
+        let path = temp_socket_path("delayed-trailing");
+        let listener = UnixListener::bind(&path).expect("bind");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut length_bytes = [0u8; 4];
+            stream.read_exact(&mut length_bytes).expect("length");
+            let length = u32::from_be_bytes(length_bytes) as usize;
+            let mut payload = vec![0u8; length];
+            stream.read_exact(&mut payload).expect("payload");
+            let response = br#"{"status":"SUCCEEDED"}"#;
+            stream
+                .write_all(&(response.len() as u32).to_be_bytes())
+                .expect("write length");
+            stream.write_all(response).expect("write body");
+            std::thread::sleep(Duration::from_millis(80));
+            stream.write_all(b"{}").expect("write trailing");
+        });
+
+        let client = ExecutionSocketClient::new(&path);
+        let error = client.invoke(&valid_request()).unwrap_err();
+        assert_eq!(error.kind(), TransportErrorKind::Protocol);
+        assert!(error.message().contains("trailing data"), "got: {error}");
+        server.join().expect("server");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_peer_that_never_closes_is_protocol_not_clean_eof() {
+        // A conforming service closes after its one frame. A peer that
+        // keeps the connection open past the read timeout violates that
+        // contract, so the answer is a protocol failure — never the
+        // clean-EOF accept that a flattened `Err(_) => None` produced.
+        let path = temp_socket_path("held-open");
+        let listener = UnixListener::bind(&path).expect("bind");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut length_bytes = [0u8; 4];
+            stream.read_exact(&mut length_bytes).expect("length");
+            let length = u32::from_be_bytes(length_bytes) as usize;
+            let mut payload = vec![0u8; length];
+            stream.read_exact(&mut payload).expect("payload");
+            let response = br#"{"status":"SUCCEEDED"}"#;
+            stream
+                .write_all(&(response.len() as u32).to_be_bytes())
+                .expect("write length");
+            stream.write_all(response).expect("write body");
+            // Hold the connection open — no close, no trailing bytes.
+            std::thread::sleep(Duration::from_millis(500));
+        });
+
+        let client = ExecutionSocketClient::new(&path)
+            .with_timeouts(Duration::from_millis(150), DEFAULT_WRITE_TIMEOUT);
+        let error = client.invoke(&valid_request()).unwrap_err();
+        assert_eq!(error.kind(), TransportErrorKind::Protocol);
+        assert!(error.kind().is_ambiguous());
+        assert!(error.message().contains("did not close"), "got: {error}");
         server.join().expect("server");
         let _ = std::fs::remove_file(&path);
     }

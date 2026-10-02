@@ -13,10 +13,15 @@
 //
 // The digest is computed over the vendored tree's source files, sorted by
 // path, so it changes when the runtime changes and does not change when a
-// build artifact or a working-copy detail does. `-envelope` prints the digest
-// with the exact inputs it covers, in the same idiom as the registry envelope:
-// a consumer verifies what it was given rather than reproducing the
-// computation.
+// build artifact or a working-copy detail does. It is a regular-file
+// identity: only `find -type f` entries are hashed, so symlinks and other
+// non-regular entries — the tree carries a few, like the per-crate LICENSE
+// links — are not part of the digest. Their presence in a shipped root is
+// covered separately: the component manifest's exhaustive check refuses a
+// distribution carrying anything undeclared. `-envelope` prints the digest
+// with the exact inputs it covers, in the same idiom as the registry
+// envelope: a consumer verifies what it was given rather than reproducing
+// the computation.
 //
 // Recompute by hand (the same definition, shell-only):
 //
@@ -206,7 +211,9 @@ func fileDigest(path string) (string, error) {
 // a declaration inside the tree would be part of the digest it declares, and a
 // digest of content that contains the digest can never be self-consistent. The
 // computed fields are checked against the tree; the inventory fields are
-// checked structurally by scripts/check-nemo-transfer-manifest.sh.
+// checked structurally — every declared path exists and every declared
+// workspace member is a member — and, when the source copy is present,
+// exhaustively: the declared delta must equal the actual one.
 type transferManifest struct {
 	// Tree is the vendored runtime tree, relative to the repository root.
 	Tree string `json:"tree"`
@@ -224,8 +231,13 @@ type transferManifest struct {
 	WorkspaceMembersAdded []string `json:"workspace_members_added,omitempty"`
 	// LocalModifications lists the upstream files the transfer modifies.
 	LocalModifications []string `json:"local_modifications,omitempty"`
-	// AddedPaths lists the paths that exist only in the vendored tree.
+	// AddedPaths lists the paths that exist only in the vendored tree. An
+	// entry may name a file or a directory prefix (trailing slash) that
+	// covers an entire added subtree.
 	AddedPaths []string `json:"added_paths,omitempty"`
+	// RemovedPaths lists the upstream paths the vendored tree deletes. Absent
+	// means none — an undeclared deletion fails verification.
+	RemovedPaths []string `json:"removed_paths,omitempty"`
 	// Binaries lists the executables the vendored tree must produce, with the
 	// source each is built from. A declared binary whose source is absent is
 	// exactly the defect this inventory exists to catch.
@@ -317,6 +329,15 @@ func verifyManifest(path string) error {
 		fmt.Printf("ok: %d declared binaries have sources and declarations\n", len(manifest.Binaries))
 	}
 
+	// The provenance record's generated delta block is the manifest rendered
+	// for a human reader: it must say exactly what the manifest declares,
+	// computed or not. A stale block is drift, and drift fails here so CI
+	// catches a declaration that was edited without regenerating the doc.
+	if err := syncProvenanceDoc(manifest.Tree, manifest, false); err != nil {
+		return err
+	}
+	fmt.Printf("ok: %s's generated delta block matches the manifest\n", provenanceDocName)
+
 	if manifest.Source == nil {
 		return nil
 	}
@@ -334,6 +355,17 @@ func verifyManifest(path string) error {
 			source.NemoRuntimeSHA256, source.FileCount, path)
 	}
 	fmt.Printf("ok: source %s %s (%d files)\n", source.Tree, source.NemoRuntimeSHA256, source.FileCount)
+
+	// The inventory claims are not advisory: the difference between the two
+	// trees must equal the declared patch set exactly. An undeclared
+	// modification, addition, or removal means the human-auditable delta this
+	// transfer exists to record is incomplete.
+	delta, err := verifyDelta(manifest)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("ok: delta %d modifications, %d added, %d removed — all declared\n",
+		len(delta.modified), len(delta.added), len(delta.removed))
 	return nil
 }
 
@@ -552,6 +584,264 @@ func declaredWorkspaceMembers(tree string) ([]string, error) {
 	return members, nil
 }
 
+// treeDelta is the complete difference between the source copy and the
+// vendored tree: which paths carry different content, which exist only in
+// the vendored tree, and which only the source still has.
+type treeDelta struct {
+	modified []string
+	added    []string
+	removed  []string
+}
+
+// treeEntries maps every non-directory entry under root to a content
+// identity: the file digest for regular files, the link target for symlinks,
+// and the node type for anything else. The tree carries symlinks the file
+// digest never sees — a retargeted link must still surface in the delta, so
+// this walk is broader than sourceFiles on purpose.
+func treeEntries(root string) (map[string]string, error) {
+	entries := map[string]string{}
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			if path != root && excluded[entry.Name()] {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		key := filepath.ToSlash(rel)
+		switch typ := entry.Type(); {
+		case typ.IsRegular():
+			sum, err := fileDigest(path)
+			if err != nil {
+				return err
+			}
+			entries[key] = "file:" + sum
+		case typ&fs.ModeSymlink != 0:
+			target, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			entries[key] = "symlink:" + target
+		default:
+			entries[key] = "other:" + typ.String()
+		}
+		return nil
+	})
+	return entries, err
+}
+
+// diffTrees computes the treeDelta between the source copy and the vendored
+// tree, applying the same exclusion set to both.
+func diffTrees(source, vendored string) (treeDelta, error) {
+	src, err := treeEntries(source)
+	if err != nil {
+		return treeDelta{}, fmt.Errorf("reading the source tree: %w", err)
+	}
+	vend, err := treeEntries(vendored)
+	if err != nil {
+		return treeDelta{}, fmt.Errorf("reading the vendored tree: %w", err)
+	}
+	var delta treeDelta
+	for path, sourceID := range src {
+		vendoredID, ok := vend[path]
+		if !ok {
+			delta.removed = append(delta.removed, path)
+			continue
+		}
+		if vendoredID != sourceID {
+			delta.modified = append(delta.modified, path)
+		}
+	}
+	for path := range vend {
+		if _, ok := src[path]; !ok {
+			delta.added = append(delta.added, path)
+		}
+	}
+	sort.Strings(delta.modified)
+	sort.Strings(delta.added)
+	sort.Strings(delta.removed)
+	return delta, nil
+}
+
+// addedPathCovers reports whether a declared added_paths entry covers an
+// actual added path: an exact match, or a directory prefix covering a whole
+// added subtree.
+func addedPathCovers(declared, actual string) bool {
+	if strings.HasSuffix(declared, "/") {
+		return strings.HasPrefix(actual, declared)
+	}
+	return actual == declared
+}
+
+// verifyDelta checks that the declared inventory is the complete difference
+// between the source copy and the vendored tree — not merely that the
+// declared paths exist. The digest proves what the tree is; this proves the
+// human-auditable delta is all of it.
+func verifyDelta(manifest transferManifest) (treeDelta, error) {
+	delta, err := diffTrees(manifest.Source.Path, manifest.Tree)
+	if err != nil {
+		return treeDelta{}, err
+	}
+
+	var problems []string
+	declaredModifications := slices.Clone(manifest.LocalModifications)
+	sort.Strings(declaredModifications)
+	for _, path := range delta.modified {
+		if !slices.Contains(declaredModifications, path) {
+			problems = append(problems, fmt.Sprintf("undeclared modification: %s", path))
+		}
+	}
+	for _, path := range declaredModifications {
+		if !slices.Contains(delta.modified, path) {
+			problems = append(problems, fmt.Sprintf("declared modification %s is identical to the source (stale declaration)", path))
+		}
+	}
+	for _, path := range delta.added {
+		covered := false
+		for _, declared := range manifest.AddedPaths {
+			if addedPathCovers(declared, path) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			problems = append(problems, fmt.Sprintf("undeclared addition: %s", path))
+		}
+	}
+	for _, declared := range manifest.AddedPaths {
+		covers := false
+		for _, path := range delta.added {
+			if addedPathCovers(declared, path) {
+				covers = true
+				break
+			}
+		}
+		if !covers {
+			problems = append(problems, fmt.Sprintf("declared added path %s covers no actual addition (stale declaration)", declared))
+		}
+	}
+	declaredRemoved := slices.Clone(manifest.RemovedPaths)
+	sort.Strings(declaredRemoved)
+	for _, path := range delta.removed {
+		if !slices.Contains(declaredRemoved, path) {
+			problems = append(problems, fmt.Sprintf("undeclared removal: %s", path))
+		}
+	}
+	for _, path := range declaredRemoved {
+		if !slices.Contains(delta.removed, path) {
+			problems = append(problems, fmt.Sprintf("declared removed path %s still exists in the source (stale declaration)", path))
+		}
+	}
+	if len(problems) > 0 {
+		return delta, fmt.Errorf("the declared transfer delta is not the actual delta between %s and %s:\n  %s\nregenerate with: go run ./cmd/nemo-runtime-digest -manifest <manifest> -update",
+			manifest.Source.Path, manifest.Tree, strings.Join(problems, "\n  "))
+	}
+	return delta, nil
+}
+
+// provenanceDocName is the in-tree transfer record carrying the generated
+// delta block.
+const provenanceDocName = "TRANSFER-PROVENANCE.md"
+
+// The generated block's markers. Everything between them is produced by
+// -update from the manifest's declared delta and checked by verify — a doc
+// and a manifest that disagree about the delta is the drift this block
+// exists to catch.
+const (
+	deltaBlockBegin = "<!-- BEGIN GENERATED TRANSFER DELTA — regenerated by `nemo-runtime-digest -update`; do not edit by hand -->"
+	deltaBlockEnd   = "<!-- END GENERATED TRANSFER DELTA -->"
+)
+
+// renderDeltaBlock renders the manifest's declared delta as the canonical
+// generated block: every modified, added, and removed path, in order.
+func renderDeltaBlock(manifest transferManifest) string {
+	var block strings.Builder
+	block.WriteString(deltaBlockBegin + "\n\n")
+	block.WriteString("| Kind | Path |\n| --- | --- |\n")
+	write := func(kind string, paths []string) {
+		if len(paths) == 0 {
+			block.WriteString("| " + kind + " | — |\n")
+			return
+		}
+		for _, path := range paths {
+			block.WriteString("| " + kind + " | `" + path + "` |\n")
+		}
+	}
+	write("modified", manifest.LocalModifications)
+	write("added", manifest.AddedPaths)
+	write("removed", manifest.RemovedPaths)
+	block.WriteString("\n" + deltaBlockEnd)
+	return block.String()
+}
+
+// syncProvenanceDoc reconciles the generated delta block inside
+// TRANSFER-PROVENANCE.md with the manifest. With write=false it reports
+// drift as an error; with write=true it rewrites the file. A doc without
+// the markers is drift in itself — the block must exist.
+func syncProvenanceDoc(tree string, manifest transferManifest, write bool) error {
+	docPath := filepath.Join(tree, provenanceDocName)
+	raw, err := os.ReadFile(docPath)
+	if err != nil {
+		return fmt.Errorf("the provenance record %s: %w", docPath, err)
+	}
+	doc := string(raw)
+	begin := strings.Index(doc, deltaBlockBegin)
+	end := strings.Index(doc, deltaBlockEnd)
+	if begin < 0 || end < 0 || begin > end {
+		return fmt.Errorf("%s carries no generated delta block — run `nemo-runtime-digest -update` to regenerate it", docPath)
+	}
+	reconciled := doc[:begin] + renderDeltaBlock(manifest) + doc[end+len(deltaBlockEnd):]
+	if reconciled == doc {
+		return nil
+	}
+	if !write {
+		return fmt.Errorf("%s is stale: its generated delta block does not match the manifest — regenerate with `nemo-runtime-digest -manifest %s -update`", docPath, "runtimes/nemo-transfer-manifest.json")
+	}
+	if err := os.WriteFile(docPath, []byte(reconciled), 0o644); err != nil {
+		return err
+	}
+	return nil
+}
+
+// updateDeltaInventory rewrites the declared delta to the computed one.
+// Declared added-path entries that still cover real additions survive — a
+// directory prefix covering a whole added subtree expresses intent a flat
+// file list cannot — and actual additions no declaration covers are added
+// verbatim.
+func updateDeltaInventory(manifest *transferManifest, delta treeDelta) {
+	manifest.LocalModifications = delta.modified
+	manifest.RemovedPaths = delta.removed
+	kept := manifest.AddedPaths[:0]
+	for _, declared := range manifest.AddedPaths {
+		for _, path := range delta.added {
+			if addedPathCovers(declared, path) {
+				kept = append(kept, declared)
+				break
+			}
+		}
+	}
+	for _, path := range delta.added {
+		covered := false
+		for _, declared := range kept {
+			if addedPathCovers(declared, path) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			kept = append(kept, path)
+		}
+	}
+	sort.Strings(kept)
+	manifest.AddedPaths = kept
+}
+
 // updateManifest rewrites the manifest's computed fields from the tree,
 // preserving the inventory fields a human maintains. A missing manifest is
 // created with the computed fields alone.
@@ -566,14 +856,6 @@ func updateManifest(path string) error {
 	if manifest.Tree == "" {
 		manifest.Tree = defaultRoot
 	}
-	identity, err := digestRuntime(manifest.Tree)
-	if err != nil {
-		return err
-	}
-	manifest.RuntimeVersion = identity.RuntimeVersion
-	manifest.ShippedTreeSHA256 = identity.NemoRuntimeSHA256
-	manifest.FileCount = identity.FileCount
-	manifest.Excluded = identity.Excluded
 	if manifest.Source != nil {
 		if _, err := os.Stat(manifest.Source.Path); err == nil {
 			source, err := digestRuntime(manifest.Source.Path)
@@ -582,8 +864,29 @@ func updateManifest(path string) error {
 			}
 			manifest.Source.SHA256 = source.NemoRuntimeSHA256
 			manifest.Source.FileCount = source.FileCount
+			delta, err := diffTrees(manifest.Source.Path, manifest.Tree)
+			if err != nil {
+				return fmt.Errorf("computing the source delta: %w", err)
+			}
+			updateDeltaInventory(&manifest, delta)
+		} else {
+			fmt.Fprintf(os.Stderr, "note: source tree %s is not present; the declared delta inventory is preserved, not regenerated\n", manifest.Source.Path)
 		}
 	}
+	// The provenance record is a file inside the tree it documents: sync its
+	// generated delta block first, so the digest below covers the record as
+	// it will ship — a digest taken before the doc would bind a stale one.
+	if err := syncProvenanceDoc(manifest.Tree, manifest, true); err != nil {
+		return fmt.Errorf("regenerating the provenance record: %w", err)
+	}
+	identity, err := digestRuntime(manifest.Tree)
+	if err != nil {
+		return err
+	}
+	manifest.RuntimeVersion = identity.RuntimeVersion
+	manifest.ShippedTreeSHA256 = identity.NemoRuntimeSHA256
+	manifest.FileCount = identity.FileCount
+	manifest.Excluded = identity.Excluded
 	encoded, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return err

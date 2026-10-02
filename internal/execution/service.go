@@ -39,6 +39,12 @@ type Request struct {
 	ExecutionClass string           `json:"execution_class,omitempty"` // advisory; registry is authoritative
 	IdempotencyKey string           `json:"idempotency_key,omitempty"`
 	Deadline       string           `json:"deadline,omitempty"`
+	// Mediation carries caller-declared middleware provenance — the
+	// middleware set that ran and the pre-mediation argument digest.
+	// It is evidence, never a policy input: it binds into the request
+	// digest and is persisted on the durable record, but cannot select
+	// route, provider, assurance, or authority.
+	Mediation *RequestMediation `json:"mediation,omitempty"`
 }
 
 // RequestAuthority carries the principal and authority reference.
@@ -68,6 +74,25 @@ type RequestAuthority struct {
 	// grant-free capabilities).
 	AuthorityGeneration int64  `json:"authority_generation,omitempty"`
 	AuthorityDigest     string `json:"authority_digest,omitempty"`
+}
+
+// RequestMediation is the caller-declared middleware provenance object
+// the NEMO runtime attaches when middleware (including trusted native
+// plugins) mediated the invocation. MiddlewareSetDigest names the exact
+// middleware set that ran — activated plugin identities, registration
+// descriptors, activation configuration, and host identity.
+// OriginalArgsDigest is the canonical digest of the arguments before
+// middleware rewrote them. ReleaseRootDigest names the component
+// manifest of the qualified distribution the runtime shipped in, when
+// it runs inside one. Both required fields mirror the Rust ABI, which
+// rejects a mediation object that omits them.
+type RequestMediation struct {
+	MiddlewareSetDigest    string `json:"middleware_set_digest"`
+	OriginalArgsDigest     string `json:"original_args_digest"`
+	ReleaseRootDigest      string `json:"release_root_digest,omitempty"`
+	PluginManifestSHA256   string `json:"plugin_manifest_sha256,omitempty"`
+	PluginLibrarySHA256    string `json:"plugin_library_sha256,omitempty"`
+	ActivationConfigSHA256 string `json:"activation_config_sha256,omitempty"`
 }
 
 // Response is the wire-format execution response.
@@ -307,9 +332,10 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 	msgLen := binary.BigEndian.Uint32(lenBuf)
 	if msgLen > maxMessageBytes {
 		s.writeResponse(conn, Response{
-			Status:      StatusFailed,
-			FailureCode: string(capability.FailureInvalidRequest),
-			Error:       "message too large",
+			Status:            StatusFailed,
+			FailureCode:       string(capability.FailureInvalidRequest),
+			Error:             "message too large",
+			DefinitiveFailure: true,
 		}, "")
 		return
 	}
@@ -327,9 +353,10 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 	req, err := parseInvocationRequest(msgBuf)
 	if err != nil {
 		s.writeResponse(conn, Response{
-			Status:      StatusFailed,
-			FailureCode: string(capability.FailureInvalidRequest),
-			Error:       fmt.Sprintf("invalid request: %v", err),
+			Status:            StatusFailed,
+			FailureCode:       string(capability.FailureInvalidRequest),
+			Error:             fmt.Sprintf("invalid request: %v", err),
+			DefinitiveFailure: true,
 		}, "")
 		return
 	}
@@ -388,6 +415,10 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 			s.writeResponse(conn, Response{
 				Status:      StatusFailed,
 				FailureCode: string(capability.FailureCapabilityUnavailable),
+				// The gate runs before dispatch — no handler ran and no
+				// provider was contacted, so no effect is possible for
+				// any execution class. Definitive, not UNKNOWN.
+				DefinitiveFailure: true,
 				Error: fmt.Sprintf("capability %s requires adapter %q, which is not available in this deployment (reason=%s: %s)",
 					req.Capability, desc.AdapterID, status, reason),
 			}, "")
@@ -437,6 +468,24 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 	// Verify authority (grant resolution)
 	var resolvedGrant *capability.Grant
 	if decision.Descriptor.AuthorityPolicy.GrantRequired {
+		// A request that names no authority reference asks the service
+		// to broker the principal's authority. That is only as strong as
+		// the principal's authentication: under the bearer model anyone
+		// who can reach the socket could claim a principal holding
+		// grants, so the brokered path exists only when the peer map
+		// has authenticated who is asking. A caller-supplied reference
+		// remains valid — it must still resolve against the
+		// (authenticated or claimed) principal.
+		if req.Authority.EffectiveAuthorityRef() == "" && s.peerAuth == nil {
+			s.writeResponse(conn, Response{
+				Status:      StatusDenied,
+				FailureCode: string(capability.FailureUnauthorized),
+				Error: "no authority reference supplied and brokered authority requires peer " +
+					"authentication (CRABEDENCE_PEER_PRINCIPALS): without it the principal is an " +
+					"unverified claim the service cannot resolve grants against",
+			}, "")
+			return
+		}
 		grant, fc, reason := s.registry.VerifyAuthority(ctx, capability.AdmissionRequest{
 			Capability: req.Capability,
 			Arguments:  req.Arguments,
@@ -452,6 +501,13 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 			return
 		}
 		resolvedGrant = grant
+		// The resolved grant's identity is server-determined: when the
+		// caller carried no reference, the record binds the grant the
+		// store selected, so the durable execution names the authority
+		// that actually admitted it.
+		if req.Authority.EffectiveAuthorityRef() == "" {
+			req.Authority.AuthorityRef = resolvedGrant.ID
+		}
 	}
 
 	// Bind the verified authority material into the request before
@@ -491,13 +547,16 @@ func (s *Service) writeResponse(conn net.Conn, resp Response, executedClass capa
 
 	if len(payload) > maxMessageBytes {
 		status, failureCode := StatusFailed, capability.FailureInternalError
+		definitive := true
 		if executedClass == capability.ClassMutation || executedClass == capability.ClassCritical {
 			status, failureCode = StatusUnknown, capability.FailureExecutionUnknown
+			definitive = false
 		}
 		payload, err = json.Marshal(Response{
-			Status:      status,
-			FailureCode: string(failureCode),
-			Error:       fmt.Sprintf("response exceeds the %d-byte frame bound", maxMessageBytes),
+			Status:            status,
+			FailureCode:       string(failureCode),
+			Error:             fmt.Sprintf("response exceeds the %d-byte frame bound", maxMessageBytes),
+			DefinitiveFailure: definitive,
 		})
 		if err != nil {
 			log.Printf("execution service: marshal error: %v", err)

@@ -22,6 +22,7 @@ equivalent binding configuration.
 | `[config_schema]` | An optional JSON Schema path resolved relative to the manifest. Packages that use it also declare the `config_schema` capability. |
 | `[source]` | The artifact covered by integrity verification and, for managed Python workers, the package root used to create the environment. |
 | `[integrity]` | The SHA-256 digest of `source.artifact`, plus optional signature evidence. |
+| `[security]` | Requirements the hosting environment must satisfy. `requires_confinement = true` declares that the artifact refuses a host policy that does not confine it — a deployment offering `trusted-process` must fail the plugin's session rather than run it unconfined. The declaration travels inside the artifact's own approved digest, so a deployment cannot edit it away without breaking the approval. |
 | `[load]` | The native library and symbol, Python module entrypoint, or Rust or custom-command executable entrypoint that Relay starts. |
 
 For native packages, `compat.native_api = "1"` is the authored manifest contract. It is

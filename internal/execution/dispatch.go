@@ -1,6 +1,7 @@
 package execution
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -113,8 +114,10 @@ func durabilityContext(ctx context.Context, budget time.Duration) (context.Conte
 
 // requestDigestProtocolVersion is the digest ABI version. The
 // descriptor-identity binding is additive (zero values bind nothing),
-// so it does not require a protocol bump; the executor's legacy-digest
-// retry covers records created before descriptor identity existed.
+// so it does not require a protocol bump; records created before
+// descriptor identity existed are upgraded once by migrate-on-touch
+// (MigrateRequestDigest), after which the descriptor binding protects
+// them like any fresh record.
 const requestDigestProtocolVersion = 1
 
 // DispatchExecutor wraps a Handler with dispatch-point tracking and
@@ -324,7 +327,23 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 			Error:       fmt.Sprintf("failed to compute descriptor digest: %v", err),
 		}
 	}
-	digest, err := idempotency.ComputeDigestFromRawWithDescriptor(
+	// Caller-declared middleware provenance: bound into the request
+	// digest so the durable record commits to which middleware set
+	// produced the dispatched arguments, and persisted verbatim at
+	// acquisition. Evidence only — it never selects route, provider,
+	// assurance, or authority.
+	var mediation *idempotency.MediationBinding
+	if req.Mediation != nil {
+		mediation = &idempotency.MediationBinding{
+			MiddlewareSetDigest:    req.Mediation.MiddlewareSetDigest,
+			OriginalArgsDigest:     req.Mediation.OriginalArgsDigest,
+			ReleaseRootDigest:      req.Mediation.ReleaseRootDigest,
+			PluginManifestSHA256:   req.Mediation.PluginManifestSHA256,
+			PluginLibrarySHA256:    req.Mediation.PluginLibrarySHA256,
+			ActivationConfigSHA256: req.Mediation.ActivationConfigSHA256,
+		}
+	}
+	digest, err := idempotency.ComputeDigestFromRawWithMediation(
 		requestDigestProtocolVersion,
 		req.Authority.Principal,
 		req.Capability,
@@ -337,6 +356,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		string(desc.ExecutionRoute),
 		desc.DescriptorVersion,
 		descriptorDigest,
+		mediation,
 	)
 	if err != nil {
 		return Response{
@@ -358,8 +378,8 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		Generation: req.Authority.AuthorityGeneration,
 		Digest:     req.Authority.AuthorityDigest,
 	}
-	acq, err := e.store.AcquireWithAuthority(ctx, req.IdempotencyKey, req.Authority.Principal, req.Capability, digest,
-		authorityBinding, string(desc.ExecutionClass), leaseDuration)
+	acq, err := e.store.AcquireWithMediation(ctx, req.IdempotencyKey, req.Authority.Principal, req.Capability, digest,
+		authorityBinding, mediation, string(desc.ExecutionClass), leaseDuration)
 	if err != nil {
 		return Response{
 			Status:      StatusFailed,
@@ -368,13 +388,22 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		}
 	}
 
-	// Compatibility window for records created before descriptor
-	// identity was bound: their stored digest is the legacy digest, so
-	// the descriptor-bound digest conflicts. Recompute the legacy
-	// digest and retry the acquisition exactly once — a genuine
-	// conflict (neither digest matches the stored record) still fails
-	// closed, and new records always store the descriptor-bound digest.
-	if acq.Kind == idempotency.IdempotencyConflict {
+	// Records created before descriptor identity was bound carry the
+	// prefix-format (legacy) request digest, so a first acquire under
+	// the descriptor-bound digest conflicts even when the request is
+	// the same. Recompute the legacy digest and offer the record a
+	// one-time migrate-on-touch: the store rewrites request_digest to
+	// the descriptor-bound identity only while the stored digest still
+	// equals the legacy digest, no live lease protects the record, and
+	// the stored mediation matches — then the acquisition runs again
+	// under the new identity. After migration the descriptor binding
+	// protects the record exactly like a fresh one: a registry policy
+	// change is a conflict, never a silent replay. A record that cannot
+	// be migrated yet (a live lease is held, or its recorded mediation
+	// differs) keeps its stored identity and is classified under the
+	// legacy digest — in-flight, recovery, or replay — exactly as the
+	// pre-migration path classified it.
+	if acq.Kind == idempotency.IdempotencyConflict && acq.Record != nil {
 		legacyDigest, legacyErr := idempotency.ComputeDigestFromRawWithAuthority(
 			requestDigestProtocolVersion,
 			req.Authority.Principal,
@@ -387,11 +416,55 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 			string(desc.AssuranceProfile),
 			string(desc.ExecutionRoute),
 		)
-		if legacyErr == nil && legacyDigest != digest {
-			if legacyAcq, legacyAcquireErr := e.store.AcquireWithAuthority(ctx, req.IdempotencyKey,
-				req.Authority.Principal, req.Capability, legacyDigest, authorityBinding,
-				string(desc.ExecutionClass), leaseDuration); legacyAcquireErr == nil {
-				acq = legacyAcq
+		if legacyErr == nil && legacyDigest != digest && acq.Record.RequestDigest == legacyDigest {
+			migrated, migErr := e.store.MigrateRequestDigest(ctx,
+				acq.Record.ExecutionID, legacyDigest, digest, mediation)
+			if migErr != nil {
+				return Response{
+					Status:      StatusFailed,
+					FailureCode: string(capability.FailureInternalError),
+					Error:       fmt.Sprintf("request digest migration failed: %v", migErr),
+				}
+			}
+			acquireDigest := digest
+			if !migrated {
+				// The store refused the migration. A live lease is the
+				// benign refusal: the record keeps its stored identity and
+				// the request is classified under the legacy digest —
+				// in-flight, recovery, or replay — exactly as it was before
+				// descriptor-bound digests existed. A *mediation* mismatch is
+				// different: the recorded mediation is evidence for another
+				// invocation, so the record is not this request's identity at
+				// all — the acquisition must stay a conflict rather than
+				// replay a terminal outcome across a mediation boundary.
+				storedMediation := []byte(nil)
+				if len(acq.Record.RequestMediation) > 0 {
+					storedMediation = []byte(acq.Record.RequestMediation)
+				}
+				var callerMediation []byte
+				if mediation != nil {
+					if encoded, encErr := json.Marshal(mediation); encErr == nil {
+						callerMediation = encoded
+					}
+				}
+				if !bytes.Equal(storedMediation, callerMediation) {
+					acquireDigest = ""
+				} else {
+					acquireDigest = legacyDigest
+				}
+			}
+			if acquireDigest != "" {
+				if reacq, reErr := e.store.AcquireWithMediation(ctx, req.IdempotencyKey,
+					req.Authority.Principal, req.Capability, acquireDigest, authorityBinding,
+					mediation, string(desc.ExecutionClass), leaseDuration); reErr == nil {
+					acq = reacq
+				} else {
+					return Response{
+						Status:      StatusFailed,
+						FailureCode: string(capability.FailureInternalError),
+						Error:       fmt.Sprintf("idempotency acquire failed: %v", reErr),
+					}
+				}
 			}
 		}
 	}

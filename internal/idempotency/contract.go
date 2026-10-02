@@ -233,6 +233,35 @@ type AuthorityBinding struct {
 	Digest     string `json:"digest,omitempty"`
 }
 
+// MediationBinding is the middleware provenance declared on the
+// invocation request — caller-attested evidence, never a policy input.
+// When present it is bound into the request digest (so the durable
+// record's digest commits to it) and persisted verbatim on the record
+// so receipts can name the middleware set, the pre-mediation argument
+// digest, and the release identity that produced the request.
+//
+// It is evidence only: route, provider, adapter, assurance, and
+// authority remain server-resolved. A record carries no mediation when
+// the request crossed no caller-side middleware boundary.
+type MediationBinding struct {
+	// MiddlewareSetDigest names the exact middleware set that mediated
+	// the invocation — activated plugin identities, registration
+	// descriptors, activation configuration, and host identity.
+	MiddlewareSetDigest string `json:"middleware_set_digest,omitempty"`
+	// OriginalArgsDigest is the canonical digest of the caller's
+	// arguments before middleware rewrote them.
+	OriginalArgsDigest string `json:"original_args_digest,omitempty"`
+	// ReleaseRootDigest is the component-manifest digest of the
+	// qualified distribution the composing runtime shipped in.
+	ReleaseRootDigest string `json:"release_root_digest,omitempty"`
+	// These explicit artifact identities let an auditor inspect which
+	// plugin and activation configuration were used without reversing the
+	// opaque middleware-set digest. Raw configuration is never persisted.
+	PluginManifestSHA256   string `json:"plugin_manifest_sha256,omitempty"`
+	PluginLibrarySHA256    string `json:"plugin_library_sha256,omitempty"`
+	ActivationConfigSHA256 string `json:"activation_config_sha256,omitempty"`
+}
+
 // Acquired returns true if this caller acquired the lease and may
 // proceed to dispatch.
 func (r AcquireResult) Acquired() bool {

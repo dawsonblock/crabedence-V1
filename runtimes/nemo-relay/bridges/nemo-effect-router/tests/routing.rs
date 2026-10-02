@@ -29,10 +29,7 @@ fn resolves_the_route_from_the_registry() {
     ]));
     let router = router(catalog);
     assert_eq!(router.decide("pure.local").unwrap(), RouteDecision::Local);
-    assert_eq!(
-        router.decide("read.direct").unwrap(),
-        RouteDecision::DirectUnavailable
-    );
+    assert_eq!(router.decide("read.direct").unwrap(), RouteDecision::Direct);
     assert_eq!(
         router.decide("read.high").unwrap(),
         RouteDecision::Crabedence
@@ -118,15 +115,53 @@ fn refuses_a_class_downgrade_before_the_local_path() {
 }
 
 #[test]
-fn an_unwired_read_path_is_unavailable_rather_than_rerouted() {
+fn a_read_pinned_direct_crosses_the_socket() {
+    // DIRECT is the approved read path: the request crosses to the service,
+    // whose dispatcher resolves the non-durable read route from its own
+    // registry — not from anything the request asserts.
     let router = router(catalog_for(json!([descriptor(
         "read.direct",
         "READ",
         "DIRECT"
     )])));
     let request = request_for("read.direct", ExecutionClass::Read);
-    let error = router.execute(&request).unwrap_err();
-    assert_eq!(error.code, "CAPABILITY_UNAVAILABLE");
+    router.execute(&request).expect("entered the kernel");
+    assert_eq!(router.kernel().calls(), 1);
     assert_eq!(router.local().calls(), 0);
+}
+
+#[test]
+fn refuses_a_consequential_class_on_the_direct_route() {
+    // The registry refuses DIRECT for MUTATION at registration; a snapshot
+    // that carried it anyway must fail closed rather than dispatch down the
+    // non-durable route.
+    let mut sneaky_critical = descriptor("sneaky.critical", "CRITICAL", "DIRECT");
+    sneaky_critical["assurance_profile"] = json!("HIGH_ASSURANCE");
+    let router = router(catalog_for(json!([
+        descriptor("sneaky.mutation", "MUTATION", "DIRECT"),
+        sneaky_critical,
+    ])));
+    for (id, class) in [
+        ("sneaky.mutation", ExecutionClass::Mutation),
+        ("sneaky.critical", ExecutionClass::Critical),
+    ] {
+        let request = request_for(id, class);
+        let error = router.execute(&request).expect_err("must fail closed");
+        assert_eq!(error.code, "EXECUTION_ROUTE_MISMATCH", "{id}");
+    }
+    assert_eq!(router.kernel().calls(), 0);
+    assert_eq!(router.local().calls(), 0);
+}
+
+#[test]
+fn refuses_durable_assurance_on_the_direct_route() {
+    // DIRECT cannot carry DURABLE/HIGH_ASSURANCE at registration; the router
+    // re-checks it rather than trusting the snapshot.
+    let mut descriptor = descriptor("read.durable", "READ", "DIRECT");
+    descriptor["assurance_profile"] = json!("DURABLE");
+    let router = router(catalog_for(json!([descriptor])));
+    let request = request_for("read.durable", ExecutionClass::Read);
+    let error = router.execute(&request).unwrap_err();
+    assert_eq!(error.code, "EXECUTION_ROUTE_MISMATCH");
     assert_eq!(router.kernel().calls(), 0);
 }

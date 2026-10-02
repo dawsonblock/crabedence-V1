@@ -40,15 +40,17 @@ wait_ready() {
 }
 
 # invoke <capability> <arguments-json> [idempotency-key] [exec-class]
-# Prints the JSON response. Grant-bound routes need STAGING_GRANT_ID.
+# Prints the JSON response. Grant-bound routes need STAGING_GRANT_ID —
+# passed through the environment, never argv: process arguments are
+# readable by every account on the host and a grant reference is a
+# bearer capability.
 invoke() {
   local cap="$1" args="$2" key="${3:-}" class="${4:-}"
   local cmd=("$CRABBOX" invoke --socket "$SOCKET" --capability "$cap"
     --principal "$PRINCIPAL" --arguments "$args")
-  [ -n "${STAGING_GRANT_ID:-}" ] && cmd+=(--authority-ref "$STAGING_GRANT_ID")
   [ -n "$key" ] && cmd+=(--idempotency-key "$key")
   [ -n "$class" ] && cmd+=(--execution-class "$class")
-  "${cmd[@]}"
+  CRABEDENCE_AUTHORITY_REF="${STAGING_GRANT_ID:-}" "${cmd[@]}"
 }
 
 # Durable-ledger helpers. Rows are unique on

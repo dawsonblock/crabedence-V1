@@ -1,0 +1,294 @@
+name: NEMO Distribution
+
+# The bound, per-target NEMO-CONTROL release roots — produced and qualified on
+# runners that can actually execute each target. One macOS machine cannot
+# produce or run the Linux artifacts (the Rust components need the target's
+# linker and the qualification runs the shipped binaries), so every leg runs
+# where its target is native: both darwin arches on the repo's two macOS
+# runner labels, linux_amd64 on ubuntu-latest, linux_arm64 on the arm runner.
+#
+# This workflow produces and qualifies artifacts; it does not publish. The
+# credential-free candidate contract (scripts/release-provenance.mjs) pins the
+# crabbox archive inventory, so NEMO artifacts travel as their own bound
+# family — each tarball carries the component manifest that verifies it
+# exhaustively — and publication is the separate proof-gated operation.
+
+on:
+  push:
+    tags:
+      # v* builds the family alongside the kernel release tag; nemo-v* is the
+      # family's own signed tag — the one scripts/publish-nemo-release.sh
+      # binds when publishing the separate bound artifact family.
+      - 'v*'
+      - 'nemo-v*'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Ref to build (defaults to the triggering ref)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nemo-distribution-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Resolve the source commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      version: ${{ steps.resolve.outputs.version }}
+      signing_required: ${{ steps.resolve.outputs.signing_required }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+
+      # Every leg must build the same commit — a symbolic ref resolves
+      # independently per runner, so a moved branch or tag could otherwise mix
+      # revisions inside one versioned artifact family. Resolve once here and
+      # pin every checkout below to the SHA.
+      - name: Resolve the distribution version and commit
+        id: resolve
+        shell: bash
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            # Strip the family prefix before the bare 'v': nemo-vX.Y.Z builds
+            # the same versioned artifacts as vX.Y.Z.
+            version="${GITHUB_REF_NAME#nemo-v}"
+            version="${version#v}"
+          else
+            version="$(cat VERSION)"
+          fi
+          # VERSION is the single version source — a tag cut against a tree
+          # that disagrees names artifacts the source does not claim.
+          declared="$(cat VERSION)"
+          [ "$declared" = "$version" ] || {
+            echo "VERSION declares $declared but this build is $version" >&2
+            exit 1
+          }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          # Tag builds are the protected release path: a tag artifact without
+          # a maintainer signature has no release-origin evidence, so the key
+          # is mandatory there. Manual dispatch stays a development lane where
+          # unsigned artifacts are legitimate.
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "signing_required=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "signing_required=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-qualify:
+    name: "nemo-control ${{ matrix.target }}"
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    needs: prepare
+    strategy:
+      fail-fast: false
+      # Every leg runs where its target executes natively — no cross-compile,
+      # no translation. macos-15-intel is the repo's existing Intel runner.
+      matrix:
+        include:
+          - target: darwin_arm64
+            runner: macos-15
+            rust_target: aarch64-apple-darwin
+          - target: darwin_amd64
+            runner: macos-15-intel
+            rust_target: x86_64-apple-darwin
+          - target: linux_amd64
+            runner: ubuntu-latest
+            rust_target: x86_64-unknown-linux-gnu
+          - target: linux_arm64
+            runner: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-gnu
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
+      # Mirrors the NEMO integration job; bump both together when the vendored
+      # runtime moves. Every target is the runner's host triple, so the
+      # explicit install is a no-op that keeps the intent visible.
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          toolchain: 1.96.1
+          target: ${{ matrix.rust_target }}
+
+      # Release-origin authentication: the release signing key (repository
+      # secret NEMO_RELEASE_SSH_SIGNING_KEY, matching
+      # .github/release-allowed-signers) lets the assembler SSH-sign the
+      # release-root sidecar, and the qualification below verifies it under
+      # the maintainer's principal. The step is gated on signing_required so
+      # the key never enters a run that does not need it: a manual dispatch
+      # may check out an arbitrary ref and run its scripts, so exporting the
+      # key there would hand it to code the release ruleset never vetted.
+      # On the release path (tag builds) the key is mandatory — an unsigned
+      # release artifact carries no origin proof, so the lane fails rather
+      # than shipping one. Manual development runs produce unsigned
+      # artifacts, and the verifier then skips the check rather than
+      # demanding a signature nobody could have produced.
+      - name: Provision the release signing key
+        if: needs.prepare.outputs.signing_required == 'true'
+        env:
+          SIGNING_KEY_MATERIAL: ${{ secrets.NEMO_RELEASE_SSH_SIGNING_KEY }}
+        shell: bash
+        run: |
+          if [ -z "$SIGNING_KEY_MATERIAL" ]; then
+            echo "NEMO_RELEASE_SSH_SIGNING_KEY is required on the release path — provision the repository secret" >&2
+            exit 1
+          fi
+          umask 077
+          printf '%s\n' "$SIGNING_KEY_MATERIAL" > "$RUNNER_TEMP/nemo-release-signing-key"
+          {
+            echo "NEMO_RELEASE_SIGNING_KEY=$RUNNER_TEMP/nemo-release-signing-key"
+            echo "NEMO_RELEASE_ALLOWED_SIGNERS=$GITHUB_WORKSPACE/.github/release-allowed-signers"
+            echo "NEMO_RELEASE_SIGNER=dawsonblock@users.noreply.github.com"
+          } >> "$GITHUB_ENV"
+
+      # Release profile — this is the release pipeline. The assembler verifies
+      # the root and writes the component manifest binding every shipped byte.
+      - name: Assemble and verify the distribution root
+        env:
+          NEMO_DIST_TARGET: ${{ matrix.target }}
+          NEMO_DIST_VERSION: ${{ needs.prepare.outputs.version }}
+        run: scripts/build-nemo-distribution.sh
+
+      - name: Pack the verified root
+        shell: bash
+        run: |
+          root="dist/nemo-control_${{ needs.prepare.outputs.version }}_${{ matrix.target }}"
+          [ -d "$root" ] || { echo "assembler produced no root at $root" >&2; exit 1; }
+          # COPYFILE_DISABLE keeps macOS tar from synthesizing ._ AppleDouble
+          # metadata members — the manifest must bind every file the archive
+          # carries, and metadata twins are not declared content.
+          COPYFILE_DISABLE=1 tar -C "$root" -czf "$root.tar.gz" .
+
+      - name: Qualify the packed artifact
+        shell: bash
+        run: >-
+          scripts/test-nemo-installed-distribution.sh
+          "dist/nemo-control_${{ needs.prepare.outputs.version }}_${{ matrix.target }}.tar.gz"
+
+      - name: Upload the qualified artifact and its attestation
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nemo-control_${{ needs.prepare.outputs.version }}_${{ matrix.target }}
+          path: |
+            dist/nemo-control_${{ needs.prepare.outputs.version }}_${{ matrix.target }}.tar.gz
+            dist/nemo-control_${{ needs.prepare.outputs.version }}_${{ matrix.target }}.tar.gz.qualification.json
+          if-no-files-found: error
+
+  checksums:
+    name: Release checksums
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [prepare, build-qualify]
+    steps:
+      # The allowed-signers file is release policy — fetch it at the pinned
+      # SHA, not from any artifact download.
+      - name: Check out the allowed-signers file
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+          sparse-checkout: .github/release-allowed-signers
+
+      - name: Download the qualified artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: nemo-control_*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Write the release checksum manifest
+        shell: bash
+        run: |
+          cd artifacts
+          ls nemo-control_*.tar.gz | LC_ALL=C sort > expected.txt
+          [ "$(wc -l < expected.txt)" -eq 4 ] || {
+            echo "expected four qualified tarballs, got:" >&2
+            cat expected.txt >&2
+            exit 1
+          }
+          # Each tarball's qualification attestation must bind these
+          # bytes: the record's archive digest is recomputed here, not
+          # trusted from the upload.
+          for tarball in nemo-control_*.tar.gz; do
+            attestation="$tarball.qualification.json"
+            [ -f "$attestation" ] || { echo "missing attestation for $tarball" >&2; exit 1; }
+            claimed="$(jq -r .subject.archive_sha256 "$attestation")"
+            actual="$(sha256sum "$tarball" | awk '{print $1}')"
+            [ "$claimed" = "$actual" ] || {
+              echo "attestation for $tarball binds $claimed, the artifact digests to $actual" >&2
+              exit 1
+            }
+            # All five declared gates, all passing — an unrelated all-pass
+            # list is not the qualification suite's evidence.
+            [ "$(jq -r '[.gates[].id] | sort | join(",")' "$attestation")" = \
+              "nemo-component-manifest-verify,nemo-critical-path,nemo-expired-authority,nemo-restart-idempotency,nemo-runtime-e2e" ] || {
+              echo "attestation for $tarball does not name the qualification gate set" >&2
+              exit 1
+            }
+            [ "$(jq -r '[.gates[].result] | unique | join(",")' "$attestation")" = "pass" ] || {
+              echo "attestation for $tarball records a non-pass gate" >&2
+              exit 1
+            }
+          done
+          # The attestations go into the signed manifest too: an unsigned
+          # sidecar beside an authenticated archive could be swapped for a
+          # fabricated pass without touching the tarball.
+          sha256sum nemo-control_*.tar.gz nemo-control_*.tar.gz.qualification.json \
+            | LC_ALL=C sort -k2 > "nemo-control_${{ needs.prepare.outputs.version }}_SHA256SUMS"
+          cat "nemo-control_${{ needs.prepare.outputs.version }}_SHA256SUMS"
+
+      # Sign the checksum manifest with the same release key — a published
+      # SHA256SUMS is only release-origin evidence once a named signer is
+      # bound to it. Immediately verified: a signature that does not
+      # authenticate the file it claims is a pipeline failure, not an upload.
+      # Gated on signing_required so the development lane never touches the
+      # release key and never ships a signed manifest its unsigned artifacts
+      # did not earn.
+      - name: Sign the checksum manifest
+        if: needs.prepare.outputs.signing_required == 'true'
+        env:
+          SIGNING_KEY_MATERIAL: ${{ secrets.NEMO_RELEASE_SSH_SIGNING_KEY }}
+        shell: bash
+        run: |
+          cd artifacts
+          sums="nemo-control_${{ needs.prepare.outputs.version }}_SHA256SUMS"
+          if [ -z "$SIGNING_KEY_MATERIAL" ]; then
+            echo "release tags must ship a signed SHA256SUMS — provision NEMO_RELEASE_SSH_SIGNING_KEY" >&2
+            exit 1
+          fi
+          umask 077
+          printf '%s\n' "$SIGNING_KEY_MATERIAL" > "$RUNNER_TEMP/nemo-release-signing-key"
+          ssh-keygen -Y sign -n nemo-control-release \
+            -f "$RUNNER_TEMP/nemo-release-signing-key" "$sums"
+          ssh-keygen -Y verify \
+            -f "$GITHUB_WORKSPACE/.github/release-allowed-signers" \
+            -I dawsonblock@users.noreply.github.com \
+            -n nemo-control-release -s "$sums.sig" < "$sums"
+
+      - name: Upload the checksum manifest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nemo-control_SHA256SUMS
+          path: artifacts/nemo-control_*_SHA256SUMS*
+          if-no-files-found: error

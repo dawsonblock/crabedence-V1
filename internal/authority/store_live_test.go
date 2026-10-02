@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -507,5 +509,87 @@ func TestLiveAuthorityResolvedDigestRecomputable(t *testing.T) {
 	}
 	if want := capability.ComputeGrantDigest(got); got.Digest != want {
 		t.Errorf("resolved digest %s does not recompute to %s", got.Digest, want)
+	}
+}
+
+// TestLiveAuthorityGrantsForPrincipal verifies the brokered enumeration
+// on the production store: a principal's live grants are its latest
+// unrevoked, unexpired generations — superseded, revoked, expired,
+// reissued-away, and another principal's material all stay out of the
+// candidacy.
+func TestLiveAuthorityGrantsForPrincipal(t *testing.T) {
+	dbURL := os.Getenv("CRABBOX_TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("CRABBOX_TEST_DATABASE_URL not set; skipping live PostgreSQL test")
+	}
+
+	db, err := openTestDB(dbURL)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	store, err := NewStore(db)
+	if err != nil {
+		t.Fatalf("failed to create authority store: %v", err)
+	}
+
+	ctx := context.Background()
+	suffix := fmt.Sprintf("-%d", time.Now().UnixNano())
+	principal := "alice-broker" + suffix + "@example.com"
+	other := "bob-broker" + suffix + "@example.com"
+	hour := time.Hour
+
+	id := func(name string) string { return name + suffix }
+	cleanup := func(ids ...string) {
+		for _, g := range ids {
+			db.ExecContext(ctx, `DELETE FROM authority_grants WHERE grant_id = $1`, g)
+			db.ExecContext(ctx, `DELETE FROM authority_heads WHERE grant_id = $1`, g)
+		}
+	}
+	ids := []string{id("live-a"), id("live-b"), id("reissued"), id("moved"), id("expired"), id("revoked"), id("other-p")}
+	defer cleanup(ids...)
+
+	issue := func(grantID, p string, caps []string, in time.Duration) {
+		t.Helper()
+		if _, err := store.IssueGrant(ctx, grantID, p, caps, time.Now().Add(in)); err != nil {
+			t.Fatalf("issue %s for %s: %v", grantID, p, err)
+		}
+	}
+	issue(id("live-a"), principal, []string{"cap.a"}, hour)
+	issue(id("live-b"), principal, []string{"cap.b"}, hour)
+	issue(id("reissued"), principal, []string{"cap.a"}, hour)
+	issue(id("reissued"), principal, []string{"cap.a", "cap.c"}, hour)
+	// Reissued away: the latest generation belongs to the other
+	// principal, so this principal's older row must not resurface.
+	issue(id("moved"), principal, []string{"cap.a"}, hour)
+	issue(id("moved"), other, []string{"cap.a"}, hour)
+	issue(id("expired"), principal, []string{"cap.a"}, -hour)
+	issue(id("revoked"), principal, []string{"cap.a"}, hour)
+	if err := store.RevokeGrant(ctx, id("revoked")); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	issue(id("other-p"), other, []string{"cap.a"}, hour)
+
+	grants, err := store.GrantsForPrincipal(ctx, principal)
+	if err != nil {
+		t.Fatalf("enumerate: %v", err)
+	}
+	byID := map[string]*capability.Grant{}
+	for _, g := range grants {
+		byID[g.ID] = g
+	}
+	for _, want := range []string{id("live-a"), id("live-b"), id("reissued")} {
+		if byID[want] == nil {
+			t.Errorf("expected %s among live grants, got %v", want, slices.Sorted(maps.Keys(byID)))
+		}
+	}
+	if g := byID[id("reissued")]; g != nil && g.Generation != 2 {
+		t.Errorf("superseded generation must not resurface: reissued gen=%d", g.Generation)
+	}
+	for _, deny := range []string{id("moved"), id("expired"), id("revoked"), id("other-p")} {
+		if byID[deny] != nil {
+			t.Errorf("%s must not be a live candidate for %s", deny, principal)
+		}
 	}
 }

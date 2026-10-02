@@ -30,6 +30,10 @@ func (h *MultiHandler) Execute(ctx context.Context, req Request, desc capability
 		return Response{
 			Status:      StatusFailed,
 			FailureCode: string(capability.FailureCapabilityUnavailable),
+			// No handler exists, so nothing ran: for every execution
+			// class the miss is provably no-effect — definitive, never
+			// UNKNOWN.
+			DefinitiveFailure: true,
 			Error: fmt.Sprintf("capability %s requires adapter %q, which is not configured in this deployment (reason=%s)",
 				desc.ID, desc.AdapterID, capability.FailureReasonAdapterNotConfigured),
 		}

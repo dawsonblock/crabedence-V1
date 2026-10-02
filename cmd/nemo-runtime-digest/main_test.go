@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -143,19 +145,39 @@ func writeManifestFile(t *testing.T, path string, manifest transferManifest) {
 	}
 }
 
-func declarationFor(t *testing.T, root string) transferManifest {
+// writeProvenanceDoc writes the in-tree provenance record carrying the
+// generated delta block for the declared sets — the same artifact production
+// writes before digesting, so the digest binds the doc that ships.
+func writeProvenanceDoc(t *testing.T, root string, declared transferManifest) {
 	t.Helper()
+	doc := "provenance\n\n" + renderDeltaBlock(declared) + "\n"
+	path := filepath.Join(root, provenanceDocName)
+	if err := os.WriteFile(path, []byte(doc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// declaredManifest writes the provenance doc for the declared sets, digests
+// the tree as it will stand (doc included), and fills the computed fields —
+// the same ordering updateManifest uses.
+func declaredManifest(t *testing.T, root string, declared transferManifest) transferManifest {
+	t.Helper()
+	writeProvenanceDoc(t, root, declared)
 	identity, err := digestRuntime(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return transferManifest{
-		Tree:              root,
-		RuntimeVersion:    identity.RuntimeVersion,
-		ShippedTreeSHA256: identity.NemoRuntimeSHA256,
-		FileCount:         identity.FileCount,
-		Excluded:          identity.Excluded,
-	}
+	declared.Tree = root
+	declared.RuntimeVersion = identity.RuntimeVersion
+	declared.ShippedTreeSHA256 = identity.NemoRuntimeSHA256
+	declared.FileCount = identity.FileCount
+	declared.Excluded = identity.Excluded
+	return declared
+}
+
+func declarationFor(t *testing.T, root string) transferManifest {
+	t.Helper()
+	return declaredManifest(t, root, transferManifest{})
 }
 
 func TestManifestVerificationAcceptsAMatchingDeclaration(t *testing.T) {
@@ -196,7 +218,7 @@ func TestManifestVerificationFailsClosedOnAMissingFile(t *testing.T) {
 func TestManifestUpdateRefreshesComputedFieldsAndKeepsTheInventory(t *testing.T) {
 	root := baseTree(t)
 	path := filepath.Join(t.TempDir(), "nemo-transfer-manifest.json")
-	writeManifestFile(t, path, transferManifest{
+	skeleton := transferManifest{
 		Tree:                  root,
 		RuntimeVersion:        "stale",
 		ShippedTreeSHA256:     "stale",
@@ -204,7 +226,11 @@ func TestManifestUpdateRefreshesComputedFieldsAndKeepsTheInventory(t *testing.T)
 		WorkspaceMembersAdded: []string{"bridges/nemo-crabedence"},
 		LocalModifications:    []string{"Cargo.toml"},
 		AddedPaths:            []string{"bridges/"},
-	})
+	}
+	writeManifestFile(t, path, skeleton)
+	// The tree carries the provenance record; update regenerates its block in
+	// place rather than creating the file.
+	writeProvenanceDoc(t, root, skeleton)
 
 	if err := updateManifest(path); err != nil {
 		t.Fatalf("update: %v", err)
@@ -246,12 +272,18 @@ func TestManifestSourceIsCheckedWhenPresent(t *testing.T) {
 		"Cargo.toml":          "[workspace.package]\nversion = \"1.2.3\"\n",
 		"crates/a/src/lib.rs": "pub fn a() { let _ = 1; }\n",
 	})
-	declaration := declarationFor(t, root)
-	declaration.Source = &manifestSource{
-		Path:      source,
-		FileCount: sourceIdentity.FileCount,
-		SHA256:    sourceIdentity.NemoRuntimeSHA256,
-	}
+	// The vendored tree modifies crates/a and drops crates/b; the complete
+	// delta must be declared.
+	declaration := declaredManifest(t, root, transferManifest{
+		Source: &manifestSource{
+			Path:      source,
+			FileCount: sourceIdentity.FileCount,
+			SHA256:    sourceIdentity.NemoRuntimeSHA256,
+		},
+		LocalModifications: []string{"crates/a/src/lib.rs"},
+		AddedPaths:         []string{"TRANSFER-PROVENANCE.md"},
+		RemovedPaths:       []string{"crates/b/src/lib.rs"},
+	})
 	path := filepath.Join(t.TempDir(), "nemo-transfer-manifest.json")
 	writeManifestFile(t, path, declaration)
 	if err := verifyManifest(path); err != nil {
@@ -271,10 +303,11 @@ func TestManifestInventoryMustMatchTheTree(t *testing.T) {
 		"crates/a/src/lib.rs":    "pub fn a() {}\n",
 		"bridges/one/Cargo.toml": "x\n",
 	})
-	declaration := declarationFor(t, root)
-	declaration.WorkspaceMembersAdded = []string{"bridges/one"}
-	declaration.LocalModifications = []string{"crates/a/src/lib.rs"}
-	declaration.AddedPaths = []string{"bridges/"}
+	declaration := declaredManifest(t, root, transferManifest{
+		WorkspaceMembersAdded: []string{"bridges/one"},
+		LocalModifications:    []string{"crates/a/src/lib.rs"},
+		AddedPaths:            []string{"bridges/", "TRANSFER-PROVENANCE.md"},
+	})
 	path := filepath.Join(t.TempDir(), "nemo-transfer-manifest.json")
 	writeManifestFile(t, path, declaration)
 	if err := verifyManifest(path); err != nil {
@@ -383,5 +416,259 @@ func TestManifestSourceAbsenceIsReportedNotFailed(t *testing.T) {
 	writeManifestFile(t, path, declaration)
 	if err := verifyManifest(path); err != nil {
 		t.Fatalf("an absent source tree must not fail verification: %v", err)
+	}
+}
+
+// transferredPair builds the shape the real transfer has: a vendored tree
+// that modifies one source file, adds a subtree, and removes one source
+// file.
+func transferredPair(t *testing.T) (source, vendored string) {
+	source = writeTree(t, map[string]string{
+		"Cargo.toml":          "[workspace.package]\nversion = \"1.2.3\"\n",
+		"crates/a/src/lib.rs": "pub fn a() {}\n",
+		"crates/b/src/lib.rs": "pub fn b() {}\n",
+		"docs/old.md":         "retired\n",
+	})
+	vendored = writeTree(t, map[string]string{
+		"Cargo.toml":             "[workspace.package]\nversion = \"1.2.3\"\n",
+		"crates/a/src/lib.rs":    "pub fn a() { let _ = 1; }\n",
+		"crates/b/src/lib.rs":    "pub fn b() {}\n",
+		"bridges/x/src/lib.rs":   "pub fn x() {}\n",
+		"TRANSFER-PROVENANCE.md": "provenance\n",
+	})
+	return source, vendored
+}
+
+func declarationForPair(t *testing.T, source, vendored string, declared transferManifest) transferManifest {
+	t.Helper()
+	sourceIdentity, err := digestRuntime(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	declaration := declaredManifest(t, vendored, declared)
+	declaration.Source = &manifestSource{
+		Path:      source,
+		FileCount: sourceIdentity.FileCount,
+		SHA256:    sourceIdentity.NemoRuntimeSHA256,
+	}
+	return declaration
+}
+
+func TestDeltaVerificationAcceptsTheCompleteDeclaration(t *testing.T) {
+	source, vendored := transferredPair(t)
+	declaration := declarationForPair(t, source, vendored, transferManifest{
+		LocalModifications: []string{"crates/a/src/lib.rs"},
+		AddedPaths:         []string{"bridges/", "TRANSFER-PROVENANCE.md"},
+		RemovedPaths:       []string{"docs/old.md"},
+	})
+	path := filepath.Join(t.TempDir(), "nemo-transfer-manifest.json")
+	writeManifestFile(t, path, declaration)
+	if err := verifyManifest(path); err != nil {
+		t.Fatalf("the complete declaration must verify: %v", err)
+	}
+}
+
+func TestDeltaVerificationRejectsAnIncompleteDeclaration(t *testing.T) {
+	source, vendored := transferredPair(t)
+	cases := []struct {
+		name    string
+		declare func(*transferManifest)
+		wantErr string
+	}{
+		{
+			name: "undeclared modification",
+			declare: func(m *transferManifest) {
+				m.LocalModifications = nil
+				m.AddedPaths = []string{"bridges/", "TRANSFER-PROVENANCE.md"}
+				m.RemovedPaths = []string{"docs/old.md"}
+			},
+			wantErr: "undeclared modification: crates/a/src/lib.rs",
+		},
+		{
+			name: "stale modification declaration",
+			declare: func(m *transferManifest) {
+				m.LocalModifications = []string{"crates/a/src/lib.rs", "crates/b/src/lib.rs"}
+				m.AddedPaths = []string{"bridges/", "TRANSFER-PROVENANCE.md"}
+				m.RemovedPaths = []string{"docs/old.md"}
+			},
+			wantErr: "declared modification crates/b/src/lib.rs is identical to the source",
+		},
+		{
+			name: "undeclared addition",
+			declare: func(m *transferManifest) {
+				m.LocalModifications = []string{"crates/a/src/lib.rs"}
+				m.AddedPaths = []string{"TRANSFER-PROVENANCE.md"}
+				m.RemovedPaths = []string{"docs/old.md"}
+			},
+			wantErr: "undeclared addition: bridges/x/src/lib.rs",
+		},
+		{
+			// A declared directory prefix that exists in both trees covers
+			// nothing that was actually added.
+			name: "stale added-path declaration",
+			declare: func(m *transferManifest) {
+				m.LocalModifications = []string{"crates/a/src/lib.rs"}
+				m.AddedPaths = []string{"bridges/", "TRANSFER-PROVENANCE.md", "crates/"}
+				m.RemovedPaths = []string{"docs/old.md"}
+			},
+			wantErr: "declared added path crates/ covers no actual addition",
+		},
+		{
+			name: "undeclared removal",
+			declare: func(m *transferManifest) {
+				m.LocalModifications = []string{"crates/a/src/lib.rs"}
+				m.AddedPaths = []string{"bridges/", "TRANSFER-PROVENANCE.md"}
+				m.RemovedPaths = nil
+			},
+			wantErr: "undeclared removal: docs/old.md",
+		},
+		{
+			name: "stale removal declaration",
+			declare: func(m *transferManifest) {
+				m.LocalModifications = []string{"crates/a/src/lib.rs"}
+				m.AddedPaths = []string{"bridges/", "TRANSFER-PROVENANCE.md"}
+				m.RemovedPaths = []string{"docs/old.md", "crates/b/src/lib.rs"}
+			},
+			wantErr: "declared removed path crates/b/src/lib.rs still exists in the source",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var declared transferManifest
+			tc.declare(&declared)
+			declaration := declarationForPair(t, source, vendored, declared)
+			path := filepath.Join(t.TempDir(), "nemo-transfer-manifest.json")
+			writeManifestFile(t, path, declaration)
+			err := verifyManifest(path)
+			if err == nil {
+				t.Fatal("an incomplete declaration must fail verification")
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error = %q, want substring %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestDeltaSeesSymlinkDrift(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation needs privileges on Windows")
+	}
+	source, vendored := transferredPair(t)
+	link := filepath.Join(vendored, "crates", "a", "src", "LINK")
+	if err := os.Symlink("original-target", link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("original-target", filepath.Join(source, "crates", "a", "src", "LINK")); err != nil {
+		t.Fatal(err)
+	}
+
+	declaration := declarationForPair(t, source, vendored, transferManifest{
+		LocalModifications: []string{"crates/a/src/lib.rs"},
+		AddedPaths:         []string{"bridges/", "TRANSFER-PROVENANCE.md"},
+		RemovedPaths:       []string{"docs/old.md"},
+	})
+	path := filepath.Join(t.TempDir(), "nemo-transfer-manifest.json")
+	writeManifestFile(t, path, declaration)
+	if err := verifyManifest(path); err != nil {
+		t.Fatalf("identical symlinks must verify: %v", err)
+	}
+
+	// The file digest never sees a link's target; the delta must.
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("retargeted", link); err != nil {
+		t.Fatal(err)
+	}
+	err := verifyManifest(path)
+	if err == nil {
+		t.Fatal("a retargeted symlink is a modification and must fail undeclared")
+	}
+	if !strings.Contains(err.Error(), "undeclared modification: crates/a/src/LINK") {
+		t.Fatalf("error = %q, want the retargeted link named", err)
+	}
+}
+
+func TestManifestUpdateRegeneratesTheDeltaInventory(t *testing.T) {
+	source, vendored := transferredPair(t)
+	// Stale inventory: names the wrong modification, misses the additions and
+	// the removal entirely.
+	declaration := declarationForPair(t, source, vendored, transferManifest{
+		LocalModifications: []string{"Cargo.toml"},
+		AddedPaths:         []string{"not-present/"},
+	})
+	path := filepath.Join(t.TempDir(), "nemo-transfer-manifest.json")
+	writeManifestFile(t, path, declaration)
+
+	if err := updateManifest(path); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	updated, err := readManifest(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(updated.LocalModifications, []string{"crates/a/src/lib.rs"}) {
+		t.Fatalf("update must regenerate the modification set: %v", updated.LocalModifications)
+	}
+	for _, want := range []string{"TRANSFER-PROVENANCE.md", "bridges/x/src/lib.rs"} {
+		if !slices.Contains(updated.AddedPaths, want) {
+			t.Fatalf("update must declare the addition %s: %v", want, updated.AddedPaths)
+		}
+	}
+	if slices.Contains(updated.AddedPaths, "not-present/") {
+		t.Fatal("update must drop a declared path that covers no actual addition")
+	}
+	if !slices.Equal(updated.RemovedPaths, []string{"docs/old.md"}) {
+		t.Fatalf("update must regenerate the removal set: %v", updated.RemovedPaths)
+	}
+	if err := verifyManifest(path); err != nil {
+		t.Fatalf("a regenerated manifest must verify: %v", err)
+	}
+}
+
+func TestProvenanceDocDriftFailsVerification(t *testing.T) {
+	source, vendored := transferredPair(t)
+	declaration := declarationForPair(t, source, vendored, transferManifest{
+		LocalModifications: []string{"crates/a/src/lib.rs"},
+		AddedPaths:         []string{"bridges/", "TRANSFER-PROVENANCE.md"},
+		RemovedPaths:       []string{"docs/old.md"},
+	})
+	path := filepath.Join(t.TempDir(), "nemo-transfer-manifest.json")
+	writeManifestFile(t, path, declaration)
+	if err := verifyManifest(path); err != nil {
+		t.Fatalf("the doc generated for this declaration must verify: %v", err)
+	}
+
+	// A declared set that drifted from the doc's generated block is a stale
+	// record even though the tree digest still matches — the doc and manifest
+	// disagree about what shipped.
+	declaration.LocalModifications = []string{"crates/a/src/lib.rs", "crates/b/src/lib.rs"}
+	writeManifestFile(t, path, declaration)
+	err := verifyManifest(path)
+	if err == nil {
+		t.Fatal("a doc block that disagrees with the manifest must fail verification")
+	}
+	if !strings.Contains(err.Error(), "TRANSFER-PROVENANCE.md is stale") {
+		t.Fatalf("error = %q, want the stale-record failure named", err)
+	}
+
+	// Hand-editing the generated block is the same class of drift: the block
+	// no longer renders the declared sets.
+	writeManifestFile(t, path, declarationForPair(t, source, vendored, transferManifest{
+		LocalModifications: []string{"crates/a/src/lib.rs"},
+		AddedPaths:         []string{"bridges/", "TRANSFER-PROVENANCE.md"},
+		RemovedPaths:       []string{"docs/old.md"},
+	}))
+	docPath := filepath.Join(vendored, provenanceDocName)
+	doc, err := os.ReadFile(docPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(docPath, append(doc, []byte("hand-edited\n")...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyManifest(path); err == nil {
+		t.Fatal("a hand-edited tree must fail verification")
 	}
 }

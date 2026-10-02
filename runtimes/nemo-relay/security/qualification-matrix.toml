@@ -375,6 +375,24 @@ enforced_by = [
 note = "The macOS CI lane builds Hardened Runtime bundles and runs a strict-variant test that refuses a plugin with a different Team ID, followed by a third-party-variant test that completes authenticated transfer, staged digest verification, native load and a real registration. The supervisor derives the staged path from kernel-minted session and artifact IDs, walks without following symlinks, rechecks the approved SHA-256 and removes only com.apple.quarantine by file descriptor. The restricted loader loads this container-owned file in place and rechecks its digest after dlopen. The sandbox probe separately confirms filesystem and network denials. CI uses ad hoc identities; same-Team-ID production loading requires Developer ID qualification."
 
 [[claim]]
+id = "restricted-linux-load-completes-inside-namespaces"
+statement = "A restricted-linux host confines itself with user, mount, network, IPC, UTS and PID namespaces plus Landlock and seccomp before any plugin bytes load, completes the authenticated artifact transfer inside that boundary, verifies the staged copy and executes a real registration in a process separate from the kernel."
+status = "enforced"
+enforced_by = [
+  { rust_test = "a_restricted_linux_host_loads_only_the_transferred_approved_copy" },
+]
+note = "The test spawns the real host binary under the restricted-linux policy: the child enters the namespace sandbox, applies Landlock and seccomp, builds its kernel channel on the descriptor the supervisor connected and inherited, then completes handshake, staged transfer, digest verification, load and a registration. On a kernel that cannot create unprivileged user namespaces a development run reports the unmet requirement and skips rather than run unconfined; on the designated linux-amd64 CI lane the suite runs with NEMO_RELAY_REQUIRE_RESTRICTED_LINUX=1, which converts an unmet requirement into a failure, so this claim is proven by execution there and cannot pass on a skip. The separate fail-closed claim below covers the kernel that cannot confine."
+
+[[claim]]
+id = "restricted-linux-fails-closed-when-the-kernel-cannot-confine"
+statement = "A deployment that selects restricted-linux on a host whose kernel cannot deliver the confinement gets a refusal that names the missing requirement, never a host running unconfined."
+status = "enforced"
+enforced_by = [
+  { rust_test = "a_restricted_linux_policy_refuses_a_host_that_cannot_probe" },
+]
+note = "The requirement check runs the host binary's confinement probe — it enters the namespaces, applies Landlock and seccomp, and proves the denials in self_check before acking. A binary that cannot produce the acknowledgement fails the launch. The probe's syscall pass iterates every entry in BLOCKED_SYSCALLS and requires the boundary's own EPERM — a call that succeeded or failed for an incidental reason proves nothing — so the escape surface (execve, ptrace, setns, unshare, the mount family, bpf, perf, keyrings, module load, io_uring, process-vm access, the addressed-socket sends and the rest) is probed as blocked rather than merely listed. The filesystem pass requires reads and writes outside the Landlock allow-list to refuse, including the credential paths (/etc/shadow, /root, /home) and writes into the read-only system tree; a mounted /proc may show only the namespace's own init. The probe also proves connect() is dead in both directions (inside and outside the Landlock allow-list) and that sendto with a destination is refused while the filter must still read the argument, because Landlock does not mediate filesystem unix-socket connects on every kernel — the approved kernel channel arrives pre-connected on an inherited descriptor instead. Finally the probe asserts the boundary's own flags survived: not dumpable, no_new_privs set, and an empty capability bounding set."
+
+[[claim]]
 id = "every-hosting-consumer-carries-its-own-host"
 statement = "Every consumer that hosts plugins ships the host in the artifact that carries the binding, so a deployment never looks for one."
 status = "unverified"
@@ -384,3 +402,24 @@ terms = [
   "every consumer",
 ]
 note = "The Python wheel, the Node platform package and the CLI wheel each carry the host and each resolves it from its own installation. What is missing is the FFI: the Go binding crosses the C ABI and has no packaging step of its own, so a Go deployment names a host in `NEMO_RELAY_PLUGIN_HOST` or has one beside its process — which is a search of exactly the kind this row exists to remove."
+
+[[claim]]
+id = "an-ambient-plugin-host-override-is-pinned-or-acknowledged"
+statement = "A NEMO_RELAY_PLUGIN_HOST override names a path, and a path identifies content only while something binds it: the composition refuses an override whose bytes nothing pins — a release's component manifest, or NEMO_RELAY_PLUGIN_HOST_SHA256 — unless NEMO_RELAY_PLUGIN_HOST_ALLOW_UNPINNED=1 acknowledges the unverified host as a development deployment."
+status = "enforced"
+enforced_by = [
+  { rust_test = "an_unpinned_ambient_override_is_refused" },
+  { rust_test = "a_pinned_ambient_override_needs_no_acknowledgement" },
+  { rust_test = "no_override_never_needs_a_pin_or_an_acknowledgement" },
+]
+note = "The gate lives in the nemo-crabedence-runtime composition's prepare_host, ahead of resolution, so it applies to every isolation policy. The acknowledgement spelling is exactly '1' — 'true', 'yes' and empty values do not discharge it — and the release-manifest pin and the direct NEMO_RELAY_PLUGIN_HOST_SHA256 pin both satisfy it without the flag, so a qualified deployment never needs the development escape hatch. The composing repository's scripts/test-nemo-runtime-e2e.sh exercises the refusal against the real binaries."
+
+[[claim]]
+id = "a-confinement-required-plugin-cannot-run-unconfined"
+statement = "A plugin artifact that declares [security] requires_confinement refuses a host policy that does not confine resources: the declaration travels inside the approved manifest's digest, so a deployment offering trusted-process fails the session rather than silently downgrading a third-party artifact when sandboxing is unavailable."
+status = "enforced"
+enforced_by = [
+  { rust_test = "a_confinement_required_plugin_refuses_a_non_confining_policy" },
+  { rust_test = "manifest_security_requires_confinement_defaults_off_and_parses_on" },
+]
+note = "The check runs in open() before a host starts, on the manifest parsed from the same read that produced the approval digests — plugin_artifact_details returns both so a requirement can never describe different bytes than the approval covered. The composition reports the resolved policy, whether it confines, and whether the artifact required confinement as session evidence. scripts/test-nemo-runtime-e2e.sh exercises the refusal end to end: the fixture manifest with requires_confinement fails under an explicitly trusted-process deployment and names the declaration."

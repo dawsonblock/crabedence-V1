@@ -16,14 +16,17 @@ planner (untrusted)
 execution service (crabbox serve-exec)
     │  1. registry lookup → descriptor.authority_policy
     │  2. grant required?  ── no ──▶ grant-free admission
-    │                      └ yes ──▶ resolver.Resolve(ref, principal)
+    │                      └ yes ──▶ ref present? ──▶ resolver.Resolve(ref, principal)
+    │                                  └ absent ──▶ brokered resolution
+    │                                   (peer-authenticated requests only)
     │  3. bind generation + grant digest (server-assigned)
     ▼
 EffectStore.AcquireWithAuthority(…, AuthorityBinding{Ref, Generation, Digest}, …)
 ```
 
-The planner supplies an identity (`principal`) and an opaque reference
-(`authority_ref`). It never supplies policy, generation, or digest.
+The planner supplies an identity (`principal`) and, optionally, an
+opaque reference (`authority_ref`). It never supplies policy,
+generation, or digest.
 
 ## `authority_ref` is bearer authority
 
@@ -37,12 +40,37 @@ Two controls carry the trust boundary:
 
 - References are credentials. Issued grant IDs carry 96 bits of random
   entropy, and references must never appear in logs, receipts,
-  metrics, or error text.
+  metrics, error text, or **process arguments** — argv is readable by
+  every account on the host. The runtime and CLI accept no grant flag;
+  when a specific grant must be named it arrives through the
+  `CRABEDENCE_AUTHORITY_REF` environment variable, which is readable by
+  the same account only.
 - The transport boundary restricts presentation — a `0600` Unix socket
   today. Deployments can additionally authenticate the principal
   itself: `CRABEDENCE_PEER_PRINCIPALS` maps Unix peer UIDs
   (`SO_PEERCRED`/`LOCAL_PEERCRED`) to principals, and the claim must
   match the mapping — see *Peer authentication* below.
+
+## Brokered authority resolution
+
+A grant-required request may carry **no** `authority_ref` at all. The
+request then asks the service to broker the principal's authority: the
+authority store enumerates the principal's live grants and admits the
+request iff **exactly one** of them covers the capability and its
+resource constraints:
+
+- no admitting grant → `UNAUTHORIZED`;
+- more than one admitting grant → `UNAUTHORIZED` (ambiguous — the
+  caller must name one through `CRABEDENCE_AUTHORITY_REF`);
+- exactly one → admitted, and the resolved grant's ID, generation, and
+  digest are bound into the request as if the caller had named it.
+
+Brokering is only as strong as the principal's authentication, so the
+service reaches this path only after peer authentication has
+established who is asking. Under the bearer model a reference-less
+grant-required request is `UNAUTHORIZED` — otherwise anyone who could
+reach the socket could claim a principal and learn which grants exist
+for it.
 
 ## Peer authentication (required in production, optional elsewhere)
 
@@ -56,7 +84,12 @@ admission:
   disagrees with the mapping is denied before admission;
 - a `uid:*` entry marks a trusted local caller that may claim any
   principal (e.g. an orchestrator that proxies authenticated
-  principals upstream);
+  principals upstream). Claiming arbitrary principals is a different
+  order of privilege than authenticating as one, so it is separately
+  declared: a wildcard is honored only when the UID also appears in
+  `CRABEDENCE_TRUSTED_PROXY_UIDS`. Production requires the declaration;
+  in any mode a declared list is authoritative — a wildcard it does
+  not cover refuses startup;
 - on success the authenticated principal **replaces** the claim for
   admission, grant resolution, and the durable execution identity.
 
@@ -125,7 +158,8 @@ decides whether authority material is required:
 |---|---|---|
 | `false` | absent | Admitted grant-free. No generation/digest binding (zero values mean unversioned authority). |
 | `false` | present | Ignored by policy — grant-free capabilities never resolve or bind a grant. |
-| `true` | absent | `UNAUTHORIZED` — `missing grant_id`. |
+| `true` | absent, peer-authenticated | Brokered resolution: exactly one live grant covering the capability and constraints admits; zero or ambiguous candidates are `UNAUTHORIZED`. |
+| `true` | absent, unauthenticated principal | `UNAUTHORIZED` — brokering requires peer authentication. |
 | `true` | present, resolves, valid | Admitted; generation + digest bound into the execution identity. |
 | `true` | present, not found / revoked / expired / wrong principal / wrong capability / outside resource constraints | `UNAUTHORIZED`; the resolver's reason is recorded, never the material. |
 
@@ -163,6 +197,7 @@ idempotency key.
 | Grant-free capabilities never require or bind authority | `AuthorityPolicy.GrantRequired` | `internal/capability/admission` tests, `internal/execution/e2e_test.go` |
 | Authority metrics never expose material | `internal/authority/metrics.go` (counters only) | `metrics_test.go` |
 | With `CRABEDENCE_PEER_PRINCIPALS` set, an unmapped UID or a principal claim that disagrees with the kernel-authenticated mapping is denied before admission | `PeerPrincipalMap` + `SO_PEERCRED`/`LOCAL_PEERCRED` | `internal/execution/peer_auth_test.go`, `qualification_deployed_test.go` |
+| A reference-less request brokers exactly one live grant, binds it into the record, and never exists without peer authentication | `PrincipalGrantResolver` + the service's peer-auth gate | `internal/capability/registry_test.go`, `internal/authority/sqlite_test.go`, `internal/execution/authority_binding_test.go` |
 
 The metrics surface (`authority_grants_issued_total`,
 `authority_generations_revoked_total`, `authority_grants_revoked_total`,
