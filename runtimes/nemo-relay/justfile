@@ -1649,9 +1649,9 @@ test-go:
     # installed host: this names the one the checkout builds. It is the same escape
     # hatch a source deployment uses, used here for the same reason — and an
     # activation without it still fails closed with the message that says where the
-    # host was looked for. The FFI is the one consumer with no packaging step of its
-    # own, so naming the host *is* how its deployments reach one, which is why the
-    # suite exercises that path rather than assuming an installed companion.
+    # host was looked for. The FFI also resolves a host beside its own library —
+    # the layout `just package-ffi` produces for a vendored deployment — and the
+    # suite exercises that resolution by unsetting this name as well.
     cargo build $flag -p nemo-relay-native-loader
     export NEMO_RELAY_PLUGIN_HOST="$lib_dir/nemo-plugin-host"
 
@@ -2327,6 +2327,35 @@ package-python-plugin:
     fi
     python_executable="$(project_python_executable)"
     "$python_executable" scripts/validate_python_plugin_package.py
+
+# Package the FFI library and its plugin host as one directory.
+#
+# The FFI is the one consumer with no installer of its own: a Go deployment
+# vendors this directory, and the library resolves the host from beside itself
+# rather than searching beside the process that happens to run. The pair in one
+# directory is what makes that resolution a deployment fact instead of a
+# build-machine coincidence.
+# --set [output_dir=<path>]
+package-ffi:
+    #!/usr/bin/env bash
+    {{ bash_helpers }}
+    output_dir="{{ output_dir }}"
+    cd "$NEMO_RELAY_REPO_ROOT"
+    cargo build --release -p nemo-relay-ffi -p nemo-relay-native-loader
+    library_name="libnemo_relay_ffi.so"
+    host_name="nemo-plugin-host"
+    case "$(uname -s)" in
+        Darwin) library_name="libnemo_relay_ffi.dylib" ;;
+        MINGW*|MSYS*|CYGWIN*)
+            library_name="nemo_relay_ffi.dll"
+            host_name="nemo-plugin-host.exe"
+            ;;
+    esac
+    package_dir="$(prepare_package_dir ffi)"
+    cp "target/release/$library_name" "$package_dir/$library_name"
+    cp "target/release/$host_name" "$package_dir/$host_name"
+    printf 'FFI artifact: %s\n' "$package_dir"
+    ls -l "$package_dir"
 
 # Package a prebuilt CLI binary and its plugin host for PyPI.
 package-cli-bin binary host_binary target version package_dir:

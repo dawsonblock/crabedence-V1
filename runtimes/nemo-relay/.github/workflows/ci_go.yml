@@ -97,3 +97,47 @@ jobs:
           flags: go-${{ matrix.platform }}
           name: go-${{ matrix.platform }}
           verbose: true
+
+  # The FFI artifact is the pair a Go deployment vendors: the shared library and
+  # the plugin host beside it, in the layout the library resolves without an
+  # environment variable. This lane proves the recipe still produces that pair.
+  Package:
+    name: Package FFI artifact (linux-amd64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Load CI tool versions
+        id: ci-config
+        uses: ./.github/actions/load-ci-tool-versions
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+          toolchain: ${{ steps.ci-config.outputs.rust_version }}
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: nemo-relay-rust-linux-amd64-${{ steps.ci-config.outputs.rust_version }}-release
+          workspaces: . -> target
+          cache-all-crates: true
+          cache-bin: false
+          save-if: false
+
+      - uses: taiki-e/install-action@c070f87102a1c75b3183910f391c1cb887fe13c8 # v2.77.6
+        with:
+          tool: just@${{ steps.ci-config.outputs.just_version }}
+
+      - name: Package the FFI artifact and check its layout
+        working-directory: ${{ env.NEMO_RELAY_CI_WORKSPACE }}
+        run: |
+          set -euo pipefail
+          just package-ffi
+          test -f target/packages/ffi/libnemo_relay_ffi.so
+          test -x target/packages/ffi/nemo-plugin-host

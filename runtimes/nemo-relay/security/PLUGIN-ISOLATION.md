@@ -73,7 +73,7 @@ section was written):
   supervisor compile only on Unix. Selecting a native plugin on Windows returns
   `PluginHostError::UnsupportedPlatform`. The Windows CI lane checks every
   workspace target and compiles every test without running native-plugin tests.
-- **Claims: 41 enforced, 3 asserted and not yet.** Every claim this document makes
+- **Claims: 43 enforced, 1 asserted and not yet.** Every claim this document makes
   is listed with what enforces it in `security/QUALIFICATION-MATRIX.md`, generated
   from `security/qualification-matrix.toml`, and `just qualification-matrix`
   resolves each name against the tree. A test that is renamed or deleted turns that
@@ -91,7 +91,7 @@ section was written):
   the runtime would never honor.
   A claim enforced by a recipe also names the workflow that invokes it, so deleting
   the CI step turns the row red instead of leaving a recipe that nothing runs. The
-  three claims that are asserted rather than enforced are named there, with why.
+  claim that is asserted rather than enforced is named there, with why.
 
 What is left of the kernel's `unsafe` is nothing to do with loading. The loader's
 288 occurrences — the ABI adapter's signatures and witnesses — and the SDK's 220 and
@@ -2509,8 +2509,10 @@ which is exactly when this has to be finished.
 carry the host — the Node platform package at `bin/nemo-plugin-host`, the CLI
 wheel and its release assets beside the CLI — and the Python wheel carries one
 too, so what remained of this list was the binding cutover itself, which has since
-happened: all four consumers compose the process backend. The FFI surface still
-has no packaging step of its own.)*
+happened: all four consumers compose the process backend. The FFI surface carries
+the host the same way since: `just package-ffi` stages the library and the host as
+one artifact, and the library resolves the companion beside itself rather than
+beside whichever process loaded it.)*
 
 **And the npm packages are checked the way the wheel is: by installing them.**
 `scripts/verify-installed-node-plugin.py` installs a built metapackage and

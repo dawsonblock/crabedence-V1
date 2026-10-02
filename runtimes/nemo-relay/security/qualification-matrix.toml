@@ -310,13 +310,14 @@ enforced_by = [
 [[claim]]
 id = "installed-artifact-qualification-covers-every-packaged-target"
 statement = "The installed-artifact check that drives a real plugin through an installed host runs on every platform that ships a plugin-hosting package, not only on Linux amd64."
-status = "unverified"
-terms = [
-  "every packaged target",
-  "every shipping platform",
-  "installed-artifact check",
+status = "enforced"
+enforced_by = [
+  { recipe = "verify-installed-python-plugin" },
+  { recipe = "verify-installed-node-plugin" },
+  { workflow = "verify-installed-python-plugin" },
+  { workflow = "verify-installed-node-plugin" },
 ]
-note = "The installed-artifact lanes run on Linux amd64: the Python wheel lane and the Node InstalledArtifact job each build a real fixture, install the package the build produced, and drive a plugin through the host that package installed. Linux arm64, the musllinux wheels, macOS arm64 and the Windows packages get package install, import and host-startup smoke coverage plus the source-level isolation tests, which is a different claim: a host that starts is not a host that loaded a plugin. Closing this means running the same two recipes on another runner, which is a matrix change rather than an architecture one."
+note = "Every platform whose package carries a plugin host now runs the check: the Node InstalledArtifact job covers linux amd64, linux arm64 and macOS arm64, and InstalledArtifactMusl covers both musl packages inside the alpine image they target; the Python side runs the same recipe against the linux arm64 and macOS arm64 wheels, and against both musllinux wheels inside the musllinux build image. The musl fixtures are built for the musl target on the runner and the verify scripts run under the container's own libc, because a musl addon cannot load under glibc. Windows ships no plugin-hosting package — the isolated runtime is not implemented there — so 'every packaged target' is every platform that carries a host."
 
 [[claim]]
 id = "a-confinement-this-build-cannot-deliver-is-refused"
@@ -405,13 +406,13 @@ enforced_by = [
 [[claim]]
 id = "every-hosting-consumer-carries-its-own-host"
 statement = "Every consumer that hosts plugins ships the host in the artifact that carries the binding, so a deployment never looks for one."
-status = "unverified"
-terms = [
-  "host resolution",
-  "carries the host",
-  "every consumer",
+status = "enforced"
+enforced_by = [
+  { recipe = "package-ffi" },
+  { workflow = "package-ffi" },
+  { rust_test = "the_anchor_resolves_to_a_directory_that_exists" },
 ]
-note = "The Python wheel, the Node platform package and the CLI wheel each carry the host and each resolves it from its own installation. What is missing is the FFI: the Go binding crosses the C ABI and has no packaging step of its own, so a Go deployment names a host in `NEMO_RELAY_PLUGIN_HOST` or has one beside its process — which is a search of exactly the kind this row exists to remove."
+note = "The Python wheel, the Node platform package and the CLI wheel each carry the host and each resolves it from its own installation. The FFI now does the same from the library's own directory: `package-ffi` stages the shared library and the host as one artifact, `dladdr` gives the library the file it was mapped from, and the Go lane proves the resolution by unsetting `NEMO_RELAY_PLUGIN_HOST` and hosting the fixture anyway. The override variable stays authoritative where a deployment names it; the beside-the-library answer only applies when nothing did."
 
 [[claim]]
 id = "an-ambient-plugin-host-override-is-pinned-or-acknowledged"
