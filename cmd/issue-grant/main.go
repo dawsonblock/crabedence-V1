@@ -18,7 +18,13 @@
 // Usage:
 //
 //	issue-grant --principal <id> --capability <id> [--capability <id>...] \
-//	  [--constraint <dimension=value>...] [--grant-id <id>] [--expires-at <RFC3339>]
+//	  [--constraint <dimension=value>...] [--unconstrained <dimension>...] \
+//	  [--grant-id <id>] [--expires-at <RFC3339>]
+//
+// Every resource dimension the requested capabilities declare must be
+// addressed exactly once: --constraint dimension=value binds it, and
+// --unconstrained dimension acknowledges deliberate wildcard scope. An omitted
+// dimension is a rejection — omission can never silently broaden authority.
 //
 // Prints the issued authority reference as JSON on stdout:
 //
@@ -45,6 +51,7 @@ import (
 
 	"github.com/openclaw/crabbox/internal/authority"
 	"github.com/openclaw/crabbox/internal/capability"
+	"github.com/openclaw/crabbox/internal/execution"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "modernc.org/sqlite"
@@ -76,7 +83,28 @@ func (c constraintList) Set(v string) error {
 	if !ok || dimension == "" || value == "" {
 		return fmt.Errorf("constraint must be dimension=value (e.g. repo=example-org/my-app)")
 	}
+	if value == "*" {
+		return fmt.Errorf("constraint value %q is wildcard shorthand; use --unconstrained %s to declare deliberate wildcard scope", value, dimension)
+	}
+	for _, existing := range c[dimension] {
+		if existing == value {
+			return fmt.Errorf("constraint %s=%s declared twice", dimension, value)
+		}
+	}
 	c[dimension] = append(c[dimension], value)
+	return nil
+}
+
+// dimensionList collects --unconstrained dimension flags: the issuer's
+// explicit acknowledgement that a declared dimension is deliberately wildcard.
+type dimensionList []string
+
+func (d *dimensionList) String() string { return fmt.Sprint([]string(*d)) }
+func (d *dimensionList) Set(v string) error {
+	if v == "" {
+		return fmt.Errorf("unconstrained dimension name must not be empty")
+	}
+	*d = append(*d, v)
 	return nil
 }
 
@@ -113,9 +141,11 @@ func loadConfig(argv []string, getenv func(string) string, stderr io.Writer) (co
 		expiresAt = fs.String("expires-at", "", "RFC3339 expiry; must be in the future (default: no expiry)")
 	)
 	var caps capabilityList
-	fs.Var(&caps, "capability", "capability id to authorize (repeatable, required)")
+	fs.Var(&caps, "capability", "capability id to authorize (repeatable, required; \"*\" authorizes every catalog capability)")
 	constraints := constraintList{}
 	fs.Var(constraints, "constraint", "resource constraint as dimension=value (repeatable; e.g. repo=example-org/my-app)")
+	var unconstrained dimensionList
+	fs.Var(&unconstrained, "unconstrained", "declare a resource dimension deliberately wildcard (repeatable; e.g. --unconstrained base)")
 	if err := fs.Parse(argv); err != nil {
 		return config{}, err
 	}
@@ -125,6 +155,19 @@ func loadConfig(argv []string, getenv func(string) string, stderr io.Writer) (co
 	}
 	if len(caps) == 0 {
 		return config{}, fmt.Errorf("at least one --capability is required")
+	}
+
+	// Issuance policy, evaluated against the resolved-descriptor catalog:
+	// every declared resource dimension must be addressed once — a constraint
+	// or an explicit --unconstrained acknowledgement. Omission is a
+	// rejection, so this check runs before any backend work.
+	catalog, err := execution.IssuanceCatalog()
+	if err != nil {
+		return config{}, fmt.Errorf("cannot build the issuance catalog: %v", err)
+	}
+	effectiveConstraints, err := catalog.ValidateIssuanceScope(caps, constraints, unconstrained)
+	if err != nil {
+		return config{}, err
 	}
 
 	dsn := getenv("CRABEDENCE_DATABASE_URL")
@@ -162,7 +205,7 @@ func loadConfig(argv []string, getenv func(string) string, stderr io.Writer) (co
 		grantID:     id,
 		principal:   *principal,
 		caps:        caps,
-		constraints: constraints,
+		constraints: effectiveConstraints,
 		expiresAt:   expiry,
 		dsn:         dsn,
 		sqlitePath:  sqlitePath,
@@ -174,7 +217,7 @@ func main() {
 	cfg, err := loadConfig(os.Args[1:], os.Getenv, os.Stderr)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "issue-grant: %v\n", err)
-		fmt.Fprintln(os.Stderr, "usage: issue-grant --principal <id> --capability <id> [--capability <id>...] [--constraint <dim=value>...] [--grant-id <id>] [--expires-at <RFC3339>]")
+		fmt.Fprintln(os.Stderr, "usage: issue-grant --principal <id> --capability <id> [--capability <id>...] [--constraint <dim=value>...] [--unconstrained <dim>...] [--grant-id <id>] [--expires-at <RFC3339>]")
 		os.Exit(2)
 	}
 
