@@ -186,14 +186,22 @@ impl Drop for StagedHost {
 /// when the platform provides it; the temporary directory is the fallback
 /// everywhere else.
 fn staging_root() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
+    staging_root_from(std::env::var_os("XDG_RUNTIME_DIR"))
+}
+
+fn staging_root_from(runtime_dir: Option<std::ffi::OsString>) -> PathBuf {
+    runtime_dir
         .map(PathBuf::from)
         .filter(|dir| dir.is_dir())
         .unwrap_or_else(std::env::temp_dir)
 }
 
 fn stage_host(source: &Path) -> Result<StagedHost, String> {
-    let dir = staging_root().join(format!("nemo-plugin-host-{}", Uuid::now_v7().simple()));
+    stage_host_under(source, &staging_root())
+}
+
+fn stage_host_under(source: &Path, root: &Path) -> Result<StagedHost, String> {
+    let dir = root.join(format!("nemo-plugin-host-{}", Uuid::now_v7().simple()));
     let executable = dir.join("nemo-plugin-host");
     let staged = (|| -> Result<(), String> {
         #[cfg(unix)]
@@ -949,5 +957,78 @@ mod tests {
                 "the error must name the variable a deployer can fix: {error}"
             );
         }
+    }
+
+    #[test]
+    fn staging_prefers_a_real_xdg_runtime_dir() {
+        // `XDG_RUNTIME_DIR` is the exec-capable, owner-private mount; a value
+        // that names a real directory must win over the temporary fallback.
+        let runtime_dir =
+            std::env::temp_dir().join(format!("nemo-xdg-runtime-{}", Uuid::now_v7().simple()));
+        std::fs::create_dir(&runtime_dir).expect("create the fake runtime dir");
+        assert_eq!(
+            staging_root_from(Some(runtime_dir.as_os_str().to_owned())),
+            runtime_dir
+        );
+        std::fs::remove_dir(&runtime_dir).expect("remove the fake runtime dir");
+    }
+
+    #[test]
+    fn staging_falls_back_when_xdg_is_absent_or_not_a_directory() {
+        let not_a_dir =
+            std::env::temp_dir().join(format!("nemo-xdg-missing-{}", Uuid::now_v7().simple()));
+        for value in [None, Some(not_a_dir.as_os_str().to_owned())] {
+            assert_eq!(staging_root_from(value), std::env::temp_dir());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_staged_host_is_private_read_only_and_removed_on_drop() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root =
+            std::env::temp_dir().join(format!("nemo-staging-root-{}", Uuid::now_v7().simple()));
+        std::fs::create_dir(&root).expect("create the staging root");
+        let source = root.join("source-host");
+        std::fs::write(&source, b"host-bytes").expect("write the source host");
+
+        let dir;
+        {
+            let staged = stage_host_under(&source, &root).expect("the host must stage");
+            dir = staged.dir.clone();
+            assert_eq!(
+                std::fs::read(&staged.executable).expect("read the staged host"),
+                b"host-bytes",
+                "the staged copy must carry the verified bytes"
+            );
+            assert_eq!(
+                staged
+                    .dir
+                    .metadata()
+                    .expect("dir metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700,
+                "the staging directory must be owner-private"
+            );
+            assert_eq!(
+                staged
+                    .executable
+                    .metadata()
+                    .expect("executable metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o500,
+                "the staged host must be read/execute, never writable"
+            );
+        }
+        assert!(
+            !dir.exists(),
+            "the staging directory must be removed with the staged host"
+        );
+        std::fs::remove_dir_all(&root).expect("remove the test root");
     }
 }
