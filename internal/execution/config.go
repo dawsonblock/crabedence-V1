@@ -70,7 +70,7 @@ func LoadServiceConfig(opts ServeOptions) (*ServiceConfig, error) {
 		production:       mode == "production",
 	}
 
-	topology, err := resolveTopology()
+	topology, err := resolveTopology(cfg.production)
 	if err != nil {
 		return nil, err
 	}

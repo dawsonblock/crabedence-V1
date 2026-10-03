@@ -9,75 +9,82 @@ package execution
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
-func TestProductionModeParsing(t *testing.T) {
+func TestDeploymentModeParsing(t *testing.T) {
 	t.Setenv("CRABBOX_MODE", "")
-	if productionMode() {
-		t.Fatal("unset CRABBOX_MODE must not be production")
+	if _, err := resolveDeploymentMode(); err == nil ||
+		!strings.Contains(err.Error(), "must be declared") {
+		t.Fatal("unset CRABBOX_MODE must fail closed, never assume a mode")
 	}
 	t.Setenv("CRABBOX_MODE", "development")
-	if productionMode() {
-		t.Fatal("development must not be production")
+	if mode, err := resolveDeploymentMode(); err != nil || mode != "development" {
+		t.Fatalf("development must resolve, got %q, %v", mode, err)
 	}
 	t.Setenv("CRABBOX_MODE", "production")
-	if !productionMode() {
-		t.Fatal("CRABBOX_MODE=production must be production")
+	if mode, err := resolveDeploymentMode(); err != nil || mode != "production" {
+		t.Fatalf("CRABBOX_MODE=production must resolve, got %q, %v", mode, err)
 	}
 	t.Setenv("CRABBOX_MODE", " Production ")
-	if !productionMode() {
-		t.Fatal("production parsing must be case/space-insensitive")
+	if mode, err := resolveDeploymentMode(); err != nil || mode != "production" {
+		t.Fatalf("production parsing must be case/space-insensitive, got %q, %v", mode, err)
+	}
+	t.Setenv("CRABBOX_MODE", "staging")
+	if _, err := resolveDeploymentMode(); err == nil ||
+		!strings.Contains(err.Error(), "unknown CRABBOX_MODE") {
+		t.Fatal("an unknown mode must fail closed, never map to a weaker one")
 	}
 }
 
 func TestEvidenceKeyPolicyDevelopmentAllowsGeneration(t *testing.T) {
-	t.Setenv("CRABBOX_MODE", "development")
-	t.Setenv("CRABBOX_REPLICAS", "")
 	// Missing env var path: development may fall back to a default
 	// host-local key path and generate it crash-durably.
-	if err := validateEvidenceKeyPolicy(TopologySingle, ""); err != nil {
+	cfg := &ServiceConfig{Topology: TopologySingle, Replicas: 1}
+	if err := validateEvidenceKeyPolicy(cfg); err != nil {
 		t.Fatalf("development must allow missing key path, got %v", err)
 	}
-	if err := validateEvidenceKeyPolicy(TopologySingle, filepath.Join(t.TempDir(), "does-not-exist.pem")); err != nil {
+	cfg.EvidenceKeyPath = filepath.Join(t.TempDir(), "does-not-exist.pem")
+	if err := validateEvidenceKeyPolicy(cfg); err != nil {
 		t.Fatalf("development must allow nonexistent key path, got %v", err)
 	}
 }
 
 func TestEvidenceKeyPolicyProductionRequiresProvisionedKey(t *testing.T) {
-	t.Setenv("CRABBOX_MODE", "production")
-	t.Setenv("CRABBOX_REPLICAS", "")
-	if err := validateEvidenceKeyPolicy(TopologySingle, ""); err == nil {
+	cfg := &ServiceConfig{Topology: TopologySingle, Replicas: 1, production: true}
+	if err := validateEvidenceKeyPolicy(cfg); err == nil {
 		t.Fatal("production must refuse a missing CRABBOX_EVIDENCE_KEY")
 	}
-	missing := filepath.Join(t.TempDir(), "no-such.pem")
-	if err := validateEvidenceKeyPolicy(TopologySingle, missing); err == nil {
+	cfg.EvidenceKeyPath = filepath.Join(t.TempDir(), "no-such.pem")
+	if err := validateEvidenceKeyPolicy(cfg); err == nil {
 		t.Fatal("production must refuse a nonexistent key file")
 	}
 	existing := filepath.Join(t.TempDir(), "key.pem")
 	if err := os.WriteFile(existing, []byte("k"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := validateEvidenceKeyPolicy(TopologySingle, existing); err != nil {
+	cfg.EvidenceKeyPath = existing
+	if err := validateEvidenceKeyPolicy(cfg); err != nil {
 		t.Fatalf("production must accept an existing provisioned key, got %v", err)
 	}
 }
 
 func TestEvidenceKeyPolicyReplicasRequireSharedKey(t *testing.T) {
-	t.Setenv("CRABBOX_MODE", "")
-	t.Setenv("CRABBOX_REPLICAS", "3")
-	if err := validateEvidenceKeyPolicy(TopologySingle, ""); err == nil {
+	cfg := &ServiceConfig{Topology: TopologySingle, Replicas: 3}
+	if err := validateEvidenceKeyPolicy(cfg); err == nil {
 		t.Fatal("multi-replica must refuse a missing CRABBOX_EVIDENCE_KEY")
 	}
-	missing := filepath.Join(t.TempDir(), "no-such.pem")
-	if err := validateEvidenceKeyPolicy(TopologySingle, missing); err == nil {
+	cfg.EvidenceKeyPath = filepath.Join(t.TempDir(), "no-such.pem")
+	if err := validateEvidenceKeyPolicy(cfg); err == nil {
 		t.Fatal("multi-replica must refuse a nonexistent key file")
 	}
 	existing := filepath.Join(t.TempDir(), "key.pem")
 	if err := os.WriteFile(existing, []byte("k"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := validateEvidenceKeyPolicy(TopologySingle, existing); err != nil {
+	cfg.EvidenceKeyPath = existing
+	if err := validateEvidenceKeyPolicy(cfg); err != nil {
 		t.Fatalf("multi-replica must accept an existing provisioned key, got %v", err)
 	}
 }
@@ -88,20 +95,20 @@ func TestEvidenceKeyPolicyReplicasRequireSharedKey(t *testing.T) {
 // host-local key would become a divergent cluster identity the moment a
 // second replica appears.
 func TestEvidenceKeyPolicyClusterRequiresProvisionedKey(t *testing.T) {
-	t.Setenv("CRABBOX_MODE", "")
-	t.Setenv("CRABBOX_REPLICAS", "")
-	if err := validateEvidenceKeyPolicy(TopologyCluster, ""); err == nil {
+	cfg := &ServiceConfig{Topology: TopologyCluster, Replicas: 1}
+	if err := validateEvidenceKeyPolicy(cfg); err == nil {
 		t.Fatal("cluster topology must refuse a missing CRABBOX_EVIDENCE_KEY")
 	}
-	missing := filepath.Join(t.TempDir(), "no-such.pem")
-	if err := validateEvidenceKeyPolicy(TopologyCluster, missing); err == nil {
+	cfg.EvidenceKeyPath = filepath.Join(t.TempDir(), "no-such.pem")
+	if err := validateEvidenceKeyPolicy(cfg); err == nil {
 		t.Fatal("cluster topology must refuse a nonexistent key file")
 	}
 	existing := filepath.Join(t.TempDir(), "key.pem")
 	if err := os.WriteFile(existing, []byte("k"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := validateEvidenceKeyPolicy(TopologyCluster, existing); err != nil {
+	cfg.EvidenceKeyPath = existing
+	if err := validateEvidenceKeyPolicy(cfg); err != nil {
 		t.Fatalf("cluster topology must accept an existing provisioned key, got %v", err)
 	}
 }

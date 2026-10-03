@@ -27,11 +27,13 @@ const insecureTestProviderOriginEnv = "CRABBOX_ALLOW_INSECURE_TEST_PROVIDER_ORIG
 
 // githubOriginOptions resolves the origin policy the deployment may
 // use. Production admits HTTPS origins only; development additionally
-// admits plaintext loopback under the explicit test exception.
-func githubOriginOptions() (providertransport.OriginOptions, error) {
+// admits plaintext loopback under the explicit test exception. The
+// deployment mode is the validated startup snapshot's, not a re-read
+// of the process environment.
+func githubOriginOptions(production bool) (providertransport.OriginOptions, error) {
 	insecure := strings.EqualFold(strings.TrimSpace(os.Getenv(insecureTestProviderOriginEnv)), "true") ||
 		strings.TrimSpace(os.Getenv(insecureTestProviderOriginEnv)) == "1"
-	if insecure && productionMode() {
+	if insecure && production {
 		return providertransport.OriginOptions{}, fmt.Errorf(
 			"%s permits plaintext provider origins and is unavailable in production mode", insecureTestProviderOriginEnv)
 	}
@@ -60,7 +62,7 @@ func newGitHubTransport(baseURL, token string) (*providertransport.Transport, er
 // exception (refused in production), and the deployment token becomes
 // both the transport-owned credential and a DLP-protected value.
 func newGitHubTransportForService(cfg *ServiceConfig, audit providertransport.AuditSink) (*providertransport.Transport, error) {
-	opts, err := githubOriginOptions()
+	opts, err := githubOriginOptions(cfg.Production())
 	if err != nil {
 		return nil, err
 	}

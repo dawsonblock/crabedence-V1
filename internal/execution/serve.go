@@ -239,7 +239,7 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	var signer *evidence.Signer
 	if store != nil {
 		keyPath := cfg.EvidenceKeyPath
-		if err := validateEvidenceKeyPolicy(cfg.Topology, keyPath); err != nil {
+		if err := validateEvidenceKeyPolicy(cfg); err != nil {
 			return err
 		}
 		if keyPath == "" {
@@ -702,12 +702,14 @@ const (
 // resolveTopology parses CRABBOX_TOPOLOGY. Outside production an unset
 // value resolves to single; production must declare the topology
 // explicitly. CRABBOX_REPLICAS remains a declared replica count and a
-// consistency check — never the source of truth.
-func resolveTopology() (Topology, error) {
+// consistency check — never the source of truth. The deployment mode
+// arrives already resolved: configuration decided at load is held in the
+// ServiceConfig snapshot rather than re-read from the environment.
+func resolveTopology(production bool) (Topology, error) {
 	raw := strings.ToLower(strings.TrimSpace(os.Getenv("CRABBOX_TOPOLOGY")))
 	switch raw {
 	case "":
-		if productionMode() {
+		if production {
 			return "", fmt.Errorf("CRABBOX_TOPOLOGY must be explicitly declared in production (single or cluster): a missing topology is never assumed to mean one production replica")
 		}
 		return TopologySingle, nil
@@ -736,26 +738,6 @@ func replicaCount() (int, error) {
 	return n, nil
 }
 
-// replicatedDeployment reports whether the operator declared a
-// multi-replica topology via CRABBOX_REPLICAS > 1. Replicated mode
-// tightens evidence-key requirements — a cryptographic cluster
-// identity must never be accidentally host-local. A malformed
-// CRABBOX_REPLICAS counts as replicated here (fail closed); Serve
-// rejects it outright via replicaCount before this runs.
-func replicatedDeployment() bool {
-	n, err := replicaCount()
-	return err != nil || n > 1
-}
-
-// productionMode reports whether the operator declared production
-// via CRABBOX_MODE=production. Production forbids auto-generating a
-// signing identity — the trust root must be provisioned (mounted
-// Ed25519 key, KMS/HSM signer, or an explicitly configured secret),
-// never silently created per host.
-func productionMode() bool {
-	return strings.EqualFold(strings.TrimSpace(os.Getenv("CRABBOX_MODE")), "production")
-}
-
 // resolveDeploymentMode resolves CRABBOX_MODE at service startup. The
 // execution service is the consequential surface: every production
 // requirement — peer authentication, attestation, provisioned
@@ -781,9 +763,11 @@ func resolveDeploymentMode() (string, error) {
 // (CRABBOX_REPLICAS > 1), and production (CRABBOX_MODE=production).
 // All require CRABBOX_EVIDENCE_KEY to point at an existing provisioned
 // key; auto-creation remains available only in single-node development
-// mode.
-func validateEvidenceKeyPolicy(topology Topology, keyPath string) error {
-	if topology == TopologyCluster {
+// mode. Every input comes from the validated startup snapshot — the
+// environment is never re-read on the execution path.
+func validateEvidenceKeyPolicy(cfg *ServiceConfig) error {
+	keyPath := cfg.EvidenceKeyPath
+	if cfg.Topology == TopologyCluster {
 		if keyPath == "" {
 			return fmt.Errorf("cluster topology (CRABBOX_TOPOLOGY=cluster) requires CRABBOX_EVIDENCE_KEY pointing to a provisioned key shared across replicas")
 		}
@@ -792,16 +776,16 @@ func validateEvidenceKeyPolicy(topology Topology, keyPath string) error {
 		}
 		return nil
 	}
-	if replicatedDeployment() {
+	if cfg.Replicas > 1 {
 		if keyPath == "" {
-			return fmt.Errorf("multi-replica deployment (CRABBOX_REPLICAS=%s) requires CRABBOX_EVIDENCE_KEY pointing to a provisioned key shared across replicas", os.Getenv("CRABBOX_REPLICAS"))
+			return fmt.Errorf("multi-replica deployment (CRABBOX_REPLICAS=%d) requires CRABBOX_EVIDENCE_KEY pointing to a provisioned key shared across replicas", cfg.Replicas)
 		}
 		if _, err := os.Stat(keyPath); err != nil {
 			return fmt.Errorf("multi-replica deployment requires an existing evidence key at CRABBOX_EVIDENCE_KEY=%s (key auto-creation is disabled for replicas): %w", keyPath, err)
 		}
 		return nil
 	}
-	if productionMode() {
+	if cfg.Production() {
 		if keyPath == "" {
 			return fmt.Errorf("production mode (CRABBOX_MODE=production) requires CRABBOX_EVIDENCE_KEY pointing to a provisioned signing key — key auto-generation is development-only")
 		}
