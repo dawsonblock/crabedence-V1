@@ -19,6 +19,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=lib/release-paths.sh
+. "$REPO_ROOT/scripts/lib/release-paths.sh"
 MANIFEST="${1:-$REPO_ROOT/release-evidence/source-tree-sha256.txt}"
 ROOT="${2:-$REPO_ROOT}"
 
@@ -41,6 +43,11 @@ trap 'rm -f "$manifest_paths_file"' EXIT
 while read -r mode type sha path; do
   if [ -z "$mode" ] || [ -z "$path" ]; then
     echo "MALFORMED: ${mode:-<empty>} ${type:-} ${sha:-} ${path:-}"
+    malformed=$((malformed + 1))
+    continue
+  fi
+  if ! release_path_check "$path"; then
+    printf 'POLICY: %s is not a release-path-legal name\n' "$path"
     malformed=$((malformed + 1))
     continue
   fi
@@ -98,12 +105,27 @@ done < "$MANIFEST"
 source_paths_file="$(mktemp)"
 trap 'rm -f "$manifest_paths_file" "$source_paths_file"' EXIT
 
+# All three enumerations emit NUL records and validate each name against
+# the release-path policy: a tree holding a name the toolchain cannot
+# carry byte-for-byte fails here rather than passing a mangled record.
+collect_source_paths() {
+  local f
+  while IFS= read -r -d '' f; do
+    f="${f#./}"
+    if ! release_path_check "$f"; then
+      printf 'POLICY: %s is not a release-path-legal name\n' "$f" >&2
+      return 1
+    fi
+    printf '%s\n' "$f"
+  done | LC_ALL=C sort
+}
+
 GIT_TOP="$(git -C "$ROOT" rev-parse --show-toplevel 2>/dev/null || true)"
 if [ "$GIT_TOP" = "$(cd "$ROOT" && pwd -P)" ]; then
   # The packaged set is the Git HEAD tree, exactly as the generator derived it.
   git -C "$ROOT" ls-tree -r -z HEAD | while IFS= read -r -d '' record; do
-    printf '%s\n' "${record#*$'\t'}"
-  done | LC_ALL=C sort > "$source_paths_file"
+    printf '%s\0' "${record#*$'\t'}"
+  done | collect_source_paths > "$source_paths_file"
 elif [ -n "$GIT_TOP" ]; then
   # ROOT sits inside a repository (nested checkout). The manifest derives
   # from tracked source, so enumerate the tracked set under ROOT through
@@ -111,13 +133,13 @@ elif [ -n "$GIT_TOP" ]; then
   # caller's clean-tree gate keeps index == HEAD.
   (
     cd "$ROOT"
-    git ls-files -z -- . | tr '\0' '\n' | LC_ALL=C sort
-  ) > "$source_paths_file"
+    git ls-files -z -- .
+  ) | collect_source_paths > "$source_paths_file"
 else
   (
     cd "$ROOT"
-    find . \( -type f -o -type l \) | sed 's|^\./||' | LC_ALL=C sort
-  ) > "$source_paths_file"
+    find . \( -type f -o -type l \) -print0
+  ) | collect_source_paths > "$source_paths_file"
 fi
 
 while IFS= read -r src_file; do

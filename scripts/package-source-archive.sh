@@ -36,6 +36,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=lib/release-paths.sh
+. "$ROOT/scripts/lib/release-paths.sh"
 cd "$ROOT"
 
 FORMAT="tar.gz"
@@ -63,7 +65,7 @@ esac
 # Tracked-file modifications change the packaged bytes without changing
 # the path list — refuse by default so a release cannot quietly ship a
 # tree that differs from HEAD. Untracked files are never packaged.
-if [ -n "$(git diff --name-only HEAD)" ] && [ "$ALLOW_DIRTY" -eq 0 ]; then
+if [ "$ALLOW_DIRTY" -eq 0 ] && ! git diff --quiet HEAD; then
   echo "package-source-archive: tracked files differ from HEAD — commit first (or pass --allow-dirty for gate development)" >&2
   git diff --name-only HEAD | sed 's/^/  modified: /' >&2
   exit 1
@@ -110,37 +112,77 @@ trap 'rm -rf -- "$work"' EXIT
 # represented by the release commit, and packaging fails before an
 # archive is created when even one is not. The uncovered path is
 # reported, never silently added.
-list="$work/files.txt"
-git ls-tree -r --name-only HEAD | LC_ALL=C sort -u > "$list"
+# Path enumeration is NUL-delimited end to end: Git's -z forms carry
+# filenames verbatim, so no path can be split, option-parsed, or dropped
+# by a line-oriented step. The release-path policy (scripts/lib/
+# release-paths.sh) additionally rejects names that could not survive
+# the archive/manifest toolchain byte-for-byte — control characters,
+# backslashes, "-"-leading and whitespace-edged components — before
+# anything is packaged.
+list="$work/files.bin"
+git ls-tree -r -z HEAD | while IFS= read -r -d '' record; do
+  p="${record#*$'\t'}"
+  if ! release_path_check "$p"; then
+    printf 'package-source-archive: release path policy violation: %q\n' "$p" >&2
+    exit 1
+  fi
+  printf '%s\0' "$p"
+done > "$list"
 if [ -d runtimes/nemo-relay ] && [ -f runtimes/nemo-provenance-policy.json ]; then
-  prov="$work/provenance.txt"
+  prov="$work/provenance.bin"
   # NEMO_RUNTIME_DIGEST_BIN may name a prebuilt digest binary (CI and
   # the packaging tests use it to run the real enumerator without a
   # `go run` rebuild); the default builds the tool from this tree.
   digest_list() {
     if [ -n "${NEMO_RUNTIME_DIGEST_BIN:-}" ]; then
       "$NEMO_RUNTIME_DIGEST_BIN" -root runtimes/nemo-relay \
-        -policy runtimes/nemo-provenance-policy.json -list
+        -policy runtimes/nemo-provenance-policy.json -list -z
     else
       go run ./cmd/nemo-runtime-digest -root runtimes/nemo-relay \
-        -policy runtimes/nemo-provenance-policy.json -list
+        -policy runtimes/nemo-provenance-policy.json -list -z
     fi
   }
-  digest_list | sed 's#^#runtimes/nemo-relay/#' | LC_ALL=C sort -u > "$prov"
-  untracked="$(comm -13 "$list" "$prov")"
-  if [ -n "$untracked" ]; then
-    printf '%s\n' "$untracked" \
-      | sed 's/^/package-source-archive: provenance-covered path is not tracked by release commit: /' >&2
+  digest_list | while IFS= read -r -d '' p; do
+    full="runtimes/nemo-relay/$p"
+    if ! release_path_check "$full"; then
+      printf 'package-source-archive: release path policy violation in provenance enumeration: %q\n' "$full" >&2
+      exit 1
+    fi
+    printf '%s\0' "$full"
+  done > "$prov"
+  # NUL-exact set membership: every provenance-covered object must be
+  # represented by the release commit. A miss is reported byte-verbatim
+  # and fails packaging; it is never silently added to the archive.
+  if ! python3 - "$list" "$prov" >&2 <<'PYEOF'
+import sys
+with open(sys.argv[1], "rb") as fh:
+    tracked = set(fh.read().split(b"\0"))
+missing = False
+with open(sys.argv[2], "rb") as fh:
+    for p in fh.read().split(b"\0"):
+        if p and p not in tracked:
+            sys.stderr.buffer.write(
+                b"package-source-archive: provenance-covered path is not"
+                b" tracked by release commit: " + p + b"\n")
+            missing = True
+sys.exit(1 if missing else 0)
+PYEOF
+  then
     exit 1
   fi
 fi
 
+# tar writes gnutar-format members, never the default pax: libarchive
+# pax writers normalize non-ASCII names (NFC -> NFD), which would make
+# the archived path differ from the tracked name and fail manifest
+# verification. gnutar stores the name bytes verbatim and has no
+# practical length limit.
 stage="$work/stage"
 mkdir -p -- "$stage/$prefix"
-tar -cf - -T "$list" | tar -xf - -C "$stage/$prefix"
+tar --format=gnutar --null -cf - -T "$list" | tar -xf - -C "$stage/$prefix"
 
 case "$FORMAT" in
-  tar.gz) tar -czf "$work/archive.tar.gz" -C "$stage" -- "$prefix" ;;
+  tar.gz) tar --format=gnutar -czf "$work/archive.tar.gz" -C "$stage" -- "$prefix" ;;
   # -y keeps symlink entries instead of dereferencing them — a plain
   # `zip -r` silently stores the target's contents or drops the entry,
   # which is how the .claude/skills link went missing previously. The

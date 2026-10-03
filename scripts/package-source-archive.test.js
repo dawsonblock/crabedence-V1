@@ -43,10 +43,12 @@ function makeRepo(t, { runtime = false } = {}) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cbx-pack-")));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   fs.mkdirSync(path.join(root, "scripts"));
+  fs.mkdirSync(path.join(root, "scripts", "lib"), { recursive: true });
   for (const name of [
     "package-source-archive.sh",
     "generate-source-manifest.sh",
     "verify-source-manifest.sh",
+    "lib/release-paths.sh",
   ]) {
     const dest = path.join(root, "scripts", name);
     fs.copyFileSync(path.join(scripts, name), dest);
@@ -270,3 +272,50 @@ for (const kind of ["file", "symlink"]) {
     });
   }
 }
+
+// The release-path filename policy: names the archive/manifest
+// toolchain cannot carry byte-for-byte are rejected before packaging;
+// names it can carry — spaces inside a component, UTF-8 — are packaged
+// and verified exactly.
+test("tracked files with spaces and UTF-8 names package byte-exactly", { skip: !prerequisites && skipReason }, (t) => {
+  const { root, git } = makeRepo(t);
+  const out = outDir(t);
+  fs.writeFileSync(path.join(root, "sp ace.txt"), "spaces are legal\n");
+  fs.writeFileSync(path.join(root, "unicodé-文件.txt"), "utf8 is legal\n");
+  git("add", "sp ace.txt", "unicodé-文件.txt");
+  git("commit", "--quiet", "-m", "legal names");
+  const archive = path.join(out, "names.tar.gz");
+  const r = pack(root, ["--prefix", "fixture", "-o", archive]);
+  assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+  const dst = path.join(out, "extract");
+  fs.mkdirSync(dst);
+  execFileSync("tar", ["-xzf", archive, "-C", dst]);
+  assert.equal(fs.readFileSync(path.join(dst, "fixture", "sp ace.txt"), "utf8"), "spaces are legal\n");
+  assert.equal(fs.readFileSync(path.join(dst, "fixture", "unicodé-文件.txt"), "utf8"), "utf8 is legal\n");
+});
+
+test("tracked files violating the release-path policy fail before any archive command", { skip: !prerequisites && skipReason }, (t) => {
+  for (const bad of [
+    "-lead.txt",
+    "dir/-lead.txt",
+    "tab\tname.txt",
+    "nl\nname.txt",
+    "back\\slash.txt",
+    " lead.txt",
+    "trail ",
+    "dir /x.txt",
+  ]) {
+    const { root, git } = makeRepo(t);
+    const out = outDir(t);
+    const abs = path.join(root, bad);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, "payload\n");
+    git("add", "--", bad);
+    git("commit", "--quiet", "-m", "violating name");
+    const archive = path.join(out, "bad.tar.gz");
+    const r = pack(root, ["--prefix", "fixture", "-o", archive]);
+    assert.notEqual(r.status, 0, `tracked name ${JSON.stringify(bad)} must refuse packaging`);
+    assert.match(r.stderr, /release path policy violation/, `name ${JSON.stringify(bad)}`);
+    assert.ok(!fs.existsSync(archive), `name ${JSON.stringify(bad)} left an archive behind`);
+  }
+});

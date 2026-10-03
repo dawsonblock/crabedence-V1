@@ -407,6 +407,7 @@ func main() {
 	update := flag.Bool("update", false, "rewrite the manifest's computed fields instead of verifying them")
 	requireSource := flag.Bool("require-source", false, "transfer-provenance qualification: the declared source tree must be present and verify — absence fails closed instead of reporting a note")
 	list := flag.Bool("list", false, "print the policy-enumerated tree paths (one per line, relative to -root) instead of digesting; requires the format-2 policy")
+	listZ := flag.Bool("z", false, "with -list, terminate each path with NUL instead of LF so names containing newlines survive verbatim")
 	flag.Parse()
 
 	if *list {
@@ -421,7 +422,11 @@ func main() {
 			os.Exit(1)
 		}
 		for _, entry := range entries {
-			fmt.Println(strings.TrimPrefix(entry.path, "./"))
+			if *listZ {
+				fmt.Printf("%s\x00", strings.TrimPrefix(entry.path, "./"))
+			} else {
+				fmt.Println(strings.TrimPrefix(entry.path, "./"))
+			}
 		}
 		return
 	}
