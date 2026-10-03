@@ -72,7 +72,7 @@ CRABEDENCE_STORE_PATH="$store" go run ./cmd/issue-grant \
   --grant-id critical-grant >/dev/null
 
 printf 'starting the service with the qualification extension…\n'
-CRABEDENCE_STORE_PATH="$store" CRABEDENCE_STORE_BACKEND=sqlite \
+CRABBOX_MODE=development CRABEDENCE_STORE_PATH="$store" CRABEDENCE_STORE_BACKEND=sqlite \
   CRABEDENCE_QUAL_PROVIDER_URL="$provider_url" \
   XDG_RUNTIME_DIR="$work_dir" "$crabbox_bin" serve-exec \
   >"$work_dir/serve.log" 2>&1 &

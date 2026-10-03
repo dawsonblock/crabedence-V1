@@ -42,6 +42,12 @@ type ServiceConfig struct {
 	// session requirement — a development-only posture, since
 	// production requires attestation.
 	Attestation *AttestationPolicy
+
+	// production is the deployment mode validated by
+	// resolveDeploymentMode at load — CRABBOX_MODE=production. Held
+	// rather than re-read so the config reflects exactly what startup
+	// enforced.
+	production bool
 }
 
 // LoadServiceConfig resolves and validates the deployment configuration.
@@ -49,9 +55,19 @@ type ServiceConfig struct {
 // enforced (topology must be declared, cluster requires PostgreSQL and
 // a provisioned key) rather than assumed.
 func LoadServiceConfig(opts ServeOptions) (*ServiceConfig, error) {
+	// The deployment mode gates every security posture below — peer
+	// authentication, attestation, evidence-key policy. An omitted
+	// CRABBOX_MODE must never resolve to development semantics on the
+	// authority service, so the mode is declared explicitly here or
+	// startup fails.
+	mode, err := resolveDeploymentMode()
+	if err != nil {
+		return nil, err
+	}
 	cfg := &ServiceConfig{
 		DatabaseURL:      opts.DatabaseURL,
 		ExecutorTimeouts: DefaultExecutorTimeouts(),
+		production:       mode == "production",
 	}
 
 	topology, err := resolveTopology()
@@ -86,22 +102,26 @@ func LoadServiceConfig(opts ServeOptions) (*ServiceConfig, error) {
 	}
 	cfg.StorePath = os.Getenv("CRABEDENCE_STORE_PATH")
 
-	// Adapter wiring: CRABBOX_GITHUB_ENABLED forces the adapter on, a
-	// token enables it implicitly, and enabling without a token still
-	// fails closed at startup. GITHUB_TOKEN is ambient in many dev
-	// shells and CI environments, so an explicit
-	// CRABBOX_GITHUB_ENABLED=false/0/no must disable the adapter even
-	// when a token is present.
+	// Adapter wiring: capability availability is configuration, never
+	// a side effect of credential discovery. CRABBOX_GITHUB_TOKEN —
+	// the service's own variable — enables the adapter implicitly
+	// because setting it is itself a declaration. Ambient GITHUB_TOKEN
+	// (present in many dev shells and CI environments without intent)
+	// supplies the credential only once CRABBOX_GITHUB_ENABLED opted
+	// the adapter in; enabling without any token still fails closed at
+	// startup, and CRABBOX_GITHUB_ENABLED=false/0/no always disables.
 	githubToken := os.Getenv("CRABBOX_GITHUB_TOKEN")
 	if githubToken == "" {
 		githubToken = os.Getenv("GITHUB_TOKEN")
 	}
-	githubEnabled := githubToken != ""
+	var githubEnabled bool
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("CRABBOX_GITHUB_ENABLED"))) {
 	case "true", "1", "yes":
 		githubEnabled = true
 	case "false", "0", "no":
 		githubEnabled = false
+	default:
+		githubEnabled = os.Getenv("CRABBOX_GITHUB_TOKEN") != ""
 	}
 	if githubEnabled && githubToken == "" {
 		return nil, fmt.Errorf("github adapter enabled (CRABBOX_GITHUB_ENABLED) but no CRABBOX_GITHUB_TOKEN or GITHUB_TOKEN configured")
@@ -136,13 +156,13 @@ func LoadServiceConfig(opts ServeOptions) (*ServiceConfig, error) {
 	// it: an unverified claim is any local process's to choose. And a
 	// wildcard mapping — a peer that may claim any principal — is a
 	// stronger privilege than an exact one, gated on its own list.
-	if err := validatePeerAuthPolicy(productionMode(), peerMap, trustedProxies); err != nil {
+	if err := validatePeerAuthPolicy(cfg.production, peerMap, trustedProxies); err != nil {
 		return nil, err
 	}
 	cfg.PeerPrincipals = peerMap
 	cfg.TrustedProxyUIDs = trustedProxies
 
-	attestation, err := attestationPolicyFromEnv(productionMode())
+	attestation, err := attestationPolicyFromEnv(cfg.production)
 	if err != nil {
 		return nil, err
 	}
@@ -239,8 +259,9 @@ func envTruthy(name string) bool {
 	return false
 }
 
-// Production reports whether the deployment declared production mode.
-func (c *ServiceConfig) Production() bool { return productionMode() }
+// Production reports whether the deployment declared production mode
+// — the value validated at load, never a re-read of the environment.
+func (c *ServiceConfig) Production() bool { return c.production }
 
 // EvidenceKeySource describes where the signing identity comes from
 // without revealing the path: a provisioned key is a deployment

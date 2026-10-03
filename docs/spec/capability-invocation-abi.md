@@ -312,7 +312,10 @@ claim that disagrees with the mapping is denied — the authenticated
 principal replaces the claim before admission (see
 `docs/architecture/authority-model.md`). A `uid:*` wildcard — a peer
 that may claim any principal — additionally requires the UID to be
-declared in `CRABEDENCE_TRUSTED_PROXY_UIDS`. Production requires the
+declared in `CRABEDENCE_TRUSTED_PROXY_UIDS`. The service requires
+`CRABBOX_MODE` to be declared at all — `development` or `production`,
+never assumed — so startup fails rather than guessing a posture.
+Production then requires the
 map: `CRABBOX_MODE=production` refuses to start without a nonempty
 one, and refuses a wildcard its trusted-proxy list does not cover,
 because an unverified claim is not an identity. Alternatively, an

@@ -76,7 +76,7 @@ printf 'starting the service…\n'
 # the service brokers the authenticated principal's grants itself. The
 # wildcard is declared twice, the way production requires it — once in
 # the peer map and once in the trusted-proxy set.
-CRABEDENCE_STORE_PATH="$store" CRABEDENCE_STORE_BACKEND=sqlite \
+CRABBOX_MODE=development CRABEDENCE_STORE_PATH="$store" CRABEDENCE_STORE_BACKEND=sqlite \
   CRABEDENCE_PEER_PRINCIPALS="$(id -u):*" \
   CRABEDENCE_TRUSTED_PROXY_UIDS="$(id -u)" \
   XDG_RUNTIME_DIR="$work_dir" "$crabbox_bin" serve-exec \

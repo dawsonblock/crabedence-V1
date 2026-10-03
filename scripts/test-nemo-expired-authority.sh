@@ -64,7 +64,7 @@ CRABEDENCE_STORE_PATH="$store" go run ./cmd/issue-grant \
   --expires-at "$expiry" >/dev/null
 
 printf 'starting the service…\n'
-CRABEDENCE_STORE_PATH="$store" CRABEDENCE_STORE_BACKEND=sqlite \
+CRABBOX_MODE=development CRABEDENCE_STORE_PATH="$store" CRABEDENCE_STORE_BACKEND=sqlite \
   XDG_RUNTIME_DIR="$work_dir" "$crabbox_bin" serve-exec >"$work_dir/serve.log" 2>&1 &
 service_pid=$!
 

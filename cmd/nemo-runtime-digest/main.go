@@ -406,7 +406,25 @@ func main() {
 	manifestPath := flag.String("manifest", "", "verify the transfer manifest at this path; with -update, rewrite its computed fields (the manifest declares the tree to digest, relative to the repository root)")
 	update := flag.Bool("update", false, "rewrite the manifest's computed fields instead of verifying them")
 	requireSource := flag.Bool("require-source", false, "transfer-provenance qualification: the declared source tree must be present and verify — absence fails closed instead of reporting a note")
+	list := flag.Bool("list", false, "print the policy-enumerated tree paths (one per line, relative to -root) instead of digesting; requires the format-2 policy")
 	flag.Parse()
+
+	if *list {
+		policy, err := readPolicy(*policyPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "nemo-runtime-digest: %v\n", err)
+			os.Exit(1)
+		}
+		entries, err := canonicalEntries(*root, &policy)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "nemo-runtime-digest: %v\n", err)
+			os.Exit(1)
+		}
+		for _, entry := range entries {
+			fmt.Println(strings.TrimPrefix(entry.path, "./"))
+		}
+		return
+	}
 
 	if *manifestPath != "" {
 		var err error

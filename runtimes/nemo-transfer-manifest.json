@@ -2,8 +2,8 @@
   "provenance_format_version": 2,
   "tree": "runtimes/nemo-relay",
   "runtime_version": "0.9.1-rc.4",
-  "shipped_tree_sha256": "060719d750238e7de19527aca256262e4568dea09d311dfde08855dfdf97cba9",
-  "file_count": 1465,
+  "shipped_tree_sha256": "e1279ef20acc448ac52a6ac2332c81f71e278b2bf71579160ffc953d0f9567a0",
+  "file_count": 1466,
   "symlink_count": 10,
   "policy": {
     "path": "runtimes/nemo-provenance-policy.json",
@@ -110,7 +110,8 @@
       "crates/native-loader/src/bin/unix/linux_sandbox.rs",
       "scripts/tcb/invariants.py",
       "scripts/tcb/test_invariants.py",
-      "security/LINUX-RESTRICTED-HOST.md"
+      "security/LINUX-RESTRICTED-HOST.md",
+      "security/PLUGIN-ISOLATION-HISTORY.md"
     ],
     "removed_files": [
       "crates/core/src/kernel.rs"

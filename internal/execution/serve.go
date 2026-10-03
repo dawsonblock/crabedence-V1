@@ -756,6 +756,25 @@ func productionMode() bool {
 	return strings.EqualFold(strings.TrimSpace(os.Getenv("CRABBOX_MODE")), "production")
 }
 
+// resolveDeploymentMode resolves CRABBOX_MODE at service startup. The
+// execution service is the consequential surface: every production
+// requirement — peer authentication, attestation, provisioned
+// evidence keys, plaintext-transport refusals — keys off the declared
+// mode, so an omitted or misspelled value must never quietly resolve
+// to development semantics. The ordinary crabbox CLI is unaffected;
+// only serve-exec reaches LoadServiceConfig.
+func resolveDeploymentMode() (string, error) {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv("CRABBOX_MODE")))
+	switch raw {
+	case "production", "development":
+		return raw, nil
+	case "":
+		return "", fmt.Errorf("CRABBOX_MODE must be declared (development or production): the execution service's security posture keys off it, so an unset mode is never assumed to be development")
+	default:
+		return "", fmt.Errorf("unknown CRABBOX_MODE %q (want development or production)", os.Getenv("CRABBOX_MODE"))
+	}
+}
+
 // validateEvidenceKeyPolicy enforces the provisioned-key requirement
 // for deployment modes that must never auto-generate a signer: a
 // cluster topology (CRABBOX_TOPOLOGY=cluster), multi-replica

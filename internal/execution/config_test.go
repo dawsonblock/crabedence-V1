@@ -33,6 +33,9 @@ func clearServiceEnv(t *testing.T) {
 	} {
 		t.Setenv(name, "")
 	}
+	// LoadServiceConfig requires an explicitly declared deployment
+	// mode — tests exercise development defaults, so declare it.
+	t.Setenv("CRABBOX_MODE", "development")
 }
 
 // testApprovedRuntimeKey returns a valid
@@ -107,6 +110,8 @@ func TestLoadServiceConfigFailsClosed(t *testing.T) {
 		setup   func(t *testing.T)
 		wantErr string
 	}{
+		{"mode undeclared", func(t *testing.T) { t.Setenv("CRABBOX_MODE", "") }, "CRABBOX_MODE must be declared"},
+		{"unknown mode", func(t *testing.T) { t.Setenv("CRABBOX_MODE", "staging") }, "unknown CRABBOX_MODE"},
 		{"unknown backend", func(t *testing.T) { t.Setenv("CRABEDENCE_STORE_BACKEND", "mysql") }, "unknown CRABEDENCE_STORE_BACKEND"},
 		{"malformed replica count", func(t *testing.T) { t.Setenv("CRABBOX_REPLICAS", "2x") }, "not a positive integer"},
 		{"unknown topology", func(t *testing.T) { t.Setenv("CRABBOX_TOPOLOGY", "sharded") }, "unknown CRABBOX_TOPOLOGY"},
@@ -236,5 +241,45 @@ func TestServiceConfigReportExcludesSecrets(t *testing.T) {
 		if !strings.Contains(report, want) {
 			t.Errorf("startup report is missing %q:\n%s", want, report)
 		}
+	}
+}
+
+// TestLoadServiceConfigAmbientGitHubTokenDoesNotEnable proves an
+// ambient GITHUB_TOKEN — present in many shells and CI environments
+// without intent — cannot switch on the adapter by itself: capability
+// availability is configuration, not credential discovery. The
+// service-specific CRABBOX_GITHUB_TOKEN is itself a declaration and
+// still enables implicitly; CRABBOX_GITHUB_ENABLED=true makes an
+// ambient token usable.
+func TestLoadServiceConfigAmbientGitHubTokenDoesNotEnable(t *testing.T) {
+	clearServiceEnv(t)
+	t.Setenv("GITHUB_TOKEN", "ghp_ambient_only")
+	cfg, err := LoadServiceConfig(ServeOptions{})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.GitHubEnabled {
+		t.Fatal("ambient GITHUB_TOKEN must not enable the github adapter")
+	}
+
+	// Explicit opt-in admits the ambient token as the credential.
+	t.Setenv("CRABBOX_GITHUB_ENABLED", "true")
+	cfg, err = LoadServiceConfig(ServeOptions{})
+	if err != nil {
+		t.Fatalf("load with explicit enable: %v", err)
+	}
+	if !cfg.GitHubEnabled || cfg.GitHubToken != "ghp_ambient_only" {
+		t.Fatalf("explicit enable must admit the ambient token: enabled=%v", cfg.GitHubEnabled)
+	}
+
+	// The service-specific variable is itself a declaration.
+	t.Setenv("CRABBOX_GITHUB_ENABLED", "")
+	t.Setenv("CRABBOX_GITHUB_TOKEN", "ghp_declared")
+	cfg, err = LoadServiceConfig(ServeOptions{})
+	if err != nil {
+		t.Fatalf("load with CRABBOX_GITHUB_TOKEN: %v", err)
+	}
+	if !cfg.GitHubEnabled || cfg.GitHubToken != "ghp_declared" {
+		t.Fatalf("CRABBOX_GITHUB_TOKEN must enable the adapter and win the credential: enabled=%v", cfg.GitHubEnabled)
 	}
 }

@@ -93,7 +93,10 @@ admission:
 - on success the authenticated principal **replaces** the claim for
   admission, grant resolution, and the durable execution identity.
 
-Unset outside production, the bearer model above applies unchanged.
+The deployment mode itself is declared, never inferred: `crabbox
+serve-exec` refuses to start without `CRABBOX_MODE` set to `development`
+or `production`, so the security posture a run carries is always the one
+an operator named. Unset outside production, the bearer model above applies unchanged.
 Production is stricter: `CRABBOX_MODE=production` refuses to start
 without a nonempty map, because an unverified claim is not an identity —
 any local process that can reach the socket could otherwise act as any

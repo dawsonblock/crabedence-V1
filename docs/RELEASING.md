@@ -693,6 +693,16 @@ may produce unsigned output. The family's proof chain is:
 - `nemo-control_X.Y.Z_SHA256SUMS.sig`, an SSH signature over the manifest in
   the `nemo-control-release` namespace by the release signer.
 
+Source bundles (`NEMO-CONTROL-*.zip` / `*.tar.gz`) are produced by
+`scripts/package-source-archive.sh` — never by an ad-hoc `zip -r` of a
+checkout. The script packages the tracked path list with the worktree bytes
+qualification measured (so `eol`/`text` smudges and untracked-but-covered
+paths like `runtimes/nemo-relay/.claude/skills` survive), extracts the
+emitted archive into a clean directory, and runs the source-manifest and
+transfer-provenance verifiers on the extracted bytes — the package fails
+rather than ships when the two disagree. This is the gate the missing
+`.claude/skills` symlink would have failed.
+
 After the distribution run succeeds on the family tag, merge its authorization
 record to `main` — `release/records/nemo-vX.Y.Z.json`, same schema as the
 kernel records with `tag` set to the family spelling — binding the family tag

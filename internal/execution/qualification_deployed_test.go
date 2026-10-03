@@ -24,6 +24,7 @@ import (
 // Unix socket, and a real grant — the same wiring proof 09's deployed
 // tier drives on staging.
 func TestServeDeployedQualificationProvider(t *testing.T) {
+	t.Setenv("CRABBOX_MODE", "development")
 	dir := t.TempDir()
 	// The durable ledger must live under an owner-only directory.
 	stateDir := filepath.Join(dir, "state")
@@ -135,6 +136,7 @@ func TestServeDeployedQualificationProvider(t *testing.T) {
 // fail-closed startup gate: a configured provider that does not answer
 // must not start a service that would mint unreconcilable UNKNOWNs.
 func TestServeRejectsUnreachableQualificationProvider(t *testing.T) {
+	t.Setenv("CRABBOX_MODE", "development")
 	t.Setenv("CRABEDENCE_STORE_BACKEND", "none")
 	t.Setenv("CRABEDENCE_QUAL_PROVIDER_URL", "http://127.0.0.1:1")
 	err := Serve(context.Background(), ServeOptions{SocketPath: testSocketPath(t)})
@@ -146,6 +148,7 @@ func TestServeRejectsUnreachableQualificationProvider(t *testing.T) {
 // TestServeRejectsMalformedQualificationProviderURL covers the
 // configuration validation boundary.
 func TestServeRejectsMalformedQualificationProviderURL(t *testing.T) {
+	t.Setenv("CRABBOX_MODE", "development")
 	t.Setenv("CRABEDENCE_STORE_BACKEND", "none")
 	for _, raw := range []string{"not-a-url", "ftp://example.com", "http://"} {
 		t.Setenv("CRABEDENCE_QUAL_PROVIDER_URL", raw)
@@ -159,6 +162,7 @@ func TestServeRejectsMalformedQualificationProviderURL(t *testing.T) {
 // TestServeRejectsMalformedPeerPrincipalMap proves a malformed map is a
 // startup error, not a silently ignored control.
 func TestServeRejectsMalformedPeerPrincipalMap(t *testing.T) {
+	t.Setenv("CRABBOX_MODE", "development")
 	t.Setenv("CRABEDENCE_STORE_BACKEND", "none")
 	t.Setenv("CRABEDENCE_PEER_PRINCIPALS", "not-a-uid:alice")
 	err := Serve(context.Background(), ServeOptions{SocketPath: testSocketPath(t)})
@@ -172,6 +176,7 @@ func TestServeRejectsMalformedPeerPrincipalMap(t *testing.T) {
 // the mapped principal resolves even if the caller claims nothing —
 // while a mismatched claim is denied before admission.
 func TestPeerAuthDeployEndToEnd(t *testing.T) {
+	t.Setenv("CRABBOX_MODE", "development")
 	dir := t.TempDir()
 	// The durable ledger must live under an owner-only directory.
 	stateDir := filepath.Join(dir, "state")

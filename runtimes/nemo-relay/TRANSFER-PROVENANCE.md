@@ -201,6 +201,7 @@ gate fails on drift between it and the manifest:
 | added file | `scripts/tcb/invariants.py` | |
 | added file | `scripts/tcb/test_invariants.py` | |
 | added file | `security/LINUX-RESTRICTED-HOST.md` | |
+| added file | `security/PLUGIN-ISOLATION-HISTORY.md` | |
 | removed file | `crates/core/src/kernel.rs` | |
 
 <!-- END GENERATED TRANSFER DELTA -->

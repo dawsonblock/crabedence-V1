@@ -43,7 +43,7 @@ service. The application owns orchestration and provider credentials.
 | --- | --- |
 | Immutable capability registration and schema enforcement | LLM planning, agent memory, workflow orchestration |
 | Runtime identity and execution-class pinning | Authoritative policy language and approvals — [Correct-Once](integrations/correct-once) |
-| Admission, route binding, and bounded provider execution | Durable mutations and exactly-once execution — Effect Fabric |
+| Admission, route binding, and bounded provider execution | Durable mutations — at-most-once dispatch with reconciliation of uncertain outcomes (Effect Fabric) |
 | Scopes, middleware, interceptors, lifecycle events, telemetry | Hostile-code isolation and outbound DLP — enforcement is still scaffolding |
 
 The `authority`, `ledger`, `executor`, `isolation`, and `dlp` crates here are
@@ -205,11 +205,10 @@ What the numbers currently show, and what they do not:
   several are structural rather than conventional — only a sealed registry can
   produce a kernel, and an action that may have been dispatched becomes
   `UNKNOWN` rather than `FAILED` by a total `match` with no catch-all.
-- The kernel is still larger than its target, and most of its remaining `unsafe`
-  is the dynamic native plugin loader. Relocating that loader to another crate
-  would change nothing, because it would still share the address space;
-  `security/PLUGIN-ISOLATION.md` records the program to move it behind a process
-  boundary, and `kernel-process unsafe tokens` is the number that has to fall.
+- The dynamic native plugin loader runs in a separate `plugin-host` process, so
+  the kernel's own `unsafe` surface no longer includes loading;
+  `security/PLUGIN-ISOLATION.md` states the boundary as enforced today and
+  `kernel-process unsafe tokens` is the figure that records it.
 - DLP, sandboxing, and provider isolation are contracts, not enforcement. Their
   flags are `false` in the source, deliberately.
 
