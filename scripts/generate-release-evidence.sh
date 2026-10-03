@@ -31,8 +31,9 @@ source "$REPO_ROOT/scripts/lib/redact.sh"
 rm -f "$EVIDENCE_DIR"/*.json "$EVIDENCE_DIR"/SHA256SUMS \
   "$EVIDENCE_DIR"/source-tree-sha256.txt "$EVIDENCE_DIR"/source-tree-git-blobs.txt \
   "$EVIDENCE_DIR"/provenance.json "$EVIDENCE_DIR"/artifact.json \
-  "$EVIDENCE_DIR"/toolchains.json "$EVIDENCE_DIR"/environment.json
-rm -rf "$EVIDENCE_DIR/gate-results"
+  "$EVIDENCE_DIR"/toolchains.json "$EVIDENCE_DIR"/environment.json \
+  "$EVIDENCE_DIR"/FINAL_QUALIFICATION_REPORT.md
+rm -rf "$EVIDENCE_DIR/gate-results" "$EVIDENCE_DIR/gates"
 mkdir -p "$EVIDENCE_DIR/gate-results"
 
 # ─── Gate tracking ─────────────────────────────────────────────────────────
@@ -1197,6 +1198,17 @@ if ! GATE_FINDINGS="$(validate_qualification_gates "$EVIDENCE_DIR/qualification.
     exit 1
   fi
 fi
+
+# ─── Phase 16b: Per-gate records ────────────────────────────────────────────
+# qualification.json is the canonical admission record; gates/<id>.json
+# explodes each gate into a standalone record so a single gate's result
+# and log binding can be examined and verified independently.
+mkdir -p "$EVIDENCE_DIR/gates"
+jq -r '.gates[].gate_id' "$EVIDENCE_DIR/qualification.json" | while IFS= read -r gid; do
+  jq --arg gid "$gid" \
+    '.gates[] | select(.gate_id == $gid) | {schema_version: 2, record_type: "gate"} + .' \
+    "$EVIDENCE_DIR/qualification.json" > "$EVIDENCE_DIR/gates/$gid.json"
+done
 
 # ─── Phase 23: Generate qualification matrix from JSON ──────────────────────
 "$REPO_ROOT/scripts/generate-qualification-matrix.sh"
