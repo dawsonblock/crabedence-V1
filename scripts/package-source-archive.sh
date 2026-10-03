@@ -25,9 +25,11 @@
 #      the runtime tree.
 #
 # Usage: package-source-archive.sh [--format zip|tar.gz] [-o output]
-#                                  [--allow-dirty]
+#                                  [--prefix name] [--allow-dirty]
 #   --format       archive format; default tar.gz
 #   -o, --output   output path; default dist/source-<describe>.<ext>
+#   --prefix       top-level directory name inside the archive;
+#                  default nemo-control-<describe>
 #   --allow-dirty  package a modified tracked worktree (for gate
 #                  development); release use should be clean.
 #   Exit 0 only when the extracted bytes verify.
@@ -38,6 +40,7 @@ cd "$ROOT"
 
 FORMAT="tar.gz"
 OUTPUT=""
+PREFIX=""
 ALLOW_DIRTY=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -45,6 +48,8 @@ while [ $# -gt 0 ]; do
     --format=*) FORMAT="${1#*=}"; shift ;;
     -o|--output) OUTPUT="$2"; shift 2 ;;
     --output=*) OUTPUT="${1#*=}"; shift ;;
+    --prefix) PREFIX="$2"; shift 2 ;;
+    --prefix=*) PREFIX="${1#*=}"; shift ;;
     --allow-dirty) ALLOW_DIRTY=1; shift ;;
     *) echo "package-source-archive: unknown argument $1" >&2; exit 2 ;;
   esac
@@ -63,7 +68,12 @@ if [ -n "$(git diff --name-only HEAD)" ] && [ "$ALLOW_DIRTY" -eq 0 ]; then
   exit 1
 fi
 
-prefix="nemo-control-$(git describe --tags --always 2>/dev/null || git rev-parse --short HEAD)"
+prefix="${PREFIX:-nemo-control-$(git describe --tags --always 2>/dev/null || git rev-parse --short HEAD)}"
+# The archive root is a single directory name — a slash or traversal
+# would silently relocate packaged entries outside the extraction dir.
+case "$prefix" in
+  ""|.|..|*/*|*\\*) printf "package-source-archive: --prefix must be a single directory name, got '%s'\n" "$prefix" >&2; exit 2 ;;
+esac
 OUTPUT="${OUTPUT:-dist/source-${prefix}.${FORMAT}}"
 
 work="$(mktemp -d)"

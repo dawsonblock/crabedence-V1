@@ -462,14 +462,26 @@ jobs:
         run: bash scripts/check-release-admission.sh
 
       # ─── Build artifact from the same clean checkout ──────────────────
+      # The public source bundle is produced ONLY by
+      # package-source-archive.sh. Git's archive plumbing emits blob
+      # bytes, which differ from the qualified checkout wherever a
+      # text/eol attribute smudges the worktree (runtimes/nemo-relay
+      # carries *.cmd eol=crlf), and every Git-derived packager dropped
+      # provenance-covered untracked paths (the .claude/skills symlink
+      # defect). The packager reads worktree bytes over the HEAD path
+      # set unioned with the provenance enumeration, then verifies the
+      # EMITTED archive by extraction against the source and transfer
+      # manifests before anything downstream sees it.
       - name: Build source archive
         shell: bash
         run: |
           mkdir -p dist
-          git archive --format=tar.gz --prefix="crabedence-${RELEASE_VERSION}/" \
-            -o "dist/crabedence-${RELEASE_VERSION}.tar.gz" HEAD
-          git archive --format=zip --prefix="crabedence-${RELEASE_VERSION}/" \
-            -o "dist/crabedence-${RELEASE_VERSION}.zip" HEAD
+          bash scripts/package-source-archive.sh --format tar.gz \
+            --prefix "crabedence-${RELEASE_VERSION}" \
+            -o "dist/crabedence-${RELEASE_VERSION}.tar.gz"
+          bash scripts/package-source-archive.sh --format zip \
+            --prefix "crabedence-${RELEASE_VERSION}" \
+            -o "dist/crabedence-${RELEASE_VERSION}.zip"
 
       # ─── Generate SBOM (fail-closed, pinned version) ──────────────────
       # The SBOM is generated BEFORE artifact.json so the release object

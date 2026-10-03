@@ -203,6 +203,23 @@ test("the clean room verifies the published evidence bundle, not the raw directo
   assert.doesNotMatch(cleanRoom, /cp -r evidence/);
 });
 
+test("the public source bundle is produced by the verified packager, never git archive", () => {
+  // `git archive` emits blob bytes, which diverge from the qualified
+  // worktree wherever a text/eol attribute smudges the checkout (the
+  // runtime's *.cmd eol=crlf file is exactly that), and Git-derived
+  // packagers dropped provenance-covered paths Git did not track — the
+  // .claude/skills symlink defect. package-source-archive.sh reads
+  // worktree bytes over the unioned path set and verifies the emitted
+  // archive by extraction before anything downstream consumes it.
+  assert.doesNotMatch(workflow, /git archive/);
+  const build = job("build");
+  assert.match(build, /package-source-archive\.sh --format tar\.gz/);
+  assert.match(build, /package-source-archive\.sh --format zip/);
+  assert.match(build, /--prefix "crabedence-\$\{RELEASE_VERSION\}"/);
+  assert.match(build, /-o "dist\/crabedence-\$\{RELEASE_VERSION\}\.tar\.gz"/);
+  assert.match(build, /-o "dist\/crabedence-\$\{RELEASE_VERSION\}\.zip"/);
+});
+
 test("the release script suite gates the build", () => {
   const scriptsJob = job("release-scripts");
   assert.match(scriptsJob, /node --test scripts\/\*\.test\.js scripts\/\*\.test\.mjs/);
