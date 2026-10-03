@@ -30,12 +30,34 @@ const captureFixtureSource = "fixture-source-immutable-id"
 // These tests cross the actual CLI, native subprocess, claim, and checkpoint
 // boundaries. Cooperative context cancellation alone misses the lost record
 // while Machine0's source restart outlives the caller's cancellation.
-func TestCheckpointCaptureBuiltBinaryContract(t *testing.T) {
-	repo, err := filepath.Abs(filepath.Join("..", ".."))
+// checkpointTestModuleRoot is the Go module root — the directory
+// `go build ./internal/cli/...` must run from. It may differ from the
+// repository boundary below when the checkout is nested inside a larger
+// repository.
+func checkpointTestModuleRoot(t *testing.T) string {
+	t.Helper()
+	root, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {
 		t.Fatal(err)
 	}
-	repo, err = filepath.EvalSymlinks(repo)
+	root, err = filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return root
+}
+
+func TestCheckpointCaptureBuiltBinaryContract(t *testing.T) {
+	// The project may sit inside a larger repository: the binary resolves
+	// repo ownership to the nearest .git ancestor, which need not be the
+	// module root. The claim fixture must bind whatever the binary will
+	// discover — git's toplevel — while builds still run in the module.
+	moduleRoot := checkpointTestModuleRoot(t)
+	repoOut, err := exec.Command("git", "-C", moduleRoot, "rev-parse", "--show-toplevel").CombinedOutput()
+	if err != nil {
+		t.Fatalf("resolve repo boundary: %v\n%s", err, repoOut)
+	}
+	repo, err := filepath.EvalSymlinks(strings.TrimSpace(string(repoOut)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +67,7 @@ func TestCheckpointCaptureBuiltBinaryContract(t *testing.T) {
 	}
 	t.Logf("compiled immutable Crabbox binary: %s", binary)
 	providerBuild := exec.Command("go", "build", "-trimpath", "-o", binary+".provider", "./internal/cli/testdata/checkpoint-provider")
-	providerBuild.Dir = repo
+	providerBuild.Dir = moduleRoot
 	if output, err := providerBuild.CombinedOutput(); err != nil {
 		t.Fatalf("build fake provider: %v\n%s", err, output)
 	}

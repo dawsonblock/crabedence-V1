@@ -5184,6 +5184,22 @@ exit 0
 
 func TestRunCommandKeepOnFailureKeepsLeaseAfterLocalActionsHydrationFailure(t *testing.T) {
 	clearConfigEnv(t)
+	projectRoot, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workdir := t.TempDir()
+	gitInit := exec.Command("git", "init", "-q")
+	gitInit.Dir = workdir
+	if out, err := gitInit.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, out)
+	}
+	workflow, err := os.ReadFile(filepath.Join(projectRoot, ".github", "workflows", "hydrate.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustWriteTestFile(t, filepath.Join(workdir, ".github", "workflows", "hydrate.yml"), string(workflow))
+	t.Chdir(workdir)
 	dir := t.TempDir()
 	isolateRunTestUserDirs(t, dir)
 	sshPath := filepath.Join(dir, "ssh")
@@ -5224,7 +5240,7 @@ exit 0
 	t.Setenv("CRABBOX_FAKE_SSH_PROXY", "1")
 
 	var stdout, stderr bytes.Buffer
-	err := (App{Stdout: &stdout, Stderr: &stderr}).runCommand(context.Background(), []string{
+	err = (App{Stdout: &stdout, Stderr: &stderr}).runCommand(context.Background(), []string{
 		"--provider", "run-env-profile-test",
 		"--keep-on-failure",
 		"--", "pnpm", "test:docs",
