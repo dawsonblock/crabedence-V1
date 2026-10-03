@@ -695,13 +695,48 @@ may produce unsigned output. The family's proof chain is:
 
 Source bundles (`NEMO-CONTROL-*.zip` / `*.tar.gz`) are produced by
 `scripts/package-source-archive.sh` — never by an ad-hoc `zip -r` of a
-checkout. The script packages the tracked path list with the worktree bytes
-qualification measured (so `eol`/`text` smudges and untracked-but-covered
-paths like `runtimes/nemo-relay/.claude/skills` survive), extracts the
-emitted archive into a clean directory, and runs the source-manifest and
-transfer-provenance verifiers on the extracted bytes — the package fails
-rather than ships when the two disagree. This is the gate the missing
-`.claude/skills` symlink would have failed.
+checkout. The packager enforces the tracked-only provenance invariant:
+
+> provenance-covered ⇒ tracked ⇒ source-manifested ⇒ packaged ⇒
+> independently verifiable
+
+It enumerates every provenance-covered regular file and symlink and requires
+each to be represented by the release commit; a covered-but-untracked path
+fails packaging before an archive exists — it is never silently added. (This
+is the gate the missing `runtimes/nemo-relay/.claude/skills` symlink taught
+us: the fix is to *commit* the covered path, not to union it into the
+artifact.) The package set is the Git HEAD path set read as worktree bytes,
+so `eol`/`text` smudges are preserved byte-for-byte.
+
+Additional packager gates, all of which fail before any archive command
+runs:
+
+- the archive prefix is restricted to `[A-Za-z0-9][A-Za-z0-9._+-]*` — an
+  option-lookalike, a path component, or a control character can never reach
+  `tar`/`zip` as an argument;
+- path enumeration is NUL-delimited end to end (`git ls-tree -z`, the
+  digest tool's `-list -z`, `sort -z`, tar `--null -T`) plus a hard
+  release-path filename policy, so names the toolchain cannot carry
+  byte-for-byte are rejected rather than mangled;
+- tar members are written in gnutar format so non-ASCII filenames are not
+  Unicode-normalized inside the archive;
+- the generated source manifest is embedded in the archive at
+  `release-evidence/source-tree-sha256.txt`, so the artifact is
+  self-verifying without a side channel;
+- the emitted archive is extracted into a clean directory and verified
+  against the source manifest and the transfer manifest — the package
+  fails rather than ships when the two disagree.
+
+Qualification then runs in two explicit lanes. `scripts/qualify-repository.sh`
+carries the Git-dependent gates (history, attributes, tracked files, clean
+worktree). `scripts/qualify-source-distribution.sh` runs on a clean
+extraction with no `.git` — it refuses a `.git` entry in the tree — and
+verifies the embedded source manifest, path policy, symlinks, generated
+content, and build inputs. The RC workflow copies only the published
+archives into a clean-room job with no checkout and runs the distribution
+suite shipped inside each archive, then `verify-release-artifact.sh --mode
+release` on the same bytes; a post-publication job repeats the whole check
+against the publicly downloadable assets only.
 
 After the distribution run succeeds on the family tag, merge its authorization
 record to `main` — `release/records/nemo-vX.Y.Z.json`, same schema as the
