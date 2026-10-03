@@ -29,6 +29,13 @@ function fixture(t, { docker = "down" } = {}) {
   if (docker === "down") {
     // Daemon absent or hung: info fails fast.
     writeStub("docker", `${recorder}\nexit 1`);
+  } else if (docker === "run-fails") {
+    // Daemon answers info but cannot start a container: read-only
+    // storage, exhausted quota, policy denial. run exits non-zero.
+    writeStub(
+      "docker",
+      `${recorder}\ncase "$1" in run) exit 1 ;; esac\nexit 0`,
+    );
   } else {
     // Working daemon: run prints a container id, everything else ok.
     writeStub(
@@ -70,6 +77,23 @@ test("falls back to initdb when Docker is unreachable", (t) => {
   assert.match(calls, /pg_ctl .* start/);
   assert.match(calls, /pg_ctl .* stop/);
   assert.doesNotMatch(calls, /docker run/);
+
+  const url = fs.readFileSync(out, "utf8");
+  assert.match(url, /^postgres:\/\/postgres@127\.0\.0\.1:\d+\/crabbox_test\?sslmode=disable$/);
+});
+
+test("falls back to initdb when the daemon answers but docker run fails", (t) => {
+  const { dir, log, env } = fixture(t, { docker: "run-fails" });
+  const { out, argv } = urlCaptureCommand(dir);
+  const res = spawnSync(script, argv, { env, encoding: "utf8" });
+  assert.equal(res.status, 0, res.stderr);
+
+  const calls = fs.readFileSync(log, "utf8");
+  assert.match(calls, /docker run/);
+  assert.match(calls, /initdb /);
+  assert.match(calls, /pg_isready /);
+  // The stale container handle must not leak into readiness or cleanup.
+  assert.doesNotMatch(calls, /docker exec/);
 
   const url = fs.readFileSync(out, "utf8");
   assert.match(url, /^postgres:\/\/postgres@127\.0\.0\.1:\d+\/crabbox_test\?sslmode=disable$/);

@@ -125,13 +125,17 @@ start_docker_postgres() {
   PG_PORT="$(pick_port)"
   DOCKER_CONTAINER="crabbox-test-pg-$$-$RANDOM"
   echo "==> Starting $PG_IMAGE in Docker on 127.0.0.1:$PG_PORT"
+  # A daemon that answers `docker info` but cannot start a container
+  # (read-only storage, exhausted quota, policy denial) must fall through
+  # to the initdb fallback — the assignment below cannot stand in for a
+  # server that never started.
   docker run -d --rm \
     --name "$DOCKER_CONTAINER" \
     -p "127.0.0.1:$PG_PORT:5432" \
     -e POSTGRES_USER=postgres \
     -e POSTGRES_HOST_AUTH_METHOD=trust \
     -e POSTGRES_DB="$PG_DB" \
-    "$PG_IMAGE" >/dev/null
+    "$PG_IMAGE" >/dev/null || { DOCKER_CONTAINER=""; return 1; }
   # Trust auth on a loopback-bound throwaway container — same auth model as
   # the initdb fallback below, no credential in the URL.
   CRABBOX_TEST_DATABASE_URL="postgres://postgres@127.0.0.1:$PG_PORT/$PG_DB"
