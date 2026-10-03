@@ -246,6 +246,12 @@ still requires a VM boundary or an independently enforced resource controller.
   way is not accepted by the system's own checks.
 - **Security architecture: the entitlements.** Deny by default, with the weakened
   library-validation variant as a separate bundle rather than a flag.
-- **Distribution: Developer ID and notarization.** Tracked as its own row in the
-  qualification matrix rather than assumed, because it is a CI and key-custody
-  decision and not an architecture one.
+- **Distribution: Developer ID and notarization.** `package-plugin-host-app.py`
+  carries the release lane itself — `--signing-identity "Developer ID
+  Application: <Team>" --notary-profile <keychain-profile>` signs with the
+  hardened runtime and secure timestamp, submits the bundle to the notary
+  service and waits, staples the ticket, and re-verifies. `--verify-release`
+  is the admission side: strict signature validity, a `Developer ID
+  Application` authority rather than an ad-hoc one, the hardened-runtime flag,
+  a stapled ticket, and Gatekeeper acceptance, each a hard refusal rather than
+  a warning. A bundle that is only ad-hoc signed fails that check by name.

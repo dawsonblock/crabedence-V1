@@ -354,6 +354,10 @@ fn reset_runtime_state() {
 
 #[test]
 fn test_native_pymodule_entrypoint_registers_bindings_without_local_provider_install() {
+    crate::test_support::with_test_stack(test_native_pymodule_entrypoint_registers_bindings_without_local_provider_install_inner);
+}
+
+fn test_native_pymodule_entrypoint_registers_bindings_without_local_provider_install_inner() {
     let _python = crate::test_support::init_python_test();
     let _serial_guard = SERIAL_TEST_MUTEX.lock().unwrap();
     reset_runtime_state();
@@ -396,6 +400,10 @@ fn test_native_pymodule_entrypoint_registers_bindings_without_local_provider_ins
 
 #[test]
 fn test_guardrails_local_runtime_enforces_llm_input_and_output_checks() {
+    crate::test_support::with_test_stack(test_guardrails_local_runtime_enforces_llm_input_and_output_checks_inner);
+}
+
+fn test_guardrails_local_runtime_enforces_llm_input_and_output_checks_inner() {
     let _python = crate::test_support::init_python_test();
     reset_runtime_state();
 
@@ -528,6 +536,10 @@ async def run_case():
 
 #[test]
 fn test_guardrails_local_runtime_rejects_unsupported_nemoguardrails_version() {
+    crate::test_support::with_test_stack(test_guardrails_local_runtime_rejects_unsupported_nemoguardrails_version_inner);
+}
+
+fn test_guardrails_local_runtime_rejects_unsupported_nemoguardrails_version_inner() {
     let _python = crate::test_support::init_python_test();
     reset_runtime_state();
 
@@ -606,6 +618,10 @@ async def run_case():
 
 #[test]
 fn test_guardrails_local_runtime_enforces_streamed_output_rails() {
+    crate::test_support::with_test_stack(test_guardrails_local_runtime_enforces_streamed_output_rails_inner);
+}
+
+fn test_guardrails_local_runtime_enforces_streamed_output_rails_inner() {
     let _python = crate::test_support::init_python_test();
     reset_runtime_state();
 
@@ -789,6 +805,10 @@ async def run_case():
 
 #[test]
 fn test_local_guardrails_provider_initializes_and_enforces_managed_core_calls() {
+    crate::test_support::with_test_stack(test_local_guardrails_provider_initializes_and_enforces_managed_core_calls_inner);
+}
+
+fn test_local_guardrails_provider_initializes_and_enforces_managed_core_calls_inner() {
     let _python = crate::test_support::init_python_test();
     reset_runtime_state();
 

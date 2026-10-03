@@ -356,6 +356,14 @@ run_gate effect-fabric-race TEST env -u CRABBOX_TEST_DATABASE_URL \
 # value and the runtime serves it: qualified policy = released policy =
 # runtime policy.
 run_gate registry-digest PROVENANCE go run ./cmd/registry-digest
+
+# NeMo transfer provenance: the format-2 manifest must verify against the
+# frozen reference source — file content, executable bits, symlink targets,
+# typed delta. -require-source makes a missing reference a hard failure,
+# which is what release admission means here.
+run_gate nemo-transfer-provenance PROVENANCE \
+  bash "$REPO_ROOT/scripts/verify-nemo-provenance.sh" --require-source
+
 REGISTRY_SHA256="$(sed -n 's/^\([0-9a-f]\{64\}\)$/\1/p' "$EVIDENCE_DIR/gate-results/registry-digest.log" | tail -1)"
 if [ -z "$REGISTRY_SHA256" ]; then
   echo "ERROR: registry-digest gate produced no digest — the release cannot bind its policy identity" >&2

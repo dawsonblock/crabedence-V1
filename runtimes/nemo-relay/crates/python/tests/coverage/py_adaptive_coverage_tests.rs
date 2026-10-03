@@ -49,6 +49,10 @@ fn adaptive_config<'py>(py: Python<'py>, provider: &str) -> Bound<'py, pyo3::typ
 
 #[test]
 fn set_latency_sensitivity_rejects_zero_and_registers_binding() {
+    crate::test_support::with_test_stack(set_latency_sensitivity_rejects_zero_and_registers_binding_inner);
+}
+
+fn set_latency_sensitivity_rejects_zero_and_registers_binding_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         let module = PyModule::new(py, "_adaptive_cov").unwrap();
@@ -65,6 +69,10 @@ fn set_latency_sensitivity_rejects_zero_and_registers_binding() {
 
 #[test]
 fn py_adaptive_uses_canonical_adaptive_acg_imports() {
+    crate::test_support::with_test_stack(py_adaptive_uses_canonical_adaptive_acg_imports_inner);
+}
+
+fn py_adaptive_uses_canonical_adaptive_acg_imports_inner() {
     let source =
         fs::read_to_string(format!("{}/src/py_adaptive.rs", env!("CARGO_MANIFEST_DIR"))).unwrap();
 
@@ -74,6 +82,10 @@ fn py_adaptive_uses_canonical_adaptive_acg_imports() {
 
 #[test]
 fn python_crate_manifest_drops_direct_acg_dependency() {
+    crate::test_support::with_test_stack(python_crate_manifest_drops_direct_acg_dependency_inner);
+}
+
+fn python_crate_manifest_drops_direct_acg_dependency_inner() {
     let manifest =
         fs::read_to_string(format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR"))).unwrap();
 
@@ -82,6 +94,10 @@ fn python_crate_manifest_drops_direct_acg_dependency() {
 
 #[test]
 fn validate_adaptive_config_accepts_openai_provider_without_transport_fields() {
+    crate::test_support::with_test_stack(validate_adaptive_config_accepts_openai_provider_without_transport_fields_inner);
+}
+
+fn validate_adaptive_config_accepts_openai_provider_without_transport_fields_inner() {
     Python::initialize();
     Python::attach(|py| {
         let module = PyModule::new(py, "_adaptive_cov").unwrap();
@@ -116,6 +132,10 @@ fn validate_adaptive_config_accepts_openai_provider_without_transport_fields() {
 
 #[test]
 fn adaptive_runtime_methods_cover_pending_ready_and_shutdown_paths() {
+    crate::test_support::with_test_stack(adaptive_runtime_methods_cover_pending_ready_and_shutdown_paths_inner);
+}
+
+fn adaptive_runtime_methods_cover_pending_ready_and_shutdown_paths_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         let runner = PyModule::from_code(
@@ -348,6 +368,10 @@ def bind_scope_and_translate(api_module, runtime, request):
 
 #[test]
 fn adaptive_runtime_locking_and_helper_errors_are_covered() {
+    crate::test_support::with_test_stack(adaptive_runtime_locking_and_helper_errors_are_covered_inner);
+}
+
+fn adaptive_runtime_locking_and_helper_errors_are_covered_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         let parsed_config: AdaptiveConfig = serde_json::from_value(json!({
@@ -584,6 +608,10 @@ fn assert_py_error_contains<T>(result: PyResult<T>, expected: &str) {
 
 #[test]
 fn adaptive_runtime_shutdown_and_register_error_paths_are_covered() {
+    crate::test_support::with_test_stack(adaptive_runtime_shutdown_and_register_error_paths_are_covered_inner);
+}
+
+fn adaptive_runtime_shutdown_and_register_error_paths_are_covered_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         let runner = PyModule::from_code(

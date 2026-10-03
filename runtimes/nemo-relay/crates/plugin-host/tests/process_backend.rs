@@ -45,6 +45,23 @@ async fn lease_guard() -> tokio::sync::MutexGuard<'static, ()> {
     LEASE_GUARD.lock().await
 }
 
+/// Serializes the tests that install a fixture's proxies into this process.
+///
+/// Activation registers global middleware proxies named
+/// `nemo-relay-plugin.v1.<plugin_id>:1:<registration>` in this test binary's
+/// runtime registry. The plugin id is compiled into the fixture library, so
+/// two tests that activate it at once claim the same names and the second
+/// install is refused — the registry is correct to refuse, and the coupling is
+/// the tests', not the kernel's. A test holds this guard for as long as the
+/// fixture's proxies are installed; tests that never activate a fixture stay
+/// parallel.
+static FIXTURE_NAMESPACE_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The guard a test takes to own the fixture's process-global registration names.
+async fn fixture_namespace_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    FIXTURE_NAMESPACE_GUARD.lock().await
+}
+
 fn host_config() -> PluginHostSupervisorConfig {
     PluginHostSupervisorConfig {
         executable: host_executable(),
@@ -210,6 +227,7 @@ async fn a_restricted_bundle_loads_only_the_transferred_approved_copy() {
         PluginLoadRequest, PluginRegistrationOperation,
     };
 
+    let _fixture_namespace = fixture_namespace_guard().await;
     let _lease = lease_guard().await;
     let executable = std::env::var_os("NEMO_RELAY_RESTRICTED_HOST_EXECUTABLE")
         .map(PathBuf::from)
@@ -305,6 +323,7 @@ async fn a_restricted_linux_host_loads_only_the_transferred_approved_copy() {
         PluginLoadRequest, PluginRegistrationOperation,
     };
 
+    let _fixture_namespace = fixture_namespace_guard().await;
     let _lease = lease_guard().await;
     let mut config = host_config();
     config.isolation =
@@ -475,6 +494,7 @@ async fn a_real_tool_call_reaches_a_registration_inside_the_child() {
     // proxy one class needs: the other fixture registers sixteen, and activating
     // it against a one-class session is refused — correctly, but uselessly for
     // this test.
+    let _fixture_namespace = fixture_namespace_guard().await;
     let fixture = support::PreparedFixture::write(
         "fixture_intercept",
         "nemo-ph-intercept",
@@ -605,6 +625,7 @@ async fn a_real_event_sanitizer_in_the_child_changes_only_what_is_published() {
     // Three mark sanitizers, two scope-start sanitizers and one scope-end sanitizer
     // are what this fixture registers, and the log is how "which of them ran" becomes
     // a fact this process can read rather than an inference from the answer.
+    let _fixture_namespace = fixture_namespace_guard().await;
     let log = std::env::temp_dir().join(format!(
         "nemo-event-sanitizers-{}.log",
         nemo_relay_plugin_protocol::Uuid::now_v7().simple()
@@ -842,6 +863,8 @@ async fn a_real_llm_response_sanitizer_resolves_the_calls_codec_through_the_kern
         BuiltinLlmCodec, LlmCodecIdentity, PluginComponentConfiguration,
     };
 
+    let _fixture_namespace = fixture_namespace_guard().await;
+
     /// A response codec that answers with a recognizable id, so the test can tell that the
     /// codec the *kernel* holds is the one that ran.
     struct TestResponseCodec;
@@ -974,6 +997,7 @@ async fn a_real_llm_request_sanitizer_resolves_the_calls_codec_through_the_kerne
     use nemo_relay_plugin_host::ProcessLoadedPlugins;
     use nemo_relay_plugin_protocol::PluginComponentConfiguration;
 
+    let _fixture_namespace = fixture_namespace_guard().await;
     let fixture = support::PreparedFixture::write(
         "fixture_intercept",
         "nemo-ph-llm-sanitize",
@@ -1087,6 +1111,7 @@ async fn a_real_sanitizer_in_the_child_decides_with_the_events_category() {
     use nemo_relay_plugin_host::ProcessLoadedPlugins;
     use nemo_relay_plugin_protocol::PluginComponentConfiguration;
 
+    let _fixture_namespace = fixture_namespace_guard().await;
     let fixture = support::PreparedFixture::write(
         "fixture_intercept",
         "nemo-ph-discriminators",
@@ -1233,6 +1258,7 @@ async fn a_failing_sanitizer_in_the_child_cannot_publish_what_it_was_shown() {
     use nemo_relay_plugin_host::ProcessLoadedPlugins;
     use nemo_relay_plugin_protocol::PluginComponentConfiguration;
 
+    let _fixture_namespace = fixture_namespace_guard().await;
     let fixture = support::PreparedFixture::write(
         "fixture_intercept",
         "nemo-ph-event-sanitizer-failure",
@@ -1480,6 +1506,7 @@ async fn the_composition_installs_a_plugin_from_another_process_into_this_chain(
     // own process: it starts the host, loads the approved artifact there,
     // activates the component there, and installs a proxy here — with no loader
     // call in this process at all.
+    let _fixture_namespace = fixture_namespace_guard().await;
     let fixture = support::PreparedFixture::write(
         "fixture_intercept",
         "nemo-ph-composed",
@@ -1981,6 +2008,7 @@ async fn the_composition_installs_a_plugin_from_another_process_into_this_chain(
 async fn a_composition_refuses_a_cap_that_would_refuse_every_invocation() {
     use nemo_relay_plugin_host::ProcessLoadedPlugins;
 
+    let _fixture_namespace = fixture_namespace_guard().await;
     let fixture = support::PreparedFixture::write(
         "fixture_intercept",
         "nemo-ph-zerocap",
@@ -2014,6 +2042,7 @@ async fn a_composition_refuses_a_cap_that_would_refuse_every_invocation() {
 async fn a_composition_refuses_a_context_bound_to_another_runtime() {
     use nemo_relay_plugin_host::ProcessLoadedPlugins;
 
+    let _fixture_namespace = fixture_namespace_guard().await;
     let fixture = support::PreparedFixture::write(
         "fixture_intercept",
         "nemo-ph-foreign-context",
@@ -2095,6 +2124,7 @@ async fn the_shared_composition_runs_a_native_plugin_in_another_process() {
     use nemo_relay::plugin::dynamic::DynamicPluginActivationSpec;
     use nemo_relay_plugin_host::activation::{ActivatedPluginRuntime, IsolationPolicy};
 
+    let _fixture_namespace = fixture_namespace_guard().await;
     let _lease = lease_guard().await;
     // The composition every binding and the CLI share. What a binding needs to
     // know is only this: `activate` returning `Ok` means the plugin is live, and
@@ -2159,6 +2189,7 @@ async fn a_composition_with_no_host_binary_fails_closed_and_owns_nothing_afterwa
     use nemo_relay::plugin::dynamic::DynamicPluginActivationSpec;
     use nemo_relay_plugin_host::activation::{ActivatedPluginRuntime, IsolationPolicy};
 
+    let _fixture_namespace = fixture_namespace_guard().await;
     let _lease = lease_guard().await;
     let fixture = support::PreparedFixture::write(
         "fixture_intercept",
@@ -2210,6 +2241,7 @@ async fn a_caller_that_stops_waiting_does_not_leave_a_half_applied_activation() 
     use nemo_relay::plugin::dynamic::DynamicPluginActivationSpec;
     use nemo_relay_plugin_host::activation::{ActivatedPluginRuntime, IsolationPolicy};
 
+    let _fixture_namespace = fixture_namespace_guard().await;
     let _lease = lease_guard().await;
     // The defect this pins: an activation claims process-wide ownership, registers
     // components and starts a process, so a caller that gives up halfway through
@@ -2605,6 +2637,7 @@ async fn an_answer_that_outgrows_its_operation_is_refused_by_the_kernel() {
     // what arrived. The second measurement is the point of this test: the child
     // runs a native plugin, so an answer from it is not evidence the kernel
     // accepts without checking it against the operation that asked.
+    let _fixture_namespace = fixture_namespace_guard().await;
     let backend = ProcessPluginBackend::launch(host_config())
         .await
         .expect("a plugin host should start and handshake");
@@ -2674,6 +2707,7 @@ async fn an_answer_that_outgrows_its_operation_is_refused_by_the_kernel() {
 async fn the_full_fixture_is_served_whole_by_the_boundary() {
     use nemo_relay_plugin_host::ProcessLoadedPlugins;
 
+    let _fixture_namespace = fixture_namespace_guard().await;
     let fixture = support::PreparedFixture::write(
         "fixture_native",
         "nemo-ph-unsupported",
@@ -2728,6 +2762,7 @@ async fn the_full_fixture_is_served_whole_by_the_boundary() {
 async fn a_tool_execution_intercept_wraps_a_call_across_the_boundary() {
     use nemo_relay_plugin_host::ProcessLoadedPlugins;
 
+    let _fixture_namespace = fixture_namespace_guard().await;
     let fixture = support::PreparedFixture::write(
         "fixture_intercept",
         "nemo-ph-execution",
@@ -2826,6 +2861,7 @@ async fn a_wrapped_call_can_be_replaced_run_twice_or_failed_after() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    let _fixture_namespace = fixture_namespace_guard().await;
     let fixture = support::PreparedFixture::write(
         "fixture_intercept",
         "nemo-ph-execution-shapes",
@@ -2960,6 +2996,7 @@ async fn a_wrapped_call_can_be_replaced_run_twice_or_failed_after() {
 async fn an_llm_execution_intercept_wraps_a_call_across_the_boundary() {
     use nemo_relay_plugin_host::ProcessLoadedPlugins;
 
+    let _fixture_namespace = fixture_namespace_guard().await;
     let fixture = support::PreparedFixture::write(
         "fixture_intercept",
         "nemo-ph-llm-execution",
@@ -3133,6 +3170,7 @@ async fn a_host_exits_when_its_kernel_goes_away() {
 async fn the_full_fixture_is_inspectable_over_the_boundary() {
     use nemo_relay_plugin_protocol::PluginRegistrationOperation as Operation;
 
+    let _fixture_namespace = fixture_namespace_guard().await;
     let fixture = support::PreparedFixture::write(
         "fixture_native",
         "nemo-ph-inspection",

@@ -202,10 +202,14 @@ before admission — it is never partially interpreted.
 
 `grant_id` remains a deliberate compatibility alias for
 `authority_ref`. `authority_generation` and `authority_digest` are
-accepted from the caller and overwritten by the server from the
-resolved grant; every other server-resolved field in the list above is
-outside the ABI, so sending one is an `unknown field` refusal rather
-than a silent ignore.
+tolerated on the wire for backward compatibility and carry **zero
+authority**: the server overwrites them unconditionally from the
+resolved grant before dispatch — a caller can neither forge authority
+binding nor omit it. "Present on the wire" must never be read as
+"trusted by the server". Every other server-resolved field in the list
+above is outside the ABI, so sending one is an `unknown field` refusal
+rather than a silent ignore. A future ABI version may reject the legacy
+authority fields outright; planners should omit them today.
 
 ## Unix Socket Transport Binding
 

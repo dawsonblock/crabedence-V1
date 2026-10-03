@@ -27,3 +27,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 go run ./cmd/nemo-runtime-digest -manifest runtimes/nemo-transfer-manifest.json
+
+# Documentation that restates provenance statistics is a dependent of the
+# manifest, not a second source of truth: drift between them fails the gate.
+scripts/check-provenance-docs.sh

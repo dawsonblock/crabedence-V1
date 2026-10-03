@@ -71,6 +71,10 @@ fn py_mark_event(event: Event) -> PyMarkEvent {
 
 #[test]
 fn test_register_exposes_all_type_bindings() {
+    crate::test_support::with_test_stack(test_register_exposes_all_type_bindings_inner);
+}
+
+fn test_register_exposes_all_type_bindings_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         let module = PyModule::new(py, "_types_test").unwrap();
@@ -106,6 +110,10 @@ fn test_register_exposes_all_type_bindings() {
 
 #[test]
 fn test_bitflags_handles_and_event_wrappers_expose_expected_fields() {
+    crate::test_support::with_test_stack(test_bitflags_handles_and_event_wrappers_expose_expected_fields_inner);
+}
+
+fn test_bitflags_handles_and_event_wrappers_expose_expected_fields_inner() {
     let _python = crate::test_support::init_python_test();
     let scope_attrs =
         PyScopeAttributes::new(PyScopeAttributes::PARALLEL | PyScopeAttributes::RELOCATABLE);
@@ -333,6 +341,10 @@ fn test_bitflags_handles_and_event_wrappers_expose_expected_fields() {
 
 #[test]
 fn test_atif_exporter_methods_cover_register_export_and_clear() {
+    crate::test_support::with_test_stack(test_atif_exporter_methods_cover_register_export_and_clear_inner);
+}
+
+fn test_atif_exporter_methods_cover_register_export_and_clear_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         let tool_def = json_to_py(py, &json!({"name": "typed_tool"})).unwrap();
@@ -412,6 +424,10 @@ fn test_atif_exporter_methods_cover_register_export_and_clear() {
 
 #[test]
 fn test_open_telemetry_config_and_subscriber_cover_lifecycle() {
+    crate::test_support::with_test_stack(test_open_telemetry_config_and_subscriber_cover_lifecycle_inner);
+}
+
+fn test_open_telemetry_config_and_subscriber_cover_lifecycle_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         let mut config =
@@ -448,6 +464,10 @@ fn test_open_telemetry_config_and_subscriber_cover_lifecycle() {
 
 #[test]
 fn test_open_telemetry_config_rejects_invalid_inputs() {
+    crate::test_support::with_test_stack(test_open_telemetry_config_rejects_invalid_inputs_inner);
+}
+
+fn test_open_telemetry_config_rejects_invalid_inputs_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         let mut config =
@@ -476,6 +496,10 @@ fn test_open_telemetry_config_rejects_invalid_inputs() {
 
 #[test]
 fn test_openinference_typed_otel_config_and_subscriber_cover_lifecycle() {
+    crate::test_support::with_test_stack(test_openinference_typed_otel_config_and_subscriber_cover_lifecycle_inner);
+}
+
+fn test_openinference_typed_otel_config_and_subscriber_cover_lifecycle_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         let mut config = PyOpenTelemetryConfig::new(
@@ -514,6 +538,10 @@ fn test_openinference_typed_otel_config_and_subscriber_cover_lifecycle() {
 
 #[test]
 fn test_openinference_typed_otel_config_rejects_invalid_inputs() {
+    crate::test_support::with_test_stack(test_openinference_typed_otel_config_rejects_invalid_inputs_inner);
+}
+
+fn test_openinference_typed_otel_config_rejects_invalid_inputs_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         let mut config = PyOpenTelemetryConfig::new(
@@ -534,6 +562,10 @@ fn test_openinference_typed_otel_config_rejects_invalid_inputs() {
 
 #[test]
 fn test_attribute_wrappers_cover_remaining_bitwise_methods() {
+    crate::test_support::with_test_stack(test_attribute_wrappers_cover_remaining_bitwise_methods_inner);
+}
+
+fn test_attribute_wrappers_cover_remaining_bitwise_methods_inner() {
     let _python = crate::test_support::init_python_test();
 
     let scope_or = PyScopeAttributes::new(PyScopeAttributes::PARALLEL)
@@ -562,6 +594,10 @@ fn test_attribute_wrappers_cover_remaining_bitwise_methods() {
 
 #[test]
 fn test_request_and_handle_wrappers_cover_remaining_methods() {
+    crate::test_support::with_test_stack(test_request_and_handle_wrappers_cover_remaining_methods_inner);
+}
+
+fn test_request_and_handle_wrappers_cover_remaining_methods_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         fn assert_remaining_handle_methods(py: Python<'_>) {
@@ -633,6 +669,10 @@ fn test_request_and_handle_wrappers_cover_remaining_methods() {
 
 #[test]
 fn test_event_wrappers_cover_remaining_methods() {
+    crate::test_support::with_test_stack(test_event_wrappers_cover_remaining_methods_inner);
+}
+
+fn test_event_wrappers_cover_remaining_methods_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         fn assert_remaining_event_methods(py: Python<'_>) {
@@ -828,6 +868,10 @@ fn test_event_wrappers_cover_remaining_methods() {
 
 #[test]
 fn test_llm_stream_wrapper_covers_remaining_methods() {
+    crate::test_support::with_test_stack(test_llm_stream_wrapper_covers_remaining_methods_inner);
+}
+
+fn test_llm_stream_wrapper_covers_remaining_methods_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         fn assert_llm_stream_methods(py: Python<'_>) {
@@ -940,6 +984,10 @@ async def next_item(stream):
 
 #[test]
 fn test_python_side_core_type_constructors_cover_exposed_entrypoints() {
+    crate::test_support::with_test_stack(test_python_side_core_type_constructors_cover_exposed_entrypoints_inner);
+}
+
+fn test_python_side_core_type_constructors_cover_exposed_entrypoints_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         let module = PyModule::new(py, "_types_python_side").unwrap();
@@ -1093,6 +1141,10 @@ fn test_python_side_core_type_constructors_cover_exposed_entrypoints() {
 
 #[test]
 fn test_metric_measurement_and_pending_mark_getters_cover_python_surface() {
+    crate::test_support::with_test_stack(test_metric_measurement_and_pending_mark_getters_cover_python_surface_inner);
+}
+
+fn test_metric_measurement_and_pending_mark_getters_cover_python_surface_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         let module = PyModule::new(py, "_types_metric_mark_getters").unwrap();
@@ -1234,6 +1286,10 @@ fn test_metric_measurement_and_pending_mark_getters_cover_python_surface() {
 
 #[test]
 fn test_metric_enum_conversions_and_tool_execution_outcome_getters() {
+    crate::test_support::with_test_stack(test_metric_enum_conversions_and_tool_execution_outcome_getters_inner);
+}
+
+fn test_metric_enum_conversions_and_tool_execution_outcome_getters_inner() {
     let _python = crate::test_support::init_python_test();
     for (python, native) in [
         (PyLogSeverity::Trace, LogSeverity::Trace),
@@ -1308,6 +1364,10 @@ fn test_metric_enum_conversions_and_tool_execution_outcome_getters() {
 
 #[test]
 fn test_annotated_llm_types_and_builtin_codecs_cover_mutators_and_codecs() {
+    crate::test_support::with_test_stack(test_annotated_llm_types_and_builtin_codecs_cover_mutators_and_codecs_inner);
+}
+
+fn test_annotated_llm_types_and_builtin_codecs_cover_mutators_and_codecs_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         let messages = json_to_py(
@@ -1824,6 +1884,10 @@ fn test_annotated_llm_types_and_builtin_codecs_cover_mutators_and_codecs() {
 
 #[test]
 fn test_forced_serialization_error_hooks_cover_unreachable_wrappers() {
+    crate::test_support::with_test_stack(test_forced_serialization_error_hooks_cover_unreachable_wrappers_inner);
+}
+
+fn test_forced_serialization_error_hooks_cover_unreachable_wrappers_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         let tool_def = json_to_py(py, &json!({"name": "typed_tool"})).unwrap();
@@ -2016,6 +2080,10 @@ fn test_forced_serialization_error_hooks_cover_unreachable_wrappers() {
 
 #[test]
 fn test_python_visible_type_none_and_error_paths_cover_remaining_branches() {
+    crate::test_support::with_test_stack(test_python_visible_type_none_and_error_paths_cover_remaining_branches_inner);
+}
+
+fn test_python_visible_type_none_and_error_paths_cover_remaining_branches_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         let types_module = PyModule::new(py, "_types_none_paths").unwrap();
@@ -2226,6 +2294,10 @@ def run(types):
 
 #[test]
 fn test_python_visible_wrappers_cover_pyclass_trampolines() {
+    crate::test_support::with_test_stack(test_python_visible_wrappers_cover_pyclass_trampolines_inner);
+}
+
+fn test_python_visible_wrappers_cover_pyclass_trampolines_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         let types_module = PyModule::new(py, "_types_py_visible").unwrap();

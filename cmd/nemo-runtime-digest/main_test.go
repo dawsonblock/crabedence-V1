@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -145,6 +146,92 @@ func writeManifestFile(t *testing.T, path string, manifest transferManifest) {
 	}
 }
 
+// writeTestPolicyWith writes a minimal format-2 policy for fixture trees and
+// returns its path. The enumeration mirrors the real policy's exclusions;
+// generated paths are caller-supplied so the generated-file tests can pin
+// their own patterns.
+func writeTestPolicyWith(t *testing.T, generated []string) string {
+	t.Helper()
+	if generated == nil {
+		generated = []string{}
+	}
+	policy := map[string]interface{}{
+		"policy":                    "test-canonical-tree",
+		"policy_version":            1,
+		"provenance_format_version": 2,
+		"enumeration": map[string]interface{}{
+			"excluded_dir_names":     []string{"target", ".git", "node_modules", ".venv", "__pycache__"},
+			"excluded_dir_suffixes":  []string{".egg-info"},
+			"excluded_file_names":    []string{".DS_Store"},
+			"excluded_file_suffixes": []string{".pyc"},
+			"generated_paths":        generated,
+		},
+	}
+	encoded, err := json.MarshalIndent(policy, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "provenance-policy.json")
+	if err := os.WriteFile(path, append(encoded, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func writeTestPolicy(t *testing.T) string {
+	t.Helper()
+	return writeTestPolicyWith(t, nil)
+}
+
+// policyBinding reads a policy file back and returns the manifest-side
+// reference (path + content hash) updateManifest would record.
+func policyBinding(t *testing.T, policyPath string) *policyRef {
+	t.Helper()
+	sum, err := policyDigest(policyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &policyRef{Path: policyPath, SHA256: sum}
+}
+
+// writeProvenanceDocV2 is the format-2 counterpart of writeProvenanceDoc: the
+// typed delta block and the file+symlink source block.
+func writeProvenanceDocV2(t *testing.T, root string, declared transferManifest) {
+	t.Helper()
+	doc := "provenance\n\n"
+	if declared.Source != nil {
+		doc += renderSourceBlockV2(*declared.Source) + "\n\n"
+	}
+	doc += renderDeltaBlockV2(declared) + "\n"
+	path := filepath.Join(root, provenanceDocName)
+	if err := os.WriteFile(path, []byte(doc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// declaredManifestV2 fills a format-2 manifest's computed fields for root —
+// the same ordering updateManifest uses: provenance doc first, digest after.
+func declaredManifestV2(t *testing.T, root, policyPath string, declared transferManifest) transferManifest {
+	t.Helper()
+	declared.FormatVersion = formatVersion
+	declared.Policy = policyBinding(t, policyPath)
+	writeProvenanceDocV2(t, root, declared)
+	policy, err := readPolicy(policyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := digestRuntimeV2(root, &policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	declared.Tree = root
+	declared.RuntimeVersion = identity.RuntimeVersion
+	declared.ShippedTreeSHA256 = identity.NemoRuntimeSHA256
+	declared.FileCount = identity.FileCount
+	declared.SymlinkCount = identity.SymlinkCount
+	return declared
+}
+
 // writeProvenanceDoc writes the in-tree provenance record carrying the
 // generated blocks for the declared values — the source-identity block when
 // a source is declared, then the delta block — the same artifact production
@@ -189,7 +276,7 @@ func TestManifestVerificationAcceptsAMatchingDeclaration(t *testing.T) {
 	root := baseTree(t)
 	path := filepath.Join(t.TempDir(), "nemo-transfer-manifest.json")
 	writeManifestFile(t, path, declarationFor(t, root))
-	if err := verifyManifest(path); err != nil {
+	if err := verifyManifest(path, false); err != nil {
 		t.Fatalf("a matching declaration must verify: %v", err)
 	}
 }
@@ -202,7 +289,7 @@ func TestManifestVerificationRejectsDriftAndNamesTheField(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "crates/a/src/lib.rs"), []byte("pub fn a() { let _ = 1; }\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	err := verifyManifest(path)
+	err := verifyManifest(path, false)
 	if err == nil {
 		t.Fatal("tree drift must fail verification")
 	}
@@ -215,7 +302,7 @@ func TestManifestVerificationRejectsDriftAndNamesTheField(t *testing.T) {
 }
 
 func TestManifestVerificationFailsClosedOnAMissingFile(t *testing.T) {
-	if err := verifyManifest(filepath.Join(t.TempDir(), "absent.json")); err == nil {
+	if err := verifyManifest(filepath.Join(t.TempDir(), "absent.json"), false); err == nil {
 		t.Fatal("a missing manifest must fail verification")
 	}
 }
@@ -236,15 +323,20 @@ func TestManifestUpdateRefreshesComputedFieldsAndKeepsTheInventory(t *testing.T)
 	// The tree carries the provenance record; update regenerates its block in
 	// place rather than creating the file.
 	writeProvenanceDoc(t, root, skeleton)
+	policyPath := writeTestPolicy(t)
 
-	if err := updateManifest(path); err != nil {
+	if err := updateManifest(path, policyPath); err != nil {
 		t.Fatalf("update: %v", err)
 	}
 	updated, err := readManifest(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	identity, err := digestRuntime(root)
+	policy, err := readPolicy(policyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := digestRuntimeV2(root, &policy)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,17 +345,17 @@ func TestManifestUpdateRefreshesComputedFieldsAndKeepsTheInventory(t *testing.T)
 		updated.RuntimeVersion != identity.RuntimeVersion {
 		t.Fatalf("update must refresh the computed fields: %+v", updated)
 	}
-	if len(updated.Excluded) != len(identity.Excluded) {
-		t.Fatalf("update must record the exclusion set: %+v", updated.Excluded)
+	if updated.FormatVersion != formatVersion || updated.Policy == nil {
+		t.Fatalf("update must emit the current provenance format and bind the policy: %+v", updated)
 	}
 	if len(updated.WorkspaceMembersAdded) != 1 || updated.WorkspaceMembersAdded[0] != "bridges/nemo-crabedence" {
 		t.Fatal("update must preserve the inventory fields")
 	}
-	if len(updated.LocalModifications) != 1 || updated.LocalModifications[0] != "Cargo.toml" {
-		t.Fatal("update must preserve the local modifications")
+	if updated.Delta == nil || !slices.Equal(updated.Delta.ModifiedFiles, []string{"Cargo.toml"}) {
+		t.Fatalf("update must carry the local modifications in the typed delta: %+v", updated.Delta)
 	}
-	if len(updated.AddedPaths) != 1 || updated.AddedPaths[0] != "bridges/" {
-		t.Fatal("update must preserve the added paths")
+	if !slices.Equal(updated.Delta.AddedFiles, []string{"bridges/"}) {
+		t.Fatalf("update must carry the added paths in the typed delta: %+v", updated.Delta.AddedFiles)
 	}
 }
 
@@ -291,13 +383,13 @@ func TestManifestSourceIsCheckedWhenPresent(t *testing.T) {
 	})
 	path := filepath.Join(t.TempDir(), "nemo-transfer-manifest.json")
 	writeManifestFile(t, path, declaration)
-	if err := verifyManifest(path); err != nil {
+	if err := verifyManifest(path, false); err != nil {
 		t.Fatalf("a matching source declaration must verify: %v", err)
 	}
 
 	declaration.Source.SHA256 = strings.Repeat("0", 64)
 	writeManifestFile(t, path, declaration)
-	if err := verifyManifest(path); err == nil {
+	if err := verifyManifest(path, false); err == nil {
 		t.Fatal("a wrong source identity must fail verification")
 	}
 }
@@ -315,14 +407,14 @@ func TestManifestInventoryMustMatchTheTree(t *testing.T) {
 	})
 	path := filepath.Join(t.TempDir(), "nemo-transfer-manifest.json")
 	writeManifestFile(t, path, declaration)
-	if err := verifyManifest(path); err != nil {
+	if err := verifyManifest(path, false); err != nil {
 		t.Fatalf("a matching inventory must verify: %v", err)
 	}
 
 	// A member the workspace does not list is a failure.
 	declaration.WorkspaceMembersAdded = []string{"bridges/two"}
 	writeManifestFile(t, path, declaration)
-	if err := verifyManifest(path); err == nil {
+	if err := verifyManifest(path, false); err == nil {
 		t.Fatal("an unlisted workspace member must fail verification")
 	}
 
@@ -330,7 +422,7 @@ func TestManifestInventoryMustMatchTheTree(t *testing.T) {
 	declaration.WorkspaceMembersAdded = []string{"bridges/one"}
 	declaration.AddedPaths = []string{"bridges/missing"}
 	writeManifestFile(t, path, declaration)
-	if err := verifyManifest(path); err == nil {
+	if err := verifyManifest(path, false); err == nil {
 		t.Fatal("a declared path that does not exist must fail verification")
 	}
 }
@@ -359,7 +451,7 @@ func TestManifestBinariesMustHaveSourcesAndDeclarations(t *testing.T) {
 	}
 	path := filepath.Join(t.TempDir(), "nemo-transfer-manifest.json")
 	writeManifestFile(t, path, declaration)
-	if err := verifyManifest(path); err != nil {
+	if err := verifyManifest(path, false); err != nil {
 		t.Fatalf("declared binaries with sources and declarations must verify: %v", err)
 	}
 
@@ -398,7 +490,7 @@ func TestManifestBinariesMustHaveSourcesAndDeclarations(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			declaration.Binaries = []manifestBinary{tc.binary}
 			writeManifestFile(t, path, declaration)
-			err := verifyManifest(path)
+			err := verifyManifest(path, false)
 			if err == nil {
 				t.Fatal("the declaration must fail verification")
 			}
@@ -422,7 +514,7 @@ func TestManifestSourceAbsenceIsReportedNotFailed(t *testing.T) {
 	})
 	path := filepath.Join(t.TempDir(), "nemo-transfer-manifest.json")
 	writeManifestFile(t, path, declaration)
-	if err := verifyManifest(path); err != nil {
+	if err := verifyManifest(path, false); err != nil {
 		t.Fatalf("an absent source tree must not fail verification: %v", err)
 	}
 }
@@ -473,7 +565,7 @@ func TestDeltaVerificationAcceptsTheCompleteDeclaration(t *testing.T) {
 	})
 	path := filepath.Join(t.TempDir(), "nemo-transfer-manifest.json")
 	writeManifestFile(t, path, declaration)
-	if err := verifyManifest(path); err != nil {
+	if err := verifyManifest(path, false); err != nil {
 		t.Fatalf("the complete declaration must verify: %v", err)
 	}
 }
@@ -549,7 +641,7 @@ func TestDeltaVerificationRejectsAnIncompleteDeclaration(t *testing.T) {
 			declaration := declarationForPair(t, source, vendored, declared)
 			path := filepath.Join(t.TempDir(), "nemo-transfer-manifest.json")
 			writeManifestFile(t, path, declaration)
-			err := verifyManifest(path)
+			err := verifyManifest(path, false)
 			if err == nil {
 				t.Fatal("an incomplete declaration must fail verification")
 			}
@@ -580,7 +672,7 @@ func TestDeltaSeesSymlinkDrift(t *testing.T) {
 	})
 	path := filepath.Join(t.TempDir(), "nemo-transfer-manifest.json")
 	writeManifestFile(t, path, declaration)
-	if err := verifyManifest(path); err != nil {
+	if err := verifyManifest(path, false); err != nil {
 		t.Fatalf("identical symlinks must verify: %v", err)
 	}
 
@@ -591,7 +683,7 @@ func TestDeltaSeesSymlinkDrift(t *testing.T) {
 	if err := os.Symlink("retargeted", link); err != nil {
 		t.Fatal(err)
 	}
-	err := verifyManifest(path)
+	err := verifyManifest(path, false)
 	if err == nil {
 		t.Fatal("a retargeted symlink is a modification and must fail undeclared")
 	}
@@ -611,28 +703,32 @@ func TestManifestUpdateRegeneratesTheDeltaInventory(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nemo-transfer-manifest.json")
 	writeManifestFile(t, path, declaration)
 
-	if err := updateManifest(path); err != nil {
+	policyPath := writeTestPolicy(t)
+	if err := updateManifest(path, policyPath); err != nil {
 		t.Fatalf("update: %v", err)
 	}
 	updated, err := readManifest(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(updated.LocalModifications, []string{"crates/a/src/lib.rs"}) {
-		t.Fatalf("update must regenerate the modification set: %v", updated.LocalModifications)
+	if updated.Delta == nil {
+		t.Fatalf("a regenerated manifest must carry the typed delta: %+v", updated)
+	}
+	if !slices.Equal(updated.Delta.ModifiedFiles, []string{"crates/a/src/lib.rs"}) {
+		t.Fatalf("update must regenerate the modification set: %v", updated.Delta.ModifiedFiles)
 	}
 	for _, want := range []string{"TRANSFER-PROVENANCE.md", "bridges/x/src/lib.rs"} {
-		if !slices.Contains(updated.AddedPaths, want) {
-			t.Fatalf("update must declare the addition %s: %v", want, updated.AddedPaths)
+		if !slices.Contains(updated.Delta.AddedFiles, want) {
+			t.Fatalf("update must declare the addition %s: %v", want, updated.Delta.AddedFiles)
 		}
 	}
-	if slices.Contains(updated.AddedPaths, "not-present/") {
+	if slices.Contains(updated.Delta.AddedFiles, "not-present/") {
 		t.Fatal("update must drop a declared path that covers no actual addition")
 	}
-	if !slices.Equal(updated.RemovedPaths, []string{"docs/old.md"}) {
-		t.Fatalf("update must regenerate the removal set: %v", updated.RemovedPaths)
+	if !slices.Equal(updated.Delta.RemovedFiles, []string{"docs/old.md"}) {
+		t.Fatalf("update must regenerate the removal set: %v", updated.Delta.RemovedFiles)
 	}
-	if err := verifyManifest(path); err != nil {
+	if err := verifyManifest(path, false); err != nil {
 		t.Fatalf("a regenerated manifest must verify: %v", err)
 	}
 }
@@ -646,7 +742,7 @@ func TestProvenanceDocDriftFailsVerification(t *testing.T) {
 	})
 	path := filepath.Join(t.TempDir(), "nemo-transfer-manifest.json")
 	writeManifestFile(t, path, declaration)
-	if err := verifyManifest(path); err != nil {
+	if err := verifyManifest(path, false); err != nil {
 		t.Fatalf("the doc generated for this declaration must verify: %v", err)
 	}
 
@@ -655,7 +751,7 @@ func TestProvenanceDocDriftFailsVerification(t *testing.T) {
 	// disagree about what shipped.
 	declaration.LocalModifications = []string{"crates/a/src/lib.rs", "crates/b/src/lib.rs"}
 	writeManifestFile(t, path, declaration)
-	err := verifyManifest(path)
+	err := verifyManifest(path, false)
 	if err == nil {
 		t.Fatal("a doc block that disagrees with the manifest must fail verification")
 	}
@@ -678,7 +774,7 @@ func TestProvenanceDocDriftFailsVerification(t *testing.T) {
 	if err := os.WriteFile(docPath, append(doc, []byte("hand-edited\n")...), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := verifyManifest(path); err == nil {
+	if err := verifyManifest(path, false); err == nil {
 		t.Fatal("a hand-edited tree must fail verification")
 	}
 }
@@ -696,7 +792,7 @@ func TestProvenanceDocSourceIdentityIsGenerated(t *testing.T) {
 	})
 	path := filepath.Join(t.TempDir(), "nemo-transfer-manifest.json")
 	writeManifestFile(t, path, declaration)
-	if err := verifyManifest(path); err != nil {
+	if err := verifyManifest(path, false); err != nil {
 		t.Fatalf("the doc generated for this declaration must verify: %v", err)
 	}
 
@@ -727,7 +823,7 @@ func TestProvenanceDocSourceIdentityIsGenerated(t *testing.T) {
 	declaration.ShippedTreeSHA256 = identity.NemoRuntimeSHA256
 	declaration.FileCount = identity.FileCount
 	writeManifestFile(t, path, declaration)
-	err = verifyManifest(path)
+	err = verifyManifest(path, false)
 	if err == nil {
 		t.Fatal("a stale source-identity block must fail verification")
 	}
@@ -771,7 +867,7 @@ func TestProvenanceDocRejectsDuplicateGeneratedBlocks(t *testing.T) {
 	declaration.FileCount = identity.FileCount
 	path := filepath.Join(t.TempDir(), "nemo-transfer-manifest.json")
 	writeManifestFile(t, path, declaration)
-	err = verifyManifest(path)
+	err = verifyManifest(path, false)
 	if err == nil {
 		t.Fatal("a duplicated generated block must fail verification")
 	}
@@ -806,11 +902,450 @@ func TestProvenanceDocSourceBlockWithoutDeclaredSourceFails(t *testing.T) {
 	declaration.FileCount = identity.FileCount
 	path := filepath.Join(t.TempDir(), "nemo-transfer-manifest.json")
 	writeManifestFile(t, path, declaration)
-	err = verifyManifest(path)
+	err = verifyManifest(path, false)
 	if err == nil {
 		t.Fatal("a source-identity block with no declared source must fail verification")
 	}
 	if !strings.Contains(err.Error(), "declares no source") {
 		t.Fatalf("error = %q, want the undeclared source named", err)
+	}
+}
+
+// declarationForPairV2 fills a format-2 manifest for a source/vendored pair:
+// the bound policy, the typed delta, and both canonical-stream identities —
+// the same artifacts updateManifest produces.
+func declarationForPairV2(t *testing.T, source, vendored, policyPath string, delta typedDelta) transferManifest {
+	t.Helper()
+	policy, err := readPolicy(policyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceIdentity, err := digestRuntimeV2(source, &policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	declared := transferManifest{
+		Source: &manifestSource{
+			Path:         source,
+			FileCount:    sourceIdentity.FileCount,
+			SymlinkCount: sourceIdentity.SymlinkCount,
+			SHA256:       sourceIdentity.NemoRuntimeSHA256,
+		},
+		Delta: &delta,
+	}
+	return declaredManifestV2(t, vendored, policyPath, declared)
+}
+
+func TestDigestV2BindsSymlinksAndTheExecutableBit(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation needs privileges on Windows")
+	}
+	policyPath := writeTestPolicy(t)
+	policy, err := readPolicy(policyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := baseTree(t)
+	first, err := digestRuntimeV2(root, &policy)
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	if first.SymlinkCount != 0 {
+		t.Fatalf("a link-free tree must report zero symlinks: %d", first.SymlinkCount)
+	}
+
+	// A symlink is an identity-bearing object: adding one must change the
+	// digest even though no regular file moved.
+	link := filepath.Join(root, "crates", "a", "src", "LINK")
+	if err := os.Symlink("lib.rs", link); err != nil {
+		t.Fatal(err)
+	}
+	linked, err := digestRuntimeV2(root, &policy)
+	if err != nil {
+		t.Fatalf("digest with link: %v", err)
+	}
+	if linked.SymlinkCount != 1 {
+		t.Fatalf("symlink count: got %d", linked.SymlinkCount)
+	}
+	if linked.NemoRuntimeSHA256 == first.NemoRuntimeSHA256 {
+		t.Fatal("adding a symlink must change the tree identity")
+	}
+
+	// Retargeting changes identity — the target is the record.
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../b/src/lib.rs", link); err != nil {
+		t.Fatal(err)
+	}
+	retargeted, err := digestRuntimeV2(root, &policy)
+	if err != nil {
+		t.Fatalf("digest retargeted: %v", err)
+	}
+	if retargeted.NemoRuntimeSHA256 == linked.NemoRuntimeSHA256 {
+		t.Fatal("retargeting a symlink must change the tree identity")
+	}
+
+	// Removal must restore the original identity exactly.
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := digestRuntimeV2(root, &policy)
+	if err != nil {
+		t.Fatalf("digest after removal: %v", err)
+	}
+	if removed.NemoRuntimeSHA256 != first.NemoRuntimeSHA256 {
+		t.Fatal("removing the symlink must restore the prior identity")
+	}
+
+	// The executable bit is provenance-relevant for shipped scripts.
+	script := filepath.Join(root, "crates", "a", "src", "lib.rs")
+	if err := os.Chmod(script, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	exec, err := digestRuntimeV2(root, &policy)
+	if err != nil {
+		t.Fatalf("digest exec: %v", err)
+	}
+	if exec.NemoRuntimeSHA256 == removed.NemoRuntimeSHA256 {
+		t.Fatal("flipping the executable bit must change the tree identity")
+	}
+}
+
+func TestDigestV2ExcludesTransientsAndGenerated(t *testing.T) {
+	policyPath := writeTestPolicyWith(t, []string{"generated/out.py", "generated/"})
+	policy, err := readPolicy(policyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := baseTree(t)
+	first, err := digestRuntimeV2(root, &policy)
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	for rel, contents := range map[string]string{
+		"target/debug/app":     "build output\n",
+		"node_modules/x/i.js":  "dep\n",
+		"__pycache__/m.pyc":    "cache\n",
+		"pkg.egg-info/PKG":     "metadata\n",
+		".DS_Store":            "junk\n",
+		"notes.pyc":            "bytecode\n",
+		"generated/out.py":     "# generated\n",
+		"generated/other/x.py": "# generated subtree\n",
+	} {
+		path := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	withArtifacts, err := digestRuntimeV2(root, &policy)
+	if err != nil {
+		t.Fatalf("digest with artifacts: %v", err)
+	}
+	if withArtifacts.NemoRuntimeSHA256 != first.NemoRuntimeSHA256 || withArtifacts.FileCount != first.FileCount {
+		t.Fatal("transient build state and generated paths must not change the tree identity")
+	}
+}
+
+func TestDigestV2RejectsNonCanonicalObjects(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fifo creation is POSIX-only")
+	}
+	policyPath := writeTestPolicy(t)
+	policy, err := readPolicy(policyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := baseTree(t)
+	fifo := filepath.Join(root, "crates", "a", "src", "pipe")
+	if err := syscall.Mkfifo(fifo, 0o644); err != nil {
+		t.Fatalf("mkfifo: %v", err)
+	}
+	if _, err := digestRuntimeV2(root, &policy); err == nil {
+		t.Fatal("a fifo inside the canonical tree must fail enumeration, not silently skip")
+	}
+}
+
+func TestDiffTreesV2ClassifiesEveryObjectKind(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation needs privileges on Windows")
+	}
+	policyPath := writeTestPolicy(t)
+	policy, err := readPolicy(policyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := writeTree(t, map[string]string{
+		"Cargo.toml":          "[workspace.package]\nversion = \"1.2.3\"\n",
+		"crates/a/src/lib.rs": "pub fn a() {}\n",
+		"gone.rs":             "gone\n",
+	})
+	vendored := writeTree(t, map[string]string{
+		"Cargo.toml":          "[workspace.package]\nversion = \"1.2.3\"\n",
+		"crates/a/src/lib.rs": "pub fn a() { let _ = 1; }\n",
+	})
+	if err := os.Symlink("target-a", filepath.Join(source, "retargeted")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("target-b", filepath.Join(vendored, "retargeted")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("dangling", filepath.Join(source, "removed-link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("fresh", filepath.Join(vendored, "added-link")); err != nil {
+		t.Fatal(err)
+	}
+	// A file in the source that is a symlink in the runtime is a retype.
+	if err := os.WriteFile(filepath.Join(source, "retyped"), []byte("file\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("now-a-link", filepath.Join(vendored, "retyped")); err != nil {
+		t.Fatal(err)
+	}
+	// Same content, different mode: a mode change, not a modification.
+	if err := os.WriteFile(filepath.Join(source, "tool.sh"), []byte("#!/bin/sh\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(vendored, "tool.sh"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	delta, err := diffTreesV2(source, vendored, &policy)
+	if err != nil {
+		t.Fatalf("diff: %v", err)
+	}
+	if !slices.Equal(delta.ModifiedFiles, []string{"crates/a/src/lib.rs"}) {
+		t.Fatalf("modified: %v", delta.ModifiedFiles)
+	}
+	if !slices.Equal(delta.AddedFiles, []string{"TRANSFER-PROVENANCE.md"}) && len(delta.AddedFiles) != 0 {
+		// No provenance doc in this fixture: every added file must surface.
+		for _, p := range delta.AddedFiles {
+			if strings.Contains(p, "retargeted") {
+				t.Fatalf("a symlink must not appear in added_files: %v", delta.AddedFiles)
+			}
+		}
+	}
+	if !slices.Equal(delta.RemovedFiles, []string{"gone.rs"}) {
+		t.Fatalf("removed files: %v", delta.RemovedFiles)
+	}
+	if !slices.Equal(delta.AddedSymlinks, []string{"added-link"}) {
+		t.Fatalf("added symlinks: %v", delta.AddedSymlinks)
+	}
+	if !slices.Equal(delta.RemovedSymlinks, []string{"removed-link"}) {
+		t.Fatalf("removed symlinks: %v", delta.RemovedSymlinks)
+	}
+	if !slices.Equal(delta.RetargetedSymlinks, []string{"retargeted"}) {
+		t.Fatalf("retargeted symlinks: %v", delta.RetargetedSymlinks)
+	}
+	if !slices.Equal(delta.RetypedPaths, []string{"retyped"}) {
+		t.Fatalf("retyped paths: %v", delta.RetypedPaths)
+	}
+	if len(delta.ModeChanges) != 1 || delta.ModeChanges[0].Path != "tool.sh" ||
+		delta.ModeChanges[0].From != "-" || delta.ModeChanges[0].To != "x" {
+		t.Fatalf("mode changes: %+v", delta.ModeChanges)
+	}
+}
+
+func TestManifestV2RejectsUnsupportedAndAmbiguousForms(t *testing.T) {
+	root := baseTree(t)
+	policyPath := writeTestPolicy(t)
+	path := filepath.Join(t.TempDir(), "nemo-transfer-manifest.json")
+
+	// A future format is never reinterpreted.
+	future := declarationFor(t, root)
+	future.FormatVersion = 3
+	writeManifestFile(t, path, future)
+	if err := verifyManifest(path, false); err == nil || !strings.Contains(err.Error(), "provenance_format_version 3") {
+		t.Fatalf("a future version must be rejected: %v", err)
+	}
+
+	// Format 2 without its policy binding is incomplete.
+	loose := declaredManifestV2(t, root, policyPath, transferManifest{Delta: &typedDelta{}})
+	loose.Policy = nil
+	writeManifestFile(t, path, loose)
+	if err := verifyManifest(path, false); err == nil || !strings.Contains(err.Error(), "no policy") {
+		t.Fatalf("a v2 manifest must bind the policy: %v", err)
+	}
+
+	// Format 2 carrying the flat v1 delta fields is ambiguous.
+	flat := declaredManifestV2(t, root, policyPath, transferManifest{Delta: &typedDelta{}})
+	flat.LocalModifications = []string{"Cargo.toml"}
+	writeManifestFile(t, path, flat)
+	if err := verifyManifest(path, false); err == nil || !strings.Contains(err.Error(), "flat v1 delta") {
+		t.Fatalf("flat fields in a v2 manifest must be rejected: %v", err)
+	}
+
+	// A swapped policy breaks the hash binding.
+	bound := declaredManifestV2(t, root, policyPath, transferManifest{Delta: &typedDelta{}})
+	bound.Policy = &policyRef{Path: bound.Policy.Path, SHA256: strings.Repeat("0", 64)}
+	writeManifestFile(t, path, bound)
+	if err := verifyManifest(path, false); err == nil || !strings.Contains(err.Error(), "enumeration rules") {
+		t.Fatalf("a policy hash mismatch must fail closed: %v", err)
+	}
+}
+
+func TestManifestV2RejectsGeneratedDeclarations(t *testing.T) {
+	policyPath := writeTestPolicyWith(t, []string{"gen/out.py"})
+	// The generated file exists on disk: enumeration must exclude it AND the
+	// declaration must refuse to claim it — the exact way generated protobuf
+	// bindings once rode into the source delta.
+	root := writeTree(t, map[string]string{
+		"Cargo.toml":          "[workspace.package]\nversion = \"1.2.3\"\n",
+		"crates/a/src/lib.rs": "pub fn a() {}\n",
+		"gen/out.py":          "# generated\n",
+	})
+	declared := declaredManifestV2(t, root, policyPath, transferManifest{
+		Delta: &typedDelta{AddedFiles: []string{"gen/out.py"}},
+	})
+	path := filepath.Join(t.TempDir(), "nemo-transfer-manifest.json")
+	writeManifestFile(t, path, declared)
+	err := verifyManifest(path, false)
+	if err == nil {
+		t.Fatal("declaring a generated path as source must fail")
+	}
+	if !strings.Contains(err.Error(), "generated artifact") {
+		t.Fatalf("error = %q, want the generated-path rejection named", err)
+	}
+}
+
+func TestManifestV2RequireSourceFailsClosed(t *testing.T) {
+	root := baseTree(t)
+	policyPath := writeTestPolicy(t)
+	missing := filepath.Join(t.TempDir(), "absent-source")
+	declared := declaredManifestV2(t, root, policyPath, transferManifest{
+		Source: &manifestSource{Path: missing, FileCount: 3, SHA256: strings.Repeat("0", 64)},
+		Delta:  &typedDelta{},
+	})
+	path := filepath.Join(t.TempDir(), "nemo-transfer-manifest.json")
+
+	// Standalone shipping-tree verification may report and continue.
+	writeManifestFile(t, path, declared)
+	if err := verifyManifest(path, false); err != nil {
+		t.Fatalf("informational verification may proceed without the source: %v", err)
+	}
+
+	// The flag is official transfer-provenance qualification: fail closed.
+	if err := verifyManifest(path, true); err == nil || !strings.Contains(err.Error(), "requires it") {
+		t.Fatalf("-require-source must fail when the source is absent: %v", err)
+	}
+
+	// The manifest can demand the same strictness on its own.
+	declared.Source.Required = true
+	writeManifestFile(t, path, declared)
+	if err := verifyManifest(path, false); err == nil || !strings.Contains(err.Error(), "requires it") {
+		t.Fatalf("source.required must fail when the source is absent: %v", err)
+	}
+}
+
+func TestManifestV2VerifyTransferIsExhaustiveForSymlinks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation needs privileges on Windows")
+	}
+	policyPath := writeTestPolicy(t)
+	source, vendored := transferredPair(t)
+	if err := os.MkdirAll(filepath.Join(vendored, "docs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("target-a", filepath.Join(source, "docs", "link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("target-b", filepath.Join(vendored, "docs", "link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("fresh", filepath.Join(vendored, "docs", "new-link")); err != nil {
+		t.Fatal(err)
+	}
+	declared := declarationForPairV2(t, source, vendored, policyPath, typedDelta{
+		ModifiedFiles: []string{"crates/a/src/lib.rs"},
+		AddedFiles:    []string{"TRANSFER-PROVENANCE.md", "bridges/x/src/lib.rs"},
+		RemovedFiles:  []string{"docs/old.md"},
+		// The symlink classes deliberately left undeclared.
+	})
+	path := filepath.Join(t.TempDir(), "nemo-transfer-manifest.json")
+	writeManifestFile(t, path, declared)
+	err := verifyManifest(path, false)
+	if err == nil {
+		t.Fatal("undeclared symlink changes must fail verification")
+	}
+	if !strings.Contains(err.Error(), "undeclared added symlink: docs/new-link") {
+		t.Fatalf("error = %q, want the added link named", err)
+	}
+	if !strings.Contains(err.Error(), "undeclared retargeted symlink: docs/link") {
+		t.Fatalf("error = %q, want the retargeted link named", err)
+	}
+
+	// Declare the full symlink delta: verification passes.
+	declared.Delta.AddedSymlinks = []string{"docs/new-link"}
+	declared.Delta.RetargetedSymlinks = []string{"docs/link"}
+	writeManifestFile(t, path, declaredManifestV2(t, vendored, policyPath, declared))
+	if err := verifyManifest(path, false); err != nil {
+		t.Fatalf("the complete symlink declaration must verify: %v", err)
+	}
+}
+
+func TestGeneratedPathMatching(t *testing.T) {
+	cases := []struct {
+		pattern string
+		path    string
+		want    bool
+	}{
+		{"gen/", "gen/out.py", true},
+		{"gen/", "gen/sub/deep.py", true},
+		{"gen/", "generation/out.py", false},
+		{"crates/node/*.node", "crates/node/x.node", true},
+		{"crates/node/*.node", "crates/node/sub/x.node", false},
+		{"examples/**/relay-plugin.local.toml", "examples/a/b/relay-plugin.local.toml", true},
+		{"examples/**/relay-plugin.local.toml", "examples/relay-plugin.local.toml", true},
+		{"out.py", "out.py", true},
+		{"out.py", "sub/out.py", false},
+		{"**/pb2.py", "a/b/pb2.py", true},
+	}
+	for _, c := range cases {
+		if got := generatedMatch(c.pattern, c.path); got != c.want {
+			t.Errorf("generatedMatch(%q, %q) = %v, want %v", c.pattern, c.path, got, c.want)
+		}
+	}
+}
+
+// The format-2 golden vector: a fixed fixture tree must digest to exactly
+// this value — the same bytes the Python reference implementation produces
+// record-for-record. A format regression changes the value; an intentional
+// format change regenerates the fixture deliberately.
+func TestDigestV2GoldenFixture(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation needs privileges on Windows")
+	}
+	policyPath := writeTestPolicy(t)
+	policy, err := readPolicy(policyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := writeTree(t, map[string]string{
+		"Cargo.toml":          "[workspace.package]\nversion = \"9.9.9\"\n",
+		"crates/a/src/lib.rs": "pub fn a() {}\n",
+		"tool.sh":             "#!/bin/sh\ntrue\n",
+	})
+	if err := os.Chmod(filepath.Join(root, "tool.sh"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("crates/a/src/lib.rs", filepath.Join(root, "LINK")); err != nil {
+		t.Fatal(err)
+	}
+	identity, err := digestRuntimeV2(root, &policy)
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	// FILE records for Cargo.toml / lib.rs / tool.sh (x) plus SYMLINK LINK,
+	// byte-sorted: the stream any conforming implementation must emit.
+	const want = "9cc44e1e276860ac273a2a0516223d7ad4ce90eacbe8e28cc2d2dd5a6b1b98b2"
+	if identity.NemoRuntimeSHA256 != want {
+		t.Fatalf("golden digest drifted: got %s, want %s", identity.NemoRuntimeSHA256, want)
+	}
+	if identity.FileCount != 3 || identity.SymlinkCount != 1 {
+		t.Fatalf("counts: got %d files %d links", identity.FileCount, identity.SymlinkCount)
 	}
 }

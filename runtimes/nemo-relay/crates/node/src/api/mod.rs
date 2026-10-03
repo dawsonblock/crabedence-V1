@@ -6091,7 +6091,7 @@ pub struct DynamicPluginActivation {
 type DynamicPluginTeardownResult = std::result::Result<(), String>;
 
 enum DynamicPluginCloseStatus {
-    Active(Option<ActivatedPluginRuntime>),
+    Active(Option<Box<ActivatedPluginRuntime>>),
     Closing,
     Closed,
 }
@@ -6105,7 +6105,7 @@ impl DynamicPluginCloseState {
     fn new(activation: ActivatedPluginRuntime) -> Self {
         let (completion, _) = tokio::sync::watch::channel(None);
         Self {
-            status: StdMutex::new(DynamicPluginCloseStatus::Active(Some(activation))),
+            status: StdMutex::new(DynamicPluginCloseStatus::Active(Some(Box::new(activation)))),
             completion,
         }
     }
