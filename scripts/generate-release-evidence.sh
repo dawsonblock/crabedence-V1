@@ -1347,10 +1347,21 @@ cat > "$EVIDENCE_DIR/sbom.spdx.json" << EOF
 }
 EOF
 
-# ─── Phase 19: The human-readable report is a VIEW over the records ──────
+# ─── Phase 19: Manifest copy, evidence root, then the generated report ───
+# The component manifest ships inside the bundle so the evidence root
+# binds it without reaching back into the repository.
+cp "$REPO_ROOT/runtimes/nemo-transfer-manifest.json" "$EVIDENCE_DIR/nemo-transfer-manifest.json"
+
+# The semantic closure: binds every identity the run produced — commit,
+# source manifest, runtime and component digests, every gate's log
+# digest — reduced to a single signable root_sha256. The artifact
+# binding lands at finalization.
+python3 "$REPO_ROOT/scripts/generate-evidence-root.py" "$EVIDENCE_DIR" --repo-root "$REPO_ROOT"
+
 # FINAL_QUALIFICATION_REPORT.md is generated from qualification.json /
 # release-manifest.json / evidence-root.json — never written by hand,
-# so a PASS cannot be asserted in prose the records do not support.
+# so a PASS cannot be asserted in prose the records do not support. It
+# runs after the root so the report can display the signed digest.
 "$REPO_ROOT/scripts/generate-qualification-report.sh" "$EVIDENCE_DIR"
 
 # ─── Phase 20: SHA256SUMS for evidence bundle ──────────────────────────────

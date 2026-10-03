@@ -411,6 +411,23 @@ if [ -f "$ARTIFACT_JSON" ]; then
   fi
 fi
 
+# 1bb. The evidence root is the semantic closure: every named binding —
+# commit, source manifest, runtime and component digests, every gate's
+# log digest, the release artifact digests — is recomputed from the
+# evidence files, and root_sha256 must cover the stored document. The
+# claim "these outputs correspond to these release bytes" is machine-
+# checked here, not asserted in prose.
+if [ -f "$EVIDENCE_DIR/evidence-root.json" ]; then
+  if python3 "$SCRIPT_DIR/generate-evidence-root.py" --verify "$EVIDENCE_DIR" --repo-root "$SOURCE_DIR" >/dev/null 2>&1; then
+    check "Evidence root bindings" "PASS"
+  else
+    check "Evidence root bindings" "FAIL"
+    python3 "$SCRIPT_DIR/generate-evidence-root.py" --verify "$EVIDENCE_DIR" --repo-root "$SOURCE_DIR" >&2 || true
+  fi
+else
+  check "Evidence root (missing)" "FAIL"
+fi
+
 # 1c. Registry policy identity — the capability catalog the release was
 # qualified against. The envelope carries the exact canonical descriptor
 # bytes, so the digest is recomputed HERE from the bytes; a stored digest

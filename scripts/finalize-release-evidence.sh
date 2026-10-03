@@ -88,6 +88,14 @@ if [ -d "$EVIDENCE_DIR/attestation" ]; then
   rm -rf "$EVIDENCE_DIR/attestation"
 fi
 
+# ─── Rebind the evidence root: artifacts pending -> bound ────────────────
+# The qualification-time root recorded artifacts.status "pending"; with
+# artifact.json present the root must bind the release artifact digests
+# before SHA256SUMS seals it. The generated report displays the root
+# digest, so it is regenerated with it.
+python3 "$REPO_ROOT/scripts/generate-evidence-root.py" "$EVIDENCE_DIR" --repo-root "$REPO_ROOT"
+"$REPO_ROOT/scripts/generate-qualification-report.sh" "$EVIDENCE_DIR"
+
 # ─── Regenerate SHA256SUMS over the final bundle ──────────────────────────
 # Same traversal as generate-release-evidence.sh, with artifact.json now
 # INCLUDED. SHA256SUMS and evidence-manifest.json stay excluded: the
