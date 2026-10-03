@@ -32,7 +32,20 @@ function fixture(t, { artifact = true, manifest = true } = {}) {
   );
   fs.writeFileSync(
     path.join(root, "qualification.json"),
-    JSON.stringify({ release_status: "PASS", gates: [] }, null, 2),
+    JSON.stringify(
+      {
+        release_status: "PASS",
+        artifact_promotable: true,
+        provenance: { ...identity, timestamp: "2026-09-18T00:00:00Z" },
+        gate_summary: { total: 0, passed: 0, failed: 0, skipped: 0 },
+        gates: [],
+        invariants: [],
+        toolchains: {},
+        environment: {},
+      },
+      null,
+      2,
+    ),
   );
   fs.writeFileSync(
     path.join(root, "release-manifest.json"),

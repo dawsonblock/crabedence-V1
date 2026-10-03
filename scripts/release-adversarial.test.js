@@ -231,6 +231,16 @@ function verifierFixture(t, mutate = () => {}) {
   const artifactBytes = Buffer.from(JSON.stringify(artifact));
   fs.writeFileSync(path.join(root, "artifact.json"), artifactBytes);
 
+  // The verifier requires the semantic closure over every binding above:
+  // generate the real evidence root the same way the pipeline does,
+  // against the same repo-root the verifier is handed.
+  execFileSync("python3", [
+    path.join(scripts, "generate-evidence-root.py"),
+    root,
+    "--repo-root",
+    source,
+  ]);
+
   const covered = [
     "provenance.json",
     "source-commit.txt",
@@ -245,6 +255,7 @@ function verifierFixture(t, mutate = () => {}) {
     "release-manifest.json",
     "sbom.spdx.json",
     "gate-results/exact-toolchain.log",
+    "evidence-root.json",
   ];
   fs.writeFileSync(
     path.join(root, "SHA256SUMS"),
