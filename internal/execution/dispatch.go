@@ -12,6 +12,7 @@ import (
 	"github.com/openclaw/crabbox/internal/capability"
 	"github.com/openclaw/crabbox/internal/evidence"
 	"github.com/openclaw/crabbox/internal/idempotency"
+	"github.com/openclaw/crabbox/internal/providertransport"
 )
 
 // DispatchState tracks where an execution is in the dispatch lifecycle.
@@ -243,6 +244,16 @@ func (e *DispatchExecutor) SetProviderGate(g *ProviderGate) {
 // provider-level health surface.
 func (e *DispatchExecutor) ProviderGate() *ProviderGate { return e.gate }
 
+// laneFor maps the resolved execution class onto the provider lane —
+// direct reads draw from the read lane, effect dispatches from the
+// mutation lane. Both share the bounded dispatch pool.
+func laneFor(desc capability.ResolvedDescriptor) ProviderLane {
+	if desc.ExecutionClass == capability.ClassRead {
+		return LaneRead
+	}
+	return LaneMutation
+}
+
 // observeProviderOutcome accounts one provider outcome on the gate.
 // Health is updated ONLY when the provider actually participated: an
 // executor refusal (open circuit, saturated bound, expired deadline)
@@ -251,20 +262,33 @@ func (e *DispatchExecutor) ProviderGate() *ProviderGate { return e.gate }
 // invocation that outlived the ceiling degrades the provider; a
 // definitive answer — success, definitive failure, or denial — proves
 // the provider is answering and resets the streak.
+//
+// UNKNOWN degradation is cause-aware: the dispatch provenance's
+// classified cause decides whether the ambiguity is attributable to
+// the provider. Provably local causes — executor cancellation, a
+// deadline that fired before dispatch, a policy refusal — are counted
+// without advancing the streak. An absent or unclassified cause stays
+// conservative: an unattributed ambiguity is provider-side.
 func (e *DispatchExecutor) observeProviderOutcome(
 	desc capability.ResolvedDescriptor,
 	outcome DispatchOutcome,
 	state idempotency.State,
+	provResp Response,
 ) {
 	if !outcome.ProviderInvoked {
 		return
 	}
 	if state == idempotency.StateUnknown {
-		e.gate.RecordAmbiguous(desc.AdapterID, "post-dispatch ambiguity (UNKNOWN)")
+		cause := providertransport.AmbiguityCause("")
+		if provResp.Dispatch != nil {
+			cause = providertransport.AmbiguityCause(provResp.Dispatch.Cause)
+		}
+		providerSide := cause == "" || cause == providertransport.CauseUnknown || cause.ProviderSide()
+		e.gate.RecordAmbiguousOutcome(desc.AdapterID, providerSide, "post-dispatch ambiguity (UNKNOWN)")
 		return
 	}
 	if outcome.TimedOut {
-		e.gate.RecordAmbiguous(desc.AdapterID, "provider exceeded the executor ceiling")
+		e.gate.RecordAmbiguousOutcome(desc.AdapterID, true, "provider exceeded the executor ceiling")
 		return
 	}
 	e.gate.RecordSuccess(desc.AdapterID)
@@ -286,7 +310,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	if desc.ExecutionClass == capability.ClassPure || desc.ExecutionClass == capability.ClassRead {
 		outcome := e.dispatch(ctx, req, desc, nil)
 		state, _ := classifyPostDispatch(outcome.Response, desc)
-		e.observeProviderOutcome(desc, outcome, state)
+		e.observeProviderOutcome(desc, outcome, state, outcome.Response)
 		return outcome.Response
 	}
 
@@ -378,8 +402,38 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		Generation: req.Authority.AuthorityGeneration,
 		Digest:     req.Authority.AuthorityDigest,
 	}
-	acq, err := e.store.AcquireWithMediation(ctx, req.IdempotencyKey, req.Authority.Principal, req.Capability, digest,
-		authorityBinding, mediation, string(desc.ExecutionClass), leaseDuration)
+	// Server-verified runtime provenance: resolved by the service from
+	// the attestation session — never the caller's claim. It is bound
+	// onto the record at insert; it is NOT part of the request digest,
+	// so a request re-attested under a new session replays to the same
+	// execution identity.
+	var attestation *idempotency.AttestationBinding
+	if req.Attestation != nil {
+		attestation = &idempotency.AttestationBinding{
+			SessionID:      req.Attestation.SessionID,
+			IdentityDigest: req.Attestation.IdentityDigest,
+			KeyFingerprint: req.Attestation.KeyFingerprint,
+		}
+	}
+	// Kernel-supplied local-caller evidence: resolved once on the
+	// connection — which OS-level process invoked. Like attestation it
+	// is evidence only, never bound into the request digest.
+	var peer *idempotency.PeerBinding
+	if req.Peer != nil {
+		peer = &idempotency.PeerBinding{
+			UID:        req.Peer.UID,
+			PID:        req.Peer.PID,
+			Executable: req.Peer.Executable,
+		}
+	}
+	provenance := idempotency.AcquireProvenance{
+		Authority:   authorityBinding,
+		Mediation:   mediation,
+		Attestation: attestation,
+		Peer:        peer,
+	}
+	acq, err := e.store.AcquireWithProvenance(ctx, req.IdempotencyKey, req.Authority.Principal, req.Capability, digest,
+		provenance, string(desc.ExecutionClass), leaseDuration)
 	if err != nil {
 		return Response{
 			Status:      StatusFailed,
@@ -454,9 +508,9 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 				}
 			}
 			if acquireDigest != "" {
-				if reacq, reErr := e.store.AcquireWithMediation(ctx, req.IdempotencyKey,
-					req.Authority.Principal, req.Capability, acquireDigest, authorityBinding,
-					mediation, string(desc.ExecutionClass), leaseDuration); reErr == nil {
+				if reacq, reErr := e.store.AcquireWithProvenance(ctx, req.IdempotencyKey,
+					req.Authority.Principal, req.Capability, acquireDigest,
+					provenance, string(desc.ExecutionClass), leaseDuration); reErr == nil {
 					acq = reacq
 				} else {
 					return Response{
@@ -575,7 +629,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	// reservation is abandoned rather than consumed — the record
 	// returns to claimable PREPARED, so a retry with the same key
 	// reacquires and, once capacity exists, dispatches for real.
-	providerLease, err := e.gate.Acquire(desc.AdapterID)
+	providerLease, err := e.gate.Acquire(desc.AdapterID, laneFor(desc))
 	if err != nil {
 		e.abandonPreDispatch(ctx, executionID, leaseToken, leaseGen)
 		return e.providerRefusedResponse(err)
@@ -758,7 +812,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 
 	// ─── TERMINAL DECISION — single post-dispatch decision table ─────────
 	state, resp := classifyPostDispatch(providerResp, desc)
-	e.observeProviderOutcome(desc, outcome, state)
+	e.observeProviderOutcome(desc, outcome, state, providerResp)
 
 	evidenceDigest := ""
 	receiptVersion := 0
@@ -1026,7 +1080,7 @@ func (e *DispatchExecutor) dispatch(ctx context.Context, req Request, desc capab
 	// the outcome is a provable no-effect failure — never post-dispatch
 	// ambiguity.
 	if lease == nil {
-		acquired, err := e.gate.Acquire(desc.AdapterID)
+		acquired, err := e.gate.Acquire(desc.AdapterID, laneFor(desc))
 		if err != nil {
 			return DispatchOutcome{Response: e.providerRefusedResponse(err), ProvableNoEffect: true}
 		}
@@ -1260,6 +1314,10 @@ func buildObservation(resp Response, desc capability.ResolvedDescriptor) idempot
 	if resp.Evidence != nil {
 		obs.EvidenceDigest = resp.Evidence.Digest
 		obs.ReceiptVersion = resp.Evidence.ReceiptVersion
+	}
+	if resp.Dispatch != nil {
+		obs.AmbiguityCause = resp.Dispatch.Cause
+		obs.DispatchMilestone = resp.Dispatch.Milestone
 	}
 	return obs
 }

@@ -1,13 +1,11 @@
 package execution
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"sort"
@@ -16,6 +14,7 @@ import (
 
 	"github.com/openclaw/crabbox/internal/capability"
 	"github.com/openclaw/crabbox/internal/idempotency"
+	"github.com/openclaw/crabbox/internal/providertransport"
 )
 
 // State-observation recovery: a PATCHed field carries no free-form
@@ -68,9 +67,8 @@ func digestStringSet(values []string) string {
 //   - Resolve GETs the issue — strictly observational. state=closed →
 //     COMMITTED (the desired postcondition holds); otherwise → UNKNOWN.
 type GitHubIssueCloseHandler struct {
-	baseURL string
-	token   string
-	client  *http.Client
+	transport    *providertransport.Transport
+	transportErr error
 }
 
 // NewGitHubIssueCloseHandler creates the close adapter against the same
@@ -79,15 +77,39 @@ func NewGitHubIssueCloseHandler(baseURL, token string) *GitHubIssueCloseHandler 
 	if baseURL == "" {
 		baseURL = "https://api.github.com"
 	}
-	return &GitHubIssueCloseHandler{
-		baseURL: strings.TrimRight(baseURL, "/"),
-		token:   token,
-		client:  &http.Client{Timeout: 10 * time.Second},
+	h := &GitHubIssueCloseHandler{}
+	h.transport, h.transportErr = newGitHubTransport(baseURL, token)
+	return h
+}
+
+// SetTransport installs the shared trusted transport — the production
+// wiring path.
+func (h *GitHubIssueCloseHandler) SetTransport(t *providertransport.Transport) {
+	h.transport, h.transportErr = t, nil
+}
+
+// SetHTTPClient overrides the transport's HTTP client (tests use
+// short timeouts and injected round-trippers).
+func (h *GitHubIssueCloseHandler) SetHTTPClient(c *http.Client) {
+	if h.transport != nil {
+		h.transport.SetHTTPClient(c)
 	}
 }
 
-// SetHTTPClient overrides the HTTP client (tests use short timeouts).
-func (h *GitHubIssueCloseHandler) SetHTTPClient(c *http.Client) { h.client = c }
+// transportFailure renders a transport-construction failure as a
+// definite no-effect — nothing was ever dispatched.
+func (h *GitHubIssueCloseHandler) transportFailure() (Response, bool) {
+	if h.transportErr == nil {
+		return Response{}, false
+	}
+	return Response{
+		Status:            StatusFailed,
+		FailureCode:       string(capability.FailureInternalError),
+		Error:             fmt.Sprintf("github transport unavailable: %v", h.transportErr),
+		DefinitiveFailure: true,
+		Execution:         &ExecutionMeta{Provider: "github"},
+	}, true
+}
 
 // issueCloseStateReasons is the closed set the schema's enum must match
 // — the adapter re-validates semantically, always.
@@ -165,6 +187,9 @@ func (h *GitHubIssueCloseHandler) Execute(ctx context.Context, req Request, desc
 		}
 	}
 
+	if fail, bad := h.transportFailure(); bad {
+		return fail
+	}
 	payload := map[string]string{"state": "closed"}
 	if args.StateReason != "" {
 		payload["state_reason"] = args.StateReason
@@ -172,39 +197,22 @@ func (h *GitHubIssueCloseHandler) Execute(ctx context.Context, req Request, desc
 	body, _ := json.Marshal(payload)
 
 	owner, name, _ := githubRepoParts(args.Repo)
-	endpoint := fmt.Sprintf("%s/repos/%s/%s/issues/%d",
-		h.baseURL, url.PathEscape(owner), url.PathEscape(name), args.Number)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPatch, endpoint, bytes.NewReader(body))
+	token := ExternalTokenFromContext(ctx)
+	httpResp, err := h.transport.Do(ctx, providertransport.ProviderHTTPRequest{
+		Method: http.MethodPatch,
+		URL: fmt.Sprintf("/repos/%s/%s/issues/%d",
+			url.PathEscape(owner), url.PathEscape(name), args.Number),
+		Headers: map[string]string{
+			"Content-Type": "application/json",
+			"Accept":       "application/vnd.github+json",
+		},
+		Body:    body,
+		Context: githubRequestContext(req, "github.issue.close", desc, fmt.Sprintf("repos/%s/issues/%d", args.Repo, args.Number), token),
+	})
 	if err != nil {
-		return Response{
-			Status:            StatusFailed,
-			FailureCode:       string(capability.FailureInternalError),
-			Error:             err.Error(),
-			DefinitiveFailure: true,
-			Execution:         &ExecutionMeta{Provider: "github"},
-		}
+		return githubFailure(err)
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "application/vnd.github+json")
-	if h.token != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+h.token)
-	}
-	if token := ExternalTokenFromContext(ctx); token != "" {
-		httpReq.Header.Set("X-Crabex-Operation", token)
-	}
-
-	httpResp, err := h.client.Do(httpReq)
-	if err != nil {
-		return Response{
-			Status:            StatusFailed,
-			FailureCode:       string(capability.FailureExecutionFailed),
-			Error:             fmt.Sprintf("github request failed: %v", err),
-			DefinitiveFailure: githubTransportDefinitive(err),
-			Execution:         &ExecutionMeta{Provider: "github"},
-		}
-	}
-	defer httpResp.Body.Close()
-	respBody, _ := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))
+	respBody := httpResp.Body
 
 	if httpResp.StatusCode == http.StatusOK {
 		var issue struct {
@@ -219,6 +227,7 @@ func (h *GitHubIssueCloseHandler) Execute(ctx context.Context, req Request, desc
 				FailureCode: string(capability.FailureExecutionUnknown),
 				Error:       fmt.Sprintf("github returned %d with unparseable body: %v", httpResp.StatusCode, err),
 				Execution:   &ExecutionMeta{Provider: "github"},
+				Dispatch:    githubProvenance(httpResp.Trace, httpResp.StatusCode),
 			}
 		}
 		runID := issue.HTMLURL
@@ -237,6 +246,7 @@ func (h *GitHubIssueCloseHandler) Execute(ctx context.Context, req Request, desc
 			Evidence:         &EvidenceRef{ReceiptVersion: 3},
 			EvidenceArtifact: respBody, // raw provider response — digest is recomputed upstream
 			Execution:        &ExecutionMeta{Provider: "github", RunID: runID},
+			Dispatch:         githubProvenance(httpResp.Trace, httpResp.StatusCode),
 		}
 	}
 
@@ -250,6 +260,7 @@ func (h *GitHubIssueCloseHandler) Execute(ctx context.Context, req Request, desc
 		DefinitiveFailure: definitive,
 		EvidenceArtifact:  respBody, // provider's rejection body — artifact for NO_EFFECT proof
 		Execution:         &ExecutionMeta{Provider: "github"},
+		Dispatch:          githubProvenance(httpResp.Trace, httpResp.StatusCode),
 	}
 }
 
@@ -273,23 +284,24 @@ func (h *GitHubIssueCloseHandler) Resolve(ctx context.Context, rec *idempotency.
 		return idempotency.RecoveryResult{Decision: idempotency.RecoveryUnknown}, nil
 	}
 
-	endpoint := fmt.Sprintf("%s/repos/%s/%s/issues/%d",
-		h.baseURL, url.PathEscape(owner), url.PathEscape(name), number)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return idempotency.RecoveryResult{}, err
+	if h.transportErr != nil {
+		return idempotency.RecoveryResult{}, fmt.Errorf("github transport unavailable: %w", h.transportErr)
 	}
-	httpReq.Header.Set("Accept", "application/vnd.github+json")
-	if h.token != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+h.token)
-	}
-	httpResp, err := h.client.Do(httpReq)
+	httpResp, err := h.transport.Do(ctx, providertransport.ProviderHTTPRequest{
+		Method: http.MethodGet,
+		URL: fmt.Sprintf("/repos/%s/%s/issues/%d",
+			url.PathEscape(owner), url.PathEscape(name), number),
+		Headers: map[string]string{"Accept": "application/vnd.github+json"},
+		Context: providertransport.RequestContext{
+			Capability: "github.issue.close",
+			Resource:   fmt.Sprintf("repos/%s/issues/%d", repo, number),
+		},
+	})
 	if err != nil {
 		return idempotency.RecoveryResult{}, fmt.Errorf("github issue get failed: %w", err)
 	}
-	respBody, _ := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))
+	respBody := httpResp.Body
 	status := httpResp.StatusCode
-	httpResp.Body.Close()
 	if status != http.StatusOK {
 		return idempotency.RecoveryResult{}, fmt.Errorf("github issue get returned %d", status)
 	}
@@ -400,9 +412,8 @@ func transitionWithinExecution(transition string, rec *idempotency.Record) bool 
 // canonical form, and Resolve commits when every provided field's
 // digest matches the observed object.
 type GitHubIssueUpdateHandler struct {
-	baseURL string
-	token   string
-	client  *http.Client
+	transport    *providertransport.Transport
+	transportErr error
 }
 
 // NewGitHubIssueUpdateHandler creates the update adapter against the
@@ -411,15 +422,39 @@ func NewGitHubIssueUpdateHandler(baseURL, token string) *GitHubIssueUpdateHandle
 	if baseURL == "" {
 		baseURL = "https://api.github.com"
 	}
-	return &GitHubIssueUpdateHandler{
-		baseURL: strings.TrimRight(baseURL, "/"),
-		token:   token,
-		client:  &http.Client{Timeout: 10 * time.Second},
+	h := &GitHubIssueUpdateHandler{}
+	h.transport, h.transportErr = newGitHubTransport(baseURL, token)
+	return h
+}
+
+// SetTransport installs the shared trusted transport — the production
+// wiring path.
+func (h *GitHubIssueUpdateHandler) SetTransport(t *providertransport.Transport) {
+	h.transport, h.transportErr = t, nil
+}
+
+// SetHTTPClient overrides the transport's HTTP client (tests use
+// short timeouts and injected round-trippers).
+func (h *GitHubIssueUpdateHandler) SetHTTPClient(c *http.Client) {
+	if h.transport != nil {
+		h.transport.SetHTTPClient(c)
 	}
 }
 
-// SetHTTPClient overrides the HTTP client (tests use short timeouts).
-func (h *GitHubIssueUpdateHandler) SetHTTPClient(c *http.Client) { h.client = c }
+// transportFailure renders a transport-construction failure as a
+// definite no-effect — nothing was ever dispatched.
+func (h *GitHubIssueUpdateHandler) transportFailure() (Response, bool) {
+	if h.transportErr == nil {
+		return Response{}, false
+	}
+	return Response{
+		Status:            StatusFailed,
+		FailureCode:       string(capability.FailureInternalError),
+		Error:             fmt.Sprintf("github transport unavailable: %v", h.transportErr),
+		DefinitiveFailure: true,
+		Execution:         &ExecutionMeta{Provider: "github"},
+	}, true
+}
 
 type githubIssueUpdateArgs struct {
 	Repo      string    `json:"repo"`
@@ -575,40 +610,26 @@ func (h *GitHubIssueUpdateHandler) Execute(ctx context.Context, req Request, des
 	}
 	body, _ := json.Marshal(payload)
 
+	if fail, bad := h.transportFailure(); bad {
+		return fail
+	}
 	owner, name, _ := githubRepoParts(args.Repo)
-	endpoint := fmt.Sprintf("%s/repos/%s/%s/issues/%d",
-		h.baseURL, url.PathEscape(owner), url.PathEscape(name), args.Number)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPatch, endpoint, bytes.NewReader(body))
+	token := ExternalTokenFromContext(ctx)
+	httpResp, err := h.transport.Do(ctx, providertransport.ProviderHTTPRequest{
+		Method: http.MethodPatch,
+		URL: fmt.Sprintf("/repos/%s/%s/issues/%d",
+			url.PathEscape(owner), url.PathEscape(name), args.Number),
+		Headers: map[string]string{
+			"Content-Type": "application/json",
+			"Accept":       "application/vnd.github+json",
+		},
+		Body:    body,
+		Context: githubRequestContext(req, "github.issue.update", desc, fmt.Sprintf("repos/%s/issues/%d", args.Repo, args.Number), token),
+	})
 	if err != nil {
-		return Response{
-			Status:            StatusFailed,
-			FailureCode:       string(capability.FailureInternalError),
-			Error:             err.Error(),
-			DefinitiveFailure: true,
-			Execution:         &ExecutionMeta{Provider: "github"},
-		}
+		return githubFailure(err)
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "application/vnd.github+json")
-	if h.token != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+h.token)
-	}
-	if token := ExternalTokenFromContext(ctx); token != "" {
-		httpReq.Header.Set("X-Crabex-Operation", token)
-	}
-
-	httpResp, err := h.client.Do(httpReq)
-	if err != nil {
-		return Response{
-			Status:            StatusFailed,
-			FailureCode:       string(capability.FailureExecutionFailed),
-			Error:             fmt.Sprintf("github request failed: %v", err),
-			DefinitiveFailure: githubTransportDefinitive(err),
-			Execution:         &ExecutionMeta{Provider: "github"},
-		}
-	}
-	defer httpResp.Body.Close()
-	respBody, _ := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))
+	respBody := httpResp.Body
 
 	if httpResp.StatusCode == http.StatusOK {
 		var issue struct {
@@ -621,6 +642,7 @@ func (h *GitHubIssueUpdateHandler) Execute(ctx context.Context, req Request, des
 				FailureCode: string(capability.FailureExecutionUnknown),
 				Error:       fmt.Sprintf("github returned %d with unparseable body: %v", httpResp.StatusCode, err),
 				Execution:   &ExecutionMeta{Provider: "github"},
+				Dispatch:    githubProvenance(httpResp.Trace, httpResp.StatusCode),
 			}
 		}
 		runID := issue.HTMLURL
@@ -639,6 +661,7 @@ func (h *GitHubIssueUpdateHandler) Execute(ctx context.Context, req Request, des
 			Evidence:         &EvidenceRef{ReceiptVersion: 3},
 			EvidenceArtifact: respBody,
 			Execution:        &ExecutionMeta{Provider: "github", RunID: runID},
+			Dispatch:         githubProvenance(httpResp.Trace, httpResp.StatusCode),
 		}
 	}
 
@@ -650,6 +673,7 @@ func (h *GitHubIssueUpdateHandler) Execute(ctx context.Context, req Request, des
 		DefinitiveFailure: definitive,
 		EvidenceArtifact:  respBody,
 		Execution:         &ExecutionMeta{Provider: "github"},
+		Dispatch:          githubProvenance(httpResp.Trace, httpResp.StatusCode),
 	}
 }
 
@@ -685,23 +709,24 @@ func (h *GitHubIssueUpdateHandler) Resolve(ctx context.Context, rec *idempotency
 		return idempotency.RecoveryResult{Decision: idempotency.RecoveryUnknown}, nil
 	}
 
-	endpoint := fmt.Sprintf("%s/repos/%s/%s/issues/%d",
-		h.baseURL, url.PathEscape(owner), url.PathEscape(name), number)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return idempotency.RecoveryResult{}, err
+	if h.transportErr != nil {
+		return idempotency.RecoveryResult{}, fmt.Errorf("github transport unavailable: %w", h.transportErr)
 	}
-	httpReq.Header.Set("Accept", "application/vnd.github+json")
-	if h.token != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+h.token)
-	}
-	httpResp, err := h.client.Do(httpReq)
+	httpResp, err := h.transport.Do(ctx, providertransport.ProviderHTTPRequest{
+		Method: http.MethodGet,
+		URL: fmt.Sprintf("/repos/%s/%s/issues/%d",
+			url.PathEscape(owner), url.PathEscape(name), number),
+		Headers: map[string]string{"Accept": "application/vnd.github+json"},
+		Context: providertransport.RequestContext{
+			Capability: "github.issue.update",
+			Resource:   fmt.Sprintf("repos/%s/issues/%d", repo, number),
+		},
+	})
 	if err != nil {
 		return idempotency.RecoveryResult{}, fmt.Errorf("github issue get failed: %w", err)
 	}
-	respBody, _ := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))
+	respBody := httpResp.Body
 	status := httpResp.StatusCode
-	httpResp.Body.Close()
 	if status != http.StatusOK {
 		return idempotency.RecoveryResult{}, fmt.Errorf("github issue get returned %d", status)
 	}

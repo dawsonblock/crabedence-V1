@@ -120,6 +120,10 @@ type ObservationRecord struct {
 	EvidenceSHA256        string          `json:"evidence_sha256,omitempty"`
 	ReceiptVersion        int             `json:"receipt_version,omitempty"`
 	ObservedAt            time.Time       `json:"observed_at"`
+	// AmbiguityCause/DispatchMilestone are the UNKNOWN-causality
+	// provenance the observation carried — see Record.AmbiguityCause.
+	AmbiguityCause    string `json:"ambiguity_cause,omitempty"`
+	DispatchMilestone string `json:"dispatch_milestone,omitempty"`
 }
 
 // sha256Hex returns the lowercase hex SHA-256 of b, or "" for empty

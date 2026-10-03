@@ -85,6 +85,15 @@ with:
 go run ./cmd/nemo-runtime-digest -manifest runtimes/nemo-transfer-manifest.json
 ```
 
+A consumer without a Go toolchain verifies the same declaration with
+`scripts/verify-nemo-transfer.py` — a stdlib-only Python mirror of the
+tool's verify path (same digest definition, same checks, same failure
+semantics):
+
+```sh
+python3 scripts/verify-nemo-transfer.py
+```
+
 After a deliberate change to this tree, regenerate the declaration with the
 same command plus `-update`, then commit the manifest with the change.
 
@@ -104,18 +113,47 @@ gate fails on drift between it and the manifest:
 
 | Kind | Path |
 | --- | --- |
+| modified | `.github/workflows/ci_go.yml` |
+| modified | `.github/workflows/ci_node.yml` |
+| modified | `.github/workflows/ci_python.yml` |
 | modified | `.github/workflows/ci_rust.yml` |
+| modified | `.github/workflows/dependency-gates.yml` |
+| modified | `.github/workflows/effect-contract-conformance.yml` |
+| modified | `.pre-commit-config.yaml` |
 | modified | `Cargo.lock` |
 | modified | `Cargo.toml` |
 | modified | `README.md` |
+| modified | `crates/cli/src/bootstrap/mod.rs` |
+| modified | `crates/cli/src/diagnostics/mod.rs` |
+| modified | `crates/cli/src/diagnostics/model.rs` |
+| modified | `crates/cli/src/diagnostics/render.rs` |
+| modified | `crates/cli/src/installation/marketplace/mod.rs` |
+| modified | `crates/cli/src/lib.rs` |
+| modified | `crates/cli/src/mcp/mod.rs` |
 | modified | `crates/cli/src/mcp_environment.rs` |
-| modified | `crates/core/src/kernel.rs` |
+| modified | `crates/cli/tests/coverage/agents/plugin_install_tests.rs` |
+| modified | `crates/cli/tests/coverage/shared/bootstrap_tests.rs` |
+| modified | `crates/cli/tests/coverage/shared/doctor_tests.rs` |
+| modified | `crates/cli/tests/coverage/shared/test_support.rs` |
+| modified | `crates/core/Cargo.toml` |
+| modified | `crates/core/src/lib.rs` |
+| modified | `crates/core/src/plugin.rs` |
 | modified | `crates/core/src/plugin/dynamic/artifact.rs` |
 | modified | `crates/core/src/plugin/dynamic/manifest.rs` |
+| modified | `crates/core/src/plugin/dynamic/worker.rs` |
+| modified | `crates/core/src/plugin/execution.rs` |
 | modified | `crates/core/tests/fixtures/native_intercept_plugin/Cargo.lock` |
 | modified | `crates/core/tests/fixtures/native_intercept_plugin/src/lib.rs` |
+| modified | `crates/core/tests/unit/dynamic_worker_tests.rs` |
 | modified | `crates/core/tests/unit/plugin_dynamic_tests.rs` |
+| modified | `crates/effect-qualification/Cargo.toml` |
+| modified | `crates/effect-qualification/src/main.rs` |
+| modified | `crates/effect-runtime/Cargo.toml` |
+| modified | `crates/effect-runtime/src/lib.rs` |
+| modified | `crates/effect-runtime/tests/production_composition.rs` |
 | modified | `crates/executor/src/lib.rs` |
+| modified | `crates/ffi/src/api/plugin.rs` |
+| modified | `crates/ffi/src/lib.rs` |
 | modified | `crates/native-loader/Cargo.toml` |
 | modified | `crates/native-loader/src/bin/nemo-plugin-host.rs` |
 | modified | `crates/native-loader/src/bin/unix/nemo-plugin-host.rs` |
@@ -126,8 +164,16 @@ gate fails on drift between it and the manifest:
 | modified | `crates/plugin-host/src/supervisor.rs` |
 | modified | `crates/plugin-host/tests/process_backend.rs` |
 | modified | `crates/plugin-host/tests/support/mod.rs` |
+| modified | `docs/build-plugins/about.mdx` |
 | modified | `docs/build-plugins/package-discoverable-plugins.mdx` |
+| modified | `docs/nemo-relay-cli/plugin-installation.mdx` |
+| modified | `docs/reference/hardening.mdx` |
+| modified | `go/nemo_relay/plugin_activation_test.go` |
 | modified | `integrations/coding-agents/codex/.mcp.json` |
+| modified | `justfile` |
+| modified | `scripts/tcb/test_layers.py` |
+| modified | `security/INVARIANTS.md` |
+| modified | `security/MACOS-RESTRICTED-HOST.md` |
 | modified | `security/PLUGIN-ISOLATION.md` |
 | modified | `security/QUALIFICATION-MATRIX.md` |
 | modified | `security/layers.toml` |
@@ -135,9 +181,15 @@ gate fails on drift between it and the manifest:
 | modified | `security/tcb.toml` |
 | added | `TRANSFER-PROVENANCE.md` |
 | added | `bridges/` |
+| added | `crates/effect-runtime/src/kernel.rs` |
+| added | `crates/ffi/src/plugin_host_location.rs` |
 | added | `crates/native-loader/src/bin/unix/linux_sandbox.rs` |
+| added | `python/plugin/src/nemo_relay_plugin/_proto/plugin_worker_pb2.py` |
+| added | `python/plugin/src/nemo_relay_plugin/_proto/plugin_worker_pb2_grpc.py` |
+| added | `scripts/tcb/invariants.py` |
+| added | `scripts/tcb/test_invariants.py` |
 | added | `security/LINUX-RESTRICTED-HOST.md` |
-| removed | — |
+| removed | `crates/core/src/kernel.rs` |
 
 <!-- END GENERATED TRANSFER DELTA -->
 

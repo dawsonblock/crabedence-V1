@@ -262,6 +262,46 @@ type MediationBinding struct {
 	ActivationConfigSHA256 string `json:"activation_config_sha256,omitempty"`
 }
 
+// AttestationBinding is the server-verified runtime provenance bound
+// onto the record at acquisition: the attested session that carried
+// the request and the digest of the runtime identity that attested
+// it. Unlike MediationBinding it is NOT caller-declared — the service
+// resolves it from a verified attestation session — and it is NOT
+// bound into the request digest: the same caller request attested
+// under a new runtime session must replay to the same execution
+// identity. Provenance only; it never selects route, adapter,
+// assurance, or authority.
+type AttestationBinding struct {
+	SessionID      string `json:"session_id,omitempty"`
+	IdentityDigest string `json:"runtime_identity_digest,omitempty"`
+	KeyFingerprint string `json:"key_fingerprint,omitempty"`
+}
+
+// PeerBinding is the kernel-supplied local-caller evidence — which
+// OS-level process invoked the request. UID is present on every
+// supported platform; PID and Executable are populated where the
+// kernel reports them (Linux SO_PEERCRED + /proc/pid/exe). Nil fields
+// mean the platform cannot supply them, never that the peer has none.
+// Like every binding it is provenance, never a policy input.
+type PeerBinding struct {
+	UID        *int64 `json:"uid,omitempty"`
+	PID        *int64 `json:"pid,omitempty"`
+	Executable string `json:"executable,omitempty"`
+}
+
+// AcquireProvenance is the complete provenance bound onto a record at
+// acquisition — caller-declared mediation, server-resolved authority
+// and runtime attestation, and kernel-supplied local-caller evidence.
+// None of it is a policy input: route, adapter, assurance, and
+// authority are resolved independently, and only the request digest
+// fields participate in execution identity.
+type AcquireProvenance struct {
+	Authority   AuthorityBinding
+	Mediation   *MediationBinding
+	Attestation *AttestationBinding
+	Peer        *PeerBinding
+}
+
 // Acquired returns true if this caller acquired the lease and may
 // proceed to dispatch.
 func (r AcquireResult) Acquired() bool {

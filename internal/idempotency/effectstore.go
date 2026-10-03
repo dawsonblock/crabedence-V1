@@ -26,6 +26,16 @@ type EffectStore interface {
 	// arguments. Evidence only; nil mediation means the request crossed
 	// no caller-side middleware boundary.
 	AcquireWithMediation(ctx context.Context, key, principal, capability, digest string, authority AuthorityBinding, mediation *MediationBinding, class string, leaseDuration time.Duration) (*AcquireResult, error)
+	// AcquireWithProvenance is AcquireWithMediation plus the rest of
+	// the acquisition provenance: the server-verified runtime
+	// attestation (attested session, identity digest, key fingerprint)
+	// and the kernel-supplied local-caller evidence (peer UID, PID,
+	// executable) are persisted on the record at insert so the ledger
+	// names the verified runtime and local process that produced the
+	// request. Evidence only; none of it is bound into the request
+	// digest, so a re-attested session replays to the same execution
+	// identity.
+	AcquireWithProvenance(ctx context.Context, key, principal, capability, digest string, provenance AcquireProvenance, class string, leaseDuration time.Duration) (*AcquireResult, error)
 	// MigrateRequestDigest is the one-time migrate-on-touch for records
 	// written before descriptor/mediation identity was bound
 	// (digest_version = DigestVersionLegacy). The CAS rewrites

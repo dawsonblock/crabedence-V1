@@ -51,6 +51,8 @@ enum Fields {
     Authority,
     /// The `mediation` object: the complete known-field set, nothing else.
     Mediation,
+    /// The `session` object: the complete known-field set, nothing else.
+    Session,
     /// An argument subtree or array: no field set applies.
     None,
 }
@@ -60,7 +62,7 @@ fn root_field(name: &str) -> Option<FieldType> {
         "capability" | "execution_class" | "idempotency_key" | "deadline" => {
             Some(FieldType::String)
         }
-        "arguments" | "authority" | "mediation" => Some(FieldType::Object),
+        "arguments" | "authority" | "mediation" | "session" => Some(FieldType::Object),
         _ => None,
     }
 }
@@ -85,6 +87,13 @@ fn mediation_field(name: &str) -> Option<FieldType> {
     }
 }
 
+fn session_field(name: &str) -> Option<FieldType> {
+    match name {
+        "id" | "proof" => Some(FieldType::String),
+        _ => None,
+    }
+}
+
 /// Enforces field presence rules the type map cannot express: a
 /// `mediation` object that omits either required digest is malformed
 /// evidence — the pre-mediation argument digest is what makes the
@@ -94,6 +103,16 @@ fn mediation_field(name: &str) -> Option<FieldType> {
 fn check_required_fields(path: &str, fields: Fields, keys: &HashSet<String>) -> Result<(), String> {
     if fields == Fields::Mediation {
         for required in ["middleware_set_digest", "original_args_digest"] {
+            if !keys.contains(required) {
+                return Err(format!("{path}.{required} is required"));
+            }
+        }
+    }
+    // A present session object must carry both binding fields: a
+    // session ID without a proof is a bare claim, and a proof without
+    // a session ID binds nothing.
+    if fields == Fields::Session {
+        for required in ["id", "proof"] {
             if !keys.contains(required) {
                 return Err(format!("{path}.{required} is required"));
             }
@@ -290,6 +309,7 @@ impl<'a> Scanner<'a> {
                 Fields::Root => root_field(&key),
                 Fields::Authority => authority_field(&key),
                 Fields::Mediation => mediation_field(&key),
+                Fields::Session => session_field(&key),
                 Fields::None => None,
             };
             if fields != Fields::None && expected.is_none() {
@@ -300,6 +320,8 @@ impl<'a> Scanner<'a> {
                 Fields::Authority
             } else if path == "request" && key == "mediation" {
                 Fields::Mediation
+            } else if path == "request" && key == "session" {
+                Fields::Session
             } else {
                 Fields::None
             };

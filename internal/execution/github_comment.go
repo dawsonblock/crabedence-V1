@@ -1,21 +1,17 @@
 package execution
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"strings"
-	"syscall"
-	"time"
 
 	"github.com/openclaw/crabbox/internal/capability"
 	"github.com/openclaw/crabbox/internal/idempotency"
+	"github.com/openclaw/crabbox/internal/providertransport"
 )
 
 // GitHubCommentHandler implements the github.issue.comment capability —
@@ -32,9 +28,8 @@ import (
 //     because comment listing is eventually consistent and absence of
 //     positive evidence is not proof of no effect.
 type GitHubCommentHandler struct {
-	baseURL string
-	token   string
-	client  *http.Client
+	transport    *providertransport.Transport
+	transportErr error
 }
 
 // NewGitHubCommentHandler creates the comment adapter against the same
@@ -43,15 +38,39 @@ func NewGitHubCommentHandler(baseURL, token string) *GitHubCommentHandler {
 	if baseURL == "" {
 		baseURL = "https://api.github.com"
 	}
-	return &GitHubCommentHandler{
-		baseURL: strings.TrimRight(baseURL, "/"),
-		token:   token,
-		client:  &http.Client{Timeout: 10 * time.Second},
+	h := &GitHubCommentHandler{}
+	h.transport, h.transportErr = newGitHubTransport(baseURL, token)
+	return h
+}
+
+// SetTransport installs the shared trusted transport — the production
+// wiring path.
+func (h *GitHubCommentHandler) SetTransport(t *providertransport.Transport) {
+	h.transport, h.transportErr = t, nil
+}
+
+// SetHTTPClient overrides the transport's HTTP client (tests use
+// short timeouts and injected round-trippers).
+func (h *GitHubCommentHandler) SetHTTPClient(c *http.Client) {
+	if h.transport != nil {
+		h.transport.SetHTTPClient(c)
 	}
 }
 
-// SetHTTPClient overrides the HTTP client (tests use short timeouts).
-func (h *GitHubCommentHandler) SetHTTPClient(c *http.Client) { h.client = c }
+// transportFailure renders a transport-construction failure as a
+// definite no-effect — nothing was ever dispatched.
+func (h *GitHubCommentHandler) transportFailure() (Response, bool) {
+	if h.transportErr == nil {
+		return Response{}, false
+	}
+	return Response{
+		Status:            StatusFailed,
+		FailureCode:       string(capability.FailureInternalError),
+		Error:             fmt.Sprintf("github transport unavailable: %v", h.transportErr),
+		DefinitiveFailure: true,
+		Execution:         &ExecutionMeta{Provider: "github"},
+	}, true
+}
 
 type githubCommentArgs struct {
 	Repo   string `json:"repo"`   // "owner/name"
@@ -122,6 +141,9 @@ func (h *GitHubCommentHandler) Execute(ctx context.Context, req Request, desc ca
 		}
 	}
 
+	if fail, bad := h.transportFailure(); bad {
+		return fail
+	}
 	token := ExternalTokenFromContext(ctx)
 	body := args.Body
 	if token != "" {
@@ -130,52 +152,21 @@ func (h *GitHubCommentHandler) Execute(ctx context.Context, req Request, desc ca
 	payload, _ := json.Marshal(map[string]string{"body": body})
 
 	owner, name, _ := strings.Cut(args.Repo, "/")
-	endpoint := fmt.Sprintf("%s/repos/%s/%s/issues/%d/comments",
-		h.baseURL, url.PathEscape(owner), url.PathEscape(name), args.Number)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	httpResp, err := h.transport.Do(ctx, providertransport.ProviderHTTPRequest{
+		Method: http.MethodPost,
+		URL: fmt.Sprintf("/repos/%s/%s/issues/%d/comments",
+			url.PathEscape(owner), url.PathEscape(name), args.Number),
+		Headers: map[string]string{
+			"Content-Type": "application/json",
+			"Accept":       "application/vnd.github+json",
+		},
+		Body:    payload,
+		Context: githubRequestContext(req, "github.issue.comment", desc, fmt.Sprintf("repos/%s/issues/%d/comments", args.Repo, args.Number), token),
+	})
 	if err != nil {
-		return Response{
-			Status:            StatusFailed,
-			FailureCode:       string(capability.FailureInternalError),
-			Error:             err.Error(),
-			DefinitiveFailure: true,
-			Execution:         &ExecutionMeta{Provider: "github"},
-		}
+		return githubFailure(err)
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "application/vnd.github+json")
-	if h.token != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+h.token)
-	}
-	if token != "" {
-		httpReq.Header.Set("X-Crabex-Operation", token)
-	}
-
-	httpResp, err := h.client.Do(httpReq)
-	if err != nil {
-		// Same dispatch-ambiguity contract as issue.create: only a
-		// failure provably before request bytes left is definitive —
-		// connection refused or unresolved name. Resets, timeouts, and
-		// mid-request drops are ambiguous: UNKNOWN.
-		definitive := errors.Is(err, syscall.ECONNREFUSED)
-		var dnsErr *net.DNSError
-		if errors.As(err, &dnsErr) {
-			definitive = true
-		}
-		var ne net.Error
-		if errors.As(err, &ne) && ne.Timeout() {
-			definitive = false
-		}
-		return Response{
-			Status:            StatusFailed,
-			FailureCode:       string(capability.FailureExecutionFailed),
-			Error:             fmt.Sprintf("github request failed: %v", err),
-			DefinitiveFailure: definitive,
-			Execution:         &ExecutionMeta{Provider: "github"},
-		}
-	}
-	defer httpResp.Body.Close()
-	respBody, _ := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))
+	respBody := httpResp.Body
 
 	if httpResp.StatusCode == http.StatusCreated || httpResp.StatusCode == http.StatusOK {
 		var comment struct {
@@ -190,6 +181,7 @@ func (h *GitHubCommentHandler) Execute(ctx context.Context, req Request, desc ca
 				FailureCode: string(capability.FailureExecutionUnknown),
 				Error:       fmt.Sprintf("github returned %d with unparseable body: %v", httpResp.StatusCode, err),
 				Execution:   &ExecutionMeta{Provider: "github"},
+				Dispatch:    githubProvenance(httpResp.Trace, httpResp.StatusCode),
 			}
 		}
 		runID := comment.HTMLURL
@@ -208,6 +200,7 @@ func (h *GitHubCommentHandler) Execute(ctx context.Context, req Request, desc ca
 			Evidence:         &EvidenceRef{ReceiptVersion: 3},
 			EvidenceArtifact: respBody, // raw provider response — digest is recomputed upstream
 			Execution:        &ExecutionMeta{Provider: "github", RunID: runID},
+			Dispatch:         githubProvenance(httpResp.Trace, httpResp.StatusCode),
 		}
 	}
 
@@ -222,6 +215,7 @@ func (h *GitHubCommentHandler) Execute(ctx context.Context, req Request, desc ca
 		DefinitiveFailure: definitive,
 		EvidenceArtifact:  respBody, // provider's rejection body — artifact for NO_EFFECT proof
 		Execution:         &ExecutionMeta{Provider: "github"},
+		Dispatch:          githubProvenance(httpResp.Trace, httpResp.StatusCode),
 	}
 }
 
@@ -274,30 +268,34 @@ func (h *GitHubCommentHandler) Resolve(ctx context.Context, rec *idempotency.Rec
 	// is only followed on the API origin so the bearer never leaks.
 	truncated := false
 	seen := map[string]bool{}
-	nextURL := fmt.Sprintf("%s/repos/%s/%s/issues/%d/comments?per_page=100",
-		h.baseURL, url.PathEscape(owner), url.PathEscape(name), number)
+	nextURL := fmt.Sprintf("/repos/%s/%s/issues/%d/comments?per_page=100",
+		url.PathEscape(owner), url.PathEscape(name), number)
 	for nextURL != "" {
 		if seen[nextURL] {
 			truncated = true
 			break
 		}
 		seen[nextURL] = true
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, nextURL, nil)
+		httpResp, err := h.transport.Do(ctx, providertransport.ProviderHTTPRequest{
+			Method:  http.MethodGet,
+			URL:     nextURL,
+			Headers: map[string]string{"Accept": "application/vnd.github+json"},
+			Context: providertransport.RequestContext{
+				Capability: "github.issue.comment",
+				Resource:   fmt.Sprintf("repos/%s/issues/%d/comments", repo, number),
+			},
+		})
 		if err != nil {
-			return idempotency.RecoveryResult{}, err
-		}
-		httpReq.Header.Set("Accept", "application/vnd.github+json")
-		if h.token != "" {
-			httpReq.Header.Set("Authorization", "Bearer "+h.token)
-		}
-		httpResp, err := h.client.Do(httpReq)
-		if err != nil {
+			var policyErr *providertransport.PolicyError
+			if errors.As(err, &policyErr) && !policyErr.DLP {
+				truncated = true
+				break
+			}
 			return idempotency.RecoveryResult{}, fmt.Errorf("github comment list failed: %w", err)
 		}
-		respBody, _ := io.ReadAll(io.LimitReader(httpResp.Body, 4<<20))
+		respBody := httpResp.Body
 		linkHeader := httpResp.Header.Get("Link")
 		status := httpResp.StatusCode
-		httpResp.Body.Close()
 		if status != http.StatusOK {
 			return idempotency.RecoveryResult{}, fmt.Errorf("github comment list returned %d", status)
 		}
@@ -333,9 +331,9 @@ func (h *GitHubCommentHandler) Resolve(ctx context.Context, rec *idempotency.Rec
 			}
 		}
 		candidate := nextLinkURL(linkHeader)
-		if candidate != "" && !sameOrigin(h.baseURL, candidate) {
-			truncated = true
-			candidate = ""
+		if candidate == "" {
+			nextURL = ""
+			continue
 		}
 		nextURL = candidate
 	}

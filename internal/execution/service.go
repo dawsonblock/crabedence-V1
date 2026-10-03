@@ -45,6 +45,36 @@ type Request struct {
 	// digest and is persisted on the durable record, but cannot select
 	// route, provider, assurance, or authority.
 	Mediation *RequestMediation `json:"mediation,omitempty"`
+	// Session carries the runtime-attestation binding: the session ID
+	// issued by the challenge/attest handshake and the runtime's
+	// proof-of-possession signature for THIS request. Like
+	// AuthorityGeneration it is caller-supplied material the server
+	// verifies — it grants nothing by itself.
+	Session *RequestSession `json:"session,omitempty"`
+	// Attestation is the server-verified runtime identity resolved
+	// from Session — assigned by the service after proof verification,
+	// never trusted from the wire. It is provenance bound onto the
+	// durable execution record.
+	Attestation *AttestedRuntime `json:"-"`
+	// Peer is the kernel-supplied local-caller evidence resolved once
+	// per connection — assigned by the service, never trusted from the
+	// wire. It is provenance bound onto the durable execution record.
+	Peer *PeerEvidence `json:"-"`
+}
+
+// RequestSession is the caller-supplied attestation binding.
+type RequestSession struct {
+	ID    string `json:"id"`
+	Proof string `json:"proof"`
+}
+
+// AttestedRuntime is the verified runtime provenance bound onto the
+// durable record — the attested session ID and the digest of the
+// runtime identity that attested it.
+type AttestedRuntime struct {
+	SessionID      string
+	IdentityDigest string
+	KeyFingerprint string
 }
 
 // RequestAuthority carries the principal and authority reference.
@@ -128,6 +158,27 @@ type Response struct {
 	// artifact cannot be attested and fails closed to UNKNOWN.
 	// Transient: never serialized to the wire or the ledger.
 	EvidenceArtifact []byte `json:"-"`
+
+	// Dispatch carries the outbound transport's dispatch provenance —
+	// how far the provider request actually got and, for failures, the
+	// classified cause — so an UNKNOWN transition records WHY it is
+	// ambiguous rather than a bare fact of ambiguity. Transient: set
+	// by the trusted transport, consumed by the executor's observation
+	// ledger, never serialized.
+	Dispatch *DispatchProvenance `json:"-"`
+}
+
+// DispatchProvenance is the ambiguity provenance one outbound dispatch
+// produced: the furthest milestone reached and the classified cause.
+// It distinguishes "provably never dispatched" (definite no-effect)
+// from every shape of post-dispatch uncertainty.
+type DispatchProvenance struct {
+	// Milestone is the furthest dispatch milestone reached
+	// (providertransport.DispatchMilestone).
+	Milestone string
+	// Cause is the classified ambiguity cause
+	// (providertransport.AmbiguityCause).
+	Cause string
 }
 
 // EvidenceRef is the evidence reference returned to the caller.
@@ -183,6 +234,11 @@ type Service struct {
 	// the claimed principal must agree with the mapping. nil preserves
 	// the bearer model's claimed principal (single-user local socket).
 	peerAuth PeerPrincipalMap
+	// attestation, when non-nil, is the runtime-attestation registry:
+	// challenges, verified sessions, and the deployment policy. nil
+	// means attestation is disabled (a non-required deployment); the
+	// handshake messages are refused rather than answered.
+	attestation *attestationRegistry
 }
 
 // NewService creates a new execution service.
@@ -213,6 +269,13 @@ func (s *Service) SetGrantResolver(resolver capability.GrantResolver) {
 // claim for admission, grant resolution, and the durable record.
 func (s *Service) SetPeerAuth(m PeerPrincipalMap) {
 	s.peerAuth = m
+}
+
+// SetAttestation enables the runtime-attestation handshake and session
+// verification under the deployment's policy. When policy.Required is
+// set, every invocation must carry a valid attested-session proof.
+func (s *Service) SetAttestation(policy AttestationPolicy) {
+	s.attestation = newAttestationRegistry(policy)
 }
 
 // Start begins listening on the Unix socket.
@@ -346,6 +409,19 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 		return
 	}
 
+	// Attestation handshake messages are dispatched before the strict
+	// invocation ABI — they are service frames, not capability
+	// invocations. A handshake message when attestation is unconfigured
+	// is refused, not ignored.
+	if t := messageType(msgBuf); t == attestChallengeType || t == attestType {
+		if s.attestation == nil {
+			writeJSONFrame(conn, attestResponse{Status: "error", Error: "runtime attestation is not configured on this service"})
+			return
+		}
+		s.handleAttestation(conn, msgBuf, t)
+		return
+	}
+
 	// Parse request under the strict invocation ABI: duplicate keys,
 	// explicit nulls, unknown fields, invalid UTF-8, excessive nesting,
 	// and trailing data are refused before admission ever sees the
@@ -361,6 +437,16 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 		return
 	}
 
+	// ─── Local-caller evidence ─────────────────────────────────────────
+	// Resolve the kernel-supplied peer credentials once: the same
+	// snapshot feeds the attestation session binding, peer principal
+	// authentication, and the durable provenance record — the recorded
+	// caller is exactly the caller that was authenticated.
+	peerCreds, peerErr := unixPeerCredentials(conn)
+	if peerErr == nil {
+		req.Peer = peerCreds.Evidence()
+	}
+
 	// ─── Peer authentication ────────────────────────────────────────────
 	// When the deployment configures a UID→principal map, the caller's
 	// principal is not merely claimed: the kernel supplies the peer UID
@@ -369,8 +455,35 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 	// grant resolution, and the durable execution record — so authority
 	// binds to a kernel-authenticated identity, not a string the client
 	// wrote.
+	// ─── Runtime attestation ──────────────────────────────────────────
+	// Verified before peer authentication: the proof signs the request
+	// exactly as the runtime sent it, and peer authentication rewrites
+	// the principal claim — verifying after the rewrite would deny a
+	// correctly signed request. The session must exist, be unexpired,
+	// be bound to this connection's peer UID, and carry a valid
+	// proof-of-possession for this request. The verified identity — not
+	// the caller's claim — becomes the execution's runtime provenance.
+	if s.attestation != nil {
+		sess, err := s.attestation.verifyRequest(peerCreds, peerErr, req)
+		if err != nil {
+			s.writeResponse(conn, Response{
+				Status:      StatusDenied,
+				FailureCode: string(capability.FailureAdmissionDenied),
+				Error:       "runtime attestation failed: " + err.Error(),
+			}, "")
+			return
+		}
+		if sess != nil {
+			req.Attestation = &AttestedRuntime{
+				SessionID:      req.Session.ID,
+				IdentityDigest: sess.digest,
+				KeyFingerprint: sess.fingerprint,
+			}
+		}
+	}
+
 	if s.peerAuth != nil {
-		principal, err := s.peerAuth.authenticatePeer(conn, req.Authority.Principal)
+		principal, err := s.peerAuth.authenticatePeer(peerCreds, peerErr, req.Authority.Principal)
 		if err != nil {
 			s.writeResponse(conn, Response{
 				Status:      StatusDenied,

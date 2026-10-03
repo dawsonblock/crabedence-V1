@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Qualification: the installed-distribution suite now gates on the release pin's real property rather than a development-tree assumption. `scripts/test-nemo-runtime-e2e.sh`'s ambient-override check assumed nothing pins the plugin host — true in a development tree, false under a qualified layout where the component manifest binds it — so the installed-artifact qualification could never pass. The gate now branches on `NEMO_E2E_EXPECT_RELEASE_ROOT`: development keeps the unpinned-override refusal; installed proves the manifest-pinned override runs and an override naming different bytes is refused by the release pin. A companion fix makes `nemo-crabedence-runtime` name the pin's source in the mismatch error — a release-install failure now says the component manifest rejected the resolved host instead of pointing at `NEMO_RELAY_PLUGIN_HOST_SHA256` when the deployer never set it.
+
 ### Execution identity, release signing, and qualification gates
 
 - Docs: `docs/plan/capability-packs.md` records the governed capability-pack design — signed packs supply implementation while the kernel keeps verdicts, plus the ordered work to get there (extract GitHub as the reference pack first) and the non-optional prerequisites (outbound DLP, authenticated runtime provenance, stronger local caller identity).

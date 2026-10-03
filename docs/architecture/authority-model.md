@@ -109,6 +109,21 @@ mechanism fails closed — peer credentials are unavailable and every
 request is denied — so a production deployment must run on a platform
 that provides one.
 
+The service resolves the credentials once per connection and uses the
+same snapshot for three purposes:
+
+- the principal mapping above;
+- the attestation session binding — an attested session is bound to
+  the peer UID and, on Linux, to the attesting executable resolved
+  from `/proc/<pid>/exe`, so a same-UID process running a different
+  binary cannot exercise a stolen session ID;
+- durable provenance — the peer UID (all supported platforms), plus
+  peer PID and executable (Linux), is persisted on the execution
+  record as local-caller evidence. It is provenance, not a policy
+  input, and is not part of the request digest: the same request
+  invoked by a different local process replays to the same execution
+  identity.
+
 ## Grant material is immutable and generation-scoped
 
 - Grants are never updated in place. Reissuing a `grant_id` appends a

@@ -106,8 +106,33 @@ pub struct PluginOptions {
     /// The digest the executed host binary must carry, when the deployment
     /// pins one (`NEMO_RELAY_PLUGIN_HOST_SHA256`). A qualified distribution
     /// sets it from the component manifest so `NEMO_RELAY_PLUGIN_HOST` can
-    /// locate the host without locating a different binary.
-    pub host_sha256_pin: Option<String>,
+    /// locate the host without locating a different binary. The pin records
+    /// which declaration made it, so a rejection names the source a deployer
+    /// can fix rather than a variable they never set.
+    pub host_sha256_pin: Option<HostPin>,
+}
+
+/// Which declaration produced the executed host's pin.
+///
+/// The pin is only a digest; this keeps its provenance so a mismatch can
+/// name the declaration that rejected the resolved binary — an operator who
+/// never set `NEMO_RELAY_PLUGIN_HOST_SHA256` is told the release's component
+/// manifest is the pin's source, not pointed at an unset variable.
+#[derive(Clone, Copy)]
+pub enum HostPinSource {
+    /// `NEMO_RELAY_PLUGIN_HOST_SHA256`, set by the deployment directly.
+    Environment,
+    /// The release's component manifest, discovered beside this binary.
+    ComponentManifest,
+}
+
+/// The digest the executed host must carry, and which declaration made it.
+#[derive(Clone)]
+pub struct HostPin {
+    /// The SHA-256 the resolved host bytes must digest to, hex.
+    pub sha256: String,
+    /// Which declaration produced the digest.
+    pub source: HostPinSource,
 }
 
 /// The executed host binary's identity.
@@ -397,7 +422,7 @@ pub async fn open(options: &PluginOptions) -> Result<PluginSession, String> {
     // signed executable, whose integrity the platform checks at launch;
     // staging a bare copy of it would strip the signature the confinement
     // travels with, so it is the one path that is spawned as resolved.
-    let (host, staging) = prepare_host(&mut config, options.host_sha256_pin.as_deref())?;
+    let (host, staging) = prepare_host(&mut config, options.host_sha256_pin.as_ref())?;
     // The composition is assembled where it is owned: launch, load, activate,
     // and proxy install all happen inside `load_with_context`, with this
     // caller's mediation context — the crabedence binding digest and the
@@ -584,11 +609,11 @@ fn enforce_host_override(
 /// quieter host.
 fn prepare_host(
     config: &mut PluginHostSupervisorConfig,
-    pin: Option<&str>,
+    pin: Option<&HostPin>,
 ) -> Result<(HostIdentity, Option<StagedHost>), String> {
     enforce_host_override(
         std::env::var_os(EXECUTABLE_ENV).as_deref(),
-        pin,
+        pin.map(|pin| pin.sha256.as_str()),
         std::env::var_os(UNPINNED_HOST_ENV).as_deref(),
     )?;
     // `restricted-linux` resolves to the configured path unchanged — but its
@@ -626,18 +651,34 @@ fn prepare_host(
             )
         })?;
     if let Some(expected) = pin {
-        if !expected.chars().all(|c| c.is_ascii_hexdigit()) || expected.len() != 64 {
-            return Err(format!(
-                "{HOST_SHA256_ENV} is not a SHA-256 hex digest: {expected:?}"
-            ));
+        if !expected.sha256.chars().all(|c| c.is_ascii_hexdigit()) || expected.sha256.len() != 64 {
+            return Err(match expected.source {
+                HostPinSource::Environment => format!(
+                    "{HOST_SHA256_ENV} is not a SHA-256 hex digest: {:?}",
+                    expected.sha256
+                ),
+                HostPinSource::ComponentManifest => format!(
+                    "the release's component manifest declares a non-SHA-256 \
+                     plugin-host digest: {:?}",
+                    expected.sha256
+                ),
+            });
         }
-        if !expected.eq_ignore_ascii_case(&sha256) {
+        if !expected.sha256.eq_ignore_ascii_case(&sha256) {
+            let requirement = match expected.source {
+                HostPinSource::Environment => {
+                    format!("{HOST_SHA256_ENV} requires {}", expected.sha256)
+                }
+                HostPinSource::ComponentManifest => format!(
+                    "the release's component manifest requires {}",
+                    expected.sha256
+                ),
+            };
             return Err(format!(
-                "the plugin host at '{}' digests to {}, but {HOST_SHA256_ENV} requires {} — \
+                "the plugin host at '{}' digests to {}, but {requirement} — \
                  the resolved binary is not the one the release declared",
                 executable.display(),
                 sha256,
-                expected
             ));
         }
     }
@@ -716,7 +757,7 @@ fn host_sha256_pin() -> Result<Option<String>, String> {
 /// override — which one lied is a deployer's question, not the runtime's.
 pub(crate) fn resolve_host_pin(
     release: Option<&crate::release::ReleaseIdentity>,
-) -> Result<Option<String>, String> {
+) -> Result<Option<HostPin>, String> {
     let configured = host_sha256_pin()?;
     match (release, configured) {
         (Some(release), Some(pin)) if !pin.eq_ignore_ascii_case(&release.plugin_host_sha256) => {
@@ -727,8 +768,15 @@ pub(crate) fn resolve_host_pin(
                 release.plugin_host_sha256,
             ))
         }
-        (Some(release), _) => Ok(Some(release.plugin_host_sha256.clone())),
-        (None, pin) => Ok(pin),
+        (Some(release), _) => Ok(Some(HostPin {
+            sha256: release.plugin_host_sha256.clone(),
+            source: HostPinSource::ComponentManifest,
+        })),
+        (None, Some(pin)) => Ok(Some(HostPin {
+            sha256: pin,
+            source: HostPinSource::Environment,
+        })),
+        (None, None) => Ok(None),
     }
 }
 

@@ -255,9 +255,12 @@ library = "$(basename "$library")"
 symbol = "nemo_relay_native_intercept_fixture"
 TOML
 export NEMO_RELAY_PLUGIN_HOST="$host_bin"
-# This tree is a development deployment: it names the host by ambient path and
-# has no release manifest or digest to pin its bytes, so it acknowledges the
-# unverified host explicitly — the composition refuses the override otherwise.
+# A development deployment names the host by ambient path with no release
+# manifest to pin its bytes, so it acknowledges the unverified host
+# explicitly — the composition refuses the override otherwise. Under an
+# installed distribution the component manifest already pins the host, and
+# the acknowledgement is never consulted; exporting it in both contexts
+# keeps the rest of this suite identical.
 export NEMO_RELAY_PLUGIN_HOST_ALLOW_UNPINNED=1
 pass "plugin host and fixture staged"
 
@@ -561,24 +564,63 @@ pass "malformed managed-call budget fails startup"
 # explicitly acknowledged as development, and an artifact that declares
 # confinement cannot be hosted by a policy that does not confine it.
 
-# 23. The ambient override alone is not enough: unsetting the development
-#     acknowledgement leaves a path nobody pinned, and the composition must
-#     refuse it rather than execute whichever binary the path resolves to.
-set +e
-out="$(
-  unset NEMO_RELAY_PLUGIN_HOST_ALLOW_UNPINNED
-  export NEMO_RELAY_PLUGIN_HOST_SHA256=
-  run_runtime \
-    --plugin "$plugin_dir" --plugin-id fixture_intercept \
-    --component fixture_intercept --capability system.echo \
-    --arguments '{"probe":"unpinned-override"}' 2>&1
-)"
-status=$?
-set -e
-[[ $status -ne 0 ]] || fail "an unpinned ambient override must be refused: $out"
-printf '%s' "$out" | grep -q 'NEMO_RELAY_PLUGIN_HOST_ALLOW_UNPINNED' \
-  || fail "the refusal must name the acknowledgement: $out"
-pass "an ambient host override with nothing pinning it is refused"
+# 23. The ambient override is only as strong as what binds it. In a
+#     development tree nothing pins the path once the acknowledgement is
+#     unset, so the composition must refuse it rather than execute whichever
+#     binary the path resolves to. In a qualified distribution the component
+#     manifest already pins the host: the override naming the shipped bytes
+#     runs pinned, and the adversarial case is an override naming bytes the
+#     manifest never declared — refused whatever the path claims.
+if [[ -z "${NEMO_E2E_EXPECT_RELEASE_ROOT:-}" ]]; then
+  set +e
+  out="$(
+    unset NEMO_RELAY_PLUGIN_HOST_ALLOW_UNPINNED
+    export NEMO_RELAY_PLUGIN_HOST_SHA256=
+    run_runtime \
+      --plugin "$plugin_dir" --plugin-id fixture_intercept \
+      --component fixture_intercept --capability system.echo \
+      --arguments '{"probe":"unpinned-override"}' 2>&1
+  )"
+  status=$?
+  set -e
+  [[ $status -ne 0 ]] || fail "an unpinned ambient override must be refused: $out"
+  printf '%s' "$out" | grep -q 'NEMO_RELAY_PLUGIN_HOST_ALLOW_UNPINNED' \
+    || fail "the refusal must name the acknowledgement: $out"
+  pass "an ambient host override with nothing pinning it is refused"
+else
+  # The manifest pin survives the environment knobs being cleared: the
+  # override still names the shipped bytes, so the session opens pinned.
+  out="$(
+    unset NEMO_RELAY_PLUGIN_HOST_ALLOW_UNPINNED
+    export NEMO_RELAY_PLUGIN_HOST_SHA256=
+    run_runtime \
+      --plugin "$plugin_dir" --plugin-id fixture_intercept \
+      --component fixture_intercept --capability system.echo \
+      --arguments '{"probe":"manifest-pinned-override"}')" \
+    || fail "the manifest-pinned host override must run: $out"
+  printf '%s' "$out" | jq -e '.status=="SUCCEEDED" and .plugin.host.pinned==true' >/dev/null \
+    || fail "the ambient override must run under the release's pin: $out"
+  pass "the release manifest pins the ambient host override"
+  # An override naming different bytes is the substitution the pin exists
+  # for: the path is ambient, the content is not.
+  different_host="$work_dir/different-host"
+  install -m 0755 "$runtime_bin" "$different_host"
+  set +e
+  out="$(
+    unset NEMO_RELAY_PLUGIN_HOST_ALLOW_UNPINNED
+    export NEMO_RELAY_PLUGIN_HOST_SHA256=
+    NEMO_RELAY_PLUGIN_HOST="$different_host" run_runtime \
+      --plugin "$plugin_dir" --plugin-id fixture_intercept \
+      --component fixture_intercept --capability system.echo \
+      --arguments '{"probe":"substituted-host"}' 2>&1
+  )"
+  status=$?
+  set -e
+  [[ $status -ne 0 ]] || fail "an override naming different bytes must be refused: $out"
+  printf '%s' "$out" | grep -q 'component manifest' \
+    || fail "the refusal must name the release's pin: $out"
+  pass "an ambient override naming different bytes is refused by the release pin"
+fi
 
 # 24. An artifact that requires confinement refuses trusted-process: the
 #     manifest's declaration is inside the digest that approved it, so a

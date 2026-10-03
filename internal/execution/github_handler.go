@@ -1,21 +1,16 @@
 package execution
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net"
 	"net/http"
-	"net/url"
 	"strings"
-	"syscall"
-	"time"
 
 	"github.com/openclaw/crabbox/internal/capability"
 	"github.com/openclaw/crabbox/internal/idempotency"
+	"github.com/openclaw/crabbox/internal/providertransport"
 )
 
 // GitHubIssueHandler implements the github.issue.create capability —
@@ -35,24 +30,50 @@ import (
 //   - Resolve is strictly observational: it only reads (GET), never
 //     writes — a duplicate or racing resolver is harmless.
 type GitHubIssueHandler struct {
-	baseURL string
-	token   string
-	client  *http.Client
+	transport    *providertransport.Transport
+	transportErr error
 }
 
 // NewGitHubIssueHandler creates the adapter. baseURL points at the
-// GitHub API root (or a test server); token is the API token sent as a
-// Bearer credential.
+// GitHub API root (or a test server); token becomes the transport's
+// bearer credential — the handler never holds it. The production path
+// builds the transport from the validated service configuration via
+// SetTransport instead.
 func NewGitHubIssueHandler(baseURL, token string) *GitHubIssueHandler {
-	return &GitHubIssueHandler{
-		baseURL: strings.TrimRight(baseURL, "/"),
-		token:   token,
-		client:  &http.Client{Timeout: 10 * time.Second},
+	h := &GitHubIssueHandler{}
+	h.transport, h.transportErr = newGitHubTransport(baseURL, token)
+	return h
+}
+
+// SetTransport installs the shared trusted transport — the production
+// wiring path. The handler accepts whatever destination and DLP policy
+// the transport enforces; it cannot widen them.
+func (h *GitHubIssueHandler) SetTransport(t *providertransport.Transport) {
+	h.transport, h.transportErr = t, nil
+}
+
+// SetHTTPClient overrides the transport's HTTP client (tests use
+// short timeouts and injected round-trippers).
+func (h *GitHubIssueHandler) SetHTTPClient(c *http.Client) {
+	if h.transport != nil {
+		h.transport.SetHTTPClient(c)
 	}
 }
 
-// SetHTTPClient overrides the HTTP client (tests use short timeouts).
-func (h *GitHubIssueHandler) SetHTTPClient(c *http.Client) { h.client = c }
+// transportFailure renders a transport-construction failure as a
+// definite no-effect — nothing was ever dispatched.
+func (h *GitHubIssueHandler) transportFailure() (Response, bool) {
+	if h.transportErr == nil {
+		return Response{}, false
+	}
+	return Response{
+		Status:            StatusFailed,
+		FailureCode:       string(capability.FailureInternalError),
+		Error:             fmt.Sprintf("github transport unavailable: %v", h.transportErr),
+		DefinitiveFailure: true,
+		Execution:         &ExecutionMeta{Provider: "github"},
+	}, true
+}
 
 // opMarker returns the hidden issue-body marker binding the issue to
 // the stable external operation token.
@@ -126,6 +147,9 @@ func (h *GitHubIssueHandler) Execute(ctx context.Context, req Request, desc capa
 		}
 	}
 
+	if fail, bad := h.transportFailure(); bad {
+		return fail
+	}
 	token := ExternalTokenFromContext(ctx)
 	body := args.Body
 	if token != "" {
@@ -133,54 +157,26 @@ func (h *GitHubIssueHandler) Execute(ctx context.Context, req Request, desc capa
 	}
 	payload, _ := json.Marshal(map[string]string{"title": args.Title, "body": body})
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		h.baseURL+"/repos/"+args.Repo+"/issues", bytes.NewReader(payload))
+	// The trusted transport owns destination, DLP, credentials, and
+	// dispatch; the handler declares only the operation and payload.
+	httpResp, err := h.transport.Do(ctx, providertransport.ProviderHTTPRequest{
+		Method: http.MethodPost,
+		URL:    "/repos/" + args.Repo + "/issues",
+		Headers: map[string]string{
+			"Content-Type": "application/json",
+			"Accept":       "application/vnd.github+json",
+		},
+		Body:    payload,
+		Context: githubRequestContext(req, "github.issue.create", desc, "repos/"+args.Repo+"/issues", token),
+	})
 	if err != nil {
-		return Response{
-			Status:            StatusFailed,
-			FailureCode:       string(capability.FailureInternalError),
-			Error:             err.Error(),
-			DefinitiveFailure: true,
-			Execution:         &ExecutionMeta{Provider: "github"},
-		}
+		// NoEffectProof keeps the old classification and strengthens
+		// it: milestone tracing proves no request bytes left — DNS,
+		// refused, TLS, DLP, and policy refusals are definite
+		// no-effects; anything at or past request-write is ambiguous.
+		return githubFailure(err)
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "application/vnd.github+json")
-	if h.token != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+h.token)
-	}
-	if token != "" {
-		httpReq.Header.Set("X-Crabex-Operation", token)
-	}
-
-	httpResp, err := h.client.Do(httpReq)
-	if err != nil {
-		// Only a failure provably BEFORE any request bytes were
-		// transmitted is a no-effect proof: the connection was refused
-		// or the name never resolved, so GitHub never saw the request.
-		// A TCP reset (ECONNRESET) is NOT definitive — the request may
-		// have been fully received and the issue created before the
-		// connection dropped. Everything else — resets, timeouts,
-		// mid-request drops — is ambiguous: UNKNOWN.
-		definitive := errors.Is(err, syscall.ECONNREFUSED)
-		var dnsErr *net.DNSError
-		if errors.As(err, &dnsErr) {
-			definitive = true // name resolution failed — no request sent
-		}
-		var ne net.Error
-		if errors.As(err, &ne) && ne.Timeout() {
-			definitive = false // timeout — may have executed
-		}
-		return Response{
-			Status:            StatusFailed,
-			FailureCode:       string(capability.FailureExecutionFailed),
-			Error:             fmt.Sprintf("github request failed: %v", err),
-			DefinitiveFailure: definitive,
-			Execution:         &ExecutionMeta{Provider: "github"},
-		}
-	}
-	defer httpResp.Body.Close()
-	respBody, _ := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))
+	respBody := httpResp.Body
 
 	if httpResp.StatusCode == http.StatusCreated || httpResp.StatusCode == http.StatusOK {
 		var issue struct {
@@ -196,6 +192,7 @@ func (h *GitHubIssueHandler) Execute(ctx context.Context, req Request, desc capa
 				FailureCode: string(capability.FailureExecutionUnknown),
 				Error:       fmt.Sprintf("github returned %d with unparseable body: %v", httpResp.StatusCode, err),
 				Execution:   &ExecutionMeta{Provider: "github"},
+				Dispatch:    githubProvenance(httpResp.Trace, httpResp.StatusCode),
 			}
 		}
 		runID := issue.HTMLURL
@@ -213,6 +210,7 @@ func (h *GitHubIssueHandler) Execute(ctx context.Context, req Request, desc capa
 			Evidence:         &EvidenceRef{ReceiptVersion: 3},
 			EvidenceArtifact: respBody, // raw provider response — digest is recomputed upstream
 			Execution:        &ExecutionMeta{Provider: "github", RunID: runID},
+			Dispatch:         githubProvenance(httpResp.Trace, httpResp.StatusCode),
 		}
 	}
 
@@ -227,6 +225,7 @@ func (h *GitHubIssueHandler) Execute(ctx context.Context, req Request, desc capa
 		DefinitiveFailure: definitive,
 		EvidenceArtifact:  respBody, // provider's rejection body — artifact for NO_EFFECT proof
 		Execution:         &ExecutionMeta{Provider: "github"},
+		Dispatch:          githubProvenance(httpResp.Trace, httpResp.StatusCode),
 	}
 }
 
@@ -272,7 +271,7 @@ func (h *GitHubIssueHandler) Resolve(ctx context.Context, rec *idempotency.Recor
 	// the Authorization bearer must never leave the configured base URL.
 	truncated := false
 	seen := map[string]bool{}
-	nextURL := h.baseURL + "/repos/" + repo + "/issues?state=all&per_page=100"
+	nextURL := "/repos/" + repo + "/issues?state=all&per_page=100"
 	for nextURL != "" {
 		if seen[nextURL] {
 			// A rel="next" pointing back at a visited page means the
@@ -282,22 +281,32 @@ func (h *GitHubIssueHandler) Resolve(ctx context.Context, rec *idempotency.Recor
 			break
 		}
 		seen[nextURL] = true
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, nextURL, nil)
+		// The transport enforces the pagination trust boundary: a
+		// rel="next" resolving off the trusted origin is refused before
+		// any credential exists on the request.
+		httpResp, err := h.transport.Do(ctx, providertransport.ProviderHTTPRequest{
+			Method:  http.MethodGet,
+			URL:     nextURL,
+			Headers: map[string]string{"Accept": "application/vnd.github+json"},
+			Context: providertransport.RequestContext{
+				Capability: "github.issue.create",
+				Resource:   "repos/" + repo + "/issues",
+			},
+		})
 		if err != nil {
-			return idempotency.RecoveryResult{}, err
-		}
-		httpReq.Header.Set("Accept", "application/vnd.github+json")
-		if h.token != "" {
-			httpReq.Header.Set("Authorization", "Bearer "+h.token)
-		}
-		httpResp, err := h.client.Do(httpReq)
-		if err != nil {
+			var policyErr *providertransport.PolicyError
+			if errors.As(err, &policyErr) && !policyErr.DLP {
+				// A refused destination (cross-origin rel=next) means
+				// the listing cannot be fully traversed — truncated,
+				// not a provider failure.
+				truncated = true
+				break
+			}
 			return idempotency.RecoveryResult{}, fmt.Errorf("github issue list failed: %w", err)
 		}
-		respBody, _ := io.ReadAll(io.LimitReader(httpResp.Body, 4<<20))
+		respBody := httpResp.Body
 		linkHeader := httpResp.Header.Get("Link")
 		status := httpResp.StatusCode
-		httpResp.Body.Close()
 		if status != http.StatusOK {
 			return idempotency.RecoveryResult{}, fmt.Errorf("github issue list returned %d", status)
 		}
@@ -332,10 +341,13 @@ func (h *GitHubIssueHandler) Resolve(ctx context.Context, rec *idempotency.Recor
 			}
 		}
 		candidate := nextLinkURL(linkHeader)
-		if candidate != "" && !sameOrigin(h.baseURL, candidate) {
-			truncated = true
-			candidate = ""
+		if candidate == "" {
+			nextURL = ""
+			continue
 		}
+		// A candidate that fails the origin check on the next dispatch
+		// becomes the truncation path above; normalize nothing here —
+		// the transport validates.
 		nextURL = candidate
 	}
 
@@ -354,23 +366,6 @@ func (h *GitHubIssueHandler) Resolve(ctx context.Context, rec *idempotency.Recor
 		ProviderID: "github",
 		Result:     json.RawMessage(fmt.Sprintf(`{"repo":%q,"marker_absent":true%s}`, repo, extra)),
 	}, nil
-}
-
-// sameOrigin reports whether nextURL is on the same scheme+host as
-// baseURL. Pagination must not carry credentials to an unrelated host —
-// a hostile or compromised Link header could otherwise exfiltrate the
-// API token.
-func sameOrigin(baseURL, nextURL string) bool {
-	base, err := url.Parse(baseURL)
-	if err != nil {
-		return false
-	}
-	next, err := url.Parse(nextURL)
-	if err != nil {
-		return false
-	}
-	return strings.EqualFold(base.Scheme, next.Scheme) &&
-		strings.EqualFold(base.Host, next.Host)
 }
 
 // nextLinkURL extracts the rel="next" URL from a GitHub Link header,
@@ -407,21 +402,6 @@ func githubRepoParts(repo string) (owner, name string, err error) {
 		return "", "", fmt.Errorf("repo must be \"owner/name\", got %q", repo)
 	}
 	return owner, name, nil
-}
-
-// githubTransportDefinitive reports whether a transport error provably
-// occurred before any request bytes reached the provider. Only
-// connection-refused and DNS failures are no-effect proofs — resets,
-// timeouts, and mid-request drops are ambiguous because the request may
-// have been fully received before the failure.
-func githubTransportDefinitive(err error) bool {
-	if errors.Is(err, syscall.ECONNREFUSED) {
-		return true
-	}
-	// A DNS failure — including a resolution timeout — means no
-	// connection was attempted, so no request bytes left.
-	var dnsErr *net.DNSError
-	return errors.As(err, &dnsErr)
 }
 
 // RegisterGitHubIssueCapability registers github.issue.create.

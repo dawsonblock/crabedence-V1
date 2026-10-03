@@ -5,13 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
 
 	"github.com/openclaw/crabbox/internal/capability"
+	"github.com/openclaw/crabbox/internal/providertransport"
 )
 
 // GitHubReads implements the observational GitHub read capabilities on
@@ -25,9 +24,8 @@ import (
 // gets exactly the fields the capability declares, and the adapter
 // never logs or returns credentials.
 type GitHubReads struct {
-	baseURL string
-	token   string
-	client  *http.Client
+	transport    *providertransport.Transport
+	transportErr error
 }
 
 // maxDirectReadBytes bounds the provider response body a DIRECT read
@@ -39,11 +37,15 @@ func NewGitHubReads(baseURL, token string) *GitHubReads {
 	if baseURL == "" {
 		baseURL = "https://api.github.com"
 	}
-	return &GitHubReads{
-		baseURL: strings.TrimRight(baseURL, "/"),
-		token:   token,
-		client:  &http.Client{Timeout: 20 * time.Second},
-	}
+	g := &GitHubReads{}
+	g.transport, g.transportErr = newGitHubTransport(baseURL, token)
+	return g
+}
+
+// SetTransport installs the shared trusted transport — the production
+// wiring path.
+func (g *GitHubReads) SetTransport(t *providertransport.Transport) {
+	g.transport, g.transportErr = t, nil
 }
 
 // githubReadAuthority is the authority policy every GitHub DIRECT read
@@ -151,28 +153,29 @@ func (g *GitHubReads) IssueGet(ctx context.Context, call CallContext) (json.RawM
 		return nil, errors.New("repo must be owner/name and number must be a positive issue number")
 	}
 
-	endpoint := fmt.Sprintf("%s/repos/%s/%s/issues/%d",
-		g.baseURL, url.PathEscape(owner), url.PathEscape(name), args.Number)
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil, fmt.Errorf("build github request: %w", err)
+	if g.transportErr != nil {
+		return nil, fmt.Errorf("github transport unavailable: %w", g.transportErr)
 	}
-	request.Header.Set("Accept", "application/vnd.github+json")
-	request.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-	if g.token != "" {
-		request.Header.Set("Authorization", "Bearer "+g.token)
-	}
-
-	response, err := g.client.Do(request)
+	response, err := g.transport.Do(ctx, providertransport.ProviderHTTPRequest{
+		Method: http.MethodGet,
+		URL: fmt.Sprintf("/repos/%s/%s/issues/%d",
+			url.PathEscape(owner), url.PathEscape(name), args.Number),
+		Headers: map[string]string{
+			"Accept":               "application/vnd.github+json",
+			"X-GitHub-Api-Version": "2022-11-28",
+		},
+		Context: providertransport.RequestContext{
+			Capability:     "github.issue.get",
+			Principal:      call.Principal,
+			ExecutionClass: "READ",
+			Resource:       fmt.Sprintf("repos/%s/issues/%d", args.Repo, args.Number),
+		},
+	})
 	if err != nil {
 		return nil, fmt.Errorf("github read failed: %w", err)
 	}
-	defer response.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(response.Body, maxDirectReadBytes+1))
-	if err != nil {
-		return nil, fmt.Errorf("read github response: %w", err)
-	}
+	body := response.Body
 	if len(body) > maxDirectReadBytes {
 		return nil, fmt.Errorf("github response exceeds %d bytes", maxDirectReadBytes)
 	}
@@ -260,32 +263,34 @@ func (g *GitHubReads) IssueList(ctx context.Context, call CallContext) (json.Raw
 		return nil, fmt.Errorf("limit must be 1..%d, got %d", maxIssueListResults, args.Limit)
 	}
 
-	endpoint := fmt.Sprintf("%s/repos/%s/%s/issues?state=%s&per_page=%d",
-		g.baseURL, url.PathEscape(owner), url.PathEscape(name), state, limit)
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil, fmt.Errorf("build github request: %w", err)
-	}
-	request.Header.Set("Accept", "application/vnd.github+json")
-	request.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-	if g.token != "" {
-		request.Header.Set("Authorization", "Bearer "+g.token)
-	}
-
-	response, err := g.client.Do(request)
-	if err != nil {
-		return nil, fmt.Errorf("github read failed: %w", err)
-	}
-	defer response.Body.Close()
-
 	readBound := int64(limit) * issueListItemBytes
 	if readBound < maxDirectReadBytes {
 		readBound = maxDirectReadBytes
 	}
-	body, err := io.ReadAll(io.LimitReader(response.Body, readBound+1))
-	if err != nil {
-		return nil, fmt.Errorf("read github response: %w", err)
+	if g.transportErr != nil {
+		return nil, fmt.Errorf("github transport unavailable: %w", g.transportErr)
 	}
+	response, err := g.transport.Do(ctx, providertransport.ProviderHTTPRequest{
+		Method: http.MethodGet,
+		URL: fmt.Sprintf("/repos/%s/%s/issues?state=%s&per_page=%d",
+			url.PathEscape(owner), url.PathEscape(name), state, limit),
+		Headers: map[string]string{
+			"Accept":               "application/vnd.github+json",
+			"X-GitHub-Api-Version": "2022-11-28",
+		},
+		MaxResponseBytes: readBound,
+		Context: providertransport.RequestContext{
+			Capability:     "github.issue.list",
+			Principal:      call.Principal,
+			ExecutionClass: "READ",
+			Resource:       fmt.Sprintf("repos/%s/issues", args.Repo),
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("github read failed: %w", err)
+	}
+
+	body := response.Body
 	if int64(len(body)) > readBound {
 		return nil, fmt.Errorf("github response exceeds %d bytes", readBound)
 	}

@@ -51,6 +51,7 @@ Unix-socket transport binding (see below) uses this exact structure:
 | `execution_class`  | string | Caller assertion; checked against registry. If absent, registry's pinned class is used. Mismatch = DENIED. |
 | `deadline`         | string | RFC3339 timestamp; request is DENIED after this time |
 | `mediation`        | object | Middleware provenance for the request (see below) |
+| `session`          | object | Runtime-attestation binding for the request (see below) |
 
 ### Mediation object
 
@@ -91,6 +92,36 @@ into the durable request identity and persisted on the durable record; the
 terminal receipt signs that request identity. It never selects the capability,
 route, authority, or outcome. A present `mediation` object missing either
 required field is refused.
+
+### Session object
+
+The `session` field carries the runtime-attestation binding — evidence the
+server verifies, never a grant:
+
+```json
+{
+  "id": "rts-…",
+  "proof": "base64 Ed25519 signature"
+}
+```
+
+- `id` (required when `session` is present): the attested session identifier
+  issued by the `attest_challenge`/`attest` handshake (see *Runtime
+  attestation* below).
+- `proof` (required when `session` is present): the runtime's Ed25519
+  signature over the pipe-joined request binding
+  `crabedence-session-proof-v1|session_id|capability|idempotency_key|principal|authority_ref|deadline|sha256(arguments)|sha256(mediation)`,
+  proving the sender holds the key the session attested — for THIS request.
+
+The session object is proof-of-possession, not authorization: a valid proof
+verifies which runtime sent the request and binds its identity onto the
+durable record as provenance; it never selects capability, route, assurance,
+or authority, and it is not part of the request digest — a request
+re-attested under a new session replays to the same execution identity.
+When the deployment requires attestation
+(`CRABEDENCE_ATTESTATION_REQUIRED`), an invocation without a verified
+session is DENIED. A present `session` object missing either field is
+refused.
 
 ### Authority object
 
@@ -165,7 +196,7 @@ before admission — it is never partially interpreted.
 | Root shape | The request must be a JSON object. |
 | Duplicate keys | Refused anywhere in the document — `encoding/json` and `JSON.parse` otherwise silently take the last value. |
 | Nesting depth | At most 64 open containers. |
-| Known fields | Root, `authority`, and `mediation` accept only the documented fields. |
+| Known fields | Root, `authority`, `mediation`, and `session` accept only the documented fields. |
 | Null | Explicit `null` is refused for every known field; omit the field instead. `null` inside `arguments` is governed by the capability schema. |
 | Types | Known fields carry their declared JSON types. `authority_generation` must be a canonical JSON integer literal (no fraction, exponent, or leading zeros) that fits in a signed 64-bit integer. |
 
@@ -191,6 +222,41 @@ over a Unix domain socket:
 The request body is the JSON object described above. There is no
 envelope, no `abi_version` field — the semantic contract is enforced
 by the capability registry, not a version tag on the wire.
+
+### Runtime attestation
+
+Two framed service messages sit beside the invocation frame — they are
+not capability invocations and are refused when attestation is not
+configured on the service:
+
+1. `{"type":"attest_challenge"}` → the service answers with a
+   single-use, short-lived `{"session_id","nonce","expires_at","protocol"}`.
+2. `{"type":"attest","session_id","runtime_identity":{…},"signature"}` →
+   the runtime signs the pipe-joined attestation envelope
+   (`crabedence-attestation-v1|session_id|nonce|runtime_key|release_digest|release_root_digest|plugin_manifest_digest|plugin_host_version|activation_digest|abi_version|runtime_config_digest`)
+   with its Ed25519 key, asserted inside `runtime_identity.runtime_key`.
+   The service verifies the signature against the approved-key set and
+   the asserted identity against the deployment's allowlists, binds the
+   session to the connection's kernel-supplied peer credentials — the
+   peer UID, and on Linux the peer executable resolved from
+   `/proc/<pid>/exe` — and answers
+   `{"status":"attested","session_id","runtime_identity_digest","expires_at"}`
+   or `{"status":"denied","error"}`.
+
+Each invocation then carries `session.id` + `session.proof` as above.
+Challenges are single-use, sessions expire, and a session bound to one
+peer cannot be exercised by another: a different peer UID is denied,
+and on Linux a same-UID process running a *different executable* is
+denied too — a sibling binary cannot ride a stolen session ID. Where
+the platform reports only the UID (BSD, macOS), the binding is the
+UID alone. Deployment controls:
+`CRABEDENCE_ATTESTATION_REQUIRED` (mandatory in production),
+`CRABEDENCE_APPROVED_RUNTIME_KEYS`,
+`CRABEDENCE_APPROVED_RELEASES`,
+`CRABEDENCE_APPROVED_PLUGIN_MANIFESTS`, `CRABEDENCE_APPROVED_ABI`,
+`CRABEDENCE_ATTESTATION_SESSION_TTL`, and the development-only
+`CRABEDENCE_ATTESTATION_RELAXED`. Attestation supplements peer
+authentication; it never replaces it.
 
 ## Why `authority_ref` instead of `grant_id`
 
@@ -248,6 +314,16 @@ one, and refuses a wildcard its trusted-proxy list does not cover,
 because an unverified claim is not an identity. Alternatively, an
 authenticated proxy or a future signed-session authority mechanism can
 front the socket.
+
+Whether or not peer authentication is configured, the service resolves
+the kernel-supplied peer credentials once per connection and persists
+them on the durable execution record as local-caller evidence — peer
+UID (every supported platform), plus peer PID and executable where the
+kernel reports them (Linux). This is provenance, not a policy input:
+it names which local process invoked the request, participates in the
+attestation session binding described above, and is never bound into
+the request digest, so the same request invoked by a different local
+process replays to the same execution identity.
 
 ## Three Orthogonal Dimensions
 

@@ -2,7 +2,6 @@ package execution
 
 import (
 	"fmt"
-	"net"
 	"strconv"
 	"strings"
 )
@@ -148,17 +147,17 @@ func (m PeerPrincipalMap) Authorize(uid uint32, claimed string) (string, bool) {
 	return mapped, true
 }
 
-// authenticatePeer extracts the kernel-supplied UID and enforces the
-// map against the request's claimed principal. On success it returns
-// the authenticated principal to bind into the request.
-func (m PeerPrincipalMap) authenticatePeer(conn net.Conn, claimed string) (string, error) {
-	uid, err := unixPeerUID(conn)
-	if err != nil {
-		return "", fmt.Errorf("peer credentials unavailable: %w", err)
+// authenticatePeer enforces the map against the request's claimed
+// principal using the connection's once-resolved kernel credentials.
+// On success it returns the authenticated principal to bind into the
+// request.
+func (m PeerPrincipalMap) authenticatePeer(creds PeerCredentials, credErr error, claimed string) (string, error) {
+	if credErr != nil {
+		return "", fmt.Errorf("peer credentials unavailable: %w", credErr)
 	}
-	principal, ok := m.Authorize(uid, claimed)
+	principal, ok := m.Authorize(creds.UID, claimed)
 	if !ok {
-		return "", fmt.Errorf("peer uid %d is not authorized for the claimed principal", uid)
+		return "", fmt.Errorf("peer uid %d is not authorized for the claimed principal", creds.UID)
 	}
 	return principal, nil
 }

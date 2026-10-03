@@ -401,6 +401,9 @@ var sqliteSchemaMigrations = []sqliteSchemaMigration{
 	{11, "cluster_recovery_mode", sqliteMigrationClusterRecoveryMode},
 	{12, "request_mediation", sqliteMigrationRequestMediation},
 	{13, "digest_version", sqliteMigrationDigestVersion},
+	{14, "ambiguity_provenance", sqliteMigrationAmbiguityProvenance},
+	{15, "attestation_provenance", sqliteMigrationAttestationProvenance},
+	{16, "peer_evidence", sqliteMigrationPeerEvidence},
 }
 
 func (s *SQLiteStore) ensureSchema(ctx context.Context) error {
@@ -527,6 +530,14 @@ func sqliteMigrationBaseTable(ctx context.Context, tx *sql.Tx) error {
 			authority_digest TEXT,
 			request_mediation TEXT,
 			digest_version INTEGER NOT NULL DEFAULT 1,
+			ambiguity_cause TEXT,
+			dispatch_milestone TEXT,
+			attested_session_id TEXT,
+			runtime_identity_digest TEXT,
+			runtime_key_fingerprint TEXT,
+			peer_uid INTEGER,
+			peer_pid INTEGER,
+			peer_executable TEXT,
 			UNIQUE(principal_id, capability_id, idempotency_key)
 		)
 	`)
@@ -687,6 +698,8 @@ func sqliteMigrationForensic(ctx context.Context, tx *sql.Tx) error {
 			evidence_sha256 TEXT,
 			receipt_version INTEGER NOT NULL DEFAULT 0,
 			observed_at INTEGER NOT NULL,
+			ambiguity_cause TEXT,
+			dispatch_milestone TEXT,
 			PRIMARY KEY (execution_id, sequence)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_observations_run
@@ -869,6 +882,97 @@ func sqliteMigrationDigestVersion(ctx context.Context, tx *sql.Tx) error {
 	return err
 }
 
+// sqliteMigrationAmbiguityProvenance mirrors the PG migration 14:
+// ambiguity_cause and dispatch_milestone on the materialized row and
+// the immutable observation ledger. Fresh v1/v8 schemas already carry
+// the columns; existing embedded databases get them via
+// PRAGMA-checked ALTERs.
+func sqliteMigrationAmbiguityProvenance(ctx context.Context, tx *sql.Tx) error {
+	for _, table := range []string{"execution_requests", "effect_provider_observations"} {
+		for _, col := range []string{"ambiguity_cause", "dispatch_milestone"} {
+			exists, err := sqliteColumnExists(ctx, tx, table, col)
+			if err != nil {
+				return err
+			}
+			if exists {
+				continue
+			}
+			if _, err := tx.ExecContext(ctx,
+				fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s TEXT`, table, col)); err != nil {
+				return fmt.Errorf("%s.%s: %w", table, col, err)
+			}
+		}
+	}
+	return nil
+}
+
+// sqliteMigrationAttestationProvenance mirrors the PG migration 15:
+// the server-verified runtime-identity columns on the materialized
+// row. Fresh v1 schemas already carry them; existing embedded
+// databases get them via PRAGMA-checked ALTERs.
+func sqliteMigrationAttestationProvenance(ctx context.Context, tx *sql.Tx) error {
+	for _, col := range []string{"attested_session_id", "runtime_identity_digest", "runtime_key_fingerprint"} {
+		exists, err := sqliteColumnExists(ctx, tx, "execution_requests", col)
+		if err != nil {
+			return err
+		}
+		if exists {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx,
+			fmt.Sprintf(`ALTER TABLE execution_requests ADD COLUMN %s TEXT`, col)); err != nil {
+			return fmt.Errorf("%s: %w", col, err)
+		}
+	}
+	return nil
+}
+
+// sqliteMigrationPeerEvidence mirrors the PG migration 16: the
+// kernel-supplied local-caller columns on the materialized row. UID
+// and PID are INTEGER (NULL means the platform cannot supply them —
+// 0 is a legitimate UID); executable is TEXT.
+func sqliteMigrationPeerEvidence(ctx context.Context, tx *sql.Tx) error {
+	for _, col := range []struct{ name, typ string }{
+		{"peer_uid", "INTEGER"}, {"peer_pid", "INTEGER"}, {"peer_executable", "TEXT"},
+	} {
+		exists, err := sqliteColumnExists(ctx, tx, "execution_requests", col.name)
+		if err != nil {
+			return err
+		}
+		if exists {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx,
+			fmt.Sprintf(`ALTER TABLE execution_requests ADD COLUMN %s %s`, col.name, col.typ)); err != nil {
+			return fmt.Errorf("%s: %w", col.name, err)
+		}
+	}
+	return nil
+}
+
+// sqliteColumnExists reports whether table has column, via
+// PRAGMA table_info — SQLite has no ADD COLUMN IF NOT EXISTS.
+func sqliteColumnExists(ctx context.Context, tx *sql.Tx, table, column string) (bool, error) {
+	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`PRAGMA table_info(%s)`, table))
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, rows.Err()
+		}
+	}
+	return false, rows.Err()
+}
+
 // sqliteInsertEffectEvent mirrors insertEffectEvent for the embedded
 // backend: sequence is allocated with MAX+1 inside the mutation's
 // transaction (single-writer BEGIN IMMEDIATE serializes all writers),
@@ -902,19 +1006,22 @@ func sqliteInsertObservationRow(ctx context.Context, tx *sql.Tx, executionID, ki
 			(execution_id, sequence, record_version, observation_kind,
 			 provider_id, provider_run_id, provider_status,
 			 result_bytes, result_sha256, result_canonical_digest,
-			 evidence_sha256, receipt_version, observed_at)
+			 evidence_sha256, receipt_version, observed_at,
+			 ambiguity_cause, dispatch_milestone)
 		SELECT er.execution_id,
 			COALESCE((SELECT MAX(o.sequence) FROM effect_provider_observations o
 			          WHERE o.execution_id = er.execution_id), 0) + 1,
 			er.version, ?2,
 			NULLIF(?3, ''), NULLIF(?4, ''), NULLIF(?5, ''),
 			?6, NULLIF(?7, ''), NULLIF(?8, ''), NULLIF(?9, ''), ?10,
-			`+sqliteNow+`
+			`+sqliteNow+`,
+			NULLIF(?11, ''), NULLIF(?12, '')
 		FROM execution_requests er
 		WHERE er.execution_id = ?1
 	`, executionID, kind, obs.ProviderID, obs.ProviderRunID, obs.ProviderStatus,
 		nullableBytes(rawResult), sha256Hex(rawResult), obs.ResultDigest,
-		obs.EvidenceDigest, obs.ReceiptVersion)
+		obs.EvidenceDigest, obs.ReceiptVersion,
+		obs.AmbiguityCause, obs.DispatchMilestone)
 	return err
 }
 
@@ -959,9 +1066,18 @@ func (s *SQLiteStore) AcquireWithAuthority(ctx context.Context, key, principal, 
 // AcquireWithMediation is AcquireWithAuthority plus the caller-declared
 // middleware provenance — see Store.AcquireWithMediation.
 func (s *SQLiteStore) AcquireWithMediation(ctx context.Context, key, principal, capability, digest string, authority AuthorityBinding, mediation *MediationBinding, class string, leaseDuration time.Duration) (*AcquireResult, error) {
+	return s.AcquireWithProvenance(ctx, key, principal, capability, digest,
+		AcquireProvenance{Authority: authority, Mediation: mediation}, class, leaseDuration)
+}
+
+// AcquireWithProvenance is the embedded mirror of
+// Store.AcquireWithProvenance — same semantics, same record shape.
+func (s *SQLiteStore) AcquireWithProvenance(ctx context.Context, key, principal, capability, digest string, provenance AcquireProvenance, class string, leaseDuration time.Duration) (*AcquireResult, error) {
 	if err := s.leaseCfg.Validate(leaseDuration); err != nil {
 		return nil, err
 	}
+	authority := provenance.Authority
+	mediation := provenance.Mediation
 
 	var mediationJSON []byte
 	if mediation != nil {
@@ -969,6 +1085,17 @@ func (s *SQLiteStore) AcquireWithMediation(ctx context.Context, key, principal, 
 		if mediationJSON, err = json.Marshal(mediation); err != nil {
 			return nil, fmt.Errorf("failed to encode request mediation: %w", err)
 		}
+	}
+	var attSession, attDigest, attKeyFp *string
+	if att := provenance.Attestation; att != nil {
+		attSession = stringPtr(att.SessionID)
+		attDigest = stringPtr(att.IdentityDigest)
+		attKeyFp = stringPtr(att.KeyFingerprint)
+	}
+	var peerUID, peerPID, peerExe any
+	if peer := provenance.Peer; peer != nil {
+		peerUID, peerPID = peer.UID, peer.PID
+		peerExe = nullableString(peer.Executable)
 	}
 
 	leaseToken, err := generateLeaseToken()
@@ -998,11 +1125,14 @@ func (s *SQLiteStore) AcquireWithMediation(ctx context.Context, key, principal, 
 			 grant_id, authority_generation, authority_digest, execution_class, state,
 			 lease_owner, lease_token, lease_started_at, lease_expires_at,
 			 lease_generation, attempt, version, created_at, updated_at, admitted_epoch,
-			 request_mediation, digest_version)
+			 request_mediation, digest_version,
+			 attested_session_id, runtime_identity_digest, runtime_key_fingerprint,
+			 peer_uid, peer_pid, peer_executable)
 		SELECT ?10, ?1, ?2, ?3, ?4, ?5, ?11, ?12, ?6, 'PREPARED',
 				?7, ?8, `+sqliteNow+`, `+sqliteNow+` + ?9,
 				1, 0, 1, `+sqliteNow+`, `+sqliteNow+`, cm.epoch, ?13,
-				`+strconv.Itoa(DigestVersionDescriptorBound)+`
+				`+strconv.Itoa(DigestVersionDescriptorBound)+`, ?14, ?15, ?16,
+				?17, ?18, ?19
 		FROM cluster_meta cm
 		WHERE cm.id = 1 AND cm.epoch = `+strconv.FormatInt(s.epoch, 10)+` AND cm.recovery_required = 0
 		ON CONFLICT (principal_id, capability_id, idempotency_key) DO NOTHING
@@ -1010,7 +1140,8 @@ func (s *SQLiteStore) AcquireWithMediation(ctx context.Context, key, principal, 
 	`, key, principal, capability, digest, nullableString(authority.Ref), class,
 		leaseOwner, leaseToken, msDuration(leaseDuration),
 		genID, authority.Generation, nullableString(authority.Digest),
-		nullableBytes(mediationJSON),
+		nullableBytes(mediationJSON), attSession, attDigest, attKeyFp,
+		peerUID, peerPID, peerExe,
 	).Scan(&executionID, &createdAtMs)
 
 	if err == nil {
@@ -1034,26 +1165,32 @@ func (s *SQLiteStore) AcquireWithMediation(ctx context.Context, key, principal, 
 			LeaseToken: leaseToken,
 			Generation: 1,
 			Record: &Record{
-				ExecutionID:         executionID,
-				IdempotencyKey:      key,
-				PrincipalID:         principal,
-				CapabilityID:        capability,
-				RequestDigest:       digest,
-				GrantID:             authority.Ref,
-				AuthorityGeneration: authority.Generation,
-				AuthorityDigest:     authority.Digest,
-				RequestMediation:    json.RawMessage(mediationJSON),
-				DigestVersion:       DigestVersionDescriptorBound,
-				ExecutionClass:      class,
-				State:               StatePrepared,
-				LeaseOwner:          leaseOwner,
-				LeaseToken:          leaseToken,
-				LeaseGeneration:     1,
-				Attempt:             0,
-				Version:             1,
-				CreatedAt:           createdAt,
-				UpdatedAt:           createdAt,
-				AdmittedEpoch:       s.epoch,
+				ExecutionID:           executionID,
+				IdempotencyKey:        key,
+				PrincipalID:           principal,
+				CapabilityID:          capability,
+				RequestDigest:         digest,
+				GrantID:               authority.Ref,
+				AuthorityGeneration:   authority.Generation,
+				AuthorityDigest:       authority.Digest,
+				RequestMediation:      json.RawMessage(mediationJSON),
+				DigestVersion:         DigestVersionDescriptorBound,
+				AttestedSessionID:     deref(attSession),
+				RuntimeIdentityDigest: deref(attDigest),
+				RuntimeKeyFingerprint: deref(attKeyFp),
+				PeerUID:               provenance.peerUID(),
+				PeerPID:               provenance.peerPID(),
+				PeerExecutable:        provenance.peerExecutable(),
+				ExecutionClass:        class,
+				State:                 StatePrepared,
+				LeaseOwner:            leaseOwner,
+				LeaseToken:            leaseToken,
+				LeaseGeneration:       1,
+				Attempt:               0,
+				Version:               1,
+				CreatedAt:             createdAt,
+				UpdatedAt:             createdAt,
+				AdmittedEpoch:         s.epoch,
 			},
 		}, nil
 	}
@@ -1928,6 +2065,8 @@ func (s *SQLiteStore) EnterRecoveryWithObservation(ctx context.Context, executio
 		    provider_observed_at = `+sqliteNow+`,
 		    evidence_digest = COALESCE(?9, evidence_digest),
 		    provider_evidence_digest = COALESCE(?9, provider_evidence_digest),
+		    ambiguity_cause = COALESCE(?12, ambiguity_cause),
+		    dispatch_milestone = COALESCE(?13, dispatch_milestone),
 		    updated_at = `+sqliteNow+`
 		WHERE execution_id = ?1
 		  AND state = ?2
@@ -1941,12 +2080,15 @@ func (s *SQLiteStore) EnterRecoveryWithObservation(ctx context.Context, executio
 		  AND (provider_receipt_version IS NULL OR provider_receipt_version = 0 OR NULLIF(?8, 0) IS NULL OR provider_receipt_version = ?8)
 		  AND (evidence_digest IS NULL OR ?9 IS NULL OR evidence_digest = ?9)
 		  AND (provider_evidence_digest IS NULL OR ?9 IS NULL OR provider_evidence_digest = ?9)
+		  AND (ambiguity_cause IS NULL OR ?12 IS NULL OR ambiguity_cause = ?12)
+		  AND (dispatch_milestone IS NULL OR ?13 IS NULL OR dispatch_milestone = ?13)
 		  `+s.epochGuardSQL(), executionID, string(expectedState), expectedVersion,
 		nullableString(obs.ProviderID), nullableString(obs.ProviderRunID),
 		nullableString(obs.ProviderStatus), nullableString(obs.ResultDigest),
 		obs.ReceiptVersion,
 		nullableString(obs.EvidenceDigest), nullableString(string(obs.Result)),
-		nullableString(string(obs.Result)))
+		nullableString(string(obs.Result)),
+		nullableString(obs.AmbiguityCause), nullableString(obs.DispatchMilestone))
 	if err != nil {
 		return err
 	}
@@ -2019,6 +2161,8 @@ func (s *SQLiteStore) RecordProviderObservation(ctx context.Context, executionID
 		    provider_evidence_digest = COALESCE(?9, provider_evidence_digest),
 		    provider_receipt_version = COALESCE(NULLIF(?10, 0), provider_receipt_version),
 		    provider_observed_at = `+sqliteNow+`,
+		    ambiguity_cause = COALESCE(?12, ambiguity_cause),
+		    dispatch_milestone = COALESCE(?13, dispatch_milestone),
 		    updated_at = `+sqliteNow+`
 		WHERE execution_id = ?1
 		  AND (
@@ -2034,11 +2178,14 @@ func (s *SQLiteStore) RecordProviderObservation(ctx context.Context, executionID
 		  AND (evidence_digest IS NULL OR ?9 IS NULL OR evidence_digest = ?9)
 		  AND (provider_evidence_digest IS NULL OR ?9 IS NULL OR provider_evidence_digest = ?9)
 		  AND (provider_receipt_version IS NULL OR provider_receipt_version = 0 OR NULLIF(?10, 0) IS NULL OR provider_receipt_version = ?10)
+		  AND (ambiguity_cause IS NULL OR ?12 IS NULL OR ambiguity_cause = ?12)
+		  AND (dispatch_milestone IS NULL OR ?13 IS NULL OR dispatch_milestone = ?13)
 		  `+s.epochGuardSQL(), executionID, nullableString(leaseToken), leaseGeneration,
 		nullableString(obs.ProviderID), nullableString(obs.ProviderRunID),
 		nullableString(obs.ProviderStatus), nullableString(string(obs.Result)),
 		nullableString(obs.ResultDigest), nullableString(obs.EvidenceDigest),
-		obs.ReceiptVersion, nullableString(string(obs.Result)))
+		obs.ReceiptVersion, nullableString(string(obs.Result)),
+		nullableString(obs.AmbiguityCause), nullableString(obs.DispatchMilestone))
 	if err != nil {
 		return err
 	}
@@ -2835,6 +2982,7 @@ func scanSQLiteRecords(rows *sql.Rows) ([]*Record, error) {
 		var recLeaseExp, nextRecAt, enteredUnknownAt sql.NullInt64
 		var createdAt, updatedAt int64
 		var requestMediation []byte
+		var peerUID, peerPID sql.NullInt64
 		if err := rows.Scan(
 			&rec.ExecutionID, &rec.IdempotencyKey, &rec.PrincipalID,
 			&rec.CapabilityID, &rec.RequestDigest, &rec.GrantID,
@@ -2852,6 +3000,10 @@ func scanSQLiteRecords(rows *sql.Rows) ([]*Record, error) {
 			&rec.ProviderEvidenceDigest, &rec.TerminalResultDigest,
 			&rec.TerminalEvidenceDigest, &rec.AdmittedEpoch,
 			&requestMediation, &rec.DigestVersion,
+			&rec.AmbiguityCause, &rec.DispatchMilestone,
+			&rec.AttestedSessionID, &rec.RuntimeIdentityDigest,
+			&rec.RuntimeKeyFingerprint,
+			&peerUID, &peerPID, &rec.PeerExecutable,
 		); err != nil {
 			return nil, err
 		}
@@ -2900,6 +3052,12 @@ func scanSQLiteRecords(rows *sql.Rows) ([]*Record, error) {
 		}
 		if len(requestMediation) > 0 {
 			rec.RequestMediation = json.RawMessage(requestMediation)
+		}
+		if peerUID.Valid {
+			rec.PeerUID = &peerUID.Int64
+		}
+		if peerPID.Valid {
+			rec.PeerPID = &peerPID.Int64
 		}
 		if recOwner.Valid {
 			rec.ReconcileOwner = recOwner.String
@@ -2963,7 +3121,8 @@ func (s *SQLiteStore) ListProviderObservations(ctx context.Context, executionID 
 		       COALESCE(provider_id, ''), COALESCE(provider_run_id, ''),
 		       COALESCE(provider_status, ''), result_bytes,
 		       COALESCE(result_sha256, ''), COALESCE(result_canonical_digest, ''),
-		       COALESCE(evidence_sha256, ''), receipt_version, observed_at
+		       COALESCE(evidence_sha256, ''), receipt_version, observed_at,
+		       COALESCE(ambiguity_cause, ''), COALESCE(dispatch_milestone, '')
 		FROM effect_provider_observations
 		WHERE execution_id = ?1
 		ORDER BY sequence`, executionID)
@@ -2979,7 +3138,8 @@ func (s *SQLiteStore) ListProviderObservations(ctx context.Context, executionID 
 		if err := rows.Scan(&r.ExecutionID, &r.Sequence, &r.RecordVersion,
 			&r.Kind, &r.ProviderID, &r.ProviderRunID, &r.ProviderStatus,
 			&resultBytes, &r.ResultSHA256, &r.ResultCanonicalDigest,
-			&r.EvidenceSHA256, &r.ReceiptVersion, &observedAtMs); err != nil {
+			&r.EvidenceSHA256, &r.ReceiptVersion, &observedAtMs,
+			&r.AmbiguityCause, &r.DispatchMilestone); err != nil {
 			return nil, err
 		}
 		if resultBytes != nil {

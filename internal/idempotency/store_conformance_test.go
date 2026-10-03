@@ -891,6 +891,119 @@ func TestStoreConformanceMediationPersistence(t *testing.T) {
 	})
 }
 
+// TestStoreConformanceAttestationPersistence covers the server-
+// verified runtime-provenance columns: AcquireWithProvenance persists
+// the attested session, identity digest, and key fingerprint on the
+// durable record, every read path returns them, an unattested request
+// stores NULLs, and the binding is NOT part of the request identity —
+// a replayed request under a different attested session resolves to
+// the same record rather than a conflict.
+func TestStoreConformanceAttestationPersistence(t *testing.T) {
+	eachEffectStore(t, func(t *testing.T, s EffectStore) {
+		ctx := context.Background()
+		att := &AttestationBinding{
+			SessionID:      "rts-7f3a",
+			IdentityDigest: "aa11bb22",
+			KeyFingerprint: "cc33dd44",
+		}
+		digest := confDigest("alice", "cap.mut", `{"q":"x"}`)
+		var peerUID, peerPID int64 = 501, 4242
+		peer := &PeerBinding{UID: &peerUID, PID: &peerPID, Executable: "/usr/local/bin/nemo-relay"}
+		acq, err := s.AcquireWithProvenance(ctx, "k-att", "alice", "cap.mut", digest,
+			AcquireProvenance{Authority: AuthorityBinding{Ref: "grant-1"}, Attestation: att, Peer: peer},
+			"MUTATION", 5*time.Minute)
+		if err != nil || acq.Kind != LeaseAcquired {
+			t.Fatalf("acquire: %v kind=%v", err, acq.Kind)
+		}
+		rec := acq.Record
+		if rec.AttestedSessionID != att.SessionID ||
+			rec.RuntimeIdentityDigest != att.IdentityDigest ||
+			rec.RuntimeKeyFingerprint != att.KeyFingerprint {
+			t.Fatalf("acquired record attestation = %+v, want %+v",
+				[]string{rec.AttestedSessionID, rec.RuntimeIdentityDigest, rec.RuntimeKeyFingerprint}, att)
+		}
+		if rec.PeerUID == nil || *rec.PeerUID != peerUID ||
+			rec.PeerPID == nil || *rec.PeerPID != peerPID ||
+			rec.PeerExecutable != peer.Executable {
+			t.Fatalf("acquired record peer evidence = uid:%v pid:%v exe:%q",
+				rec.PeerUID, rec.PeerPID, rec.PeerExecutable)
+		}
+
+		looked, err := s.Lookup(ctx, rec.ExecutionID)
+		if err != nil {
+			t.Fatalf("lookup: %v", err)
+		}
+		if looked.AttestedSessionID != att.SessionID ||
+			looked.RuntimeIdentityDigest != att.IdentityDigest ||
+			looked.RuntimeKeyFingerprint != att.KeyFingerprint {
+			t.Fatalf("looked-up attestation does not match the stored binding")
+		}
+		byKey, err := s.LookupByKey(ctx, "alice", "cap.mut", "k-att")
+		if err != nil {
+			t.Fatalf("lookup by key: %v", err)
+		}
+		if byKey.AttestedSessionID != att.SessionID {
+			t.Fatalf("lookup-by-key session = %q, want %q", byKey.AttestedSessionID, att.SessionID)
+		}
+		if byKey.PeerUID == nil || *byKey.PeerUID != peerUID || byKey.PeerExecutable != peer.Executable {
+			t.Fatalf("lookup-by-key peer evidence does not match the stored binding")
+		}
+
+		// The binding is provenance, not identity: re-acquiring the same
+		// request under a DIFFERENT attested session is a lease
+		// interaction on the same record, never an idempotency
+		// conflict.
+		acq2, err := s.AcquireWithProvenance(ctx, "k-att", "alice", "cap.mut", digest,
+			AcquireProvenance{
+				Authority:   AuthorityBinding{Ref: "grant-1"},
+				Attestation: &AttestationBinding{SessionID: "rts-9c1d", IdentityDigest: "ee55", KeyFingerprint: "ff66"},
+			}, "MUTATION", 5*time.Minute)
+		if err != nil {
+			t.Fatalf("re-acquire under new session: %v", err)
+		}
+		if acq2.Kind == IdempotencyConflict {
+			t.Fatal("a re-attested session must not reinterpret the request identity")
+		}
+
+		// An unattested request stores NULLs — the record carries no
+		// runtime claim it cannot prove.
+		acq3, err := s.AcquireWithProvenance(ctx, "k-plain", "alice", "cap.mut",
+			confDigest("alice", "cap.mut", `{"q":"y"}`),
+			AcquireProvenance{Authority: AuthorityBinding{}}, "MUTATION", 5*time.Minute)
+		if err != nil || acq3.Kind != LeaseAcquired {
+			t.Fatalf("unattested acquire: %v kind=%v", err, acq3.Kind)
+		}
+		if acq3.Record.AttestedSessionID != "" || acq3.Record.RuntimeIdentityDigest != "" || acq3.Record.RuntimeKeyFingerprint != "" {
+			t.Fatalf("unattested record carries runtime provenance it was never given")
+		}
+		if acq3.Record.PeerUID != nil || acq3.Record.PeerPID != nil || acq3.Record.PeerExecutable != "" {
+			t.Fatalf("unattested record carries peer evidence it was never given")
+		}
+		plain, _ := s.Lookup(ctx, acq3.Record.ExecutionID)
+		if plain.AttestedSessionID != "" || plain.RuntimeIdentityDigest != "" || plain.RuntimeKeyFingerprint != "" {
+			t.Fatalf("unattested lookup carries runtime provenance it was never given")
+		}
+		if plain.PeerUID != nil || plain.PeerPID != nil || plain.PeerExecutable != "" {
+			t.Fatalf("unattested lookup carries peer evidence it was never given")
+		}
+
+		// A root (uid 0) peer round-trips as 0 — distinguishable from a
+		// record whose platform cannot supply the UID at all (NULL).
+		rootUID := int64(0)
+		acq4, err := s.AcquireWithProvenance(ctx, "k-root", "alice", "cap.mut",
+			confDigest("alice", "cap.mut", `{"q":"z"}`),
+			AcquireProvenance{Peer: &PeerBinding{UID: &rootUID}},
+			"MUTATION", 5*time.Minute)
+		if err != nil || acq4.Kind != LeaseAcquired {
+			t.Fatalf("root-peer acquire: %v kind=%v", err, acq4.Kind)
+		}
+		if acq4.Record.PeerUID == nil || *acq4.Record.PeerUID != 0 || acq4.Record.PeerPID != nil {
+			t.Fatalf("root peer evidence = uid:%v pid:%v — uid 0 must round-trip, absent pid stays NULL",
+				acq4.Record.PeerUID, acq4.Record.PeerPID)
+		}
+	})
+}
+
 // TestStoreConformanceMigrateRequestDigest covers the migrate-on-touch
 // contract on every engine: a record still storing a legacy
 // (pre-descriptor) digest is rewritten to the descriptor-bound identity

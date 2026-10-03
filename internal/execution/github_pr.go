@@ -1,18 +1,17 @@
 package execution
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
 
 	"github.com/openclaw/crabbox/internal/capability"
 	"github.com/openclaw/crabbox/internal/idempotency"
+	"github.com/openclaw/crabbox/internal/providertransport"
 )
 
 // GitHubPullCreateHandler implements the github.pr.create capability —
@@ -21,9 +20,8 @@ import (
 // embedded in the PR body as a hidden marker, and Resolve scans the
 // repo's pull listing for it.
 type GitHubPullCreateHandler struct {
-	baseURL string
-	token   string
-	client  *http.Client
+	transport    *providertransport.Transport
+	transportErr error
 }
 
 // NewGitHubPullCreateHandler creates the adapter against the same
@@ -32,15 +30,39 @@ func NewGitHubPullCreateHandler(baseURL, token string) *GitHubPullCreateHandler 
 	if baseURL == "" {
 		baseURL = "https://api.github.com"
 	}
-	return &GitHubPullCreateHandler{
-		baseURL: strings.TrimRight(baseURL, "/"),
-		token:   token,
-		client:  &http.Client{Timeout: 10 * time.Second},
+	h := &GitHubPullCreateHandler{}
+	h.transport, h.transportErr = newGitHubTransport(baseURL, token)
+	return h
+}
+
+// SetTransport installs the shared trusted transport — the production
+// wiring path.
+func (h *GitHubPullCreateHandler) SetTransport(t *providertransport.Transport) {
+	h.transport, h.transportErr = t, nil
+}
+
+// SetHTTPClient overrides the transport's HTTP client (tests use
+// short timeouts and injected round-trippers).
+func (h *GitHubPullCreateHandler) SetHTTPClient(c *http.Client) {
+	if h.transport != nil {
+		h.transport.SetHTTPClient(c)
 	}
 }
 
-// SetHTTPClient overrides the HTTP client (tests use short timeouts).
-func (h *GitHubPullCreateHandler) SetHTTPClient(c *http.Client) { h.client = c }
+// transportFailure renders a transport-construction failure as a
+// definite no-effect — nothing was ever dispatched.
+func (h *GitHubPullCreateHandler) transportFailure() (Response, bool) {
+	if h.transportErr == nil {
+		return Response{}, false
+	}
+	return Response{
+		Status:            StatusFailed,
+		FailureCode:       string(capability.FailureInternalError),
+		Error:             fmt.Sprintf("github transport unavailable: %v", h.transportErr),
+		DefinitiveFailure: true,
+		Execution:         &ExecutionMeta{Provider: "github"},
+	}, true
+}
 
 type githubPullCreateArgs struct {
 	Repo  string `json:"repo"`  // "owner/name"
@@ -132,40 +154,25 @@ func (h *GitHubPullCreateHandler) Execute(ctx context.Context, req Request, desc
 		"draft": args.Draft,
 	})
 
+	if fail, bad := h.transportFailure(); bad {
+		return fail
+	}
 	owner, name, _ := githubRepoParts(args.Repo)
-	endpoint := fmt.Sprintf("%s/repos/%s/%s/pulls",
-		h.baseURL, url.PathEscape(owner), url.PathEscape(name))
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	httpResp, err := h.transport.Do(ctx, providertransport.ProviderHTTPRequest{
+		Method: http.MethodPost,
+		URL: fmt.Sprintf("/repos/%s/%s/pulls",
+			url.PathEscape(owner), url.PathEscape(name)),
+		Headers: map[string]string{
+			"Content-Type": "application/json",
+			"Accept":       "application/vnd.github+json",
+		},
+		Body:    payload,
+		Context: githubRequestContext(req, "github.pr.create", desc, "repos/"+args.Repo+"/pulls", token),
+	})
 	if err != nil {
-		return Response{
-			Status:            StatusFailed,
-			FailureCode:       string(capability.FailureInternalError),
-			Error:             err.Error(),
-			DefinitiveFailure: true,
-			Execution:         &ExecutionMeta{Provider: "github"},
-		}
+		return githubFailure(err)
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "application/vnd.github+json")
-	if h.token != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+h.token)
-	}
-	if token != "" {
-		httpReq.Header.Set("X-Crabex-Operation", token)
-	}
-
-	httpResp, err := h.client.Do(httpReq)
-	if err != nil {
-		return Response{
-			Status:            StatusFailed,
-			FailureCode:       string(capability.FailureExecutionFailed),
-			Error:             fmt.Sprintf("github request failed: %v", err),
-			DefinitiveFailure: githubTransportDefinitive(err),
-			Execution:         &ExecutionMeta{Provider: "github"},
-		}
-	}
-	defer httpResp.Body.Close()
-	respBody, _ := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))
+	respBody := httpResp.Body
 
 	if httpResp.StatusCode == http.StatusCreated || httpResp.StatusCode == http.StatusOK {
 		var pr struct {
@@ -179,6 +186,7 @@ func (h *GitHubPullCreateHandler) Execute(ctx context.Context, req Request, desc
 				FailureCode: string(capability.FailureExecutionUnknown),
 				Error:       fmt.Sprintf("github returned %d with unparseable body: %v", httpResp.StatusCode, err),
 				Execution:   &ExecutionMeta{Provider: "github"},
+				Dispatch:    githubProvenance(httpResp.Trace, httpResp.StatusCode),
 			}
 		}
 		runID := pr.HTMLURL
@@ -198,6 +206,7 @@ func (h *GitHubPullCreateHandler) Execute(ctx context.Context, req Request, desc
 			Evidence:         &EvidenceRef{ReceiptVersion: 3},
 			EvidenceArtifact: respBody,
 			Execution:        &ExecutionMeta{Provider: "github", RunID: runID},
+			Dispatch:         githubProvenance(httpResp.Trace, httpResp.StatusCode),
 		}
 	}
 
@@ -212,6 +221,7 @@ func (h *GitHubPullCreateHandler) Execute(ctx context.Context, req Request, desc
 		DefinitiveFailure: definitive,
 		EvidenceArtifact:  respBody,
 		Execution:         &ExecutionMeta{Provider: "github"},
+		Dispatch:          githubProvenance(httpResp.Trace, httpResp.StatusCode),
 	}
 }
 
@@ -246,32 +256,39 @@ func (h *GitHubPullCreateHandler) Resolve(ctx context.Context, rec *idempotency.
 	if err != nil {
 		return idempotency.RecoveryResult{Decision: idempotency.RecoveryUnknown}, nil
 	}
+	if h.transportErr != nil {
+		return idempotency.RecoveryResult{}, fmt.Errorf("github transport unavailable: %w", h.transportErr)
+	}
 	truncated := false
 	seen := map[string]bool{}
-	nextURL := fmt.Sprintf("%s/repos/%s/%s/pulls?state=all&per_page=100",
-		h.baseURL, url.PathEscape(owner), url.PathEscape(name))
+	nextURL := fmt.Sprintf("/repos/%s/%s/pulls?state=all&per_page=100",
+		url.PathEscape(owner), url.PathEscape(name))
 	for nextURL != "" {
 		if seen[nextURL] {
 			truncated = true
 			break
 		}
 		seen[nextURL] = true
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, nextURL, nil)
+		httpResp, err := h.transport.Do(ctx, providertransport.ProviderHTTPRequest{
+			Method:  http.MethodGet,
+			URL:     nextURL,
+			Headers: map[string]string{"Accept": "application/vnd.github+json"},
+			Context: providertransport.RequestContext{
+				Capability: "github.pr.create",
+				Resource:   "repos/" + repo + "/pulls",
+			},
+		})
 		if err != nil {
-			return idempotency.RecoveryResult{}, err
-		}
-		httpReq.Header.Set("Accept", "application/vnd.github+json")
-		if h.token != "" {
-			httpReq.Header.Set("Authorization", "Bearer "+h.token)
-		}
-		httpResp, err := h.client.Do(httpReq)
-		if err != nil {
+			var policyErr *providertransport.PolicyError
+			if errors.As(err, &policyErr) && !policyErr.DLP {
+				truncated = true
+				break
+			}
 			return idempotency.RecoveryResult{}, fmt.Errorf("github pull list failed: %w", err)
 		}
-		respBody, _ := io.ReadAll(io.LimitReader(httpResp.Body, 4<<20))
+		respBody := httpResp.Body
 		linkHeader := httpResp.Header.Get("Link")
 		status := httpResp.StatusCode
-		httpResp.Body.Close()
 		if status != http.StatusOK {
 			return idempotency.RecoveryResult{}, fmt.Errorf("github pull list returned %d", status)
 		}
@@ -306,9 +323,9 @@ func (h *GitHubPullCreateHandler) Resolve(ctx context.Context, rec *idempotency.
 			}
 		}
 		candidate := nextLinkURL(linkHeader)
-		if candidate != "" && !sameOrigin(h.baseURL, candidate) {
-			truncated = true
-			candidate = ""
+		if candidate == "" {
+			nextURL = ""
+			continue
 		}
 		nextURL = candidate
 	}
@@ -329,9 +346,8 @@ func (h *GitHubPullCreateHandler) Resolve(ctx context.Context, rec *idempotency.
 // target-state observation: Resolve GETs the pull and commits when
 // merged=true is observed.
 type GitHubPullMergeHandler struct {
-	baseURL string
-	token   string
-	client  *http.Client
+	transport    *providertransport.Transport
+	transportErr error
 }
 
 // NewGitHubPullMergeHandler creates the merge adapter against the same
@@ -340,15 +356,39 @@ func NewGitHubPullMergeHandler(baseURL, token string) *GitHubPullMergeHandler {
 	if baseURL == "" {
 		baseURL = "https://api.github.com"
 	}
-	return &GitHubPullMergeHandler{
-		baseURL: strings.TrimRight(baseURL, "/"),
-		token:   token,
-		client:  &http.Client{Timeout: 10 * time.Second},
+	h := &GitHubPullMergeHandler{}
+	h.transport, h.transportErr = newGitHubTransport(baseURL, token)
+	return h
+}
+
+// SetTransport installs the shared trusted transport — the production
+// wiring path.
+func (h *GitHubPullMergeHandler) SetTransport(t *providertransport.Transport) {
+	h.transport, h.transportErr = t, nil
+}
+
+// SetHTTPClient overrides the transport's HTTP client (tests use
+// short timeouts and injected round-trippers).
+func (h *GitHubPullMergeHandler) SetHTTPClient(c *http.Client) {
+	if h.transport != nil {
+		h.transport.SetHTTPClient(c)
 	}
 }
 
-// SetHTTPClient overrides the HTTP client (tests use short timeouts).
-func (h *GitHubPullMergeHandler) SetHTTPClient(c *http.Client) { h.client = c }
+// transportFailure renders a transport-construction failure as a
+// definite no-effect — nothing was ever dispatched.
+func (h *GitHubPullMergeHandler) transportFailure() (Response, bool) {
+	if h.transportErr == nil {
+		return Response{}, false
+	}
+	return Response{
+		Status:            StatusFailed,
+		FailureCode:       string(capability.FailureInternalError),
+		Error:             fmt.Sprintf("github transport unavailable: %v", h.transportErr),
+		DefinitiveFailure: true,
+		Execution:         &ExecutionMeta{Provider: "github"},
+	}, true
+}
 
 // pullMergeMethods is the closed set the schema's enum must match.
 var pullMergeMethods = map[string]bool{
@@ -428,40 +468,26 @@ func (h *GitHubPullMergeHandler) Execute(ctx context.Context, req Request, desc 
 	}
 	body, _ := json.Marshal(payload)
 
+	if fail, bad := h.transportFailure(); bad {
+		return fail
+	}
 	owner, name, _ := githubRepoParts(args.Repo)
-	endpoint := fmt.Sprintf("%s/repos/%s/%s/pulls/%d/merge",
-		h.baseURL, url.PathEscape(owner), url.PathEscape(name), args.Number)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint, bytes.NewReader(body))
+	token := ExternalTokenFromContext(ctx)
+	httpResp, err := h.transport.Do(ctx, providertransport.ProviderHTTPRequest{
+		Method: http.MethodPut,
+		URL: fmt.Sprintf("/repos/%s/%s/pulls/%d/merge",
+			url.PathEscape(owner), url.PathEscape(name), args.Number),
+		Headers: map[string]string{
+			"Content-Type": "application/json",
+			"Accept":       "application/vnd.github+json",
+		},
+		Body:    body,
+		Context: githubRequestContext(req, "github.pr.merge", desc, fmt.Sprintf("repos/%s/pulls/%d/merge", args.Repo, args.Number), token),
+	})
 	if err != nil {
-		return Response{
-			Status:            StatusFailed,
-			FailureCode:       string(capability.FailureInternalError),
-			Error:             err.Error(),
-			DefinitiveFailure: true,
-			Execution:         &ExecutionMeta{Provider: "github"},
-		}
+		return githubFailure(err)
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "application/vnd.github+json")
-	if h.token != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+h.token)
-	}
-	if token := ExternalTokenFromContext(ctx); token != "" {
-		httpReq.Header.Set("X-Crabex-Operation", token)
-	}
-
-	httpResp, err := h.client.Do(httpReq)
-	if err != nil {
-		return Response{
-			Status:            StatusFailed,
-			FailureCode:       string(capability.FailureExecutionFailed),
-			Error:             fmt.Sprintf("github request failed: %v", err),
-			DefinitiveFailure: githubTransportDefinitive(err),
-			Execution:         &ExecutionMeta{Provider: "github"},
-		}
-	}
-	defer httpResp.Body.Close()
-	respBody, _ := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))
+	respBody := httpResp.Body
 
 	if httpResp.StatusCode == http.StatusOK {
 		var merge struct {
@@ -475,6 +501,7 @@ func (h *GitHubPullMergeHandler) Execute(ctx context.Context, req Request, desc 
 				FailureCode: string(capability.FailureExecutionUnknown),
 				Error:       fmt.Sprintf("github returned %d with unparseable body: %v", httpResp.StatusCode, err),
 				Execution:   &ExecutionMeta{Provider: "github"},
+				Dispatch:    githubProvenance(httpResp.Trace, httpResp.StatusCode),
 			}
 		}
 		// A 200 with merged=false means GitHub declined the merge in the
@@ -488,6 +515,7 @@ func (h *GitHubPullMergeHandler) Execute(ctx context.Context, req Request, desc 
 				DefinitiveFailure: true,
 				EvidenceArtifact:  respBody,
 				Execution:         &ExecutionMeta{Provider: "github"},
+				Dispatch:          githubProvenance(httpResp.Trace, httpResp.StatusCode),
 			}
 		}
 		runID := merge.SHA
@@ -506,6 +534,7 @@ func (h *GitHubPullMergeHandler) Execute(ctx context.Context, req Request, desc 
 			Evidence:         &EvidenceRef{ReceiptVersion: 3},
 			EvidenceArtifact: respBody,
 			Execution:        &ExecutionMeta{Provider: "github", RunID: runID},
+			Dispatch:         githubProvenance(httpResp.Trace, httpResp.StatusCode),
 		}
 	}
 
@@ -520,6 +549,7 @@ func (h *GitHubPullMergeHandler) Execute(ctx context.Context, req Request, desc 
 		DefinitiveFailure: definitive,
 		EvidenceArtifact:  respBody,
 		Execution:         &ExecutionMeta{Provider: "github"},
+		Dispatch:          githubProvenance(httpResp.Trace, httpResp.StatusCode),
 	}
 }
 
@@ -542,23 +572,24 @@ func (h *GitHubPullMergeHandler) Resolve(ctx context.Context, rec *idempotency.R
 		return idempotency.RecoveryResult{Decision: idempotency.RecoveryUnknown}, nil
 	}
 
-	endpoint := fmt.Sprintf("%s/repos/%s/%s/pulls/%d",
-		h.baseURL, url.PathEscape(owner), url.PathEscape(name), number)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return idempotency.RecoveryResult{}, err
+	if h.transportErr != nil {
+		return idempotency.RecoveryResult{}, fmt.Errorf("github transport unavailable: %w", h.transportErr)
 	}
-	httpReq.Header.Set("Accept", "application/vnd.github+json")
-	if h.token != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+h.token)
-	}
-	httpResp, err := h.client.Do(httpReq)
+	httpResp, err := h.transport.Do(ctx, providertransport.ProviderHTTPRequest{
+		Method: http.MethodGet,
+		URL: fmt.Sprintf("/repos/%s/%s/pulls/%d",
+			url.PathEscape(owner), url.PathEscape(name), number),
+		Headers: map[string]string{"Accept": "application/vnd.github+json"},
+		Context: providertransport.RequestContext{
+			Capability: "github.pr.merge",
+			Resource:   fmt.Sprintf("repos/%s/pulls/%d", repo, number),
+		},
+	})
 	if err != nil {
 		return idempotency.RecoveryResult{}, fmt.Errorf("github pull get failed: %w", err)
 	}
-	respBody, _ := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))
+	respBody := httpResp.Body
 	status := httpResp.StatusCode
-	httpResp.Body.Close()
 	if status != http.StatusOK {
 		return idempotency.RecoveryResult{}, fmt.Errorf("github pull get returned %d", status)
 	}
@@ -634,22 +665,23 @@ func (h *GitHubPullMergeHandler) mergeMethodProven(ctx context.Context, owner, n
 	if mergeSHA == "" {
 		return false
 	}
-	endpoint := fmt.Sprintf("%s/repos/%s/%s/commits/%s",
-		h.baseURL, url.PathEscape(owner), url.PathEscape(name), url.PathEscape(mergeSHA))
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if h.transportErr != nil || h.transport == nil {
+		return false
+	}
+	resp, err := h.transport.Do(ctx, providertransport.ProviderHTTPRequest{
+		Method: http.MethodGet,
+		URL: fmt.Sprintf("/repos/%s/%s/commits/%s",
+			url.PathEscape(owner), url.PathEscape(name), url.PathEscape(mergeSHA)),
+		Headers: map[string]string{"Accept": "application/vnd.github+json"},
+		Context: providertransport.RequestContext{
+			Capability: "github.pr.merge",
+			Resource:   fmt.Sprintf("repos/%s/commits/%s", owner+"/"+name, mergeSHA),
+		},
+	})
 	if err != nil {
 		return false
 	}
-	req.Header.Set("Accept", "application/vnd.github+json")
-	if h.token != "" {
-		req.Header.Set("Authorization", "Bearer "+h.token)
-	}
-	resp, err := h.client.Do(req)
-	if err != nil {
-		return false
-	}
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	resp.Body.Close()
+	body := resp.Body
 	if resp.StatusCode != http.StatusOK {
 		return false
 	}

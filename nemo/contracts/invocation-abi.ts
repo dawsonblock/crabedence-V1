@@ -33,6 +33,7 @@ const ROOT_FIELDS = new Map<string, FieldType>([
   ["idempotency_key", "string"],
   ["deadline", "string"],
   ["mediation", "object"],
+  ["session", "object"],
 ]);
 
 const AUTHORITY_FIELDS = new Map<string, FieldType>([
@@ -53,8 +54,17 @@ const MEDIATION_FIELDS = new Map<string, FieldType>([
   ["activation_config_sha256", "string"],
 ]);
 
+/** The session object's known fields — the runtime-attestation binding. */
+const SESSION_FIELDS = new Map<string, FieldType>([
+  ["id", "string"],
+  ["proof", "string"],
+]);
+
 /** Digests a mediation object must carry — see R9. */
 const MEDIATION_REQUIRED = ["middleware_set_digest", "original_args_digest"];
+
+/** The binding fields a session object must carry. */
+const SESSION_REQUIRED = ["id", "proof"];
 
 /** A mediation digest value in canonical form: 64 lowercase hex characters. */
 const SHA256_DIGEST = /^[0-9a-f]{64}$/;
@@ -89,6 +99,16 @@ function checkRequiredFields(
 ): string | null {
   if (fields === MEDIATION_FIELDS) {
     for (const required of MEDIATION_REQUIRED) {
+      if (!keys.has(required)) {
+        return `${path}.${required} is required`;
+      }
+    }
+  }
+  // A present session object must carry both binding fields: a session
+  // ID without a proof is a bare claim, and a proof without a session
+  // ID binds nothing.
+  if (fields === SESSION_FIELDS) {
+    for (const required of SESSION_REQUIRED) {
       if (!keys.has(required)) {
         return `${path}.${required} is required`;
       }
@@ -251,7 +271,9 @@ class InvocationScanner {
           ? AUTHORITY_FIELDS
           : path === "request" && key === "mediation"
             ? MEDIATION_FIELDS
-            : null;
+            : path === "request" && key === "session"
+              ? SESSION_FIELDS
+              : null;
       const error = this.parseValue(
         keyPath,
         expected,

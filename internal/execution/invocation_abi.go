@@ -53,6 +53,7 @@ var abiRootFields = map[string]abiFieldType{
 	"idempotency_key": abiString,
 	"deadline":        abiString,
 	"mediation":       abiObject,
+	"session":         abiObject,
 }
 
 var abiAuthorityFields = map[string]abiFieldType{
@@ -72,6 +73,14 @@ var abiMediationFields = map[string]abiFieldType{
 	"plugin_manifest_sha256":   abiString,
 	"plugin_library_sha256":    abiString,
 	"activation_config_sha256": abiString,
+}
+
+// abiSessionFields is the known-field set of the runtime-attestation
+// session binding: the session ID the handshake issued and the
+// runtime's proof-of-possession signature for this request.
+var abiSessionFields = map[string]abiFieldType{
+	"id":    abiString,
+	"proof": abiString,
 }
 
 // abiIntegerLiteral is the canonical JSON integer form. Fractions,
@@ -149,6 +158,23 @@ func parseInvocationRequest(data []byte) (Request, error) {
 			}
 		}
 	}
+	// A present session object must carry both binding fields: a
+	// session ID without a proof is a bare claim, and a proof without
+	// a session ID binds nothing.
+	if req.Session != nil {
+		var envelope struct {
+			Session map[string]json.RawMessage `json:"session"`
+		}
+		if err := json.Unmarshal(data, &envelope); err != nil {
+			return req, fmt.Errorf("invalid session object: %w", err)
+		}
+		if _, ok := envelope.Session["id"]; !ok {
+			return req, fmt.Errorf("request.session.id is required")
+		}
+		if _, ok := envelope.Session["proof"]; !ok {
+			return req, fmt.Errorf("request.session.proof is required")
+		}
+	}
 	return req, nil
 }
 
@@ -173,6 +199,7 @@ const (
 	abiFrameRoot
 	abiFrameAuthority
 	abiFrameMediation
+	abiFrameSession
 )
 
 // abiScanFrame is one open container during the structural scan.
@@ -252,6 +279,10 @@ func scanInvocationStructure(data []byte) error {
 					if top.kind == abiFrameRoot && top.key == "mediation" {
 						child.kind = abiFrameMediation
 						child.fields = abiMediationFields
+					}
+					if top.kind == abiFrameRoot && top.key == "session" {
+						child.kind = abiFrameSession
+						child.fields = abiSessionFields
 					}
 					top.pending = false
 				} else if top.object {

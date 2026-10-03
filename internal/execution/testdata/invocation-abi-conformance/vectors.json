@@ -1,5 +1,5 @@
 {
-  "description": "Shared Go↔NEMO capability invocation ABI conformance corpus. Each vector is one raw wire request; both runtimes must accept or reject it identically, and every rejection must include the rule-level error phrase in error_contains.",
+  "description": "Shared Go\u2194NEMO capability invocation ABI conformance corpus. Each vector is one raw wire request; both runtimes must accept or reject it identically, and every rejection must include the rule-level error phrase in error_contains.",
   "vectors": [
     {
       "name": "minimal-valid",
@@ -28,7 +28,7 @@
     },
     {
       "name": "unicode-values",
-      "wire": "{\"capability\":\"system.echo\",\"arguments\":{\"text\":\"héllo — 世界 🌍\"},\"authority\":{\"principal\":\"álîçé@example.com\"}}",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{\"text\":\"h\u00e9llo \u2014 \u4e16\u754c \ud83c\udf0d\"},\"authority\":{\"principal\":\"\u00e1l\u00ee\u00e7\u00e9@example.com\"}}",
       "expected": "accept"
     },
     {
@@ -340,6 +340,59 @@
       "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":{\"principal\":\"alice@example.com\"},\"mediation\":{}}",
       "expected": "reject",
       "error_contains": "is required"
+    },
+    {
+      "name": "session-valid",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":{\"principal\":\"alice@example.com\"},\"session\":{\"id\":\"rts-abc123\",\"proof\":\"c2ln\"}}",
+      "expected": "accept"
+    },
+    {
+      "name": "session-missing-proof",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":{\"principal\":\"alice@example.com\"},\"session\":{\"id\":\"rts-abc123\"}}",
+      "expected": "reject",
+      "error_contains": "is required"
+    },
+    {
+      "name": "session-missing-id",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":{\"principal\":\"alice@example.com\"},\"session\":{\"proof\":\"c2ln\"}}",
+      "expected": "reject",
+      "error_contains": "is required"
+    },
+    {
+      "name": "session-empty-object",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":{\"principal\":\"alice@example.com\"},\"session\":{}}",
+      "expected": "reject",
+      "error_contains": "is required"
+    },
+    {
+      "name": "unknown-session-field",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":{\"principal\":\"alice@example.com\"},\"session\":{\"id\":\"rts-abc123\",\"proof\":\"c2ln\",\"route\":\"direct\"}}",
+      "expected": "reject",
+      "error_contains": "unknown field"
+    },
+    {
+      "name": "null-session",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":{\"principal\":\"alice@example.com\"},\"session\":null}",
+      "expected": "reject",
+      "error_contains": "null is not accepted"
+    },
+    {
+      "name": "session-as-string",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":{\"principal\":\"alice@example.com\"},\"session\":\"abc\"}",
+      "expected": "reject",
+      "error_contains": "must be a JSON object"
+    },
+    {
+      "name": "session-id-nonstring",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":{\"principal\":\"alice@example.com\"},\"session\":{\"id\":7,\"proof\":\"c2ln\"}}",
+      "expected": "reject",
+      "error_contains": "must be a JSON string"
+    },
+    {
+      "name": "duplicate-session-key",
+      "wire": "{\"capability\":\"system.echo\",\"arguments\":{},\"authority\":{\"principal\":\"alice@example.com\"},\"session\":{\"id\":\"rts-a\",\"id\":\"rts-b\",\"proof\":\"c2ln\"}}",
+      "expected": "reject",
+      "error_contains": "duplicate key"
     }
   ]
 }

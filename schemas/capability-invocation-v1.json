@@ -97,6 +97,24 @@
           "description": "Canonical SHA-256 of the activated component configuration; raw configuration is omitted because it may contain credentials."
         }
       }
+    },
+    "session": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "proof"],
+      "description": "Runtime-attestation binding — evidence the server verifies, never a grant. id is the session the attest_challenge/attest handshake issued; proof is the runtime's Ed25519 signature over the pipe-joined request binding (crabedence-session-proof-v1|session_id|capability|idempotency_key|principal|authority_ref|deadline|sha256(arguments)|sha256(mediation)), proving possession of the attested key for THIS request. When the deployment requires attestation an invocation without a verified session is denied.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Attested session identifier issued by the challenge/attest handshake."
+        },
+        "proof": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Base64 Ed25519 signature over the request binding, produced by the runtime key the session attested."
+        }
+      }
     }
   },
   "x-crabedence-server-resolved": [

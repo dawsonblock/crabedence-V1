@@ -1,6 +1,11 @@
 package execution
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"strings"
 	"testing"
 	"time"
@@ -21,9 +26,25 @@ func clearServiceEnv(t *testing.T) {
 		"CRABEDENCE_PROVIDER_EXECUTION_MAX",
 		"CRABEDENCE_PROVIDER_MAX_CONCURRENT", "CRABEDENCE_PROVIDER_DEGRADED_AFTER",
 		"CRABEDENCE_PROVIDER_OPEN_AFTER", "CRABEDENCE_PROVIDER_OPEN_COOLDOWN",
+		"CRABEDENCE_ATTESTATION_REQUIRED", "CRABEDENCE_ATTESTATION_RELAXED",
+		"CRABEDENCE_ATTESTATION_SESSION_TTL", "CRABEDENCE_APPROVED_RUNTIME_KEYS",
+		"CRABEDENCE_APPROVED_RELEASES", "CRABEDENCE_APPROVED_PLUGIN_MANIFESTS",
+		"CRABEDENCE_APPROVED_ABI",
 	} {
 		t.Setenv(name, "")
 	}
+}
+
+// testApprovedRuntimeKey returns a valid
+// <fingerprint>:<base64-key> entry for CRABEDENCE_APPROVED_RUNTIME_KEYS.
+func testApprovedRuntimeKey(t *testing.T) string {
+	t.Helper()
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(pub)
+	return hex.EncodeToString(sum[:]) + ":" + base64.StdEncoding.EncodeToString(pub)
 }
 
 func TestLoadServiceConfigDevelopmentDefaults(t *testing.T) {
@@ -114,6 +135,31 @@ func TestLoadServiceConfigFailsClosed(t *testing.T) {
 			t.Setenv("CRABEDENCE_PEER_PRINCIPALS", "0:*")
 		}, "CRABEDENCE_TRUSTED_PROXY_UIDS"},
 		{"github enabled without token", func(t *testing.T) { t.Setenv("CRABBOX_GITHUB_ENABLED", "true") }, "no CRABBOX_GITHUB_TOKEN or GITHUB_TOKEN"},
+		{"production without attestation", func(t *testing.T) {
+			t.Setenv("CRABBOX_MODE", "production")
+			t.Setenv("CRABBOX_TOPOLOGY", "single")
+			t.Setenv("CRABEDENCE_PEER_PRINCIPALS", "1000:alice@example.com")
+		}, "requires runtime attestation"},
+		{"production with relaxed attestation", func(t *testing.T) {
+			t.Setenv("CRABBOX_MODE", "production")
+			t.Setenv("CRABBOX_TOPOLOGY", "single")
+			t.Setenv("CRABEDENCE_PEER_PRINCIPALS", "1000:alice@example.com")
+			t.Setenv("CRABEDENCE_ATTESTATION_REQUIRED", "true")
+			t.Setenv("CRABEDENCE_ATTESTATION_RELAXED", "true")
+		}, "RELAXED is development-only"},
+		{"required attestation without keys", func(t *testing.T) {
+			t.Setenv("CRABEDENCE_ATTESTATION_REQUIRED", "true")
+		}, "CRABEDENCE_APPROVED_RUNTIME_KEYS"},
+		{"identity allowlist without keys", func(t *testing.T) {
+			t.Setenv("CRABEDENCE_APPROVED_RELEASES", strings.Repeat("a", 64))
+		}, "require CRABEDENCE_APPROVED_RUNTIME_KEYS or CRABEDENCE_ATTESTATION_RELAXED"},
+		{"malformed runtime key", func(t *testing.T) {
+			t.Setenv("CRABEDENCE_APPROVED_RUNTIME_KEYS", "not-an-entry")
+		}, "CRABEDENCE_APPROVED_RUNTIME_KEYS"},
+		{"malformed session ttl", func(t *testing.T) {
+			t.Setenv("CRABEDENCE_ATTESTATION_RELAXED", "true")
+			t.Setenv("CRABEDENCE_ATTESTATION_SESSION_TTL", "soon")
+		}, "CRABEDENCE_ATTESTATION_SESSION_TTL"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -143,9 +189,14 @@ func TestProductionRequiresAuthenticatedPrincipals(t *testing.T) {
 	}
 
 	t.Setenv("CRABEDENCE_PEER_PRINCIPALS", "1000:alice@example.com")
+	t.Setenv("CRABEDENCE_ATTESTATION_REQUIRED", "true")
+	t.Setenv("CRABEDENCE_APPROVED_RUNTIME_KEYS", testApprovedRuntimeKey(t))
 	cfg, err := LoadServiceConfig(ServeOptions{})
 	if err != nil {
-		t.Fatalf("production with a peer map must load: %v", err)
+		t.Fatalf("production with a peer map and attestation must load: %v", err)
+	}
+	if cfg.Attestation == nil || !cfg.Attestation.Required || len(cfg.Attestation.ApprovedKeys) != 1 {
+		t.Fatalf("attestation policy = %+v, want required with one approved key", cfg.Attestation)
 	}
 	if !cfg.Production() {
 		t.Fatal("the config must report production mode")

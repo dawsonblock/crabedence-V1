@@ -19,6 +19,7 @@ import (
 	"github.com/openclaw/crabbox/internal/capability"
 	"github.com/openclaw/crabbox/internal/evidence"
 	"github.com/openclaw/crabbox/internal/idempotency"
+	"github.com/openclaw/crabbox/internal/providertransport"
 	"github.com/openclaw/crabbox/internal/reconcile"
 )
 
@@ -70,15 +71,32 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	var githubPullMergeHandler *GitHubPullMergeHandler
 	var githubReads *GitHubReads
 	if cfg.GitHubEnabled {
-		githubHandler = NewGitHubIssueHandler(cfg.GitHubAPIURL, cfg.GitHubToken)
-		githubCommentHandler = NewGitHubCommentHandler(cfg.GitHubAPIURL, cfg.GitHubToken)
-		githubIssueCloseHandler = NewGitHubIssueCloseHandler(cfg.GitHubAPIURL, cfg.GitHubToken)
-		githubIssueUpdateHandler = NewGitHubIssueUpdateHandler(cfg.GitHubAPIURL, cfg.GitHubToken)
-		githubPullCreateHandler = NewGitHubPullCreateHandler(cfg.GitHubAPIURL, cfg.GitHubToken)
-		githubPullMergeHandler = NewGitHubPullMergeHandler(cfg.GitHubAPIURL, cfg.GitHubToken)
-		// The observational read shares the provider identity and
-		// configuration with the mutation adapter.
-		githubReads = NewGitHubReads(cfg.GitHubAPIURL, cfg.GitHubToken)
+		// One trusted transport serves every GitHub capability: the
+		// declared API URL is validated as a canonical HTTPS origin
+		// (plaintext loopback needs the explicit test exception, which
+		// production refuses), the bearer token is attached only after
+		// destination and DLP checks pass, and no handler ever holds the
+		// credential or chooses a destination.
+		githubTransport, err := newGitHubTransportForService(cfg, providerAuditSink)
+		if err != nil {
+			return err
+		}
+		githubHandler = NewGitHubIssueHandler("", "")
+		githubCommentHandler = NewGitHubCommentHandler("", "")
+		githubIssueCloseHandler = NewGitHubIssueCloseHandler("", "")
+		githubIssueUpdateHandler = NewGitHubIssueUpdateHandler("", "")
+		githubPullCreateHandler = NewGitHubPullCreateHandler("", "")
+		githubPullMergeHandler = NewGitHubPullMergeHandler("", "")
+		githubReads = NewGitHubReads("", "")
+		for _, h := range []interface {
+			SetTransport(*providertransport.Transport)
+		}{
+			githubHandler, githubCommentHandler, githubIssueCloseHandler,
+			githubIssueUpdateHandler, githubPullCreateHandler, githubPullMergeHandler,
+			githubReads,
+		} {
+			h.SetTransport(githubTransport)
+		}
 	}
 
 	// Qualification extension: CRABEDENCE_QUAL_PROVIDER_URL wires the
@@ -367,6 +385,24 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	if cfg.PeerPrincipals != nil {
 		service.SetPeerAuth(cfg.PeerPrincipals)
 		fmt.Fprintf(os.Stderr, "Peer authentication: strict UID→principal map (%d entries)\n", len(cfg.PeerPrincipals))
+	}
+
+	// Runtime attestation: the Ed25519 challenge-response the runtime
+	// completes before its invocations are admitted. The verified
+	// runtime identity — release, plugin manifest, ABI — is bound to
+	// the session and persisted on each execution record. Attestation
+	// supplements peer authentication; it never replaces it.
+	if cfg.Attestation != nil {
+		service.SetAttestation(*cfg.Attestation)
+		mode := "strict"
+		if cfg.Attestation.Relaxed {
+			mode = "relaxed (development)"
+		}
+		req := "optional"
+		if cfg.Attestation.Required {
+			req = "required"
+		}
+		fmt.Fprintf(os.Stderr, "Runtime attestation: %s, %s (%d approved keys)\n", req, mode, len(cfg.Attestation.ApprovedKeys))
 	}
 
 	// Handle signals

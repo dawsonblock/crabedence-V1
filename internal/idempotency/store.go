@@ -124,6 +124,39 @@ type Record struct {
 	// AdmittedEpoch is the cluster epoch the record was acquired under
 	// — forensic provenance for "which world admitted this execution".
 	AdmittedEpoch int64 `json:"admitted_epoch,omitempty"`
+	// AmbiguityCause records why the record entered UNKNOWN —
+	// provider-side causes (timeout, connection reset, protocol
+	// ambiguity) are distinguished from local-side causes (pre-
+	// dispatch deadline, executor cancel, process shutdown) so
+	// provider-health accounting does not have to infer causality
+	// from the bare UNKNOWN state. Empty when no ambiguity was
+	// recorded or the record never entered UNKNOWN.
+	AmbiguityCause string `json:"ambiguity_cause,omitempty"`
+	// DispatchMilestone is the furthest trusted-transport boundary the
+	// dispatch observably crossed before the outcome went ambiguous
+	// (request written, response began, ...). It bounds — never
+	// proves — provider receipt: a post-dispatch milestone keeps the
+	// record eligible for provider reconciliation.
+	DispatchMilestone string `json:"dispatch_milestone,omitempty"`
+	// AttestedSessionID is the runtime-attestation session this
+	// request was verified under — server-resolved provenance, never
+	// caller-declared. Empty for unattested executions.
+	AttestedSessionID string `json:"attested_session_id,omitempty"`
+	// RuntimeIdentityDigest is the canonical digest of the attested
+	// runtime identity (release, plugin manifest, activation, ABI,
+	// key) that produced the session.
+	RuntimeIdentityDigest string `json:"runtime_identity_digest,omitempty"`
+	// RuntimeKeyFingerprint is the SHA-256 fingerprint of the Ed25519
+	// runtime key that attested the session.
+	RuntimeKeyFingerprint string `json:"runtime_key_fingerprint,omitempty"`
+	// PeerUID, PeerPID, and PeerExecutable are the kernel-supplied
+	// local-caller evidence — which OS-level process invoked the
+	// request. Nil UID/PID or empty Executable mean the platform
+	// cannot supply them, never that the peer has none. UID is a
+	// pointer because 0 (root) is a legitimate UID.
+	PeerUID        *int64 `json:"peer_uid,omitempty"`
+	PeerPID        *int64 `json:"peer_pid,omitempty"`
+	PeerExecutable string `json:"peer_executable,omitempty"`
 }
 
 // ─── Store ───────────────────────────────────────────────────────────
@@ -352,7 +385,7 @@ func (s *Store) checkEpoch(ctx context.Context) error {
 // requires. Startup verifies the migrated schema reaches this version —
 // a database older than the code fails closed rather than running
 // against a partial schema.
-const RequiredSchemaVersion = 13
+const RequiredSchemaVersion = 16
 
 // schemaMigration is one versioned, idempotent schema change. Each
 // migration must be safe to re-run (IF NOT EXISTS / addColumnIfMissing)
@@ -380,6 +413,9 @@ var schemaMigrations = []schemaMigration{
 	{11, "cluster_recovery_mode", migrationClusterRecoveryMode},
 	{12, "request_mediation", migrationRequestMediation},
 	{13, "digest_version", migrationDigestVersion},
+	{14, "ambiguity_provenance", migrationAmbiguityProvenance},
+	{15, "attestation_provenance", migrationAttestationProvenance},
+	{16, "peer_evidence", migrationPeerEvidence},
 }
 
 func (s *Store) ensureSchema(ctx context.Context) error {
@@ -939,6 +975,56 @@ func migrationDigestVersion(ctx context.Context, conn *sql.Conn) error {
 	return err
 }
 
+// migrationAmbiguityProvenance adds the UNKNOWN-causality columns:
+// ambiguity_cause records why the record entered UNKNOWN (provider
+// timeout, connection reset, local shutdown, ...) and
+// dispatch_milestone records the furthest trusted-transport boundary
+// crossed before the outcome went ambiguous. Both live on the
+// materialized row (queryable for cause-aware provider-health
+// accounting) and on each effect_provider_observations row (immutable
+// forensic provenance).
+func migrationAmbiguityProvenance(ctx context.Context, conn *sql.Conn) error {
+	for _, table := range []string{"execution_requests", "effect_provider_observations"} {
+		for _, col := range []string{"ambiguity_cause", "dispatch_milestone"} {
+			if _, err := conn.ExecContext(ctx,
+				fmt.Sprintf(`ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s TEXT`, table, col)); err != nil {
+				return fmt.Errorf("%s.%s: %w", table, col, err)
+			}
+		}
+	}
+	return nil
+}
+
+// migrationAttestationProvenance adds the server-verified runtime-
+// identity columns: the attested session the request was verified
+// under and the digest of the runtime identity (plus the runtime-key
+// fingerprint) that attested it.
+func migrationAttestationProvenance(ctx context.Context, conn *sql.Conn) error {
+	for _, col := range []string{"attested_session_id", "runtime_identity_digest", "runtime_key_fingerprint"} {
+		if _, err := conn.ExecContext(ctx,
+			fmt.Sprintf(`ALTER TABLE execution_requests ADD COLUMN IF NOT EXISTS %s TEXT`, col)); err != nil {
+			return fmt.Errorf("%s: %w", col, err)
+		}
+	}
+	return nil
+}
+
+// migrationPeerEvidence adds the kernel-supplied local-caller columns:
+// which OS-level process invoked the request. UID/PID are INTEGER
+// (NULL means the platform cannot supply them — 0 is a legitimate
+// UID); executable is TEXT.
+func migrationPeerEvidence(ctx context.Context, conn *sql.Conn) error {
+	for _, col := range []struct{ name, typ string }{
+		{"peer_uid", "BIGINT"}, {"peer_pid", "BIGINT"}, {"peer_executable", "TEXT"},
+	} {
+		if _, err := conn.ExecContext(ctx,
+			fmt.Sprintf(`ALTER TABLE execution_requests ADD COLUMN IF NOT EXISTS %s %s`, col.name, col.typ)); err != nil {
+			return fmt.Errorf("%s: %w", col.name, err)
+		}
+	}
+	return nil
+}
+
 // ─── Forensic write helpers ──────────────────────────────────────────
 
 // insertEffectEvent appends one event row inside the mutation's
@@ -978,18 +1064,21 @@ func insertObservationRow(ctx context.Context, tx *sql.Tx, executionID, kind str
 			(execution_id, sequence, record_version, observation_kind,
 			 provider_id, provider_run_id, provider_status,
 			 result_bytes, result_sha256, result_canonical_digest,
-			 evidence_sha256, receipt_version)
+			 evidence_sha256, receipt_version,
+			 ambiguity_cause, dispatch_milestone)
 		SELECT er.execution_id::text,
 			COALESCE((SELECT MAX(o.sequence) FROM effect_provider_observations o
 			          WHERE o.execution_id = er.execution_id::text), 0) + 1,
 			er.version, $2,
 			NULLIF($3, ''), NULLIF($4, ''), NULLIF($5, ''),
-			$6, NULLIF($7, ''), NULLIF($8, ''), NULLIF($9, ''), $10
+			$6, NULLIF($7, ''), NULLIF($8, ''), NULLIF($9, ''), $10,
+			NULLIF($11, ''), NULLIF($12, '')
 		FROM execution_requests er
 		WHERE er.execution_id::text = $1
 	`, executionID, kind, obs.ProviderID, obs.ProviderRunID, obs.ProviderStatus,
 		nullableBytes(rawResult), sha256Hex(rawResult), obs.ResultDigest,
-		obs.EvidenceDigest, obs.ReceiptVersion)
+		obs.EvidenceDigest, obs.ReceiptVersion,
+		obs.AmbiguityCause, obs.DispatchMilestone)
 	return err
 }
 
@@ -1084,9 +1173,23 @@ func (s *Store) AcquireWithAuthority(ctx context.Context, key, principal, capabi
 // evidence only — never consulted for authorization, routing, or
 // replay decisions.
 func (s *Store) AcquireWithMediation(ctx context.Context, key, principal, capability, digest string, authority AuthorityBinding, mediation *MediationBinding, class string, leaseDuration time.Duration) (*AcquireResult, error) {
+	return s.AcquireWithProvenance(ctx, key, principal, capability, digest,
+		AcquireProvenance{Authority: authority, Mediation: mediation}, class, leaseDuration)
+}
+
+// AcquireWithProvenance is AcquireWithMediation plus the complete
+// acquisition provenance: the attested session and identity digest,
+// and the kernel-supplied local-caller evidence, are persisted on the
+// record at insert so the ledger names the verified runtime and local
+// process that produced the request. Evidence only — none of it is
+// bound into the request digest, so a re-attested session replays to
+// the same execution identity.
+func (s *Store) AcquireWithProvenance(ctx context.Context, key, principal, capability, digest string, provenance AcquireProvenance, class string, leaseDuration time.Duration) (*AcquireResult, error) {
 	if err := s.leaseCfg.Validate(leaseDuration); err != nil {
 		return nil, err
 	}
+	authority := provenance.Authority
+	mediation := provenance.Mediation
 
 	var mediationJSON []byte
 	if mediation != nil {
@@ -1094,6 +1197,17 @@ func (s *Store) AcquireWithMediation(ctx context.Context, key, principal, capabi
 		if mediationJSON, err = json.Marshal(mediation); err != nil {
 			return nil, fmt.Errorf("failed to encode request mediation: %w", err)
 		}
+	}
+	var attSession, attDigest, attKeyFp *string
+	if att := provenance.Attestation; att != nil {
+		attSession = stringPtr(att.SessionID)
+		attDigest = stringPtr(att.IdentityDigest)
+		attKeyFp = stringPtr(att.KeyFingerprint)
+	}
+	var peerUID, peerPID, peerExe any
+	if peer := provenance.Peer; peer != nil {
+		peerUID, peerPID = peer.UID, peer.PID
+		peerExe = nullableString(peer.Executable)
 	}
 
 	leaseToken, err := generateLeaseToken()
@@ -1131,10 +1245,12 @@ func (s *Store) AcquireWithMediation(ctx context.Context, key, principal, capabi
 			 grant_id, authority_generation, authority_digest, execution_class, state,
 			 lease_owner, lease_token, lease_started_at, lease_expires_at,
 			 lease_generation, attempt, version, admitted_epoch, request_mediation,
-			 digest_version)
+			 digest_version, attested_session_id, runtime_identity_digest,
+			 runtime_key_fingerprint, peer_uid, peer_pid, peer_executable)
 		SELECT $10, $1, $2, $3, $4, $5, $11, $12, $6, 'PREPARED',
 				$7, $8, clock_timestamp(), clock_timestamp() + make_interval(secs => $9),
-				1, 0, 1, cm.epoch, $13, `+strconv.Itoa(DigestVersionDescriptorBound)+`
+				1, 0, 1, cm.epoch, $13, `+strconv.Itoa(DigestVersionDescriptorBound)+`,
+				$14, $15, $16, $17, $18, $19
 		FROM cluster_meta cm
 		WHERE cm.id = 1 AND cm.epoch = `+strconv.FormatInt(s.epoch, 10)+` AND NOT cm.recovery_required
 		ON CONFLICT (principal_id, capability_id, idempotency_key) DO NOTHING
@@ -1142,7 +1258,8 @@ func (s *Store) AcquireWithMediation(ctx context.Context, key, principal, capabi
 	`, key, principal, capability, digest, nullableString(authority.Ref), class,
 		leaseOwner, leaseToken, pgInterval(leaseDuration),
 		genID, authority.Generation, nullableString(authority.Digest),
-		nullableBytes(mediationJSON),
+		nullableBytes(mediationJSON), attSession, attDigest, attKeyFp,
+		peerUID, peerPID, peerExe,
 	).Scan(&executionID, &createdAt)
 
 	if err == nil {
@@ -1166,26 +1283,32 @@ func (s *Store) AcquireWithMediation(ctx context.Context, key, principal, capabi
 			LeaseToken: leaseToken,
 			Generation: 1,
 			Record: &Record{
-				ExecutionID:         executionID,
-				IdempotencyKey:      key,
-				PrincipalID:         principal,
-				CapabilityID:        capability,
-				RequestDigest:       digest,
-				GrantID:             authority.Ref,
-				AuthorityGeneration: authority.Generation,
-				AuthorityDigest:     authority.Digest,
-				RequestMediation:    json.RawMessage(mediationJSON),
-				DigestVersion:       DigestVersionDescriptorBound,
-				ExecutionClass:      class,
-				State:               StatePrepared,
-				LeaseOwner:          leaseOwner,
-				LeaseToken:          leaseToken,
-				LeaseGeneration:     1,
-				Attempt:             0,
-				Version:             1,
-				CreatedAt:           createdAt,
-				UpdatedAt:           createdAt,
-				AdmittedEpoch:       s.epoch,
+				ExecutionID:           executionID,
+				IdempotencyKey:        key,
+				PrincipalID:           principal,
+				CapabilityID:          capability,
+				RequestDigest:         digest,
+				GrantID:               authority.Ref,
+				AuthorityGeneration:   authority.Generation,
+				AuthorityDigest:       authority.Digest,
+				RequestMediation:      json.RawMessage(mediationJSON),
+				DigestVersion:         DigestVersionDescriptorBound,
+				AttestedSessionID:     deref(attSession),
+				RuntimeIdentityDigest: deref(attDigest),
+				RuntimeKeyFingerprint: deref(attKeyFp),
+				PeerUID:               provenance.peerUID(),
+				PeerPID:               provenance.peerPID(),
+				PeerExecutable:        provenance.peerExecutable(),
+				ExecutionClass:        class,
+				State:                 StatePrepared,
+				LeaseOwner:            leaseOwner,
+				LeaseToken:            leaseToken,
+				LeaseGeneration:       1,
+				Attempt:               0,
+				Version:               1,
+				CreatedAt:             createdAt,
+				UpdatedAt:             createdAt,
+				AdmittedEpoch:         s.epoch,
 			},
 		}, nil
 	}
@@ -2365,6 +2488,8 @@ func (s *Store) EnterRecoveryWithObservation(ctx context.Context, executionID st
 		    provider_observed_at = clock_timestamp(),
 		    evidence_digest = COALESCE($9::text, evidence_digest),
 		    provider_evidence_digest = COALESCE($9::text, provider_evidence_digest),
+		    ambiguity_cause = COALESCE($12::text, ambiguity_cause),
+		    dispatch_milestone = COALESCE($13::text, dispatch_milestone),
 		    updated_at = clock_timestamp()
 		WHERE execution_id = $1
 		  AND state = $2
@@ -2380,12 +2505,15 @@ func (s *Store) EnterRecoveryWithObservation(ctx context.Context, executionID st
 		  AND (provider_receipt_version IS NULL OR provider_receipt_version = 0 OR NULLIF($8::int, 0) IS NULL OR provider_receipt_version = $8::int)
 		  AND (evidence_digest IS NULL OR $9::text IS NULL OR evidence_digest = $9::text)
 		  AND (provider_evidence_digest IS NULL OR $9::text IS NULL OR provider_evidence_digest = $9::text)
+		  AND (ambiguity_cause IS NULL OR $12::text IS NULL OR ambiguity_cause = $12::text)
+		  AND (dispatch_milestone IS NULL OR $13::text IS NULL OR dispatch_milestone = $13::text)
 		  `+s.epochGuardSQL(), executionID, string(expectedState), expectedVersion,
 		nullableString(obs.ProviderID), nullableString(obs.ProviderRunID),
 		nullableString(obs.ProviderStatus), nullableString(obs.ResultDigest),
 		obs.ReceiptVersion,
 		nullableString(obs.EvidenceDigest), nullableString(string(obs.Result)),
-		nullableString(string(obs.Result)))
+		nullableString(string(obs.Result)),
+		nullableString(obs.AmbiguityCause), nullableString(obs.DispatchMilestone))
 	if err != nil {
 		return err
 	}
@@ -2493,6 +2621,15 @@ type ProviderObservation struct {
 	ResultDigest   string
 	EvidenceDigest string
 	ReceiptVersion int
+	// AmbiguityCause is the classified reason the outcome went
+	// ambiguous (provider timeout, connection reset, local shutdown,
+	// ...) — see Record.AmbiguityCause. Monotonic like the other
+	// observation fields: supplied values fill NULL columns and must
+	// equal any stored value.
+	AmbiguityCause string
+	// DispatchMilestone is the furthest trusted-transport boundary the
+	// dispatch observably crossed before the outcome went ambiguous.
+	DispatchMilestone string
 	// ObservedAt is populated by the store from clock_timestamp() —
 	// database time is authoritative. Caller-supplied values are
 	// ignored.
@@ -2545,6 +2682,8 @@ func (s *Store) RecordProviderObservation(ctx context.Context, executionID, leas
 		    evidence_digest = COALESCE($9::text, evidence_digest),
 		    provider_evidence_digest = COALESCE($9::text, provider_evidence_digest),
 		    provider_receipt_version = COALESCE(NULLIF($10::int, 0), provider_receipt_version),
+		    ambiguity_cause = COALESCE($12::text, ambiguity_cause),
+		    dispatch_milestone = COALESCE($13::text, dispatch_milestone),
 		    provider_observed_at = clock_timestamp(),
 		    updated_at = clock_timestamp()
 		WHERE execution_id = $1
@@ -2563,11 +2702,14 @@ func (s *Store) RecordProviderObservation(ctx context.Context, executionID, leas
 		  AND (evidence_digest IS NULL OR $9::text IS NULL OR evidence_digest = $9::text)
 		  AND (provider_evidence_digest IS NULL OR $9::text IS NULL OR provider_evidence_digest = $9::text)
 		  AND (provider_receipt_version IS NULL OR provider_receipt_version = 0 OR NULLIF($10::int, 0) IS NULL OR provider_receipt_version = $10::int)
+		  AND (ambiguity_cause IS NULL OR $12::text IS NULL OR ambiguity_cause = $12::text)
+		  AND (dispatch_milestone IS NULL OR $13::text IS NULL OR dispatch_milestone = $13::text)
 		  `+s.epochGuardSQL(), executionID, nullableString(leaseToken), leaseGeneration,
 		nullableString(obs.ProviderID), nullableString(obs.ProviderRunID),
 		nullableString(obs.ProviderStatus), nullableString(string(obs.Result)),
 		nullableString(obs.ResultDigest), nullableString(obs.EvidenceDigest),
-		obs.ReceiptVersion, nullableString(string(obs.Result)))
+		obs.ReceiptVersion, nullableString(string(obs.Result)),
+		nullableString(obs.AmbiguityCause), nullableString(obs.DispatchMilestone))
 	if err != nil {
 		return err
 	}
@@ -2973,7 +3115,11 @@ const selectColumns = `execution_id, idempotency_key, principal_id, capability_i
 	COALESCE(authority_generation, 0), COALESCE(authority_digest, ''),
 	COALESCE(provider_evidence_digest, ''), COALESCE(terminal_result_digest, ''),
 	COALESCE(terminal_evidence_digest, ''), COALESCE(admitted_epoch, 0),
-	request_mediation, COALESCE(digest_version, 1)`
+	request_mediation, COALESCE(digest_version, 1),
+	COALESCE(ambiguity_cause, ''), COALESCE(dispatch_milestone, ''),
+	COALESCE(attested_session_id, ''), COALESCE(runtime_identity_digest, ''),
+	COALESCE(runtime_key_fingerprint, ''),
+	peer_uid, peer_pid, COALESCE(peer_executable, '')`
 
 // selectColumnsER is selectColumns qualified with the `er` alias, for
 // use in UPDATE ... FROM ... RETURNING statements where the FROM clause
@@ -2993,7 +3139,11 @@ const selectColumnsER = `er.execution_id, er.idempotency_key, er.principal_id, e
 	COALESCE(er.authority_generation, 0), COALESCE(er.authority_digest, ''),
 	COALESCE(er.provider_evidence_digest, ''), COALESCE(er.terminal_result_digest, ''),
 	COALESCE(er.terminal_evidence_digest, ''), COALESCE(er.admitted_epoch, 0),
-	er.request_mediation, COALESCE(er.digest_version, 1)`
+	er.request_mediation, COALESCE(er.digest_version, 1),
+	COALESCE(er.ambiguity_cause, ''), COALESCE(er.dispatch_milestone, ''),
+	COALESCE(er.attested_session_id, ''), COALESCE(er.runtime_identity_digest, ''),
+	COALESCE(er.runtime_key_fingerprint, ''),
+	er.peer_uid, er.peer_pid, COALESCE(er.peer_executable, '')`
 
 // pgInterval converts a Go duration into a PostgreSQL interval
 // expression argument. make_interval(secs => x) accepts arbitrary
@@ -3537,7 +3687,8 @@ func (s *Store) ListProviderObservations(ctx context.Context, executionID string
 		       COALESCE(provider_id, ''), COALESCE(provider_run_id, ''),
 		       COALESCE(provider_status, ''), result_bytes,
 		       COALESCE(result_sha256, ''), COALESCE(result_canonical_digest, ''),
-		       COALESCE(evidence_sha256, ''), receipt_version, observed_at
+		       COALESCE(evidence_sha256, ''), receipt_version, observed_at,
+		       COALESCE(ambiguity_cause, ''), COALESCE(dispatch_milestone, '')
 		FROM effect_provider_observations
 		WHERE execution_id = $1
 		ORDER BY sequence`, executionID)
@@ -3552,7 +3703,8 @@ func (s *Store) ListProviderObservations(ctx context.Context, executionID string
 		if err := rows.Scan(&r.ExecutionID, &r.Sequence, &r.RecordVersion,
 			&r.Kind, &r.ProviderID, &r.ProviderRunID, &r.ProviderStatus,
 			&resultBytes, &r.ResultSHA256, &r.ResultCanonicalDigest,
-			&r.EvidenceSHA256, &r.ReceiptVersion, &r.ObservedAt); err != nil {
+			&r.EvidenceSHA256, &r.ReceiptVersion, &r.ObservedAt,
+			&r.AmbiguityCause, &r.DispatchMilestone); err != nil {
 			return nil, err
 		}
 		if resultBytes != nil {
@@ -3578,6 +3730,7 @@ func scanRecordsWithReconcile(rows *sql.Rows) ([]*Record, error) {
 		var recOwner, lastRecErr sql.NullString
 		var recLeaseExp, nextRecAt, enteredUnknownAt sql.NullTime
 		var requestMediation []byte
+		var peerUID, peerPID sql.NullInt64
 		if err := rows.Scan(
 			&rec.ExecutionID, &rec.IdempotencyKey, &rec.PrincipalID,
 			&rec.CapabilityID, &rec.RequestDigest, &rec.GrantID,
@@ -3595,6 +3748,10 @@ func scanRecordsWithReconcile(rows *sql.Rows) ([]*Record, error) {
 			&rec.ProviderEvidenceDigest, &rec.TerminalResultDigest,
 			&rec.TerminalEvidenceDigest, &rec.AdmittedEpoch,
 			&requestMediation, &rec.DigestVersion,
+			&rec.AmbiguityCause, &rec.DispatchMilestone,
+			&rec.AttestedSessionID, &rec.RuntimeIdentityDigest,
+			&rec.RuntimeKeyFingerprint,
+			&peerUID, &peerPID, &rec.PeerExecutable,
 		); err != nil {
 			return nil, err
 		}
@@ -3641,6 +3798,12 @@ func scanRecordsWithReconcile(rows *sql.Rows) ([]*Record, error) {
 		}
 		if len(requestMediation) > 0 {
 			rec.RequestMediation = json.RawMessage(requestMediation)
+		}
+		if peerUID.Valid {
+			rec.PeerUID = &peerUID.Int64
+		}
+		if peerPID.Valid {
+			rec.PeerPID = &peerPID.Int64
 		}
 		if recOwner.Valid {
 			rec.ReconcileOwner = recOwner.String
@@ -3705,4 +3868,45 @@ func nullableBytes(b []byte) any {
 		return nil
 	}
 	return b
+}
+
+// deref unwraps a *string SQL argument back to its string value for
+// the in-memory Record the acquire path returns.
+func deref(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
+// stringPtr returns nil for the empty string — NULL, not a zero-length
+// provenance value — and a pointer otherwise.
+func stringPtr(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
+// The peer accessors unwrap the optional PeerBinding so a nil binding
+// produces the zero value (nil pointer / empty string) directly.
+func (p AcquireProvenance) peerUID() *int64 {
+	if p.Peer == nil {
+		return nil
+	}
+	return p.Peer.UID
+}
+
+func (p AcquireProvenance) peerPID() *int64 {
+	if p.Peer == nil {
+		return nil
+	}
+	return p.Peer.PID
+}
+
+func (p AcquireProvenance) peerExecutable() string {
+	if p.Peer == nil {
+		return ""
+	}
+	return p.Peer.Executable
 }
