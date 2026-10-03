@@ -753,7 +753,7 @@ func resolveDeploymentMode() (string, error) {
 	case "":
 		return "", fmt.Errorf("CRABBOX_MODE must be declared (development or production): the execution service's security posture keys off it, so an unset mode is never assumed to be development")
 	default:
-		return "", fmt.Errorf("unknown CRABBOX_MODE %q (want development or production)", os.Getenv("CRABBOX_MODE"))
+		return "", fmt.Errorf("unknown CRABBOX_MODE %q (want development or production)", raw)
 	}
 }
 
