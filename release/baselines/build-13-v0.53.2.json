@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 1,
+  "record": "release-integrity baseline freeze",
+  "purpose": "Auditable before/after boundary for the v0.54.0-rc.1 release-integrity hardening cycle. The archives named below were produced by the pre-hardening packager from the frozen source commit and are the comparison baseline; nothing in this cycle edits them in place.",
+  "capturedAt": "2026-10-03T00:00:00Z",
+  "repository": "NEMO-CONTROL umbrella (dawsonblock/NEMO-CONTROL)",
+  "projectRoot": "crabedence-V1-fix-integration-integrity",
+  "baselineBranch": "main",
+  "hardeningBranch": "fix/release-integrity-v054",
+  "sourceCommit": "114ce64d9d354c4fc1a6353ce4bef38f955e9f2b",
+  "releaseVersion": "0.53.2",
+  "identities": {
+    "shippedRuntimeSha256": "e1279ef20acc448ac52a6ac2332c81f71e278b2bf71579160ffc953d0f9567a0",
+    "shippedRuntimeTree": "runtimes/nemo-relay",
+    "shippedRuntimeFiles": 1466,
+    "shippedRuntimeSymlinks": 10,
+    "nemoRuntimeVersion": "0.9.1-rc.4",
+    "nemoSourceSha256": "05d45ec86b1985b4aa4ba24f1315b96c858c56694c66116eae097cb68de06957",
+    "nemoSourceTree": "NEMO-feat-native-plugin-isolation",
+    "nemoSourceFiles": 1438,
+    "nemoSourceSymlinks": 10,
+    "provenancePolicySha256": "0ffe1cc939bcaaf4d4c361d5a58d9bd4e2a39e009f0c89d6809c32988c3feba1",
+    "capabilityRegistrySha256": "3c32a9d2f51f9c1d0068dfaad04f2499ce7baade91ccafa42fa233c1700db3e9",
+    "declaredDelta": {
+      "modifiedFiles": 78,
+      "addedFiles": 29,
+      "removedFiles": 1,
+      "addedSymlinks": 0,
+      "removedSymlinks": 0,
+      "retargetedSymlinks": 0,
+      "retypedPaths": 0,
+      "modeChanges": 0
+    }
+  },
+  "baselineArchives": {
+    "note": "Produced by scripts/package-source-archive.sh at the frozen source commit; both passed post-extraction source-manifest and transfer-manifest (--require-source) verification. Lives under the gitignored dist/ tree.",
+    "prefix": "nemo-control-v0.53.2-build13",
+    "manifestEntries": 4083,
+    "zip": {
+      "path": "dist/source-nemo-control-v0.53.2-build13.zip",
+      "sha256": "4cd6af245f2dc43e2cf194fedbb5b9041a28328b546bfc4b073e68f593b61e81"
+    },
+    "tarGz": {
+      "path": "dist/source-nemo-control-v0.53.2-build13.tar.gz",
+      "sha256": "b25d2aacdcad79c6090ed2400c3b6d9fa51bb3953b42847a3c8d054d3c820cd1"
+    }
+  },
+  "toolchains": {
+    "go": "go1.26.5 darwin/arm64",
+    "node": "v24.16.0",
+    "python3": "3.12+",
+    "tar": "bsdtar 3.5.3",
+    "zip": "Info-ZIP (macOS /usr/bin/zip)"
+  }
+}
