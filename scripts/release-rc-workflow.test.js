@@ -30,7 +30,11 @@ test("clean-room verification gates publication", () => {
   // publish job, so a failed clean-room verification cannot publish.
   assert.doesNotMatch(job("build"), /git push origin|softprops\/action-gh-release/);
   assert.doesNotMatch(cleanRoom, /git push origin|softprops\/action-gh-release/);
-  assert.match(publish, /git push origin "\$RELEASE_VERSION"/);
+  // The tag push lives in the tested script the publish job delegates
+  // to — the workflow must not carry its own tag/push logic.
+  assert.match(publish, /scripts\/ensure-release-tag\.sh "\$RELEASE_VERSION" "\$COMMIT"/);
+  const ensureTag = fs.readFileSync(path.join(repoRoot, "scripts/ensure-release-tag.sh"), "utf8");
+  assert.match(ensureTag, /git push "\$REMOTE" "\$TAG"/);
   assert.match(publish, /softprops\/action-gh-release@/);
 });
 
@@ -143,12 +147,13 @@ test("tag creation is idempotent and never moves a published tag", () => {
   const tagStep = publish.indexOf("name: Tag release candidate");
   assert.ok(tagStep >= 0);
   const tagBlock = publish.slice(tagStep, publish.indexOf("\n      - name:", tagStep));
-  // An existing tag on the qualified commit is reused; any other target
-  // is a hard failure. A published release tag is never moved.
-  assert.match(tagBlock, /ls-remote origin "refs\/tags\/\$\{RELEASE_VERSION\}\^\{\}"/);
-  assert.match(tagBlock, /"\$existing" != "\$COMMIT"/);
-  assert.match(tagBlock, /exit 1/);
-  assert.match(tagBlock, /git tag -a "\$RELEASE_VERSION"/);
+  // The admission rule lives in a tested script: an existing tag on the
+  // qualified commit is reused, any other target is a hard failure, and
+  // a published release tag is never moved. The workflow must delegate
+  // to it with the qualified commit — never re-implement it inline.
+  assert.match(tagBlock, /bash scripts\/ensure-release-tag\.sh "\$RELEASE_VERSION" "\$COMMIT"/);
+  assert.doesNotMatch(tagBlock, /git tag -/);
+  assert.doesNotMatch(tagBlock, /git push/);
 });
 
 test("an existing release must already carry the qualified bytes", () => {
