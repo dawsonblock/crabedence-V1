@@ -182,9 +182,12 @@ bash "$REPO_ROOT/scripts/generate-source-manifest.sh" \
   "$EVIDENCE_DIR/source-tree-sha256.txt" "$REPO_ROOT" 2>&1 | \
   tee "$EVIDENCE_DIR/gate-results/source-manifest-generate.log"
 
-# Git blob manifest: path → git_blob_id (for Git-native verification)
+# Git blob manifest: path → git_blob_id (for Git-native verification).
+# ls-files reports paths relative to REPO_ROOT, while "HEAD:$file"
+# resolves against the repository root; the "./" form keeps the lookup
+# anchored at REPO_ROOT in both standalone and nested checkouts.
 git -C "$REPO_ROOT" ls-files -z -- . ':(exclude)release-evidence/' ':(exclude)dist/' | sort -z | while IFS= read -r -d '' file; do
-  blob="$(git -C "$REPO_ROOT" rev-parse "HEAD:$file")"
+  blob="$(git -C "$REPO_ROOT" rev-parse "HEAD:./$file")"
   echo "$blob  $file"
 done > "$EVIDENCE_DIR/source-tree-git-blobs.txt"
 
