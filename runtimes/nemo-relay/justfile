@@ -1818,6 +1818,14 @@ symbol-report:
 layer-report:
     python3 scripts/tcb/layers.py
 
+# Resolve every citation the kernel-invariant document makes against the tree.
+invariants-report:
+    python3 scripts/tcb/invariants.py
+
+# Regenerate the line pointers in security/INVARIANTS.md after items move.
+invariants-write:
+    python3 scripts/tcb/invariants.py --write
+
 # Capture the minimal-trusted-kernel baseline into reports/ (generated, git-ignored).
 tcb-baseline:
     python3 scripts/tcb/baseline.py

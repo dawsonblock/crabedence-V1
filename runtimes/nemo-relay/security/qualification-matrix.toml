@@ -289,6 +289,14 @@ enforced_by = [
 ]
 
 [[claim]]
+id = "the-invariant-citations-resolve"
+statement = "Every path, line pointer, symbol and test name the kernel-invariant document cites resolves against the tree — a moved item or a renamed test fails the gate instead of leaving the citation pointing at whatever landed on the line."
+status = "enforced"
+enforced_by = [
+  { recipe = "invariants-report" },
+]
+
+[[claim]]
 id = "the-cli-serves-plugins-from-another-process"
 statement = "The CLI's server runs a plugin in the host process: the plugin answers a managed call from here, its kind is not registered here, and the host is a process of its own."
 status = "enforced"

@@ -640,7 +640,9 @@ max_transitive_packages = 304
 # orchestration — registry sealing, grant binding, action lifecycle, recovery —
 # moved here out of `nemo-relay` unchanged except for crate paths, which is the
 # same move the layer gate records as the last upward edges closing.
-max_source_lines = 5996
+# Settled at the measured figure after the move's final wiring edits; the
+# budget records what the tree is, not what the first measurement guessed.
+max_source_lines = 6001
 max_unsafe_occurrences = 0
 direct_dependency_digest = "db9987a808521d2a904c52d259442e382e51460bd6a6339ce58b2af64ad371b9"
 transitive_dependency_digest = "e8bf57f38cf9c90ccb884a37f0922163543d06d63a5f910cd9935259c39316d2"

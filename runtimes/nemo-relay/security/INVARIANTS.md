@@ -15,8 +15,11 @@ that enforcement is structural (a type or a total `match` makes violation
 unrepresentable), checked (a runtime predicate rejects it), or merely
 conventional. Structural enforcement is the target; convention is a gap.
 
-Line numbers are anchors into the tree at the revision recorded in
-[BASELINE.md](./BASELINE.md). Symbol names are the durable reference.
+Symbol names are the durable reference; line numbers are pointers regenerated
+by `scripts/tcb/invariants.py --write`. The same gate resolves every path,
+symbol and test name this document cites against the tree, so a moved item or
+a renamed test turns the citation red instead of leaving it pointing at
+whatever landed on the line.
 
 ## Status summary
 
@@ -44,12 +47,12 @@ Line numbers are anchors into the tree at the revision recorded in
 A lifecycle state may only advance along the declared graph.
 
 **Enforced by** `ExecutionState::is_valid_lifecycle_transition`
-(`crates/ledger/src/lib.rs:87`), plus narrower predicates for each operation:
-`is_valid_authorization_transition`, `is_valid_generic_transition`
-(`crates/ledger/src/lib.rs:127`), and `is_valid_leased_transition`
-(`crates/ledger/src/lib.rs:141`). The abstract graph is deliberately wider than
-any single operation, so each store method must apply the predicate for what it
-does.
+(`crates/ledger/src/lib.rs:107`), plus narrower predicates for each operation:
+`is_valid_authorization_transition` (`crates/ledger/src/lib.rs:133`),
+`is_valid_generic_transition` (`crates/ledger/src/lib.rs:147`), and
+`is_valid_leased_transition` (`crates/ledger/src/lib.rs:161`). The abstract
+graph is deliberately wider than any single operation, so each store method
+must apply the predicate for what it does.
 
 **Verified by** `reference_store_rejects_authorization_and_lease_contract_misuse`
 (`crates/ledger/src/lib.rs`).
@@ -77,7 +80,7 @@ Claiming an idempotency key that already exists is only a success when the
 fingerprint matches; otherwise the claim is rejected as a conflict.
 
 **Enforced by** `PrepareActionResult::IdempotencyConflict`
-(`crates/ledger/src/lib.rs:429`) and the claim path that returns it.
+(`crates/ledger/src/lib.rs:459`) and the claim path that returns it.
 
 **Verified by** the idempotency-claim cases in the store conformance suite
 (`crates/ledger/src/lib.rs`).
@@ -200,7 +203,7 @@ effect schema or its relations, alongside the existing grant checks, including
 verified against the PostgreSQL release the repository pins for qualification,
 by escalating one property at a time and asserting the specific rejection.
 
-**Verified by** `a_production_kernel_composes_only_with_the_durable_store`,
+**Verified by** `a_verified_transport_composes_a_production_kernel`,
 `production_composition_is_fail_closed`, and `the_production_store_trait_is_sealed`
 (`crates/effect-runtime/tests/production_composition.rs`).
 
@@ -242,7 +245,7 @@ A terminal `FAILED` from the dispatching phase is only legal for a proven
 pre-dispatch failure, and a provider receipt is never accepted on that path.
 
 **Enforced by** `is_valid_pre_dispatch_failure_finalization`
-(`crates/ledger/src/lib.rs:210`) and the requirement that
+(`crates/ledger/src/lib.rs:230`) and the requirement that
 `finalize_pre_dispatch_failure` carry `PreDispatchFailureEvidence` rather than a
 receipt. `is_valid_leased_transition` excludes `Dispatching -> Failed`, so the
 fenced receipt path cannot produce it either.
@@ -252,7 +255,7 @@ fenced receipt path cannot produce it either.
 
 ## K-016 — A possibly-dispatched action enters `UNKNOWN` rather than `FAILED`
 
-**Enforced by** `state_for_error` (`crates/executor/src/lib.rs:228`). The
+**Enforced by** `state_for_error` (`crates/executor/src/lib.rs:249`). The
 `match` is total with no catch-all: `FAILED` requires exactly
 `NotDispatched` with `ConfirmedFailure`. `DispatchAttempted`,
 `DispatchConfirmed`, and any `Unknown` certainty all resolve to `UNKNOWN`. The

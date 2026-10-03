@@ -190,13 +190,14 @@ adapters, and the worker protocol sits with the other generated message
 contracts, so the gate now runs with no grandfathered exceptions for a
 regression to reuse.
 
-`security/PLUGIN-ISOLATION.md` records the milestone that moves native plugin
-loading across a process boundary. Almost all of the kernel's `unsafe` is the
-native plugin path, and relocating that loader to another crate would leave the
-same code in the same address space, so the milestone is judged on
-`kernel-process unsafe tokens` from `just tcb-report` rather than on crate
-organisation. The message contract already exists in
-`crates/plugin-protocol`; the kernel does not depend on it yet.
+`security/PLUGIN-ISOLATION.md` records the milestone that moved native plugin
+loading across a process boundary: the loader serves plugins from
+`nemo-plugin-host` in its own process, and `kernel-process unsafe tokens` from
+`just tcb-report` measures what is left in the kernel's address space — 27
+tokens, with the loader's budgeted on the host side rather than inferred from
+it. Every claim the milestone document makes is pinned to what enforces it by
+`just qualification-matrix`, so a renamed or deleted test turns the gate red
+instead of leaving a sentence that reads as checked.
 
 ## Experimental effect-state contracts
 

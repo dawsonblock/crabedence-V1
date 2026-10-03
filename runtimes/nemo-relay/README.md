@@ -179,6 +179,7 @@ claim, and the measurement is enforced in CI.
 ```bash
 just tcb-report          # trusted surface, budgets, and forbidden dependencies
 just layer-report        # dependency-layer rules; fails on a new upward edge
+just invariants-report   # every citation in security/INVARIANTS.md resolves
 just test-tcb-scripts    # the gates' own tests
 ```
 

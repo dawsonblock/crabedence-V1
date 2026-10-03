@@ -21,7 +21,7 @@ section was written):
   648 when the loader, the SDK and the ABI left the kernel's process. The one it
   gained is the `pre_exec` block that clears `FD_CLOEXEC` on the kernel channel
   a restricted-linux child inherits, which is the call that has to run between
-  fork and exec. The loader's tokens are budgeted on the host side now, at 310 —
+  fork and exec. The loader's tokens are budgeted on the host side now, at 325 —
   the restricted-linux confinement is written against the syscall surface, so its
   unsafe count is the boundary itself — and the two numbers are recorded rather
   than one being inferred from the other.
@@ -67,13 +67,13 @@ section was written):
   list is empty, and it stays in the test so the next consumer to reach for that
   route fails the check instead of being grandfathered by a missing one. The loader
   is not linked into the kernel any more, which is why the unsafe count below is a
-  twenty-sixth of what it was.
+  twenty-fourth of what it was.
 - **Windows native plugin hosting is explicitly unsupported.** Shared activation,
   policy and error APIs compile on Windows; the socket transport and process
   supervisor compile only on Unix. Selecting a native plugin on Windows returns
   `PluginHostError::UnsupportedPlatform`. The Windows CI lane checks every
   workspace target and compiles every test without running native-plugin tests.
-- **Claims: 43 enforced, 1 asserted and not yet.** Every claim this document makes
+- **Claims: 44 enforced, 1 asserted and not yet.** Every claim this document makes
   is listed with what enforces it in `security/QUALIFICATION-MATRIX.md`, generated
   from `security/qualification-matrix.toml`, and `just qualification-matrix`
   resolves each name against the tree. A test that is renamed or deleted turns that
@@ -94,7 +94,8 @@ section was written):
   claim that is asserted rather than enforced is named there, with why.
 
 What is left of the kernel's `unsafe` is nothing to do with loading. The loader's
-288 occurrences — the ABI adapter's signatures and witnesses — and the SDK's 220 and
+325 occurrences — the ABI adapter's signatures and witnesses, plus the
+restricted-linux confinement's syscall surface — and the SDK's 220 and
 the ABI's 113 all live outside the kernel's process now, and `security/tcb.toml`
 records each of them where they are rather than restating them here, which is what a
 paragraph cannot be trusted to do. `just tcb-report` prints the figure this milestone
@@ -1698,7 +1699,7 @@ conversion is public — `Event::sanitize_fields` and `Event::apply_sanitize_fie
 host can turn it back into the fields the chain consumes, and no new core helper is
 needed for the authority split to hold. And the event-carrying precedent to copy is
 `install_metadata_injector` in
-[proxy.rs](/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/plugin-host/src/proxy.rs:1381), not the tool pair: it is the served class whose payload is an event,
+[proxy.rs](../crates/plugin-host/src/proxy.rs), not the tool pair: it is the served class whose payload is an event,
 with `install_tool_sanitize` supplying the off-path submission and the
 do-not-publish-on-refusal rule. Layer 2 therefore has everything it needs and is a
 write rather than a decision.
@@ -1708,7 +1709,7 @@ things the next session should not have to rediscover, both found by reading the
 already-served class whose payload is an event:
 
 - The wire already carries an event. `PluginObservedEvent` is what the metadata
-  injector's path deserializes ([service.rs](/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/plugin-host/src/service.rs:456)) and hands to
+  injector's path deserializes ([service.rs](../crates/native-loader/src/service.rs)) and hands to
   `invoke_event_metadata_injector_registration` as `observed.event`. The event
   sanitizers take the same shape, so their payload is that type rather than anything
   invented, and the answer is the sanitized event serialized back.
@@ -1734,7 +1735,7 @@ two types above were its first consumers. The disclosure ratchet that landed wit
 field from reaching a plugin by accident.
 
 What landed is the host's half of the nine properties, in
-[service.rs](/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/plugin-host/src/service.rs):
+[service.rs](../crates/native-loader/src/service.rs):
 exactly one registration runs when a call names it (three mark sanitizers with
 distinct markers, one named, neither neighbour's marker on the answer); a neighbour
 in the same family and in a family that shares the shape is not invoked; a call
@@ -1748,7 +1749,7 @@ Every negative case carries two things that make it mean something. The first is
 host that refuses every invocation of a class refuses the case under test as well —
 without the control, four of the eight properties passed while the class was
 unserved. The second is the **sentinel**:
-[confidentiality.rs](/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/plugin-host/src/confidentiality.rs)
+[confidentiality.rs](../crates/native-loader/src/confidentiality.rs)
 plants an unmistakable value in every observable field (event name, payload at two
 levels, metadata, category profile, scope phase), forces the failure, and asserts
 that neither a planted value nor the marker they carry appears anywhere in the
@@ -3000,8 +3001,9 @@ there is something to dispatch to.
 3. `native-loader`: `dlopen`, symbol acquisition, plugin lifetime, registration
    extraction. *Done.* `crates/native-loader` holds the loader and the activation
    transaction; it is the only crate that declares `libloading`; the kernel does not
-   depend on it and does not reach it. Its `unsafe` — 288 tokens, 280 of them the
-   loader's — is budgeted on the host side now, and the kernel's own figure fell
+   depend on it and does not reach it. Its `unsafe` — 325 tokens, 288 of them the
+   loader's and the rest the restricted-linux confinement's syscall surface — is
+   budgeted on the host side now, and the kernel's own figure fell
    from 648 to 27 with the code that owns it. Two things moved with it that are
    worth naming: the activation transaction (which is a composition, not a loader),
    and one kernel test that had to be re-expressed because it read the kernel's
