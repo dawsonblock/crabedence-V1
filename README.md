@@ -255,8 +255,10 @@ NeMo connects to this service over the Unix socket — no per-call subprocess
 spawn.
 
 ```sh
-# Start the persistent execution service
-crabbox serve-exec
+# Start the persistent execution service. The deployment mode is a
+# required declaration — CRABBOX_MODE=development|production, never
+# assumed; an unset or misspelled value refuses startup.
+CRABBOX_MODE=development crabbox serve-exec
 
 # The service listens on the canonical per-user Unix socket:
 #   $XDG_RUNTIME_DIR/crabedence/execution.sock when XDG_RUNTIME_DIR is set,
