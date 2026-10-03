@@ -98,9 +98,19 @@ list="$work/files.txt"
 git ls-tree -r --name-only HEAD | LC_ALL=C sort -u > "$list"
 if [ -d runtimes/nemo-relay ] && [ -f runtimes/nemo-provenance-policy.json ]; then
   prov="$work/provenance.txt"
-  go run ./cmd/nemo-runtime-digest -root runtimes/nemo-relay \
-    -policy runtimes/nemo-provenance-policy.json -list \
-    | sed 's#^#runtimes/nemo-relay/#' | LC_ALL=C sort -u > "$prov"
+  # NEMO_RUNTIME_DIGEST_BIN may name a prebuilt digest binary (CI and
+  # the packaging tests use it to run the real enumerator without a
+  # `go run` rebuild); the default builds the tool from this tree.
+  digest_list() {
+    if [ -n "${NEMO_RUNTIME_DIGEST_BIN:-}" ]; then
+      "$NEMO_RUNTIME_DIGEST_BIN" -root runtimes/nemo-relay \
+        -policy runtimes/nemo-provenance-policy.json -list
+    else
+      go run ./cmd/nemo-runtime-digest -root runtimes/nemo-relay \
+        -policy runtimes/nemo-provenance-policy.json -list
+    fi
+  }
+  digest_list | sed 's#^#runtimes/nemo-relay/#' | LC_ALL=C sort -u > "$prov"
   untracked="$(comm -13 "$list" "$prov")"
   if [ -n "$untracked" ]; then
     printf '%s\n' "$untracked" \

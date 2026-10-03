@@ -6,21 +6,40 @@ import path from "node:path";
 import test from "node:test";
 
 const scripts = import.meta.dirname;
+const projectRoot = path.resolve(scripts, "..");
 
 // The packager runs against its own repository root, so the fixture is a
 // scratch repository carrying the three scripts it drives. Its tree covers
 // every object kind the release bundle must preserve — a symlink, an
 // executable, and a .gitattributes-eol file whose worktree bytes differ
-// from its blob — plus a dirty-tree refusal case. Without the vendored
-// runtime the provenance-union and transfer-manifest gates skip, leaving
-// the packaging and clean-room manifest verification under test.
+// from its blob — plus a dirty-tree refusal case. The runtime fixture
+// additionally carries runtimes/nemo-relay plus the real provenance
+// policy so the provenance-covered => tracked gate runs against the real
+// digest enumerator (NEMO_RUNTIME_DIGEST_BIN points the packager at a
+// prebuilt binary; without it the fixture's `go run` has no module).
 const have = (tool) => spawnSync("bash", ["-c", `command -v ${tool}`], { stdio: "ignore" }).status === 0;
 const baseTools = ["bash", "git", "tar", "shasum"];
 const prerequisites = baseTools.every(have);
 const zipTools = ["zip", "unzip"].every(have);
 const skipReason = "requires git, tar, and shasum";
 
-function makeRepo(t) {
+// Build the real provenance enumerator once per run; its -list output is
+// what the packager's tracked-only invariant consumes.
+let digestBinCache;
+function digestTool() {
+  if (digestBinCache !== undefined) return digestBinCache;
+  if (!have("go")) return (digestBinCache = null);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cbx-digest-"));
+  process.on("exit", () => fs.rmSync(dir, { recursive: true, force: true }));
+  const bin = path.join(dir, "nemo-runtime-digest");
+  const r = spawnSync("go", ["build", "-o", bin, "./cmd/nemo-runtime-digest"], {
+    cwd: projectRoot,
+    encoding: "utf8",
+  });
+  return (digestBinCache = r.status === 0 ? bin : null);
+}
+
+function makeRepo(t, { runtime = false } = {}) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cbx-pack-")));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   fs.mkdirSync(path.join(root, "scripts"));
@@ -45,14 +64,27 @@ function makeRepo(t) {
   fs.chmodSync(path.join(root, "run.sh"), 0o755);
   fs.symlinkSync("tracked.txt", path.join(root, "link.txt"));
   fs.writeFileSync(path.join(root, "mock.cmd"), "@echo off\r\necho hi\r\n");
+  if (runtime) {
+    const relay = path.join(root, "runtimes", "nemo-relay");
+    fs.mkdirSync(relay, { recursive: true });
+    fs.copyFileSync(
+      path.join(projectRoot, "runtimes", "nemo-provenance-policy.json"),
+      path.join(root, "runtimes", "nemo-provenance-policy.json"),
+    );
+    fs.writeFileSync(path.join(relay, "keep.txt"), "kept\n");
+    fs.symlinkSync("keep.txt", path.join(relay, "keep-link"));
+  }
   git("add", ".");
   git("commit", "--quiet", "-m", "fixture");
-  return root;
+  return { root, git };
 }
 
 function pack(root, args) {
   const packager = path.join(root, "scripts", "package-source-archive.sh");
-  return spawnSync("bash", [packager, ...args], { cwd: root, encoding: "utf8" });
+  const env = { ...process.env };
+  const bin = digestTool();
+  if (bin) env.NEMO_RUNTIME_DIGEST_BIN = bin;
+  return spawnSync("bash", [packager, ...args], { cwd: root, encoding: "utf8", env });
 }
 
 function outDir(t) {
@@ -62,7 +94,7 @@ function outDir(t) {
 }
 
 test("the packager preserves symlinks, exec bits, and smudged worktree bytes", { skip: !prerequisites && skipReason }, (t) => {
-  const root = makeRepo(t);
+  const { root } = makeRepo(t);
   const out = outDir(t);
   const archive = path.join(out, "fixture.tar.gz");
   const r = pack(root, ["--format", "tar.gz", "--prefix", "fixture", "-o", archive]);
@@ -86,7 +118,7 @@ test("the packager preserves symlinks, exec bits, and smudged worktree bytes", {
 });
 
 test("a modified tracked file refuses packaging unless --allow-dirty", { skip: !prerequisites && skipReason }, (t) => {
-  const root = makeRepo(t);
+  const { root } = makeRepo(t);
   const out = outDir(t);
   fs.appendFileSync(path.join(root, "tracked.txt"), "dirty\n");
 
@@ -108,7 +140,7 @@ test("a modified tracked file refuses packaging unless --allow-dirty", { skip: !
 });
 
 test("zip output keeps symlink entries instead of dereferencing them", { skip: !(prerequisites && zipTools) && "requires git, tar, shasum, zip, unzip" }, (t) => {
-  const root = makeRepo(t);
+  const { root } = makeRepo(t);
   const out = outDir(t);
   const archive = path.join(out, "fixture.zip");
   const r = pack(root, ["--format", "zip", "--prefix", "fixture", "-o", archive]);
@@ -123,7 +155,7 @@ test("zip output keeps symlink entries instead of dereferencing them", { skip: !
 });
 
 test("the archive prefix must be a single directory name", { skip: !prerequisites && skipReason }, (t) => {
-  const root = makeRepo(t);
+  const { root } = makeRepo(t);
   const out = outDir(t);
   for (const bad of ["a/b", "..", ".", "a\\b"]) {
     const r = pack(root, ["--prefix", bad, "-o", path.join(out, "bad.tar.gz")]);
@@ -131,3 +163,72 @@ test("the archive prefix must be a single directory name", { skip: !prerequisite
     assert.match(r.stderr, /single directory name/);
   }
 });
+
+// The regression this guards: the packager must never produce a
+// supposedly valid source artifact from provenance content outside the
+// release commit. An object the policy enumerates but Git does not
+// track is exactly the .claude/skills failure class — the union fix
+// had packaged such bytes silently. Each object kind (regular file and
+// symlink) is exercised through both archive formats. Note the success
+// case commits, not just `git add`: a staged-only object is not
+// represented by the release commit and must still fail.
+const provenancePrereq = prerequisites && digestTool();
+const provenanceSkip = "requires git, tar, shasum, and go for the digest tool";
+
+for (const kind of ["file", "symlink"]) {
+  for (const format of ["tar.gz", "zip"]) {
+    const name = `a provenance-covered but untracked ${kind} fails ${format} packaging until committed`;
+    const ok = provenancePrereq && (format === "tar.gz" || zipTools);
+    const reason = format === "zip" && !zipTools
+      ? "requires git, tar, shasum, go, zip, unzip"
+      : provenanceSkip;
+    test(name, { skip: !ok && reason }, (t) => {
+      const { root, git } = makeRepo(t, { runtime: true });
+      const out = outDir(t);
+      const relay = path.join(root, "runtimes", "nemo-relay");
+      const entry = kind === "file" ? "provenance-only.txt" : "provenance-link";
+      const abs = path.join(relay, entry);
+      if (kind === "file") fs.writeFileSync(abs, "covered but untracked\n");
+      else fs.symlinkSync("keep.txt", abs);
+      const rel = `runtimes/nemo-relay/${entry}`;
+
+      const archive = path.join(out, `prov-${kind}.${format}`);
+      const refused = pack(root, ["--format", format, "--prefix", "fixture", "-o", archive]);
+      assert.equal(refused.status, 1, `${refused.stdout}\n${refused.stderr}`);
+      assert.match(
+        refused.stderr,
+        new RegExp(`provenance-covered path is not tracked by release commit: ${rel.replace(/[.]/g, "\\.")}`),
+        "the packager names the untracked provenance-covered path instead of silently adding it",
+      );
+      assert.ok(!fs.existsSync(archive), "no archive may be emitted from outside-commit provenance content");
+
+      // A staged-only object is still outside the release commit: the
+      // dirty-tree gate refuses first, and even with --allow-dirty the
+      // tracked-by-commit gate refuses it.
+      git("add", rel);
+      const staged = pack(root, ["--format", format, "--prefix", "fixture", "-o", archive]);
+      assert.equal(staged.status, 1, `${staged.stdout}\n${staged.stderr}`);
+      const stagedDirty = pack(root, ["--format", format, "--allow-dirty", "--prefix", "fixture", "-o", archive]);
+      assert.equal(stagedDirty.status, 1, `${stagedDirty.stdout}\n${stagedDirty.stderr}`);
+      assert.match(stagedDirty.stderr, /not tracked by release commit/);
+      assert.ok(!fs.existsSync(archive));
+
+      git("commit", "--quiet", "-m", "track the provenance-covered object");
+      const packed = pack(root, ["--format", format, "--prefix", "fixture", "-o", archive]);
+      assert.equal(packed.status, 0, `${packed.stdout}\n${packed.stderr}`);
+      assert.ok(fs.existsSync(archive), "tracked provenance content packages cleanly");
+
+      const dst = path.join(out, `extract-${kind}-${format}`);
+      fs.mkdirSync(dst);
+      if (format === "zip") execFileSync("unzip", ["-q", archive, "-d", dst]);
+      else execFileSync("tar", ["-xzf", archive, "-C", dst]);
+      const extracted = path.join(dst, "fixture", rel);
+      if (kind === "file") {
+        assert.equal(fs.readFileSync(extracted, "utf8"), "covered but untracked\n");
+      } else {
+        assert.ok(fs.lstatSync(extracted).isSymbolicLink(), "the tracked link extracts as a link");
+        assert.equal(fs.readlinkSync(extracted), "keep.txt");
+      }
+    });
+  }
+}
