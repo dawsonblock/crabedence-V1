@@ -3,7 +3,7 @@
   "repository": "dawsonblock/crabedence-V1",
   "tag": "v0.54.0-rc.1",
   "tagObject": null,
-  "sourceCommit": null,
+  "sourceCommit": "f6868c708ce7176eefbbf3733d664aa839102447",
   "publicationStatus": "blocked",
-  "blocker": "release candidate pending: tagObject and sourceCommit bind to the qualified commit when the rc tag is created; until then this record authorizes nothing"
+  "blocker": "release candidate qualified at f6868c70 (32/32 gates, evidence root 7e65f3f78fdf164dace1e2de8f43d90d514be1804a9d84328359ce19016c1f62); tagObject binds to the signed tag when it is created on this commit; until then this record authorizes nothing"
 }
