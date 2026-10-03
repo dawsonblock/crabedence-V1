@@ -20,6 +20,8 @@ import (
 	"strings"
 	"time"
 	"unicode"
+
+	"github.com/openclaw/crabbox/internal/secretpattern"
 )
 
 // ─── Record ───────────────────────────────────────────────────────────
@@ -1854,11 +1856,18 @@ func normalizeLocatorKey(k string) string {
 	return b.String()
 }
 
-// forbiddenLocatorField returns the first denied key found anywhere in
-// the locator JSON tree, or "" when the locator is clean.
+// forbiddenLocatorField returns the first denied key or the
+// credential-shape marker found anywhere in the locator JSON tree, or
+// "" when the locator is clean. Key scanning names the offending
+// field; value scanning covers the whole serialized locator so a
+// credential nested under a benign key name — including inside
+// arrays or JSON-encoded strings — cannot persist.
 func forbiddenLocatorField(raw json.RawMessage) string {
 	if len(raw) == 0 {
 		return ""
+	}
+	if hit := secretpattern.Scan(raw); hit != "" {
+		return "credential-shaped value (" + hit + ")"
 	}
 	var v any
 	if err := json.Unmarshal(raw, &v); err != nil {
@@ -1887,6 +1896,17 @@ func findForbiddenKey(v any) string {
 		for _, item := range t {
 			if f := findForbiddenKey(item); f != "" {
 				return f
+			}
+		}
+	case string:
+		// A value that itself encodes a JSON object/array gets scanned
+		// as structure — a secret nested inside an encoded string must
+		// not hide behind a benign outer key.
+		var nested any
+		if err := json.Unmarshal([]byte(t), &nested); err == nil {
+			switch nested.(type) {
+			case map[string]any, []any:
+				return findForbiddenKey(nested)
 			}
 		}
 	}

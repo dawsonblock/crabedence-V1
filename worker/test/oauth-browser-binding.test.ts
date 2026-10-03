@@ -61,7 +61,7 @@ const env = {
   CRABBOX_GITHUB_ALLOWED_ORG: "openclaw",
   CRABBOX_DEFAULT_ORG: "openclaw",
   CRABBOX_PUBLIC_URL: "https://broker.test",
-  CRABBOX_SESSION_SECRET: "session-secret",
+  CRABBOX_SESSION_SECRET: "test-session-secret-with-32-characters",
 } as Env;
 
 function setCookies(response: Response): string[] {

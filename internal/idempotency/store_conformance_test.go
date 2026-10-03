@@ -481,6 +481,34 @@ func TestStoreConformanceLocatorPolicy(t *testing.T) {
 		if err := s.MarkInFlight(ctx, rec.ExecutionID, acq.LeaseToken, acq.Generation, "prov", deny); !errors.Is(err, LocatorContainsSecret) {
 			t.Fatalf("want LocatorContainsSecret, got %v", err)
 		}
+		// Credential-shaped material must not persist under a benign key
+		// — the scan covers values, nesting, arrays, and JSON-encoded
+		// strings, not just key names.
+		adversarial := map[string]json.RawMessage{
+			"pat under benign key":       json.RawMessage(`{"repo":"ghp_` + strings.Repeat("a", 34) + `"}`),
+			"nested slack token":         json.RawMessage(`{"meta":{"note":"xoxb-123456789012"}}`),
+			"bearer token in array":      json.RawMessage(`{"tags":["run-1","Bearer ` + strings.Repeat("b", 24) + `"]}`),
+			"denied key in encoded JSON": json.RawMessage(`{"data":"{\"password\":\"hunter2\"}"}`),
+			"dsn with password":          json.RawMessage(`{"endpoint":"postgres://user:pw@db.internal/app"}`),
+			"jwt value":                  json.RawMessage(`{"ref":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5x_MK1gjtjY5FH_pz3S4538"}`),
+		}
+		for name, locator := range adversarial {
+			if err := s.MarkInFlight(ctx, rec.ExecutionID, acq.LeaseToken, acq.Generation, "prov", locator); !errors.Is(err, LocatorContainsSecret) {
+				t.Fatalf("%s: want LocatorContainsSecret, got %v", name, err)
+			}
+		}
+		// Legitimate lookup metadata — ids, names, digests, correlation
+		// tokens — is not credential-shaped and persists.
+		legit := json.RawMessage(`{"repo":"example/repo","owner":"alice@example.com","run_id":"run-42","external_token":"crabex-op-0123456789abcdef","ref":"main","issue":123,"labels":["bug","ci"],"digest":"` + strings.Repeat("0", 64) + `"}`)
+		if err := s.MarkInFlight(ctx, rec.ExecutionID, acq.LeaseToken, acq.Generation, "prov", legit); err != nil {
+			t.Fatalf("legitimate locator rejected: %v", err)
+		}
+		// MarkInFlight succeeded — re-arm for the redactor section.
+		acq, _ = s.Acquire(ctx, "k1b", "alice", "cap.mut", digest, "", "MUTATION", 5*time.Minute)
+		rec = acq.Record
+		if err := s.BeginExecution(ctx, rec.ExecutionID, acq.LeaseToken, acq.Generation); err != nil {
+			t.Fatalf("begin: %v", err)
+		}
 		// Redactor strips the denied field before the scan.
 		s.SetLocatorRedactor(func(raw json.RawMessage) (json.RawMessage, error) {
 			return json.RawMessage(`{"external_token":"tok"}`), nil

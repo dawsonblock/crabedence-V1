@@ -3,13 +3,16 @@ package execution
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/openclaw/crabbox/internal/capability"
+	"github.com/openclaw/crabbox/internal/idempotency"
 )
 
 // TestConcurrentIdenticalMutations verifies that 100 concurrent
@@ -356,5 +359,39 @@ func TestMalformedJSON(t *testing.T) {
 	}
 	if resp.FailureCode != string(capability.FailureInvalidRequest) {
 		t.Fatalf("expected INVALID_REQUEST, got %s", resp.FailureCode)
+	}
+}
+
+// TestWireStoreErrorSanitization covers the residual-risk fix: durable-
+// store and infrastructure errors must not leak driver internals (SQL
+// text, DSN fragments) over the wire. Typed lease-contract errors keep
+// their fixed messages; untyped driver errors reduce to the operation
+// prefix while the detail stays in server logs.
+func TestWireStoreErrorSanitization(t *testing.T) {
+	// Typed lease errors pass through — fixed, client-meaningful text.
+	typed := fmt.Errorf("%w: execution exec-1 token mismatch", idempotency.LeaseTokenMismatch)
+	got := wireStoreError("idempotency acquire failed", typed)
+	want := "idempotency acquire failed: LEASE_TOKEN_MISMATCH: execution exec-1 token mismatch"
+	if got != want {
+		t.Fatalf("typed error mangled: got %q want %q", got, want)
+	}
+
+	// Untyped driver errors collapse to the prefix — the message must
+	// carry no SQL fragments, DSN details, or internal paths.
+	driver := errors.New(`SQLSTATE 42703: column "secret_dsn" does not exist in pg_catalog.pg_attribute`)
+	got = wireStoreError("idempotency acquire failed", driver)
+	if got != "idempotency acquire failed" {
+		t.Fatalf("driver error leaked detail: %q", got)
+	}
+	for _, leak := range []string{"SQLSTATE", "secret_dsn", "pg_catalog", driver.Error()} {
+		if strings.Contains(got, leak) {
+			t.Fatalf("wire message leaked internal detail %q in %q", leak, got)
+		}
+	}
+
+	// Wrapped typed errors still pass through.
+	wrapped := fmt.Errorf("store call: %w", fmt.Errorf("%w: state EXECUTING", idempotency.LeaseStateConflict))
+	if got := wireStoreError("failed to begin execution", wrapped); !strings.Contains(got, "STATE_CONFLICT") {
+		t.Fatalf("wrapped lease error not preserved: %q", got)
 	}
 }

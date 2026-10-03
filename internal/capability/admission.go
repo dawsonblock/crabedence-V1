@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"sort"
 	"time"
 )
@@ -116,7 +117,11 @@ func (r *Registry) VerifyAuthority(ctx context.Context, req AdmissionRequest, re
 	if req.GrantID != "" {
 		resolved, err := resolver.Resolve(ctx, req.GrantID, req.Principal)
 		if err != nil {
-			return nil, FailureUnauthorized, fmt.Sprintf("grant resolution failed: %v", err)
+			// Resolver errors can embed driver internals (SQL
+			// fragments, DSN details) — log server-side only, keep
+			// the wire message fixed.
+			log.Printf("capability admission: grant resolution failed: %v", err)
+			return nil, FailureUnauthorized, "grant resolution failed"
 		}
 		if resolved == nil {
 			return nil, FailureUnauthorized, fmt.Sprintf("grant not found or not issued to principal: %s", req.GrantID)
@@ -136,7 +141,8 @@ func (r *Registry) VerifyAuthority(ctx context.Context, req AdmissionRequest, re
 		}
 		candidates, err := broker.GrantsForPrincipal(ctx, req.Principal)
 		if err != nil {
-			return nil, FailureUnauthorized, fmt.Sprintf("brokered grant resolution failed: %v", err)
+			log.Printf("capability admission: brokered grant resolution failed: %v", err)
+			return nil, FailureUnauthorized, "brokered grant resolution failed"
 		}
 		dbOwnedExpiry := false
 		if ar, ok := resolver.(interface{ ExpiryIsAuthoritative() bool }); ok {

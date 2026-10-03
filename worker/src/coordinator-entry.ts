@@ -281,20 +281,12 @@ function isWebVNCViewerSessionRequest(request: Request, url: URL): boolean {
   );
 }
 
+// requestWithoutCoordinatorAuthContext strips the full coordinator
+// auth context before an unauthenticated request reaches the Durable
+// Object. requestWithoutTrustedHeaders now covers the whole set — the
+// name stays so call sites read as "no auth context forwarded".
 function requestWithoutCoordinatorAuthContext(request: Request): Request {
-  const clean = requestWithoutTrustedHeaders(request);
-  const headers = new Headers(clean.headers);
-  for (const name of [
-    "x-crabbox-auth",
-    "x-crabbox-admin",
-    "x-crabbox-owner",
-    "x-crabbox-org",
-    "x-crabbox-github-login",
-    "x-crabbox-token-expires-at",
-  ]) {
-    headers.delete(name);
-  }
-  return new Request(clean, { headers });
+  return requestWithoutTrustedHeaders(request);
 }
 
 function isWebVNCAgentUpgrade(request: Request, url: URL): boolean {

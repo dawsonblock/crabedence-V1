@@ -38,6 +38,7 @@ describe("coordinator auth", () => {
     const proxyEnv = {
       CRABBOX_TRUSTED_USER_HEADER: "X-Authenticated-User",
       CRABBOX_TRUSTED_USER_ORG: "science_team",
+      CRABBOX_TRUSTED_PROXY_SECRET: "trusted-proxy-secret",
     } as Env;
     const shared = await prepareCoordinatorRequest(
       new Request("https://example.test/v1/whoami", {
@@ -47,7 +48,10 @@ describe("coordinator auth", () => {
     );
     const proxy = await prepareCoordinatorRequest(
       new Request("https://example.test/v1/whoami", {
-        headers: { "x-authenticated-user": "alice@example.com" },
+        headers: {
+          "x-authenticated-user": "alice@example.com",
+          "x-crabbox-proxy-secret": "trusted-proxy-secret",
+        },
       }),
       proxyEnv,
       { trustedProxy: true },
@@ -67,7 +71,7 @@ describe("coordinator auth", () => {
       CRABBOX_SHARED_OWNER: "automation@example.com",
     } as Env;
     const unknownEnv = { ...missingEnv, CRABBOX_DEFAULT_ORG: "unknown" } as Env;
-    const githubEnv = { CRABBOX_SESSION_SECRET: "session-secret" } as Env;
+    const githubEnv = { CRABBOX_SESSION_SECRET: "test-session-secret-with-32-characters" } as Env;
     const githubToken = await issueUserToken(githubEnv, {
       owner: "alice@example.com",
       ownerSource: "github-verified-email",
@@ -83,8 +87,11 @@ describe("coordinator auth", () => {
         missingEnv,
       ),
       prepareCoordinatorRequest(
-        proxyIdentityRequest(),
-        { CRABBOX_TRUSTED_USER_HEADER: "X-Authenticated-User" } as Env,
+        proxyIdentityRequest("trusted-proxy-secret"),
+        {
+          CRABBOX_TRUSTED_USER_HEADER: "X-Authenticated-User",
+          CRABBOX_TRUSTED_PROXY_SECRET: "trusted-proxy-secret",
+        } as Env,
         { trustedProxy: true },
       ),
       prepareCoordinatorRequest(
@@ -149,10 +156,11 @@ describe("coordinator auth", () => {
         } as Env,
       ),
       prepareCoordinatorRequest(
-        proxyIdentityRequest(),
+        proxyIdentityRequest("trusted-proxy-secret"),
         {
           CRABBOX_TRUSTED_USER_HEADER: "X-Authenticated-User",
           CRABBOX_TRUSTED_USER_ORG: invalidOrg,
+          CRABBOX_TRUSTED_PROXY_SECRET: "trusted-proxy-secret",
         } as Env,
         { trustedProxy: true },
       ),
@@ -177,7 +185,7 @@ describe("coordinator auth", () => {
 
   it("requires same-origin intent for portal-cookie mutations and viewer sockets", async () => {
     const env = {
-      CRABBOX_SESSION_SECRET: "session-secret",
+      CRABBOX_SESSION_SECRET: "test-session-secret-with-32-characters",
       CRABBOX_PUBLIC_URL: "https://broker.example.test",
       CRABBOX_DEFAULT_ORG: "example-org",
     } as Env;
@@ -330,7 +338,7 @@ describe("coordinator auth", () => {
 
   it("allows a verified same-origin portal logout without GitHub membership", async () => {
     const env = {
-      CRABBOX_SESSION_SECRET: "session-secret",
+      CRABBOX_SESSION_SECRET: "test-session-secret-with-32-characters",
       CRABBOX_PUBLIC_URL: "https://broker.example.test",
       CRABBOX_DEFAULT_ORG: "example-org",
     } as Env;
@@ -371,7 +379,7 @@ describe("coordinator auth", () => {
 
   it("fails closed when a live GitHub grant can no longer be decrypted", async () => {
     const env = {
-      CRABBOX_SESSION_SECRET: "session-secret",
+      CRABBOX_SESSION_SECRET: "test-session-secret-with-32-characters",
       CRABBOX_DEFAULT_ORG: "example-org",
     } as Env;
     const token = await issueUserToken(env, {
@@ -394,7 +402,7 @@ describe("coordinator auth", () => {
       githubUserGrantIsCurrent(
         auth!.githubGrant!,
         { owner: auth!.owner, org: auth!.org, login: auth!.login! },
-        { CRABBOX_SESSION_SECRET: "rotated-session-secret" },
+        { CRABBOX_SESSION_SECRET: "rotated-session-secret-with-32-characters" },
         allowGitHubMembership,
       ),
     ).resolves.toBe(false);
@@ -402,7 +410,7 @@ describe("coordinator auth", () => {
 
   it("treats malformed portal cookies as absent across request types", async () => {
     const env = {
-      CRABBOX_SESSION_SECRET: "session-secret",
+      CRABBOX_SESSION_SECRET: "test-session-secret-with-32-characters",
       CRABBOX_PUBLIC_URL: "https://broker.example.test",
     } as Env;
     const cookie = "__Host-crabbox_session=%ZZ";
@@ -437,7 +445,7 @@ describe("coordinator auth", () => {
 
   it("ignores legacy portal cookies and rejects duplicate host-prefixed sessions", async () => {
     const env = {
-      CRABBOX_SESSION_SECRET: "session-secret",
+      CRABBOX_SESSION_SECRET: "test-session-secret-with-32-characters",
       CRABBOX_PUBLIC_URL: "https://broker.example.test",
       CRABBOX_DEFAULT_ORG: "example-org",
     } as Env;
@@ -531,9 +539,28 @@ describe("coordinator auth", () => {
 
   it("accepts a reverse-proxy identity only from a trusted proxy source", async () => {
     const request = new Request("https://example.test/v1/whoami", {
-      headers: { "x-authenticated-user": "alice@example.com" },
+      headers: {
+        "x-authenticated-user": "alice@example.com",
+        "x-crabbox-proxy-secret": "trusted-proxy-secret",
+      },
     });
+    const trustedEnv = {
+      CRABBOX_TRUSTED_USER_HEADER: "X-Authenticated-User",
+      CRABBOX_TRUSTED_USER_ORG: "example-org",
+      CRABBOX_TRUSTED_PROXY_SECRET: "trusted-proxy-secret",
+    };
 
+    await expect(authenticateRequest(request, trustedEnv, { trustedProxy: true })).resolves.toEqual(
+      {
+        authorized: true,
+        admin: false,
+        auth: "proxy",
+        owner: "alice@example.com",
+        org: "example-org",
+      },
+    );
+    // Enabling the trusted header without the shared secret must fail
+    // closed — "unset" is never "no secret required".
     await expect(
       authenticateRequest(
         request,
@@ -543,17 +570,12 @@ describe("coordinator auth", () => {
         },
         { trustedProxy: true },
       ),
-    ).resolves.toEqual({
-      authorized: true,
-      admin: false,
-      auth: "proxy",
-      owner: "alice@example.com",
-      org: "example-org",
-    });
+    ).resolves.toBeUndefined();
     await expect(
       authenticateRequest(request, {
         CRABBOX_TRUSTED_USER_HEADER: "X-Authenticated-User",
         CRABBOX_TRUSTED_USER_ORG: "example-org",
+        CRABBOX_TRUSTED_PROXY_SECRET: "trusted-proxy-secret",
       }),
     ).resolves.toBeUndefined();
     await expect(authenticateRequest(request, {})).resolves.toBeUndefined();
@@ -620,6 +642,15 @@ describe("coordinator auth", () => {
       request.headers.set("x-crabbox-admin-grant-version", "a".repeat(64));
       request.headers.set("x-crabbox-github-token-id", "forged-token-id");
       request.headers.set("x-crabbox-github-sealed-credential", "forged-credential");
+      // Spoofed coordinator auth context — must not reach the Durable
+      // Object on unauthenticated paths.
+      request.headers.set("x-crabbox-auth", "github");
+      request.headers.set("x-crabbox-admin", "true");
+      request.headers.set("x-crabbox-owner", "admin@example.com");
+      request.headers.set("x-crabbox-org", "example-org");
+      request.headers.set("x-crabbox-github-login", "admin-login");
+      request.headers.set("x-crabbox-token-expires-at", "2999-01-01T00:00:00.000Z");
+      request.headers.set("x-crabbox-portal-session", "true");
     });
 
     const routedRequests = await Promise.all(
@@ -632,27 +663,26 @@ describe("coordinator auth", () => {
       }),
     );
 
-    expect(routedRequests.map((request) => request.headers.get("x-crabbox-proxy-secret"))).toEqual([
-      null,
-      null,
-      null,
-      null,
-    ]);
-    expect(routedRequests.map((request) => request.headers.get("x-crabbox-internal"))).toEqual([
-      null,
-      null,
-      null,
-      null,
-    ]);
-    expect(
-      routedRequests.map((request) => request.headers.get("x-crabbox-admin-grant-version")),
-    ).toEqual([null, null, null, null]);
-    expect(
-      routedRequests.map((request) => request.headers.get("x-crabbox-github-token-id")),
-    ).toEqual([null, null, null, null]);
-    expect(
-      routedRequests.map((request) => request.headers.get("x-crabbox-github-sealed-credential")),
-    ).toEqual([null, null, null, null]);
+    const strippedHeaders = [
+      "x-crabbox-proxy-secret",
+      "x-crabbox-internal",
+      "x-crabbox-admin-grant-version",
+      "x-crabbox-github-token-id",
+      "x-crabbox-github-sealed-credential",
+      "x-crabbox-auth",
+      "x-crabbox-admin",
+      "x-crabbox-owner",
+      "x-crabbox-org",
+      "x-crabbox-github-login",
+      "x-crabbox-token-expires-at",
+      "x-crabbox-portal-session",
+    ];
+    for (const name of strippedHeaders) {
+      expect(
+        routedRequests.map((request) => request.headers.get(name)),
+        `${name} must not reach the coordinator on unauthenticated routes`,
+      ).toEqual([null, null, null, null]);
+    }
   });
 
   it("replaces caller-supplied admin grant versions after authentication", async () => {
@@ -1116,7 +1146,7 @@ describe("coordinator auth", () => {
   it("accepts signed GitHub user tokens without admin rights", async () => {
     const env = {
       CRABBOX_SHARED_TOKEN: "shared",
-      CRABBOX_SESSION_SECRET: "session-secret",
+      CRABBOX_SESSION_SECRET: "test-session-secret-with-32-characters",
       CRABBOX_DEFAULT_ORG: "openclaw",
     };
     const token = await issueUserToken(env, {
@@ -1144,7 +1174,7 @@ describe("coordinator auth", () => {
   it("rejects non-canonical signed user token spellings", async () => {
     const env = {
       CRABBOX_SHARED_TOKEN: "shared",
-      CRABBOX_SESSION_SECRET: "session-secret",
+      CRABBOX_SESSION_SECRET: "test-session-secret-with-32-characters",
       CRABBOX_DEFAULT_ORG: "example-org",
     };
     const token = await issueUserToken(env, {
@@ -1169,7 +1199,7 @@ describe("coordinator auth", () => {
   });
 
   it("issues a distinct identity for each GitHub user session", async () => {
-    const env = { CRABBOX_SESSION_SECRET: "session-secret" };
+    const env = { CRABBOX_SESSION_SECRET: "test-session-secret-with-32-characters" };
     const input = {
       owner: "friend@example.com",
       ownerSource: "github-verified-email" as const,
@@ -1190,11 +1220,11 @@ describe("coordinator auth", () => {
   ])("rejects signed user tokens with %s", async (_label, schema) => {
     const env = {
       CRABBOX_SHARED_TOKEN: "shared",
-      CRABBOX_SESSION_SECRET: "session-secret",
+      CRABBOX_SESSION_SECRET: "test-session-secret-with-32-characters",
       CRABBOX_DEFAULT_ORG: "openclaw",
     };
     const now = Math.floor(Date.now() / 1000);
-    const token = await signedUserToken("session-secret", {
+    const token = await signedUserToken("test-session-secret-with-32-characters", {
       typ: "crabbox-user",
       ...schema,
       owner: "friend@example.com",
@@ -1218,7 +1248,7 @@ describe("coordinator auth", () => {
   it("promotes configured GitHub user tokens to admin", async () => {
     const env = {
       CRABBOX_SHARED_TOKEN: "shared",
-      CRABBOX_SESSION_SECRET: "session-secret",
+      CRABBOX_SESSION_SECRET: "test-session-secret-with-32-characters",
       CRABBOX_DEFAULT_ORG: "openclaw",
       CRABBOX_GITHUB_ADMIN_OWNERS: "vincentkoc@ieee.org",
       CRABBOX_GITHUB_ADMIN_LOGINS: "steipete",
@@ -1266,11 +1296,11 @@ describe("coordinator auth", () => {
   it("rejects signed user tokens with admin claims", async () => {
     const env = {
       CRABBOX_SHARED_TOKEN: "shared",
-      CRABBOX_SESSION_SECRET: "session-secret",
+      CRABBOX_SESSION_SECRET: "test-session-secret-with-32-characters",
       CRABBOX_DEFAULT_ORG: "openclaw",
     };
     const now = Math.floor(Date.now() / 1000);
-    const token = await signedUserToken("session-secret", {
+    const token = await signedUserToken("test-session-secret-with-32-characters", {
       typ: "crabbox-user",
       version: 2,
       ownerSource: "github-verified-email",
@@ -1294,7 +1324,7 @@ describe("coordinator auth", () => {
 
   it("does not route admin-claim user tokens to the coordinator", async () => {
     const now = Math.floor(Date.now() / 1000);
-    const token = await signedUserToken("session-secret", {
+    const token = await signedUserToken("test-session-secret-with-32-characters", {
       typ: "crabbox-user",
       version: 2,
       ownerSource: "github-verified-email",
@@ -1307,7 +1337,7 @@ describe("coordinator auth", () => {
     });
     const env = {
       CRABBOX_SHARED_TOKEN: "shared",
-      CRABBOX_SESSION_SECRET: "session-secret",
+      CRABBOX_SESSION_SECRET: "test-session-secret-with-32-characters",
       CRABBOX_DEFAULT_ORG: "openclaw",
       FLEET: {
         idFromName: () => "default",

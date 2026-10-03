@@ -6,10 +6,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"regexp"
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/openclaw/crabbox/internal/secretpattern"
 )
 
 // DecisionKind is the outbound-DLP verdict.
@@ -209,29 +210,9 @@ func (p *ProtectedValues) Evaluate(_ context.Context, in DLPInput) (DLPDecision,
 // cannot know about — a token copied into a title, a private key
 // pasted into a body, a database URL with an embedded password. It is
 // shape detection: it never learns what the runtime's secrets are,
-// only what secrets look like.
-
-// secretPattern pairs a detector with its non-secret audit name.
-type secretPattern struct {
-	name    string
-	pattern *regexp.Regexp
-}
-
-// secretPatterns is the baseline credential corpus. New shapes are
-// additive — the policy digest below names this exact rule set so a
-// change in detection is a change in audit identity.
-var secretPatterns = []secretPattern{
-	{name: "github-pat", pattern: regexp.MustCompile(`\b(ghp|gho|ghu|ghs|ghr|ghc)_[A-Za-z0-9]{30,}\b`)},
-	{name: "github-fine-grained-pat", pattern: regexp.MustCompile(`\bgithub_pat_[A-Za-z0-9_]{22,}\b`)},
-	{name: "github-oauth", pattern: regexp.MustCompile(`\bgho_[A-Za-z0-9]{30,}\b`)},
-	{name: "aws-access-key", pattern: regexp.MustCompile(`\b(AKIA|ASIA)[0-9A-Z]{16}\b`)},
-	{name: "private-key", pattern: regexp.MustCompile(`-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY(?: BLOCK)?-----`)},
-	{name: "jwt", pattern: regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b`)},
-	{name: "bearer-token", pattern: regexp.MustCompile(`(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{20,}\b`)},
-	{name: "slack-token", pattern: regexp.MustCompile(`\bxox[baprs]-[A-Za-z0-9-]{10,}\b`)},
-	{name: "openai-key", pattern: regexp.MustCompile(`\bsk-[A-Za-z0-9]{20,}\b`)},
-	{name: "database-url-with-password", pattern: regexp.MustCompile(`(?i)\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|amqp)://[^/\s:@]+:[^@\s/]+@`)},
-}
+// only what secrets look like. The corpus itself is shared with
+// durable-state admission checks in internal/secretpattern; the
+// policy digest below names the rule set version.
 
 // SecretPatterns blocks outbound payloads carrying credential-shaped
 // material. It scans the body and every header value.
@@ -239,7 +220,7 @@ type SecretPatterns struct{}
 
 // Evaluate implements OutboundDLP.
 func (SecretPatterns) Evaluate(_ context.Context, in DLPInput) (DLPDecision, error) {
-	if hit := scanPatterns(in.Body); hit != "" {
+	if hit := secretpattern.Scan(in.Body); hit != "" {
 		return DLPDecision{
 			Kind:         DecisionBlock,
 			Reason:       fmt.Sprintf("payload contains credential-shaped material (%s)", hit),
@@ -247,7 +228,7 @@ func (SecretPatterns) Evaluate(_ context.Context, in DLPInput) (DLPDecision, err
 		}, nil
 	}
 	for name, value := range in.Headers {
-		if hit := scanPatterns([]byte(value)); hit != "" {
+		if hit := secretpattern.Scan([]byte(value)); hit != "" {
 			return DLPDecision{
 				Kind:         DecisionBlock,
 				Reason:       fmt.Sprintf("header %s contains credential-shaped material (%s)", name, hit),
@@ -256,19 +237,6 @@ func (SecretPatterns) Evaluate(_ context.Context, in DLPInput) (DLPDecision, err
 		}
 	}
 	return DLPDecision{Kind: DecisionAllow, PolicyDigest: "sha256:secret-patterns-v1"}, nil
-}
-
-func scanPatterns(data []byte) string {
-	if len(data) == 0 {
-		return ""
-	}
-	s := string(data)
-	for _, p := range secretPatterns {
-		if p.pattern.MatchString(s) {
-			return p.name
-		}
-	}
-	return ""
 }
 
 // ─── Capability field policy ────────────────────────────────────────

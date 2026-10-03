@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/openclaw/crabbox/internal/capability"
@@ -438,7 +439,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		return Response{
 			Status:      StatusFailed,
 			FailureCode: string(capability.FailureInternalError),
-			Error:       fmt.Sprintf("idempotency acquire failed: %v", err),
+			Error:       wireStoreError("idempotency acquire failed", err),
 		}
 	}
 
@@ -477,7 +478,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 				return Response{
 					Status:      StatusFailed,
 					FailureCode: string(capability.FailureInternalError),
-					Error:       fmt.Sprintf("request digest migration failed: %v", migErr),
+					Error:       wireStoreError("request digest migration failed", migErr),
 				}
 			}
 			acquireDigest := digest
@@ -516,7 +517,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 					return Response{
 						Status:      StatusFailed,
 						FailureCode: string(capability.FailureInternalError),
-						Error:       fmt.Sprintf("idempotency acquire failed: %v", reErr),
+						Error:       wireStoreError("idempotency acquire failed", reErr),
 					}
 				}
 			}
@@ -650,7 +651,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		return Response{
 			Status:      StatusFailed,
 			FailureCode: string(capability.FailureInternalError),
-			Error:       fmt.Sprintf("failed to begin execution (lease lost or state changed): %v", err),
+			Error:       wireStoreError("failed to begin execution (lease lost or state changed)", err),
 		}
 	}
 	e.fireCrashPoint(CrashAfterBeginExecution)
@@ -695,7 +696,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		return Response{
 			Status:      StatusFailed,
 			FailureCode: string(capability.FailureInternalError),
-			Error:       fmt.Sprintf("failed to transition to IN_FLIGHT (lease lost or state changed): %v", err),
+			Error:       wireStoreError("failed to transition to IN_FLIGHT (lease lost or state changed)", err),
 		}
 	}
 	e.fireCrashPoint(CrashAfterMarkInFlight)
@@ -837,10 +838,10 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		recErr := e.enterRecovery(ctx, executionID, providerResp, desc)
 		errMsg := "post-dispatch ambiguity: entered recovery (side effect may have occurred)"
 		if recErr != nil {
-			errMsg = fmt.Sprintf("post-dispatch ambiguity: %v", recErr)
+			errMsg = wireStoreError("post-dispatch ambiguity", recErr)
 		}
 		if obsErr != nil {
-			errMsg += fmt.Sprintf("; provider observation NOT persisted: %v", obsErr)
+			errMsg += "; " + wireStoreError("provider observation NOT persisted", obsErr)
 		}
 		return Response{
 			Status:      StatusUnknown,
@@ -862,9 +863,9 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	// contradiction into an immutable terminal state.
 	if obsErr != nil {
 		recErr := e.enterRecovery(ctx, executionID, providerResp, desc)
-		errMsg := fmt.Sprintf("provider observation not persisted: %v", obsErr)
+		errMsg := wireStoreError("provider observation not persisted", obsErr)
 		if recErr != nil {
-			errMsg += fmt.Sprintf("; %v", recErr)
+			errMsg += "; " + wireStoreError("recovery transition failed", recErr)
 		}
 		return Response{
 			Status:      StatusUnknown,
@@ -957,9 +958,9 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 			// Cannot produce the required proof — treat as post-dispatch
 			// uncertainty, not a terminal outcome.
 			recErr := e.enterRecovery(ctx, executionID, providerResp, desc)
-			errMsg := fmt.Sprintf("failed to sign CRITICAL evidence receipt: %v", signErr)
+			errMsg := wireStoreError("failed to sign CRITICAL evidence receipt", signErr)
 			if recErr != nil {
-				errMsg += fmt.Sprintf("; %v", recErr)
+				errMsg += "; " + wireStoreError("recovery transition failed", recErr)
 			}
 			return Response{
 				Status:      StatusUnknown,
@@ -980,7 +981,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		return Response{
 			Status:      StatusUnknown,
 			FailureCode: string(capability.FailureExecutionUnknown),
-			Error:       fmt.Sprintf("failed to lookup execution for finalize: %v", err),
+			Error:       wireStoreError("failed to lookup execution for finalize", err),
 			Execution: &ExecutionMeta{
 				Provider: desc.AdapterID,
 				RunID:    executionID,
@@ -999,14 +1000,14 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		// transition below also writes it atomically. Report persistence
 		// honestly — never claim the observation was stored if it wasn't.
 		recErr := e.enterRecovery(ctx, executionID, providerResp, desc)
-		errMsg := fmt.Sprintf("failed to finalize execution after dispatch: %v", err)
+		errMsg := wireStoreError("failed to finalize execution after dispatch", err)
 		if recErr == nil {
 			errMsg += " (provider observation persisted)"
 		} else {
-			errMsg += fmt.Sprintf(" (%v)", recErr)
+			errMsg += fmt.Sprintf(" (%s)", wireStoreError("recovery transition failed", recErr))
 		}
 		if obsErr != nil {
-			errMsg += fmt.Sprintf("; earlier observation write failed: %v", obsErr)
+			errMsg += "; " + wireStoreError("earlier observation write failed", obsErr)
 		}
 		return Response{
 			Status:      StatusUnknown,
@@ -1595,4 +1596,20 @@ func (e *DispatchExecutor) leaseHeartbeat(ctx context.Context, executionID, leas
 			}
 		}
 	}
+}
+
+// wireStoreError renders an internal-infrastructure error for the
+// response Error field. Typed lease-contract errors carry fixed,
+// client-meaningful messages (state conflicts, fencing, epoch
+// mismatches) and pass through; everything else — driver errors that
+// can embed SQL text, DSN fragments, or I/O details — is logged
+// server-side and reduced to a generic phrase so internals never
+// cross the wire.
+func wireStoreError(prefix string, err error) string {
+	var leaseErr idempotency.LeaseError
+	if errors.As(err, &leaseErr) {
+		return fmt.Sprintf("%s: %v", prefix, err)
+	}
+	log.Printf("dispatch executor: %s: %v", prefix, err)
+	return prefix
 }

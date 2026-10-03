@@ -462,7 +462,9 @@ for (const kind of ["cloudflare", "node"] as const) {
     });
 
     it("uses immutable GitHub identity despite spoofed owner/org/admin headers", async () => {
-      const f = await fixture(kind, { CRABBOX_SESSION_SECRET: "synthetic-session-secret" });
+      const f = await fixture(kind, {
+        CRABBOX_SESSION_SECRET: "synthetic-session-secret-with-32-characters",
+      });
       const token = await issueUserToken(f.env, {
         owner,
         ownerSource: "github-verified-email",
