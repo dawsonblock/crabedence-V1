@@ -29,6 +29,18 @@ if [ ! -f "$MANIFEST" ]; then
   exit 1
 fi
 
+# When the manifest file itself lives inside the tree under test — the
+# packager embeds it at release-evidence/source-tree-sha256.txt so the
+# archive is self-verifying — it is exempt from the inverse check: a
+# manifest cannot list itself. The exemption covers exactly the passed
+# manifest path, nothing else.
+MANIFEST_ABS="$(cd "$(dirname "$MANIFEST")" && pwd -P)/$(basename "$MANIFEST")"
+ROOT_ABS="$(cd "$ROOT" && pwd -P)"
+MANIFEST_REL=""
+case "$MANIFEST_ABS" in
+  "$ROOT_ABS"/*) MANIFEST_REL="${MANIFEST_ABS#$ROOT_ABS/}" ;;
+esac
+
 missing=0
 mismatched=0
 checked=0
@@ -144,6 +156,9 @@ fi
 
 while IFS= read -r src_file; do
   [ -z "$src_file" ] && continue
+  if [ -n "$MANIFEST_REL" ] && [ "$src_file" = "$MANIFEST_REL" ]; then
+    continue
+  fi
   if ! grep -qxF "$src_file" "$manifest_paths_file"; then
     echo "UNEXPECTED: $src_file (in source tree but not in manifest)"
     unexpected=$((unexpected + 1))

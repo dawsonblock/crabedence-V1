@@ -13,10 +13,11 @@
 # The archive is then extracted into a clean directory and the
 # verifiers run against the EXTRACTED bytes:
 #
-#   1. scripts/verify-source-manifest.sh — the source manifest
-#      recomputes every record (file bytes, symlink target bytes,
-#      modes) against the extraction. A dropped symlink or mode bit
-#      fails here.
+#   1. scripts/verify-source-manifest.sh — the source manifest, which
+#      the packager embeds at release-evidence/source-tree-sha256.txt
+#      so the archive carries its own source identity, recomputes
+#      every record (file bytes, symlink target bytes, modes) against
+#      the extraction. A dropped symlink or mode bit fails here.
 #   2. scripts/verify-nemo-transfer.py — the transfer manifest's
 #      shipped-tree identity (file + symlink inventory digest). When
 #      the frozen baseline is present beside the repository it is
@@ -181,6 +182,17 @@ stage="$work/stage"
 mkdir -p -- "$stage/$prefix"
 tar --format=gnutar --null -cf - -T "$list" | tar -xf - -C "$stage/$prefix"
 
+# The generated source manifest ships inside the archive at
+# release-evidence/source-tree-sha256.txt so the extracted artifact
+# carries its own identity — a clean room can run the distribution
+# suite from the archive alone. The manifest enumerates the tree it is
+# embedded into and cannot list itself, so the verifier exempts exactly
+# its own path from the inverse check.
+manifest="$work/source-tree-sha256.txt"
+"$ROOT/scripts/generate-source-manifest.sh" "$manifest" "$ROOT" >/dev/null
+mkdir -p -- "$stage/$prefix/release-evidence"
+cp "$manifest" "$stage/$prefix/release-evidence/source-tree-sha256.txt"
+
 case "$FORMAT" in
   tar.gz) tar --format=gnutar -czf "$work/archive.tar.gz" -C "$stage" -- "$prefix" ;;
   # -y keeps symlink entries instead of dereferencing them — a plain
@@ -203,13 +215,13 @@ if [ ! -d "$extracted" ]; then
   exit 1
 fi
 
-# Gate 1 — the whole-tree manifest: every file's bytes, every symlink's
-# target bytes, every mode, checked bidirectionally against the
-# extraction (the verifier's find-walk also catches any extra entries
-# the packager added).
-manifest="$work/source-tree-sha256.txt"
-"$ROOT/scripts/generate-source-manifest.sh" "$manifest" "$ROOT" >/dev/null
-"$ROOT/scripts/verify-source-manifest.sh" "$manifest" "$extracted" >/dev/null
+# Gate 1 — the whole-tree manifest, verified exactly as the distribution
+# lane will run it: the EMBEDDED manifest against the extraction. Every
+# file's bytes, every symlink's target bytes, every mode, checked
+# bidirectionally (the verifier's find-walk also catches any extra
+# entries the packager added beyond the manifest file itself).
+"$ROOT/scripts/verify-source-manifest.sh" \
+  "$extracted/release-evidence/source-tree-sha256.txt" "$extracted" >/dev/null
 echo "ok: source manifest verified on extracted archive ($(wc -l < "$manifest" | tr -d ' ') entries)"
 
 # Gate 2 — transfer provenance on the extracted tree. Run the Python

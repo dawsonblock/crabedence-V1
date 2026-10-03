@@ -750,6 +750,20 @@ jobs:
             "clean-room/tar-source/crabedence-${RELEASE_VERSION}" \
             "clean-room/zip-source/crabedence-${RELEASE_VERSION}"
 
+      # The distribution lane: the suite the archive ships runs against
+      # its own extraction — the same qualification a downstream
+      # consumer can run from the archive alone (embedded source
+      # manifest, path policy, symlinks, generated content, build
+      # inputs). This job has no checkout, so no parent repository is
+      # visible to it.
+      - name: Run the distribution suite on each extracted tree
+        run: |
+          for tree in tar-source zip-source; do
+            src="clean-room/${tree}/crabedence-${RELEASE_VERSION}"
+            echo "=== distribution suite: $tree ==="
+            bash "$src/scripts/qualify-source-distribution.sh" "$src"
+          done
+
       - name: Verify release artifact (standalone, no .git)
         run: |
           # Run the verifier against the extracted source with the

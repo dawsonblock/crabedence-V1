@@ -52,6 +52,13 @@ jobs:
             exit 1
           fi
 
+      # The repository lane: the Git-dependent half of the
+      # repository/distribution qualification split — history,
+      # attributes, and the tracked-file set the archive will package.
+      - name: Run the repository qualification lane
+        shell: bash
+        run: bash scripts/qualify-repository.sh
+
       - name: Record source provenance
         id: record
         shell: bash
