@@ -98,11 +98,21 @@ done < "$MANIFEST"
 source_paths_file="$(mktemp)"
 trap 'rm -f "$manifest_paths_file" "$source_paths_file"' EXIT
 
-if [ "$(git -C "$ROOT" rev-parse --show-toplevel 2>/dev/null || true)" = "$(cd "$ROOT" && pwd -P)" ]; then
+GIT_TOP="$(git -C "$ROOT" rev-parse --show-toplevel 2>/dev/null || true)"
+if [ "$GIT_TOP" = "$(cd "$ROOT" && pwd -P)" ]; then
   # The packaged set is the Git HEAD tree, exactly as the generator derived it.
   git -C "$ROOT" ls-tree -r -z HEAD | while IFS= read -r -d '' record; do
     printf '%s\n' "${record#*$'\t'}"
   done | LC_ALL=C sort > "$source_paths_file"
+elif [ -n "$GIT_TOP" ]; then
+  # ROOT sits inside a repository (nested checkout). The manifest derives
+  # from tracked source, so enumerate the tracked set under ROOT through
+  # the index rather than walking generated or untracked content; the
+  # caller's clean-tree gate keeps index == HEAD.
+  (
+    cd "$ROOT"
+    git ls-files -z -- . | tr '\0' '\n' | LC_ALL=C sort
+  ) > "$source_paths_file"
 else
   (
     cd "$ROOT"
