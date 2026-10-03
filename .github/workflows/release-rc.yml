@@ -969,27 +969,15 @@ jobs:
 
       # Tag creation is idempotent: an existing tag on the qualified
       # commit is reused, an existing tag on any other commit is a hard
-      # failure. A published release tag is never moved.
+      # failure. A published release tag is never moved. The admission
+      # rule lives in a script so it is exercised by the test suite, not
+      # only by the workflow.
       - name: Tag release candidate
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          existing="$(git ls-remote origin "refs/tags/${RELEASE_VERSION}^{}" | cut -f1)"
-          if [ -z "$existing" ]; then
-            existing="$(git ls-remote origin "refs/tags/${RELEASE_VERSION}" | cut -f1)"
-          fi
-          if [ -n "$existing" ]; then
-            if [ "$existing" != "$COMMIT" ]; then
-              echo "ERROR: tag $RELEASE_VERSION already exists at $existing, which is not the qualified commit $COMMIT" >&2
-              echo "A published release tag is never moved; cut a new RC instead." >&2
-              exit 1
-            fi
-            echo "tag $RELEASE_VERSION already points at the qualified commit; reusing it"
-          else
-            git tag -a "$RELEASE_VERSION" -m "Crabedence $RELEASE_VERSION"
-            git push origin "$RELEASE_VERSION"
-          fi
+          bash scripts/ensure-release-tag.sh "$RELEASE_VERSION" "$COMMIT"
 
       # ─── Publish as GitHub prerelease ────────────────────────────────
       - name: Check for an existing release
