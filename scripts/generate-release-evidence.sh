@@ -1347,6 +1347,12 @@ cat > "$EVIDENCE_DIR/sbom.spdx.json" << EOF
 }
 EOF
 
+# ─── Phase 19: The human-readable report is a VIEW over the records ──────
+# FINAL_QUALIFICATION_REPORT.md is generated from qualification.json /
+# release-manifest.json / evidence-root.json — never written by hand,
+# so a PASS cannot be asserted in prose the records do not support.
+"$REPO_ROOT/scripts/generate-qualification-report.sh" "$EVIDENCE_DIR"
+
 # ─── Phase 20: SHA256SUMS for evidence bundle ──────────────────────────────
 # Must be generated AFTER all other files (including release-manifest.json
 # and sbom.spdx.json) so that every file in the evidence directory is covered.
