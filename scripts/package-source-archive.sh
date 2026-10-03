@@ -41,6 +41,7 @@ cd "$ROOT"
 FORMAT="tar.gz"
 OUTPUT=""
 PREFIX=""
+PREFIX_SET=0
 ALLOW_DIRTY=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -48,8 +49,8 @@ while [ $# -gt 0 ]; do
     --format=*) FORMAT="${1#*=}"; shift ;;
     -o|--output) OUTPUT="$2"; shift 2 ;;
     --output=*) OUTPUT="${1#*=}"; shift ;;
-    --prefix) PREFIX="$2"; shift 2 ;;
-    --prefix=*) PREFIX="${1#*=}"; shift ;;
+    --prefix) PREFIX="$2"; PREFIX_SET=1; shift 2 ;;
+    --prefix=*) PREFIX="${1#*=}"; PREFIX_SET=1; shift ;;
     --allow-dirty) ALLOW_DIRTY=1; shift ;;
     *) echo "package-source-archive: unknown argument $1" >&2; exit 2 ;;
   esac
@@ -68,16 +69,31 @@ if [ -n "$(git diff --name-only HEAD)" ] && [ "$ALLOW_DIRTY" -eq 0 ]; then
   exit 1
 fi
 
-prefix="${PREFIX:-nemo-control-$(git describe --tags --always 2>/dev/null || git rev-parse --short HEAD)}"
-# The archive root is a single directory name — a slash or traversal
-# would silently relocate packaged entries outside the extraction dir.
-case "$prefix" in
-  ""|.|..|*/*|*\\*) printf "package-source-archive: --prefix must be a single directory name, got '%s'\n" "$prefix" >&2; exit 2 ;;
-esac
+if [ "$PREFIX_SET" -eq 1 ]; then
+  prefix="$PREFIX"
+else
+  prefix="nemo-control-$(git describe --tags --always 2>/dev/null || git rev-parse --short HEAD)"
+fi
+# The archive root is a single directory name AND an operand to tar,
+# zip, mkdir, and extraction commands. The grammar is deliberately
+# restrictive — [A-Za-z0-9][A-Za-z0-9._+-]* — so the prefix can never
+# become an option (-Itrue, --checkpoint=1), a traversal (../escape),
+# a path (foo/bar, foo\bar), or a control/whitespace payload. Anything
+# else fails here, before any archive command runs.
+if ! [[ "$prefix" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]; then
+  printf "package-source-archive: --prefix must match [A-Za-z0-9][A-Za-z0-9._+-]*, got %q\n" "$prefix" >&2
+  exit 2
+fi
 OUTPUT="${OUTPUT:-dist/source-${prefix}.${FORMAT}}"
+# Absolute output paths keep the value an operand, never an option, no
+# matter what name the caller chose.
+case "$OUTPUT" in
+  /*) ;;
+  *) OUTPUT="$PWD/$OUTPUT" ;;
+esac
 
 work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
+trap 'rm -rf -- "$work"' EXIT
 
 # The packaged path set is the HEAD tree — nothing else. The
 # provenance invariant this enforces:
@@ -120,14 +136,16 @@ if [ -d runtimes/nemo-relay ] && [ -f runtimes/nemo-provenance-policy.json ]; th
 fi
 
 stage="$work/stage"
-mkdir -p "$stage/$prefix"
+mkdir -p -- "$stage/$prefix"
 tar -cf - -T "$list" | tar -xf - -C "$stage/$prefix"
 
 case "$FORMAT" in
-  tar.gz) tar -czf "$work/archive.tar.gz" -C "$stage" "$prefix" ;;
+  tar.gz) tar -czf "$work/archive.tar.gz" -C "$stage" -- "$prefix" ;;
   # -y keeps symlink entries instead of dereferencing them — a plain
   # `zip -r` silently stores the target's contents or drops the entry,
-  # which is how the .claude/skills link went missing previously.
+  # which is how the .claude/skills link went missing previously. The
+  # prefix grammar above keeps the operand from being read as an
+  # option (zip has no end-of-options marker).
   zip)    (cd "$stage" && zip -qry "$work/archive.zip" "$prefix") ;;
 esac
 
@@ -168,7 +186,7 @@ if [ -f "$transfer_manifest" ]; then
   fi
 fi
 
-mkdir -p "$(dirname "$OUTPUT")"
+mkdir -p -- "$(dirname "$OUTPUT")"
 mv "$work/archive.$FORMAT" "$OUTPUT"
 digest="$(shasum -a 256 "$OUTPUT" | cut -d ' ' -f 1)"
 printf '%s  %s\n' "$digest" "$(basename "$OUTPUT")" > "$OUTPUT.sha256"

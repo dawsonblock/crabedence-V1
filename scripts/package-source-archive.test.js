@@ -154,14 +154,52 @@ test("zip output keeps symlink entries instead of dereferencing them", { skip: !
   assert.equal(fs.readlinkSync(link), "tracked.txt");
 });
 
-test("the archive prefix must be a single directory name", { skip: !prerequisites && skipReason }, (t) => {
+test("the archive prefix accepts only [A-Za-z0-9][A-Za-z0-9._+-]*", { skip: !prerequisites && skipReason }, (t) => {
   const { root } = makeRepo(t);
   const out = outDir(t);
-  for (const bad of ["a/b", "..", ".", "a\\b"]) {
-    const r = pack(root, ["--prefix", bad, "-o", path.join(out, "bad.tar.gz")]);
+  // Every input that could become an option, a traversal, a path
+  // component, or a control payload must fail with exit 2 before any
+  // archive command runs — and must leave no archive behind.
+  for (const bad of [
+    "",
+    ".",
+    "..",
+    "-Itrue",
+    "--checkpoint=1",
+    "-",
+    "../escape",
+    "foo/bar",
+    "foo\\bar",
+    "foo bar",
+    "foo\tbar",
+    "foo\nbar",
+    " leading",
+    "trailing ",
+    ".hidden",
+    "+plus",
+    "_under",
+  ]) {
+    const archive = path.join(out, `bad-${bad.length}.tar.gz`);
+    const r = pack(root, ["--prefix", bad, "-o", archive]);
     assert.equal(r.status, 2, `prefix ${JSON.stringify(bad)} must be refused`);
-    assert.match(r.stderr, /single directory name/);
+    assert.ok(
+      r.stderr.includes("must match [A-Za-z0-9][A-Za-z0-9._+-]*"),
+      `prefix ${JSON.stringify(bad)} must name the grammar: ${r.stderr}`,
+    );
+    assert.ok(!fs.existsSync(archive), `prefix ${JSON.stringify(bad)} left an archive behind`);
   }
+});
+
+test("a normal release prefix such as NEMO-CONTROL-v0.54.0-rc.1 is accepted", { skip: !prerequisites && skipReason }, (t) => {
+  const { root } = makeRepo(t);
+  const out = outDir(t);
+  const archive = path.join(out, "rc.tar.gz");
+  const r = pack(root, ["--prefix", "NEMO-CONTROL-v0.54.0-rc.1", "-o", archive]);
+  assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+  const dst = path.join(out, "extract");
+  fs.mkdirSync(dst);
+  execFileSync("tar", ["-xzf", archive, "-C", dst]);
+  assert.ok(fs.existsSync(path.join(dst, "NEMO-CONTROL-v0.54.0-rc.1", "tracked.txt")));
 });
 
 // The regression this guards: the packager must never produce a
