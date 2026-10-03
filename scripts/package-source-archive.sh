@@ -79,20 +79,34 @@ OUTPUT="${OUTPUT:-dist/source-${prefix}.${FORMAT}}"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
-# The packaged path set is the HEAD tree UNIONED with the provenance
-# enumeration of the vendored runtime. The digest covers worktree paths
-# the policy does not exclude — including files Git ignores (the
-# .claude/skills link was exactly that: provenance-covered but
-# untracked, so every Git-derived packager dropped it). tar reads the
-# WORKTREE bytes for those paths so the archive carries the qualified
-# bytes, symlinks and all.
+# The packaged path set is the HEAD tree — nothing else. The
+# provenance invariant this enforces:
+#
+#   provenance-covered ⇒ tracked ⇒ source-manifested ⇒ packaged
+#
+# The digest covers worktree paths the policy does not exclude —
+# including files Git may ignore (the .claude/skills link was exactly
+# that: provenance-covered but untracked, so every Git-derived packager
+# dropped it, and the later union fix silently packaged bytes the
+# release commit never represented). Unioning filesystem paths with
+# the commit tree broke the chain in the other direction, so the rule
+# is now one-directional: every provenance-covered object MUST be
+# represented by the release commit, and packaging fails before an
+# archive is created when even one is not. The uncovered path is
+# reported, never silently added.
 list="$work/files.txt"
-git ls-tree -r --name-only HEAD > "$list"
+git ls-tree -r --name-only HEAD | LC_ALL=C sort -u > "$list"
 if [ -d runtimes/nemo-relay ] && [ -f runtimes/nemo-provenance-policy.json ]; then
+  prov="$work/provenance.txt"
   go run ./cmd/nemo-runtime-digest -root runtimes/nemo-relay \
     -policy runtimes/nemo-provenance-policy.json -list \
-    | sed 's#^#runtimes/nemo-relay/#' >> "$list"
-  LC_ALL=C sort -u -o "$list" "$list"
+    | sed 's#^#runtimes/nemo-relay/#' | LC_ALL=C sort -u > "$prov"
+  untracked="$(comm -13 "$list" "$prov")"
+  if [ -n "$untracked" ]; then
+    printf '%s\n' "$untracked" \
+      | sed 's/^/package-source-archive: provenance-covered path is not tracked by release commit: /' >&2
+    exit 1
+  fi
 fi
 
 stage="$work/stage"
