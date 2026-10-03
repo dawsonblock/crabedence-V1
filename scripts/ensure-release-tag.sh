@@ -47,6 +47,14 @@ if [ "${ENSURE_DRY_RUN:-0}" = "1" ]; then
   exit 0
 fi
 
-git tag -a "$TAG" -m "Crabedence $TAG" "$COMMIT"
+# The annotation is exactly the bare tag name — the release verifier
+# requires %(contents:subject) == ref name. When the local Git config has
+# a signing key the tag is signed (maintainer flow); the CI publish lane
+# has no key and produces an annotated tag.
+if [ -n "$(git config --get user.signingkey 2>/dev/null || true)" ]; then
+  git tag -s "$TAG" -m "$TAG" "$COMMIT"
+else
+  git tag -a "$TAG" -m "$TAG" "$COMMIT"
+fi
 git push "$REMOTE" "$TAG"
 echo "tag $TAG created and pushed at $COMMIT"

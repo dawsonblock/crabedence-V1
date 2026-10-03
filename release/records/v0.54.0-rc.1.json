@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "repository": "dawsonblock/crabedence-V1",
+  "tag": "v0.54.0-rc.1",
+  "tagObject": null,
+  "sourceCommit": null,
+  "publicationStatus": "blocked",
+  "blocker": "release candidate pending: tagObject and sourceCommit bind to the qualified commit when the rc tag is created; until then this record authorizes nothing"
+}

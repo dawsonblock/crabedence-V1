@@ -38,11 +38,20 @@ function makeRemote(t) {
   return { root, remote, work, git, commitA, commitB };
 }
 
-function ensure(remote, tag, commit, cwd, dry = false) {
+function ensure(remote, tag, commit, cwd, { dry = false, home = cwd } = {}) {
   return spawnSync("bash", [ENSURE, tag, commit], {
     cwd,
     encoding: "utf8",
-    env: { ...process.env, RELEASE_REMOTE: remote, ENSURE_DRY_RUN: dry ? "1" : "0" },
+    // Isolate git config: a user-level user.signingkey would flip the
+    // script into the signed-tag lane.
+    env: {
+      ...process.env,
+      HOME: home,
+      XDG_CONFIG_HOME: home,
+      GIT_CONFIG_NOSYSTEM: "1",
+      RELEASE_REMOTE: remote,
+      ENSURE_DRY_RUN: dry ? "1" : "0",
+    },
   });
 }
 
@@ -61,6 +70,31 @@ test("an absent tag is created annotated at the qualified commit and pushed", { 
     { encoding: "utf8" },
   ).trim();
   assert.equal(objType, "tag", "the pushed tag must be an annotated tag object");
+  // The release verifier requires the annotation subject to be the bare
+  // tag name — never a descriptive message.
+  const subject = execFileSync(
+    "git", ["--git-dir", r.remote, "for-each-ref", "--format=%(contents:subject)", "refs/tags/v0.54.0-rc.1"],
+    { encoding: "utf8" },
+  ).trim();
+  assert.equal(subject, "v0.54.0-rc.1");
+});
+
+test("a configured signing key produces a signed tag", { skip: !prereq && "requires git" }, (t) => {
+  const r = makeRemote(t);
+  const key = path.join(r.root, "signing-key");
+  execFileSync("ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-f", key]);
+  r.git("config", "gpg.format", "ssh");
+  r.git("config", "user.signingkey", key);
+  const res = ensure(r.remote, "v0.54.0-rc.1", r.commitA, r.work, { home: r.root });
+  assert.equal(res.status, 0, `${res.stdout}\n${res.stderr}`);
+  const allowed = path.join(r.root, "allowed");
+  fs.writeFileSync(allowed, `release@example.test ${fs.readFileSync(`${key}.pub`, "utf8").trim()}\n`);
+  const verified = spawnSync(
+    "git",
+    ["--git-dir", r.remote, "-c", "gpg.format=ssh", "-c", `gpg.ssh.allowedSignersFile=${allowed}`, "tag", "-v", "v0.54.0-rc.1"],
+    { encoding: "utf8" },
+  );
+  assert.equal(verified.status, 0, "expected a verifiable signed tag");
 });
 
 test("an existing tag on the qualified commit is reused", { skip: !prereq && "requires git" }, (t) => {
@@ -97,7 +131,7 @@ test("a pre-existing foreign tag on the same name refuses", { skip: !prereq && "
 
 test("dry-run reports without creating", { skip: !prereq && "requires git" }, (t) => {
   const r = makeRemote(t);
-  const res = ensure(r.remote, "v0.54.0-rc.9", r.commitA, r.work, true);
+  const res = ensure(r.remote, "v0.54.0-rc.9", r.commitA, r.work, { dry: true });
   assert.equal(res.status, 0);
   const tags = execFileSync("git", ["--git-dir", r.remote, "tag"], { encoding: "utf8" }).trim();
   assert.equal(tags, "", "dry run created a tag");
