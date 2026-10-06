@@ -97,10 +97,10 @@ fi
 
 stage="$work/stage"
 mkdir -p "$stage/$prefix"
-tar -cf - -T "$list" | tar -xf - -C "$stage/$prefix"
+tar --format=gnu -cf - -T "$list" | tar -xf - -C "$stage/$prefix"
 
 case "$FORMAT" in
-  tar.gz) tar -czf "$work/archive.tar.gz" -C "$stage" "$prefix" ;;
+  tar.gz) tar --format=gnu -czf "$work/archive.tar.gz" -C "$stage" "$prefix" ;;
   # -y keeps symlink entries instead of dereferencing them — a plain
   # `zip -r` silently stores the target's contents or drops the entry,
   # which is how the .claude/skills link went missing previously.

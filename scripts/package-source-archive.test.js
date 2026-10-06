@@ -50,9 +50,9 @@ function makeRepo(t) {
   return root;
 }
 
-function pack(root, args) {
+function pack(root, args, env = process.env) {
   const packager = path.join(root, "scripts", "package-source-archive.sh");
-  return spawnSync("bash", [packager, ...args], { cwd: root, encoding: "utf8" });
+  return spawnSync("bash", [packager, ...args], { cwd: root, encoding: "utf8", env });
 }
 
 function outDir(t) {
@@ -83,6 +83,36 @@ test("the packager preserves symlinks, exec bits, and smudged worktree bytes", {
     "the packaged bytes are the CRLF worktree bytes, not the normalized blob",
   );
   assert.ok(fs.existsSync(`${archive}.sha256`), "the archive carries a sha256 sidecar");
+});
+
+test("tar packaging uses GNU format with the system tar implementation", { skip: !prerequisites && skipReason }, (t) => {
+  const root = makeRepo(t);
+  const out = outDir(t);
+  const wrapperDir = path.join(out, "bin");
+  const tarLog = path.join(out, "tar-args.log");
+  fs.mkdirSync(wrapperDir);
+  const systemTar = execFileSync("which", ["tar"], { encoding: "utf8" }).trim();
+  const wrapper = path.join(wrapperDir, "tar");
+  fs.writeFileSync(
+    wrapper,
+    `#!/bin/sh\nprintf '%s\\n' "$*" >> "$TAR_ARGS_LOG"\nexec ${JSON.stringify(systemTar)} "$@"\n`,
+  );
+  fs.chmodSync(wrapper, 0o755);
+
+  const archive = path.join(out, "fixture.tar.gz");
+  const r = pack(root, ["--format", "tar.gz", "--prefix", "fixture", "-o", archive], {
+    ...process.env,
+    PATH: `${wrapperDir}${path.delimiter}${process.env.PATH}`,
+    TAR_ARGS_LOG: tarLog,
+  });
+  assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+
+  const tarCalls = fs.readFileSync(tarLog, "utf8").trim().split("\n");
+  assert.ok(tarCalls.some((args) => args.includes("--format=gnu") && args.includes("-czf")),
+    "the real archive creation command explicitly selects GNU format");
+  assert.ok(!tarCalls.some((args) => args.includes("--format=gnutar")),
+    "GNU tar's invalid gnutar format name is never used");
+  execFileSync(systemTar, ["-tzf", archive]);
 });
 
 test("a modified tracked file refuses packaging unless --allow-dirty", { skip: !prerequisites && skipReason }, (t) => {
