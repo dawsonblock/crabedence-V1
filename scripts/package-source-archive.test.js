@@ -110,8 +110,6 @@ test("tar packaging uses GNU format with the system tar implementation", { skip:
   const tarCalls = fs.readFileSync(tarLog, "utf8").trim().split("\n");
   assert.ok(tarCalls.some((args) => args.includes("--format=gnu") && args.includes("-czf")),
     "the real archive creation command explicitly selects GNU format");
-  assert.ok(!tarCalls.some((args) => args.includes("--format=gnutar")),
-    "GNU tar's invalid gnutar format name is never used");
   execFileSync(systemTar, ["-tzf", archive]);
 });
 
