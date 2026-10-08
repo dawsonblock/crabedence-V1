@@ -19,21 +19,52 @@
 //	GET  /artifacts/{id}     immutable artifact bytes
 //	GET  /stats              operation/execution counts
 //
+// # Two-phase operation commit
+//
+// An operation is durably accepted only when its PREPARED record is
+// fsynced; the acknowledgement is sent only after the artifact and the
+// COMMITTED record are durable. The phases are ordered so every crash
+// boundary is recoverable:
+//
+//	PREPARED record (fsync)   acceptance — a retry replays, never re-executes
+//	artifact (temp, fsync, atomic rename, parent fsync)
+//	COMMITTED record (fsync)  the acknowledgement point
+//
 // Every applied effect and operation is appended to fsynced JSON-lines
 // ledgers BEFORE the response is sent: the provider never acknowledges
 // work it cannot prove later. This package is shared by the test
 // harness helper process and the deployed qualification binary — the
 // same code serves both, so harness results carry over to deployed
 // qualification.
+//
+// # Startup recovery
+//
+// New() refuses to start on a ledger or artifact store it cannot
+// interpret: a corrupt line outside a crash-torn tail, a token bound to
+// two payloads, a COMMITTED marker without its PREPARED record, an
+// artifact that does not match its recorded digest, or an artifact path
+// that is not a regular file (symlinks are never followed). The one
+// documented recovery is the crash-torn final line — an append that
+// never completed and was therefore never acknowledged — which is
+// dropped so the ledger stays a sequence of complete records. Records
+// written before the two-phase protocol (a bare Operation line) are
+// read as PREPARED records, and a missing artifact is reconstructed
+// from the record and verified against the recorded digest before it is
+// ever served.
 package qualprovider
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -49,6 +80,29 @@ const (
 	FaultDefinitiveReject  = "DEFINITIVE_REJECTION"
 	FaultWrongArtifactDig  = "WRONG_ARTIFACT_DIGEST"
 	FaultCorruptArtifact   = "CORRUPT_ARTIFACT"
+
+	// Phase-boundary crash faults: the named phase completes durably,
+	// then the response is never sent — the observable equivalent of
+	// the process dying at that boundary. A restart (or a retry) must
+	// recover to exactly one committed operation.
+	FaultFailAfterPrepared  = "FAIL_AFTER_PREPARED"
+	FaultFailAfterArtifact  = "FAIL_AFTER_ARTIFACT"
+	FaultFailAfterCommitted = "FAIL_AFTER_COMMITTED"
+)
+
+// Ledger record phases.
+const (
+	phasePrepared  = "PREPARED"
+	phaseCommitted = "COMMITTED"
+)
+
+// maxRequestBodyBytes bounds any request body the provider will read.
+const maxRequestBodyBytes = 1 << 20
+
+var (
+	opIDPattern   = regexp.MustCompile(`^op-([0-9]+)$`)
+	artIDPattern  = regexp.MustCompile(`^art-([0-9]+)$`)
+	sha256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
 
 // LogEntry is one durable record in the provider's effects log.
@@ -60,10 +114,7 @@ type LogEntry struct {
 	Timestamp time.Time       `json:"timestamp"`
 }
 
-// Operation is one durable record in the provider's operation ledger
-// (operations.jsonl, fsynced before the response is sent). The ledger
-// is the provider's independent knowledge of whether the external
-// operation happened: killing Crabedence cannot erase it.
+// Operation is one durable operation, served by GET /operations/{token}.
 type Operation struct {
 	Token          string          `json:"token"`
 	PayloadDigest  string          `json:"payload_digest"`
@@ -76,6 +127,24 @@ type Operation struct {
 	Timestamp      time.Time       `json:"timestamp"`
 }
 
+// ledgerRecord is one line of operations.jsonl. A PREPARED record
+// carries the complete operation; a COMMITTED record is the marker that
+// names the operation whose artifact and commit are both durable. A
+// record written before the two-phase protocol has no phase field and
+// is read as PREPARED.
+type ledgerRecord struct {
+	Phase          string          `json:"phase"`
+	Token          string          `json:"token"`
+	PayloadDigest  string          `json:"payload_digest,omitempty"`
+	OperationID    string          `json:"operation_id"`
+	ArtifactID     string          `json:"artifact_id,omitempty"`
+	ArtifactDigest string          `json:"artifact_digest"`
+	Status         string          `json:"status,omitempty"`
+	Result         json.RawMessage `json:"result,omitempty"`
+	Executions     int             `json:"executions,omitempty"`
+	Timestamp      time.Time       `json:"timestamp"`
+}
+
 // Server is the qualification provider HTTP service bound to a state
 // directory (durable ledgers + immutable artifacts).
 type Server struct {
@@ -83,11 +152,18 @@ type Server struct {
 	logPath     string
 	opLedger    string
 	artifactDir string
+	fs          durableFS
 
-	mu              sync.Mutex
-	effects         int
-	seen            map[string]LogEntry
-	opsByToken      map[string]Operation
+	mu         sync.Mutex
+	effects    int
+	seen       map[string]LogEntry
+	opsByToken map[string]Operation
+	// prepared holds operations whose PREPARED record is durable but
+	// whose commit has not completed; a retry completes the commit
+	// rather than executing again.
+	prepared map[string]Operation
+	// committed marks tokens whose COMMITTED marker is durable.
+	committed       map[string]bool
 	opSeq           int
 	totalExecutions int
 }
@@ -95,9 +171,13 @@ type Server struct {
 // New creates the provider server rooted at dir. The directory holds
 // the effects log, the operation ledger (operations.jsonl), and
 // artifacts/; all are created with owner-only permissions. Durable
-// state is reloaded from the ledger so a restarted provider remembers
-// every operation it ever accepted.
+// state is reloaded — and repaired where a crash interrupted a commit —
+// before the server serves anything.
 func New(dir, logName string) (*Server, error) {
+	return newServer(dir, logName, osDurableFS{})
+}
+
+func newServer(dir, logName string, fs durableFS) (*Server, error) {
 	if dir == "" {
 		return nil, fmt.Errorf("qualprovider: state directory required")
 	}
@@ -109,27 +189,31 @@ func New(dir, logName string) (*Server, error) {
 		logPath:     filepath.Join(dir, logName),
 		opLedger:    filepath.Join(dir, "operations.jsonl"),
 		artifactDir: filepath.Join(dir, "artifacts"),
+		fs:          fs,
 		seen:        map[string]LogEntry{},
 		opsByToken:  map[string]Operation{},
+		prepared:    map[string]Operation{},
+		committed:   map[string]bool{},
 	}
 	if err := os.MkdirAll(s.artifactDir, 0o700); err != nil {
 		return nil, err
 	}
-	// Reload the operation ledger — provider truth survives restarts.
-	if data, err := os.ReadFile(s.opLedger); err == nil {
-		for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
-			var op Operation
-			if json.Unmarshal([]byte(line), &op) == nil && op.Token != "" {
-				s.opsByToken[op.Token] = op
-				s.opSeq++
-				s.totalExecutions += op.Executions
-			}
-		}
+	// Artifact scan first: it validates that every artifact-shaped entry
+	// is a regular file (never a link), removes scratch files from an
+	// interrupted atomic write, and advances the operation sequence past
+	// any orphan so a new operation can never overwrite existing bytes.
+	if err := s.scanArtifacts(); err != nil {
+		return nil, err
+	}
+	// Reload (and repair) the operation ledger — provider truth survives
+	// restarts, and an interrupted commit is completed, never repeated.
+	if err := s.recoverLedger(); err != nil {
+		return nil, err
 	}
 	// Reload the effects log the same way: a replayed token must stay
 	// idempotent across restarts and EffectN must not repeat, or a
 	// restarted provider would apply the same effect twice.
-	if data, err := os.ReadFile(s.logPath); err == nil {
+	if data, err := s.fs.ReadFile(s.logPath); err == nil {
 		for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
 			var e LogEntry
 			if json.Unmarshal([]byte(line), &e) == nil && e.Token != "" {
@@ -141,6 +225,394 @@ func New(dir, logName string) (*Server, error) {
 		}
 	}
 	return s, nil
+}
+
+// scanArtifacts validates the artifact directory and advances the
+// operation sequence past every existing artifact identity.
+func (s *Server) scanArtifacts() error {
+	names, err := s.fs.ReadDirNames(s.artifactDir)
+	if err != nil {
+		return err
+	}
+	for _, name := range names {
+		if strings.HasPrefix(name, ".tmp-") {
+			// Scratch from an interrupted atomic write: never referenced
+			// by a ledger record, never served, safe to remove.
+			if err := s.fs.Remove(filepath.Join(s.artifactDir, name)); err != nil {
+				return err
+			}
+			continue
+		}
+		n, ok := artifactNumber(name)
+		if !ok {
+			// Not an artifact identity this provider mints; it is never
+			// served and never deleted.
+			continue
+		}
+		info, err := s.fs.Lstat(filepath.Join(s.artifactDir, name))
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("artifact %s is not a regular file (%s) — refusing to serve or overwrite it", name, info.Mode())
+		}
+		if n > s.opSeq {
+			s.opSeq = n
+		}
+	}
+	return nil
+}
+
+// recoverLedger parses the operation ledger, refusing any state it
+// cannot interpret, and completes an interrupted commit exactly once.
+func (s *Server) recoverLedger() error {
+	data, err := s.fs.ReadFile(s.opLedger)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read operation ledger: %w", err)
+	}
+	lines, droppedTornTail := splitCompleteLines(data)
+	if droppedTornTail {
+		// The torn tail was never acknowledged (the response follows the
+		// completed, fsynced append), so dropping it loses no promise —
+		// and keeping it would corrupt the next append.
+		kept := bytes.Join(lines, []byte("\n"))
+		if len(kept) > 0 {
+			kept = append(kept, '\n')
+		}
+		if err := s.fs.WriteFileAtomic(s.opLedger, kept); err != nil {
+			return fmt.Errorf("drop torn ledger tail: %w", err)
+		}
+	}
+	var order []string
+	byToken := map[string]*tokenRecords{}
+	for i, line := range lines {
+		rec, err := parseLedgerRecord(line)
+		if err != nil {
+			return fmt.Errorf("operations ledger line %d: %w", i+1, err)
+		}
+		if n := opNumber(rec.OperationID); n > s.opSeq {
+			s.opSeq = n
+		}
+		tr, ok := byToken[rec.Token]
+		if !ok {
+			tr = &tokenRecords{token: rec.Token}
+			byToken[rec.Token] = tr
+			order = append(order, rec.Token)
+		}
+		tr.add(rec)
+	}
+	seenOps := map[string]string{}
+	seenArtifacts := map[string]string{}
+	for _, token := range order {
+		tr := byToken[token]
+		canonical, err := tr.resolve()
+		if err != nil {
+			return err
+		}
+		if prev, dup := seenOps[canonical.OperationID]; dup {
+			return fmt.Errorf("operation %s is bound to two tokens (%s and %s)", canonical.OperationID, prev, token)
+		}
+		seenOps[canonical.OperationID] = token
+		if prev, dup := seenArtifacts[canonical.ArtifactID]; dup {
+			return fmt.Errorf("artifact %s is bound to two tokens (%s and %s)", canonical.ArtifactID, prev, token)
+		}
+		seenArtifacts[canonical.ArtifactID] = token
+
+		op := canonical.operation()
+		if err := s.ensureArtifact(op); err != nil {
+			return err
+		}
+		if len(tr.committed) == 0 {
+			if err := s.appendRecord(s.opLedger, committedRecord(op)); err != nil {
+				return fmt.Errorf("complete commit for token %s: %w", token, err)
+			}
+		}
+		s.opsByToken[token] = op
+		s.committed[token] = true
+		s.totalExecutions += op.Executions
+	}
+	return nil
+}
+
+// tokenRecords groups one token's ledger records for resolution.
+type tokenRecords struct {
+	token     string
+	prepared  []ledgerRecord
+	committed []ledgerRecord
+}
+
+func (tr *tokenRecords) add(rec ledgerRecord) {
+	switch rec.Phase {
+	case phasePrepared:
+		tr.prepared = append(tr.prepared, rec)
+	case phaseCommitted:
+		tr.committed = append(tr.committed, rec)
+	}
+}
+
+// resolve picks the canonical operation for a token. A token may appear
+// in more than one PREPARED record only in ledgers written before the
+// two-phase protocol (where a failed artifact write followed by a retry
+// appended twice); the last attempt is the one that can have been
+// acknowledged, so the highest operation number wins and the others are
+// treated as unreferenced history. Conflicting payload bindings and
+// ambiguous markers are refused.
+func (tr *tokenRecords) resolve() (ledgerRecord, error) {
+	if len(tr.prepared) == 0 {
+		return ledgerRecord{}, fmt.Errorf("token %q has a COMMITTED record with no PREPARED record", tr.token)
+	}
+	if len(tr.committed) > 1 {
+		return ledgerRecord{}, fmt.Errorf("token %q has %d COMMITTED records", tr.token, len(tr.committed))
+	}
+	digest := tr.prepared[0].PayloadDigest
+	canonical := tr.prepared[0]
+	seen := map[string]bool{canonical.OperationID: true}
+	for _, rec := range tr.prepared[1:] {
+		if rec.PayloadDigest != digest {
+			return ledgerRecord{}, fmt.Errorf("token %q is bound to two payloads (%s and %s)", tr.token, digest, rec.PayloadDigest)
+		}
+		if seen[rec.OperationID] {
+			return ledgerRecord{}, fmt.Errorf("token %q repeats operation %s", tr.token, rec.OperationID)
+		}
+		seen[rec.OperationID] = true
+		if opNumber(rec.OperationID) > opNumber(canonical.OperationID) {
+			canonical = rec
+		}
+	}
+	if len(tr.committed) == 1 {
+		marker := tr.committed[0]
+		if marker.OperationID != canonical.OperationID || marker.ArtifactDigest != canonical.ArtifactDigest {
+			return ledgerRecord{}, fmt.Errorf("token %q COMMITTED marker does not match its PREPARED record", tr.token)
+		}
+	}
+	return canonical, nil
+}
+
+// parseLedgerRecord parses and validates one ledger line.
+func parseLedgerRecord(line []byte) (ledgerRecord, error) {
+	var rec ledgerRecord
+	dec := json.NewDecoder(bytes.NewReader(line))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&rec); err != nil {
+		return rec, err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return rec, fmt.Errorf("trailing data after the record")
+	}
+	if rec.Token == "" {
+		return rec, fmt.Errorf("record has no token")
+	}
+	if !opIDPattern.MatchString(rec.OperationID) {
+		return rec, fmt.Errorf("record for token %q has invalid operation id %q", rec.Token, rec.OperationID)
+	}
+	if !sha256Pattern.MatchString(rec.ArtifactDigest) {
+		return rec, fmt.Errorf("record for token %q has invalid artifact digest %q", rec.Token, rec.ArtifactDigest)
+	}
+	if rec.Phase == "" {
+		rec.Phase = phasePrepared
+	}
+	switch rec.Phase {
+	case phasePrepared:
+		if !sha256Pattern.MatchString(rec.PayloadDigest) {
+			return rec, fmt.Errorf("record for token %q has invalid payload digest %q", rec.Token, rec.PayloadDigest)
+		}
+		if !artIDPattern.MatchString(rec.ArtifactID) {
+			return rec, fmt.Errorf("record for token %q has invalid artifact id %q", rec.Token, rec.ArtifactID)
+		}
+		artifactN, _ := artifactNumber(rec.ArtifactID)
+		if opNumber(rec.OperationID) != artifactN {
+			return rec, fmt.Errorf("record for token %q pairs operation %s with artifact %s", rec.Token, rec.OperationID, rec.ArtifactID)
+		}
+		if rec.Status != "COMMITTED" && rec.Status != "REJECTED" {
+			return rec, fmt.Errorf("record for token %q has unknown status %q", rec.Token, rec.Status)
+		}
+	case phaseCommitted:
+	default:
+		return rec, fmt.Errorf("record for token %q has unknown phase %q", rec.Token, rec.Phase)
+	}
+	return rec, nil
+}
+
+// splitCompleteLines splits a ledger into complete lines. A file that
+// does not end in a newline ends in a torn append (the process died
+// mid-write, before the fsync that precedes the acknowledgement); that
+// fragment is dropped. Blank lines are skipped.
+func splitCompleteLines(data []byte) (lines [][]byte, droppedTornTail bool) {
+	if len(data) == 0 {
+		return nil, false
+	}
+	complete := data
+	if data[len(data)-1] != '\n' {
+		idx := bytes.LastIndexByte(data, '\n')
+		if idx < 0 {
+			return nil, true
+		}
+		complete = data[:idx+1]
+		droppedTornTail = true
+	}
+	for _, line := range bytes.Split(bytes.TrimSuffix(complete, []byte("\n")), []byte("\n")) {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	return lines, droppedTornTail
+}
+
+// ensureArtifact makes sure the artifact for an operation exists and
+// matches the recorded digest. A missing artifact is reconstructed from
+// the record — the derivation is deterministic — and verified before it
+// is written. A mismatched artifact is refused, never overwritten.
+func (s *Server) ensureArtifact(op Operation) error {
+	data, err := s.fs.ReadArtifact(s.artifactDir, op.ArtifactID)
+	if err == nil {
+		if sum := sha256.Sum256(data); fmt.Sprintf("%x", sum) != op.ArtifactDigest {
+			return fmt.Errorf("artifact %s does not match the recorded digest — refusing to overwrite evidence", op.ArtifactID)
+		}
+		return nil
+	}
+	if !os.IsNotExist(err) {
+		return fmt.Errorf("artifact %s: %w", op.ArtifactID, err)
+	}
+	want := artifactFor(op)
+	if sum := sha256.Sum256(want); fmt.Sprintf("%x", sum) != op.ArtifactDigest {
+		return fmt.Errorf("artifact %s: recorded digest does not cover the reconstructed artifact", op.ArtifactID)
+	}
+	return s.writeArtifactAtomic(op.ArtifactID, want)
+}
+
+// writeArtifactAtomic writes one artifact without ever truncating or
+// replacing existing bytes: a fresh identity is chosen at acceptance, so
+// an existing file here is evidence this write must not destroy.
+func (s *Server) writeArtifactAtomic(id string, data []byte) error {
+	target := filepath.Join(s.artifactDir, id)
+	if _, err := s.fs.Lstat(target); err == nil {
+		return fmt.Errorf("artifact %s already exists — refusing to overwrite evidence", id)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	tmp, err := s.fs.WriteTemp(s.artifactDir, id, data)
+	if err != nil {
+		return err
+	}
+	if err := s.fs.Rename(tmp, target); err != nil {
+		s.fs.Remove(tmp)
+		return err
+	}
+	return s.fs.SyncDir(s.artifactDir)
+}
+
+// artifactFor derives the artifact bytes an operation commits to. The
+// derivation is deterministic over the durable record, which is what
+// makes an interrupted artifact write recoverable: the bytes can always
+// be reconstructed and checked against the recorded digest.
+func artifactFor(op Operation) []byte {
+	if op.Status == "REJECTED" {
+		return []byte(fmt.Sprintf(`{"operation_id":%q,"outcome":"REJECTED","reason":"deterministic rejection"}`, op.OperationID))
+	}
+	return []byte(fmt.Sprintf(`{"operation_id":%q,"token":%q,"outcome":"COMMITTED"}`, op.OperationID, op.Token))
+}
+
+func preparedRecord(op Operation) ledgerRecord {
+	return ledgerRecord{
+		Phase:          phasePrepared,
+		Token:          op.Token,
+		PayloadDigest:  op.PayloadDigest,
+		OperationID:    op.OperationID,
+		ArtifactID:     op.ArtifactID,
+		ArtifactDigest: op.ArtifactDigest,
+		Status:         op.Status,
+		Result:         op.Result,
+		Executions:     op.Executions,
+		Timestamp:      op.Timestamp,
+	}
+}
+
+func committedRecord(op Operation) ledgerRecord {
+	return ledgerRecord{
+		Phase:          phaseCommitted,
+		Token:          op.Token,
+		OperationID:    op.OperationID,
+		ArtifactDigest: op.ArtifactDigest,
+		Timestamp:      time.Now().UTC(),
+	}
+}
+
+func (rec ledgerRecord) operation() Operation {
+	return Operation{
+		Token:          rec.Token,
+		PayloadDigest:  rec.PayloadDigest,
+		OperationID:    rec.OperationID,
+		ArtifactID:     rec.ArtifactID,
+		ArtifactDigest: rec.ArtifactDigest,
+		Status:         rec.Status,
+		Result:         rec.Result,
+		Executions:     rec.Executions,
+		Timestamp:      rec.Timestamp,
+	}
+}
+
+func (s *Server) appendRecord(path string, v any) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	return s.fs.AppendLine(path, append(b, '\n'))
+}
+
+// completeCommit finishes an operation whose PREPARED record is durable
+// but whose commit was interrupted: the artifact is verified (or
+// reconstructed), the COMMITTED marker is appended once, and the
+// operation becomes servable. It never executes anything again.
+func (s *Server) completeCommit(op Operation) error {
+	if err := s.ensureArtifact(op); err != nil {
+		return err
+	}
+	if !s.committed[op.Token] {
+		if err := s.appendRecord(s.opLedger, committedRecord(op)); err != nil {
+			return err
+		}
+		s.committed[op.Token] = true
+	}
+	s.finishCommit(op)
+	return nil
+}
+
+func (s *Server) finishCommit(op Operation) {
+	s.opsByToken[op.Token] = op
+	delete(s.prepared, op.Token)
+	s.totalExecutions += op.Executions
+}
+
+func opNumber(id string) int {
+	m := opIDPattern.FindStringSubmatch(id)
+	n, _ := strconv.Atoi(m[1])
+	return n
+}
+
+func artifactNumber(name string) (int, bool) {
+	m := artIDPattern.FindStringSubmatch(name)
+	if m == nil {
+		return 0, false
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+func validArtifactName(name string) bool {
+	_, ok := artifactNumber(name)
+	return ok
+}
+
+func writeError(w http.ResponseWriter, status int, msg string) {
+	payload, _ := json.Marshal(map[string]string{"error": msg})
+	http.Error(w, string(payload), status)
 }
 
 // Handler returns the provider's HTTP handler surface.
@@ -158,45 +630,8 @@ func (s *Server) Handler() http.Handler {
 // LogPath returns the durable effects log path.
 func (s *Server) LogPath() string { return s.logPath }
 
-func appendLine(path string, v any) error {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
-		return err
-	}
-	b, _ := json.Marshal(v)
-	if _, err := f.Write(append(b, '\n')); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return err
-	}
-	return f.Close()
-}
-
-func (s *Server) writeArtifact(id string, data []byte) error {
-	path := filepath.Join(s.artifactDir, id)
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
-	if err != nil {
-		return err
-	}
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return err
-	}
-	return f.Close()
-}
-
-func (s *Server) readArtifact(id string) ([]byte, error) {
-	return os.ReadFile(filepath.Join(s.artifactDir, id))
-}
-
 func (s *Server) postEffects(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 	var body struct {
 		Token string `json:"token"`
 	}
@@ -236,7 +671,7 @@ func (s *Server) postEffects(w http.ResponseWriter, r *http.Request) {
 		Result:    json.RawMessage(`{"ok":true}`),
 		Timestamp: time.Now().UTC(),
 	}
-	if err := appendLine(s.logPath, e); err != nil {
+	if err := s.appendRecord(s.logPath, e); err != nil {
 		http.Error(w, `{"error":"log failed"}`, http.StatusInternalServerError)
 		return
 	}
@@ -250,7 +685,7 @@ func (s *Server) getEffect(w http.ResponseWriter, r *http.Request) {
 	e, ok := s.seen[r.PathValue("token")]
 	if !ok {
 		// Re-scan the durable log — truth survives process restart.
-		data, _ := os.ReadFile(s.logPath)
+		data, _ := s.fs.ReadFile(s.logPath)
 		for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
 			var le LogEntry
 			if json.Unmarshal([]byte(line), &le) == nil && le.Token == r.PathValue("token") {
@@ -266,9 +701,13 @@ func (s *Server) getEffect(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) respondOperation(w http.ResponseWriter, op Operation, fault string) {
-	artifact, err := s.readArtifact(op.ArtifactID)
+	artifact, err := s.fs.ReadArtifact(s.artifactDir, op.ArtifactID)
 	if err != nil {
-		http.Error(w, `{"error":"artifact missing"}`, http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "artifact missing: "+err.Error())
+		return
+	}
+	if sum := sha256.Sum256(artifact); fmt.Sprintf("%x", sum) != op.ArtifactDigest {
+		writeError(w, http.StatusInternalServerError, "artifact does not match the recorded digest")
 		return
 	}
 	declared := op.ArtifactDigest
@@ -295,11 +734,21 @@ func (s *Server) respondOperation(w http.ResponseWriter, op Operation, fault str
 }
 
 func (s *Server) postOperation(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 	var body struct {
 		Token   string          `json:"token"`
 		Payload json.RawMessage `json:"payload"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Token == "" {
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, "request body exceeds the provider's bound")
+			return
+		}
+		http.Error(w, `{"error":"bad request"}`, http.StatusBadRequest)
+		return
+	}
+	if body.Token == "" {
 		http.Error(w, `{"error":"bad request"}`, http.StatusBadRequest)
 		return
 	}
@@ -320,6 +769,21 @@ func (s *Server) postOperation(w http.ResponseWriter, r *http.Request) {
 		// Duplicate token with the same payload: replay the original
 		// operation. No new effect.
 		s.respondOperation(w, existing, fault)
+		return
+	}
+
+	if pending, ok := s.prepared[body.Token]; ok {
+		if pending.PayloadDigest != payloadDigest {
+			http.Error(w, `{"error":"operation token bound to a different payload"}`, http.StatusConflict)
+			return
+		}
+		// The commit was interrupted after the durable acceptance
+		// record: complete it rather than execute a second time.
+		if err := s.completeCommit(pending); err != nil {
+			writeError(w, http.StatusInternalServerError, "commit recovery failed: "+err.Error())
+			return
+		}
+		s.respondOperation(w, s.opsByToken[body.Token], fault)
 		return
 	}
 
@@ -346,22 +810,47 @@ func (s *Server) postOperation(w http.ResponseWriter, r *http.Request) {
 		op.Status = "REJECTED"
 		op.Executions = 0
 		op.Result = nil
-		artifact = []byte(fmt.Sprintf(`{"operation_id":%q,"outcome":"REJECTED","reason":"deterministic rejection"}`, op.OperationID))
-	} else {
-		artifact = []byte(fmt.Sprintf(`{"operation_id":%q,"token":%q,"outcome":"COMMITTED"}`, op.OperationID, op.Token))
 	}
+	artifact = artifactFor(op)
 	artifactSum := sha256.Sum256(artifact)
 	op.ArtifactDigest = fmt.Sprintf("%x", artifactSum)
-	if err := appendLine(s.opLedger, op); err != nil {
+
+	// Phase 1 — durable acceptance. From here a retry replays this
+	// operation; it can never execute a second time.
+	if err := s.appendRecord(s.opLedger, preparedRecord(op)); err != nil {
 		http.Error(w, `{"error":"ledger failed"}`, http.StatusInternalServerError)
 		return
 	}
-	if err := s.writeArtifact(op.ArtifactID, artifact); err != nil {
+	s.prepared[op.Token] = op
+	if fault == FaultFailAfterPrepared {
+		http.Error(w, `{"error":"interrupted after the acceptance record"}`, http.StatusInternalServerError)
+		return
+	}
+
+	// Phase 2 — the artifact, atomically: temp write, fsync, rename,
+	// parent-directory fsync.
+	if err := s.writeArtifactAtomic(op.ArtifactID, artifact); err != nil {
 		http.Error(w, `{"error":"artifact failed"}`, http.StatusInternalServerError)
 		return
 	}
-	s.opsByToken[op.Token] = op
-	s.totalExecutions += op.Executions
+	if fault == FaultFailAfterArtifact {
+		http.Error(w, `{"error":"interrupted after the artifact"}`, http.StatusInternalServerError)
+		return
+	}
+
+	// Phase 3 — the durable commit. The acknowledgement follows only
+	// after this record is fsynced.
+	if err := s.appendRecord(s.opLedger, committedRecord(op)); err != nil {
+		http.Error(w, `{"error":"commit failed"}`, http.StatusInternalServerError)
+		return
+	}
+	s.committed[op.Token] = true
+	if fault == FaultFailAfterCommitted {
+		http.Error(w, `{"error":"interrupted after the commit record"}`, http.StatusInternalServerError)
+		return
+	}
+
+	s.finishCommit(op)
 
 	switch fault {
 	case FaultCommitThenTimeout:
@@ -393,7 +882,19 @@ func (s *Server) getOperation(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	op, ok := s.opsByToken[r.PathValue("token")]
+	token := r.PathValue("token")
+	op, ok := s.opsByToken[token]
+	if !ok {
+		if pending, isPending := s.prepared[token]; isPending {
+			// A lookup of an interrupted commit completes it, so the
+			// answer the caller receives is backed by durable bytes.
+			if err := s.completeCommit(pending); err != nil {
+				writeError(w, http.StatusInternalServerError, "operation recovery failed: "+err.Error())
+				return
+			}
+			op, ok = s.opsByToken[token]
+		}
+	}
 	if !ok {
 		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 		return
@@ -404,7 +905,7 @@ func (s *Server) getOperation(w http.ResponseWriter, r *http.Request) {
 func (s *Server) getArtifact(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	data, err := s.readArtifact(r.PathValue("id"))
+	data, err := s.fs.ReadArtifact(s.artifactDir, r.PathValue("id"))
 	if err != nil {
 		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 		return
