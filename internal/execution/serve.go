@@ -368,6 +368,11 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	// routing change).
 	service.SetAdapterAvailability(adapterStates)
 
+	// Admission ceilings: bounded by the validated configuration, so a
+	// malformed, idle, or adversarial client cannot allocate unbounded
+	// handler goroutines, memory, or file descriptors.
+	service.SetAdmissionLimits(cfg.MaxConnections, cfg.MaxHandshakeConnections)
+
 	// Wire production authority: PostgreSQL-backed grant resolution.
 	// Without this, the service defaults to NoopGrantResolver which
 	// denies all grant-required capabilities in production.

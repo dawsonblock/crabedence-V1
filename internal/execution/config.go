@@ -3,6 +3,7 @@ package execution
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -36,6 +37,12 @@ type ServiceConfig struct {
 	TrustedProxyUIDs map[uint32]struct{}
 	ExecutorTimeouts ExecutorTimeouts
 	ProviderGate     ProviderGateConfig
+
+	// Admission ceilings: simultaneously open connections and the
+	// smaller, separate bound on the unauthenticated phase
+	// (attestation handshakes and peer authentication).
+	MaxConnections          int
+	MaxHandshakeConnections int
 
 	// Attestation is the resolved runtime-attestation policy. nil
 	// means the handshake is disabled and invocations carry no
@@ -168,6 +175,20 @@ func LoadServiceConfig(opts ServeOptions) (*ServiceConfig, error) {
 	}
 	cfg.Attestation = attestation
 
+	// Admission ceilings. Bounded by default: a malformed, idle, or
+	// adversarial client cannot allocate unbounded handler goroutines,
+	// memory, or file descriptors.
+	maxConnections, err := positiveIntEnv("CRABEDENCE_MAX_CONNECTIONS", DefaultMaxConnections)
+	if err != nil {
+		return nil, err
+	}
+	cfg.MaxConnections = maxConnections
+	maxHandshakes, err := positiveIntEnv("CRABEDENCE_MAX_HANDSHAKES", DefaultMaxHandshakeConnections)
+	if err != nil {
+		return nil, err
+	}
+	cfg.MaxHandshakeConnections = maxHandshakes
+
 	// The executor-owned provider ceiling applies on top of any caller
 	// deadline: a provider that exceeds it — including one that ignores
 	// cancellation entirely — converges the record to UNKNOWN +
@@ -298,6 +319,7 @@ func (c *ServiceConfig) Report() string {
 	fmt.Fprintf(&b, "  github adapter:   %s\n", github)
 	fmt.Fprintf(&b, "  qualification:    %s\n", qualification)
 	fmt.Fprintf(&b, "  peer auth:        %d mapped UIDs (%d trusted proxies)\n", len(c.PeerPrincipals), len(c.TrustedProxyUIDs))
+	fmt.Fprintf(&b, "  admission:        %d connections / %d handshakes\n", c.MaxConnections, c.MaxHandshakeConnections)
 	attestation := "disabled"
 	if c.Attestation != nil {
 		attestation = "enabled (optional)"
@@ -313,6 +335,21 @@ func (c *ServiceConfig) Report() string {
 	fmt.Fprintf(&b, "  provider gate:    max %d concurrent; degraded after %d consecutive ambiguous outcomes; circuit opens after %d (cooldown %s)\n",
 		c.ProviderGate.MaxConcurrent, c.ProviderGate.DegradedAfter, c.ProviderGate.OpenAfter, c.ProviderGate.OpenCooldown)
 	return b.String()
+}
+
+// positiveIntEnv resolves a positive integer environment value,
+// falling back to def when unset. A present but malformed or
+// non-positive value is a startup error, never a silent fallback.
+func positiveIntEnv(name string, def int) (int, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 {
+		return 0, fmt.Errorf("%s %q is not a positive integer", name, raw)
+	}
+	return n, nil
 }
 
 // resolveStoreBackend resolves CRABEDENCE_STORE_BACKEND. "auto"/unset

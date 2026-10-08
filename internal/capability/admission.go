@@ -58,6 +58,13 @@ const (
 	// FailureIdempotencyConflict means the same key was used with a
 	// different request.
 	FailureIdempotencyConflict FailureCode = "IDEMPOTENCY_CONFLICT"
+
+	// FailureServiceBusy means the service refused the request before
+	// dispatch because an admission ceiling (connections or
+	// authentication/attestation handshakes) was reached. The refusal
+	// is definitive — nothing was dispatched, so nothing can have
+	// happened — and a retry after the backlog drains is safe.
+	FailureServiceBusy FailureCode = "EXECUTION_BUSY"
 )
 
 // AdmissionDecision is the result of admission checks.

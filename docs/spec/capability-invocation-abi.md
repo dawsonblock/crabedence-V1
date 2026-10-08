@@ -514,6 +514,13 @@ that as an argument. Crabedence's registry owns provider selection.
 `IN_FLIGHT` is a valid wire status but is converted to `UNKNOWN`
 at the client boundary — it is not a terminal outcome for the caller.
 
+`EXECUTION_BUSY` is a pre-dispatch refusal: `FAILED` with
+`definitive_failure: true` and a machine-readable failure code, returned
+when an admission ceiling is reached (simultaneously open connections,
+or the smaller bound on unauthenticated/attestation handshakes). Nothing
+was dispatched, so nothing can have happened and a retry after the
+backlog drains is safe.
+
 ## Transport Bindings
 
 The semantic contract is stable. The transport is replaceable.

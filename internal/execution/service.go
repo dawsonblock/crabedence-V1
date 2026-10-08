@@ -216,6 +216,30 @@ type Handler interface {
 	Execute(ctx context.Context, req Request, desc capability.ResolvedDescriptor) Response
 }
 
+// Admission ceilings. The connection ceiling bounds simultaneously
+// open connections (and therefore handler goroutines, memory, and file
+// descriptors); the handshake ceiling is a smaller, separate bound on
+// the unauthenticated phase — attestation handshakes and peer
+// authentication — whose work (signature verification, session
+// bookkeeping) an unauthenticated peer can trigger.
+const (
+	DefaultMaxConnections          = 64
+	DefaultMaxHandshakeConnections = 16
+	// refusalWorkerLimit bounds concurrently delivered BUSY refusals:
+	// refusing a connection means consuming its frame so the client can
+	// read the answer, and that work is bounded like any other.
+	refusalWorkerLimit = 8
+	// headerReadTimeout bounds the length prefix of a request: a
+	// connection that does not speak is a slowloris attempt, not a
+	// request. The body keeps the full request lifetime.
+	headerReadTimeout = 5 * time.Second
+	// busyWriteTimeout bounds delivering a refusal.
+	busyWriteTimeout = 5 * time.Second
+	// shutdownDrainTimeout bounds how long Stop waits for in-flight
+	// handlers before returning.
+	shutdownDrainTimeout = 5 * time.Second
+)
+
 // Service is the persistent Crabedence execution service.
 type Service struct {
 	registry      *capability.Registry
@@ -239,17 +263,70 @@ type Service struct {
 	// means attestation is disabled (a non-required deployment); the
 	// handshake messages are refused rather than answered.
 	attestation *attestationRegistry
+	// connSlots bounds simultaneously open connections; handshakeSlots
+	// bounds the unauthenticated phase. Both are acquired before the
+	// work they bound and released after it.
+	connSlots      chan struct{}
+	handshakeSlots chan struct{}
+	refusalSlots   chan struct{}
+	// handlers tracks in-flight connection handlers so Stop can drain
+	// them instead of abandoning admitted work mid-flight.
+	handlers sync.WaitGroup
+	// drainTimeout bounds the Stop drain; overridable in tests.
+	drainTimeout time.Duration
 }
 
 // NewService creates a new execution service.
 func NewService(registry *capability.Registry, handler Handler, socketPath string) *Service {
 	return &Service{
-		registry:      registry,
-		handler:       handler,
-		socketPath:    socketPath,
-		grantResolver: capability.NoopGrantResolver{},
+		registry:       registry,
+		handler:        handler,
+		socketPath:     socketPath,
+		grantResolver:  capability.NoopGrantResolver{},
+		connSlots:      make(chan struct{}, DefaultMaxConnections),
+		handshakeSlots: make(chan struct{}, DefaultMaxHandshakeConnections),
+		refusalSlots:   make(chan struct{}, refusalWorkerLimit),
+		drainTimeout:   shutdownDrainTimeout,
 	}
 }
+
+// SetAdmissionLimits overrides the admission ceilings. Call it before
+// Start. Non-positive values leave the corresponding default in place;
+// production resolves both from the validated deployment configuration
+// (CRABEDENCE_MAX_CONNECTIONS, CRABEDENCE_MAX_HANDSHAKES).
+func (s *Service) SetAdmissionLimits(connections, handshakes int) {
+	if connections > 0 {
+		s.connSlots = make(chan struct{}, connections)
+	}
+	if handshakes > 0 {
+		s.handshakeSlots = make(chan struct{}, handshakes)
+	}
+}
+
+// tryAcquireConnection takes one connection slot without waiting.
+func (s *Service) tryAcquireConnection() bool {
+	select {
+	case s.connSlots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Service) releaseConnection() { <-s.connSlots }
+
+// tryAcquireHandshake takes one unauthenticated-phase slot without
+// waiting.
+func (s *Service) tryAcquireHandshake() bool {
+	select {
+	case s.handshakeSlots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Service) releaseHandshake() { <-s.handshakeSlots }
 
 // SetAdapterAvailability declares which adapters this deployment wired.
 // A known capability whose adapter is not AVAILABLE fails as
@@ -325,18 +402,32 @@ func (s *Service) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop closes the listener and stops accepting connections.
+// Stop closes the listener, stops accepting connections, and drains
+// in-flight handlers (bounded by the drain timeout) so a shutdown does
+// not abandon admitted work mid-flight. A dispatch that outlives the
+// drain is not silently lost: its durable record is already in flight
+// state for reconciliation, which is the designed recovery path.
 func (s *Service) Stop() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if !s.running {
+		s.mu.Unlock()
 		return nil
 	}
 
 	s.running = false
 	if s.listener != nil {
 		s.listener.Close()
+	}
+	s.mu.Unlock()
+
+	drained := make(chan struct{})
+	go func() {
+		s.handlers.Wait()
+		close(drained)
+	}()
+	select {
+	case <-drained:
+	case <-time.After(s.drainTimeout):
 	}
 	os.Remove(s.socketPath)
 
@@ -375,16 +466,30 @@ func (s *Service) acceptLoop(ctx context.Context) {
 		}
 		backoff = acceptBackoffMin
 
-		go s.handleConnection(ctx, conn)
+		// Bound admission before any goroutine exists: a connection at
+		// the ceiling is refused explicitly — a definitive pre-dispatch
+		// denial — instead of spawning unbounded handlers.
+		if !s.tryAcquireConnection() {
+			s.refuseBusyConnection(conn, "the execution service is at its connection ceiling")
+			continue
+		}
+		s.handlers.Add(1)
+		go func() {
+			defer s.handlers.Done()
+			s.handleConnection(ctx, conn)
+		}()
 	}
 }
 
 func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
+	defer s.releaseConnection()
 
-	// Bound the whole connection: one request, one response, no
-	// indefinite holds.
-	_ = conn.SetDeadline(time.Now().Add(connectionLifetime))
+	start := time.Now()
+	// The length prefix must arrive promptly: a connection that never
+	// speaks is a slowloris attempt, not a request. The body keeps the
+	// full request lifetime.
+	_ = conn.SetReadDeadline(start.Add(headerReadTimeout))
 
 	// Read 4-byte big-endian length prefix
 	lenBuf := make([]byte, 4)
@@ -404,10 +509,28 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 	}
 
 	// Read message body
+	_ = conn.SetReadDeadline(start.Add(connectionLifetime))
 	msgBuf := make([]byte, msgLen)
 	if _, err := io.ReadFull(conn, msgBuf); err != nil {
 		return
 	}
+
+	// The unauthenticated phase — the attestation handshake, request
+	// parsing, attestation verification, and peer authentication — is
+	// bounded by a smaller, separate ceiling: it is the work an
+	// unauthenticated peer can trigger. The slot is released once the
+	// caller is authenticated (or the deployment authenticates nobody),
+	// before admission and dispatch.
+	if !s.tryAcquireHandshake() {
+		s.refuseUnauthenticated(conn, msgBuf)
+		return
+	}
+	handshakeHeld := true
+	defer func() {
+		if handshakeHeld {
+			s.releaseHandshake()
+		}
+	}()
 
 	// Attestation handshake messages are dispatched before the strict
 	// invocation ABI — they are service frames, not capability
@@ -494,6 +617,12 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 		}
 		req.Authority.Principal = principal
 	}
+
+	// The caller is authenticated (or this deployment authenticates
+	// nobody): release the unauthenticated-phase bound before admission
+	// and dispatch.
+	s.releaseHandshake()
+	handshakeHeld = false
 
 	// Admit the request
 	decision := s.registry.Admit(capability.AdmissionRequest{
@@ -643,6 +772,60 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 	s.writeResponse(conn, response, decision.Descriptor.ExecutionClass)
 }
 
+// refuseBusyConnection delivers a definitive BUSY response to a
+// connection the service cannot admit. The refusal itself is bounded
+// work: at most refusalWorkerLimit refusals are in flight, each bounded
+// by the header timeout and the frame bound. Beyond that pool the
+// connection is closed without a frame — still a pre-dispatch failure,
+// because nothing was dispatched and nothing can have happened.
+func (s *Service) refuseBusyConnection(conn net.Conn, reason string) {
+	select {
+	case s.refusalSlots <- struct{}{}:
+	default:
+		conn.Close()
+		return
+	}
+	go func() {
+		defer func() { <-s.refusalSlots }()
+		defer conn.Close()
+		_ = conn.SetReadDeadline(time.Now().Add(headerReadTimeout))
+		// Consume the request frame (bounded) so the client's write
+		// completes and it can read the refusal.
+		lenBuf := make([]byte, 4)
+		if _, err := io.ReadFull(conn, lenBuf); err != nil {
+			return
+		}
+		if n := binary.BigEndian.Uint32(lenBuf); n <= maxMessageBytes {
+			_, _ = io.CopyN(io.Discard, conn, int64(n))
+		}
+		s.writeBusy(conn, reason)
+	}()
+}
+
+// refuseUnauthenticated delivers an explicit refusal for a connection
+// that could not take an unauthenticated-phase slot, shaped for the
+// frame the caller sent.
+func (s *Service) refuseUnauthenticated(conn net.Conn, msgBuf []byte) {
+	if t := messageType(msgBuf); t == attestChallengeType || t == attestType {
+		writeJSONFrame(conn, attestResponse{
+			Status: "error",
+			Error:  "execution service busy: the attestation handshake ceiling is reached — retry when the backlog drains",
+		})
+		return
+	}
+	s.writeBusy(conn, "the authentication and attestation concurrency ceiling is reached")
+}
+
+// writeBusy writes a definitive pre-dispatch refusal.
+func (s *Service) writeBusy(conn net.Conn, reason string) {
+	s.writeResponseDeadline(conn, Response{
+		Status:            StatusFailed,
+		FailureCode:       string(capability.FailureServiceBusy),
+		Error:             "execution service busy: " + reason + " — the request was not dispatched; retry when the backlog drains",
+		DefinitiveFailure: true,
+	}, "", busyWriteTimeout)
+}
+
 // writeResponse writes one framed response. executedClass is the
 // resolved execution class of the request whose handler produced resp,
 // or "" before admission. A response that cannot be framed must never be
@@ -652,6 +835,10 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 // result, so a MUTATION/CRITICAL response becomes UNKNOWN. A PURE/READ
 // execution can prove no effect occurred, so FAILED stays truthful.
 func (s *Service) writeResponse(conn net.Conn, resp Response, executedClass capability.ExecutionClass) {
+	s.writeResponseDeadline(conn, resp, executedClass, responseWriteTimeout)
+}
+
+func (s *Service) writeResponseDeadline(conn net.Conn, resp Response, executedClass capability.ExecutionClass, writeTimeout time.Duration) {
 	payload, err := json.Marshal(resp)
 	if err != nil {
 		log.Printf("execution service: marshal error: %v", err)
@@ -678,7 +865,7 @@ func (s *Service) writeResponse(conn net.Conn, resp Response, executedClass capa
 	}
 
 	// Set write deadline to prevent blocking on hung clients
-	if err := conn.SetWriteDeadline(time.Now().Add(30 * time.Second)); err != nil {
+	if err := conn.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
 		log.Printf("execution service: set write deadline: %v", err)
 		return
 	}
@@ -698,14 +885,17 @@ func (s *Service) writeResponse(conn net.Conn, resp Response, executedClass capa
 // the ABI's declared maximum.
 const maxMessageBytes = 4 * 1024 * 1024
 
-// connectionLifetime bounds the REQUEST side of a client connection:
-// the read that must produce one request frame, with no indefinite
-// holds. It deliberately does not bound the response: the provider
-// budget is minutes, and writeResponse sets its own write deadline, so
-// an invocation that finishes after this lifetime still delivers its
-// definitive answer rather than stranding the caller with an ambiguity
-// it did not have.
+// connectionLifetime bounds the BODY side of a client connection: the
+// read that must produce one request frame after its length prefix, with
+// no indefinite holds. It deliberately does not bound the response: the
+// provider budget is minutes, and writeResponse sets its own write
+// deadline, so an invocation that finishes after this lifetime still
+// delivers its definitive answer rather than stranding the caller with
+// an ambiguity it did not have.
 const connectionLifetime = 60 * time.Second
+
+// responseWriteTimeout bounds delivering a response to a caller.
+const responseWriteTimeout = 30 * time.Second
 
 // writeFull writes the entire buffer. A Unix stream write may accept
 // fewer bytes than requested, and a truncated frame would corrupt the
