@@ -26,6 +26,7 @@ source "$REPO_ROOT/scripts/lib/live-gate.sh"
 # Gate logs record the command line; credential-bearing KEY=value tokens
 # are redacted so a secret never lands in the evidence bundle.
 source "$REPO_ROOT/scripts/lib/redact.sh"
+source "$REPO_ROOT/scripts/lib/evidence-inventory.sh"
 
 # Clean previous generated artifacts.
 rm -f "$EVIDENCE_DIR"/*.json "$EVIDENCE_DIR"/SHA256SUMS \
@@ -1377,13 +1378,16 @@ python3 "$REPO_ROOT/scripts/generate-evidence-root.py" "$EVIDENCE_DIR" --repo-ro
 # evidence-manifest.json is EXCLUDED because its digest is computed FROM
 # this SHA256SUMS — including it would create a self-invalidating cycle.
 cd "$EVIDENCE_DIR"
-# Hidden and temporary working entries (.* at any level) are never
-# evidence — a scratch directory left in the bundle must not silently
-# change its checksum manifest. The sort is byte-wise so the manifest
-# does not depend on the host locale.
-find . -mindepth 1 \( -name '.*' -o -name attestation \) -prune -o \
-  -type f ! -name SHA256SUMS ! -name evidence-manifest.json ! -name artifact.json -print0 \
-  | LC_ALL=C sort -z | xargs -0 shasum -a 256 > SHA256SUMS
+# Every stage agrees on membership (scripts/lib/evidence-inventory.sh):
+# a hidden scratch entry or a non-regular member is never evidence and
+# never ships, so finding one here refuses the bundle rather than
+# producing a tree finalization or packaging would reject downstream.
+evidence_refuse_strays "$EVIDENCE_DIR" "evidence generation"
+# artifact.json is excluded: the release workflow writes it after the
+# archive is built — it cannot exist yet. The sort is byte-wise so the
+# manifest does not depend on the host locale.
+evidence_checksum_members "$EVIDENCE_DIR" artifact.json \
+  | xargs -0 shasum -a 256 > SHA256SUMS
 
 # ─── Phase 25: Generate evidence-manifest.json ──────────────────────────────
 # The evidence bundle digest is the SHA-256 of the SHA256SUMS manifest,

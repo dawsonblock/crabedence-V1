@@ -168,6 +168,42 @@ test("an extra empty directory is packaged (directories carry no checksummable c
   });
 });
 
+test("packaging refuses a hidden scratch entry — never evidence, never shipped", (t) => {
+  const { root, dir } = evidenceFixture(t);
+  // The one inventory rule: hidden entries are refused at every stage, so
+  // a bundle that finalized before scratch landed still cannot package.
+  fs.mkdirSync(path.join(dir, ".scratch"));
+  fs.writeFileSync(path.join(dir, ".scratch", "partial.log"), "x\n");
+  fs.writeFileSync(path.join(dir, ".DS_Store"), "junk");
+  const out = path.join(root, "bundle.tar.gz");
+  const { status, stderr } = packageIt(dir, out);
+  assert.equal(status, 1);
+  assert.match(stderr, /hidden entries/);
+  assert.equal(fs.existsSync(out), false);
+});
+
+test("a sealed bundle packages: attestation members ship unchecksummed", (t) => {
+  const { root, dir } = evidenceFixture(t);
+  // attestation/ is the external seal applied after finalization — the
+  // canonical inventory tolerates it, consumers verify it with
+  // `gh attestation verify` rather than the checksum manifest.
+  fs.mkdirSync(path.join(dir, "attestation"));
+  fs.writeFileSync(
+    path.join(dir, "attestation", "attestation.json"),
+    JSON.stringify({ attestation_url: "https://example.invalid/att" }),
+  );
+  const out = path.join(root, "bundle.tar.gz");
+  const { status, stderr } = packageIt(dir, out);
+  assert.equal(status, 0, stderr);
+  const extract = path.join(root, "extracted");
+  fs.mkdirSync(extract);
+  execFileSync("tar", ["xzf", out, "-C", extract]);
+  assert.ok(
+    fs.existsSync(path.join(extract, "release-evidence", "attestation", "attestation.json")),
+    "the seal ships inside the bundle",
+  );
+});
+
 test("packaging refuses a fifo that SHA256SUMS cannot cover", (t) => {
   const { root, dir } = evidenceFixture(t);
   // A fifo is a non-regular member: it can never appear in SHA256SUMS, so it

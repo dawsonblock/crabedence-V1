@@ -27,8 +27,11 @@
 # evidence-manifest.json on any host, at any wall-clock time, in any
 # locale or timezone, at any directory path. Every generated timestamp is
 # bound to the qualification record's own timestamp, never to the clock;
-# the canonical traversal prunes hidden and temporary working entries and
-# sorts with LC_ALL=C.
+# the canonical traversal excludes hidden and temporary working entries and
+# sorts with LC_ALL=C. A hidden or non-regular member is refused rather than
+# silently pruned — the one inventory rule in
+# scripts/lib/evidence-inventory.sh is what generation, verification and
+# packaging all agree on.
 #
 # A bundle that already carries an attestation is SEALED: finalization
 # refuses to rewrite or silently remove it — the attestation attested the
@@ -45,6 +48,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+source "$REPO_ROOT/scripts/lib/evidence-inventory.sh"
 
 VERIFY_ONLY=0
 EVIDENCE_DIR=""
@@ -132,16 +136,20 @@ if [ -d "$EVIDENCE_DIR/attestation" ] && [ "$VERIFY_ONLY" -eq 0 ]; then
 fi
 
 # ─── The canonical checksum traversal ───────────────────────────────────
-# One function, shared by generation and verification so they can never
-# disagree about what the bundle contains. Hidden and temporary working
-# entries (.* at any level) are never evidence — a scratch directory left
-# in the bundle must not silently change its checksum manifest. Sorting
-# is byte-wise so the manifest does not depend on the host locale.
+# One inventory, shared by generation, finalization, verification and
+# packaging so they can never disagree about what the bundle contains.
+# Sorting is byte-wise so the manifest does not depend on the host locale.
 checksums() {
-  ( cd "$EVIDENCE_DIR" && find . -mindepth 1 \( -name '.*' -o -name attestation \) -prune -o \
-      -type f ! -name SHA256SUMS ! -name evidence-manifest.json -print0 \
-      | LC_ALL=C sort -z | xargs -0 shasum -a 256 )
+  ( cd "$EVIDENCE_DIR" && evidence_checksum_members . | xargs -0 shasum -a 256 )
 }
+
+# Every stage agrees on what may exist in the tree: a hidden scratch entry
+# or a non-regular member is never evidence and never ships, so finding one
+# here is a refusal — silent pruning is exactly what let a finalized bundle
+# reach packaging in a state the packager had to reject.
+if ! evidence_refuse_strays "$EVIDENCE_DIR" "finalization"; then
+  exit 1
+fi
 
 write_manifest() {
   local out="$1" sha count

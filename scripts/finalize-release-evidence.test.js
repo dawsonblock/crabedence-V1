@@ -195,22 +195,35 @@ test("re-finalization is byte-identical: same digest, same coverage", (t) => {
   assert.deepEqual(canonicalBytes(root), first);
 });
 
-test("hidden and temporary working entries never enter the checksum manifest", (t) => {
+test("hidden and temporary working entries refuse finalization", (t) => {
   const root = fixture(t);
   // Scratch state left inside the bundle directory — a temporary
-  // extraction dir, an editor file, a nested hidden directory.
+  // extraction dir, an editor file, a nested hidden directory. The one
+  // inventory rule says these are never evidence and never ship, so
+  // finalization refuses rather than silently producing a tree the
+  // packager would reject downstream.
   fs.mkdirSync(path.join(root, ".run1"));
   fs.writeFileSync(path.join(root, ".run1", "scratch.log"), "scratch\n");
   fs.writeFileSync(path.join(root, ".DS_Store"), "junk");
   fs.mkdirSync(path.join(root, "gate-results", ".tmp-work"));
   fs.writeFileSync(path.join(root, "gate-results", ".tmp-work", "partial"), "x\n");
 
+  const result = finalize(root);
+  assert.notEqual(result.status, 0, "hidden scratch must refuse, not silently prune");
+  assert.match(result.stderr, /hidden entries/);
+  assert.match(result.stderr, /\.run1|\.DS_Store|\.tmp-work/);
+  // Nothing was written: the refusal leaves the bundle as it found it.
+  assert.equal(fs.readFileSync(path.join(root, "SHA256SUMS"), "utf8"), "");
+});
+
+test("--verify refuses a tree carrying hidden scratch", (t) => {
+  const root = fixture(t);
   assert.equal(finalize(root).status, 0);
-  const sums = fs.readFileSync(path.join(root, "SHA256SUMS"), "utf8");
-  assert.doesNotMatch(sums, /\.run1|\.DS_Store|\.tmp-work/);
-  // And they still don't enter on re-finalization.
-  assert.equal(finalize(root).status, 0);
-  assert.doesNotMatch(fs.readFileSync(path.join(root, "SHA256SUMS"), "utf8"), /\.run1|\.DS_Store|\.tmp-work/);
+  fs.mkdirSync(path.join(root, ".scratch"));
+  fs.writeFileSync(path.join(root, ".scratch", "left.log"), "x\n");
+  const result = finalize(root, ["--verify"]);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /hidden entries/);
 });
 
 test("finalization is deterministic across locale and timezone", (t) => {
