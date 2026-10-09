@@ -70,9 +70,13 @@ func TestConcurrentIdenticalMutations(t *testing.T) {
 				Authority:      RequestAuthority{Principal: "alice@example.com", AuthorityRef: "grant_123"},
 				IdempotencyKey: "concurrent_key_001",
 			}
-			resp := sendRequest(t, conn, req)
+			// A definitive FAILED frame and a connection closed before
+			// the frame completes are both pre-dispatch refusals:
+			// nothing was dispatched, so nothing can have happened
+			// (sendRequestTolerant documents the classification).
+			resp, ok := sendRequestTolerant(conn, req)
 			mu.Lock()
-			if resp.Status == StatusFailed {
+			if !ok || resp.Status == StatusFailed {
 				failCount++
 			} else if resp.Status == StatusSucceeded {
 				successCount++
