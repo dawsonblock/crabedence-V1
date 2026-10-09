@@ -469,12 +469,13 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 		}()
 
 		// Evidence checkpoint: periodically commit the canonical
-		// terminal-evidence enumeration to a signed file an operator can
-		// archive independently — the anchor that proves the store still
-		// contains everything it covered (cmd/evidence-checkpoint
-		// verifies). Disabled unless a path is configured.
+		// terminal-evidence enumeration to a signed retained sequence —
+		// the anchor that proves the store still contains everything it
+		// covered (cmd/evidence-checkpoint verifies). Disabled unless a
+		// path is configured; independent custody requires the custody
+		// path to live outside this host's failure domain.
 		if cfg.CheckpointPath != "" {
-			go runCheckpointLoop(ctx, store, signer, cfg.CheckpointPath, cfg.CheckpointInterval)
+			go runCheckpointLoop(ctx, store, signer, cfg.CheckpointPath, cfg.CheckpointCustodyPath, cfg.CheckpointInterval)
 		}
 	}
 

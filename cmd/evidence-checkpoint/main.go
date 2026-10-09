@@ -2,13 +2,17 @@
 // signed evidence checkpoints.
 //
 // The service emits a checkpoint periodically when
-// CRABEDENCE_CHECKPOINT_PATH is configured; an operator archives the
-// sequence on an independent medium. This tool re-enumerates the
+// CRABEDENCE_CHECKPOINT_PATH is configured, retaining every emission in
+// an append-only log beside the latest file and mirroring both onto
+// CRABEDENCE_CHECKPOINT_CUSTODY_PATH when set — custody that counts as
+// independent only when that storage lives outside the service host's
+// failure domain. This tool re-enumerates the
 // store's terminal evidence and proves a held checkpoint still covers
 // it: the signature verifies under a trusted signer fingerprint, the
 // store still holds at least the covered records, and the covered
 // prefix recomputes to the checkpoint's chain digest — a deleted,
-// rewritten, reordered or rolled-back covered record fails.
+// rewritten, reordered or rolled-back covered record fails. Any
+// emission from the retained log may be verified the same way.
 //
 // Usage:
 //

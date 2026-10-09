@@ -45,12 +45,19 @@ type ServiceConfig struct {
 	MaxHandshakeConnections int
 
 	// CheckpointPath, when set, is where the service writes its
-	// periodically emitted signed evidence checkpoint — a single file
-	// (replaced atomically) an operator archives independently.
-	// CheckpointInterval is the emission period (default
-	// DefaultCheckpointInterval).
-	CheckpointPath     string
-	CheckpointInterval time.Duration
+	// periodically emitted signed evidence checkpoint — the latest
+	// emission (replaced atomically) beside a retained append-only
+	// sequence log (<path>.jsonl) an operator archives.
+	// CheckpointCustodyPath, when set, is a second emission target
+	// with the same layout; it only provides independent custody when
+	// its storage lives outside this host's failure domain (an
+	// independent mount or custody-backed path) — a property the
+	// service cannot verify, so local-only retention is scoped as not
+	// independent custody. CheckpointInterval is the emission period
+	// (default DefaultCheckpointInterval).
+	CheckpointPath        string
+	CheckpointCustodyPath string
+	CheckpointInterval    time.Duration
 
 	// Attestation is the resolved runtime-attestation policy. nil
 	// means the handshake is disabled and invocations carry no
@@ -198,10 +205,13 @@ func LoadServiceConfig(opts ServeOptions) (*ServiceConfig, error) {
 	cfg.MaxHandshakeConnections = maxHandshakes
 
 	// Evidence checkpoint: the service periodically commits the
-	// terminal-evidence enumeration to a signed file an operator
-	// archives independently (CRABEDENCE_CHECKPOINT_PATH to enable,
-	// CRABEDENCE_CHECKPOINT_INTERVAL to pace; default every 5m).
+	// terminal-evidence enumeration to a signed retained sequence an
+	// operator archives (CRABEDENCE_CHECKPOINT_PATH to enable,
+	// CRABEDENCE_CHECKPOINT_CUSTODY_PATH to mirror onto independent
+	// storage, CRABEDENCE_CHECKPOINT_INTERVAL to pace; default every
+	// 5m).
 	cfg.CheckpointPath = strings.TrimSpace(os.Getenv("CRABEDENCE_CHECKPOINT_PATH"))
+	cfg.CheckpointCustodyPath = strings.TrimSpace(os.Getenv("CRABEDENCE_CHECKPOINT_CUSTODY_PATH"))
 	cfg.CheckpointInterval = DefaultCheckpointInterval
 	if raw := strings.TrimSpace(os.Getenv("CRABEDENCE_CHECKPOINT_INTERVAL")); raw != "" {
 		d, err := time.ParseDuration(raw)
@@ -345,6 +355,11 @@ func (c *ServiceConfig) Report() string {
 	checkpoint := "disabled"
 	if c.CheckpointPath != "" {
 		checkpoint = fmt.Sprintf("%s every %s", c.CheckpointPath, c.CheckpointInterval)
+		if c.CheckpointCustodyPath != "" {
+			checkpoint += fmt.Sprintf(" (custody %s)", c.CheckpointCustodyPath)
+		} else {
+			checkpoint += " (local retention only — not independent custody)"
+		}
 	}
 	fmt.Fprintf(&b, "  checkpoint:       %s\n", checkpoint)
 	attestation := "disabled"
