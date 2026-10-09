@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"time"
+
+	"github.com/openclaw/crabbox/internal/evidence"
 )
 
 // EffectStore is the durable execution contract boundary. The
@@ -88,6 +90,12 @@ type EffectStore interface {
 	// ListProviderObservations returns the execution's immutable
 	// provider-observation ledger rows in commit order.
 	ListProviderObservations(ctx context.Context, executionID string) ([]ObservationRecord, error)
+	// TerminalEvidence enumerates every terminal execution as a
+	// checkpoint reference, in execution_id order — the canonical
+	// enumeration an evidence checkpoint commits to. Terminal records
+	// are immutable, so the enumeration only ever grows in a stable
+	// order.
+	TerminalEvidence(ctx context.Context) ([]evidence.TerminalRef, error)
 
 	// Cluster-epoch disaster-recovery fencing.
 	// ClusterEpoch returns the epoch this store was admitted under.

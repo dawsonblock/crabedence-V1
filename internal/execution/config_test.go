@@ -30,6 +30,7 @@ func clearServiceEnv(t *testing.T) {
 		"CRABEDENCE_ATTESTATION_SESSION_TTL", "CRABEDENCE_APPROVED_RUNTIME_KEYS",
 		"CRABEDENCE_APPROVED_RELEASES", "CRABEDENCE_APPROVED_PLUGIN_MANIFESTS",
 		"CRABEDENCE_APPROVED_ABI",
+		"CRABEDENCE_CHECKPOINT_PATH", "CRABEDENCE_CHECKPOINT_INTERVAL",
 		"CRABBOX_ALLOW_INSECURE_TEST_PROVIDER_ORIGIN",
 	} {
 		t.Setenv(name, "")
@@ -94,6 +95,26 @@ func TestLoadServiceConfigResolvesOverrides(t *testing.T) {
 	if cfg.ProviderGate.MaxConcurrent != 8 || cfg.ProviderGate.OpenCooldown != 2*time.Minute {
 		t.Fatalf("provider gate = %+v, want the overrides applied", cfg.ProviderGate)
 	}
+	t.Setenv("CRABEDENCE_CHECKPOINT_PATH", "/var/lib/crabedence/evidence-checkpoint.json")
+	t.Setenv("CRABEDENCE_CHECKPOINT_INTERVAL", "90s")
+	cfg, err = LoadServiceConfig(ServeOptions{})
+	if err != nil {
+		t.Fatalf("load with checkpoint: %v", err)
+	}
+	if cfg.CheckpointPath != "/var/lib/crabedence/evidence-checkpoint.json" ||
+		cfg.CheckpointInterval != 90*time.Second {
+		t.Fatalf("checkpoint config = %q/%s", cfg.CheckpointPath, cfg.CheckpointInterval)
+	}
+	// Unset: checkpoint emission is off and the interval is the default.
+	t.Setenv("CRABEDENCE_CHECKPOINT_PATH", "")
+	t.Setenv("CRABEDENCE_CHECKPOINT_INTERVAL", "")
+	cfg, err = LoadServiceConfig(ServeOptions{})
+	if err != nil {
+		t.Fatalf("load without checkpoint: %v", err)
+	}
+	if cfg.CheckpointPath != "" || cfg.CheckpointInterval != DefaultCheckpointInterval {
+		t.Fatalf("checkpoint defaults = %q/%s", cfg.CheckpointPath, cfg.CheckpointInterval)
+	}
 	// A DSN resolves "auto" to postgres.
 	t.Setenv("CRABEDENCE_STORE_BACKEND", "auto")
 	cfg, err = LoadServiceConfig(ServeOptions{DatabaseURL: "postgres://example/db"})
@@ -127,6 +148,7 @@ func TestLoadServiceConfigFailsClosed(t *testing.T) {
 			t.Setenv("CRABBOX_REPLICAS", "3")
 		}, "contradicts CRABBOX_REPLICAS"},
 		{"malformed executor ceiling", func(t *testing.T) { t.Setenv("CRABEDENCE_PROVIDER_EXECUTION_MAX", "soon") }, "not a positive Go duration"},
+		{"malformed checkpoint interval", func(t *testing.T) { t.Setenv("CRABEDENCE_CHECKPOINT_INTERVAL", "often") }, "CRABEDENCE_CHECKPOINT_INTERVAL"},
 		{"malformed max concurrent", func(t *testing.T) { t.Setenv("CRABEDENCE_PROVIDER_MAX_CONCURRENT", "many") }, "not a positive integer"},
 		{"contradictory gate thresholds", func(t *testing.T) {
 			t.Setenv("CRABEDENCE_PROVIDER_DEGRADED_AFTER", "9")

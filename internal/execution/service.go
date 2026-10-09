@@ -225,6 +225,10 @@ type Handler interface {
 const (
 	DefaultMaxConnections          = 64
 	DefaultMaxHandshakeConnections = 16
+	// DefaultCheckpointInterval paces the periodic signed evidence
+	// checkpoint the service emits when CRABEDENCE_CHECKPOINT_PATH is
+	// configured.
+	DefaultCheckpointInterval = 5 * time.Minute
 	// refusalWorkerLimit bounds concurrently delivered BUSY refusals:
 	// refusing a connection means consuming its frame so the client can
 	// read the answer, and that work is bounded like any other.

@@ -3,6 +3,7 @@ package idempotency
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/openclaw/crabbox/internal/evidence"
 )
@@ -145,4 +146,78 @@ func ValidateTerminalTransition(record *Record, target State, receipt TerminalRe
 		return fmt.Errorf("definitive transition to %s requires evidence or result — cannot terminate without proof", target)
 	}
 	return nil
+}
+
+// ─── Terminal evidence enumeration ───────────────────────────────────
+//
+// TerminalEvidence enumerates every terminal execution as a checkpoint
+// reference, in execution_id order — the canonical enumeration an
+// evidence checkpoint commits to. Terminal records are immutable and
+// execution ids are time-ordered UUIDv7, so the enumeration only ever
+// grows in a stable order. The timestamp is truncated to milliseconds:
+// SQLite stores millisecond integers while PostgreSQL keeps microseconds,
+// and the truncation is what makes the canonical form engine-independent.
+
+// TerminalEvidence implements the SQLite engine.
+func (s *SQLiteStore) TerminalEvidence(ctx context.Context) ([]evidence.TerminalRef, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT execution_id, state, request_digest,
+		       COALESCE(terminal_result_digest, ''),
+		       COALESCE(terminal_evidence_digest, ''),
+		       COALESCE(terminal_receipt_digest, ''),
+		       COALESCE(provider_id, ''), COALESCE(provider_run_id, ''),
+		       updated_at
+		FROM execution_requests
+		WHERE state IN ('COMMITTED', 'FAILED')
+		ORDER BY execution_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var refs []evidence.TerminalRef
+	for rows.Next() {
+		var ref evidence.TerminalRef
+		var updatedAt int64
+		if err := rows.Scan(&ref.ExecutionID, &ref.State, &ref.RequestDigest,
+			&ref.TerminalResultDigest, &ref.TerminalEvidenceDigest,
+			&ref.TerminalReceiptDigest, &ref.ProviderID, &ref.ProviderRunID,
+			&updatedAt); err != nil {
+			return nil, err
+		}
+		ref.UpdatedAt = sqliteTime(updatedAt).Truncate(time.Millisecond).Format(time.RFC3339Nano)
+		refs = append(refs, ref)
+	}
+	return refs, rows.Err()
+}
+
+// TerminalEvidence implements the PostgreSQL engine.
+func (s *Store) TerminalEvidence(ctx context.Context) ([]evidence.TerminalRef, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT execution_id, state, request_digest,
+		       COALESCE(terminal_result_digest, ''),
+		       COALESCE(terminal_evidence_digest, ''),
+		       COALESCE(terminal_receipt_digest, ''),
+		       COALESCE(provider_id, ''), COALESCE(provider_run_id, ''),
+		       updated_at
+		FROM execution_requests
+		WHERE state IN ('COMMITTED', 'FAILED')
+		ORDER BY execution_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var refs []evidence.TerminalRef
+	for rows.Next() {
+		var ref evidence.TerminalRef
+		var updatedAt time.Time
+		if err := rows.Scan(&ref.ExecutionID, &ref.State, &ref.RequestDigest,
+			&ref.TerminalResultDigest, &ref.TerminalEvidenceDigest,
+			&ref.TerminalReceiptDigest, &ref.ProviderID, &ref.ProviderRunID,
+			&updatedAt); err != nil {
+			return nil, err
+		}
+		ref.UpdatedAt = updatedAt.UTC().Truncate(time.Millisecond).Format(time.RFC3339Nano)
+		refs = append(refs, ref)
+	}
+	return refs, rows.Err()
 }
