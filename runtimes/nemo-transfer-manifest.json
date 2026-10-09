@@ -2,7 +2,7 @@
   "provenance_format_version": 2,
   "tree": "runtimes/nemo-relay",
   "runtime_version": "0.9.1-rc.4",
-  "shipped_tree_sha256": "e1279ef20acc448ac52a6ac2332c81f71e278b2bf71579160ffc953d0f9567a0",
+  "shipped_tree_sha256": "f2033ac7eddc2ee8f5b35c2ad8a3d5a3260f8e4aad03d761f3959918ba011776",
   "file_count": 1466,
   "symlink_count": 10,
   "policy": {
@@ -70,6 +70,7 @@
       "crates/node/src/api/mod.rs",
       "crates/plugin-host/src/isolation_policy.rs",
       "crates/plugin-host/src/lib.rs",
+      "crates/plugin-host/src/limits.rs",
       "crates/plugin-host/src/runtime_service.rs",
       "crates/plugin-host/src/supervisor.rs",
       "crates/plugin-host/tests/process_backend.rs",

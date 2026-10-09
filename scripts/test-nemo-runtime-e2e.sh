@@ -339,15 +339,22 @@ pass "same durable key + changed arguments → identity conflict"
 # 10b. The authority boundary at the process level: the child's environment is
 #      cleared at spawn, so it carries only the session variables it needs —
 #      never the service's socket, store, runtime dir, home, or any other
-#      variable the parent happens to have. The fixture writes the *names* it
-#      sees (never values), which is what a witness may report.
+#      variable the parent happens to have — and a descriptor this shell holds
+#      without close-on-exec does not cross into it either. The fixture writes
+#      the *names* it sees (never values) and whether any descriptor it can see
+#      points at the caller's canary file, which is what a witness may report.
 env_dump="$work_dir/child-env.txt"
+fd_dump="$work_dir/child-fds.txt"
+canary="$work_dir/fd-canary"
+printf 'descriptor canary\n' > "$canary"
+exec 3<"$canary"
 sentinel="leak-probe-$$"
 CRABEDENCE_LEAK_PROBE="$sentinel" run_runtime --plugin "$plugin_dir" \
   --plugin-id fixture_intercept --component fixture_intercept \
-  --plugin-config "{\"env_dump\":\"$env_dump\"}" \
+  --plugin-config "{\"env_dump\":\"$env_dump\",\"fd_dump\":\"$fd_dump\",\"fd_canary\":\"$canary\"}" \
   --capability system.echo --arguments '{"probe":"env-boundary"}' >/dev/null \
   || fail "the env-boundary invocation must succeed: $out"
+exec 3<&-
 [[ -s "$env_dump" ]] || fail "the child never wrote its environment names"
 grep -qx 'NEMO_RELAY_PLUGIN_HOST_SOCKET' "$env_dump" \
   || fail "the child is missing its session socket: $(cat "$env_dump")"
@@ -358,6 +365,10 @@ if grep -qE '^(HOME|XDG_RUNTIME_DIR|CRABEDENCE_|CRABBOX_)' "$env_dump"; then
 fi
 grep -q "$sentinel" "$env_dump" && fail "the leak probe reached the child"
 pass "the plugin child sees only its session environment"
+[[ -s "$fd_dump" ]] || fail "the child never wrote its descriptor witness"
+grep -qx 'canary_fds=' "$fd_dump" \
+  || fail "a caller descriptor crossed into the host child: $(cat "$fd_dump")"
+pass "a caller descriptor without close-on-exec does not cross into the child"
 
 # 11. Adversarial: middleware that answers without ever reaching the dispatch
 #     is refused — a capability result that did not cross the router is not

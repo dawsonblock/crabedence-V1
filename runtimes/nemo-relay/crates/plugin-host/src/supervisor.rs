@@ -285,9 +285,9 @@ impl PluginHostSupervisor {
                 .as_ref()
                 .map(std::os::unix::io::AsRawFd::as_raw_fd);
             // Safety: the closure runs in the forked child before `exec`, and
-            // calls `setrlimit` (and, on Linux, `prctl` and `fcntl`) and nothing
-            // else: it allocates nothing, takes no locks, and returns only an
-            // error the spawn reports.
+            // calls `setrlimit` (and, on Linux, `prctl` and `fcntl`), `close`,
+            // and nothing else: it allocates nothing, takes no locks, and
+            // returns only an error the spawn reports.
             unsafe {
                 command.pre_exec(move || {
                     if let Some(fd) = channel_fd {
@@ -298,6 +298,10 @@ impl PluginHostSupervisor {
                             return Err(error.into());
                         }
                     }
+                    // Everything above stdio that the supervisor holds is the
+                    // supervisor's, not the host's — except the channel above,
+                    // which is the confined host's only copy of it.
+                    mark_inherited_descriptors_close_on_exec(channel_fd);
                     crate::limits::apply(&limits)
                 });
             }
@@ -1677,6 +1681,50 @@ async fn handshake(
     Ok(identity)
 }
 
+/// Mark every descriptor above stdio that the host must not inherit
+/// close-on-exec.
+///
+/// The standard library opens its own descriptors close-on-exec, but an
+/// inherited descriptor is not the supervisor's to trust: anything the kernel
+/// process was handed without CLOEXEC — a launcher's log file, another
+/// service's socket, a credential the deployment thought it had put away —
+/// would otherwise cross into the host, and through the host into every plugin
+/// it loads. The one deliberate exception is the confined host's kernel channel
+/// descriptor, which is the child's only copy of that channel; it is named by
+/// `preserve` and is left alone (the spawn clears its flag separately).
+///
+/// Marking rather than closing is deliberate. The standard library keeps a
+/// private close-on-exec pipe between parent and child so a failed `exec` is
+/// reported instead of looking like a successful spawn; a loop that *closed*
+/// descriptors would close that pipe before the `exec` attempt and turn every
+/// exec failure into a host that silently never starts. Setting the flag is
+/// idempotent for descriptors that already carry it, so the child's table gains
+/// exactly the property this boundary is about — nothing crosses `exec` — and
+/// the machinery around it keeps working.
+///
+/// Runs between `fork` and `exec`: every call here is a raw syscall, so it
+/// allocates nothing and cannot deadlock against a lock another thread held at
+/// fork time. Descriptors are visited best-effort across the process's current
+/// descriptor limit (itself bounded); a descriptor that was never open answers
+/// EBADF, which is the expected result and is ignored.
+#[cfg(unix)]
+fn mark_inherited_descriptors_close_on_exec(preserve: Option<std::os::fd::RawFd>) {
+    let ceiling = crate::limits::INHERITED_DESCRIPTOR_SWEEP_CEILING;
+    let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile)
+        .current
+        .unwrap_or(ceiling);
+    let last = limit.min(ceiling) as std::os::fd::RawFd;
+    for descriptor in 3..last {
+        if preserve == Some(descriptor) {
+            continue;
+        }
+        // Safety: the raw descriptor is borrowed for the duration of the call
+        // and never closed here; EBADF is ignored.
+        let borrowed = unsafe { rustix::fd::BorrowedFd::borrow_raw(descriptor) };
+        let _ = rustix::io::fcntl_setfd(borrowed, rustix::io::FdFlags::CLOEXEC);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1795,4 +1843,173 @@ mod tests {
     // `a_host_beside_the_process_is_found_when_nothing_names_one` and
     // `a_host_that_is_nowhere_is_named_rather_than_invented`. What stays here is
     // what the supervisor does with the answer, which is the test above.
+
+    /// The descriptor boundary, exercised through real fork/execs: the parent
+    /// opens descriptors without CLOEXEC — the shape a launcher's file or
+    /// another service's socket has — the child runs the boundary, and a
+    /// grandchild proves what actually crossed the second `exec`.
+    #[test]
+    fn inherited_descriptors_do_not_cross_exec() {
+        use std::os::fd::AsRawFd;
+
+        let directory = std::env::temp_dir().join(format!(
+            "nemo-descriptor-boundary-{}",
+            nemo_relay_plugin_protocol::Uuid::now_v7().simple()
+        ));
+        std::fs::create_dir_all(&directory).expect("a directory for the descriptor fixture");
+        let leaked = std::fs::File::create(directory.join("leaked")).expect("the leaked file");
+        let preserved =
+            std::fs::File::create(directory.join("preserved")).expect("the preserved file");
+        // The standard library opens descriptors close-on-exec; clear the flag
+        // so both have the shape this boundary exists for.
+        for file in [&leaked, &preserved] {
+            rustix::io::fcntl_setfd(file, rustix::io::FdFlags::empty())
+                .expect("clearing close-on-exec");
+        }
+
+        let witness = directory.join("witness");
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("the test binary's own path"),
+        )
+        .arg("--exact")
+        .arg("supervisor::tests::descriptor_boundary_child")
+        .arg("--nocapture")
+        .env(
+            "NEMO_DESCRIPTOR_BOUNDARY_LEAKED",
+            leaked.as_raw_fd().to_string(),
+        )
+        .env(
+            "NEMO_DESCRIPTOR_BOUNDARY_PRESERVED",
+            preserved.as_raw_fd().to_string(),
+        )
+        .env("NEMO_DESCRIPTOR_BOUNDARY_WITNESS", &witness)
+        .env("NEMO_DESCRIPTOR_BOUNDARY_DIRECTORY", &directory)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("the child test binary runs");
+
+        let ran = witness.exists();
+        std::fs::remove_dir_all(&directory).ok();
+        assert!(
+            ran,
+            "the child never ran the boundary: the test filter matched nothing"
+        );
+        assert!(
+            status.success(),
+            "the child reported the descriptor boundary did not hold"
+        );
+    }
+
+    /// The child half of `inherited_descriptors_do_not_cross_exec`: it runs
+    /// the boundary, asserts the flag the boundary sets, and re-execs a
+    /// grandchild so the property that actually matters — the descriptor is
+    /// gone after `exec` — is observed rather than inferred.
+    #[test]
+    fn descriptor_boundary_child() {
+        let Ok(leaked) = std::env::var("NEMO_DESCRIPTOR_BOUNDARY_LEAKED") else {
+            return;
+        };
+        let leaked: std::os::fd::RawFd = leaked.parse().expect("a leaked descriptor number");
+        let preserved: std::os::fd::RawFd = std::env::var("NEMO_DESCRIPTOR_BOUNDARY_PRESERVED")
+            .expect("a preserved descriptor number")
+            .parse()
+            .expect("a preserved descriptor number");
+        let witness = std::env::var("NEMO_DESCRIPTOR_BOUNDARY_WITNESS")
+            .expect("a witness path for the parent");
+        let directory =
+            std::env::var("NEMO_DESCRIPTOR_BOUNDARY_DIRECTORY").expect("the fixture directory");
+
+        mark_inherited_descriptors_close_on_exec(Some(preserved));
+
+        // Safety: the descriptors were inherited from the parent and are only
+        // interrogated here.
+        let (leaked_flags, preserved_flags) = unsafe {
+            (
+                rustix::io::fcntl_getfd(rustix::fd::BorrowedFd::borrow_raw(leaked)).ok(),
+                rustix::io::fcntl_getfd(rustix::fd::BorrowedFd::borrow_raw(preserved)).ok(),
+            )
+        };
+        std::fs::write(
+            &witness,
+            format!("leaked={leaked_flags:?} preserved={preserved_flags:?}"),
+        )
+        .expect("the witness file");
+        let leaked_flags = leaked_flags.expect("the leaked descriptor is still open before exec");
+        assert!(
+            leaked_flags.contains(rustix::io::FdFlags::CLOEXEC),
+            "an inherited descriptor was left crossing exec"
+        );
+        assert!(
+            !preserved_flags
+                .expect("the preserved descriptor is still open")
+                .contains(rustix::io::FdFlags::CLOEXEC),
+            "the preserved descriptor was marked for closing"
+        );
+
+        // The property itself: a descriptor marked close-on-exec is gone in
+        // the next process, and one that was preserved is still there.
+        let grandchild_witness = std::path::Path::new(&directory).join("grandchild-witness");
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("the test binary's own path"),
+        )
+        .arg("--exact")
+        .arg("supervisor::tests::descriptor_boundary_grandchild")
+        .arg("--nocapture")
+        .env("NEMO_DESCRIPTOR_BOUNDARY_LEAKED", leaked.to_string())
+        .env("NEMO_DESCRIPTOR_BOUNDARY_PRESERVED", preserved.to_string())
+        .env("NEMO_DESCRIPTOR_BOUNDARY_WITNESS", &grandchild_witness)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("the grandchild test binary runs");
+        assert!(
+            grandchild_witness.exists(),
+            "the grandchild never ran: the test filter matched nothing"
+        );
+        assert!(
+            status.success(),
+            "the grandchild reported a descriptor crossed exec"
+        );
+    }
+
+    /// The grandchild half of `inherited_descriptors_do_not_cross_exec`; a
+    /// no-op when the harness runs it as part of the ordinary suite.
+    #[test]
+    fn descriptor_boundary_grandchild() {
+        let Ok(leaked) = std::env::var("NEMO_DESCRIPTOR_BOUNDARY_LEAKED") else {
+            return;
+        };
+        let leaked: std::os::fd::RawFd = leaked.parse().expect("a leaked descriptor number");
+        let preserved: std::os::fd::RawFd = std::env::var("NEMO_DESCRIPTOR_BOUNDARY_PRESERVED")
+            .expect("a preserved descriptor number")
+            .parse()
+            .expect("a preserved descriptor number");
+        let witness = std::env::var("NEMO_DESCRIPTOR_BOUNDARY_WITNESS")
+            .expect("a witness path for the parent");
+
+        // Safety: the descriptors were inherited from the parent process and
+        // are only interrogated here.
+        let (leaked_open, preserved_open) = unsafe {
+            (
+                rustix::io::fcntl_getfd(rustix::fd::BorrowedFd::borrow_raw(leaked)).is_ok(),
+                rustix::io::fcntl_getfd(rustix::fd::BorrowedFd::borrow_raw(preserved)).is_ok(),
+            )
+        };
+        std::fs::write(
+            &witness,
+            format!("leaked={leaked_open} preserved={preserved_open}"),
+        )
+        .expect("the grandchild witness file");
+        assert!(
+            !leaked_open,
+            "a descriptor the host must not inherit crossed exec"
+        );
+        assert!(
+            preserved_open,
+            "the preserved descriptor did not cross exec"
+        );
+    }
 }

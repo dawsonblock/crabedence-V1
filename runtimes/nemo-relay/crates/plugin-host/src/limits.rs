@@ -67,6 +67,18 @@ impl Default for PluginHostLimits {
     }
 }
 
+/// How far the supervisor sweeps descriptors when it marks what a host must not
+/// inherit.
+///
+/// The sweep exists so an inherited descriptor cannot cross `exec` into the
+/// host; this is the bound on the sweep itself, not a security budget. A
+/// descriptor above the process's soft limit cannot be opened, and a deployment
+/// that lowered its limit after opening higher descriptors is outside what this
+/// runtime does — so the ceiling only bounds the worst case of the loop on
+/// platforms without a close-range call. It lives here because a bound belongs
+/// with the other bounds, not inside the spawn path that applies it.
+pub const INHERITED_DESCRIPTOR_SWEEP_CEILING: u64 = 65_536;
+
 /// The address-space ceiling the shipped profile asks for, where it is one the
 /// platform can honour.
 ///
