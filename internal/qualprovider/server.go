@@ -11,6 +11,8 @@
 // API surface:
 //
 //	POST /effects            apply an effect; idempotent on `token`
+//	                         (legacy-effects-v2 compatibility mode —
+//	                         see "Legacy effects endpoint" below)
 //	GET  /effects/{token}    status lookup — independent evidence for
 //	                         post-crash reconciliation
 //	POST /operations         CRITICAL operation ledger + immutable
@@ -18,6 +20,18 @@
 //	GET  /operations/{token} completion / non-effect proof lookup
 //	GET  /artifacts/{id}     immutable artifact bytes
 //	GET  /stats              operation/execution counts
+//
+// # Legacy effects endpoint
+//
+// /effects is retained for the external-provider crash-qualification
+// harness (internal/execution's external provider tests dispatch
+// through it and reconcile against GET /effects/{token}). It carries
+// strict durable semantics identical in kind to the operation ledger:
+// the log is fully validated before the server serves anything, an
+// acknowledged effect survives restart, and any byte of durable state
+// the provider cannot interpret fails startup closed. New
+// qualification flows should use /operations; /effects is documented
+// for removal once the crash-qualification harness is migrated.
 //
 // # Two-phase operation commit
 //
@@ -99,6 +113,34 @@ const (
 // maxRequestBodyBytes bounds any request body the provider will read.
 const maxRequestBodyBytes = 1 << 20
 
+// Legacy-effects durability error identifiers — surfaced verbatim in
+// startup errors and HTTP error bodies so the qualification harness
+// classifies them rather than guessing from status codes.
+const (
+	// ErrCorruptEffectLog: the durable effects log failed validation —
+	// malformed record, torn tail, duplicate/conflicting identity, or
+	// an unsafe file type at the ledger path.
+	ErrCorruptEffectLog = "ERR_CORRUPT_EFFECT_LOG"
+	// ErrEffectLogUnreadable: the ledger exists but could not be read
+	// (EIO, EACCES, …). Unreadable acknowledged state can never be
+	// treated as empty acknowledged state.
+	ErrEffectLogUnreadable = "ERR_EFFECT_LOG_UNREADABLE"
+	// ErrDuplicateTokenConflict: one token is bound to two records.
+	ErrDuplicateTokenConflict = "ERR_DUPLICATE_TOKEN_CONFLICT"
+	// ErrRecoveryRequired: a durable write's completion is ambiguous —
+	// the provider no longer accepts new mutations until the state is
+	// re-verified by a restart (or explicit operator reconciliation).
+	ErrRecoveryRequired = "ERR_RECOVERY_REQUIRED"
+)
+
+// Durable effects-log bounds: the ledger is small by design; anything
+// larger is corruption or abuse, not workload.
+const (
+	maxEffectsLogBytes   = 256 << 20
+	maxEffectsLogRecords = 1 << 20
+	maxEffectTokenBytes  = 4096
+)
+
 var (
 	opIDPattern   = regexp.MustCompile(`^op-([0-9]+)$`)
 	artIDPattern  = regexp.MustCompile(`^art-([0-9]+)$`)
@@ -154,9 +196,15 @@ type Server struct {
 	artifactDir string
 	fs          durableFS
 
-	mu         sync.Mutex
-	effects    int
-	seen       map[string]LogEntry
+	mu      sync.Mutex
+	effects int
+	seen    map[string]LogEntry
+	// degraded is non-nil once a durable write's completion is
+	// ambiguous: a failed append may have left torn bytes, so the
+	// provider stops accepting NEW mutations until the state is
+	// re-verified by restart. Acknowledged records keep answering —
+	// they are durable truth — but nothing uncertain is served.
+	degraded   error
 	opsByToken map[string]Operation
 	// prepared holds operations whose PREPARED record is durable but
 	// whose commit has not completed; a retry completes the commit
@@ -184,6 +232,9 @@ func newServer(dir, logName string, fs durableFS) (*Server, error) {
 	if logName == "" {
 		logName = "provider-log.jsonl"
 	}
+	// The ledger always lives inside the state directory — a caller
+	// naming anything else is a defect, not a configuration.
+	logName = filepath.Base(logName)
 	s := &Server{
 		dir:         dir,
 		logPath:     filepath.Join(dir, logName),
@@ -194,6 +245,12 @@ func newServer(dir, logName string, fs durableFS) (*Server, error) {
 		opsByToken:  map[string]Operation{},
 		prepared:    map[string]Operation{},
 		committed:   map[string]bool{},
+	}
+	// The state directory is private by contract — the ledgers in it
+	// are the provider's acknowledged truth, so a directory another
+	// principal can read or write is refused before anything opens.
+	if err := ensurePrivateStateDir(dir); err != nil {
+		return nil, err
 	}
 	if err := os.MkdirAll(s.artifactDir, 0o700); err != nil {
 		return nil, err
@@ -210,21 +267,143 @@ func newServer(dir, logName string, fs durableFS) (*Server, error) {
 	if err := s.recoverLedger(); err != nil {
 		return nil, err
 	}
-	// Reload the effects log the same way: a replayed token must stay
-	// idempotent across restarts and EffectN must not repeat, or a
-	// restarted provider would apply the same effect twice.
-	if data, err := s.fs.ReadFile(s.logPath); err == nil {
-		for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
-			var e LogEntry
-			if json.Unmarshal([]byte(line), &e) == nil && e.Token != "" {
-				s.seen[e.Token] = e
-				if e.EffectN > s.effects {
-					s.effects = e.EffectN
-				}
-			}
-		}
+	// Reload the effects log under the same contract as the operation
+	// ledger: the whole file validates before any of it becomes live
+	// state, a replayed token stays idempotent across restarts, and
+	// EffectN never repeats. Any state the provider cannot interpret —
+	// corrupt, torn, conflicting, unreadable — refuses startup rather
+	// than silently becoming an empty map.
+	seen, maxN, err := s.loadEffectsLog()
+	if err != nil {
+		return nil, err
 	}
+	s.seen = seen
+	s.effects = maxN
 	return s, nil
+}
+
+// loadEffectsLog strictly validates the durable effects log and returns
+// the recovered acknowledged-state map and the highest durable effect
+// number. The map is populated only when every byte of the log is
+// accounted for — a partially parsed ledger never becomes live state.
+//
+// An absent file is a first initialization; anything else that is not
+// a complete newline-terminated sequence of well-formed records fails
+// closed: a torn final line is an append that may or may not have been
+// acknowledged before the process died, and guessing either way can
+// mint a second effect or forget one that happened. The bytes are left
+// in place for diagnosis; recovery is an explicit operator action, not
+// an automatic rewrite.
+func (s *Server) loadEffectsLog() (map[string]LogEntry, int, error) {
+	seen := map[string]LogEntry{}
+	info, err := s.fs.Lstat(s.logPath)
+	switch {
+	case err == nil:
+		if !info.Mode().IsRegular() {
+			return nil, 0, fmt.Errorf("%s: %s is not a regular file (%s)", ErrCorruptEffectLog, s.logPath, info.Mode())
+		}
+		if info.Size() > maxEffectsLogBytes {
+			return nil, 0, fmt.Errorf("%s: %s is %d bytes, exceeding the %d-byte ledger bound", ErrCorruptEffectLog, s.logPath, info.Size(), maxEffectsLogBytes)
+		}
+	case os.IsNotExist(err):
+		return seen, 0, nil // first initialization — no acknowledged state yet
+	default:
+		return nil, 0, fmt.Errorf("%s: stat %s: %w", ErrEffectLogUnreadable, s.logPath, err)
+	}
+	data, err := s.fs.ReadFile(s.logPath)
+	if err != nil {
+		return nil, 0, fmt.Errorf("%s: read %s: %w", ErrEffectLogUnreadable, s.logPath, err)
+	}
+	if len(data) == 0 {
+		return seen, 0, nil
+	}
+	if data[len(data)-1] != '\n' {
+		return nil, 0, fmt.Errorf("%s: %s ends in a torn record — an append interrupted before acknowledgement; preserve the bytes and reconcile before restarting", ErrCorruptEffectLog, s.logPath)
+	}
+	lines := bytes.Split(data[:len(data)-1], []byte("\n"))
+	if len(lines) > maxEffectsLogRecords {
+		return nil, 0, fmt.Errorf("%s: %s holds %d records, exceeding the %d-record bound", ErrCorruptEffectLog, s.logPath, len(lines), maxEffectsLogRecords)
+	}
+	maxN := 0
+	for i, line := range lines {
+		if len(line) == 0 {
+			return nil, 0, fmt.Errorf("%s: %s line %d is empty — a missing record boundary", ErrCorruptEffectLog, s.logPath, i+1)
+		}
+		e, err := parseEffectRecord(line)
+		if err != nil {
+			return nil, 0, fmt.Errorf("%s: %s line %d: %w", ErrCorruptEffectLog, s.logPath, i+1, err)
+		}
+		if e.EffectN <= maxN {
+			return nil, 0, fmt.Errorf("%s: %s line %d: effect number %d does not strictly increase (previous %d) — the durable sequence order is violated", ErrCorruptEffectLog, s.logPath, i+1, e.EffectN, maxN)
+		}
+		if _, dup := seen[e.Token]; dup {
+			return nil, 0, fmt.Errorf("%s: %s line %d: token %q is bound to two records", ErrDuplicateTokenConflict, s.logPath, i+1, e.Token)
+		}
+		seen[e.Token] = e
+		maxN = e.EffectN
+	}
+	return seen, maxN, nil
+}
+
+// parseEffectRecord validates one effects-log line: exactly one
+// complete JSON object in the committed schema, with a non-empty
+// bounded token, a positive effect number that matches the canonical
+// run identity, a real timestamp and a real JSON result. Unknown
+// fields are refused — the durable schema is owned by this provider
+// and a field it does not know is not a record it wrote.
+func parseEffectRecord(line []byte) (LogEntry, error) {
+	var e LogEntry
+	dec := json.NewDecoder(bytes.NewReader(line))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&e); err != nil {
+		return e, err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return e, fmt.Errorf("trailing data after the record")
+	}
+	if e.Token == "" {
+		return e, fmt.Errorf("record has no token")
+	}
+	if len(e.Token) > maxEffectTokenBytes {
+		return e, fmt.Errorf("token exceeds the %d-byte bound", maxEffectTokenBytes)
+	}
+	if e.EffectN <= 0 {
+		return e, fmt.Errorf("record for token %q has non-positive effect number %d", e.Token, e.EffectN)
+	}
+	if want := fmt.Sprintf("run-%d", e.EffectN); e.RunID != want {
+		return e, fmt.Errorf("record for token %q binds run %q to effect %d — the canonical run identity is %q", e.Token, e.RunID, e.EffectN, want)
+	}
+	if e.Timestamp.IsZero() {
+		return e, fmt.Errorf("record for token %q has no timestamp", e.Token)
+	}
+	if len(e.Result) == 0 || string(e.Result) == "null" {
+		return e, fmt.Errorf("record for token %q has no result", e.Token)
+	}
+	return e, nil
+}
+
+// ensurePrivateStateDir makes the provider's state directory if absent
+// and refuses one it cannot prove private: the durable ledgers inside
+// are acknowledged truth, so a shared, world-readable or foreign-owned
+// directory is a deployment defect, not a preference.
+func ensurePrivateStateDir(dir string) error {
+	info, err := os.Lstat(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return os.MkdirAll(dir, 0o700)
+		}
+		return fmt.Errorf("state directory %s: %w", dir, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("state directory %s is a symlink — the durable state path is never followed", dir)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("state path %s is not a directory (%s)", dir, info.Mode())
+	}
+	if perm := info.Mode().Perm(); perm&0o077 != 0 {
+		return fmt.Errorf("state directory %s is not private (mode %o grants group/other access)", dir, perm)
+	}
+	return privateDirOwner(dir, info)
 }
 
 // scanArtifacts validates the artifact directory and advances the
@@ -659,8 +838,17 @@ func (s *Server) postEffects(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	if e, ok := s.seen[body.Token]; ok {
-		// Idempotent replay — logged result, no new effect.
+		// Idempotent replay — logged result, no new effect. Acknowledged
+		// truth keeps answering even while the provider is degraded.
 		respond(e)
+		return
+	}
+	// A never-acknowledged token is a mutation. Once a durable write
+	// has failed ambiguously the provider refuses further mutations —
+	// an append that may have committed torn bytes cannot be followed
+	// by more appends, and uncertain state is never claimed empty.
+	if s.degraded != nil {
+		writeError(w, http.StatusServiceUnavailable, ErrRecoveryRequired+": "+s.degraded.Error())
 		return
 	}
 	s.effects++
@@ -672,28 +860,29 @@ func (s *Server) postEffects(w http.ResponseWriter, r *http.Request) {
 		Timestamp: time.Now().UTC(),
 	}
 	if err := s.appendRecord(s.logPath, e); err != nil {
-		http.Error(w, `{"error":"log failed"}`, http.StatusInternalServerError)
+		s.degraded = fmt.Errorf("effects append for token %q: %w", body.Token, err)
+		writeError(w, http.StatusServiceUnavailable, ErrRecoveryRequired+": "+s.degraded.Error())
 		return
 	}
 	s.seen[body.Token] = e
 	respond(e)
 }
 
+// getEffect is the out-of-band reconciliation surface: after a crash a
+// caller asks the provider, not the executor, whether a token ever ran.
+// It answers only from the acknowledged-state map, which is populated
+// exclusively by a strictly validated durable log or a fully committed
+// append — the log is never re-scanned at query time, so state the
+// provider did not durably establish can never be served.
 func (s *Server) getEffect(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	e, ok := s.seen[r.PathValue("token")]
 	if !ok {
-		// Re-scan the durable log — truth survives process restart.
-		data, _ := s.fs.ReadFile(s.logPath)
-		for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
-			var le LogEntry
-			if json.Unmarshal([]byte(line), &le) == nil && le.Token == r.PathValue("token") {
-				e, ok = le, true
-			}
+		if s.degraded != nil {
+			writeError(w, http.StatusServiceUnavailable, ErrRecoveryRequired+": "+s.degraded.Error())
+			return
 		}
-	}
-	if !ok {
 		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 		return
 	}

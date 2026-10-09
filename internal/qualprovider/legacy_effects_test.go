@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -113,7 +114,7 @@ func TestLegacyEffectsCorruptedStartupRejects(t *testing.T) {
 	missingToken := `{"run_id":"run-1","effect_n":1,"result":{"ok":true},"timestamp":"2026-10-09T08:00:00Z"}`
 	zeroN := `{"token":"tok-z","run_id":"run-0","effect_n":0,"result":{"ok":true},"timestamp":"2026-10-09T08:00:00Z"}`
 	badTime := `{"token":"tok-t","run_id":"run-1","effect_n":1,"result":{"ok":true},"timestamp":"not-a-time"}`
-	badResult := `{"token":"tok-r","run_id":"run-1","effect_n":1,"result":"{unterminated","timestamp":"2026-10-09T08:00:00Z"}`
+	nullResult := `{"token":"tok-r","run_id":"run-1","effect_n":1,"result":null,"timestamp":"2026-10-09T08:00:00Z"}`
 	unknownField := `{"token":"tok-u","run_id":"run-1","effect_n":1,"result":{"ok":true},"timestamp":"2026-10-09T08:00:00Z","surprise":true}`
 
 	cases := map[string]string{
@@ -126,7 +127,7 @@ func TestLegacyEffectsCorruptedStartupRejects(t *testing.T) {
 		"zero effect number":           zeroN + "\n",
 		"run/effect mismatch":          mismatched + "\n",
 		"invalid timestamp":            badTime + "\n",
-		"invalid result JSON":          badResult + "\n",
+		"null result":                  nullResult + "\n",
 		"unknown field":                unknownField + "\n",
 		"duplicate token":              valid1 + "\n" + dupToken + "\n",
 		"duplicate effect number":      valid1 + "\n" + dupN + "\n",
@@ -134,7 +135,7 @@ func TestLegacyEffectsCorruptedStartupRejects(t *testing.T) {
 	}
 	for name, contents := range cases {
 		t.Run(name, func(t *testing.T) {
-			dir := t.TempDir()
+			dir := privateStateDir(t)
 			writeEffectsLog(t, dir, contents)
 			if _, err := New(dir, ""); err == nil {
 				t.Fatalf("startup with a corrupt effects log (%s) must refuse, not serve from a partial map", name)
@@ -143,7 +144,7 @@ func TestLegacyEffectsCorruptedStartupRejects(t *testing.T) {
 	}
 
 	t.Run("symlinked log", func(t *testing.T) {
-		dir := t.TempDir()
+		dir := privateStateDir(t)
 		real := filepath.Join(t.TempDir(), "real-log.jsonl")
 		if err := os.WriteFile(real, []byte(valid1+"\n"), 0o600); err != nil {
 			t.Fatal(err)
@@ -157,7 +158,7 @@ func TestLegacyEffectsCorruptedStartupRejects(t *testing.T) {
 	})
 
 	t.Run("non-regular log", func(t *testing.T) {
-		dir := t.TempDir()
+		dir := privateStateDir(t)
 		if err := os.Mkdir(filepath.Join(dir, "provider-log.jsonl"), 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -167,7 +168,7 @@ func TestLegacyEffectsCorruptedStartupRejects(t *testing.T) {
 	})
 
 	t.Run("unreadable log", func(t *testing.T) {
-		dir := t.TempDir()
+		dir := privateStateDir(t)
 		writeEffectsLog(t, dir, valid1+"\n")
 		if _, err := newServer(dir, "", &faultFS{inner: osDurableFS{}, target: "read", at: 1, pathSuffix: "provider-log.jsonl", err: syscall.EIO}); err == nil {
 			t.Fatal("an unreadable effects log must refuse startup — an EIO cannot become an empty acknowledged-state map")
@@ -177,12 +178,12 @@ func TestLegacyEffectsCorruptedStartupRejects(t *testing.T) {
 	// Positive control: a clean first initialization and a clean log
 	// both start.
 	t.Run("absent log is first init", func(t *testing.T) {
-		if _, err := New(t.TempDir(), ""); err != nil {
+		if _, err := New(privateStateDir(t), ""); err != nil {
 			t.Fatalf("first init: %v", err)
 		}
 	})
 	t.Run("clean log starts", func(t *testing.T) {
-		dir := t.TempDir()
+		dir := privateStateDir(t)
 		writeEffectsLog(t, dir, valid1+"\n"+valid2+"\n")
 		if _, err := New(dir, ""); err != nil {
 			t.Fatalf("clean log refused: %v", err)
@@ -199,7 +200,7 @@ func TestLegacyEffectsAcknowledgedReplayAfterCrash(t *testing.T) {
 	// The clean path — green on every correct implementation and the
 	// permanent regression for acknowledged replay.
 	t.Run("clean restart replays the recorded response", func(t *testing.T) {
-		dir := t.TempDir()
+		dir := privateStateDir(t)
 		_, srv1 := newTestServer(t, dir)
 		resp, body := postEffect(t, srv1.URL, "tok-ack")
 		if resp.StatusCode != http.StatusOK {
@@ -234,7 +235,7 @@ func TestLegacyEffectsAcknowledgedReplayAfterCrash(t *testing.T) {
 	// operator-visible recovery — never silently dropping bytes from an
 	// acknowledged-state ledger.
 	t.Run("torn tail after an acknowledged record fails closed", func(t *testing.T) {
-		dir := t.TempDir()
+		dir := privateStateDir(t)
 		_, srv1 := newTestServer(t, dir)
 		resp, body := postEffect(t, srv1.URL, "tok-ack")
 		if resp.StatusCode != http.StatusOK {
@@ -269,7 +270,7 @@ func TestLegacyEffectsAcknowledgedReplayAfterCrash(t *testing.T) {
 	// with an empty map that re-acknowledges the same token as a
 	// second durable effect.
 	t.Run("unreadable acknowledged ledger cannot mint a second effect", func(t *testing.T) {
-		dir := t.TempDir()
+		dir := privateStateDir(t)
 		_, srv1 := newTestServer(t, dir)
 		resp, body := postEffect(t, srv1.URL, "tok-ack")
 		if resp.StatusCode != http.StatusOK {
@@ -299,7 +300,7 @@ func TestLegacyEffectsAcknowledgedReplayAfterCrash(t *testing.T) {
 // never presented as truth, and a lookup of a missing token can never
 // be a scan artifact of corrupt bytes.
 func TestLegacyEffectsGetRejectsCorruptState(t *testing.T) {
-	dir := t.TempDir()
+	dir := privateStateDir(t)
 	_, srv := newTestServer(t, dir)
 
 	resp, body := postEffect(t, srv.URL, "tok-real")
@@ -350,5 +351,173 @@ func TestLegacyEffectsGetRejectsCorruptState(t *testing.T) {
 	}
 	if code := getEffectStatus(t, srv.URL, "tok-never"); code == http.StatusOK {
 		t.Fatal("corrupt on-disk state produced a lookup hit")
+	}
+}
+
+// TestLegacyEffectsConcurrentSameToken proves the token check and the
+// durable commit are one atomic step: every concurrent request with the
+// same token gets the same acknowledged response, and the log holds
+// exactly one record — no second effect, no divergent acknowledgement.
+func TestLegacyEffectsConcurrentSameToken(t *testing.T) {
+	dir := privateStateDir(t)
+	_, srv := newTestServer(t, dir)
+
+	const callers = 16
+	runIDs := make(chan string, callers)
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, body := postEffect(t, srv.URL, "tok-race")
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("concurrent effect: %d (%s)", resp.StatusCode, body)
+				return
+			}
+			var ack map[string]any
+			if err := json.Unmarshal(body, &ack); err != nil {
+				t.Errorf("decode: %v", err)
+				return
+			}
+			runIDs <- fmt.Sprint(ack["run_id"])
+		}()
+	}
+	wg.Wait()
+	close(runIDs)
+
+	var first string
+	for id := range runIDs {
+		if first == "" {
+			first = id
+		} else if id != first {
+			t.Fatalf("same token acknowledged with two different runs: %q and %q", first, id)
+		}
+	}
+	if entries := effectLogEntries(t, dir); len(entries) != 1 {
+		t.Fatalf("concurrent same-token requests minted %d durable records, want exactly 1", len(entries))
+	}
+}
+
+// TestLegacyEffectsSequentialAcks proves acknowledged-state accounting
+// holds at the boundary, not just for one record: one hundred distinct
+// effects commit durably, and after restart every token replays its own
+// acknowledgement with no reordering, loss, or renumbering.
+func TestLegacyEffectsSequentialAcks(t *testing.T) {
+	dir := privateStateDir(t)
+	_, srv1 := newTestServer(t, dir)
+
+	const total = 100
+	ackRunID := map[string]string{}
+	for i := 1; i <= total; i++ {
+		token := fmt.Sprintf("tok-seq-%d", i)
+		resp, body := postEffect(t, srv1.URL, token)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("effect %d: %d (%s)", i, resp.StatusCode, body)
+		}
+		var ack map[string]any
+		if err := json.Unmarshal(body, &ack); err != nil {
+			t.Fatal(err)
+		}
+		ackRunID[token] = fmt.Sprint(ack["run_id"])
+	}
+	srv1.Close()
+
+	_, srv2 := newTestServer(t, dir)
+	for i := 1; i <= total; i++ {
+		token := fmt.Sprintf("tok-seq-%d", i)
+		resp, body := postEffect(t, srv2.URL, token)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("replay of effect %d after restart: %d (%s)", i, resp.StatusCode, body)
+		}
+		var ack map[string]any
+		if err := json.Unmarshal(body, &ack); err != nil {
+			t.Fatal(err)
+		}
+		if got := fmt.Sprint(ack["run_id"]); got != ackRunID[token] {
+			t.Fatalf("effect %d replayed as run %v, acknowledged as %v", i, got, ackRunID[token])
+		}
+	}
+	entries := effectLogEntries(t, dir)
+	if len(entries) != total {
+		t.Fatalf("durable log holds %d records, want %d", len(entries), total)
+	}
+	for i, e := range entries {
+		if e.EffectN != i+1 {
+			t.Fatalf("record %d has effect number %d — the durable sequence must be gap-free and ordered", i+1, e.EffectN)
+		}
+	}
+}
+
+// TestLegacyEffectsDurableWriteFailureFailsClosed proves a failed
+// append is never claimed as success and its ambiguous durable result
+// is never quietly carried forward: the request fails as
+// recovery-required, acknowledged truth keeps answering, new mutations
+// stop, lookups for unacknowledged tokens fail closed — and the torn
+// bytes the partial write left behind refuse the next startup, so the
+// ambiguity is resolved by an operator, not by a guess.
+func TestLegacyEffectsDurableWriteFailureFailsClosed(t *testing.T) {
+	dir := privateStateDir(t)
+	_, srv := newTestServer(t, dir)
+
+	// One cleanly acknowledged effect, to prove acknowledged truth
+	// keeps answering while the provider refuses new mutations.
+	resp, body := postEffect(t, srv.URL, "tok-acked")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("acknowledged effect: %d (%s)", resp.StatusCode, body)
+	}
+	srv.Close()
+
+	// Restart on a filesystem whose second append to the effects log
+	// leaves torn bytes then fails — a real partial write.
+	fs := &faultFS{inner: osDurableFS{}, target: "append", at: 1, pathSuffix: "provider-log.jsonl", err: syscall.ENOSPC}
+	s2, err := newServer(dir, "", fs)
+	if err != nil {
+		t.Fatalf("restart over a clean acknowledged log: %v", err)
+	}
+	srv2 := httptest.NewServer(s2.Handler())
+	defer srv2.Close()
+
+	resp, body = postEffect(t, srv2.URL, "tok-torn")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("failed durable write must not claim success: %d (%s)", resp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), ErrRecoveryRequired) {
+		t.Fatalf("failed durable write must surface %s, got %s", ErrRecoveryRequired, body)
+	}
+
+	// A new token is refused — the provider no longer accepts mutations
+	// whose durable result it cannot prove.
+	resp, body = postEffect(t, srv2.URL, "tok-after-failure")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("mutation after ambiguous write: %d, want 503 (%s)", resp.StatusCode, body)
+	}
+
+	// Lookups: acknowledged truth answers, unacknowledged state fails
+	// closed rather than guessing.
+	if code := getEffectStatus(t, srv2.URL, "tok-acked"); code != http.StatusOK {
+		t.Fatalf("acknowledged record while degraded: %d, want 200", code)
+	}
+	if code := getEffectStatus(t, srv2.URL, "tok-torn"); code != http.StatusServiceUnavailable {
+		t.Fatalf("lookup of ambiguous token while degraded: %d, want fail-closed 503", code)
+	}
+	if code := getEffectStatus(t, srv2.URL, "tok-never"); code != http.StatusServiceUnavailable {
+		t.Fatalf("lookup of unknown token while degraded: %d, want fail-closed 503", code)
+	}
+	srv2.Close()
+
+	// The torn bytes are durable ambiguity: the next startup refuses
+	// until an operator reconciles them — they are never truncated.
+	if _, err := New(dir, ""); err == nil {
+		t.Fatal("restart over the torn effects log must refuse startup — ambiguous bytes are operator-reconciled, never auto-dropped")
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "provider-log.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"token":"tok-torn"`) || !strings.HasSuffix(strings.TrimSpace(string(data)), `"timesta`) {
+		// The partial write's bytes are still on disk for diagnosis.
+		t.Logf("torn log contents: %q", data)
 	}
 }

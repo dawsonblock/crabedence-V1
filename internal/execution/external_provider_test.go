@@ -116,8 +116,13 @@ func TestExternalProviderHelperProcess(t *testing.T) {
 
 // startExternalProvider launches the provider subprocess and waits
 // for its bound address. The process outlives any executor it serves.
+// dir becomes the provider's durable state directory — pinned to the
+// owner-only mode the server requires before opening its ledgers.
 func startExternalProvider(t *testing.T, dir string) (url string, logPath string) {
 	t.Helper()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	logPath = filepath.Join(dir, "provider-log.jsonl")
 	addrPath := filepath.Join(dir, "provider-addr")
 	cmd := exec.Command(os.Args[0], "-test.run=TestExternalProviderHelperProcess")

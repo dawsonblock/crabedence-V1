@@ -10,6 +10,18 @@ import (
 	"testing"
 )
 
+// privateStateDir returns a state directory the provider will accept:
+// owner-only, like a deployed ledger directory. t.TempDir() is 0o755,
+// which the private-state check rightly refuses.
+func privateStateDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
 func postOperation(t *testing.T, url, token, payload, fault string) (*http.Response, map[string]any) {
 	t.Helper()
 	req, err := http.NewRequest(http.MethodPost, url+"/operations",
@@ -32,7 +44,7 @@ func postOperation(t *testing.T, url, token, payload, fault string) (*http.Respo
 }
 
 func TestOperationIdempotentReplay(t *testing.T) {
-	s, err := New(t.TempDir(), "")
+	s, err := New(privateStateDir(t), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +77,7 @@ func TestOperationIdempotentReplay(t *testing.T) {
 }
 
 func TestOperationTokenCollisionRejected(t *testing.T) {
-	s, err := New(t.TempDir(), "")
+	s, err := New(privateStateDir(t), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +92,7 @@ func TestOperationTokenCollisionRejected(t *testing.T) {
 }
 
 func TestLedgerSurvivesRestart(t *testing.T) {
-	dir := t.TempDir()
+	dir := privateStateDir(t)
 	s1, err := New(dir, "")
 	if err != nil {
 		t.Fatal(err)
@@ -113,7 +125,7 @@ func TestLedgerSurvivesRestart(t *testing.T) {
 }
 
 func TestFaultInjection(t *testing.T) {
-	s, err := New(t.TempDir(), "")
+	s, err := New(privateStateDir(t), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +163,7 @@ func TestFaultInjection(t *testing.T) {
 }
 
 func TestEffectsLogSurvivesRestart(t *testing.T) {
-	dir := t.TempDir()
+	dir := privateStateDir(t)
 	s1, err := New(dir, "")
 	if err != nil {
 		t.Fatal(err)
@@ -196,7 +208,7 @@ func TestEffectsLogSurvivesRestart(t *testing.T) {
 }
 
 func TestArtifactEndpoint(t *testing.T) {
-	s, err := New(t.TempDir(), "")
+	s, err := New(privateStateDir(t), "")
 	if err != nil {
 		t.Fatal(err)
 	}

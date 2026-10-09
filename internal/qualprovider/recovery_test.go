@@ -164,7 +164,7 @@ func getStats(t *testing.T, url string) providerStats {
 // is recoverable: the response is never sent without a durable commit,
 // and a restart completes the commit exactly once.
 func TestCrashAfterPreparedRecoversToSingleCommit(t *testing.T) {
-	dir := t.TempDir()
+	dir := privateStateDir(t)
 	_, srv1 := newTestServer(t, dir)
 
 	resp, body := postRaw(t, srv1.URL, `{"token":"tok-prep","payload":{"operation":"a"}}`, FaultFailAfterPrepared)
@@ -205,7 +205,7 @@ func TestCrashAfterPreparedRecoversToSingleCommit(t *testing.T) {
 // window after the artifact write is recoverable and that recovery
 // verifies the existing bytes instead of rewriting them.
 func TestCrashAfterArtifactRecoversWithoutRewritingEvidence(t *testing.T) {
-	dir := t.TempDir()
+	dir := privateStateDir(t)
 	_, srv1 := newTestServer(t, dir)
 
 	resp, body := postRaw(t, srv1.URL, `{"token":"tok-art-phase","payload":{"operation":"a"}}`, FaultFailAfterArtifact)
@@ -245,7 +245,7 @@ func TestCrashAfterArtifactRecoversWithoutRewritingEvidence(t *testing.T) {
 // the commit record produces neither a duplicate commit record nor a
 // second execution on retry.
 func TestCrashAfterCommittedReplaysWithoutDuplication(t *testing.T) {
-	dir := t.TempDir()
+	dir := privateStateDir(t)
 	_, srv1 := newTestServer(t, dir)
 
 	resp, body := postRaw(t, srv1.URL, `{"token":"tok-commit","payload":{"operation":"a"}}`, FaultFailAfterCommitted)
@@ -290,7 +290,7 @@ func TestCrashAfterCommittedReplaysWithoutDuplication(t *testing.T) {
 // TestStartupRejectsCorruptLedgerLine proves a ledger corrupted outside
 // the crash-torn tail is a startup error, not a silently skipped line.
 func TestStartupRejectsCorruptLedgerLine(t *testing.T) {
-	dir := t.TempDir()
+	dir := privateStateDir(t)
 	first, _ := legacyLedgerLine("tok-a", 1, `{"operation":"a"}`)
 	third, _ := legacyLedgerLine("tok-b", 3, `{"operation":"b"}`)
 	writeLedger(t, dir, first, "not json at all", third)
@@ -304,7 +304,7 @@ func TestStartupRejectsCorruptLedgerLine(t *testing.T) {
 // parses as JSON but is not an operation record is refused even in the
 // tail position: only a torn (incomplete) tail is recoverable.
 func TestStartupRejectsCompleteButInvalidLedgerLine(t *testing.T) {
-	dir := t.TempDir()
+	dir := privateStateDir(t)
 	writeLedger(t, dir, `{"hello":"world"}`)
 
 	if _, err := New(dir, ""); err == nil {
@@ -317,7 +317,7 @@ func TestStartupRejectsCompleteButInvalidLedgerLine(t *testing.T) {
 // completed) is dropped so the ledger stays a sequence of complete
 // records, and the token it half-names executes exactly once on retry.
 func TestStartupRecoversTornTailLine(t *testing.T) {
-	dir := t.TempDir()
+	dir := privateStateDir(t)
 	if err := os.MkdirAll(filepath.Join(dir, "artifacts"), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -357,7 +357,7 @@ func TestStartupRecoversTornTailLine(t *testing.T) {
 // different payloads is a startup error: the ledger cannot decide which
 // execution is the real one, so it must refuse rather than guess.
 func TestStartupRejectsTokenPayloadConflict(t *testing.T) {
-	dir := t.TempDir()
+	dir := privateStateDir(t)
 	first, _ := legacyLedgerLine("tok-conflict", 1, `{"operation":"a"}`)
 	second, _ := legacyLedgerLine("tok-conflict", 2, `{"operation":"different"}`)
 	writeLedger(t, dir, first, second)
@@ -372,7 +372,7 @@ func TestStartupRejectsTokenPayloadConflict(t *testing.T) {
 // is reconstructed from the durable record, verified against the
 // recorded digest, and only then served.
 func TestStartupRepairsLegacyMissingArtifact(t *testing.T) {
-	dir := t.TempDir()
+	dir := privateStateDir(t)
 	line, artifact := legacyLedgerLine("tok-legacy", 1, `{"operation":"a"}`)
 	writeLedger(t, dir, line)
 
@@ -404,7 +404,7 @@ func TestStartupRepairsLegacyMissingArtifact(t *testing.T) {
 // bytes do not match the recorded digest refuses startup: corruption
 // must never be overwritten or served.
 func TestStartupRejectsArtifactDigestMismatch(t *testing.T) {
-	dir := t.TempDir()
+	dir := privateStateDir(t)
 	line, _ := legacyLedgerLine("tok-mismatch", 1, `{"operation":"a"}`)
 	writeLedger(t, dir, line)
 	if err := os.WriteFile(filepath.Join(dir, "artifacts", "art-1"), []byte("corrupted bytes"), 0o600); err != nil {
@@ -420,7 +420,7 @@ func TestStartupRejectsArtifactDigestMismatch(t *testing.T) {
 // follow links: a symlink where an artifact belongs is refused, not
 // resolved to whatever it points at.
 func TestStartupRejectsSymlinkedArtifact(t *testing.T) {
-	dir := t.TempDir()
+	dir := privateStateDir(t)
 	line, artifact := legacyLedgerLine("tok-link", 1, `{"operation":"a"}`)
 	writeLedger(t, dir, line)
 	outside := filepath.Join(t.TempDir(), "outside")
@@ -439,7 +439,7 @@ func TestStartupRejectsSymlinkedArtifact(t *testing.T) {
 // TestArtifactFetchRefusesSymlink proves the fetch path itself refuses
 // a link planted after startup instead of serving the link target.
 func TestArtifactFetchRefusesSymlink(t *testing.T) {
-	dir := t.TempDir()
+	dir := privateStateDir(t)
 	_, srv := newTestServer(t, dir)
 
 	secret := filepath.Join(t.TempDir(), "secret")
@@ -477,7 +477,7 @@ func TestArtifactFetchRefusesSymlink(t *testing.T) {
 // artifact file with no ledger record (a legacy crash leftover) is
 // preserved and never overwritten: new operation IDs continue past it.
 func TestStartupPreservesOrphanArtifactsWithoutIDCollision(t *testing.T) {
-	dir := t.TempDir()
+	dir := privateStateDir(t)
 	if err := os.MkdirAll(filepath.Join(dir, "artifacts"), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -511,7 +511,7 @@ func TestStartupPreservesOrphanArtifactsWithoutIDCollision(t *testing.T) {
 // interrupted atomic write are cleaned up so they cannot be mistaken
 // for artifacts.
 func TestStartupRemovesStaleTempFiles(t *testing.T) {
-	dir := t.TempDir()
+	dir := privateStateDir(t)
 	if err := os.MkdirAll(filepath.Join(dir, "artifacts"), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -532,7 +532,7 @@ func TestStartupRemovesStaleTempFiles(t *testing.T) {
 // TestOperationBodyLimit proves an oversized request body is refused
 // before any durable state is touched.
 func TestOperationBodyLimit(t *testing.T) {
-	dir := t.TempDir()
+	dir := privateStateDir(t)
 	_, srv := newTestServer(t, dir)
 
 	big := strings.Repeat("x", 2<<20)
@@ -650,7 +650,7 @@ func TestInjectedDurableFailureAtEachStep(t *testing.T) {
 	}
 	for _, step := range steps {
 		t.Run(step.name, func(t *testing.T) {
-			dir := t.TempDir()
+			dir := privateStateDir(t)
 			s1, err := newServer(dir, "", &faultFS{inner: osDurableFS{}, target: step.target, at: step.at, err: syscall.ENOSPC})
 			if err != nil {
 				t.Fatalf("newServer: %v", err)
@@ -712,7 +712,7 @@ func TestInjectedDurableFailureAtEachStep(t *testing.T) {
 // is itself fail-closed: if the rewrite cannot be made durable, startup
 // refuses rather than serving a ledger it could not repair.
 func TestRecoveryRewriteFailureRefusesStartup(t *testing.T) {
-	dir := t.TempDir()
+	dir := privateStateDir(t)
 	if err := os.MkdirAll(filepath.Join(dir, "artifacts"), 0o700); err != nil {
 		t.Fatal(err)
 	}
