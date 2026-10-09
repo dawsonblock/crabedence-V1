@@ -57,8 +57,8 @@ normalized tar ↔ ZIP tree equivalence
 Each release includes `.sha256` files alongside the archives:
 
 ```bash
-# The release you are verifying (current candidate: 0.54.0-rc.1)
-VERSION=0.54.0-rc.1
+# The release you are verifying (current candidate: 0.54.0-rc.3)
+VERSION=0.54.0-rc.3
 
 sha256sum -c "crabedence-${VERSION}.tar.gz.sha256"
 sha256sum -c "crabedence-${VERSION}.zip.sha256"
@@ -94,7 +94,7 @@ object this artifact was qualified against:
 ```json
 {
   "schema_version": 2,
-  "release": "0.54.0-rc.1",
+  "release": "0.54.0-rc.3",
   "source": { "commit": "...", "tree": "...", "manifest_sha256": "..." },
   "artifact": { "filename": "...tar.gz", "sha256": "...", "size": 12345,
                 "zip_filename": "...zip", "zip_sha256": "...", "zip_size": 12345 },
