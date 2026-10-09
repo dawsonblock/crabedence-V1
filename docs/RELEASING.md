@@ -718,8 +718,10 @@ runs:
   digest tool's `-list -z`, `sort -z`, tar `--null -T`) plus a hard
   release-path filename policy, so names the toolchain cannot carry
   byte-for-byte are rejected rather than mangled;
-- tar members are written in gnutar format so non-ASCII filenames are not
-  Unicode-normalized inside the archive;
+- tar members are written in GNU format so non-ASCII filenames are not
+  Unicode-normalized inside the archive; the flag is spelled per
+  implementation (`gnu` on GNU tar, `gnutar` on libarchive) so the
+  packager runs on both Linux and macOS toolchains;
 - the generated source manifest is embedded in the archive at
   `release-evidence/source-tree-sha256.txt`, so the artifact is
   self-verifying without a side channel;

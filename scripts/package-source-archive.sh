@@ -173,14 +173,22 @@ PYEOF
   fi
 fi
 
-# tar writes gnutar-format members, never the default pax: libarchive
-# pax writers normalize non-ASCII names (NFC -> NFD), which would make
-# the archived path differ from the tracked name and fail manifest
-# verification. gnutar stores the name bytes verbatim and has no
-# practical length limit.
+# tar writes GNU-format members, never the default pax: libarchive pax
+# writers normalize non-ASCII names (NFC -> NFD), which would make the
+# archived path differ from the tracked name and fail manifest
+# verification. The GNU format stores the name bytes verbatim and has no
+# practical length limit. The flag is spelled differently per
+# implementation — GNU tar calls it `gnu`, libarchive `gnutar` — and
+# neither accepts the other's name, so the name follows the binary
+# rather than being hard-coded.
+if tar --version 2>/dev/null | grep -q 'GNU tar'; then
+  tar_format=gnu
+else
+  tar_format=gnutar
+fi
 stage="$work/stage"
 mkdir -p -- "$stage/$prefix"
-tar --format=gnutar --null -cf - -T "$list" | tar -xf - -C "$stage/$prefix"
+tar --format="$tar_format" --null -cf - -T "$list" | tar -xf - -C "$stage/$prefix"
 
 # The generated source manifest ships inside the archive at
 # release-evidence/source-tree-sha256.txt so the extracted artifact
@@ -193,14 +201,31 @@ manifest="$work/source-tree-sha256.txt"
 mkdir -p -- "$stage/$prefix/release-evidence"
 cp "$manifest" "$stage/$prefix/release-evidence/source-tree-sha256.txt"
 
+# Deterministic archives: the member list is sorted byte-wise and member
+# mtimes are normalized before the archive is built, so the same staged
+# tree archives to the same member order and timestamps on any host.
+# Ownership is normalized inside the tar stream per implementation
+# (zip has no such field to normalize).
+find "$stage/$prefix" -exec touch -h -t 202001010000.00 {} +
+member_list="$work/members.txt"
+( cd "$stage" && find "$prefix" -print | LC_ALL=C sort ) > "$member_list"
+
 case "$FORMAT" in
-  tar.gz) tar --format=gnutar -czf "$work/archive.tar.gz" -C "$stage" -- "$prefix" ;;
+  tar.gz)
+    if [ "$tar_format" = "gnu" ]; then
+      tar --format=gnu --no-recursion --owner=0 --group=0 --numeric-owner \
+        -cf - -C "$stage" -T "$member_list"
+    else
+      tar --format=gnutar --no-recursion --uid=0 --gid=0 --uname=root --gname=root \
+        -cf - -C "$stage" -T "$member_list"
+    fi | gzip -n > "$work/archive.tar.gz"
+    ;;
   # -y keeps symlink entries instead of dereferencing them — a plain
   # `zip -r` silently stores the target's contents or drops the entry,
   # which is how the .claude/skills link went missing previously. The
-  # prefix grammar above keeps the operand from being read as an
-  # option (zip has no end-of-options marker).
-  zip)    (cd "$stage" && zip -qry "$work/archive.zip" "$prefix") ;;
+  # member list comes from -@ so the archive members are the sorted
+  # canonical set, not a filesystem walk order.
+  zip)    (cd "$stage" && zip -qry -@ "$work/archive.zip" < "$member_list") ;;
 esac
 
 mkdir -p "$work/extract"
