@@ -140,6 +140,13 @@ COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 TREE="$(git -C "$REPO_ROOT" rev-parse HEAD^{tree})"
 BRANCH="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD)"
 
+# One timestamp for the whole qualification run. Every derived artifact
+# (qualification provenance, evidence manifest, evidence root, report)
+# binds THIS value — downstream regeneration reads it back from the
+# records instead of sampling the clock again, which is what makes
+# re-finalization byte-identical.
+EVIDENCE_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
 cat > "$EVIDENCE_DIR/provenance.json" << EOF
 {
   "commit": "$COMMIT",
@@ -1162,7 +1169,7 @@ cat > "$EVIDENCE_DIR/qualification.json" << EOF
     "commit": "$COMMIT",
     "tree": "$TREE",
     "branch": "$BRANCH",
-    "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    "timestamp": "$EVIDENCE_TIMESTAMP"
   },
   "toolchains": {
     "go": "$GO_VERSION",
@@ -1370,7 +1377,13 @@ python3 "$REPO_ROOT/scripts/generate-evidence-root.py" "$EVIDENCE_DIR" --repo-ro
 # evidence-manifest.json is EXCLUDED because its digest is computed FROM
 # this SHA256SUMS — including it would create a self-invalidating cycle.
 cd "$EVIDENCE_DIR"
-find . -type f ! -name SHA256SUMS ! -name evidence-manifest.json ! -name artifact.json -print0 | sort -z | xargs -0 shasum -a 256 > SHA256SUMS
+# Hidden and temporary working entries (.* at any level) are never
+# evidence — a scratch directory left in the bundle must not silently
+# change its checksum manifest. The sort is byte-wise so the manifest
+# does not depend on the host locale.
+find . -mindepth 1 \( -name '.*' -o -name attestation \) -prune -o \
+  -type f ! -name SHA256SUMS ! -name evidence-manifest.json ! -name artifact.json -print0 \
+  | LC_ALL=C sort -z | xargs -0 shasum -a 256 > SHA256SUMS
 
 # ─── Phase 25: Generate evidence-manifest.json ──────────────────────────────
 # The evidence bundle digest is the SHA-256 of the SHA256SUMS manifest,
@@ -1395,7 +1408,7 @@ cat > "$EVIDENCE_DIR/evidence-manifest.json" << EOF
   "commit": "$COMMIT",
   "tree": "$TREE",
   "branch": "$BRANCH",
-  "generated_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  "generated_at": "$EVIDENCE_TIMESTAMP"
 }
 EOF
 

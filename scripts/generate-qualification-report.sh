@@ -24,7 +24,9 @@ PROMOTABLE="$(jq -r '.artifact_promotable' "$QUAL")"
 COMMIT="$(jq -r '.provenance.commit' "$QUAL")"
 TREE="$(jq -r '.provenance.tree' "$QUAL")"
 BRANCH="$(jq -r '.provenance.branch' "$QUAL")"
-STAMP="$(jq -r '.provenance.timestamp' "$QUAL")"
+# The report carries the qualification run's timestamp, not the wall
+# clock — regenerating unchanged records must produce identical bytes.
+STAMP="$(jq -r '.provenance.timestamp // "unknown"' "$QUAL")"
 ROOT_SHA="not generated"
 [ -f "$ROOT_DOC" ] && ROOT_SHA="$(jq -r '.root_sha256' "$ROOT_DOC")"
 
@@ -107,7 +109,7 @@ EOF
 
 ---
 
-_Report regenerated at $(date -u +%Y-%m-%dT%H:%M:%SZ) from records. If any
+_Generated from records qualified at ${STAMP}. If any
 figure here disagrees with the JSON records, the JSON records win._
 EOF
 } > "$OUT"

@@ -26,10 +26,19 @@ evidence directory — never trusting the stored document — then:
   1. the stored document must equal the rebuilt one, except
      generated_at;
   2. root_sha256 must equal sha256 over the canonical serialization of
-     the stored document with root_sha256 and generated_at removed.
+     the stored document with root_sha256 and generated_at removed;
+  3. the stored bytes must equal a fresh serialization — the document
+     is byte-deterministic, so whitespace or field-order drift is
+     itself evidence of a rewrite.
 
 A root that names a digest the files do not produce, or a root_sha256
 that does not cover the document, fails verification.
+
+Determinism: generated_at binds the qualification run's own timestamp
+(qualification.json's provenance.timestamp, falling back to
+provenance.json's timestamp) — the wall clock at generation time is
+not an input, so it can never make two finalizations of the same
+evidence differ.
 
 Usage:
   generate-evidence-root.py <evidence-dir> [--repo-root DIR]
@@ -170,14 +179,15 @@ def build(evidence_dir, repo_root):
     else:
         artifacts = {"status": "pending", "entries": []}
 
-    import datetime
     doc = {
         "schema_version": SCHEMA_VERSION,
         "document": "evidence-root",
         "release_name": relman.get("release_name"),
-        "generated_at": datetime.datetime.now(
-            datetime.timezone.utc
-        ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        # Bound to the qualification record's timestamp — the wall
+        # clock is not an input, so regenerating unchanged evidence
+        # must produce identical bytes.
+        "generated_at": (qual.get("provenance") or {}).get("timestamp")
+        or prov.get("timestamp"),
         "source": source,
         "components": components,
         "qualification": qualification,
@@ -218,6 +228,20 @@ def verify(evidence_dir, repo_root):
             file=sys.stderr,
         )
         ok = False
+
+    # Byte identity: the document is deterministic, so a stored file
+    # whose bytes differ from a fresh serialization was written by a
+    # different process — drift worth surfacing even when the values
+    # happen to agree.
+    fresh = json.dumps(expected, indent=1, sort_keys=False) + "\n"
+    with open(root_path, "rb") as fh:
+        if fh.read() != fresh.encode():
+            print(
+                "evidence-root: stored bytes differ from a fresh "
+                "canonical serialization",
+                file=sys.stderr,
+            )
+            ok = False
     return ok
 
 

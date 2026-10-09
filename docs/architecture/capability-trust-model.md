@@ -165,6 +165,15 @@ principal.
   and artifact binding exist, regenerating `SHA256SUMS` (which now covers
   `artifact.json`) and `evidence-manifest.json`; the verifier fails a
   bundle whose checksum manifest does not cover the artifact binding.
+  Finalization is deterministic — unchanged inputs produce byte-identical
+  `evidence-root.json`, `FINAL_QUALIFICATION_REPORT.md`, `SHA256SUMS` and
+  `evidence-manifest.json` at any wall-clock time, locale, timezone or
+  path (every generated timestamp binds the qualification record's own
+  timestamp, and the checksum traversal prunes hidden/temporary entries
+  and sorts byte-wise). `--verify` recomputes every final artifact
+  read-only and byte-compares it; a bundle carrying an `attestation/` is
+  sealed — finalization refuses to rewrite or silently remove it, so
+  signed history is never revised underneath its attestation.
 - The attestation terminates the chain: its subject is the final
   `evidence-manifest.json` and its predicate carries the manifest digest
   (`evidence_sha256`), which the verifier cross-checks. An attestation of

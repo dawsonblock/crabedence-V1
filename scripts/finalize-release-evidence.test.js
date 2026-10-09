@@ -91,8 +91,21 @@ function fixture(t, { artifact = true, manifest = true } = {}) {
   return root;
 }
 
-function finalize(root) {
-  return spawnSync("bash", [FINALIZER, root], { encoding: "utf8" });
+function finalize(root, args = []) {
+  return spawnSync("bash", [FINALIZER, ...args, root], { encoding: "utf8" });
+}
+
+function finalizeEnv(root, env) {
+  return spawnSync("bash", [FINALIZER, root], { encoding: "utf8", env: { ...process.env, ...env } });
+}
+
+// Every byte of the four canonical finalization artifacts.
+function canonicalBytes(root) {
+  return Object.fromEntries(
+    ["evidence-root.json", "FINAL_QUALIFICATION_REPORT.md", "SHA256SUMS", "evidence-manifest.json"].map(
+      (name) => [name, fs.readFileSync(path.join(root, name), "utf8")],
+    ),
+  );
 }
 
 test("artifact.json is covered by the final checksum manifest", (t) => {
@@ -158,26 +171,106 @@ test("falls back to provenance.json when no prior manifest exists", (t) => {
   assert.equal(manifest.tree, "b".repeat(40));
 });
 
-test("a stale attestation reference is removed from the final bundle", (t) => {
+test("a sealed bundle refuses finalization — attestations are never silently removed", (t) => {
   const root = fixture(t);
   fs.mkdirSync(path.join(root, "attestation"));
   fs.writeFileSync(
     path.join(root, "attestation", "attestation.json"),
     JSON.stringify({ attestation_url: "https://example.invalid/stale" }),
   );
-  assert.equal(finalize(root).status, 0);
-  assert.equal(fs.existsSync(path.join(root, "attestation")), false);
+  const result = finalize(root);
+  assert.notEqual(result.status, 0, "finalization over an attested bundle must refuse");
+  assert.match(result.stderr, /refusing to rewrite sealed evidence/);
+  // And the attestation is still there — removal is an operator's
+  // deliberate act, never a side effect of this script.
+  assert.equal(fs.existsSync(path.join(root, "attestation", "attestation.json")), true);
 });
 
-test("re-finalization is stable: same digest, same coverage", (t) => {
+test("re-finalization is byte-identical: same digest, same coverage", (t) => {
   const root = fixture(t);
   assert.equal(finalize(root).status, 0);
-  const first = JSON.parse(fs.readFileSync(path.join(root, "evidence-manifest.json"), "utf8"));
-  const firstSums = fs.readFileSync(path.join(root, "SHA256SUMS"), "utf8");
+  const first = canonicalBytes(root);
 
   assert.equal(finalize(root).status, 0);
-  const second = JSON.parse(fs.readFileSync(path.join(root, "evidence-manifest.json"), "utf8"));
-  assert.equal(second.sha256, first.sha256);
-  assert.equal(second.file_count, first.file_count);
-  assert.equal(fs.readFileSync(path.join(root, "SHA256SUMS"), "utf8"), firstSums);
+  assert.deepEqual(canonicalBytes(root), first);
+});
+
+test("hidden and temporary working entries never enter the checksum manifest", (t) => {
+  const root = fixture(t);
+  // Scratch state left inside the bundle directory — a temporary
+  // extraction dir, an editor file, a nested hidden directory.
+  fs.mkdirSync(path.join(root, ".run1"));
+  fs.writeFileSync(path.join(root, ".run1", "scratch.log"), "scratch\n");
+  fs.writeFileSync(path.join(root, ".DS_Store"), "junk");
+  fs.mkdirSync(path.join(root, "gate-results", ".tmp-work"));
+  fs.writeFileSync(path.join(root, "gate-results", ".tmp-work", "partial"), "x\n");
+
+  assert.equal(finalize(root).status, 0);
+  const sums = fs.readFileSync(path.join(root, "SHA256SUMS"), "utf8");
+  assert.doesNotMatch(sums, /\.run1|\.DS_Store|\.tmp-work/);
+  // And they still don't enter on re-finalization.
+  assert.equal(finalize(root).status, 0);
+  assert.doesNotMatch(fs.readFileSync(path.join(root, "SHA256SUMS"), "utf8"), /\.run1|\.DS_Store|\.tmp-work/);
+});
+
+test("finalization is deterministic across locale and timezone", (t) => {
+  const root = fixture(t);
+  assert.equal(finalizeEnv(root, { TZ: "UTC", LC_ALL: "C" }).status, 0);
+  const first = canonicalBytes(root);
+  assert.equal(finalizeEnv(root, { TZ: "Pacific/Kiritimati", LC_ALL: "en_US.UTF-8" }).status, 0);
+  assert.deepEqual(canonicalBytes(root), first);
+  assert.equal(finalizeEnv(root, { TZ: "America/St_Johns", LC_ALL: "C.UTF-8" }).status, 0);
+  assert.deepEqual(canonicalBytes(root), first);
+});
+
+test("a relocated bundle finalizes and verifies identically — no path leaks", (t) => {
+  const root = fixture(t);
+  assert.equal(finalize(root).status, 0);
+  const first = canonicalBytes(root);
+
+  const copy = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cbx-finalize-copy-")));
+  t.after(() => fs.rmSync(copy, { recursive: true, force: true }));
+  for (const name of fs.readdirSync(root)) {
+    fs.cpSync(path.join(root, name), path.join(copy, name), { recursive: true });
+  }
+  assert.equal(finalize(copy, ["--verify"]).status, 0);
+  assert.equal(finalize(copy).status, 0);
+  assert.deepEqual(canonicalBytes(copy), first);
+});
+
+test("--verify confirms a finalized bundle and writes nothing", (t) => {
+  const root = fixture(t);
+  assert.equal(finalize(root).status, 0);
+  const before = canonicalBytes(root);
+  const result = finalize(root, ["--verify"]);
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(canonicalBytes(root), before);
+});
+
+test("--verify fails on a mutated evidence file", (t) => {
+  const root = fixture(t);
+  assert.equal(finalize(root).status, 0);
+  fs.writeFileSync(path.join(root, "gate-results", "go-tests.log"), "tampered\n");
+  const result = finalize(root, ["--verify"]);
+  assert.notEqual(result.status, 0);
+});
+
+test("--verify fails on a bundle that was never finalized", (t) => {
+  const root = fixture(t);
+  const result = finalize(root, ["--verify"]);
+  assert.notEqual(result.status, 0);
+});
+
+test("--verify does not reject a sealed bundle", (t) => {
+  const root = fixture(t);
+  assert.equal(finalize(root).status, 0);
+  fs.mkdirSync(path.join(root, "attestation"));
+  fs.writeFileSync(
+    path.join(root, "attestation", "attestation.json"),
+    JSON.stringify({ attestation_url: "https://example.invalid/att" }),
+  );
+  // Verification of an attested bundle is a read operation — the seal
+  // blocks rewriting, not reading.
+  const result = finalize(root, ["--verify"]);
+  assert.equal(result.status, 0, result.stderr);
 });
