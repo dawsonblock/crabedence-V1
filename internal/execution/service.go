@@ -17,6 +17,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -244,14 +245,66 @@ const (
 	shutdownDrainTimeout = 5 * time.Second
 )
 
+// ServiceState is the lifecycle phase of the execution service,
+// transitioned under s.mu.
+type ServiceState int
+
+const (
+	// StateNew is the zero state: constructed, never started.
+	StateNew ServiceState = iota
+	// StateRunning: the accept loop admits connections and handlers
+	// register with the drain group.
+	StateRunning
+	// StateStopping: shutdown began — intake is cancelled and the
+	// listener closed; the accept loop and admitted handlers may still
+	// be draining. A service in this state is degraded, never clean:
+	// health surfaces must not report it as stopped.
+	StateStopping
+	// StateStopped: the accept loop terminated and every admitted
+	// handler completed. Only then may a clean stop be reported.
+	StateStopped
+)
+
+// ErrShutdownTimeout is returned by Stop when the accept loop or the
+// admitted handlers do not finish within the shared stop deadline. It
+// is a typed failure, never a clean drain: the service remains in
+// StateStopping until a later Stop observes the drains complete.
+var ErrShutdownTimeout = errors.New("execution service shutdown timed out")
+
 // Service is the persistent Crabedence execution service.
 type Service struct {
-	registry      *capability.Registry
-	handler       Handler
-	socketPath    string
-	listener      net.Listener
-	mu            sync.Mutex
-	running       bool
+	registry   *capability.Registry
+	handler    Handler
+	socketPath string
+	listener   net.Listener
+	mu         sync.Mutex
+	state      ServiceState
+	// acceptDone is closed by the accept loop when it exits — created
+	// fresh on each Start so a second lifecycle never waits on a
+	// previous loop. Stop joins it before waiting on the handler
+	// group: while the accept loop runs it can still call
+	// handlers.Add(1), so a drain observed without the join can never
+	// be trusted.
+	acceptDone chan struct{}
+	// handlersDrained is closed by the one drain watcher spawned at
+	// the STOPPING transition, so every concurrent Stop call (and any
+	// retry after a timeout) waits on the same drain.
+	handlersDrained chan struct{}
+	// intakeCancel cancels the context the accept loop and every
+	// handler were started with. Stop invokes it at the STOPPING
+	// transition so in-flight work learns the service is draining.
+	intakeCancel context.CancelFunc
+	// stopDeadline is the shared bound for both drain phases, fixed
+	// at the first Stop. A retried Stop re-waits against the same
+	// deadline rather than extending it; once the drains have
+	// completed the wait returns immediately, so a retry does finish
+	// the transition to StateStopped.
+	stopDeadline time.Time
+	// socketIdent is the filesystem identity (device + inode) of the
+	// socket this service bound, captured at Start. Stop removes the
+	// path only when it still names that same object — a replaced or
+	// foreign file is left for the operator.
+	socketIdent   *socketFileID
 	grantResolver capability.GrantResolver
 	// adapterAvailability is the deployment's runtime adapter state. It
 	// is nil when the caller did not declare one (tests that construct
@@ -366,13 +419,29 @@ func (s *Service) SetAttestation(policy AttestationPolicy) {
 	s.attestation = newAttestationRegistry(policy)
 }
 
+// LifecycleState reports the service's current lifecycle phase for
+// health and observability surfaces. A service whose state is
+// StateStopping is degraded — its drain has not finished — and must
+// never be reported as cleanly stopped.
+func (s *Service) LifecycleState() ServiceState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.state
+}
+
 // Start begins listening on the Unix socket.
 func (s *Service) Start(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.running {
+	switch s.state {
+	case StateRunning:
 		return fmt.Errorf("service already running")
+	case StateStopping:
+		// A stop in flight must complete before a new lifecycle can
+		// begin: the accept loop and handlers of the old one still own
+		// the socket and the drain group.
+		return fmt.Errorf("service is stopping; wait for the drain to complete")
 	}
 
 	// Secure the socket directory and clear any stale socket before
@@ -399,16 +468,26 @@ func (s *Service) Start(ctx context.Context) error {
 		listener.Close()
 		return fmt.Errorf("secure socket permissions on %s: %w", s.socketPath, err)
 	}
-	if err := verifySocketFile(s.socketPath); err != nil {
+	ident, err := verifySocketFile(s.socketPath)
+	if err != nil {
 		listener.Close()
 		os.Remove(s.socketPath)
 		return err
 	}
 
+	// Initialize the listener, drain channels, intake context and
+	// lifecycle state BEFORE publishing the accept goroutine: the loop
+	// reads them on entry, and everything it observes must already
+	// belong to this lifecycle.
 	s.listener = listener
-	s.running = true
+	s.socketIdent = ident
+	s.acceptDone = make(chan struct{})
+	s.handlersDrained = make(chan struct{})
+	intakeCtx, intakeCancel := context.WithCancel(ctx)
+	s.intakeCancel = intakeCancel
+	s.state = StateRunning
 
-	go s.acceptLoop(ctx)
+	go s.acceptLoop(intakeCtx)
 
 	return nil
 }
@@ -418,34 +497,106 @@ func (s *Service) Start(ctx context.Context) error {
 // not abandon admitted work mid-flight. A dispatch that outlives the
 // drain is not silently lost: its durable record is already in flight
 // state for reconciliation, which is the designed recovery path.
+//
+// Ordering contract — the barrier that makes a clean return true:
+//
+//  1. STOPPING is set under the lifecycle mutex, the intake context is
+//     cancelled and the listener is closed. From this point the accept
+//     loop refuses every connection it has not yet registered, and —
+//     because handler registration happens under the same mutex — no
+//     new handlers.Add(1) can follow the transition.
+//  2. Stop joins the accept loop (acceptDone). While the loop was
+//     still running it could hold a connection between Accept() and
+//     registration; a drain observed without this join can watch a
+//     zero handler count while a handler registers one instant later.
+//  3. Only then does Stop wait on the handler group (handlersDrained).
+//
+// Both waits share one deadline fixed at the first Stop call. A wait
+// that expires returns ErrShutdownTimeout — a typed failure, never a
+// clean drain — and the service stays in StateStopping. A retried
+// Stop re-waits against the same deadline: once the drains complete
+// it returns immediately and finishes the transition to StateStopped,
+// so a retry does complete the drain. A dispatch that outlives the
+// deadline keeps its durable in-flight record; Stop never marks it
+// failed — UNKNOWN reconciliation decides its outcome.
 func (s *Service) Stop() error {
 	s.mu.Lock()
-	if !s.running {
+	switch s.state {
+	case StateNew, StateStopped:
 		s.mu.Unlock()
 		return nil
+	case StateRunning:
+		s.state = StateStopping
+		s.stopDeadline = time.Now().Add(s.drainTimeout)
+		s.intakeCancel()
+		if s.listener != nil {
+			s.listener.Close()
+		}
+		// The single drain watcher for this lifecycle: every Stop call
+		// — concurrent or retried — waits on the same channel rather
+		// than spawning its own WaitGroup waiter.
+		go func(drained chan<- struct{}) {
+			s.handlers.Wait()
+			close(drained)
+		}(s.handlersDrained)
 	}
-
-	s.running = false
-	if s.listener != nil {
-		s.listener.Close()
-	}
+	acceptDone := s.acceptDone
+	handlersDrained := s.handlersDrained
+	deadline := s.stopDeadline
 	s.mu.Unlock()
 
-	drained := make(chan struct{})
-	go func() {
-		s.handlers.Wait()
-		close(drained)
-	}()
-	select {
-	case <-drained:
-	case <-time.After(s.drainTimeout):
+	// Barrier 1: the accept loop must terminate first. It is the only
+	// caller of handlers.Add(1), so once it is gone the handler count
+	// can never rise again while the drain is observed.
+	if !waitClosed(acceptDone, deadline) {
+		return fmt.Errorf("%w: the accept loop did not terminate", ErrShutdownTimeout)
 	}
-	os.Remove(s.socketPath)
+	// Barrier 2: drain every handler admitted before the transition.
+	if !waitClosed(handlersDrained, deadline) {
+		return fmt.Errorf("%w: in-flight handlers did not drain", ErrShutdownTimeout)
+	}
+
+	s.mu.Lock()
+	s.state = StateStopped
+	s.mu.Unlock()
+	s.removeOwnedSocket()
 
 	return nil
 }
 
+// waitClosed reports whether done closes before deadline. A channel
+// that is already closed returns true even when the deadline has
+// passed, so a retried Stop after a completed drain still finishes.
+func waitClosed(done <-chan struct{}, deadline time.Time) bool {
+	select {
+	case <-done:
+		return true
+	default:
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return false
+	}
+	timer := time.NewTimer(remaining)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
 func (s *Service) acceptLoop(ctx context.Context) {
+	// Bound to THIS lifecycle: the channels and listener were published
+	// before the goroutine started, and a later Start never reuses
+	// them. acceptDone closes exactly once, on every exit path — a
+	// listener-close, a persistent-error return, or an intake-context
+	// cancellation — so a joining Stop never hangs waiting for it.
+	done := s.acceptDone
+	listener := s.listener
+	defer close(done)
+
 	// A persistent accept error (EMFILE, ENFILE, a transient kernel
 	// condition) must not become a hot spin that pegs a core and floods
 	// the log. Mirror net/http: back off exponentially on consecutive
@@ -456,12 +607,12 @@ func (s *Service) acceptLoop(ctx context.Context) {
 	)
 	backoff := acceptBackoffMin
 	for {
-		conn, err := s.listener.Accept()
+		conn, err := listener.Accept()
 		if err != nil {
 			s.mu.Lock()
-			running := s.running
+			stopping := s.state != StateRunning
 			s.mu.Unlock()
-			if !running {
+			if stopping {
 				return
 			}
 			log.Printf("execution service: accept error: %v", err)
@@ -484,10 +635,40 @@ func (s *Service) acceptLoop(ctx context.Context) {
 			s.refuseBusyConnection(conn, "the execution service is at its connection ceiling")
 			continue
 		}
+
+		// A shutdown that began while this connection sat in the
+		// accept queue owns the window before the gate: the connection
+		// is refused and its slot released — no socket or semaphore is
+		// leaked to a stopped service.
+		s.mu.Lock()
+		if s.state != StateRunning {
+			s.mu.Unlock()
+			s.releaseConnection()
+			s.refuseBusyConnection(conn, "the execution service is shutting down")
+			continue
+		}
+		s.mu.Unlock()
+
 		if s.acceptGate != nil {
 			s.acceptGate()
 		}
+
+		// Registration with the drain group happens under the same
+		// mutex the STOPPING transition holds — so an Add that could
+		// escape a stopping drain cannot exist: either registration
+		// ran before the transition (and the drain counts it), or the
+		// transition already happened and the connection is refused
+		// instead of served.
+		s.mu.Lock()
+		if s.state != StateRunning {
+			s.mu.Unlock()
+			s.releaseConnection()
+			s.refuseBusyConnection(conn, "the execution service is shutting down")
+			continue
+		}
 		s.handlers.Add(1)
+		s.mu.Unlock()
+
 		go func() {
 			defer s.handlers.Done()
 			s.handleConnection(ctx, conn)
@@ -780,7 +961,10 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 
 	// Dispatch to handler. The DispatchExecutor handles CRITICAL evidence
 	// validation internally — post-dispatch evidence failures become
-	// UNKNOWN (not FAILED) per the durable execution contract.
+	// UNKNOWN (not FAILED) per the durable execution contract. A stop
+	// that lands mid-dispatch cancels the intake context but never marks
+	// the durable record failed: an interrupted effect is UNKNOWN until
+	// reconciliation proves otherwise.
 	response := s.handler.Execute(ctx, req, decision.Descriptor)
 
 	s.writeResponse(conn, response, decision.Descriptor.ExecutionClass)

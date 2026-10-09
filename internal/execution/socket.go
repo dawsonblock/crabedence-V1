@@ -2,6 +2,7 @@ package execution
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -105,22 +106,58 @@ func clearStaleSocket(path string) error {
 
 // verifySocketFile confirms a freshly bound socket is owner-only and
 // owned by the current user — the chmod result is verified, not
-// assumed.
-func verifySocketFile(path string) error {
+// assumed. On success it returns the socket's filesystem identity so
+// Stop can later remove only that same object.
+func verifySocketFile(path string) (*socketFileID, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
-		return fmt.Errorf("inspect socket %s: %w", path, err)
+		return nil, fmt.Errorf("inspect socket %s: %w", path, err)
 	}
 	if info.Mode()&os.ModeSocket == 0 {
-		return fmt.Errorf("socket path %s is not a socket after listen (mode %s)", path, info.Mode())
+		return nil, fmt.Errorf("socket path %s is not a socket after listen (mode %s)", path, info.Mode())
 	}
 	if err := verifyOwnership(path, info, "socket"); err != nil {
-		return err
+		return nil, err
 	}
 	if perm := info.Mode().Perm(); perm&0o077 != 0 {
-		return fmt.Errorf("socket %s is group/world accessible (mode %04o)", path, perm)
+		return nil, fmt.Errorf("socket %s is group/world accessible (mode %04o)", path, perm)
 	}
-	return nil
+	return socketFileIdentity(info), nil
+}
+
+// socketFileID identifies one filesystem object by device and inode.
+// A path that later names a different object — the socket was deleted
+// and a successor or attacker re-created the name — fails the identity
+// comparison even though the name matches.
+type socketFileID struct {
+	dev uint64
+	ino uint64
+}
+
+// removeOwnedSocket deletes the socket path this service bound, and
+// only that object. A path that no longer names the bound socket —
+// already removed, replaced by a successor, or swapped for a foreign
+// file — is left alone with a warning rather than unlinked: the bytes
+// at that name may belong to somebody else.
+func (s *Service) removeOwnedSocket() {
+	info, err := os.Lstat(s.socketPath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("execution service: cannot inspect socket path %s for cleanup: %v", s.socketPath, err)
+		}
+		return
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		log.Printf("execution service: not removing %s: the path is no longer a socket (mode %s)", s.socketPath, info.Mode())
+		return
+	}
+	if ident := socketFileIdentity(info); ident != nil && s.socketIdent != nil && *ident != *s.socketIdent {
+		log.Printf("execution service: not removing %s: the socket at that path is not the one this service bound", s.socketPath)
+		return
+	}
+	if err := os.Remove(s.socketPath); err != nil && !os.IsNotExist(err) {
+		log.Printf("execution service: cannot remove socket %s: %v", s.socketPath, err)
+	}
 }
 
 // verifyOwnership checks that info describes a path owned by the

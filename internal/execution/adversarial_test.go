@@ -231,7 +231,7 @@ func TestSocketCloseBeforeResponse(t *testing.T) {
 
 	// Service should still be running
 	service.mu.Lock()
-	running := service.running
+	running := service.state == StateRunning
 	service.mu.Unlock()
 	if !running {
 		t.Fatal("service should still be running after client disconnect")
