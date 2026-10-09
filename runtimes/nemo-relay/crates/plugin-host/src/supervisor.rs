@@ -284,10 +284,21 @@ impl PluginHostSupervisor {
             let channel_fd = kernel_channel
                 .as_ref()
                 .map(std::os::unix::io::AsRawFd::as_raw_fd);
+            // The descriptor table is enumerated here, in the parent, where
+            // allocation and directory walks are safe; the closure below only
+            // reads the snapshot. An enumeration that cannot run means the
+            // boundary cannot be established — a host started without it is
+            // worse than none, so the launch is refused.
+            let descriptor_inventory = open_descriptor_inventory().map_err(|error| {
+                unavailable(format!(
+                    "cannot enumerate the descriptors a plugin host must not inherit: {error}"
+                ))
+            })?;
             // Safety: the closure runs in the forked child before `exec`, and
-            // calls `setrlimit` (and, on Linux, `prctl` and `fcntl`), `close`,
-            // and nothing else: it allocates nothing, takes no locks, and
-            // returns only an error the spawn reports.
+            // calls `setrlimit` (and, on Linux, `prctl`, `fcntl` and
+            // `close_range`), `close`, and nothing else: it reads the captured
+            // inventory without mutating it, allocates nothing, takes no
+            // locks, and returns only an error the spawn reports.
             unsafe {
                 command.pre_exec(move || {
                     if let Some(fd) = channel_fd {
@@ -301,7 +312,7 @@ impl PluginHostSupervisor {
                     // Everything above stdio that the supervisor holds is the
                     // supervisor's, not the host's — except the channel above,
                     // which is the confined host's only copy of it.
-                    mark_inherited_descriptors_close_on_exec(channel_fd);
+                    mark_inherited_descriptors_close_on_exec(channel_fd, &descriptor_inventory)?;
                     crate::limits::apply(&limits)
                 });
             }
@@ -1693,36 +1704,230 @@ async fn handshake(
 /// descriptor, which is the child's only copy of that channel; it is named by
 /// `preserve` and is left alone (the spawn clears its flag separately).
 ///
+/// Coverage is complete by construction, not by bound. On Linux `close_range`
+/// marks the entire descriptor space in one syscall, above any ceiling a loop
+/// could stop at. Where the kernel lacks that call the boundary is
+/// `inventory`: the open-descriptor snapshot the parent took before `fork`,
+/// so every descriptor the kernel reported open is marked. The bounded sweep
+/// after it is only a backstop for a descriptor opened in the narrow window
+/// between snapshot and `exec`, and it is not what the guarantee stands on.
+///
 /// Marking rather than closing is deliberate. The standard library keeps a
 /// private close-on-exec pipe between parent and child so a failed `exec` is
 /// reported instead of looking like a successful spawn; a loop that *closed*
 /// descriptors would close that pipe before the `exec` attempt and turn every
 /// exec failure into a host that silently never starts. Setting the flag is
-/// idempotent for descriptors that already carry it, so the child's table gains
-/// exactly the property this boundary is about — nothing crosses `exec` — and
+/// idempotent for descriptors that already carry it — including that pipe —
+/// so the child's table gains exactly the property this boundary is about and
 /// the machinery around it keeps working.
 ///
-/// Runs between `fork` and `exec`: every call here is a raw syscall, so it
-/// allocates nothing and cannot deadlock against a lock another thread held at
-/// fork time. Descriptors are visited best-effort across the process's current
-/// descriptor limit (itself bounded); a descriptor that was never open answers
-/// EBADF, which is the expected result and is ignored.
+/// Runs between `fork` and `exec`: every call here is a raw syscall or a read
+/// of the captured inventory, so it allocates nothing and cannot deadlock
+/// against a lock another thread held at fork time. A marking failure other
+/// than EBADF is returned, not ignored: a host that cannot establish the
+/// boundary is a host that does not start.
 #[cfg(unix)]
-fn mark_inherited_descriptors_close_on_exec(preserve: Option<std::os::fd::RawFd>) {
-    let ceiling = crate::limits::INHERITED_DESCRIPTOR_SWEEP_CEILING;
-    let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile)
-        .current
-        .unwrap_or(ceiling);
-    let last = limit.min(ceiling) as std::os::fd::RawFd;
-    for descriptor in 3..last {
-        if preserve == Some(descriptor) {
+fn mark_inherited_descriptors_close_on_exec(
+    preserve: Option<std::os::fd::RawFd>,
+    inventory: &[std::os::fd::RawFd],
+) -> std::io::Result<()> {
+    // The complete mechanism first: one call covers every descriptor number
+    // the kernel can mint, including any opened after the inventory was
+    // taken. A kernel without it — or without the CLOEXEC flag for it —
+    // falls through to the inventory path rather than running unconfined.
+    #[cfg(target_os = "linux")]
+    if close_range_cloexec(preserve)? {
+        return Ok(());
+    }
+
+    // The inventory is the boundary: every descriptor the parent observed
+    // open gets marked, however high its number.
+    for &descriptor in inventory {
+        if descriptor < 3 || Some(descriptor) == preserve {
             continue;
         }
-        // Safety: the raw descriptor is borrowed for the duration of the call
-        // and never closed here; EBADF is ignored.
-        let borrowed = unsafe { rustix::fd::BorrowedFd::borrow_raw(descriptor) };
-        let _ = rustix::io::fcntl_setfd(borrowed, rustix::io::FdFlags::CLOEXEC);
+        mark_cloexec(descriptor)?;
     }
+    // The backstop for the snapshot-to-exec window. It stays bounded on
+    // purpose — the guarantee above does not stand on it — and a slot that
+    // was never open answers EBADF, the expected result.
+    let bound = supplementary_sweep_bound();
+    for descriptor in 3..bound {
+        if Some(descriptor) == preserve {
+            continue;
+        }
+        mark_cloexec(descriptor)?;
+    }
+    Ok(())
+}
+
+/// One `F_SETFD` for the boundary. `EBADF` is the expected answer for a slot
+/// that was never open; anything else is a containment failure the spawn
+/// reports rather than ignores.
+#[cfg(unix)]
+fn mark_cloexec(descriptor: std::os::fd::RawFd) -> std::io::Result<()> {
+    // Safety: the raw descriptor is borrowed for the duration of the call
+    // and never closed here.
+    let borrowed = unsafe { rustix::fd::BorrowedFd::borrow_raw(descriptor) };
+    match rustix::io::fcntl_setfd(borrowed, rustix::io::FdFlags::CLOEXEC) {
+        Ok(()) | Err(rustix::io::Errno::BADF) => Ok(()),
+        Err(error) => Err(std::io::Error::other(format!(
+            "descriptor {descriptor} could not be marked close-on-exec: {error}"
+        ))),
+    }
+}
+
+/// The bound on the supplementary sweep — the smaller of the process's hard
+/// descriptor limit and the shipped constant. Neither is the boundary; this
+/// only bounds the backstop's worst case.
+#[cfg(unix)]
+fn supplementary_sweep_bound() -> std::os::fd::RawFd {
+    let bound = crate::limits::SUPPLEMENTARY_DESCRIPTOR_SWEEP_BOUND;
+    let hard = rustix::process::getrlimit(rustix::process::Resource::Nofile)
+        .maximum
+        .unwrap_or(bound);
+    hard.min(bound) as std::os::fd::RawFd
+}
+
+/// Mark every descriptor above stdio close-on-exec in one kernel call, or
+/// report that this kernel cannot.
+///
+/// `Ok(true)` means the entire descriptor space is covered and no fallback
+/// is needed. `Ok(false)` means the kernel lacks the call or the
+/// `CLOSE_RANGE_CLOEXEC` flag and the caller should fall back to the
+/// inventory. `Err` is a real failure: a boundary that cannot be established
+/// is a host that does not start.
+#[cfg(target_os = "linux")]
+fn close_range_cloexec(preserve: Option<std::os::fd::RawFd>) -> std::io::Result<bool> {
+    // `<sys/close_range.h>`: CLOSE_RANGE_CLOEXEC.
+    const CLOSE_RANGE_CLOEXEC: libc::c_int = 1 << 3;
+    // The call is unsigned; a preserved descriptor outside the marked space
+    // needs no range carved around it.
+    let preserve = preserve
+        .filter(|descriptor| *descriptor >= 3)
+        .map(|descriptor| descriptor as u32);
+    let spans: [(u32, u32); 2] = match preserve {
+        Some(preserved) if preserved > 3 && preserved < u32::MAX => {
+            [(3, preserved - 1), (preserved + 1, u32::MAX)]
+        }
+        Some(3) => [(4, u32::MAX), (0, 0)],
+        Some(_) => [(3, u32::MAX - 1), (0, 0)],
+        None => [(3, u32::MAX), (0, 0)],
+    };
+    for (first, last) in spans {
+        if first > last {
+            continue;
+        }
+        // Safety: `close_range` touches no memory and marks only this
+        // process's own descriptors; the arguments are within range by
+        // construction.
+        if unsafe { libc::syscall(libc::SYS_close_range, first, last, CLOSE_RANGE_CLOEXEC) } != 0 {
+            let error = std::io::Error::last_os_error();
+            return match error.raw_os_error() {
+                // Kernel older than 5.9 has no such call; 5.9–5.10 has it
+                // without the CLOEXEC flag and answers EINVAL. Both mean the
+                // inventory is the boundary here, not that the boundary
+                // failed.
+                Some(libc::ENOSYS) | Some(libc::EINVAL) => Ok(false),
+                _ => Err(error),
+            };
+        }
+    }
+    Ok(true)
+}
+
+/// The process's open descriptors, enumerated in the parent before `fork`.
+///
+/// The fallback boundary marks against a real table rather than a guessed
+/// bound: whatever the kernel reports open here is what the child marks
+/// close-on-exec. An enumeration that cannot run is a containment failure —
+/// a host started without the boundary is worse than none.
+#[cfg(unix)]
+fn open_descriptor_inventory() -> std::io::Result<Vec<std::os::fd::RawFd>> {
+    descriptor_inventory_impl()
+}
+
+/// Linux enumerates `/proc/self/fd`, with `/dev/fd` as the fallback for
+/// kernels or containers where procfs is not mounted.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn descriptor_inventory_impl() -> std::io::Result<Vec<std::os::fd::RawFd>> {
+    fd_dir_inventory("/proc/self/fd").or_else(|_| fd_dir_inventory("/dev/fd"))
+}
+
+/// macOS has neither close_range nor a reliable descriptor filesystem:
+/// `proc_pidinfo` reports the real table, and the buffer grows until the
+/// kernel says it fit.
+#[cfg(target_os = "macos")]
+fn descriptor_inventory_impl() -> std::io::Result<Vec<std::os::fd::RawFd>> {
+    let mut capacity = 1024usize;
+    loop {
+        let mut records = vec![
+            libc::proc_fdinfo {
+                proc_fd: 0,
+                proc_fdtype: 0,
+            };
+            capacity
+        ];
+        // Safety: `records` is a live buffer of exactly the advertised size.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                libc::getpid(),
+                libc::PROC_PIDLISTFDS,
+                0,
+                records.as_mut_ptr().cast::<libc::c_void>(),
+                (capacity * std::mem::size_of::<libc::proc_fdinfo>()) as libc::c_int,
+            )
+        };
+        if written < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let count = written as usize / std::mem::size_of::<libc::proc_fdinfo>();
+        if count < capacity {
+            records.truncate(count);
+            return Ok(records.into_iter().map(|record| record.proc_fd).collect());
+        }
+        capacity = capacity.saturating_mul(4);
+        if capacity > (1 << 22) {
+            return Err(std::io::Error::other(
+                "the descriptor table kept growing past four million entries",
+            ));
+        }
+    }
+}
+
+/// Every other unix target enumerates `/dev/fd` — the per-process view the
+/// descriptor filesystem serves where it is mounted. Where it is not, the
+/// spawn refuses rather than starting a host without the boundary.
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android", target_os = "macos"))
+))]
+fn descriptor_inventory_impl() -> std::io::Result<Vec<std::os::fd::RawFd>> {
+    fd_dir_inventory("/dev/fd")
+}
+
+/// Read a descriptor directory (`/proc/self/fd`, `/dev/fd`) into numbers.
+/// A non-numeric entry is skipped rather than failing the inventory; a
+/// directory that cannot be read fails it.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn fd_dir_inventory(path: &str) -> std::io::Result<Vec<std::os::fd::RawFd>> {
+    let entries = std::fs::read_dir(path).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("cannot enumerate {path} for descriptor containment: {error}"),
+        )
+    })?;
+    let mut descriptors = Vec::new();
+    for entry in entries {
+        if let Ok(descriptor) = entry?
+            .file_name()
+            .to_string_lossy()
+            .parse::<std::os::fd::RawFd>()
+        {
+            descriptors.push(descriptor);
+        }
+    }
+    Ok(descriptors)
 }
 
 #[cfg(test)]
@@ -1921,7 +2126,10 @@ mod tests {
         let directory =
             std::env::var("NEMO_DESCRIPTOR_BOUNDARY_DIRECTORY").expect("the fixture directory");
 
-        mark_inherited_descriptors_close_on_exec(Some(preserved));
+        let inventory = open_descriptor_inventory()
+            .expect("the child's descriptor table enumerates for the boundary");
+        mark_inherited_descriptors_close_on_exec(Some(preserved), &inventory)
+            .expect("the descriptor boundary applies");
 
         // Safety: the descriptors were inherited from the parent and are only
         // interrogated here.
@@ -2095,7 +2303,14 @@ mod tests {
             "the fixture must start inheritable"
         );
 
-        mark_inherited_descriptors_close_on_exec(None);
+        // The inventory is taken after planting: on the fallback path the
+        // planted descriptor is above every bound the sweep could reach, so
+        // only the inventory — or Linux's complete `close_range` — can cover
+        // it. That is the property this test qualifies.
+        let inventory =
+            open_descriptor_inventory().expect("the descriptor table enumerates for the boundary");
+        mark_inherited_descriptors_close_on_exec(None, &inventory)
+            .expect("the descriptor boundary applies");
 
         let flags = rustix::io::fcntl_getfd(&planted)
             .expect("the planted descriptor stays open until exec");
@@ -2106,6 +2321,29 @@ mod tests {
             flags.contains(rustix::io::FdFlags::CLOEXEC),
             "descriptor {planted_fd} above the legacy sweep ceiling was left inheritable — \
              it would cross exec into the confined host"
+        );
+    }
+
+    /// The fallback boundary stands on the inventory, so the inventory must
+    /// actually see what is open: a descriptor planted inheritable is in the
+    /// snapshot. This is the qualification the macOS fallback runs on — the
+    /// high-descriptor test above can only run where the kernel can place
+    /// one.
+    #[test]
+    fn the_inventory_reports_an_open_descriptor() {
+        use std::os::fd::AsRawFd;
+
+        let file = std::fs::File::create(
+            std::env::temp_dir().join("nemo-inventory-witness"),
+        )
+        .expect("a file for the inventory check");
+        rustix::io::fcntl_setfd(&file, rustix::io::FdFlags::empty())
+            .expect("the descriptor starts inheritable");
+        let inventory =
+            open_descriptor_inventory().expect("the descriptor table enumerates for the boundary");
+        assert!(
+            inventory.contains(&file.as_raw_fd()),
+            "an open descriptor is absent from the inventory the boundary marks against"
         );
     }
 }

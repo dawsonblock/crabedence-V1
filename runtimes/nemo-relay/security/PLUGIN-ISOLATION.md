@@ -21,14 +21,17 @@ is history, not drift. Where the two disagree, this document is right.
   child in each direction resolving the call's codec through the kernel. Every attachment
   point the ABI exposes is served, and the match that installs proxies is exhaustive: a
   class added to the ABI fails to compile there rather than being refused at runtime.
-- **Kernel-process unsafe tokens: 27**, measured by `just tcb-report` — down from
-  648 when the loader, the SDK and the ABI left the kernel's process. The one it
-  gained is the `pre_exec` block that clears `FD_CLOEXEC` on the kernel channel
-  a restricted-linux child inherits, which is the call that has to run between
-  fork and exec. The loader's tokens are budgeted on the host side now, at 325 —
-  the restricted-linux confinement is written against the syscall surface, so its
-  unsafe count is the boundary itself — and the two numbers are recorded rather
-  than one being inferred from the other.
+- **Kernel-process unsafe tokens: 32**, measured by `just tcb-report` — down from
+  648 when the loader, the SDK and the ABI left the kernel's process. The ones the
+  count gained live beside the `pre_exec` block that clears `FD_CLOEXEC` on the
+  kernel channel a restricted-linux child inherits: the `close_range` call that
+  marks every descriptor number close-on-exec where the kernel has it, the
+  `proc_pidinfo` enumeration that stands in for it on macOS, and the tokens the
+  boundary's own descriptor tests carry — all calls that run between fork and
+  exec, allocate nothing and take no locks. The loader's tokens are budgeted on
+  the host side now, at 325 — the restricted-linux confinement is written
+  against the syscall surface, so its unsafe count is the boundary itself — and
+  the two numbers are recorded rather than one being inferred from the other.
 - **No root reaches the loader at all, on any platform the packages ship on.**
   `just tcb-report` checks the property rather than the progress, for the kernel
   library and for the composition surfaces together: on each of the five targets the
@@ -107,7 +110,7 @@ is judged on, and the gate requires the figure to appear exactly once in this
 document:
 
 ```
-kernel-process unsafe tokens: 27
+kernel-process unsafe tokens: 32
 ```
 
 ## The boundary

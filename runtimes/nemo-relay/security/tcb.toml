@@ -777,7 +777,11 @@ transitive_dependency_digest = "e8bf57f38cf9c90ccb884a37f0922163543d06d63a5f910c
 # the decision to be made on the child's side of the boundary. No dependency moved and
 # no `unsafe` did.
 [limits.nemo-relay-plugin-host]
-max_direct_dependencies = 15
+# Raised for `libc`: the descriptor boundary's complete mechanism on Linux
+# (`close_range`) and its table enumeration on macOS (`proc_pidinfo`) are the
+# two kernel surfaces rustix does not wrap, same as the loader's Landlock and
+# seccomp bindings.
+max_direct_dependencies = 16
 # Raised to the platform union; see the measurement note at the top of this file.
 max_transitive_packages = 294
 # Raised for the codec capability record: references bound to an invocation, a
@@ -888,9 +892,23 @@ max_transitive_packages = 294
 # Raised by one package for the ABI's own crate: the host links the plugin SDK, so the
 # identity of the ABI the SDK re-exports is one more name in its resolved set. Nothing
 # the host can reach changed with it.
+#
+# Raised by one dependency and two `unsafe` occurrences for the inherited-
+# descriptor boundary's complete mechanism. `libc` arrives for `close_range` —
+# the Linux call that marks every descriptor number close-on-exec in one
+# operation, above any ceiling a loop could stop at — and for `proc_pidinfo`,
+# which enumerates the real descriptor table on macOS where no such call
+# exists; rustix wraps neither. The unsafe budget also records what the
+# boundary's tests had already grown to: the count stood at five through the
+# descriptor-boundary tests' own `unsafe` blocks while the budget still said
+# two, so this raise is two new occurrences on a drifted baseline rather than
+# five on a clean one. Both new occurrences are audited the way the `pre_exec`
+# block is: raw calls between fork and exec that allocate nothing and take no
+# locks. The transitive set is unchanged — `libc` was already resolved beneath
+# the tree.
 max_source_lines = 23990
-max_unsafe_occurrences = 2
-direct_dependency_digest = "860f647bef245db99fdaae4cdac0794e3b63703fc39937fd902bfbbeb0d65b5d"
+max_unsafe_occurrences = 7
+direct_dependency_digest = "5c11e03a989d3ff24d0ff17f4b54526f15afb1fca055efa27b2195e239c27054"
 transitive_dependency_digest = "2a7b949e6a225b25199e32baef09d0ba6ec5814d814909342b1cc4666a053040"
 
 # The wire schema. Measured because it is shipped and because its transitive set
