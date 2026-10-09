@@ -85,6 +85,16 @@ type Health struct {
 	CyclesFailed     int64
 	ResolverFailures int64
 	DeadLetters      int64
+
+	// InvariantCounters is the store's semantic counter snapshot, keyed
+	// by the stable names the store exports: fence rejections,
+	// conflicting provider observations, lost leases, epoch and
+	// recovery rejections, denied CRITICAL receipts. These are the
+	// signals an operator must alert on, so they travel on the same
+	// readiness surface as the cycle health rather than staying inside
+	// the process. nil when the composed store does not expose
+	// counters.
+	InvariantCounters map[string]int64
 }
 
 // NewSupervisor creates a supervisor for the given worker.
@@ -224,6 +234,18 @@ func (s *Supervisor) Health(ctx context.Context) Health {
 	health.CyclesFailed = metrics.CyclesFailed
 	health.ResolverFailures = metrics.ResolverFailures
 	health.DeadLetters = metrics.DeadLetters
+
+	// The store's invariant counters are exported through the same
+	// surface: a fence rejection, a conflicting provider observation, a
+	// lost lease or a denied CRITICAL receipt is exactly what an
+	// operator must be able to alert on without reading logs. A store
+	// composed without counters leaves the field nil rather than
+	// inventing zeros that would read as "nothing happened".
+	if counterStore, ok := s.store.(interface {
+		Metrics() *idempotency.StoreMetrics
+	}); ok {
+		health.InvariantCounters = counterStore.Metrics().Snapshot()
+	}
 
 	now := time.Now()
 	var degraded, notReady []string
