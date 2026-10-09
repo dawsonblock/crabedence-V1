@@ -555,10 +555,18 @@ type faultFS struct {
 	at     int
 	calls  int
 	err    error
+	// pathSuffix, when non-empty, scopes the injection to calls whose
+	// path ends with it — an operation-ledger append and an effects-log
+	// append reach the same primitive, so targeting one ledger's call
+	// needs a path match, not just a call count.
+	pathSuffix string
 }
 
-func (f *faultFS) hit(step string) bool {
+func (f *faultFS) hit(step, path string) bool {
 	if step != f.target {
+		return false
+	}
+	if f.pathSuffix != "" && !strings.HasSuffix(path, f.pathSuffix) {
 		return false
 	}
 	f.calls++
@@ -566,7 +574,7 @@ func (f *faultFS) hit(step string) bool {
 }
 
 func (f *faultFS) AppendLine(path string, payload []byte) error {
-	if f.hit("append") {
+	if f.hit("append", path) {
 		if len(payload) > 1 {
 			_ = f.inner.AppendLine(path, payload[:len(payload)/2])
 		}
@@ -575,31 +583,36 @@ func (f *faultFS) AppendLine(path string, payload []byte) error {
 	return f.inner.AppendLine(path, payload)
 }
 
-func (f *faultFS) ReadFile(path string) ([]byte, error) { return f.inner.ReadFile(path) }
+func (f *faultFS) ReadFile(path string) ([]byte, error) {
+	if f.hit("read", path) {
+		return nil, f.err
+	}
+	return f.inner.ReadFile(path)
+}
 
 func (f *faultFS) WriteFileAtomic(path string, data []byte) error {
-	if f.hit("rewrite") {
+	if f.hit("rewrite", path) {
 		return f.err
 	}
 	return f.inner.WriteFileAtomic(path, data)
 }
 
 func (f *faultFS) WriteTemp(dir, name string, data []byte) (string, error) {
-	if f.hit("write-temp") {
+	if f.hit("write-temp", filepath.Join(dir, name)) {
 		return "", f.err
 	}
 	return f.inner.WriteTemp(dir, name, data)
 }
 
 func (f *faultFS) Rename(oldpath, newpath string) error {
-	if f.hit("rename") {
+	if f.hit("rename", newpath) {
 		return f.err
 	}
 	return f.inner.Rename(oldpath, newpath)
 }
 
 func (f *faultFS) SyncDir(dir string) error {
-	if f.hit("sync-dir") {
+	if f.hit("sync-dir", dir) {
 		return f.err
 	}
 	return f.inner.SyncDir(dir)

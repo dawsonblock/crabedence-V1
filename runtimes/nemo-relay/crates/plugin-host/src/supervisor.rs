@@ -2012,4 +2012,100 @@ mod tests {
             "the preserved descriptor did not cross exec"
         );
     }
+
+    /// The sweep's own bound is part of the boundary's contract: a
+    /// descriptor planted ABOVE the historical 65,536 ceiling, left
+    /// inheritable, is still the supervisor's responsibility — whatever
+    /// the launcher handed this process is exactly what the confined
+    /// host would otherwise inherit.
+    ///
+    /// Hosts whose descriptor hard limit cannot place an fd that high
+    /// cannot run this check; they print SKIP and return. A skip is a
+    /// qualification gap to close on a capable runner, never evidence
+    /// that the guarantee held on this host.
+    #[test]
+    fn inherited_descriptor_above_the_legacy_ceiling_is_marked() {
+        use std::os::fd::AsRawFd;
+
+        const PLANTED_FD: std::os::fd::RawFd = 70_000;
+
+        let rlimit = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+        if let Some(hard) = rlimit.maximum {
+            if hard <= PLANTED_FD as u64 {
+                eprintln!(
+                    "SKIP: descriptor hard limit {hard} cannot place fd {PLANTED_FD} — \
+                     this host cannot qualify the high-descriptor boundary"
+                );
+                return;
+            }
+        }
+        let needed = PLANTED_FD as u64 + 1024;
+        if rlimit.current.is_some_and(|soft| soft < needed) {
+            if let Err(error) = rustix::process::setrlimit(
+                rustix::process::Resource::Nofile,
+                rustix::process::Rlimit {
+                    current: Some(needed),
+                    maximum: rlimit.maximum,
+                },
+            ) {
+                eprintln!(
+                    "SKIP: raising the soft descriptor limit for the planted fd failed: \
+                     {error} — this host cannot qualify the high-descriptor boundary"
+                );
+                return;
+            }
+        }
+
+        let directory = std::env::temp_dir().join(format!(
+            "nemo-descriptor-high-fd-{}",
+            nemo_relay_plugin_protocol::Uuid::now_v7().simple()
+        ));
+        std::fs::create_dir_all(&directory).expect("a directory for the high-fd fixture");
+        let source = std::fs::File::create(directory.join("planted"))
+            .expect("the planted descriptor's file");
+
+        // F_DUPFD places the duplicate at the first free number at or
+        // above the floor; clearing the flag then gives it the shape a
+        // launcher's log file or a credential handle arrives in. A
+        // kernel that cannot place a descriptor there — macOS caps a
+        // process below the legacy ceiling outright — cannot run the
+        // check and reports SKIP rather than pretending to.
+        let planted = match rustix::io::fcntl_dupfd_cloexec(&source, PLANTED_FD) {
+            Ok(fd) => fd,
+            Err(error) => {
+                eprintln!(
+                    "SKIP: the kernel cannot plant a descriptor at {PLANTED_FD} \
+                     ({error}) — this host cannot qualify the high-descriptor boundary"
+                );
+                std::fs::remove_dir_all(&directory).ok();
+                return;
+            }
+        };
+        rustix::io::fcntl_setfd(&planted, rustix::io::FdFlags::empty())
+            .expect("the planted descriptor starts inheritable");
+        let planted_fd = planted.as_raw_fd();
+        assert!(
+            planted_fd >= PLANTED_FD,
+            "the planted descriptor landed at {planted_fd}, below the legacy ceiling"
+        );
+        assert!(
+            !rustix::io::fcntl_getfd(&planted)
+                .expect("the planted descriptor is open")
+                .contains(rustix::io::FdFlags::CLOEXEC),
+            "the fixture must start inheritable"
+        );
+
+        mark_inherited_descriptors_close_on_exec(None);
+
+        let flags = rustix::io::fcntl_getfd(&planted)
+            .expect("the planted descriptor stays open until exec");
+        drop(planted);
+        drop(source);
+        std::fs::remove_dir_all(&directory).ok();
+        assert!(
+            flags.contains(rustix::io::FdFlags::CLOEXEC),
+            "descriptor {planted_fd} above the legacy sweep ceiling was left inheritable — \
+             it would cross exec into the confined host"
+        );
+    }
 }

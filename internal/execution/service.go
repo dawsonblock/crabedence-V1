@@ -278,6 +278,13 @@ type Service struct {
 	handlers sync.WaitGroup
 	// drainTimeout bounds the Stop drain; overridable in tests.
 	drainTimeout time.Duration
+	// acceptGate, when non-nil, runs in the accept loop after a
+	// connection is accepted and its slot acquired but before its
+	// handler registers with the drain group — the exact window a
+	// racing Stop must own. It exists so the shutdown-barrier
+	// regression can hold a connection inside that window
+	// deterministically; nil in production.
+	acceptGate func()
 }
 
 // NewService creates a new execution service.
@@ -476,6 +483,9 @@ func (s *Service) acceptLoop(ctx context.Context) {
 		if !s.tryAcquireConnection() {
 			s.refuseBusyConnection(conn, "the execution service is at its connection ceiling")
 			continue
+		}
+		if s.acceptGate != nil {
+			s.acceptGate()
 		}
 		s.handlers.Add(1)
 		go func() {
