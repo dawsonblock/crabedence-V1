@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"time"
 )
@@ -25,31 +26,46 @@ import (
 // executions that happened after it.
 //
 // The chain digest covers the length-prefixed canonical fields of every
-// covered record, in execution_id order — an order the store controls
-// (execution ids are time-ordered UUIDv7) and that never changes,
-// because terminal records are immutable. Verification recomputes the
-// chain over the first RecordCount records of the current store: if any
-// covered record was deleted, reordered or rewritten, the digest
-// differs; if the store now holds fewer records, the checkpoint's count
-// no longer fits. Records appended after the checkpoint do not affect
-// either check — the prefix property is what makes a monotonic sequence
-// of checkpoints meaningful.
+// covered record, in terminalization-commit order — the durable
+// terminal_seq assigned transactionally with each terminal write, so
+// the enumeration is append-only by construction. Verification
+// recomputes the chain over the first RecordCount records of the
+// current store: if any covered record was deleted, reordered or
+// rewritten, the digest differs; if the store now holds fewer records,
+// the checkpoint's count no longer fits. Records appended after the
+// checkpoint do not affect either check — the prefix property is what
+// makes a monotonic sequence of checkpoints meaningful.
+//
+// Schema v1 checkpoints (execution_id order, no terminal_seq in the
+// canon) remain verifiable under their own ordering for stores that
+// issued them; v1 cannot promise append-only semantics — a late
+// terminalization legitimately reorders the v1 enumeration — so v1
+// verification answers "the covered records still exist, unchanged" and
+// nothing more. Issue a fresh v2 baseline after upgrading.
 
-// CheckpointSchemaVersion is the only accepted checkpoint schema version.
-const CheckpointSchemaVersion = 1
+// CheckpointSchemaVersion is the current checkpoint schema version.
+const CheckpointSchemaVersion = 2
 
 // CheckpointType identifies the checkpoint schema in serialized form.
-const CheckpointType = "evidence-checkpoint-v1"
+const CheckpointType = "evidence-checkpoint-v2"
 
 // checkpointSigningDomain separates checkpoint signatures from every
 // other message the signer produces (receipts use signingDomain).
-const checkpointSigningDomain = "crabbox-evidence-checkpoint-v1\x00"
+const checkpointSigningDomain = "crabbox-evidence-checkpoint-v2\x00"
+
+// Legacy v1 identifiers, kept so checkpoints issued before the
+// terminal-seq ledger upgrade remain verifiable under v1 semantics.
+const checkpointSchemaVersionV1 = 1
+const checkpointTypeV1 = "evidence-checkpoint-v1"
+const checkpointSigningDomainV1 = "crabbox-evidence-checkpoint-v1\x00"
 
 // TerminalRef is one terminal execution as a checkpoint commits to it:
-// the execution identity, the terminal state, the request digest, the
-// immutable terminal result/evidence/receipt digests, the provider
-// operation identity, and the terminalization timestamp.
+// the durable terminalization sequence, the execution identity, the
+// terminal state, the request digest, the immutable terminal
+// result/evidence/receipt digests, the provider operation identity, and
+// the terminalization timestamp.
 type TerminalRef struct {
+	Seq                    int64  `json:"terminal_seq"`
 	ExecutionID            string `json:"execution_id"`
 	State                  string `json:"state"`
 	RequestDigest          string `json:"request_digest"`
@@ -78,7 +94,38 @@ type Checkpoint struct {
 // CheckpointChainDigest computes the canonical chain digest over refs —
 // a SHA-256 over the length-prefixed canonical fields, in enumeration
 // order. The same refs always produce the same digest, on both engines.
+// The durable terminal_seq is committed first: a checkpoint binds not
+// only the record content but its position in the ledger, so
+// renumbering the ledger is itself detected.
 func CheckpointChainDigest(refs []TerminalRef) string {
+	h := sha256.New()
+	var length [4]byte
+	for _, ref := range refs {
+		for _, value := range []string{
+			strconv.FormatInt(ref.Seq, 10),
+			ref.ExecutionID,
+			ref.State,
+			ref.RequestDigest,
+			ref.TerminalResultDigest,
+			ref.TerminalEvidenceDigest,
+			ref.TerminalReceiptDigest,
+			ref.ProviderID,
+			ref.ProviderRunID,
+			ref.UpdatedAt,
+		} {
+			binary.BigEndian.PutUint32(length[:], uint32(len(value)))
+			h.Write(length[:])
+			h.Write([]byte(value))
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// checkpointChainDigestV1 is the legacy v1 canon: the same nine fields
+// as CheckpointChainDigest minus the terminal_seq, computed over the
+// execution_id-ordered enumeration. It exists so checkpoints issued
+// before the ledger upgrade can still be answered.
+func checkpointChainDigestV1(refs []TerminalRef) string {
 	h := sha256.New()
 	var length [4]byte
 	for _, ref := range refs {
@@ -123,8 +170,12 @@ func (s *Signer) SignCheckpoint(sequence int64, refs []TerminalRef) *Checkpoint 
 
 // checkpointSigningBytes builds the canonical signing payload — the same
 // domain-separated length-prefixed construction as receipt
-// signingBytes, under the checkpoint domain.
+// signingBytes, under the checkpoint domain for the schema version.
 func checkpointSigningBytes(cp Checkpoint) []byte {
+	domain := checkpointSigningDomain
+	if cp.CheckpointType == checkpointTypeV1 {
+		domain = checkpointSigningDomainV1
+	}
 	values := []string{
 		cp.CheckpointType,
 		strconv.FormatInt(cp.Sequence, 10),
@@ -135,7 +186,7 @@ func checkpointSigningBytes(cp Checkpoint) []byte {
 		cp.Signer,
 	}
 	var payload bytes.Buffer
-	payload.WriteString(checkpointSigningDomain)
+	payload.WriteString(domain)
 	var length [4]byte
 	for _, value := range values {
 		binary.BigEndian.PutUint32(length[:], uint32(len(value)))
@@ -154,15 +205,24 @@ func checkpointSigningBytes(cp Checkpoint) []byte {
 //   - the first RecordCount records recompute to the checkpoint's chain
 //     digest — deleting, reordering or rewriting any covered record
 //     fails verification.
+//
+// current must be the store's terminal enumeration in terminal_seq
+// order. A legacy v1 checkpoint is verified under its own semantics —
+// the covered prefix of the execution_id-ordered enumeration — which
+// detects deletion, rewrite and rollback of covered records but cannot
+// assert append-only ordering. Only v2 checkpoints carry that
+// guarantee.
 func VerifyCheckpoint(cp *Checkpoint, current []TerminalRef, trustedSigners map[string]bool) error {
 	if cp == nil {
 		return errors.New("checkpoint is nil")
 	}
-	if cp.CheckpointType != CheckpointType {
-		return fmt.Errorf("unsupported checkpoint_type %q", cp.CheckpointType)
-	}
-	if cp.SchemaVersion != CheckpointSchemaVersion {
-		return fmt.Errorf("unsupported schema_version %d", cp.SchemaVersion)
+	legacy := false
+	switch {
+	case cp.CheckpointType == CheckpointType && cp.SchemaVersion == CheckpointSchemaVersion:
+	case cp.CheckpointType == checkpointTypeV1 && cp.SchemaVersion == checkpointSchemaVersionV1:
+		legacy = true
+	default:
+		return fmt.Errorf("unsupported checkpoint schema %q version %d", cp.CheckpointType, cp.SchemaVersion)
 	}
 	if cp.Sequence < 0 {
 		return fmt.Errorf("invalid sequence %d", cp.Sequence)
@@ -196,6 +256,22 @@ func VerifyCheckpoint(cp *Checkpoint, current []TerminalRef, trustedSigners map[
 	if len(current) < cp.RecordCount {
 		return fmt.Errorf("store holds %d terminal records but the checkpoint commits to %d — records deleted or the store rolled back",
 			len(current), cp.RecordCount)
+	}
+	if legacy {
+		ordered := make([]TerminalRef, len(current))
+		copy(ordered, current)
+		sort.SliceStable(ordered, func(i, j int) bool {
+			return ordered[i].ExecutionID < ordered[j].ExecutionID
+		})
+		if got := checkpointChainDigestV1(ordered[:cp.RecordCount]); got != cp.ChainDigest {
+			return fmt.Errorf("chain mismatch — a covered terminal record changed or moved since the checkpoint")
+		}
+		return nil
+	}
+	for i, ref := range current[:cp.RecordCount] {
+		if i > 0 && ref.Seq <= current[i-1].Seq {
+			return fmt.Errorf("terminal enumeration is not in commit order (seq %d after %d)", ref.Seq, current[i-1].Seq)
+		}
 	}
 	if got := CheckpointChainDigest(current[:cp.RecordCount]); got != cp.ChainDigest {
 		return fmt.Errorf("chain mismatch — a covered terminal record changed or moved since the checkpoint")

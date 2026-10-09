@@ -1,17 +1,20 @@
 package evidence
 
 import (
+	"crypto/ed25519"
+	"encoding/base64"
 	"fmt"
 	"strings"
 	"testing"
 )
 
 // checkpointFixture returns n deterministic terminal refs in the
-// canonical (execution_id ascending) order.
+// canonical ledger order (terminal_seq ascending).
 func checkpointFixture(n int) []TerminalRef {
 	refs := make([]TerminalRef, n)
 	for i := 0; i < n; i++ {
 		refs[i] = TerminalRef{
+			Seq:                    int64(i + 1),
 			ExecutionID:            fmt.Sprintf("exec-%04d", i),
 			State:                  "COMMITTED",
 			RequestDigest:          fmt.Sprintf("sha256:req-%04d", i),
@@ -24,6 +27,35 @@ func checkpointFixture(n int) []TerminalRef {
 		}
 	}
 	return refs
+}
+
+// signCheckpointV1 produces a legacy v1 checkpoint for the migration
+// tests: v1 canon over the execution_id-ordered enumeration, signed
+// under the v1 domain.
+func signCheckpointV1(s *Signer, sequence int64, refs []TerminalRef) *Checkpoint {
+	ordered := make([]TerminalRef, len(refs))
+	copy(ordered, refs)
+	for i := 0; i < len(ordered); i++ {
+		for j := i + 1; j < len(ordered); j++ {
+			if ordered[j].ExecutionID < ordered[i].ExecutionID {
+				ordered[i], ordered[j] = ordered[j], ordered[i]
+			}
+		}
+	}
+	pub := s.key.Public().(ed25519.PublicKey)
+	cp := &Checkpoint{
+		SchemaVersion:  checkpointSchemaVersionV1,
+		CheckpointType: checkpointTypeV1,
+		Sequence:       sequence,
+		IssuedAt:       "2026-10-09T04:00:00.000Z",
+		RecordCount:    len(refs),
+		ChainDigest:    checkpointChainDigestV1(ordered),
+		PublicKey:      base64.StdEncoding.EncodeToString(pub),
+		Signer:         Fingerprint(pub),
+	}
+	cp.Signature = base64.StdEncoding.EncodeToString(
+		ed25519.Sign(s.key, checkpointSigningBytes(*cp)))
+	return cp
 }
 
 func trustedFp(t *testing.T, s *Signer) map[string]bool {
@@ -180,5 +212,60 @@ func TestCheckpointRejectsMalformed(t *testing.T) {
 	}
 	if err := VerifyCheckpoint(nil, refs, trustedFp(t, signer)); err == nil {
 		t.Fatal("nil checkpoint accepted")
+	}
+}
+
+// Renumbering a covered record's ledger position is detected — the
+// checkpoint binds the position, not just the record content.
+func TestCheckpointDetectsLedgerRenumber(t *testing.T) {
+	signer, _ := GenerateSigner()
+	refs := checkpointFixture(3)
+	cp := signer.SignCheckpoint(1, refs)
+	renumbered := checkpointFixture(3)
+	renumbered[1].Seq = 77
+	if err := VerifyCheckpoint(cp, renumbered, trustedFp(t, signer)); err == nil {
+		t.Fatal("renumbered ledger position accepted")
+	}
+}
+
+// An enumeration that is not in terminal_seq order is rejected outright
+// — a caller passing a wrongly-ordered enumeration must not produce a
+// misleading verdict.
+func TestCheckpointRejectsUnsortedEnumeration(t *testing.T) {
+	signer, _ := GenerateSigner()
+	refs := checkpointFixture(3)
+	cp := signer.SignCheckpoint(1, refs)
+	unsorted := checkpointFixture(3)
+	unsorted[0].Seq, unsorted[2].Seq = unsorted[2].Seq, unsorted[0].Seq
+	if err := VerifyCheckpoint(cp, unsorted, trustedFp(t, signer)); err == nil {
+		t.Fatal("unsorted enumeration accepted")
+	}
+}
+
+// A legacy v1 checkpoint issued before the ledger upgrade still verifies
+// under its own semantics: the covered prefix of the execution_id
+// enumeration must be unchanged. Order here is not asserted — v1 cannot
+// promise it — so the refs may be in commit order (seq order) rather
+// than id order.
+func TestCheckpointV1LegacyVerification(t *testing.T) {
+	signer, _ := GenerateSigner()
+	refs := checkpointFixture(3)
+	// Simulate a post-upgrade store: refs enumerate in seq order, which
+	// need not be execution_id order.
+	refs[0].ExecutionID, refs[2].ExecutionID = refs[2].ExecutionID, refs[0].ExecutionID
+	cp := signCheckpointV1(signer, 1, refs)
+	if err := VerifyCheckpoint(cp, refs, trustedFp(t, signer)); err != nil {
+		t.Fatalf("v1 checkpoint rejected: %v", err)
+	}
+	// Covered-record deletion is still detected under v1 semantics.
+	if err := VerifyCheckpoint(cp, refs[:2], trustedFp(t, signer)); err == nil {
+		t.Fatal("v1 checkpoint accepted a truncated enumeration")
+	}
+	// Covered-record rewrite is still detected.
+	mutated := checkpointFixture(3)
+	mutated[0].ExecutionID, mutated[2].ExecutionID = mutated[2].ExecutionID, mutated[0].ExecutionID
+	mutated[1].State = "FAILED"
+	if err := VerifyCheckpoint(cp, mutated, trustedFp(t, signer)); err == nil {
+		t.Fatal("v1 checkpoint accepted a rewritten covered record")
 	}
 }

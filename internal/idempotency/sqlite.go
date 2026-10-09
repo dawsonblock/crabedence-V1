@@ -404,6 +404,7 @@ var sqliteSchemaMigrations = []sqliteSchemaMigration{
 	{14, "ambiguity_provenance", sqliteMigrationAmbiguityProvenance},
 	{15, "attestation_provenance", sqliteMigrationAttestationProvenance},
 	{16, "peer_evidence", sqliteMigrationPeerEvidence},
+	{17, "terminal_evidence_ledger", sqliteMigrationTerminalEvidenceLedger},
 }
 
 func (s *SQLiteStore) ensureSchema(ctx context.Context) error {
@@ -459,6 +460,21 @@ func (s *SQLiteStore) ensureSchema(ctx context.Context) error {
 			`INSERT INTO schema_migrations (version, name, applied_at) VALUES (?1, ?2, `+sqliteNow+`)
 			 ON CONFLICT (version) DO NOTHING`, m.version, m.name); err != nil {
 			return fmt.Errorf("failed to record migration %d: %w", m.version, err)
+		}
+	}
+
+	// Convergence pass: any terminal row that missed the ledger — a
+	// rolling-upgrade straggler written under an older binary — is
+	// appended at open time rather than left to poison enumeration.
+	// Skipped when the ledger table does not exist yet (pre-17 schema).
+	var ledgerTable int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'terminal_counter'`).Scan(&ledgerTable); err != nil {
+		return err
+	}
+	if ledgerTable == 1 {
+		if err := sqliteRepairTerminalEvidenceLedger(ctx, tx); err != nil {
+			return fmt.Errorf("terminal evidence ledger repair: %w", err)
 		}
 	}
 
@@ -538,6 +554,7 @@ func sqliteMigrationBaseTable(ctx context.Context, tx *sql.Tx) error {
 			peer_uid INTEGER,
 			peer_pid INTEGER,
 			peer_executable TEXT,
+			terminal_seq INTEGER,
 			UNIQUE(principal_id, capability_id, idempotency_key)
 		)
 	`)
@@ -946,6 +963,88 @@ func sqliteMigrationPeerEvidence(ctx context.Context, tx *sql.Tx) error {
 			fmt.Sprintf(`ALTER TABLE execution_requests ADD COLUMN %s %s`, col.name, col.typ)); err != nil {
 			return fmt.Errorf("%s: %w", col.name, err)
 		}
+	}
+	return nil
+}
+
+// sqliteMigrationTerminalEvidenceLedger mirrors the PG migration 17:
+// the append-only terminal evidence ledger. terminal_seq is assigned
+// transactionally with each terminal write from the single-row
+// terminal_counter table, so the enumeration order is the order the
+// terminal states were durably committed — never execution_id order.
+// Rows already terminal when the migration runs are backfilled in
+// (updated_at, execution_id) order: terminal records are immutable, so
+// updated_at is their terminalization instant. A transaction that
+// rolls back releases its bump, so the sequence has no gaps.
+func sqliteMigrationTerminalEvidenceLedger(ctx context.Context, tx *sql.Tx) error {
+	exists, err := sqliteColumnExists(ctx, tx, "execution_requests", "terminal_seq")
+	if err != nil {
+		return err
+	}
+	if !exists {
+		if _, err := tx.ExecContext(ctx,
+			`ALTER TABLE execution_requests ADD COLUMN terminal_seq INTEGER`); err != nil {
+			return fmt.Errorf("terminal_seq: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS terminal_counter (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			value INTEGER NOT NULL
+		)`); err != nil {
+		return fmt.Errorf("terminal_counter: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT OR IGNORE INTO terminal_counter (id, value) VALUES (1, 0)`); err != nil {
+		return fmt.Errorf("terminal_counter seed: %w", err)
+	}
+	if err := sqliteRepairTerminalEvidenceLedger(ctx, tx); err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_requests_terminal_seq
+		ON execution_requests (terminal_seq)
+		WHERE terminal_seq IS NOT NULL`)
+	return err
+}
+
+// sqliteRepairTerminalEvidenceLedger assigns ledger positions to any
+// terminal row that lacks one — a rolling-upgrade straggler written by
+// a binary that predates the ledger, or a partial earlier migration —
+// appending it above the current maximum in (updated_at, execution_id)
+// order. Terminal records are immutable, so updated_at is the
+// terminalization instant. The counter lift is monotonic so a
+// concurrent allocation can never be regressed. Runs at migration time
+// and again on every open, so stragglers self-heal at startup.
+// Idempotent.
+func sqliteRepairTerminalEvidenceLedger(ctx context.Context, tx *sql.Tx) error {
+	// Re-seed defensively: a deleted singleton row would otherwise
+	// hard-fail every terminalization.
+	if _, err := tx.ExecContext(ctx,
+		`INSERT OR IGNORE INTO terminal_counter (id, value) VALUES (1, 0)`); err != nil {
+		return fmt.Errorf("terminal_counter seed: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE execution_requests AS er
+		SET terminal_seq = o.seq
+		FROM (
+			SELECT execution_id,
+			       ROW_NUMBER() OVER (ORDER BY updated_at, execution_id)
+			         + COALESCE((SELECT MAX(terminal_seq) FROM execution_requests), 0) AS seq
+			FROM execution_requests
+			WHERE terminal_seq IS NULL
+			  AND state IN ('COMMITTED', 'FAILED', 'DENIED')
+		) o
+		WHERE er.execution_id = o.execution_id
+		  AND er.terminal_seq IS NULL`); err != nil {
+		return fmt.Errorf("terminal_seq backfill: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE terminal_counter
+		SET value = MAX(value,
+			(SELECT COALESCE(MAX(terminal_seq), 0) FROM execution_requests))
+		WHERE id = 1`); err != nil {
+		return fmt.Errorf("terminal_counter lift: %w", err)
 	}
 	return nil
 }
@@ -1897,6 +1996,14 @@ func (s *SQLiteStore) Finalize(ctx context.Context, executionID, leaseToken stri
 		return err
 	}
 	defer tx.Rollback()
+	// Allocate the ledger position inside the terminalization
+	// transaction itself: the bump commits iff the terminal write does,
+	// so a CAS loss or rollback leaves no gap and no ledger row exists
+	// without the terminal state it orders.
+	terminalSeq, err := allocTerminalSeq(ctx, tx)
+	if err != nil {
+		return err
+	}
 	result, err := tx.ExecContext(ctx, `
 		UPDATE execution_requests
 		SET state = ?1, result = ?2, evidence_digest = ?3, receipt_version = ?4,
@@ -1904,6 +2011,7 @@ func (s *SQLiteStore) Finalize(ctx context.Context, executionID, leaseToken stri
 		    provider_run_id = COALESCE(?6, provider_run_id),
 		    terminal_receipt_digest = ?7, evidence_receipt = ?13,
 		    terminal_result_digest = ?14, terminal_evidence_digest = ?15,
+		    terminal_seq = ?16,
 		    lease_owner = NULL, lease_token = NULL,
 		    lease_started_at = NULL, lease_expires_at = NULL,
 		    recovery_locator = NULL,
@@ -1925,7 +2033,8 @@ func (s *SQLiteStore) Finalize(ctx context.Context, executionID, leaseToken stri
 		receiptDigest,
 		executionID, string(expectedState), leaseToken, leaseGeneration, existing.Version,
 		nullableString(string(receipt.EvidenceReceipt)),
-		nullableString(terminalResultSHA), nullableString(receipt.EvidenceDigest))
+		nullableString(terminalResultSHA), nullableString(receipt.EvidenceDigest),
+		terminalSeq)
 	if err != nil {
 		return err
 	}
@@ -2428,6 +2537,12 @@ func (s *SQLiteStore) ResolveRecovery(ctx context.Context, executionID string, e
 		return err
 	}
 	defer tx.Rollback()
+	// Ledger position allocated inside the terminalization transaction —
+	// see Finalize.
+	terminalSeq, err := allocTerminalSeq(ctx, tx)
+	if err != nil {
+		return err
+	}
 	result2, err := tx.ExecContext(ctx, `
 		UPDATE execution_requests
 		SET state = ?1,
@@ -2438,6 +2553,7 @@ func (s *SQLiteStore) ResolveRecovery(ctx context.Context, executionID string, e
 		    provider_run_id = COALESCE(?6, provider_run_id),
 		    terminal_receipt_digest = ?7, evidence_receipt = ?10,
 		    terminal_result_digest = ?11, terminal_evidence_digest = ?12,
+		    terminal_seq = ?13,
 		    reconcile_owner = NULL, reconcile_lease_expires_at = NULL,
 		    next_reconcile_at = NULL, last_reconcile_error = NULL,
 		    recovery_locator = NULL,
@@ -2454,7 +2570,8 @@ func (s *SQLiteStore) ResolveRecovery(ctx context.Context, executionID string, e
 		receiptDigest,
 		executionID, expectedVersion,
 		nullableString(string(result.EvidenceReceipt)),
-		nullableString(terminalResultSHA), nullableString(result.EvidenceDigest))
+		nullableString(terminalResultSHA), nullableString(result.EvidenceDigest),
+		terminalSeq)
 	if err != nil {
 		return err
 	}

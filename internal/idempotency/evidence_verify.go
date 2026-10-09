@@ -2,6 +2,7 @@ package idempotency
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"time"
 
@@ -151,25 +152,30 @@ func ValidateTerminalTransition(record *Record, target State, receipt TerminalRe
 // ─── Terminal evidence enumeration ───────────────────────────────────
 //
 // TerminalEvidence enumerates every terminal execution as a checkpoint
-// reference, in execution_id order — the canonical enumeration an
-// evidence checkpoint commits to. Terminal records are immutable and
-// execution ids are time-ordered UUIDv7, so the enumeration only ever
-// grows in a stable order. The timestamp is truncated to milliseconds:
-// SQLite stores millisecond integers while PostgreSQL keeps microseconds,
-// and the truncation is what makes the canonical form engine-independent.
+// reference, in terminal_seq order — the durable terminalization-commit
+// order assigned transactionally with each terminal write. The
+// enumeration is append-only by construction: a record that terminalizes
+// late lands at the end, never mid-history, so previously issued
+// checkpoints keep verifying as legitimate prefixes. A terminal record
+// lacking a ledger position (a NULL terminal_seq — only possible for a
+// rolling-upgrade straggler that escaped open-time repair) is a
+// fail-closed error, never a silently skipped row. The timestamp is
+// truncated to milliseconds: SQLite stores millisecond integers while
+// PostgreSQL keeps microseconds, and the truncation is what makes the
+// canonical form engine-independent.
 
 // TerminalEvidence implements the SQLite engine.
 func (s *SQLiteStore) TerminalEvidence(ctx context.Context) ([]evidence.TerminalRef, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT execution_id, state, request_digest,
+		SELECT terminal_seq, execution_id, state, request_digest,
 		       COALESCE(terminal_result_digest, ''),
 		       COALESCE(terminal_evidence_digest, ''),
 		       COALESCE(terminal_receipt_digest, ''),
 		       COALESCE(provider_id, ''), COALESCE(provider_run_id, ''),
 		       updated_at
 		FROM execution_requests
-		WHERE state IN ('COMMITTED', 'FAILED')
-		ORDER BY execution_id`)
+		WHERE state IN ('COMMITTED', 'FAILED', 'DENIED')
+		ORDER BY terminal_seq`)
 	if err != nil {
 		return nil, err
 	}
@@ -177,13 +183,18 @@ func (s *SQLiteStore) TerminalEvidence(ctx context.Context) ([]evidence.Terminal
 	var refs []evidence.TerminalRef
 	for rows.Next() {
 		var ref evidence.TerminalRef
+		var seq sql.NullInt64
 		var updatedAt int64
-		if err := rows.Scan(&ref.ExecutionID, &ref.State, &ref.RequestDigest,
+		if err := rows.Scan(&seq, &ref.ExecutionID, &ref.State, &ref.RequestDigest,
 			&ref.TerminalResultDigest, &ref.TerminalEvidenceDigest,
 			&ref.TerminalReceiptDigest, &ref.ProviderID, &ref.ProviderRunID,
 			&updatedAt); err != nil {
 			return nil, err
 		}
+		if !seq.Valid {
+			return nil, fmt.Errorf("terminal record %s (%s) has no terminal_seq — the evidence ledger is incomplete; reopen the store to run the repair pass", ref.ExecutionID, ref.State)
+		}
+		ref.Seq = seq.Int64
 		ref.UpdatedAt = sqliteTime(updatedAt).Truncate(time.Millisecond).Format(time.RFC3339Nano)
 		refs = append(refs, ref)
 	}
@@ -193,15 +204,15 @@ func (s *SQLiteStore) TerminalEvidence(ctx context.Context) ([]evidence.Terminal
 // TerminalEvidence implements the PostgreSQL engine.
 func (s *Store) TerminalEvidence(ctx context.Context) ([]evidence.TerminalRef, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT execution_id, state, request_digest,
+		SELECT terminal_seq, execution_id, state, request_digest,
 		       COALESCE(terminal_result_digest, ''),
 		       COALESCE(terminal_evidence_digest, ''),
 		       COALESCE(terminal_receipt_digest, ''),
 		       COALESCE(provider_id, ''), COALESCE(provider_run_id, ''),
 		       updated_at
 		FROM execution_requests
-		WHERE state IN ('COMMITTED', 'FAILED')
-		ORDER BY execution_id`)
+		WHERE state IN ('COMMITTED', 'FAILED', 'DENIED')
+		ORDER BY terminal_seq`)
 	if err != nil {
 		return nil, err
 	}
@@ -209,13 +220,18 @@ func (s *Store) TerminalEvidence(ctx context.Context) ([]evidence.TerminalRef, e
 	var refs []evidence.TerminalRef
 	for rows.Next() {
 		var ref evidence.TerminalRef
+		var seq sql.NullInt64
 		var updatedAt time.Time
-		if err := rows.Scan(&ref.ExecutionID, &ref.State, &ref.RequestDigest,
+		if err := rows.Scan(&seq, &ref.ExecutionID, &ref.State, &ref.RequestDigest,
 			&ref.TerminalResultDigest, &ref.TerminalEvidenceDigest,
 			&ref.TerminalReceiptDigest, &ref.ProviderID, &ref.ProviderRunID,
 			&updatedAt); err != nil {
 			return nil, err
 		}
+		if !seq.Valid {
+			return nil, fmt.Errorf("terminal record %s (%s) has no terminal_seq — the evidence ledger is incomplete; reopen the store to run the repair pass", ref.ExecutionID, ref.State)
+		}
+		ref.Seq = seq.Int64
 		ref.UpdatedAt = updatedAt.UTC().Truncate(time.Millisecond).Format(time.RFC3339Nano)
 		refs = append(refs, ref)
 	}

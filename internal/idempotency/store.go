@@ -387,7 +387,7 @@ func (s *Store) checkEpoch(ctx context.Context) error {
 // requires. Startup verifies the migrated schema reaches this version —
 // a database older than the code fails closed rather than running
 // against a partial schema.
-const RequiredSchemaVersion = 16
+const RequiredSchemaVersion = 17
 
 // schemaMigration is one versioned, idempotent schema change. Each
 // migration must be safe to re-run (IF NOT EXISTS / addColumnIfMissing)
@@ -418,6 +418,7 @@ var schemaMigrations = []schemaMigration{
 	{14, "ambiguity_provenance", migrationAmbiguityProvenance},
 	{15, "attestation_provenance", migrationAttestationProvenance},
 	{16, "peer_evidence", migrationPeerEvidence},
+	{17, "terminal_evidence_ledger", migrationTerminalEvidenceLedger},
 }
 
 func (s *Store) ensureSchema(ctx context.Context) error {
@@ -490,6 +491,16 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 			`INSERT INTO schema_migrations (version, name) VALUES ($1, $2)
 			 ON CONFLICT (version) DO NOTHING`, m.version, m.name); err != nil {
 			return fmt.Errorf("failed to record migration %d: %w", m.version, err)
+		}
+	}
+
+	// Convergence pass: any terminal row that missed the ledger — a
+	// rolling-upgrade straggler written under an older binary — is
+	// appended at open time rather than left to poison enumeration.
+	// Runs after the migration loop so the counter table exists.
+	if version, verr := schemaVersion(ctx, conn); verr == nil && version >= 17 {
+		if err := repairTerminalEvidenceLedger(ctx, conn); err != nil {
+			return fmt.Errorf("terminal evidence ledger repair: %w", err)
 		}
 	}
 
@@ -1027,7 +1038,119 @@ func migrationPeerEvidence(ctx context.Context, conn *sql.Conn) error {
 	return nil
 }
 
+// migrationTerminalEvidenceLedger builds the append-only terminal
+// evidence ledger. terminal_seq is assigned transactionally with each
+// terminal write from the single-row terminal_counter table, so the
+// enumeration order is the order the terminal states were durably
+// committed — never execution_id order. Rows already terminal when the
+// migration runs are backfilled in (updated_at, execution_id) order:
+// terminal records are immutable, so updated_at is their
+// terminalization instant. A rolled-back transaction releases its bump,
+// so the sequence has no gaps. Every statement is idempotent: a
+// partially-applied migration can simply be re-run.
+func migrationTerminalEvidenceLedger(ctx context.Context, conn *sql.Conn) error {
+	if _, err := conn.ExecContext(ctx,
+		`ALTER TABLE execution_requests ADD COLUMN IF NOT EXISTS terminal_seq BIGINT`); err != nil {
+		return fmt.Errorf("terminal_seq: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS terminal_counter (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			value BIGINT NOT NULL
+		)`); err != nil {
+		return fmt.Errorf("terminal_counter: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx,
+		`INSERT INTO terminal_counter (id, value) VALUES (1, 0) ON CONFLICT (id) DO NOTHING`); err != nil {
+		return fmt.Errorf("terminal_counter seed: %w", err)
+	}
+	if err := repairTerminalEvidenceLedger(ctx, conn); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, `
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_requests_terminal_seq
+		ON execution_requests (terminal_seq)
+		WHERE terminal_seq IS NOT NULL`); err != nil {
+		return fmt.Errorf("terminal_seq index: %w", err)
+	}
+	return nil
+}
+
+// repairTerminalEvidenceLedger assigns ledger positions to any terminal
+// row that lacks one — a rolling-upgrade straggler written by a binary
+// that predates the ledger, or a partial earlier migration — appending
+// it above the current maximum in (updated_at, execution_id) order.
+// Terminal records are immutable, so updated_at is the terminalization
+// instant. The whole pass runs in a transaction that first locks the
+// terminal_counter row, so a concurrent ledger-aware terminalization
+// either commits entirely before the snapshot or waits for the lift —
+// it can never interleave with the backfill. The counter lift is
+// monotonic (GREATEST) regardless. Runs at migration time and again on
+// every open, so stragglers self-heal at startup. Idempotent.
+func repairTerminalEvidenceLedger(ctx context.Context, conn *sql.Conn) error {
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	// Re-seed defensively (a deleted singleton row would otherwise hard-
+	// fail every terminalization), then lock the counter row for the
+	// duration of the pass: every ledger-aware terminalization blocks on
+	// this row until commit.
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO terminal_counter (id, value) VALUES (1, 0) ON CONFLICT (id) DO NOTHING`); err != nil {
+		return fmt.Errorf("terminal_counter seed: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE terminal_counter SET value = value WHERE id = 1`); err != nil {
+		return fmt.Errorf("terminal_counter lock: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE execution_requests er
+		SET terminal_seq = o.seq
+		FROM (
+			SELECT execution_id,
+			       ROW_NUMBER() OVER (ORDER BY updated_at, execution_id)
+			         + COALESCE((SELECT MAX(terminal_seq) FROM execution_requests), 0) AS seq
+			FROM execution_requests
+			WHERE terminal_seq IS NULL
+			  AND state IN ('COMMITTED', 'FAILED', 'DENIED')
+		) o
+		WHERE er.execution_id = o.execution_id
+		  AND er.terminal_seq IS NULL`); err != nil {
+		return fmt.Errorf("terminal_seq backfill: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE terminal_counter
+		SET value = GREATEST(value,
+			(SELECT COALESCE(MAX(terminal_seq), 0) FROM execution_requests))
+		WHERE id = 1`); err != nil {
+		return fmt.Errorf("terminal_counter lift: %w", err)
+	}
+	return tx.Commit()
+}
+
 // ─── Forensic write helpers ──────────────────────────────────────────
+
+// allocTerminalSeq allocates the next position in the append-only
+// terminal evidence ledger, inside the caller's transaction. The
+// single terminal_counter row is the commit-order token: on PostgreSQL
+// its row lock serializes concurrent terminalizations, and because the
+// lock is held to commit, a second transaction can only take the next
+// number after the first has committed — so terminal_seq order is
+// durable commit order. On SQLite the single-writer model serializes
+// the same way. A transaction that rolls back releases the bump, so
+// the sequence has no gaps; a terminalization that fails its CAS never
+// commits a seq at all.
+func allocTerminalSeq(ctx context.Context, tx *sql.Tx) (int64, error) {
+	var seq int64
+	err := tx.QueryRowContext(ctx,
+		`UPDATE terminal_counter SET value = value + 1 WHERE id = 1 RETURNING value`).Scan(&seq)
+	if err != nil {
+		return 0, fmt.Errorf("terminal evidence sequence allocation failed: %w", err)
+	}
+	return seq, nil
+}
 
 // insertEffectEvent appends one event row inside the mutation's
 // transaction. Sequence is allocated with MAX+1 under the record's row
@@ -2307,6 +2430,16 @@ func (s *Store) Finalize(ctx context.Context, executionID, leaseToken string, le
 		return err
 	}
 	defer tx.Rollback()
+	// Allocate the ledger position inside the terminalization
+	// transaction itself: the bump commits iff the terminal write does,
+	// so a CAS loss or rollback leaves no gap and no ledger row exists
+	// without the terminal state it orders. The counter row lock also
+	// serializes concurrent terminalizations — seq order is commit
+	// order.
+	terminalSeq, err := allocTerminalSeq(ctx, tx)
+	if err != nil {
+		return err
+	}
 	result, err := tx.ExecContext(ctx, `
 		UPDATE execution_requests
 		SET state = $1, result = $2, evidence_digest = $3, receipt_version = $4,
@@ -2314,6 +2447,7 @@ func (s *Store) Finalize(ctx context.Context, executionID, leaseToken string, le
 		    provider_run_id = COALESCE($6::text, provider_run_id),
 		    terminal_receipt_digest = $7, evidence_receipt = $13,
 		    terminal_result_digest = $14, terminal_evidence_digest = $15,
+		    terminal_seq = $16,
 		    lease_owner = NULL, lease_token = NULL,
 		    lease_started_at = NULL, lease_expires_at = NULL,
 		    recovery_locator = NULL,
@@ -2335,7 +2469,8 @@ func (s *Store) Finalize(ctx context.Context, executionID, leaseToken string, le
 		receiptDigest,
 		executionID, string(expectedState), leaseToken, leaseGeneration, existing.Version,
 		nullableString(string(receipt.EvidenceReceipt)),
-		nullableString(terminalResultSHA), nullableString(receipt.EvidenceDigest))
+		nullableString(terminalResultSHA), nullableString(receipt.EvidenceDigest),
+		terminalSeq)
 	if err != nil {
 		return err
 	}
@@ -3021,6 +3156,12 @@ func (s *Store) ResolveRecovery(ctx context.Context, executionID string, expecte
 		return err
 	}
 	defer tx.Rollback()
+	// Ledger position allocated inside the terminalization transaction —
+	// see Finalize.
+	terminalSeq, err := allocTerminalSeq(ctx, tx)
+	if err != nil {
+		return err
+	}
 	result2, err := tx.ExecContext(ctx, `
 		UPDATE execution_requests
 		SET state = $1,
@@ -3031,6 +3172,7 @@ func (s *Store) ResolveRecovery(ctx context.Context, executionID string, expecte
 		    provider_run_id = COALESCE($6::text, provider_run_id),
 		    terminal_receipt_digest = $7, evidence_receipt = $10,
 		    terminal_result_digest = $11, terminal_evidence_digest = $12,
+		    terminal_seq = $13,
 		    reconcile_owner = NULL, reconcile_lease_expires_at = NULL,
 		    next_reconcile_at = NULL, last_reconcile_error = NULL,
 		    recovery_locator = NULL,
@@ -3047,7 +3189,8 @@ func (s *Store) ResolveRecovery(ctx context.Context, executionID string, expecte
 		receiptDigest,
 		executionID, expectedVersion,
 		nullableString(string(result.EvidenceReceipt)),
-		nullableString(terminalResultSHA), nullableString(result.EvidenceDigest))
+		nullableString(terminalResultSHA), nullableString(result.EvidenceDigest),
+		terminalSeq)
 	if err != nil {
 		return err
 	}
