@@ -152,6 +152,47 @@ test("the distribution lane never reaches for git", { skip: !prerequisites && sk
   );
 });
 
+// The release clean room verifies the extracted archive against the
+// PUBLISHED manifest — a file that lives outside the tree. The embedded
+// manifest copy is exempt from the inverse check only while it is
+// byte-identical to the manifest under verification.
+test("the extracted archive verifies against an external manifest", { skip: !prerequisites && skipReason }, (t) => {
+  const { root } = makeRepo(t);
+  const out = outDir(t);
+  const archive = path.join(out, "fixture.tar.gz");
+  pack(root, archive);
+  const extracted = extract(archive, path.join(out, "room"));
+  const embedded = path.join(extracted, "release-evidence", "source-tree-sha256.txt");
+  const published = path.join(out, "published-source-tree-sha256.txt");
+  fs.copyFileSync(embedded, published);
+  const r = spawnSync(
+    "bash",
+    [path.join(extracted, "scripts", "verify-source-manifest.sh"), published, extracted],
+    { encoding: "utf8" },
+  );
+  assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+  assert.match(r.stdout, /status=PASS/);
+});
+
+test("a divergent embedded manifest fails external verification", { skip: !prerequisites && skipReason }, (t) => {
+  const { root } = makeRepo(t);
+  const out = outDir(t);
+  const archive = path.join(out, "fixture.tar.gz");
+  pack(root, archive);
+  const extracted = extract(archive, path.join(out, "room"));
+  const embedded = path.join(extracted, "release-evidence", "source-tree-sha256.txt");
+  const published = path.join(out, "published-source-tree-sha256.txt");
+  fs.copyFileSync(embedded, published);
+  fs.appendFileSync(embedded, "# tampered self-identity\n");
+  const r = spawnSync(
+    "bash",
+    [path.join(extracted, "scripts", "verify-source-manifest.sh"), published, extracted],
+    { encoding: "utf8" },
+  );
+  assert.notEqual(r.status, 0);
+  assert.match(r.stdout + r.stderr, /UNEXPECTED: release-evidence\/source-tree-sha256\.txt/);
+});
+
 test("a mutated byte fails the embedded manifest", { skip: !prerequisites && skipReason }, (t) => {
   const { root } = makeRepo(t);
   const out = outDir(t);

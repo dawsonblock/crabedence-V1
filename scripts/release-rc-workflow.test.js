@@ -350,6 +350,33 @@ test("public reverification checks the SBOM and tree equivalence from public ass
   assert.match(reverify, /--source-digest "\$SOURCE_DIGEST"/);
 });
 
+test("clean-room installs materialize the pinned schema validator", () => {
+  // verify-release-artifact.sh resolves the JSON Schema validator from
+  // dirname(EVIDENCE_DIR)/nemo/scripts/validate-schema.mjs first — an
+  // extracted source tree carries no node_modules, so the workflow must
+  // place BOTH the installed dependencies and the validator script under
+  // clean-room/nemo. Dependencies without the script leave the candidate
+  // absent; the script without dependencies leaves its ajv import
+  // unresolvable.
+  for (const jobName of ["clean-room-verify", "public-reverify"]) {
+    const body = job(jobName);
+    const installAt = body.indexOf("- name: Install pinned verification dependencies");
+    assert.ok(installAt >= 0, `${jobName} installs pinned verification dependencies`);
+    const install = body.slice(installAt, installAt + 1200);
+    assert.match(
+      install,
+      /mkdir -p clean-room\/nemo\/scripts/,
+      `${jobName} creates the validator script directory`,
+    );
+    assert.match(
+      install,
+      /cp "clean-room\/tar-source\/crabedence-\$\{RELEASE_VERSION\}\/nemo\/scripts\/validate-schema\.mjs"/,
+      `${jobName} copies the pinned validator script beside its dependencies`,
+    );
+    assert.match(install, /npm ci --prefix clean-room\/nemo/, `${jobName} installs the pinned dependency set`);
+  }
+});
+
 test("neither release workflow writes an attestation inside the evidence closure", () => {
   // An attestation is an external statement about the frozen evidence
   // object. A reference written into the closure would make the evidence

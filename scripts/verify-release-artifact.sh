@@ -668,9 +668,13 @@ if [ -f "$EVIDENCE_DIR/qualification.json" ]; then
   # toolchain. A mutable global `ajv` binary is only a fallback, and no
   # validator at all is a qualification failure.
   VALIDATOR_SCRIPT=""
+  # A validator materialized beside the evidence directory wins over the
+  # in-tree copy: the release pipeline installs its dependencies there,
+  # while an extracted source tree deliberately carries no node_modules —
+  # the shipped script alone cannot resolve its own pinned import.
   for candidate in \
-    "$REPO_ROOT/nemo/scripts/validate-schema.mjs" \
-    "$(dirname "$EVIDENCE_DIR")/nemo/scripts/validate-schema.mjs"; do
+    "$(dirname "$EVIDENCE_DIR")/nemo/scripts/validate-schema.mjs" \
+    "$REPO_ROOT/nemo/scripts/validate-schema.mjs"; do
     if [ -f "$candidate" ]; then
       VALIDATOR_SCRIPT="$candidate"
       break

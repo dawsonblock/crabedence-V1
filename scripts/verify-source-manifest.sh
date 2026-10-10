@@ -40,6 +40,17 @@ MANIFEST_REL=""
 case "$MANIFEST_ABS" in
   "$ROOT_ABS"/*) MANIFEST_REL="${MANIFEST_ABS#$ROOT_ABS/}" ;;
 esac
+# An extracted archive also carries the embedded manifest copy at
+# release-evidence/source-tree-sha256.txt. When the passed manifest lives
+# outside the tree — the published qualification manifest the clean-room
+# lane verifies against — the embedded copy gets the same exemption only
+# while it is byte-identical to it. A self-identity that differs from the
+# record under verification is a defect, not an extra to tolerate.
+if [ -z "$MANIFEST_REL" ] && [ -f "$ROOT/release-evidence/source-tree-sha256.txt" ]; then
+  if cmp -s "$ROOT/release-evidence/source-tree-sha256.txt" "$MANIFEST"; then
+    MANIFEST_REL="release-evidence/source-tree-sha256.txt"
+  fi
+fi
 
 missing=0
 mismatched=0

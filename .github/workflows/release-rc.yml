@@ -721,10 +721,14 @@ jobs:
           # Install OUTSIDE the extracted source. The verifier walks the
           # source tree to prove it equals the packaged archive, so an
           # install inside it would add node_modules the archive does not
-          # contain. The verifier resolves ajv from the parent directory.
-          mkdir -p clean-room/nemo
+          # contain. The verifier resolves ajv from the parent directory
+          # of the evidence directory — the validator script is copied
+          # next to the installed dependencies so it resolves them.
+          mkdir -p clean-room/nemo/scripts
           cp "clean-room/tar-source/crabedence-${RELEASE_VERSION}/nemo/package.json" \
              "clean-room/tar-source/crabedence-${RELEASE_VERSION}/nemo/package-lock.json" clean-room/nemo/
+          cp "clean-room/tar-source/crabedence-${RELEASE_VERSION}/nemo/scripts/validate-schema.mjs" \
+             clean-room/nemo/scripts/
           npm ci --prefix clean-room/nemo
 
       # Each extracted tree must independently reproduce the source
@@ -1142,10 +1146,14 @@ jobs:
           # Install OUTSIDE the extracted source. The verifier walks the
           # source tree to prove it equals the packaged archive, so an
           # install inside it would add node_modules the archive does not
-          # contain. The verifier resolves ajv from the parent directory.
-          mkdir -p clean-room/nemo
+          # contain. The verifier resolves ajv from the parent directory
+          # of the evidence directory — the validator script is copied
+          # next to the installed dependencies so it resolves them.
+          mkdir -p clean-room/nemo/scripts
           cp "clean-room/tar-source/crabedence-${RELEASE_VERSION}/nemo/package.json" \
              "clean-room/tar-source/crabedence-${RELEASE_VERSION}/nemo/package-lock.json" clean-room/nemo/
+          cp "clean-room/tar-source/crabedence-${RELEASE_VERSION}/nemo/scripts/validate-schema.mjs" \
+             clean-room/nemo/scripts/
           npm ci --prefix clean-room/nemo
 
       - name: Verify both public source trees
