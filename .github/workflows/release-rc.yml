@@ -1048,50 +1048,59 @@ jobs:
             echo "Published $f matches the qualified bytes"
           done
 
+      # Publication is draft-first by necessity: on a repository that
+      # enforces immutable releases, assets can only be attached while the
+      # release is still a draft — a publish-then-upload flow is refused
+      # outright. The draft is created with the same body and file set the
+      # action previously declared, then publishing freezes exactly the
+      # verified bytes.
       - name: Create GitHub prerelease
         if: steps.existing_release.outputs.exists != 'true'
-        uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.2
-        with:
-          tag_name: ${{ env.RELEASE_VERSION }}
-          name: Crabedence ${{ env.RELEASE_VERSION }}
-          prerelease: true
-          body: |
-            ## Crabedence ${{ env.RELEASE_VERSION }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cat > release-notes.md <<'BODY_EOF'
+          ## Crabedence ${{ env.RELEASE_VERSION }}
 
-            ### Source provenance
-            - **Commit:** `${{ env.COMMIT }}`
-            - **Tree:** `${{ env.TREE }}`
-            - **Branch:** `${{ github.ref_name }}`
+          ### Source provenance
+          - **Commit:** `${{ env.COMMIT }}`
+          - **Tree:** `${{ env.TREE }}`
+          - **Branch:** `${{ github.ref_name }}`
 
-            ### Artifact hashes
-            - **tar.gz SHA-256:** `${{ needs.build.outputs.tar_sha256 }}`
-            - **zip SHA-256:** `${{ needs.build.outputs.zip_sha256 }}`
-            - **release-evidence.tar.gz SHA-256:** `${{ needs.build.outputs.evidence_archive_sha256 }}`
+          ### Artifact hashes
+          - **tar.gz SHA-256:** `${{ needs.build.outputs.tar_sha256 }}`
+          - **zip SHA-256:** `${{ needs.build.outputs.zip_sha256 }}`
+          - **release-evidence.tar.gz SHA-256:** `${{ needs.build.outputs.evidence_archive_sha256 }}`
 
-            ### Verification
-            See [VERIFY-RELEASE.md](./VERIFY-RELEASE.md) for instructions on how to verify this release artifact.
+          ### Verification
+          See [VERIFY-RELEASE.md](./VERIFY-RELEASE.md) for instructions on how to verify this release artifact.
 
-            ```bash
-            # Verify artifact attestation
-            gh attestation verify dist/crabedence-${{ env.RELEASE_VERSION }}.tar.gz \
-              --repo ${{ github.repository }}
-            ```
+          ```bash
+          # Verify artifact attestation
+          gh attestation verify dist/crabedence-${{ env.RELEASE_VERSION }}.tar.gz \
+            --repo ${{ github.repository }}
+          ```
 
-            ### Qualification
-            All mandatory gates passed. See `qualification.json` for the exact gate count and per-gate status.
+          ### Qualification
+          All mandatory gates passed. See `qualification.json` for the exact gate count and per-gate status.
+          BODY_EOF
+          gh release create "$RELEASE_VERSION" --repo "${{ github.repository }}" \
+            --draft --prerelease --target "$COMMIT" \
+            --title "Crabedence ${RELEASE_VERSION}" --notes-file release-notes.md
           # The COMPLETE finalized evidence tree ships as one immutable
           # archive. Publishing a hand-maintained subset would leave the
           # published set unable to verify itself: SHA256SUMS references
           # every evidence file, so a partial upload cannot be checked.
-          files: |
-            dist/crabedence-${{ env.RELEASE_VERSION }}.tar.gz
-            dist/crabedence-${{ env.RELEASE_VERSION }}.tar.gz.sha256
-            dist/crabedence-${{ env.RELEASE_VERSION }}.zip
-            dist/crabedence-${{ env.RELEASE_VERSION }}.zip.sha256
-            dist/crabedence-${{ env.RELEASE_VERSION }}.bom.json
-            dist/crabedence-${{ env.RELEASE_VERSION }}.bom.json.sha256
-            dist/crabedence-${{ env.RELEASE_VERSION }}-release-evidence.tar.gz
-            dist/crabedence-${{ env.RELEASE_VERSION }}-release-evidence.tar.gz.sha256
+          gh release upload "$RELEASE_VERSION" --repo "${{ github.repository }}" --clobber \
+            "dist/crabedence-${RELEASE_VERSION}.tar.gz" \
+            "dist/crabedence-${RELEASE_VERSION}.tar.gz.sha256" \
+            "dist/crabedence-${RELEASE_VERSION}.zip" \
+            "dist/crabedence-${RELEASE_VERSION}.zip.sha256" \
+            "dist/crabedence-${RELEASE_VERSION}.bom.json" \
+            "dist/crabedence-${RELEASE_VERSION}.bom.json.sha256" \
+            "dist/crabedence-${RELEASE_VERSION}-release-evidence.tar.gz" \
+            "dist/crabedence-${RELEASE_VERSION}-release-evidence.tar.gz.sha256"
+          gh release edit "$RELEASE_VERSION" --repo "${{ github.repository }}" --draft=false
 
   # ─── Public reverify (distribution integrity) ────────────────────────
   # After publication, download the PUBLIC bytes and verify them against

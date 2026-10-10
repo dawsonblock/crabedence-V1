@@ -28,14 +28,19 @@ test("clean-room verification gates publication", () => {
 
   // Publication actions (tag push, release creation) exist only in the
   // publish job, so a failed clean-room verification cannot publish.
-  assert.doesNotMatch(job("build"), /git push origin|softprops\/action-gh-release/);
-  assert.doesNotMatch(cleanRoom, /git push origin|softprops\/action-gh-release/);
+  assert.doesNotMatch(job("build"), /git push origin|softprops\/action-gh-release|gh release create/);
+  assert.doesNotMatch(cleanRoom, /git push origin|softprops\/action-gh-release|gh release create/);
   // The tag push lives in the tested script the publish job delegates
   // to — the workflow must not carry its own tag/push logic.
   assert.match(publish, /scripts\/ensure-release-tag\.sh "\$RELEASE_VERSION" "\$COMMIT"/);
   const ensureTag = fs.readFileSync(path.join(repoRoot, "scripts/ensure-release-tag.sh"), "utf8");
   assert.match(ensureTag, /git push "\$REMOTE" "\$TAG"/);
-  assert.match(publish, /softprops\/action-gh-release@/);
+  // Publication is draft-first: assets attach only while the release is
+  // mutable, then the draft is published. Immutable-release repositories
+  // refuse asset upload to an already-published release.
+  assert.match(publish, /gh release create "\$RELEASE_VERSION"[^]*--draft --prerelease/);
+  assert.match(publish, /gh release upload "\$RELEASE_VERSION"/);
+  assert.match(publish, /gh release edit "\$RELEASE_VERSION"[^]*--draft=false/);
 });
 
 test("artifact attestations are created only after clean-room verification", () => {
@@ -121,7 +126,7 @@ test("the build job stages the exact bytes the clean room and publish consume", 
 
 test("the complete evidence bundle is a published release asset", () => {
   const publish = job("publish");
-  assert.match(publish, /dist\/crabedence-\$\{\{ env\.RELEASE_VERSION \}\}-release-evidence\.tar\.gz/);
+  assert.match(publish, /dist\/crabedence-\$\{RELEASE_VERSION\}-release-evidence\.tar\.gz/);
   // The partial allow-list is gone. SHA256SUMS covers every evidence file,
   // so publishing a subset leaves the published set unable to verify
   // itself — a consumer would hold a manifest referencing files that were
