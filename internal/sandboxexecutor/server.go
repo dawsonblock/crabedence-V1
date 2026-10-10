@@ -305,7 +305,45 @@ func (s *Server) Start() error {
 		s.cfg.EvidenceDir, evLog.SignerFingerprint())
 	s.acceptWg.Add(1)
 	go s.acceptLoop(listener)
+	// Surface unresolved backend work from previous lifetimes —
+	// audit-only, bounded, and never a re-dispatch or auto-destroy
+	// trigger.
+	s.acceptWg.Add(1)
+	go s.inspectUnresolved()
 	return nil
+}
+
+// inspectUnresolved reports every ambiguous or interrupted job's
+// backend handle against the live backend at startup: an orphaned
+// workload belongs in the audit log, not in an operator's memory.
+// It never re-dispatches and never destroys — a live handle is for a
+// human to reconcile.
+func (s *Server) inspectUnresolved() {
+	defer s.acceptWg.Done()
+	if s.cfg.Backend == nil {
+		return
+	}
+	jobs, err := s.ledger.ReconcileCandidates(64)
+	if err != nil {
+		s.audit("reconcile inspect failed: %v", err)
+		return
+	}
+	for _, j := range jobs {
+		ctx, cancel := context.WithTimeout(s.shutdown, 10*time.Second)
+		live, ierr := s.cfg.Backend.Inspect(ctx, j.BackendHandle)
+		cancel()
+		switch {
+		case ierr != nil:
+			s.audit("reconcile: job %s (%s) handle %s — inspect failed: %v", j.JobID, j.State, j.BackendHandle, ierr)
+		case live:
+			s.audit("reconcile: job %s (%s) backend %s handle %s is STILL RUNNING — operator must inspect/remove it (evidence preserved, never auto-destroyed)", j.JobID, j.State, j.BackendID, j.BackendHandle)
+		default:
+			s.audit("reconcile: job %s (%s) backend %s handle %s is gone", j.JobID, j.State, j.BackendID, j.BackendHandle)
+		}
+		if s.isStopped() {
+			return
+		}
+	}
 }
 
 // Stop shuts the server down in drain order: cancel monitors'
@@ -665,7 +703,7 @@ func (s *Server) serve(conn *net.UnixConn) {
 			// reconciles against the backend, never a blind relaunch.
 			_ = s.ledger.Transition(jobID, JobStateDispatchAmbig, []string{JobStateDispatching},
 				func(j *LedgerJob) error {
-					j.BackendHandle = handle
+					j.BackendID, j.BackendHandle = s.backendName, handle
 					j.Error = derr.Error()
 					return nil
 				})
@@ -686,7 +724,8 @@ func (s *Server) serve(conn *net.UnixConn) {
 			}
 			_ = s.ledger.Transition(jobID, JobStateDispatchFailed, []string{JobStateDispatching},
 				func(j *LedgerJob) error {
-					j.Error, j.BackendID, j.ReceiptSHA256 = derr.Error(), s.backendName, receiptSHA
+					j.Error, j.BackendID, j.BackendHandle, j.ReceiptSHA256 =
+						derr.Error(), s.backendName, handle, receiptSHA
 					return nil
 				})
 			s.checkpoint()

@@ -347,6 +347,50 @@ func TestReplayAcrossRestart(t *testing.T) {
 	}
 }
 
+// An interrupted or ambiguous job from a previous lifetime must
+// surface in the audit log at startup — the operator learns a handle
+// may still be live instead of discovering it manually.
+func TestReconcileInspectsUnresolvedHandles(t *testing.T) {
+	dir := socketDir(t)
+	key, keys := testAuthority(t)
+
+	// First lifetime: job reaches RUNNING, then the daemon stops —
+	// INTERRUPTED with a live-looking handle behind it.
+	be1 := &stubBackend{handle: "vm-orphan", wait: make(chan *ExecResult)}
+	srv1 := startServer(t, Config{SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys, Backend: be1})
+	conn, reader := connect(t, srv1.SocketPath())
+	resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV1) {
+		c.JobID, c.Nonce = "orphan-1", "orphan-n"
+	}))
+	conn.Close()
+	if resp.State != JobStateRunning {
+		t.Fatalf("dispatch state = %s", resp.State)
+	}
+	srv1.Stop()
+
+	// Second lifetime: the audit sink must capture the reconcile
+	// line reporting the handle as STILL RUNNING.
+	audits := make(chan string, 64)
+	sink := func(format string, args ...any) { audits <- fmt.Sprintf(format, args...) }
+	be2 := &stubBackend{live: true}
+	srv2 := startServer(t, Config{
+		SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys, Backend: be2, Audit: sink,
+	})
+	defer srv2.Stop()
+
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case line := <-audits:
+			if strings.Contains(line, "orphan-1") && strings.Contains(line, "STILL RUNNING") {
+				return
+			}
+		case <-deadline:
+			t.Fatal("reconcile never surfaced the orphaned handle")
+		}
+	}
+}
+
 // The operator ceiling is a hard bound on the authority's grant: a
 // validly-signed contract asking for more than the ceiling refuses.
 func TestCeilingRefusesOverBudgetContract(t *testing.T) {

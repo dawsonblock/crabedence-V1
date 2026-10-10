@@ -348,6 +348,7 @@ type stubBackend struct {
 	got    *JobContractV1
 	wait   chan *ExecResult
 	werr   error
+	live   bool
 }
 
 func (b *stubBackend) Dispatch(ctx context.Context, job *JobContractV1) (string, error) {
@@ -377,7 +378,7 @@ func (b *stubBackend) Wait(ctx context.Context, handle string) (*ExecResult, err
 }
 
 func (b *stubBackend) Inspect(ctx context.Context, handle string) (bool, error) {
-	return false, nil
+	return b.live, nil
 }
 
 func (b *stubBackend) Close() error { return nil }

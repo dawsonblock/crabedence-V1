@@ -464,6 +464,39 @@ func (l *Ledger) Get(jobID string) (*LedgerJob, error) {
 	return j, finishScan(j)
 }
 
+// ReconcileCandidates returns jobs whose backend outcome is
+// unresolved — DISPATCH_AMBIGUOUS (may or may not have launched) and
+// INTERRUPTED (definitely launched, result unknown) — newest first,
+// capped at limit. The startup pass inspects their handles against
+// the live backend so an orphaned workload surfaces in the audit log
+// instead of being discovered manually.
+func (l *Ledger) ReconcileCandidates(limit int) ([]*LedgerJob, error) {
+	if limit <= 0 {
+		limit = 64
+	}
+	rows, err := l.db.Query(
+		`SELECT `+jobColumns+` FROM jobs
+		 WHERE state IN (?, ?) AND backend_handle != ''
+		 ORDER BY seq DESC LIMIT ?`,
+		JobStateDispatchAmbig, JobStateInterrupted, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*LedgerJob
+	for rows.Next() {
+		j := &LedgerJob{}
+		if err := rows.Scan(scanFields(j)...); err != nil {
+			return nil, err
+		}
+		if err := finishScan(j); err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
 // Count reports the durable registry size.
 func (l *Ledger) Count() (int, error) {
 	var n int
