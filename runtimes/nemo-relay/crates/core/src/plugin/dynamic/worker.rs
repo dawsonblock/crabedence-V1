@@ -552,6 +552,7 @@ fn load_one_worker_plugin(
         host_endpoint: &host_advertise,
         worker_endpoint: &worker_advertise,
         worker_endpoint_file: worker_endpoint_file.as_deref(),
+        activation_dir: &activation_dir,
     })?);
     log::info!(
         target: "nemo_relay.worker",
@@ -1014,6 +1015,7 @@ struct WorkerProcessLaunch<'a> {
     host_endpoint: &'a str,
     worker_endpoint: &'a str,
     worker_endpoint_file: Option<&'a Path>,
+    activation_dir: &'a Path,
 }
 
 fn spawn_worker_process(spec: WorkerProcessLaunch<'_>) -> crate::plugin::Result<Child> {
@@ -1044,7 +1046,27 @@ fn spawn_worker_process(spec: WorkerProcessLaunch<'_>) -> crate::plugin::Result<
             (Command::new(entrypoint), command_display)
         }
     };
-    minimize_worker_environment(&mut command);
+    let worker_home = spec.activation_dir.join("home");
+    std::fs::create_dir_all(&worker_home).map_err(|err| {
+        PluginError::RegistrationFailed(format!(
+            "failed to create worker home {}: {err}",
+            worker_home.display()
+        ))
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(&worker_home, std::fs::Permissions::from_mode(0o700)).map_err(
+            |err| {
+                PluginError::RegistrationFailed(format!(
+                    "failed to secure worker home {}: {err}",
+                    worker_home.display()
+                ))
+            },
+        )?;
+    }
+    minimize_worker_environment(&mut command, &worker_home);
     command
         .current_dir(manifest_dir)
         .env("NEMO_RELAY_WORKER_ID", spec.activation_id)
@@ -1066,7 +1088,7 @@ fn spawn_worker_process(spec: WorkerProcessLaunch<'_>) -> crate::plugin::Result<
     })
 }
 
-fn minimize_worker_environment(command: &mut Command) {
+fn minimize_worker_environment(command: &mut Command, home: &Path) {
     const ALLOWLIST: &[&str] = &[
         "PATH",
         "SYSTEMROOT",
@@ -1083,6 +1105,20 @@ fn minimize_worker_environment(command: &mut Command) {
         .collect::<Vec<_>>();
     command.env_clear();
     command.envs(retained);
+    // The worker gets a per-activation synthetic home, not the operator's:
+    // `expanduser`, XDG lookups and platform home resolution land in the
+    // activation directory the lifecycle already cleans up, instead of
+    // rediscovering credential files under the real home.
+    command
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("APPDATA", home.join("AppData").join("Roaming"))
+        .env("LOCALAPPDATA", home.join("AppData").join("Local"))
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .env("XDG_DATA_HOME", home.join(".local").join("share"))
+        .env("XDG_STATE_HOME", home.join(".local").join("state"))
+        .env("XDG_RUNTIME_DIR", home.join(".run"));
 }
 
 fn resolve_python_executable(

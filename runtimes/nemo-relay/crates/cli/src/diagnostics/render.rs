@@ -24,6 +24,10 @@ pub(crate) fn exit_code(report: &DoctorReport) -> u8 {
         || matches!(report.configuration.global.status, Status::Fail)
         || matches!(report.configuration.system.status, Status::Fail)
         || matches!(report.configuration.plugin_resolution.status, Status::Fail)
+        || matches!(
+            report.configuration.native_plugin_isolation.status,
+            Status::Fail
+        )
         || matches!(report.configuration.resolution.status, Status::Fail);
     u8::from(any_fail)
 }
@@ -55,6 +59,10 @@ pub(super) fn report_has_warn(report: &DoctorReport) -> bool {
         || matches!(report.configuration.global.status, Status::Warn)
         || matches!(report.configuration.system.status, Status::Warn)
         || matches!(report.configuration.plugin_resolution.status, Status::Warn)
+        || matches!(
+            report.configuration.native_plugin_isolation.status,
+            Status::Warn
+        )
         || matches!(report.configuration.resolution.status, Status::Warn)
 }
 
@@ -166,6 +174,11 @@ pub(super) fn format_human_plugin_configuration(out: &mut String, report: &Docto
         "    Plugins    {} {}\n",
         format_status(report.configuration.plugin_resolution.status),
         report.configuration.plugin_resolution.details
+    ));
+    out.push_str(&format!(
+        "    Isolation  {} {}\n",
+        format_status(report.configuration.native_plugin_isolation.status),
+        report.configuration.native_plugin_isolation.details
     ));
     for plugin in &report.configuration.dynamic_plugins {
         for check in [

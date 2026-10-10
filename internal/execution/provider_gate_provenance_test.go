@@ -58,7 +58,7 @@ func TestProviderGateSaturationDoesNotResetHealth(t *testing.T) {
 	exec.SetProviderGate(gate)
 
 	gate.RecordAmbiguous(readDesc.AdapterID, "ambiguous outcome")
-	slot, err := gate.Acquire(readDesc.AdapterID)
+	slot, err := gate.Acquire(readDesc.AdapterID, LaneRead)
 	if err != nil {
 		t.Fatalf("occupy slot: %v", err)
 	}

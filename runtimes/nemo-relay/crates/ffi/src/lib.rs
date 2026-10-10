@@ -51,4 +51,5 @@ pub mod api;
 pub mod callable;
 pub mod convert;
 pub mod error;
+mod plugin_host_location;
 pub mod types;

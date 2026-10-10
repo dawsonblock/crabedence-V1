@@ -1800,6 +1800,17 @@ fn generated_mcp_config_check_for_platform(
     if let (Some(expected_server), Some(actual_server)) = (expected_server, actual_server) {
         expected_server.remove("env_vars");
         actual_server.remove("env_vars");
+        // The home-boundary literals a newer install writes are owned by
+        // runtime enforcement — their absence (older install) or stale
+        // values (moved home directory) do not make this manifest foreign,
+        // the same way previously-forwardable env_vars names are tolerated.
+        for server in [expected_server, actual_server] {
+            if let Some(env) = server.get_mut("env").and_then(Value::as_object_mut) {
+                for name in crate::mcp_environment::managed_home_literal_names() {
+                    env.remove(*name);
+                }
+            }
+        }
         if actual_without_vars == expected_without_vars {
             return Ok(format!("valid at {}", path.display()));
         }

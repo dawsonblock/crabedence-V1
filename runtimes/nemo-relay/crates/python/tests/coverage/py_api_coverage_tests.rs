@@ -93,6 +93,10 @@ impl Drop for CancellationSignal {
 
 #[test]
 fn safe_future_into_py_settles_rust_panics() {
+    crate::test_support::with_test_stack(safe_future_into_py_settles_rust_panics_inner);
+}
+
+fn safe_future_into_py_settles_rust_panics_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         with_event_loop(py, |event_loop| {
@@ -117,6 +121,10 @@ fn safe_future_into_py_settles_rust_panics() {
 
 #[test]
 fn safe_future_into_py_cancels_rust_work() {
+    crate::test_support::with_test_stack(safe_future_into_py_cancels_rust_work_inner);
+}
+
+fn safe_future_into_py_cancels_rust_work_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         let event_loop = test_loop(py, false);
@@ -144,6 +152,10 @@ fn safe_future_into_py_cancels_rust_work() {
 
 #[test]
 fn safe_future_into_py_skips_completion_on_closed_loop() {
+    crate::test_support::with_test_stack(safe_future_into_py_skips_completion_on_closed_loop_inner);
+}
+
+fn safe_future_into_py_skips_completion_on_closed_loop_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         let event_loop = test_loop(py, true);
@@ -178,6 +190,10 @@ fn safe_future_into_py_skips_completion_on_closed_loop() {
 
 #[test]
 fn py_api_helpers_and_scope_lifecycle_round_trip() {
+    crate::test_support::with_test_stack(py_api_helpers_and_scope_lifecycle_round_trip_inner);
+}
+
+fn py_api_helpers_and_scope_lifecycle_round_trip_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         let module = PyModule::new(py, "_py_api_cov").unwrap();
@@ -316,6 +332,10 @@ fn py_api_helpers_and_scope_lifecycle_round_trip() {
 
 #[test]
 fn py_api_execute_and_registry_paths_cover_global_and_scope_local_features() {
+    crate::test_support::with_test_stack(py_api_execute_and_registry_paths_cover_global_and_scope_local_features_inner);
+}
+
+fn py_api_execute_and_registry_paths_cover_global_and_scope_local_features_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         let helpers = load_module(
@@ -1173,6 +1193,10 @@ async def run_stream(api, request, func, collector, finalizer, handle, attribute
 
 #[test]
 fn to_py_err_and_forward_stream_to_channel_cover_private_helpers() {
+    crate::test_support::with_test_stack(to_py_err_and_forward_stream_to_channel_cover_private_helpers_inner);
+}
+
+fn to_py_err_and_forward_stream_to_channel_cover_private_helpers_inner() {
     let _python = crate::test_support::init_python_test();
     let err = to_py_err(nemo_relay::error::FlowError::Internal("boom".into()));
     assert!(err.to_string().contains("boom"));
@@ -1197,6 +1221,10 @@ fn to_py_err_and_forward_stream_to_channel_cover_private_helpers() {
 
 #[test]
 fn synchronous_middleware_bridge_avoids_tokio_runtime_reentry() {
+    crate::test_support::with_test_stack(synchronous_middleware_bridge_avoids_tokio_runtime_reentry_inner);
+}
+
+fn synchronous_middleware_bridge_avoids_tokio_runtime_reentry_inner() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1209,6 +1237,10 @@ fn synchronous_middleware_bridge_avoids_tokio_runtime_reentry() {
 
 #[test]
 fn llm_execution_uses_all_response_codec_selection_paths() {
+    crate::test_support::with_test_stack(llm_execution_uses_all_response_codec_selection_paths_inner);
+}
+
+fn llm_execution_uses_all_response_codec_selection_paths_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         let helpers = load_module(

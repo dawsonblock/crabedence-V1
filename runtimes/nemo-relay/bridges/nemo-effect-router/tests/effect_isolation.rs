@@ -97,6 +97,51 @@ fn no_consequential_effect_reaches_the_local_backend() {
 }
 
 #[test]
+fn the_direct_route_crosses_the_socket_not_the_local_backend() {
+    // DIRECT-pinned reads are the approved non-durable read path: they cross
+    // to the service, which resolves its own read route. The local backend
+    // never sees them, and the decision is kernel-crossing even though the
+    // effect is observational.
+    let router = router(catalog_for(legal_registry()));
+    for id in ["pure.direct", "read.direct"] {
+        let decision = router.decide(id).expect("registered");
+        assert_eq!(decision, RouteDecision::Direct, "{id}");
+        assert!(
+            decision.crosses_the_kernel(),
+            "{id}: DIRECT must leave the process"
+        );
+        let request = request_for(id, class_of(id));
+        router.execute(&request).expect("dispatched");
+    }
+    assert_eq!(router.kernel().calls(), 2);
+    assert_eq!(
+        router.local().calls(),
+        0,
+        "a DIRECT-pinned capability must not execute in-process"
+    );
+}
+
+#[test]
+fn a_consequential_direct_pin_fails_closed() {
+    // Registration refuses DIRECT for MUTATION/CRITICAL; a snapshot that
+    // somehow carried it must not dispatch down the non-durable route.
+    let router = router(catalog_for(json!([
+        descriptor("sneaky.mutation", "MUTATION", "DIRECT"),
+        descriptor("sneaky.critical", "CRITICAL", "DIRECT"),
+    ])));
+    for (id, class) in [
+        ("sneaky.mutation", ExecutionClass::Mutation),
+        ("sneaky.critical", ExecutionClass::Critical),
+    ] {
+        let request = request_for(id, class);
+        let error = router.execute(&request).expect_err("must fail closed");
+        assert_eq!(error.code, "EXECUTION_ROUTE_MISMATCH", "{id}");
+    }
+    assert_eq!(router.local().calls(), 0);
+    assert_eq!(router.kernel().calls(), 0);
+}
+
+#[test]
 fn only_pure_capabilities_reach_the_local_backend() {
     let router = router(catalog_for(legal_registry()));
     let request = request_for("pure.local", ExecutionClass::Pure);

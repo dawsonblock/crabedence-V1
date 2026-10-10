@@ -618,3 +618,175 @@ jobs:
           # The sdist carries no bundled host — the host arrives with the wheel —
           # so this installation must refuse rather than search beside the process.
           just verify-installed-python-plugin "${RUNNER_TEMP}/nemo-relay-sdist-venv/bin/python" refused
+
+  # The linux-amd64 wheel's installed-artifact proof lives in the
+  # source-and-plugin lane above. These lanes run the same check against the
+  # wheels every other packaged platform ships: Windows carries the runtime
+  # alone — the isolated runtime is not implemented there — so the matrix
+  # covers every platform whose wheel carries a plugin host.
+  InstalledArtifact:
+    name: Installed wheel hosts a plugin (${{ matrix.platform }})
+    needs: [Package]
+    if: ${{ inputs.run_package && !cancelled() && needs.Package.result == 'success' }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+          - platform: macos-arm64
+            runner: macos-15
+    steps:
+      - name: Remove untrusted Homebrew tap
+        if: ${{ runner.os == 'macOS' }}
+        run: |
+          if [ -d "$(brew --repository aws/tap)" ]; then
+            brew untap aws/tap
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Load CI tool versions
+        id: ci-config
+        uses: ./.github/actions/load-ci-tool-versions
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+          toolchain: ${{ steps.ci-config.outputs.rust_version }}
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: nemo-relay-rust-${{ matrix.platform }}-${{ steps.ci-config.outputs.rust_version }}-release
+          workspaces: . -> target
+          cache-all-crates: true
+          cache-bin: false
+          save-if: false
+
+      - uses: taiki-e/install-action@c070f87102a1c75b3183910f391c1cb887fe13c8 # v2.77.6
+        with:
+          tool: just@${{ steps.ci-config.outputs.just_version }}
+
+      - uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57 # v8
+        with:
+          version: ${{ steps.ci-config.outputs.uv_version }}
+          enable-cache: true
+          cache-dependency-glob: ${{ env.NEMO_RELAY_CI_WORKSPACE }}/uv.lock
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ steps.ci-config.outputs.default_python_version }}
+
+      - name: Download matching Python wheel artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: wheel-${{ matrix.platform }}
+          path: python-wheel/
+
+      - name: Build the native plugin fixture
+        run: just build-test-plugin-fixtures
+
+      - name: Prove the installed wheel hosts a native plugin out of process
+        run: |
+          set -euo pipefail
+          wheel="$(find python-wheel -maxdepth 1 -name '*.whl' -print -quit)"
+          test -n "$wheel"
+          uv venv --python "$(uv python find)" "${RUNNER_TEMP}/nemo-relay-installed-venv"
+          # SONAR_IGNORE_START: local wheel with no dependencies or index access.
+          uv pip install --python "${RUNNER_TEMP}/nemo-relay-installed-venv/bin/python" --no-deps --no-index "$wheel"
+          # SONAR_IGNORE_END
+          # Nothing in the environment names a host, so what runs the plugin is
+          # the host the wheel installed beside the interpreter.
+          just verify-installed-python-plugin "${RUNNER_TEMP}/nemo-relay-installed-venv/bin/python" runs
+
+  # The musllinux wheels host plugins under musl, so the same check runs inside
+  # the distribution's own libc: the fixture is built for the musl target on
+  # the runner, and the verify script — pure Python and stdlib — runs in the
+  # musllinux image the wheel was built in.
+  InstalledArtifactMusl:
+    name: Installed musllinux wheel hosts a plugin (${{ matrix.platform }})
+    needs: [Package]
+    if: ${{ inputs.run_package && !cancelled() && needs.Package.result == 'success' }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux-musl-amd64
+            runner: ubuntu-latest
+            rust_target: x86_64-unknown-linux-musl
+            container_image: quay.io/pypa/musllinux_1_2_x86_64@sha256:7b54360b191356838f6e41d4b9820c69be4f3d8dc8e7bca26f2684d48e5c8633
+          - platform: linux-musl-arm64
+            runner: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-musl
+            container_image: quay.io/pypa/musllinux_1_2_aarch64@sha256:274a947b4d5d745b56b868b0d052641e0798a652e3e65755987edf60547d1268
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Load CI tool versions
+        id: ci-config
+        uses: ./.github/actions/load-ci-tool-versions
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+          toolchain: ${{ steps.ci-config.outputs.rust_version }}
+
+      - name: Install the musl toolchain for the fixture
+        run: |
+          set -e
+          rustup target add ${{ matrix.rust_target }}
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 install -y musl-tools
+
+      - name: Build the native plugin fixture for musl
+        run: |
+          set -euo pipefail
+          cc_var="CC_$(printf '%s' "${{ matrix.rust_target }}" | tr '-' '_')"
+          export "$cc_var=musl-gcc"
+          cargo build --locked \
+            --manifest-path crates/core/tests/fixtures/native_plugin/Cargo.toml \
+            --target ${{ matrix.rust_target }} \
+            --target-dir target/test-plugin-fixtures-musl
+
+      - name: Download matching musllinux Python wheel artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: wheel-${{ matrix.platform }}
+          path: python-wheel/
+
+      - name: Prove the installed musllinux wheel hosts a native plugin out of process
+        env:
+          MUSLLINUX_IMAGE: ${{ matrix.container_image }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --volume "${{ github.workspace }}:${{ github.workspace }}" \
+            --workdir "${{ github.workspace }}" \
+            "$MUSLLINUX_IMAGE" \
+            /bin/sh -ec '
+              set -e
+              wheel="$(find python-wheel -maxdepth 1 -name "*.whl" -print -quit)"
+              test -n "$wheel"
+              fixture="$(find target/test-plugin-fixtures-musl -name "libnemo_relay_plugin_fixture.so" -print -quit)"
+              test -n "$fixture"
+              /opt/python/cp311-cp311/bin/python -m venv /tmp/nemo-relay-wheel-venv
+              /tmp/nemo-relay-wheel-venv/bin/python -m pip install --no-deps "$wheel"
+              /opt/python/cp311-cp311/bin/python scripts/verify-installed-python-plugin.py \
+                --python /tmp/nemo-relay-wheel-venv/bin/python \
+                --fixture "$fixture" --expect runs
+            '

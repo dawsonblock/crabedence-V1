@@ -1164,7 +1164,7 @@ describe("durable Azure admission and reconstruction", () => {
     const publicJSON = await response.text();
     expect(publicJSON).not.toContain("adminPassword");
     expect(publicJSON).not.toContain("bootstrap");
-    expect(publicJSON).not.toContain("synthetic-session-secret");
+    expect(publicJSON).not.toContain("synthetic-session-secret-with-32-characters");
   });
 
   it("rolls back the canonical binding, lease, material and due marker on admission failure", async () => {

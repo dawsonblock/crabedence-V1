@@ -41,11 +41,13 @@ evidence bundle self-checks (shasum -c SHA256SUMS)
     ↓
 final evidence manifest (covers artifact.json and every evidence file)
     ↓
+evidence-root.json (semantic root binding commit, source, gates, artifacts)
+    ↓
 registry policy identity (recomputed from the canonical envelope)
     ↓
-qualification.json (including the exact-toolchain gate)
+qualification.json + per-gate records (including the exact-toolchain gate)
     ↓
-source manifest (both extracted archives)
+source manifest (both extracted archives; also embedded in each)
     ↓
 normalized tar ↔ ZIP tree equivalence
 ```
@@ -55,8 +57,8 @@ normalized tar ↔ ZIP tree equivalence
 Each release includes `.sha256` files alongside the archives:
 
 ```bash
-# The release you are verifying (current candidate: 0.52.0-rc.1)
-VERSION=0.52.0-rc.1
+# The release you are verifying (current candidate: 0.54.0-rc.3)
+VERSION=0.54.0-rc.3
 
 sha256sum -c "crabedence-${VERSION}.tar.gz.sha256"
 sha256sum -c "crabedence-${VERSION}.zip.sha256"
@@ -92,7 +94,7 @@ object this artifact was qualified against:
 ```json
 {
   "schema_version": 2,
-  "release": "0.52.0-rc.1",
+  "release": "0.54.0-rc.3",
   "source": { "commit": "...", "tree": "...", "manifest_sha256": "..." },
   "artifact": { "filename": "...tar.gz", "sha256": "...", "size": 12345,
                 "zip_filename": "...zip", "zip_sha256": "...", "zip_size": 12345 },
@@ -189,10 +191,14 @@ if they do not.
 
 ## Step 6: Verify the source manifest (both archives)
 
-The source manifest is the release source **inventory**: it is derived from
-the Git HEAD tree — the same tree `git archive HEAD` packages — so it cannot
-diverge from the archive. Each record carries the Git mode, the object type,
-the SHA-256 of the exact bytes, and the path:
+The source manifest is the release source **inventory**: the packager builds
+it from the Git HEAD path set read as worktree bytes, so `eol`/`text`
+checkout smudges are preserved — it deliberately is not `git archive`
+output. The tracked-only provenance invariant backs it: every object the
+runtime provenance enumerates must be represented by the release commit, or
+the packager refuses before an archive exists — provenance content outside
+the commit can never form a valid source artifact. Each record carries the
+Git mode, the object type, the SHA-256 of the exact bytes, and the path:
 
 ```
 100644 file    <sha256>  README.md
@@ -220,7 +226,9 @@ mkdir -p tar-source zip-source
 tar xzf "crabedence-${VERSION}.tar.gz" -C tar-source
 unzip -q "crabedence-${VERSION}.zip" -d zip-source
 
-# Each tree must independently reproduce the manifest
+# Each tree must independently reproduce the manifest. The archive also
+# embeds a copy at release-evidence/source-tree-sha256.txt — either copy
+# may be used; both must agree.
 for tree in tar-source zip-source; do
   bash "${tree}/crabedence-${VERSION}/scripts/verify-source-manifest.sh" \
     evidence/source-tree-sha256.txt "${tree}/crabedence-${VERSION}"
@@ -240,6 +248,22 @@ bash "tar-source/crabedence-${VERSION}/scripts/compare-source-trees.sh" \
 ```
 
 It must print `identical inventories` and exit 0.
+
+### The shipped distribution suite (one command)
+
+Each archive carries the qualification suite that runs without Git —
+the same suite CI executes in its clean-room job. Running it against the
+extracted tree checks the embedded manifest, the release-path filename
+policy, symlinks, generated-content and build-input gates in one shot:
+
+```bash
+bash "tar-source/crabedence-${VERSION}/scripts/qualify-source-distribution.sh" \
+  "tar-source/crabedence-${VERSION}"
+```
+
+It must print `DISTRIBUTION QUALIFICATION: PASS` and exit 0. A `.git`
+directory inside the tree is refused, so the check can never silently
+depend on repository state.
 
 ## Step 7: Verify release invariants
 
@@ -326,6 +350,25 @@ gh attestation verify "crabedence-${VERSION}.bom.json" --repo dawsonblock/crabed
 gh attestation verify "crabedence-${VERSION}-release-evidence.tar.gz" --repo dawsonblock/crabedence-V1 --signer-workflow "$SIGNER"
 ```
 
+### The evidence root
+
+`SHA256SUMS` proves the bundle's bytes; `evidence-root.json` proves the
+bundle's *semantics* — it binds the source commit, the source-manifest and
+runtime digests, the registry digests, every gate record's log digest, and
+the finalized artifact digests by name, then reduces the whole closure to
+one `root_sha256`. The generator ships inside the archive and rebuilds
+every binding from the files, never trusting the stored document:
+
+```bash
+python3 "tar-source/crabedence-${VERSION}/scripts/generate-evidence-root.py" \
+  --verify evidence
+```
+
+It must print `evidence root: PASS` and exit 0. `qualification.json` is
+the record of the run; the per-gate records under `gates/` and the hashed
+logs under `logs/` are what `FINAL_QUALIFICATION_REPORT.md` renders — the
+Markdown is a view of the JSON, never the source of truth.
+
 ### Registry policy identity
 
 The release binds the exact capability policy it was qualified against.
@@ -344,6 +387,48 @@ All three values must be equal — qualified policy = released policy. The
 running service prints the same digest in its startup report and exports
 it in `capabilities.json` next to its socket, completing the chain:
 qualified = released = runtime.
+
+## The NEMO distribution
+
+The `nemo-control_<version>_<target>` artifact family is verified the same
+way, against its own proof chain:
+
+```bash
+# 1. The checksum manifest's SSH signature (signed under the maintainer's
+#    release key in the nemo-control-release namespace)
+ssh-keygen -Y verify -f .github/release-allowed-signers \
+  -I dawsonblock@users.noreply.github.com -n nemo-control-release \
+  -s nemo-control_<version>_SHA256SUMS.sig \
+  < nemo-control_<version>_SHA256SUMS
+
+# 2. The tarball's digest against that authenticated manifest
+shasum -a 256 -c nemo-control_<version>_SHA256SUMS \
+  --ignore-missing 2>/dev/null || grep "<target>.tar.gz" \
+  nemo-control_<version>_SHA256SUMS | shasum -a 256 -c -
+
+# 3. Unpack and verify the release root — the component manifest against
+#    every shipped byte (exhaustive: an undeclared file fails), plus its own
+#    release signature over manifests/component-manifest.sha256. The
+#    extractor preflights members and writes only in-directory regular
+#    files, so the tarball cannot place content outside its destination.
+mkdir -p unpack
+go run ./cmd/nemo-archive-extract \
+  -archive nemo-control_<version>_<target>.tar.gz -dest unpack
+go run ./cmd/nemo-component-manifest \
+  -root unpack/nemo-control_<version>_<target> -verify \
+  -allowed-signers .github/release-allowed-signers \
+  -signer-identity dawsonblock@users.noreply.github.com
+
+# 4. The qualification attestation binds this archive's digest and records
+#    only passing gates
+jq -e '.subject.archive_sha256 ==
+  ("'"$(shasum -a 256 nemo-control_<version>_<target>.tar.gz | cut -d' ' -f1)"'")
+  and ([.gates[].result] | all(. == "pass"))' \
+  nemo-control_<version>_<target>.tar.gz.qualification.json
+```
+
+An unsigned `SHA256SUMS` or missing `.sig` means the artifact did not come
+through the release signing step — treat it as unqualified for release use.
 
 ## Summary
 

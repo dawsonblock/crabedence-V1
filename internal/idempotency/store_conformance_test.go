@@ -481,6 +481,34 @@ func TestStoreConformanceLocatorPolicy(t *testing.T) {
 		if err := s.MarkInFlight(ctx, rec.ExecutionID, acq.LeaseToken, acq.Generation, "prov", deny); !errors.Is(err, LocatorContainsSecret) {
 			t.Fatalf("want LocatorContainsSecret, got %v", err)
 		}
+		// Credential-shaped material must not persist under a benign key
+		// — the scan covers values, nesting, arrays, and JSON-encoded
+		// strings, not just key names.
+		adversarial := map[string]json.RawMessage{
+			"pat under benign key":       json.RawMessage(`{"repo":"ghp_` + strings.Repeat("a", 34) + `"}`),
+			"nested slack token":         json.RawMessage(`{"meta":{"note":"xoxb-123456789012"}}`),
+			"bearer token in array":      json.RawMessage(`{"tags":["run-1","Bearer ` + strings.Repeat("b", 24) + `"]}`),
+			"denied key in encoded JSON": json.RawMessage(`{"data":"{\"password\":\"hunter2\"}"}`),
+			"dsn with password":          json.RawMessage(`{"endpoint":"postgres://user:pw@db.internal/app"}`),
+			"jwt value":                  json.RawMessage(`{"ref":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5x_MK1gjtjY5FH_pz3S4538"}`),
+		}
+		for name, locator := range adversarial {
+			if err := s.MarkInFlight(ctx, rec.ExecutionID, acq.LeaseToken, acq.Generation, "prov", locator); !errors.Is(err, LocatorContainsSecret) {
+				t.Fatalf("%s: want LocatorContainsSecret, got %v", name, err)
+			}
+		}
+		// Legitimate lookup metadata — ids, names, digests, correlation
+		// tokens — is not credential-shaped and persists.
+		legit := json.RawMessage(`{"repo":"example/repo","owner":"alice@example.com","run_id":"run-42","external_token":"crabex-op-0123456789abcdef","ref":"main","issue":123,"labels":["bug","ci"],"digest":"` + strings.Repeat("0", 64) + `"}`)
+		if err := s.MarkInFlight(ctx, rec.ExecutionID, acq.LeaseToken, acq.Generation, "prov", legit); err != nil {
+			t.Fatalf("legitimate locator rejected: %v", err)
+		}
+		// MarkInFlight succeeded — re-arm for the redactor section.
+		acq, _ = s.Acquire(ctx, "k1b", "alice", "cap.mut", digest, "", "MUTATION", 5*time.Minute)
+		rec = acq.Record
+		if err := s.BeginExecution(ctx, rec.ExecutionID, acq.LeaseToken, acq.Generation); err != nil {
+			t.Fatalf("begin: %v", err)
+		}
 		// Redactor strips the denied field before the scan.
 		s.SetLocatorRedactor(func(raw json.RawMessage) (json.RawMessage, error) {
 			return json.RawMessage(`{"external_token":"tok"}`), nil
@@ -819,6 +847,335 @@ func TestStoreConformanceReconciliationBacklog(t *testing.T) {
 		pending, oldest, err = s.ReconciliationBacklog(ctx)
 		if err != nil || pending != 0 || oldest != nil {
 			t.Fatalf("drained backlog: pending=%d oldest=%v err=%v", pending, oldest, err)
+		}
+	})
+}
+
+// TestStoreConformanceMediationPersistence covers the middleware-
+// provenance column: AcquireWithMediation persists the caller-declared
+// middleware, plugin, and activation identities on the durable record, Lookup reads it back on
+// every read path, and a request that crossed no middleware boundary
+// stores NULL — the record carries no claim it cannot prove.
+func TestStoreConformanceMediationPersistence(t *testing.T) {
+	eachEffectStore(t, func(t *testing.T, s EffectStore) {
+		ctx := context.Background()
+		mediation := &MediationBinding{
+			MiddlewareSetDigest:    "aa55",
+			OriginalArgsDigest:     "bb66",
+			ReleaseRootDigest:      "cc77",
+			PluginManifestSHA256:   "dd99",
+			PluginLibrarySHA256:    "ee11",
+			ActivationConfigSHA256: "ff22",
+		}
+		digest := confDigest("alice", "cap.mut", `{"q":"x"}`)
+		acq, err := s.AcquireWithMediation(ctx, "k1", "alice", "cap.mut", digest,
+			AuthorityBinding{Ref: "grant-1"}, mediation, "MUTATION", 5*time.Minute)
+		if err != nil || acq.Kind != LeaseAcquired {
+			t.Fatalf("acquire: %v kind=%v", err, acq.Kind)
+		}
+		rec := acq.Record
+		var stored MediationBinding
+		if err := json.Unmarshal(rec.RequestMediation, &stored); err != nil {
+			t.Fatalf("record mediation is not the stored object: %v (%q)", err, rec.RequestMediation)
+		}
+		if stored != *mediation {
+			t.Fatalf("acquired record mediation = %+v, want %+v", stored, *mediation)
+		}
+
+		// The read path preserves it — Lookup and LookupByKey agree.
+		looked, err := s.Lookup(ctx, rec.ExecutionID)
+		if err != nil {
+			t.Fatalf("lookup: %v", err)
+		}
+		var lookedMediation MediationBinding
+		if err := json.Unmarshal(looked.RequestMediation, &lookedMediation); err != nil {
+			t.Fatalf("lookup mediation decode: %v", err)
+		}
+		if lookedMediation != *mediation {
+			t.Fatalf("looked-up mediation = %+v, want %+v", lookedMediation, *mediation)
+		}
+		byKey, err := s.LookupByKey(ctx, "alice", "cap.mut", "k1")
+		if err != nil {
+			t.Fatalf("lookup by key: %v", err)
+		}
+		if string(byKey.RequestMediation) != string(rec.RequestMediation) {
+			t.Fatalf("lookup-by-key mediation = %s, want %s", byKey.RequestMediation, rec.RequestMediation)
+		}
+
+		// A request with no mediation carries NULL — the record does
+		// not fabricate provenance it was never given.
+		acq2, err := s.AcquireWithAuthority(ctx, "k2", "alice", "cap.mut",
+			confDigest("alice", "cap.mut", `{"q":"y"}`), AuthorityBinding{}, "MUTATION", 5*time.Minute)
+		if err != nil || acq2.Kind != LeaseAcquired {
+			t.Fatalf("unmediated acquire: %v kind=%v", err, acq2.Kind)
+		}
+		if len(acq2.Record.RequestMediation) != 0 {
+			t.Fatalf("unmediated record carries mediation %s", acq2.Record.RequestMediation)
+		}
+		plain, _ := s.Lookup(ctx, acq2.Record.ExecutionID)
+		if len(plain.RequestMediation) != 0 {
+			t.Fatalf("unmediated lookup carries mediation %s", plain.RequestMediation)
+		}
+	})
+}
+
+// TestStoreConformanceAttestationPersistence covers the server-
+// verified runtime-provenance columns: AcquireWithProvenance persists
+// the attested session, identity digest, and key fingerprint on the
+// durable record, every read path returns them, an unattested request
+// stores NULLs, and the binding is NOT part of the request identity —
+// a replayed request under a different attested session resolves to
+// the same record rather than a conflict.
+func TestStoreConformanceAttestationPersistence(t *testing.T) {
+	eachEffectStore(t, func(t *testing.T, s EffectStore) {
+		ctx := context.Background()
+		att := &AttestationBinding{
+			SessionID:      "rts-7f3a",
+			IdentityDigest: "aa11bb22",
+			KeyFingerprint: "cc33dd44",
+		}
+		digest := confDigest("alice", "cap.mut", `{"q":"x"}`)
+		var peerUID, peerPID int64 = 501, 4242
+		peer := &PeerBinding{UID: &peerUID, PID: &peerPID, Executable: "/usr/local/bin/nemo-relay"}
+		acq, err := s.AcquireWithProvenance(ctx, "k-att", "alice", "cap.mut", digest,
+			AcquireProvenance{Authority: AuthorityBinding{Ref: "grant-1"}, Attestation: att, Peer: peer},
+			"MUTATION", 5*time.Minute)
+		if err != nil || acq.Kind != LeaseAcquired {
+			t.Fatalf("acquire: %v kind=%v", err, acq.Kind)
+		}
+		rec := acq.Record
+		if rec.AttestedSessionID != att.SessionID ||
+			rec.RuntimeIdentityDigest != att.IdentityDigest ||
+			rec.RuntimeKeyFingerprint != att.KeyFingerprint {
+			t.Fatalf("acquired record attestation = %+v, want %+v",
+				[]string{rec.AttestedSessionID, rec.RuntimeIdentityDigest, rec.RuntimeKeyFingerprint}, att)
+		}
+		if rec.PeerUID == nil || *rec.PeerUID != peerUID ||
+			rec.PeerPID == nil || *rec.PeerPID != peerPID ||
+			rec.PeerExecutable != peer.Executable {
+			t.Fatalf("acquired record peer evidence = uid:%v pid:%v exe:%q",
+				rec.PeerUID, rec.PeerPID, rec.PeerExecutable)
+		}
+
+		looked, err := s.Lookup(ctx, rec.ExecutionID)
+		if err != nil {
+			t.Fatalf("lookup: %v", err)
+		}
+		if looked.AttestedSessionID != att.SessionID ||
+			looked.RuntimeIdentityDigest != att.IdentityDigest ||
+			looked.RuntimeKeyFingerprint != att.KeyFingerprint {
+			t.Fatalf("looked-up attestation does not match the stored binding")
+		}
+		byKey, err := s.LookupByKey(ctx, "alice", "cap.mut", "k-att")
+		if err != nil {
+			t.Fatalf("lookup by key: %v", err)
+		}
+		if byKey.AttestedSessionID != att.SessionID {
+			t.Fatalf("lookup-by-key session = %q, want %q", byKey.AttestedSessionID, att.SessionID)
+		}
+		if byKey.PeerUID == nil || *byKey.PeerUID != peerUID || byKey.PeerExecutable != peer.Executable {
+			t.Fatalf("lookup-by-key peer evidence does not match the stored binding")
+		}
+
+		// The binding is provenance, not identity: re-acquiring the same
+		// request under a DIFFERENT attested session is a lease
+		// interaction on the same record, never an idempotency
+		// conflict.
+		acq2, err := s.AcquireWithProvenance(ctx, "k-att", "alice", "cap.mut", digest,
+			AcquireProvenance{
+				Authority:   AuthorityBinding{Ref: "grant-1"},
+				Attestation: &AttestationBinding{SessionID: "rts-9c1d", IdentityDigest: "ee55", KeyFingerprint: "ff66"},
+			}, "MUTATION", 5*time.Minute)
+		if err != nil {
+			t.Fatalf("re-acquire under new session: %v", err)
+		}
+		if acq2.Kind == IdempotencyConflict {
+			t.Fatal("a re-attested session must not reinterpret the request identity")
+		}
+
+		// An unattested request stores NULLs — the record carries no
+		// runtime claim it cannot prove.
+		acq3, err := s.AcquireWithProvenance(ctx, "k-plain", "alice", "cap.mut",
+			confDigest("alice", "cap.mut", `{"q":"y"}`),
+			AcquireProvenance{Authority: AuthorityBinding{}}, "MUTATION", 5*time.Minute)
+		if err != nil || acq3.Kind != LeaseAcquired {
+			t.Fatalf("unattested acquire: %v kind=%v", err, acq3.Kind)
+		}
+		if acq3.Record.AttestedSessionID != "" || acq3.Record.RuntimeIdentityDigest != "" || acq3.Record.RuntimeKeyFingerprint != "" {
+			t.Fatalf("unattested record carries runtime provenance it was never given")
+		}
+		if acq3.Record.PeerUID != nil || acq3.Record.PeerPID != nil || acq3.Record.PeerExecutable != "" {
+			t.Fatalf("unattested record carries peer evidence it was never given")
+		}
+		plain, _ := s.Lookup(ctx, acq3.Record.ExecutionID)
+		if plain.AttestedSessionID != "" || plain.RuntimeIdentityDigest != "" || plain.RuntimeKeyFingerprint != "" {
+			t.Fatalf("unattested lookup carries runtime provenance it was never given")
+		}
+		if plain.PeerUID != nil || plain.PeerPID != nil || plain.PeerExecutable != "" {
+			t.Fatalf("unattested lookup carries peer evidence it was never given")
+		}
+
+		// A root (uid 0) peer round-trips as 0 — distinguishable from a
+		// record whose platform cannot supply the UID at all (NULL).
+		rootUID := int64(0)
+		acq4, err := s.AcquireWithProvenance(ctx, "k-root", "alice", "cap.mut",
+			confDigest("alice", "cap.mut", `{"q":"z"}`),
+			AcquireProvenance{Peer: &PeerBinding{UID: &rootUID}},
+			"MUTATION", 5*time.Minute)
+		if err != nil || acq4.Kind != LeaseAcquired {
+			t.Fatalf("root-peer acquire: %v kind=%v", err, acq4.Kind)
+		}
+		if acq4.Record.PeerUID == nil || *acq4.Record.PeerUID != 0 || acq4.Record.PeerPID != nil {
+			t.Fatalf("root peer evidence = uid:%v pid:%v — uid 0 must round-trip, absent pid stays NULL",
+				acq4.Record.PeerUID, acq4.Record.PeerPID)
+		}
+	})
+}
+
+// TestStoreConformanceMigrateRequestDigest covers the migrate-on-touch
+// contract on every engine: a record still storing a legacy
+// (pre-descriptor) digest is rewritten to the descriptor-bound identity
+// exactly once, and only while the stored digest still equals the
+// caller's recomputation, no live lease protects the record, and the
+// stored mediation equals the caller's.
+func TestStoreConformanceMigrateRequestDigest(t *testing.T) {
+	eachEffectStore(t, func(t *testing.T, s EffectStore) {
+		ctx := context.Background()
+		legacy := confDigest("alice", "cap.mut", `{"x":1}`)
+		bound := confDigest("alice", "cap.mut", `{"x":1}`) + "-descriptor-bound"
+
+		// ── Terminal record: migrates, then replays under the new digest.
+		acq, err := s.AcquireWithAuthority(ctx, "mig-terminal", "alice", "cap.mut", legacy,
+			AuthorityBinding{Ref: "g1"}, "MUTATION", 5*time.Minute)
+		if err != nil || acq.Kind != LeaseAcquired {
+			t.Fatalf("acquire terminal: %v kind=%v", err, acq.Kind)
+		}
+		rec := acq.Record
+		if err := s.BeginExecution(ctx, rec.ExecutionID, acq.LeaseToken, acq.Generation); err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		if err := s.MarkInFlight(ctx, rec.ExecutionID, acq.LeaseToken, acq.Generation, "prov", nil); err != nil {
+			t.Fatalf("in-flight: %v", err)
+		}
+		receipt := confReceipt(rec.ExecutionID, "cap.mut", "alice", legacy, "prov", "run-mig", StateCommitted)
+		if err := s.Finalize(ctx, rec.ExecutionID, acq.LeaseToken, acq.Generation, StateInFlight, receipt); err != nil {
+			t.Fatalf("finalize: %v", err)
+		}
+
+		// A wrong expected digest never migrates.
+		ok, err := s.MigrateRequestDigest(ctx, rec.ExecutionID, "not-the-legacy-digest", bound, nil)
+		if err != nil || ok {
+			t.Fatalf("wrong-digest migration: ok=%v err=%v", ok, err)
+		}
+		ok, err = s.MigrateRequestDigest(ctx, rec.ExecutionID, legacy, bound, nil)
+		if err != nil || !ok {
+			t.Fatalf("migration: ok=%v err=%v", ok, err)
+		}
+		stored, err := s.Lookup(ctx, rec.ExecutionID)
+		if err != nil {
+			t.Fatalf("lookup: %v", err)
+		}
+		if stored.RequestDigest != bound || stored.DigestVersion != DigestVersionDescriptorBound {
+			t.Fatalf("migrated record digest=%q version=%d, want %q / %d",
+				stored.RequestDigest, stored.DigestVersion, bound, DigestVersionDescriptorBound)
+		}
+		// The migration is on the forensic ledger.
+		events, err := s.ListEffectEvents(ctx, rec.ExecutionID)
+		if err != nil {
+			t.Fatalf("events: %v", err)
+		}
+		sawMigrated := false
+		for _, ev := range events {
+			if ev.EventType == EventDigestMigrated {
+				sawMigrated = true
+			}
+		}
+		if !sawMigrated {
+			t.Fatal("DIGEST_MIGRATED event missing")
+		}
+		// Already migrated — a second attempt can never match.
+		ok, err = s.MigrateRequestDigest(ctx, rec.ExecutionID, legacy, bound+"-again", nil)
+		if err != nil || ok {
+			t.Fatalf("re-migration must fail: ok=%v err=%v", ok, err)
+		}
+		// The record now answers under the bound identity.
+		replay, err := s.AcquireWithAuthority(ctx, "mig-terminal", "alice", "cap.mut", bound,
+			AuthorityBinding{Ref: "g1"}, "MUTATION", 5*time.Minute)
+		if err != nil || replay.Kind != TerminalReplay {
+			t.Fatalf("post-migration replay: %v kind=%v", err, replay.Kind)
+		}
+		// And under the legacy identity it now conflicts — the window is closed.
+		conflict, err := s.AcquireWithAuthority(ctx, "mig-terminal", "alice", "cap.mut", legacy,
+			AuthorityBinding{Ref: "g1"}, "MUTATION", 5*time.Minute)
+		if err != nil || conflict.Kind != IdempotencyConflict {
+			t.Fatalf("post-migration legacy acquire must conflict: %v kind=%v", err, conflict.Kind)
+		}
+
+		// ── Live lease: migration refused; the record keeps its identity.
+		acq2, err := s.AcquireWithAuthority(ctx, "mig-held", "alice", "cap.mut", legacy,
+			AuthorityBinding{}, "MUTATION", 5*time.Minute)
+		if err != nil || acq2.Kind != LeaseAcquired {
+			t.Fatalf("acquire held: %v kind=%v", err, acq2.Kind)
+		}
+		ok, err = s.MigrateRequestDigest(ctx, acq2.Record.ExecutionID, legacy, bound, nil)
+		if err != nil || ok {
+			t.Fatalf("live-lease migration must fail: ok=%v err=%v", ok, err)
+		}
+		held, _ := s.Lookup(ctx, acq2.Record.ExecutionID)
+		if held.RequestDigest != legacy {
+			t.Fatalf("held record digest rewritten: %s", held.RequestDigest)
+		}
+
+		// ── Expired lease: migrates; the next acquire reclaims under the
+		// bound identity and can finalize against it.
+		acq3, err := s.AcquireWithAuthority(ctx, "mig-expired", "alice", "cap.mut", legacy,
+			AuthorityBinding{}, "MUTATION", 5*time.Minute)
+		if err != nil || acq3.Kind != LeaseAcquired {
+			t.Fatalf("acquire expired: %v kind=%v", err, acq3.Kind)
+		}
+		expireLeaseForTest(t, s, acq3.Record.ExecutionID)
+		ok, err = s.MigrateRequestDigest(ctx, acq3.Record.ExecutionID, legacy, bound, nil)
+		if err != nil || !ok {
+			t.Fatalf("expired-lease migration: ok=%v err=%v", ok, err)
+		}
+		reAcq, err := s.AcquireWithAuthority(ctx, "mig-expired", "alice", "cap.mut", bound,
+			AuthorityBinding{}, "MUTATION", 5*time.Minute)
+		if err != nil || !reAcq.Acquired() {
+			t.Fatalf("post-migration reclaim: %v kind=%v", err, reAcq.Kind)
+		}
+		if err := s.BeginExecution(ctx, acq3.Record.ExecutionID, reAcq.LeaseToken, reAcq.Generation); err != nil {
+			t.Fatalf("begin after reclaim: %v", err)
+		}
+		if err := s.MarkInFlight(ctx, acq3.Record.ExecutionID, reAcq.LeaseToken, reAcq.Generation, "prov", nil); err != nil {
+			t.Fatalf("in-flight after reclaim: %v", err)
+		}
+		migReceipt := confReceipt(acq3.Record.ExecutionID, "cap.mut", "alice", bound, "prov", "run-mig-2", StateCommitted)
+		if err := s.Finalize(ctx, acq3.Record.ExecutionID, reAcq.LeaseToken, reAcq.Generation, StateInFlight, migReceipt); err != nil {
+			t.Fatalf("finalize under migrated identity: %v", err)
+		}
+
+		// ── Mediation must match: a record carrying middleware provenance
+		// cannot be re-identified by a caller asserting different or no
+		// mediation.
+		med := &MediationBinding{MiddlewareSetDigest: "mw-1", PluginManifestSHA256: "pm-1"}
+		other := &MediationBinding{MiddlewareSetDigest: "mw-2", PluginManifestSHA256: "pm-2"}
+		acq4, err := s.AcquireWithMediation(ctx, "mig-med", "alice", "cap.mut", legacy,
+			AuthorityBinding{}, med, "MUTATION", 5*time.Minute)
+		if err != nil || acq4.Kind != LeaseAcquired {
+			t.Fatalf("acquire mediated: %v kind=%v", err, acq4.Kind)
+		}
+		expireLeaseForTest(t, s, acq4.Record.ExecutionID)
+		ok, err = s.MigrateRequestDigest(ctx, acq4.Record.ExecutionID, legacy, bound, nil)
+		if err != nil || ok {
+			t.Fatalf("mediation drop must fail: ok=%v err=%v", ok, err)
+		}
+		ok, err = s.MigrateRequestDigest(ctx, acq4.Record.ExecutionID, legacy, bound, other)
+		if err != nil || ok {
+			t.Fatalf("mediation mismatch must fail: ok=%v err=%v", ok, err)
+		}
+		ok, err = s.MigrateRequestDigest(ctx, acq4.Record.ExecutionID, legacy, bound, med)
+		if err != nil || !ok {
+			t.Fatalf("matching mediation must migrate: ok=%v err=%v", ok, err)
 		}
 	})
 }

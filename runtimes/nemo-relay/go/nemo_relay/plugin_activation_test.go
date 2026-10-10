@@ -624,6 +624,59 @@ func TestInitializeWithDynamicPluginsLoadsNativePluginThroughCgo(t *testing.T) {
 	assertMissingNativePluginFails(t)
 }
 
+// A deployment that vendors the FFI artifact — the library with the plugin
+// host beside it — names no host at all: the library resolves its own
+// directory rather than searching beside whichever process loaded it. The
+// checkout's target directory is that same layout, so unsetting the override
+// proves the resolution rather than assuming it.
+func TestInitializeWithDynamicPluginsFindsHostBesideFfiLibrary(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("native plugin process isolation is unsupported on windows")
+	}
+	previous, had := os.LookupEnv("NEMO_RELAY_PLUGIN_HOST")
+	if err := os.Unsetenv("NEMO_RELAY_PLUGIN_HOST"); err != nil {
+		t.Fatalf("Unsetenv(NEMO_RELAY_PLUGIN_HOST) error = %v", err)
+	}
+	t.Cleanup(func() {
+		if had {
+			if err := os.Setenv("NEMO_RELAY_PLUGIN_HOST", previous); err != nil {
+				t.Errorf("restore NEMO_RELAY_PLUGIN_HOST error = %v", err)
+			}
+		}
+	})
+	t.Setenv("NEMO_RELAY_TEST_SKIP_IMPLICIT_CONFIG", "")
+	if err := ClearPluginConfiguration(); err != nil {
+		t.Fatalf(clearConfigurationErrorFmt, err)
+	}
+	library := goNativePluginFixture(t)
+	manifest := writeGoNativePluginManifest(t, library)
+	pluginsTOML := configureNativePluginUserConfig(t)
+	staticRegistrations, staticCallbacks := registerStaticFixturePlugin(t)
+
+	activation, report, err := InitializeWithDynamicPlugins(NewPluginConfig(), []DynamicPluginActivationSpec{{
+		PluginID:    "fixture_native",
+		Kind:        DynamicPluginKindRustDynamic,
+		ManifestRef: manifest,
+		Config:      map[string]any{},
+	}})
+	if err != nil {
+		t.Fatalf(initializePluginsErrorFmt, err)
+	}
+	defer func() {
+		if err := activation.Close(); err != nil {
+			t.Errorf(deferredCloseErrorFmt, err)
+		}
+	}()
+	if len(report.Diagnostics) != 1 {
+		t.Fatalf("activation diagnostics = %#v, want one inherited-configuration warning", report.Diagnostics)
+	}
+	if staticRegistrations.Load() != 1 {
+		t.Fatalf("static registrations = %d, want 1", staticRegistrations.Load())
+	}
+	assertNativePluginInterception(t, pluginsTOML, staticCallbacks)
+	assertNativePluginCleanup(t, activation, pluginsTOML, staticCallbacks)
+}
+
 func TestInitializeWithDynamicPluginsIgnoresProjectPluginConfig(t *testing.T) {
 	if err := ClearPluginConfiguration(); err != nil {
 		t.Fatalf(clearConfigurationErrorFmt, err)

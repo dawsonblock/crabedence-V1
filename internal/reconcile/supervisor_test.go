@@ -99,6 +99,67 @@ func TestSupervisorPublishesReadinessToStatusWriter(t *testing.T) {
 	}
 }
 
+// TestSupervisorPublishesStoreInvariantCounters proves the readiness
+// surface carries the store's semantic counters — the signals an
+// operator must alert on — and that a store composed without counters
+// publishes none rather than inventing zeros that would read as
+// "nothing happened".
+func TestSupervisorPublishesStoreInvariantCounters(t *testing.T) {
+	store := sqliteStore(t)
+	worker := NewWorker(store, NoopResolver{})
+	supervisor := NewSupervisor(worker, store, SupervisorConfig{Interval: time.Minute})
+
+	var published []Health
+	supervisor.SetStatusWriter(func(health Health) {
+		published = append(published, health)
+	})
+
+	// Move one counter: the durable admission every later invariant
+	// keys off.
+	if _, err := store.Acquire(context.Background(), "counter-key",
+		"alice@example.com", "test.mut", "digest", "grant", "MUTATION", time.Minute); err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	supervisor.runCycle(context.Background())
+	if len(published) != 1 {
+		t.Fatalf("status writer calls = %d, want 1", len(published))
+	}
+	counters := published[0].InvariantCounters
+	if counters == nil {
+		t.Fatal("the readiness surface must carry the store's invariant counters")
+	}
+	if got := counters["effect_acquires_total"]; got != 1 {
+		t.Fatalf("effect_acquires_total = %d, want 1", got)
+	}
+	for _, name := range []string{
+		"effect_fence_rejections_total",
+		"provider_observation_conflicts_total",
+		"critical_evidence_rejected_total",
+		"effect_lease_lost_total",
+		"cluster_epoch_rejections_total",
+		"cluster_recovery_rejections_total",
+	} {
+		if _, ok := counters[name]; !ok {
+			t.Errorf("invariant counter %q is not exported", name)
+		}
+	}
+
+	// A store without counters composes the same way: nil, not zeros.
+	stub := &stubStore{}
+	stubSupervisor := NewSupervisor(NewWorker(stub, NoopResolver{}), stub, SupervisorConfig{Interval: time.Minute})
+	var stubPublished []Health
+	stubSupervisor.SetStatusWriter(func(health Health) {
+		stubPublished = append(stubPublished, health)
+	})
+	stubSupervisor.runCycle(context.Background())
+	if len(stubPublished) != 1 {
+		t.Fatalf("stub status writer calls = %d, want 1", len(stubPublished))
+	}
+	if stubPublished[0].InvariantCounters != nil {
+		t.Fatal("a store without counters must publish nil, not an empty map")
+	}
+}
+
 func TestSupervisorReadinessPolicy(t *testing.T) {
 	store := &stubStore{}
 	worker := NewWorker(store, NoopResolver{})

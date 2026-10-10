@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"time"
+
+	"github.com/openclaw/crabbox/internal/evidence"
 )
 
 // EffectStore is the durable execution contract boundary. The
@@ -19,6 +21,34 @@ type EffectStore interface {
 	// admitted the request are persisted on the record so the ledger
 	// can prove which authority admitted each execution.
 	AcquireWithAuthority(ctx context.Context, key, principal, capability, digest string, authority AuthorityBinding, class string, leaseDuration time.Duration) (*AcquireResult, error)
+	// AcquireWithMediation is AcquireWithAuthority plus the
+	// caller-declared middleware provenance — the mediation object the
+	// request carried is persisted on the record at insert so the
+	// ledger can prove which middleware set produced the dispatched
+	// arguments. Evidence only; nil mediation means the request crossed
+	// no caller-side middleware boundary.
+	AcquireWithMediation(ctx context.Context, key, principal, capability, digest string, authority AuthorityBinding, mediation *MediationBinding, class string, leaseDuration time.Duration) (*AcquireResult, error)
+	// AcquireWithProvenance is AcquireWithMediation plus the rest of
+	// the acquisition provenance: the server-verified runtime
+	// attestation (attested session, identity digest, key fingerprint)
+	// and the kernel-supplied local-caller evidence (peer UID, PID,
+	// executable) are persisted on the record at insert so the ledger
+	// names the verified runtime and local process that produced the
+	// request. Evidence only; none of it is bound into the request
+	// digest, so a re-attested session replays to the same execution
+	// identity.
+	AcquireWithProvenance(ctx context.Context, key, principal, capability, digest string, provenance AcquireProvenance, class string, leaseDuration time.Duration) (*AcquireResult, error)
+	// MigrateRequestDigest is the one-time migrate-on-touch for records
+	// written before descriptor/mediation identity was bound
+	// (digest_version = DigestVersionLegacy). The CAS rewrites
+	// request_digest to newDigest only while the stored digest still
+	// equals expectedDigest, the record carries no live lease, and the
+	// stored request_mediation equals the caller's — so the migration
+	// can never reinterpret a record under an identity it did not
+	// provably already have. Returns false without error when a guard
+	// fails; the caller then classifies the record under its stored
+	// legacy identity.
+	MigrateRequestDigest(ctx context.Context, executionID, expectedDigest, newDigest string, mediation *MediationBinding) (bool, error)
 	BeginExecution(ctx context.Context, executionID, leaseToken string, leaseGeneration int) error
 	MarkInFlight(ctx context.Context, executionID, leaseToken string, leaseGeneration int, providerID string, recoveryLocator json.RawMessage) error
 	RenewLease(ctx context.Context, executionID, leaseToken string, leaseGeneration int, duration time.Duration) error
@@ -60,6 +90,13 @@ type EffectStore interface {
 	// ListProviderObservations returns the execution's immutable
 	// provider-observation ledger rows in commit order.
 	ListProviderObservations(ctx context.Context, executionID string) ([]ObservationRecord, error)
+	// TerminalEvidence enumerates every terminal execution as a
+	// checkpoint reference, in terminal_seq order — the durable
+	// terminalization-commit order assigned transactionally with each
+	// terminal write, so the enumeration is append-only by
+	// construction. A terminal record lacking a ledger position is a
+	// hard error, never a silently skipped row.
+	TerminalEvidence(ctx context.Context) ([]evidence.TerminalRef, error)
 
 	// Cluster-epoch disaster-recovery fencing.
 	// ClusterEpoch returns the epoch this store was admitted under.

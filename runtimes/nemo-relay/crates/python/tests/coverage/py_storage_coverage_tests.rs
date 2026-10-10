@@ -147,6 +147,10 @@ fn sample_stability_result() -> StabilityAnalysisResult {
 
 #[test]
 fn test_py_storage_backend_roundtrips_all_supported_methods() {
+    crate::test_support::with_test_stack(test_py_storage_backend_roundtrips_all_supported_methods_inner);
+}
+
+fn test_py_storage_backend_roundtrips_all_supported_methods_inner() {
     let _python = crate::test_support::init_python_test();
 
     let agent_id = "agent-storage";
@@ -287,6 +291,10 @@ class Backend:
 
 #[test]
 fn test_py_storage_backend_roundtrips_observations_and_stability() {
+    crate::test_support::with_test_stack(test_py_storage_backend_roundtrips_observations_and_stability_inner);
+}
+
+fn test_py_storage_backend_roundtrips_observations_and_stability_inner() {
     Python::initialize();
 
     let agent_id = "agent-storage";
@@ -381,6 +389,10 @@ class Backend:
 
 #[test]
 fn py_storage_uses_canonical_adaptive_acg_imports() {
+    crate::test_support::with_test_stack(py_storage_uses_canonical_adaptive_acg_imports_inner);
+}
+
+fn py_storage_uses_canonical_adaptive_acg_imports_inner() {
     let source =
         std::fs::read_to_string(format!("{}/src/py_storage.rs", env!("CARGO_MANIFEST_DIR")))
             .unwrap();
@@ -391,6 +403,10 @@ fn py_storage_uses_canonical_adaptive_acg_imports() {
 
 #[test]
 fn test_py_storage_backend_covers_none_and_error_paths() {
+    crate::test_support::with_test_stack(test_py_storage_backend_covers_none_and_error_paths_inner);
+}
+
+fn test_py_storage_backend_covers_none_and_error_paths_inner() {
     let _python = crate::test_support::init_python_test();
 
     let trie = sample_trie("agent-storage");
@@ -519,6 +535,10 @@ class FailingBackend:
 
 #[test]
 fn test_py_storage_backend_reuses_cached_task_locals_in_background_tasks() {
+    crate::test_support::with_test_stack(test_py_storage_backend_reuses_cached_task_locals_in_background_tasks_inner);
+}
+
+fn test_py_storage_backend_reuses_cached_task_locals_in_background_tasks_inner() {
     let _python = crate::test_support::init_python_test();
 
     let run = sample_run("agent-storage");
@@ -592,6 +612,10 @@ class Backend:
 
 #[test]
 fn test_py_storage_backend_covers_missing_method_and_optional_observation_paths() {
+    crate::test_support::with_test_stack(test_py_storage_backend_covers_missing_method_and_optional_observation_paths_inner);
+}
+
+fn test_py_storage_backend_covers_missing_method_and_optional_observation_paths_inner() {
     let _python = crate::test_support::init_python_test();
 
     let observations = sample_observations();

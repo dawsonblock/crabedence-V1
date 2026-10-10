@@ -94,6 +94,114 @@ func TestGitHubIssueGetDirectRead(t *testing.T) {
 	}
 }
 
+func TestGitHubIssueListDirectRead(t *testing.T) {
+	var gotAuth, gotPath, gotQuery string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotPath = r.URL.Path
+		gotQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `[
+			{"number": 41, "title": "First", "state": "open",
+			 "html_url": "https://github.com/example-org/my-app/issues/41",
+			 "created_at": "2026-09-01T10:00:00Z", "updated_at": "2026-09-01T10:00:00Z",
+			 "user": {"login": "alice"}, "body": "SECRET", "labels": []},
+			{"number": 42, "title": "Second", "state": "open",
+			 "html_url": "https://github.com/example-org/my-app/issues/42",
+			 "created_at": "2026-09-02T10:00:00Z", "updated_at": "2026-09-02T10:00:00Z",
+			 "user": {"login": "bob"}, "body": "SECRET", "labels": []}
+		]`)
+	}))
+	defer server.Close()
+
+	registry, reads := githubReadsRegistry(t, server.URL, "test-token")
+	desc, ok := registry.Lookup("github.issue.list")
+	if !ok {
+		t.Fatal("github.issue.list must be registered")
+	}
+	if desc.ExecutionRoute != capability.RouteDirect {
+		t.Fatalf("route = %s, want DIRECT", desc.ExecutionRoute)
+	}
+
+	dispatcher := NewRouteDispatcher(nil)
+	dispatcher.SetDirect(reads)
+	response := dispatcher.Execute(context.Background(), Request{
+		Capability: "github.issue.list",
+		Arguments:  json.RawMessage(`{"repo":"example-org/my-app","state":"closed","limit":2}`),
+		Authority:  RequestAuthority{Principal: "alice@example.com"},
+	}, desc)
+
+	if response.Status != StatusSucceeded {
+		t.Fatalf("direct read failed: %s: %s", response.Status, response.Error)
+	}
+	if gotPath != "/repos/example-org/my-app/issues" {
+		t.Fatalf("request path = %s", gotPath)
+	}
+	if !strings.Contains(gotQuery, "state=closed") || !strings.Contains(gotQuery, "per_page=2") {
+		t.Fatalf("request query = %s, want state=closed&per_page=2", gotQuery)
+	}
+	if gotAuth != "Bearer test-token" {
+		t.Fatalf("authorization header = %q", gotAuth)
+	}
+
+	var result struct {
+		Repo   string           `json:"repo"`
+		State  string           `json:"state"`
+		Count  int              `json:"count"`
+		Issues []map[string]any `json:"issues"`
+	}
+	if err := json.Unmarshal(response.Result, &result); err != nil {
+		t.Fatalf("result is not valid JSON: %v", err)
+	}
+	if result.Count != 2 || len(result.Issues) != 2 {
+		t.Fatalf("projected result = %+v", result)
+	}
+	if result.Issues[0]["title"] != "First" || result.Issues[1]["author"] != "bob" {
+		t.Fatalf("projected issues = %v", result.Issues)
+	}
+	if _, present := result.Issues[0]["body"]; present {
+		t.Fatal("the list projection must not pass provider payloads through")
+	}
+}
+
+func TestGitHubIssueListDefaultsAndBounds(t *testing.T) {
+	var gotQuery string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `[]`)
+	}))
+	defer server.Close()
+
+	registry, reads := githubReadsRegistry(t, server.URL, "")
+	desc, _ := registry.Lookup("github.issue.list")
+	dispatcher := NewRouteDispatcher(nil)
+	dispatcher.SetDirect(reads)
+
+	// Defaults: state=open, limit=30.
+	response := dispatcher.Execute(context.Background(), Request{
+		Capability: "github.issue.list",
+		Arguments:  json.RawMessage(`{"repo":"example-org/my-app"}`),
+	}, desc)
+	if response.Status != StatusSucceeded {
+		t.Fatalf("defaulted read failed: %v", response.Error)
+	}
+	if !strings.Contains(gotQuery, "state=open") || !strings.Contains(gotQuery, "per_page=30") {
+		t.Fatalf("defaulted query = %s", gotQuery)
+	}
+
+	// An out-of-contract limit is refused at admission by the schema
+	// (DENIED) before the adapter runs; the adapter's own bound is the
+	// same ceiling in case a call ever bypasses schema validation.
+	response = dispatcher.Execute(context.Background(), Request{
+		Capability: "github.issue.list",
+		Arguments:  json.RawMessage(`{"repo":"example-org/my-app","limit":500}`),
+	}, desc)
+	if response.Status == StatusSucceeded {
+		t.Fatalf("limit above the ceiling must not succeed: %v", response.Status)
+	}
+}
+
 func TestGitHubIssueGetFailuresAreSafe(t *testing.T) {
 	notFound := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, `{"message":"Not Found"}`, http.StatusNotFound)

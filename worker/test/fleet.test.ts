@@ -1538,7 +1538,7 @@ describe("runtime adapter relay", () => {
 
   it("fails closed active non-admin GitHub WebVNC and egress bridges after revocation", async () => {
     const env = {
-      CRABBOX_SESSION_SECRET: "session-secret",
+      CRABBOX_SESSION_SECRET: "test-session-secret-with-32-characters",
       CRABBOX_DEFAULT_ORG: "example-org",
       CRABBOX_GITHUB_REVOKED_USERS: "github:12345",
     } as Env;
@@ -1697,7 +1697,7 @@ describe("runtime adapter relay", () => {
   it("rejects a WebVNC upgrade revoked before its buffered desktop frames flush", async () => {
     const storage = new MemoryStorage();
     const env = {
-      CRABBOX_SESSION_SECRET: "session-secret",
+      CRABBOX_SESSION_SECRET: "test-session-secret-with-32-characters",
       CRABBOX_DEFAULT_ORG: "example-org",
     } as Env;
     const token = await issueUserToken(env, {
@@ -6321,7 +6321,7 @@ describe("fleet lease identity and idle", () => {
   it("exposes recorded Hetzner cleanup through authenticated release, alarm and owner GET only", async () => {
     const storage = new MemoryStorage();
     const env = {
-      CRABBOX_SESSION_SECRET: "synthetic-session-secret",
+      CRABBOX_SESSION_SECRET: "synthetic-session-secret-with-32-characters",
       CRABBOX_DEFAULT_ORG: "example-org",
       HETZNER_TOKEN: "synthetic-provider-token",
     } as Env;
@@ -31366,7 +31366,7 @@ describe("fleet lease identity and idle", () => {
     const env = {
       CRABBOX_CODE_ORIGIN_TEMPLATE: "https://{lease}.code.example.test",
       CRABBOX_PUBLIC_URL: "https://crabbox.test",
-      CRABBOX_SESSION_SECRET: "session-secret",
+      CRABBOX_SESSION_SECRET: "test-session-secret-with-32-characters",
       CRABBOX_DEFAULT_ORG: "example-org",
       CRABBOX_GITHUB_MEMBERSHIP_CACHE_SECONDS: "0",
     } as Env;
@@ -32199,7 +32199,7 @@ describe("fleet lease identity and idle", () => {
   it("revalidates non-admin GitHub grants when agent bridge tickets are consumed", async () => {
     const storage = new MemoryStorage();
     const env = {
-      CRABBOX_SESSION_SECRET: "session-secret",
+      CRABBOX_SESSION_SECRET: "test-session-secret-with-32-characters",
       CRABBOX_DEFAULT_ORG: "example-org",
     } as Env;
     const token = await issueUserToken(env, {
@@ -33861,7 +33861,7 @@ describe("fleet lease identity and idle", () => {
 
     const githubStorage = new MemoryStorage();
     const githubEnv = {
-      CRABBOX_SESSION_SECRET: "session-secret",
+      CRABBOX_SESSION_SECRET: "test-session-secret-with-32-characters",
       CRABBOX_DEFAULT_ORG: "example-org",
     } as Env;
     const githubFleet = new FleetDurableObject(
@@ -34010,7 +34010,7 @@ describe("fleet lease identity and idle", () => {
   it("keeps existing GitHub portal WebVNC sessions compatible", async () => {
     const storage = new MemoryStorage();
     const env = {
-      CRABBOX_SESSION_SECRET: "session-secret",
+      CRABBOX_SESSION_SECRET: "test-session-secret-with-32-characters",
       CRABBOX_DEFAULT_ORG: "example-org",
       CRABBOX_PUBLIC_URL: "https://crabbox.test",
     } as Env;
@@ -42300,7 +42300,7 @@ describe("fleet identity", () => {
         CRABBOX_GITHUB_CLIENT_ID: "github-client",
         CRABBOX_GITHUB_CLIENT_SECRET: "github-secret",
         CRABBOX_SHARED_TOKEN: "shared",
-        CRABBOX_SESSION_SECRET: "session-secret",
+        CRABBOX_SESSION_SECRET: "test-session-secret-with-32-characters",
       } as Env,
     );
     const pollSecret = "local-poll-secret";
@@ -42453,7 +42453,7 @@ describe("fleet identity", () => {
         CRABBOX_PUBLIC_URL: "https://broker.example.test",
         CRABBOX_GITHUB_CLIENT_ID: "github-client",
         CRABBOX_GITHUB_CLIENT_SECRET: "github-secret",
-        CRABBOX_SESSION_SECRET: "session-secret",
+        CRABBOX_SESSION_SECRET: "test-session-secret-with-32-characters",
       },
     );
     const response = await fleet.fetch(
@@ -42479,7 +42479,7 @@ describe("fleet identity", () => {
         CRABBOX_GITHUB_CLIENT_ID: "github-client",
         CRABBOX_GITHUB_CLIENT_SECRET: "github-secret",
         CRABBOX_SHARED_TOKEN: "shared",
-        CRABBOX_SESSION_SECRET: "session-secret",
+        CRABBOX_SESSION_SECRET: "test-session-secret-with-32-characters",
       } as Env,
     );
 
@@ -42589,7 +42589,7 @@ describe("fleet identity", () => {
         CRABBOX_GITHUB_CLIENT_ID: "github-client",
         CRABBOX_GITHUB_CLIENT_SECRET: "github-secret",
         CRABBOX_SHARED_TOKEN: "shared",
-        CRABBOX_SESSION_SECRET: "session-secret",
+        CRABBOX_SESSION_SECRET: "test-session-secret-with-32-characters",
       } as Env,
     );
     const start = await fleet.fetch(
@@ -42707,7 +42707,7 @@ describe("fleet identity", () => {
         CRABBOX_GITHUB_CLIENT_ID: "github-client",
         CRABBOX_GITHUB_CLIENT_SECRET: "github-secret",
         CRABBOX_SHARED_TOKEN: "shared",
-        CRABBOX_SESSION_SECRET: "session-secret",
+        CRABBOX_SESSION_SECRET: "test-session-secret-with-32-characters",
       } as Env,
     );
     const start = await fleet.fetch(request("GET", `/portal/login?returnTo=${returnTo}`));
@@ -42761,7 +42761,7 @@ describe("fleet identity", () => {
         CRABBOX_GITHUB_CLIENT_ID: "github-client",
         CRABBOX_GITHUB_CLIENT_SECRET: "github-secret",
         CRABBOX_SHARED_TOKEN: "shared",
-        CRABBOX_SESSION_SECRET: "session-secret",
+        CRABBOX_SESSION_SECRET: "test-session-secret-with-32-characters",
       } as Env,
     );
     storage.seed("oauth:login_old", {
@@ -43656,7 +43656,7 @@ async function startGitHubLogin(env: Partial<Env> = {}): Promise<{
       CRABBOX_GITHUB_CLIENT_ID: "github-client",
       CRABBOX_GITHUB_CLIENT_SECRET: "github-secret",
       CRABBOX_SHARED_TOKEN: "shared",
-      CRABBOX_SESSION_SECRET: "session-secret",
+      CRABBOX_SESSION_SECRET: "test-session-secret-with-32-characters",
       ...env,
     } as Env,
   );
@@ -43688,7 +43688,7 @@ function githubLoginTestFleet(storage = new MemoryStorage()): FleetDurableObject
       CRABBOX_GITHUB_CLIENT_ID: "github-client",
       CRABBOX_GITHUB_CLIENT_SECRET: "github-secret",
       CRABBOX_SHARED_TOKEN: "shared",
-      CRABBOX_SESSION_SECRET: "session-secret",
+      CRABBOX_SESSION_SECRET: "test-session-secret-with-32-characters",
     },
   );
 }

@@ -397,6 +397,7 @@ func TestRunFailureEvidenceFinalization(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv("GIT_CEILING_DIRECTORIES", filepath.Dir(repoRoot))
 	t.Chdir(repoRoot)
 	for _, keep := range []bool{false, true} {
 		t.Run(fmt.Sprintf("keep=%t", keep), func(t *testing.T) {

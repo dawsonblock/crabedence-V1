@@ -74,7 +74,8 @@ use std::sync::Arc;
 use nemo_relay::plugin::execution::{PluginExecutionBackend, PluginManager};
 #[cfg(unix)]
 use nemo_relay_plugin_protocol::{
-    PluginArtifactIdentity, PluginFailure, PluginHandle, PluginLoadRequest, PluginProtocolError,
+    PluginArtifactIdentity, PluginDescriptor, PluginExecutionContext, PluginFailure, PluginHandle,
+    PluginLoadRequest, PluginProtocolError,
 };
 
 #[cfg(unix)]
@@ -110,6 +111,7 @@ pub struct ProcessLoadedPlugins {
     off_path: Arc<crate::off_path::OffPathPluginExecutor>,
     proxies: Vec<crate::proxy::RegistrationProxies>,
     handles: Vec<PluginHandle>,
+    descriptors: Vec<PluginDescriptor>,
 }
 
 #[cfg(unix)]
@@ -130,6 +132,42 @@ impl ProcessLoadedPlugins {
     where
         I: IntoIterator<Item = (String, String)>,
         J: IntoIterator<Item = nemo_relay_plugin_protocol::PluginComponentConfiguration>,
+    {
+        Self::load_with_context(
+            config,
+            registration_cap_millis,
+            observability,
+            specs,
+            components,
+            lifecycle_context,
+        )
+        .await
+    }
+
+    /// `load` for a composition whose lifecycle operations carry a context the
+    /// caller supplies rather than the one the session generates.
+    ///
+    /// The session's own context binds a lifecycle operation to the session's
+    /// runtime digest and a generated budget. A caller whose loads and
+    /// activations must be attributable to an operation somebody else already
+    /// opened — a mediating runtime's binding digest, a managed call's
+    /// deadline — supplies it here instead: `context` is called once per
+    /// lifecycle operation with the session's binding and the operation's
+    /// name, and the value it returns is what crosses the boundary. Nothing
+    /// else about the composition changes: same approval order, same host,
+    /// same proxies.
+    pub async fn load_with_context<I, J, F>(
+        config: PluginHostSupervisorConfig,
+        registration_cap_millis: u64,
+        observability: crate::off_path::ObservabilityPolicy,
+        specs: I,
+        components: J,
+        context: F,
+    ) -> Result<Self, PluginProtocolError>
+    where
+        I: IntoIterator<Item = (String, String)>,
+        J: IntoIterator<Item = nemo_relay_plugin_protocol::PluginComponentConfiguration>,
+        F: Fn(&str, &'static str) -> PluginExecutionContext,
     {
         // A registration is never given more than the action it serves can
         // afford, and this is the second limit on top of that. Zero would mean
@@ -191,7 +229,7 @@ impl ProcessLoadedPlugins {
                         artifact,
                         identity,
                     },
-                    lifecycle_context(&binding, "load"),
+                    context(&binding, "load"),
                 )
                 .await
                 .map_err(|error| PluginProtocolError {
@@ -216,10 +254,11 @@ impl ProcessLoadedPlugins {
                         // rather than half-served.
                         discovery: false,
                     },
-                    lifecycle_context(&binding, "activate"),
+                    context(&binding, "activate"),
                 )
                 .await?
         };
+        let activated_descriptors = descriptors;
 
         // One proxy per registration, installable only for the classes this
         // backend can serve. The manager is the only path to the backend, and
@@ -236,7 +275,7 @@ impl ProcessLoadedPlugins {
             // callback service checks.
             .with_codec_capabilities(backend.codec_capabilities());
         let mut proxies = Vec::new();
-        for descriptor in &descriptors {
+        for descriptor in &activated_descriptors {
             let handle = handles
                 .iter()
                 .find(|handle| handle.plugin_id == descriptor.plugin_id)
@@ -254,6 +293,7 @@ impl ProcessLoadedPlugins {
             backend,
             proxies,
             handles,
+            descriptors: activated_descriptors,
             off_path,
         })
     }
@@ -279,6 +319,15 @@ impl ProcessLoadedPlugins {
     /// The backend holding the loaded plugins.
     pub fn backend(&self) -> &Arc<ProcessPluginBackend> {
         &self.backend
+    }
+
+    /// What the host reported each activated component as.
+    ///
+    /// A caller that binds its own evidence to an activation — a mediation
+    /// layer recording what a host claimed, not just that it claimed — reads
+    /// the descriptors here rather than asking the host again.
+    pub fn descriptors(&self) -> &[PluginDescriptor] {
+        &self.descriptors
     }
 
     /// The runtime work beside a call runs on.

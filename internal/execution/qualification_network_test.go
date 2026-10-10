@@ -12,6 +12,7 @@ import (
 // contract: the adapter accepts only the local host and refuses every
 // remote, private-LAN, userinfo, and alternate-encoding form.
 func TestQualificationAdapterLoopbackBoundary(t *testing.T) {
+	t.Setenv("CRABBOX_MODE", "development")
 	accepted := []string{
 		"http://127.0.0.1:8080",
 		"http://127.9.9.9:1234",
@@ -76,6 +77,7 @@ func TestQualificationAdapterLoopbackBoundary(t *testing.T) {
 // redirect policy refuses every hop, so the request either reaches the
 // configured local provider or fails closed.
 func TestQualificationAdapterRefusesRedirects(t *testing.T) {
+	t.Setenv("CRABBOX_MODE", "development")
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -103,6 +105,7 @@ func TestQualificationAdapterRefusesRedirects(t *testing.T) {
 // boundary fails closed before any network attempt: a remote provider
 // URL is a startup error, never a best-effort connection.
 func TestServeRejectsRemoteQualificationProvider(t *testing.T) {
+	t.Setenv("CRABBOX_MODE", "development")
 	t.Setenv("CRABEDENCE_STORE_BACKEND", "none")
 	t.Setenv("CRABEDENCE_QUAL_PROVIDER_URL", "http://example.com:8080")
 	err := Serve(context.Background(), ServeOptions{SocketPath: testSocketPath(t)})

@@ -30,6 +30,21 @@ use super::DYNAMIC_PLUGIN_MANIFEST_FILENAME;
 use super::manifest::{DynamicPluginManifest, DynamicPluginManifestLoad};
 use crate::plugin::PluginError;
 
+/// The digests and the validated manifest of one artifact, from one read.
+///
+/// Returned together because they describe the same bytes: a digest taken from
+/// one read beside a manifest parsed from another could name requirements the
+/// approval never covered.
+#[derive(Debug, Clone)]
+pub struct PluginArtifactDetails {
+    /// SHA-256 of `relay-plugin.toml`, hex.
+    pub manifest_sha256: String,
+    /// SHA-256 of the library the manifest names, hex.
+    pub library_sha256: String,
+    /// The validated manifest those digests cover.
+    pub manifest: DynamicPluginManifest,
+}
+
 /// The identity of one plugin artifact: its manifest and the library it names.
 ///
 /// Both digests in one answer, from one read, because the pair is what a caller
@@ -39,6 +54,20 @@ use crate::plugin::PluginError;
 /// # Errors
 /// Returns what could not be read or parsed, naming the reference that failed.
 pub fn plugin_artifact_identity(manifest_ref: &str) -> crate::plugin::Result<(String, String)> {
+    let details = plugin_artifact_details(manifest_ref)?;
+    Ok((details.manifest_sha256, details.library_sha256))
+}
+
+/// The identity of one plugin artifact, together with the manifest it names.
+///
+/// The same read [`plugin_artifact_identity`] makes, for a caller that also
+/// needs the manifest's declared requirements — an artifact's
+/// `security.requires_confinement` is a policy input, and the digest that
+/// approves the artifact has to be the digest of the manifest that declared it.
+///
+/// # Errors
+/// Returns what could not be read or parsed, naming the reference that failed.
+pub fn plugin_artifact_details(manifest_ref: &str) -> crate::plugin::Result<PluginArtifactDetails> {
     // One read, one hash, one parse. The manifest that is hashed has to be the
     // manifest the library is resolved from: reading the path a second time
     // could return different bytes, and the pair returned here would then
@@ -82,7 +111,11 @@ pub fn plugin_artifact_identity(manifest_ref: &str) -> crate::plugin::Result<(St
         .map_err(|error| missing_artifact(&library_path.display().to_string(), &error))?;
     let library_sha256 = sha256_of_reader(&mut library)?;
 
-    Ok((manifest_sha256, library_sha256))
+    Ok(PluginArtifactDetails {
+        manifest_sha256,
+        library_sha256,
+        manifest,
+    })
 }
 
 /// The error one failed read becomes.

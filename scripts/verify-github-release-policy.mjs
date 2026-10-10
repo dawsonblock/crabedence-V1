@@ -6,20 +6,38 @@ function fail(message) {
   throw new Error(message);
 }
 
-if (process.argv.length !== 7) {
+if (process.argv.length !== 7 && process.argv.length !== 8) {
   fail(
-    "usage: verify-github-release-policy.mjs <repository-json> <rulesets-json> <owner/repo> <default-branch> <tag>",
+    "usage: verify-github-release-policy.mjs <repository-json> <rulesets-json> <owner/repo> <default-branch> <tag> [tag-prefix]",
   );
 }
 
-const [, , repositoryFile, rulesetsFile, expectedRepository, defaultBranch, tag] = process.argv;
+const [
+  ,
+  ,
+  repositoryFile,
+  rulesetsFile,
+  expectedRepository,
+  defaultBranch,
+  tag,
+  tagPrefix = "",
+] = process.argv;
 if (!/^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/.test(expectedRepository)) {
   fail("invalid repository identity");
 }
 if (!/^[a-zA-Z0-9._/-]+$/.test(defaultBranch) || defaultBranch.includes("..")) {
   fail("invalid default branch");
 }
-if (!/^v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/.test(tag)) {
+// A release family may carry a literal dash-terminated tag prefix — the NEMO
+// distribution family releases under nemo-vX.Y.Z.
+if (tagPrefix !== "" && !/^[a-z0-9]+(?:-[a-z0-9]+)*-$/.test(tagPrefix)) {
+  fail("invalid release tag prefix");
+}
+if (
+  !new RegExp(
+    `^${tagPrefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}v(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)$`,
+  ).test(tag)
+) {
   fail("invalid release tag");
 }
 
@@ -119,8 +137,8 @@ function includesStableTags(value) {
   const excludes = value.conditions.ref_name.exclude;
   return (
     (includes.includes("~ALL") ||
-      includes.includes("refs/tags/v*") ||
-      includes.includes("refs/tags/v**")) &&
+      includes.includes(`refs/tags/${tagPrefix}v*`) ||
+      includes.includes(`refs/tags/${tagPrefix}v**`)) &&
     excludes.length === 0
   );
 }

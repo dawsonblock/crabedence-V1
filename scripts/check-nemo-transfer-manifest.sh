@@ -11,8 +11,10 @@
 # digest, file count, runtime version, and exclusion set; the declared source
 # identity when the source copy is present (a standalone checkout does not
 # carry it, and that is reported rather than silently skipped); and the
-# inventory claims — that the added workspace members are members, and that
-# the modified and added paths exist.
+# inventory claims — that the added workspace members are members, that the
+# declared paths exist, and, when the source copy is present, that the
+# declared delta is the complete one: no modification, addition, or removal
+# may be missing from the declaration, and none declared may be stale.
 #
 # A failure means the tree changed without its declaration being regenerated.
 # Regenerate deliberately, in the same commit as the change:
@@ -25,3 +27,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 go run ./cmd/nemo-runtime-digest -manifest runtimes/nemo-transfer-manifest.json
+
+# Documentation that restates provenance statistics is a dependent of the
+# manifest, not a second source of truth: drift between them fails the gate.
+scripts/check-provenance-docs.sh

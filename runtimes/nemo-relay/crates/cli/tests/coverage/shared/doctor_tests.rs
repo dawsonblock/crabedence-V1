@@ -80,6 +80,11 @@ fn empty_report() -> DoctorReport {
                 status: Status::Info,
                 details: "plugins.toml not configured".into(),
             },
+            native_plugin_isolation: Check {
+                name: "Native isolation",
+                status: Status::Info,
+                details: "'trusted-process' (trusted class)".into(),
+            },
             resolution: Check {
                 name: "Resolution",
                 status: Status::Pass,
@@ -2618,4 +2623,95 @@ fn doctor_agent_status_helpers_cover_readiness_and_version_outcomes() {
     );
     assert_eq!(status, Status::Fail);
     assert!(details[0].contains("could not determine version"));
+}
+
+#[test]
+fn native_isolation_check_reports_the_default_trusted_class() {
+    use nemo_relay_plugin_host::isolation_policy::NativeIsolationPolicy;
+
+    let check = native_isolation_check_for(Ok(NativeIsolationPolicy::TrustedProcess));
+    assert_eq!(check.name, "Native isolation");
+    if cfg!(target_os = "windows") {
+        assert!(check.details.contains("unsupported on this platform"));
+    } else {
+        assert_eq!(check.status, Status::Info);
+        assert!(check.details.contains("trusted-process"));
+        assert!(check.details.contains("trusted class"));
+    }
+}
+
+#[test]
+fn native_isolation_check_reports_a_restricted_selection() {
+    use nemo_relay_plugin_host::isolation_policy::NativeIsolationPolicy;
+
+    // The check reports what the selection delivers — its trust class and the
+    // confinement note — not whether this machine could honor it: that answer
+    // is activation's, and it refuses by name there.
+    let (spelling, policy) = if cfg!(target_os = "macos") {
+        ("restricted-macos", NativeIsolationPolicy::RestrictedMacOS)
+    } else {
+        ("restricted-linux", NativeIsolationPolicy::RestrictedLinux)
+    };
+    let check = native_isolation_check_for(Ok(policy));
+    if cfg!(target_os = "windows") {
+        assert_eq!(check.status, Status::Fail);
+        assert!(check.details.contains("unsupported on this platform"));
+    } else {
+        assert_eq!(check.status, Status::Pass);
+        assert!(check.details.contains(spelling));
+        assert!(check.details.contains("restricted class"));
+        assert!(
+            check
+                .details
+                .contains("not a boundary for code assumed hostile")
+        );
+    }
+}
+
+#[test]
+fn native_isolation_check_fails_on_a_hostile_request() {
+    use nemo_relay_plugin_host::isolation_policy::NativeIsolationPolicy;
+
+    // A hostile-class spelling is refused at parse time, so the check surfaces
+    // the refusal rather than a selection the runtime would never honor.
+    let error = NativeIsolationPolicy::parse("hostile-vm").expect_err("a named refusal");
+    let check = native_isolation_check_for(Err(error));
+    assert_eq!(check.status, Status::Fail);
+    assert!(check.details.contains("hostile-code boundary"));
+    assert!(check.details.contains("VM-grade"));
+}
+
+#[test]
+fn native_isolation_check_fails_on_a_malformed_value() {
+    use nemo_relay_plugin_host::isolation_policy::NativeIsolationPolicy;
+
+    let error = NativeIsolationPolicy::parse("restrictd").expect_err("malformed");
+    let check = native_isolation_check_for(Err(error));
+    assert_eq!(check.status, Status::Fail);
+    assert!(check.details.contains("unsupported value"));
+    assert!(check.details.contains("NEMO_RELAY_NATIVE_ISOLATION"));
+}
+
+#[test]
+fn exit_code_fails_when_native_isolation_fails() {
+    let mut report = empty_report();
+    report.configuration.native_plugin_isolation = Check {
+        name: "Native isolation",
+        status: Status::Fail,
+        details: "hostile-vm asks for a boundary this build does not provide".into(),
+    };
+    assert_eq!(exit_code(&report), 1);
+}
+
+#[test]
+fn format_human_renders_the_isolation_check() {
+    let mut report = empty_report();
+    report.configuration.native_plugin_isolation = Check {
+        name: "Native isolation",
+        status: Status::Pass,
+        details: "'restricted-linux' (restricted class)".into(),
+    };
+    let rendered = format_human(&report);
+    assert!(rendered.contains("Isolation"));
+    assert!(rendered.contains("restricted-linux"));
 }

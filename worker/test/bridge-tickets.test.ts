@@ -361,7 +361,7 @@ describe.each(cases)("$kind ticket contract", (item) => {
   ])("revalidates GitHub grants: %s", async (outcome) => {
     const f = await fixture(item);
     Object.assign(f.env, {
-      CRABBOX_SESSION_SECRET: "fixture-session-secret",
+      CRABBOX_SESSION_SECRET: "fixture-session-secret-with-32-characters",
       CRABBOX_GITHUB_ALLOWED_ORG: "example-org",
       CRABBOX_GITHUB_MEMBERSHIP_CACHE_SECONDS: "0",
     });

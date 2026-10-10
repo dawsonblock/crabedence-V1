@@ -13,9 +13,9 @@
 #
 #   PURE                      → routed locally, no socket hop
 #   MUTATION without a key    → refused before dispatch, exit 2
-#   MUTATION with grant + key → committed with evidence
+#   MUTATION with key, brokered authority → committed with evidence
 #   the same key again        → replayed, exactly one effect
-#   MUTATION without a grant  → UNAUTHORIZED, definitive and non-retryable
+#   MUTATION by a grantless principal → UNAUTHORIZED, definitive and non-retryable
 #   unregistered capability   → refused before any socket hop
 #
 # Usage: scripts/test-nemo-runtime-e2e.sh
@@ -41,7 +41,8 @@ socket="$work_dir/crabedence/execution.sock"
 snapshot="$work_dir/crabedence/capabilities.json"
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
-pass() { printf 'ok: %s\n' "$*"; }
+check_count=0
+pass() { check_count=$((check_count + 1)); printf 'ok: %s\n' "$*"; }
 
 # NEMO_E2E_CRABBOX / NEMO_E2E_RUNTIME / NEMO_E2E_PLUGIN_HOST point the suite at
 # already-built binaries — the installed-artifact qualification uses them so
@@ -70,7 +71,14 @@ CRABEDENCE_STORE_PATH="$store" go run ./cmd/issue-grant \
   --grant-id runtime-e2e-grant >/dev/null
 
 printf 'starting the service…\n'
-CRABEDENCE_STORE_PATH="$store" CRABEDENCE_STORE_BACKEND=sqlite \
+# The peer map authenticates this user to claim any principal, which is
+# what lets the invocations below carry no authority reference at all:
+# the service brokers the authenticated principal's grants itself. The
+# wildcard is declared twice, the way production requires it — once in
+# the peer map and once in the trusted-proxy set.
+CRABBOX_MODE=development CRABEDENCE_STORE_PATH="$store" CRABEDENCE_STORE_BACKEND=sqlite \
+  CRABEDENCE_PEER_PRINCIPALS="$(id -u):*" \
+  CRABEDENCE_TRUSTED_PROXY_UIDS="$(id -u)" \
   XDG_RUNTIME_DIR="$work_dir" "$crabbox_bin" serve-exec \
   >"$work_dir/serve.log" 2>&1 &
 service_pid=$!
@@ -98,6 +106,31 @@ printf '%s' "$out" | jq -e '.status=="SUCCEEDED" and .result.local==true' >/dev/
   || fail "system.echo did not route locally: $out"
 pass "PURE routed locally"
 
+# 1c. DIRECT crosses the socket: system.info is pinned READ + DIRECT, so the
+#     runtime dispatches it to the service, whose own dispatcher resolves the
+#     non-durable read route. The answer carries the service's read (system
+#     fields, no `local` marker) and no durable receipt — evidence it crossed
+#     the boundary rather than executing in-process.
+out="$(run_runtime --capability system.info --arguments '{}')" \
+  || fail "the DIRECT read must succeed: $out"
+printf '%s' "$out" | jq -e '
+    .status=="SUCCEEDED"
+    and .result.go_version
+    and (.result.local | not)
+    and (.receipt_digest == null)' >/dev/null \
+  || fail "system.info did not execute over the DIRECT socket path: $out"
+pass "READ pinned DIRECT dispatched over the socket (no durable receipt)"
+
+# 1b. When the bytes under test are an installed distribution, the runtime
+#     must have bound itself to the release root: every report carries the
+#     component-manifest digest it discovered beside its own binary.
+if [[ -n "${NEMO_E2E_EXPECT_RELEASE_ROOT:-}" ]]; then
+  printf '%s' "$out" | jq -e --arg d "$NEMO_E2E_EXPECT_RELEASE_ROOT" '
+      .identity.release.release_root_digest==$d' >/dev/null \
+    || fail "the runtime did not report the release root it shipped in: $out"
+  pass "runtime reports the release-root identity from its component manifest"
+fi
+
 # 2. A consequential invocation without a caller key is refused before
 #    dispatch — no capability-derived default.
 set +e
@@ -110,33 +143,38 @@ set -e
   || fail "the refusal must name the missing key: $out"
 pass "MUTATION without a key refused before dispatch"
 
-# 3. With a grant and a key it commits, with evidence.
+# 3. With the peer principal holding a grant it commits, with evidence —
+#    the runtime carries no authority reference; the service resolved the
+#    grant for the authenticated principal itself.
 counter="runtime-e2e-$$"
 key="runtime-e2e-key-$$"
 out="$(run_runtime --capability test.counter.increment \
   --arguments "{\"counter\":\"$counter\",\"by\":1}" \
-  --idempotency-key "$key" --grant runtime-e2e-grant)" \
-  || fail "the granted mutation must commit: $out"
+  --idempotency-key "$key")" \
+  || fail "the brokered mutation must commit: $out"
 printf '%s' "$out" | jq -e '.status=="SUCCEEDED" and .result.value==1 and (.receipt_digest != null)' >/dev/null \
   || fail "the mutation did not commit with evidence: $out"
-pass "MUTATION committed with evidence (value 1)"
+pass "MUTATION committed with evidence (value 1, brokered authority)"
 
 # 4. The same logical action replays: a second effect would read 2.
 out="$(run_runtime --capability test.counter.increment \
   --arguments "{\"counter\":\"$counter\",\"by\":1}" \
-  --idempotency-key "$key" --grant runtime-e2e-grant)" \
+  --idempotency-key "$key")" \
   || fail "the replay must answer from the durable record: $out"
 printf '%s' "$out" | jq -e '.status=="SUCCEEDED" and .result.value==1' >/dev/null \
   || fail "a repeated key duplicated the effect: $out"
 pass "the repeated key replayed (still value 1)"
 
-# 5. Without a grant the mutation is denied — definitive, not retryable.
+# 5. A principal holding no grant is denied — definitive, not retryable.
+#    The peer map lets this caller claim any principal, and the brokered
+#    resolution for one holding no grants still answers unauthorized.
 out="$(run_runtime --capability test.counter.increment \
+  --principal mallory@example.com \
   --arguments "{\"counter\":\"$counter\",\"by\":1}" \
   --idempotency-key "${key}-ungranted")" || true
 printf '%s' "$out" | jq -e '.status=="FAILED" and .code=="UNAUTHORIZED" and .retryable==false' >/dev/null \
-  || fail "a mutation without a grant must be a definitive refusal: $out"
-pass "MUTATION without a grant refused (non-retryable)"
+  || fail "a mutation by a grantless principal must be a definitive refusal: $out"
+pass "MUTATION by a principal holding no grant refused (non-retryable)"
 
 # 6. An unregistered capability never reaches the socket.
 set +e
@@ -147,6 +185,17 @@ set -e
 [[ "$out" == *"not in the verified registry"* ]] \
   || fail "the refusal must say the capability is unregistered: $out"
 pass "unregistered capability refused before routing"
+
+# 6b. A registered capability whose adapter this deployment did not wire
+# resolves through the registry (it IS known — the snapshot carries it)
+# and fails at the deployment boundary as CAPABILITY_UNAVAILABLE, not
+# NOT_FOUND and not a route change. The e2e service has no GitHub
+# adapter, so the new DIRECT read exercises exactly that seam.
+out="$(run_runtime --capability github.issue.list \
+  --arguments '{"repo":"example-org/my-app"}')" || true
+printf '%s' "$out" | jq -e '.status=="FAILED" and .code=="CAPABILITY_UNAVAILABLE" and .reconciliation_required==false' >/dev/null \
+  || fail "a registered capability with an unwired adapter must fail unavailable: $out"
+pass "registered capability with unwired adapter fails CAPABILITY_UNAVAILABLE"
 
 # ─── The joined path: a real plugin host mediating managed invocations ──────
 #
@@ -206,6 +255,13 @@ library = "$(basename "$library")"
 symbol = "nemo_relay_native_intercept_fixture"
 TOML
 export NEMO_RELAY_PLUGIN_HOST="$host_bin"
+# A development deployment names the host by ambient path with no release
+# manifest to pin its bytes, so it acknowledges the unverified host
+# explicitly — the composition refuses the override otherwise. Under an
+# installed distribution the component manifest already pins the host, and
+# the acknowledgement is never consulted; exporting it in both contexts
+# keeps the rest of this suite identical.
+export NEMO_RELAY_PLUGIN_HOST_ALLOW_UNPINNED=1
 pass "plugin host and fixture staged"
 
 # 7. A managed PURE invocation through the plugin: the chain's request and
@@ -224,6 +280,9 @@ printf '%s' "$out" | jq -e '
     and .result.arguments.probe=="joined"
     and .plugin.process_id != null
     and (.identity.middleware_set_digest != null)
+    and (.identity.mediation.plugin_manifest_sha256 | length) == 64
+    and (.identity.mediation.plugin_library_sha256 | length) == 64
+    and (.identity.mediation.activation_config_sha256 | length) == 64
     and .identity.original_args_digest != .attempts[0].effective_args_digest
     and (.attempts | length) == 1' >/dev/null \
   || fail "the joined PURE invocation did not prove middleware + function hooks: $out"
@@ -231,9 +290,10 @@ pass "PURE mediated by the child's middleware, executed by the function-hook bac
 
 # 8. A MUTATION through the same chain. The counter's argument schema is
 #    closed, so the plugin runs with its argument markers off — its execution
-#    intercept still wraps the call, and the marker it writes into the *result*
-#    is the proof the child's middleware held the continuation around the
-#    Crabedence dispatch without altering the request.
+#    intercept still wraps the call, and the marker it writes into the result
+#    it returns is the proof the child's middleware held the continuation
+#    around the Crabedence dispatch. That marked payload is not the report —
+#    the routed outcome is — so it lands in `middleware_result`.
 counter_joined="runtime-e2e-joined-$$"
 key_joined="runtime-e2e-joined-key-$$"
 out="$(run_runtime --plugin "$plugin_dir" --plugin-id fixture_intercept \
@@ -241,11 +301,11 @@ out="$(run_runtime --plugin "$plugin_dir" --plugin-id fixture_intercept \
   --plugin-config '{"arg_marks":false}' \
   --capability test.counter.increment \
   --arguments "{\"counter\":\"$counter_joined\",\"by\":1}" \
-  --idempotency-key "$key_joined" --grant runtime-e2e-grant)" \
+  --idempotency-key "$key_joined")" \
   || fail "the joined MUTATION must commit: $out"
 printf '%s' "$out" | jq -e '
     .status=="SUCCEEDED" and .result.value==1
-    and .native_intercept_execution==true
+    and .middleware_result.native_intercept_execution==true
     and (.receipt_digest != null)
     and .plugin.process_id != null
     and (.attempts | length) == 1' >/dev/null \
@@ -259,11 +319,11 @@ out="$(run_runtime --plugin "$plugin_dir" --plugin-id fixture_intercept \
   --plugin-config '{"arg_marks":false}' \
   --capability test.counter.increment \
   --arguments "{\"counter\":\"$counter_joined\",\"by\":1}" \
-  --idempotency-key "$key_joined" --grant runtime-e2e-grant)" \
+  --idempotency-key "$key_joined")" \
   || fail "the replay must answer from the durable record: $out"
 printf '%s' "$out" | jq -e '
     .status=="SUCCEEDED" and .result.value==1
-    and .native_intercept_execution==true' >/dev/null \
+    and .middleware_result.native_intercept_execution==true' >/dev/null \
   || fail "a repeated key duplicated the effect: $out"
 pass "the repeated logical action replayed (still value 1)"
 
@@ -271,7 +331,7 @@ pass "the repeated logical action replayed (still value 1)"
 #     never a second effect.
 out="$(run_runtime --capability test.counter.increment \
   --arguments "{\"counter\":\"$counter_joined\",\"by\":99}" \
-  --idempotency-key "$key_joined" --grant runtime-e2e-grant || true)"
+  --idempotency-key "$key_joined" || true)"
 printf '%s' "$out" | jq -e '.status=="FAILED" and (.code | test("IDEMPOTENCY"))' >/dev/null \
   || fail "same key with different arguments must be an identity conflict: $out"
 pass "same durable key + changed arguments → identity conflict"
@@ -279,15 +339,22 @@ pass "same durable key + changed arguments → identity conflict"
 # 10b. The authority boundary at the process level: the child's environment is
 #      cleared at spawn, so it carries only the session variables it needs —
 #      never the service's socket, store, runtime dir, home, or any other
-#      variable the parent happens to have. The fixture writes the *names* it
-#      sees (never values), which is what a witness may report.
+#      variable the parent happens to have — and a descriptor this shell holds
+#      without close-on-exec does not cross into it either. The fixture writes
+#      the *names* it sees (never values) and whether any descriptor it can see
+#      points at the caller's canary file, which is what a witness may report.
 env_dump="$work_dir/child-env.txt"
+fd_dump="$work_dir/child-fds.txt"
+canary="$work_dir/fd-canary"
+printf 'descriptor canary\n' > "$canary"
+exec 3<"$canary"
 sentinel="leak-probe-$$"
 CRABEDENCE_LEAK_PROBE="$sentinel" run_runtime --plugin "$plugin_dir" \
   --plugin-id fixture_intercept --component fixture_intercept \
-  --plugin-config "{\"env_dump\":\"$env_dump\"}" \
+  --plugin-config "{\"env_dump\":\"$env_dump\",\"fd_dump\":\"$fd_dump\",\"fd_canary\":\"$canary\"}" \
   --capability system.echo --arguments '{"probe":"env-boundary"}' >/dev/null \
   || fail "the env-boundary invocation must succeed: $out"
+exec 3<&-
 [[ -s "$env_dump" ]] || fail "the child never wrote its environment names"
 grep -qx 'NEMO_RELAY_PLUGIN_HOST_SOCKET' "$env_dump" \
   || fail "the child is missing its session socket: $(cat "$env_dump")"
@@ -298,6 +365,10 @@ if grep -qE '^(HOME|XDG_RUNTIME_DIR|CRABEDENCE_|CRABBOX_)' "$env_dump"; then
 fi
 grep -q "$sentinel" "$env_dump" && fail "the leak probe reached the child"
 pass "the plugin child sees only its session environment"
+[[ -s "$fd_dump" ]] || fail "the child never wrote its descriptor witness"
+grep -qx 'canary_fds=' "$fd_dump" \
+  || fail "a caller descriptor crossed into the host child: $(cat "$fd_dump")"
+pass "a caller descriptor without close-on-exec does not cross into the child"
 
 # 11. Adversarial: middleware that answers without ever reaching the dispatch
 #     is refused — a capability result that did not cross the router is not
@@ -311,10 +382,11 @@ pass "middleware bypass of the routed dispatch refused"
 
 # ─── Plugin-host binary binding ─────────────────────────────────────────────
 #
-# The distribution's component manifest declares the host's SHA-256, and a
-# qualified deployment pins it through NEMO_RELAY_PLUGIN_HOST_SHA256. The
-# digest is computed over the executable the supervisor will actually spawn —
-# the override cannot substitute a different host than the one it named.
+# The distribution's component manifest declares the host's SHA-256 — a
+# qualified layout binds it automatically, and outside a release a deployment
+# pins it through NEMO_RELAY_PLUGIN_HOST_SHA256. The digest is computed over
+# the bytes the supervisor actually spawns — an override cannot substitute a
+# different host than the one it named.
 
 host_sha256() {
   if command -v shasum >/dev/null 2>&1; then
@@ -433,7 +505,7 @@ out="$(run_runtime --plugin "$plugin_dir" --plugin-id fixture_intercept \
   --component fixture_intercept \
   --plugin-config '{"arg_marks":false,"fail_after_next":true}' --capability test.counter.increment \
   --arguments "{\"counter\":\"$counter_fail_after\",\"by\":1}" \
-  --idempotency-key "runtime-e2e-failafter-key-$$" --grant runtime-e2e-grant)" \
+  --idempotency-key "runtime-e2e-failafter-key-$$")" \
   || fail "a post-dispatch middleware error must not uncommit the effect: $out"
 printf '%s' "$out" | jq -e '
     .status=="SUCCEEDED" and .result.value==1
@@ -444,23 +516,28 @@ printf '%s' "$out" | jq -e '
 pass "post-dispatch middleware failure cannot relabel a committed effect"
 
 # 20. Concurrent continuation: the ABI lets an intercept fan its continuation
-#     out — each call is a real dispatch attempt under the same logical key,
-#     and the durable record turns the second into a replay. Two attempts, one
-#     effect.
+#     out, but a consequential operation may dispatch only once — the second
+#     call is refused before it can reach the router. The first routed verdict
+#     stays authoritative, the refusal is evidence, and the middleware error
+#     the second call raised is recorded without relabeling the commit.
 counter_concurrent="runtime-e2e-concurrent-$$"
 out="$(run_runtime --plugin "$plugin_dir" --plugin-id fixture_intercept \
   --component fixture_intercept \
   --plugin-config '{"arg_marks":false,"use_concurrent_next":true}' --capability test.counter.increment \
   --arguments "{\"counter\":\"$counter_concurrent\",\"by\":1}" \
-  --idempotency-key "runtime-e2e-concurrent-key-$$" --grant runtime-e2e-grant)" \
-  || fail "a concurrent continuation must still commit exactly once: $out"
+  --idempotency-key "runtime-e2e-concurrent-key-$$")" \
+  || fail "a refused second dispatch must not uncommit the first: $out"
 printf '%s' "$out" | jq -e '
     .status=="SUCCEEDED" and .result.value==1
-    and (.attempts | length) == 2
-    and ([.attempts[].status] | all(. == "SUCCEEDED"))
-    and (.attempts[0].execution_id != .attempts[1].execution_id)' >/dev/null \
-  || fail "two attempts under one logical key must produce one effect: $out"
-pass "concurrent continuation: two attempts, one durable effect"
+    and (.receipt_digest != null)
+    and (.attempts | length) == 1
+    and (.refused_dispatches | length) == 1
+    and .refused_dispatches[0].reason=="MULTIPLE_DISPATCH_ATTEMPTS"
+    and .refused_dispatches[0].attempt==2
+    and (.refused_dispatches[0].effective_args_digest | length) == 64
+    and (.post_dispatch_middleware_error | length) > 0' >/dev/null \
+  || fail "a fanned continuation must dispatch once and record the refusal: $out"
+pass "concurrent continuation: first dispatch authoritative, second refused and recorded"
 
 # 21. Middleware timeout: a plugin that holds the call past the managed
 #     deadline fails the invocation — the deadline is the deployment's bound
@@ -491,4 +568,113 @@ set -e
   || fail "a malformed call budget must name the variable: $out"
 pass "malformed managed-call budget fails startup"
 
-printf 'runtime e2e: twenty-three checks passed\n'
+# ─── Trust-class and ambient-override gates ─────────────────────────────────
+#
+# Two rules keep the ambient knobs from becoming ambient authority: an
+# environment variable that names the host must have its bytes pinned or be
+# explicitly acknowledged as development, and an artifact that declares
+# confinement cannot be hosted by a policy that does not confine it.
+
+# 23. The ambient override is only as strong as what binds it. In a
+#     development tree nothing pins the path once the acknowledgement is
+#     unset, so the composition must refuse it rather than execute whichever
+#     binary the path resolves to. In a qualified distribution the component
+#     manifest already pins the host: the override naming the shipped bytes
+#     runs pinned, and the adversarial case is an override naming bytes the
+#     manifest never declared — refused whatever the path claims.
+if [[ -z "${NEMO_E2E_EXPECT_RELEASE_ROOT:-}" ]]; then
+  set +e
+  out="$(
+    unset NEMO_RELAY_PLUGIN_HOST_ALLOW_UNPINNED
+    export NEMO_RELAY_PLUGIN_HOST_SHA256=
+    run_runtime \
+      --plugin "$plugin_dir" --plugin-id fixture_intercept \
+      --component fixture_intercept --capability system.echo \
+      --arguments '{"probe":"unpinned-override"}' 2>&1
+  )"
+  status=$?
+  set -e
+  [[ $status -ne 0 ]] || fail "an unpinned ambient override must be refused: $out"
+  printf '%s' "$out" | grep -q 'NEMO_RELAY_PLUGIN_HOST_ALLOW_UNPINNED' \
+    || fail "the refusal must name the acknowledgement: $out"
+  pass "an ambient host override with nothing pinning it is refused"
+else
+  # The manifest pin survives the environment knobs being cleared: the
+  # override still names the shipped bytes, so the session opens pinned.
+  out="$(
+    unset NEMO_RELAY_PLUGIN_HOST_ALLOW_UNPINNED
+    export NEMO_RELAY_PLUGIN_HOST_SHA256=
+    run_runtime \
+      --plugin "$plugin_dir" --plugin-id fixture_intercept \
+      --component fixture_intercept --capability system.echo \
+      --arguments '{"probe":"manifest-pinned-override"}')" \
+    || fail "the manifest-pinned host override must run: $out"
+  printf '%s' "$out" | jq -e '.status=="SUCCEEDED" and .plugin.host.pinned==true' >/dev/null \
+    || fail "the ambient override must run under the release's pin: $out"
+  pass "the release manifest pins the ambient host override"
+  # An override naming different bytes is the substitution the pin exists
+  # for: the path is ambient, the content is not.
+  different_host="$work_dir/different-host"
+  install -m 0755 "$runtime_bin" "$different_host"
+  set +e
+  out="$(
+    unset NEMO_RELAY_PLUGIN_HOST_ALLOW_UNPINNED
+    export NEMO_RELAY_PLUGIN_HOST_SHA256=
+    NEMO_RELAY_PLUGIN_HOST="$different_host" run_runtime \
+      --plugin "$plugin_dir" --plugin-id fixture_intercept \
+      --component fixture_intercept --capability system.echo \
+      --arguments '{"probe":"substituted-host"}' 2>&1
+  )"
+  status=$?
+  set -e
+  [[ $status -ne 0 ]] || fail "an override naming different bytes must be refused: $out"
+  printf '%s' "$out" | grep -q 'component manifest' \
+    || fail "the refusal must name the release's pin: $out"
+  pass "an ambient override naming different bytes is refused by the release pin"
+fi
+
+# 24. An artifact that requires confinement refuses trusted-process: the
+#     manifest's declaration is inside the digest that approved it, so a
+#     deployment that offers a non-confining policy gets a refusal, not a
+#     silently downgraded host.
+confined_plugin_dir="$work_dir/plugin-confined"
+mkdir -p "$confined_plugin_dir"
+install -m 0644 "$library" "$confined_plugin_dir/$(basename "$library")"
+cat > "$confined_plugin_dir/relay-plugin.toml" <<TOML
+manifest_version = 1
+
+[plugin]
+id = "fixture_intercept"
+kind = "rust_dynamic"
+
+[compat]
+relay = "=$relay_version"
+native_api = "1"
+
+[defaults]
+enabled = false
+
+[capabilities]
+items = ["plugin_native"]
+
+[load]
+library = "$(basename "$library")"
+symbol = "nemo_relay_native_intercept_fixture"
+
+[security]
+requires_confinement = true
+TOML
+
+set +e
+out="$(NEMO_RELAY_NATIVE_ISOLATION=trusted-process run_runtime \
+  --plugin "$confined_plugin_dir" --plugin-id fixture_intercept \
+  --component fixture_intercept --capability system.echo \
+  --arguments '{"probe":"requires-confinement"}' 2>&1)"
+status=$?
+set -e
+[[ $status -ne 0 ]] || fail "a confinement-required plugin must refuse trusted-process: $out"
+printf '%s' "$out" | grep -q 'requires_confinement' \
+  || fail "the refusal must name the manifest's declaration: $out"
+pass "a confinement-required plugin refuses a non-confining policy"
+
+printf 'runtime e2e: %d checks passed\n' "$check_count"

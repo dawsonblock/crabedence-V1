@@ -188,7 +188,6 @@ type invokeKongCmd struct {
 	Socket         string        `help:"Unix socket path (default: the canonical per-user execution socket)" default:"${execution_socket}"`
 	Capability     string        `help:"Capability to invoke" required:""`
 	Principal      string        `help:"Requesting principal" required:""`
-	AuthorityRef   string        `help:"Authority reference (e.g. grant ID)"`
 	IdempotencyKey string        `help:"Idempotency key (required for MUTATION/CRITICAL)"`
 	Arguments      string        `help:"Arguments as JSON" default:"{}"`
 	ExecutionClass string        `help:"Execution class assertion (advisory; registry is authoritative)"`
@@ -698,7 +697,7 @@ func (c *serveExecKongCmd) Run(ctx context.Context, app App) error {
 	return app.serveExecCommand(ctx, c.Socket)
 }
 func (c *invokeKongCmd) Run(ctx context.Context, app App) error {
-	return app.invokeCommand(ctx, c.Socket, c.Capability, c.Principal, c.AuthorityRef, c.IdempotencyKey, c.Arguments, c.ExecutionClass, c.Deadline, c.Timeout)
+	return app.invokeCommand(ctx, c.Socket, c.Capability, c.Principal, c.IdempotencyKey, c.Arguments, c.ExecutionClass, c.Deadline, c.Timeout)
 }
 func (c *watchKongCmd) Run(ctx context.Context, app App) error { return app.watch(ctx, c.Args) }
 func (c *shardKongCmd) Run(ctx context.Context, app App) error { return app.shard(ctx, c.Args) }

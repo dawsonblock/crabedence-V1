@@ -62,6 +62,28 @@ const (
 	ProviderOpen     ProviderHealth = "open"
 )
 
+// ProviderLane identifies which capacity budget a provider call draws
+// from. Read and mutation dispatches share the bounded dispatch pool —
+// the bound protects process resources against a wedged provider, and
+// both classes equally consume it. Reconciliation draws from a small
+// reserved budget so recovery lookups keep running while the dispatch
+// pool is saturated or the circuit is open: the exact provider failure
+// that strands records in UNKNOWN must not also prevent the lookup
+// that resolves them.
+type ProviderLane string
+
+const (
+	// LaneRead is a direct-read provider dispatch (READ class).
+	LaneRead ProviderLane = "read"
+	// LaneMutation is an effect dispatch (MUTATION/CRITICAL class).
+	LaneMutation ProviderLane = "mutation"
+	// LaneReconciliation is a recovery resolver's provider lookup.
+	// It draws from the reserved reconciliation budget and is never
+	// refused by an open circuit — the circuit guards dispatch, not
+	// resolution of the records dispatch stranded.
+	LaneReconciliation ProviderLane = "reconciliation"
+)
+
 // ProviderGateConfig tunes one gate.
 type ProviderGateConfig struct {
 	// MaxConcurrent bounds simultaneously executing provider calls.
@@ -75,6 +97,10 @@ type ProviderGateConfig struct {
 	// OpenCooldown is how long an open circuit refuses new dispatch
 	// before admitting a single probe.
 	OpenCooldown time.Duration
+	// ReconMaxConcurrent is the reserved reconciliation-lane budget:
+	// provider lookups that may proceed regardless of dispatch
+	// saturation or circuit state.
+	ReconMaxConcurrent int
 }
 
 // DefaultProviderGateConfig returns the production policy. The
@@ -82,10 +108,11 @@ type ProviderGateConfig struct {
 // runaway goroutines, not to throttle ordinary load.
 func DefaultProviderGateConfig() ProviderGateConfig {
 	return ProviderGateConfig{
-		MaxConcurrent: 64,
-		DegradedAfter: 5,
-		OpenAfter:     10,
-		OpenCooldown:  30 * time.Second,
+		MaxConcurrent:      64,
+		DegradedAfter:      5,
+		OpenAfter:          10,
+		OpenCooldown:       30 * time.Second,
+		ReconMaxConcurrent: 4,
 	}
 }
 
@@ -103,6 +130,9 @@ func (c ProviderGateConfig) withDefaults() ProviderGateConfig {
 	if c.OpenCooldown <= 0 {
 		c.OpenCooldown = d.OpenCooldown
 	}
+	if c.ReconMaxConcurrent <= 0 {
+		c.ReconMaxConcurrent = d.ReconMaxConcurrent
+	}
 	return c
 }
 
@@ -111,16 +141,23 @@ type ProviderHealthSnapshot struct {
 	ProviderID             string         `json:"provider_id"`
 	Health                 ProviderHealth `json:"health"`
 	InFlight               int            `json:"in_flight"`
+	ReadInFlight           int            `json:"read_in_flight"`
+	MutationInFlight       int            `json:"mutation_in_flight"`
+	ReconInFlight          int            `json:"recon_in_flight"`
 	Wedged                 int            `json:"wedged"`
 	ConsecutiveFailures    int            `json:"consecutive_failures"`
 	Timeouts               int64          `json:"timeouts"`
 	TransportFailures      int64          `json:"transport_failures"`
+	LocalAmbiguities       int64          `json:"local_ambiguities"`
 	ReconciliationFailures int64          `json:"reconciliation_failures"`
 	LastFailure            string         `json:"last_failure,omitempty"`
 }
 
 type providerState struct {
-	inFlight               int
+	inFlight               int // dispatch-pool slots in use (read + mutation)
+	inFlightRead           int
+	inFlightMutation       int
+	inFlightRecon          int
 	wedged                 int
 	consecutiveFailures    int
 	openedAt               time.Time
@@ -128,6 +165,7 @@ type providerState struct {
 	lastFailure            string
 	timeouts               int64
 	transportFailures      int64
+	localAmbiguities       int64
 	reconciliationFailures int64
 }
 
@@ -156,20 +194,36 @@ func (g *ProviderGate) state(providerID string) *providerState {
 	return st
 }
 
-// Acquire reserves one dispatch slot for providerID. It never blocks:
-// a saturated or open provider is refused immediately, so a caller
-// converges without spawning another goroutine. The returned lease
-// must be released exactly once when the provider call finishes.
-func (g *ProviderGate) Acquire(providerID string) (*ProviderLease, error) {
+// Acquire reserves one provider slot on the given lane. It never
+// blocks: a saturated or open provider is refused immediately, so a
+// caller converges without spawning another goroutine. The
+// reconciliation lane draws from its own reserved budget and bypasses
+// the circuit — a refused recon call means every reserved slot is in
+// use, nothing more. The returned lease must be released exactly once
+// when the provider call finishes.
+func (g *ProviderGate) Acquire(providerID string, lane ProviderLane) (*ProviderLease, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	st := g.state(providerID)
+	if lane == LaneReconciliation {
+		if st.inFlightRecon >= g.cfg.ReconMaxConcurrent {
+			return nil, fmt.Errorf("%w: %s reconciliation lane (%d in flight)", ErrProviderSaturated, providerID, st.inFlightRecon)
+		}
+		st.inFlightRecon++
+		return &ProviderLease{gate: g, providerID: providerID, lane: lane}, nil
+	}
 	probe, err := g.admitLocked(providerID, st)
 	if err != nil {
 		return nil, err
 	}
 	st.inFlight++
-	return &ProviderLease{gate: g, providerID: providerID, probe: probe}, nil
+	switch lane {
+	case LaneRead:
+		st.inFlightRead++
+	default:
+		st.inFlightMutation++
+	}
+	return &ProviderLease{gate: g, providerID: providerID, probe: probe, lane: lane}, nil
 }
 
 // admitLocked decides whether one call may start, implementing the
@@ -211,9 +265,26 @@ func (g *ProviderGate) RecordSuccess(providerID string) {
 // the provider did not give a usable answer. Consecutive ambiguous
 // outcomes degrade the provider and eventually open the circuit.
 func (g *ProviderGate) RecordAmbiguous(providerID string, reason string) {
+	g.RecordAmbiguousOutcome(providerID, true, reason)
+}
+
+// RecordAmbiguousOutcome records an ambiguous outcome attributed to a
+// causality class. Only provider-side ambiguity degrades health —
+// timeouts, transport failures, protocol ambiguity, and provider-side
+// unavailability are evidence the provider cannot answer. A local
+// cause (executor cancellation, a deadline that fired before dispatch,
+// a policy refusal) says nothing about provider health: it is counted
+// for visibility but never advances the failure streak or opens the
+// circuit.
+func (g *ProviderGate) RecordAmbiguousOutcome(providerID string, providerSide bool, reason string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	st := g.state(providerID)
+	if !providerSide {
+		st.localAmbiguities++
+		st.probeInFlight = false
+		return
+	}
 	st.consecutiveFailures++
 	st.transportFailures++
 	st.lastFailure = reason
@@ -250,10 +321,14 @@ func (g *ProviderGate) Snapshot() []ProviderHealthSnapshot {
 			ProviderID:             id,
 			Health:                 g.healthLocked(st),
 			InFlight:               st.inFlight,
+			ReadInFlight:           st.inFlightRead,
+			MutationInFlight:       st.inFlightMutation,
+			ReconInFlight:          st.inFlightRecon,
 			Wedged:                 st.wedged,
 			ConsecutiveFailures:    st.consecutiveFailures,
 			Timeouts:               st.timeouts,
 			TransportFailures:      st.transportFailures,
+			LocalAmbiguities:       st.localAmbiguities,
 			ReconciliationFailures: st.reconciliationFailures,
 			LastFailure:            st.lastFailure,
 		})
@@ -287,18 +362,35 @@ type ProviderLease struct {
 	gate       *ProviderGate
 	providerID string
 	probe      bool
+	lane       ProviderLane
 	once       sync.Once
 	wedged     atomic.Bool
 }
 
-// Release returns the dispatch slot.
+// Release returns the lane's slot.
 func (l *ProviderLease) Release() {
 	l.once.Do(func() {
 		l.gate.mu.Lock()
 		defer l.gate.mu.Unlock()
 		st := l.gate.state(l.providerID)
+		if l.lane == LaneReconciliation {
+			if st.inFlightRecon > 0 {
+				st.inFlightRecon--
+			}
+			return
+		}
 		if st.inFlight > 0 {
 			st.inFlight--
+		}
+		switch l.lane {
+		case LaneRead:
+			if st.inFlightRead > 0 {
+				st.inFlightRead--
+			}
+		default:
+			if st.inFlightMutation > 0 {
+				st.inFlightMutation--
+			}
 		}
 		if l.wedged.Load() && st.wedged > 0 {
 			st.wedged--
@@ -342,6 +434,16 @@ type observedResolver struct {
 }
 
 func (r *observedResolver) Resolve(ctx context.Context, record *idempotency.Record) (idempotency.RecoveryResult, error) {
+	// Reconciliation draws from the reserved lane — bounded, but never
+	// circuit-gated: the exact provider failure that stranded records
+	// must not prevent the lookup resolving them. A saturated lane
+	// defers the attempt; the record stays UNKNOWN for the next cycle.
+	lease, err := r.gate.Acquire(r.providerID, LaneReconciliation)
+	if err != nil {
+		r.gate.RecordReconciliationFailure(r.providerID)
+		return idempotency.RecoveryResult{}, err
+	}
+	defer lease.Release()
 	result, err := r.inner.Resolve(ctx, record)
 	if err != nil || result.Decision == idempotency.RecoveryUnknown {
 		r.gate.RecordReconciliationFailure(r.providerID)

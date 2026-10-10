@@ -393,5 +393,6 @@ retry. Therefore:
 | Broker client              | `internal/cli/coordinator.go`, `provider_coordinator.go`                                                |
 | Run / sync / lease         | `internal/cli/run.go`, `lease.go`                                                                       |
 | Coordinator entry / auth   | `worker/src/coordinator-entry.ts`, `worker/src/index.ts`, `worker/node/server.ts`, `worker/src/auth.ts` |
-| Fleet state / endpoints    | `worker/src/fleet.ts`, `types.ts`, `config.ts`, `usage.ts`                                              |
+| Fleet state / endpoints    | `worker/src/fleet.ts`, `fleet-shared.ts`, `types.ts`, `config.ts`, `usage.ts`                           |
+| Cloud provider adapters    | `worker/src/fleet-providers.ts`, `aws.ts`, `azure.ts`, `gcp.ts`, `hetzner.ts`, `daytona.ts`             |
 | Runtime adapters           | `worker/src/coordinator-runtime.ts`, `worker/node/node-runtime.ts`, `worker/node/postgres-storage.ts`   |

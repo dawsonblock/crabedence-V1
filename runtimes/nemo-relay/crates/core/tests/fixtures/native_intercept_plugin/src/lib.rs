@@ -221,6 +221,45 @@ impl NativePlugin for InterceptPlugin {
                 }
             }
         }
+        // What the child was handed, in descriptors: whether any descriptor it
+        // can see is the caller's canary file. Only that fact is written —
+        // never another descriptor's target — because the boundary is about
+        // what crossed, and a witness that carries paths is a leak. Descriptors
+        // are matched by inode identity, not by path: on macOS `/dev/fd/N` is a
+        // descriptor view that reports the target's inode under the view's own
+        // device, so a (device, inode) pair would never match, and a path is
+        // exactly what this witness must not carry. The directory is this
+        // process's own view of its table: /dev/fd on macOS, /proc/self/fd on
+        // Linux.
+        if let (Some(dump), Some(canary)) = (
+            config.get("fd_dump").and_then(|value| value.as_str()),
+            config.get("fd_canary").and_then(|value| value.as_str()),
+        ) {
+            use std::io::Write;
+            use std::os::unix::fs::MetadataExt;
+            if let Ok(mut file) = std::fs::File::create(dump) {
+                let mut carried = Vec::new();
+                if let Ok(canary) = std::fs::metadata(canary) {
+                    let inode = canary.ino();
+                    for directory in ["/dev/fd", "/proc/self/fd"] {
+                        let Ok(entries) = std::fs::read_dir(directory) else {
+                            continue;
+                        };
+                        for entry in entries.flatten() {
+                            let Ok(target) = std::fs::metadata(entry.path()) else {
+                                continue;
+                            };
+                            if target.ino() == inode {
+                                carried.push(entry.file_name().to_string_lossy().into_owned());
+                            }
+                        }
+                        break;
+                    }
+                }
+                carried.sort();
+                let _ = writeln!(file, "canary_fds={}", carried.join(","));
+            }
+        }
         ctx.register_llm_request_intercept(
             "fixture_intercept_llm_rewrite",
             0,

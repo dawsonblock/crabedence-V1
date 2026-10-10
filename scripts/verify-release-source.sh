@@ -15,13 +15,21 @@ export CRABBOX_RELEASE_REPOSITORY
 TRUSTED_HEAD=${TRUSTED_HEAD:-HEAD}
 ALLOWED_SIGNERS=${ALLOWED_SIGNERS:-"$ROOT/.github/release-allowed-signers"}
 RELEASE_RECORD=${RELEASE_RECORD:-"$ROOT/release/records/$RELEASE_TAG.json"}
+# A release family may carry a literal tag prefix (the NEMO distribution
+# family releases under nemo-vX.Y.Z). Empty means the stable vMAJOR.MINOR.PATCH
+# spelling; anything else must be a lowercase dash-terminated prefix.
+RELEASE_TAG_PREFIX=${RELEASE_TAG_PREFIX:-}
+if [[ -n "$RELEASE_TAG_PREFIX" && ! "$RELEASE_TAG_PREFIX" =~ ^[a-z0-9]+(-[a-z0-9]+)*-$ ]]; then
+  echo "::error::release tag prefix must be lowercase dash-terminated (e.g. nemo-)"
+  exit 1
+fi
 
 if [[ -n "${WORKFLOW_REF:-}" && "$WORKFLOW_REF" != "refs/heads/$DEFAULT_BRANCH" ]]; then
   echo "::error::release events must run from $DEFAULT_BRANCH"
   exit 1
 fi
-if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-  echo "::error::release tag must match vMAJOR.MINOR.PATCH"
+if [[ ! "$RELEASE_TAG" =~ ^${RELEASE_TAG_PREFIX}v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+  echo "::error::release tag must match ${RELEASE_TAG_PREFIX}vMAJOR.MINOR.PATCH"
   exit 1
 fi
 if [[ ! "$EXPECTED_TAG_OBJECT" =~ ^[0-9a-f]{40}$ ]] ||

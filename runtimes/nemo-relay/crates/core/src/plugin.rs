@@ -2375,10 +2375,23 @@ pub fn system_config_dir() -> PathBuf {
     }
 }
 
-/// Resolves the nemo-relay user config directory from `XDG_CONFIG_HOME`, then
+/// Environment variable pinning the user config directory explicitly.
+///
+/// Managed MCP processes run under a synthetic home directory so plugin and
+/// subprocess code cannot discover credentials through `$HOME` or XDG
+/// locations; this variable carries the real config directory across that
+/// boundary so `config.toml`, `plugins.toml`, bootstrap state and managed
+/// plugin environments still resolve where the installation put them.
+pub const USER_CONFIG_DIR_ENV: &str = "NEMO_RELAY_USER_CONFIG_DIR";
+
+/// Resolves the nemo-relay user config directory: an explicit
+/// `NEMO_RELAY_USER_CONFIG_DIR` pin first, then `XDG_CONFIG_HOME`, then
 /// `HOME`/`USERPROFILE`. `pub` only for cross-crate reuse by the gateway.
 #[doc(hidden)]
 pub fn user_config_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os(USER_CONFIG_DIR_ENV).filter(|dir| !dir.is_empty()) {
+        return Some(PathBuf::from(dir));
+    }
     if let Some(base) = std::env::var_os("XDG_CONFIG_HOME") {
         return Some(PathBuf::from(base).join("nemo-relay"));
     }

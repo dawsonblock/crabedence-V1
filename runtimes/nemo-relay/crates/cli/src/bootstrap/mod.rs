@@ -329,6 +329,54 @@ fn incompatible_relay_error(url: &str) -> String {
     )
 }
 
+/// Applies the managed-MCP home boundary to a spawned gateway.
+///
+/// The gateway is the process that actually loads plugin code, so it must
+/// not observe the operator's real `HOME`/XDG tree regardless of which
+/// launch path spawned it — a managed MCP proxy, a transparent
+/// `nemo-relay run`, or an older generated contract that still forwards the
+/// ambient environment. The private home lives inside the real user config
+/// directory, and `NEMO_RELAY_USER_CONFIG_DIR` keeps that directory
+/// reachable so `config.toml`, `plugins.toml`, bootstrap state and managed
+/// plugin environments keep resolving where the installation put them.
+///
+/// `NEMO_RELAY_MCP_INHERIT_HOME=1` is the explicit install-level opt-out:
+/// the generated contract records the operator's real home in
+/// `NEMO_RELAY_REAL_HOME`, and the gateway restores it instead of the
+/// synthetic directory.
+fn apply_gateway_home_boundary(command: &mut Command) -> Result<(), String> {
+    use crate::mcp_environment::{IsolatedHome, MCP_REAL_HOME_ENV, inherit_home_requested};
+
+    if inherit_home_requested() {
+        if let Some(real_home) = env::var_os(MCP_REAL_HOME_ENV).filter(|home| !home.is_empty()) {
+            command.env("HOME", &real_home);
+            command.env("USERPROFILE", &real_home);
+        }
+        for name in [
+            "APPDATA",
+            "LOCALAPPDATA",
+            "XDG_CACHE_HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_RUNTIME_DIR",
+            "XDG_STATE_HOME",
+        ] {
+            command.env_remove(name);
+        }
+        command.env_remove(nemo_relay::plugin::USER_CONFIG_DIR_ENV);
+        return Ok(());
+    }
+    let config_dir = crate::configuration::user_config_dir().ok_or_else(|| {
+        "gateway home isolation cannot determine the per-user NeMo Relay config directory; set HOME or USERPROFILE"
+            .to_string()
+    })?;
+    let home = IsolatedHome::for_managed_mcp(config_dir);
+    home.create()
+        .map_err(|error| format!("gateway home isolation setup failed: {error}"))?;
+    home.apply_to_command(command);
+    Ok(())
+}
+
 fn bootstrap_failure_kind(error: &str) -> &'static str {
     if error.contains("not a compatible NeMo Relay gateway") {
         "foreign_listener"
@@ -380,6 +428,7 @@ fn start_gateway(spec: &GatewaySpec, state: &Path) -> Result<GatewayEndpoint, St
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    apply_gateway_home_boundary(&mut command)?;
     detached::configure_detached(&mut command);
     let child = detached::spawn_detached(&mut command)
         .map_err(|error| format!("failed to spawn nemo-relay gateway: {error}"))?;

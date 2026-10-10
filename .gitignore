@@ -51,6 +51,11 @@ internal/applevmhelper/embedded/
 .DS_Store
 **/.DS_Store
 .claude/
+# The vendored runtime's .claude/skills link is provenance-covered: it
+# must stay tracked so Git-derived packaging cannot drop it.
+!runtimes/nemo-relay/.claude/
+runtimes/nemo-relay/.claude/*
+!runtimes/nemo-relay/.claude/skills
 nemo/node_modules/
 release-evidence/
 

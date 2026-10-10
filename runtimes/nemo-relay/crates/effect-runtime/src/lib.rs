@@ -3,12 +3,19 @@
 
 //! Validated composition of the NEMO kernel with a PostgreSQL effect store.
 //!
+//! The durable-effect [`kernel`] itself lives here: composition sits above the
+//! adapter crates in `security/layers.toml`, so the orchestration that names
+//! the authority, ledger, and executor contracts belongs to this crate rather
+//! than to the runtime vocabulary in `nemo-relay`.
+//!
 //! This crate deliberately does not implement Correct-Once or an external
 //! provider. Deployments supply those adapters, while this boundary ensures a
 //! production kernel cannot be assembled before its stable runtime identity,
 //! secure database transport, and versioned durable schema are verified.
 
-use nemo_relay::kernel::{BackendRouter, CapabilityRegistry, Kernel, KernelError};
+pub mod kernel;
+
+use crate::kernel::{BackendRouter, CapabilityRegistry, Kernel, KernelError};
 use nemo_relay_executor::unstable::{ExecutionBackend, RuntimeIdentity, RuntimeIdentityError};
 use nemo_relay_ledger::postgres::{
     PostgresEffectStore, PostgresEffectStoreError, PostgresMutualTlsCredentials,

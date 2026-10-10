@@ -30,6 +30,10 @@ tokio = { version = "1", features = [
 chrono = "0.4"
 getrandom = "0.3"
 hyper-util = { version = "0.1", features = ["tokio"] }
+# `close_range` on Linux and `proc_pidinfo` on macOS: the two kernel
+# enumeration surfaces the descriptor boundary uses that rustix does
+# not wrap. The smallest honest binding to them.
+libc = "0.2"
 nemo-relay-plugin-proto.workspace = true
 rustix = { version = "1.1.4", features = ["fs", "process", "thread"] }
 serde = { version = "1", features = ["derive"] }

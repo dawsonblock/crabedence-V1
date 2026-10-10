@@ -41,7 +41,7 @@ Unix-socket transport binding (see below) uses this exact structure:
 
 | Field                     | Type   | Required when                          |
 |---------------------------|--------|----------------------------------------|
-| `authority.authority_ref` | string | Capability's authority policy requires authorization |
+| `authority.authority_ref` | string | Capability's authority policy requires authorization *and* the service is not brokering the authenticated principal's grants |
 | `idempotency_key`         | string | Effect class is MUTATION or CRITICAL   |
 
 ### Optional fields
@@ -50,6 +50,78 @@ Unix-socket transport binding (see below) uses this exact structure:
 |--------------------|--------|--------------------------------------------------|
 | `execution_class`  | string | Caller assertion; checked against registry. If absent, registry's pinned class is used. Mismatch = DENIED. |
 | `deadline`         | string | RFC3339 timestamp; request is DENIED after this time |
+| `mediation`        | object | Middleware provenance for the request (see below) |
+| `session`          | object | Runtime-attestation binding for the request (see below) |
+
+### Mediation object
+
+The `mediation` field carries provenance about the middleware that
+handled the invocation *before* it crossed the ABI — for a runtime like
+NEMO, which middleware/plugin set rewrote the arguments and which
+release composed the call:
+
+```json
+{
+  "middleware_set_digest": "64-char hex SHA-256",
+  "original_args_digest": "64-char hex SHA-256",
+  "release_root_digest": "64-char hex SHA-256",
+  "plugin_manifest_sha256": "64-char hex SHA-256",
+  "plugin_library_sha256": "64-char hex SHA-256",
+  "activation_config_sha256": "64-char hex SHA-256"
+}
+```
+
+- `middleware_set_digest` (required when `mediation` is present):
+  digest of the exact middleware composition that ran — the activated
+  plugin identities, their registration descriptors and activation
+  configuration, and the host executable that served them.
+- `original_args_digest` (required when `mediation` is present):
+  digest of the caller's `arguments` *before* middleware rewrote them.
+  The `arguments` field itself always carries the post-middleware
+  (effective) arguments.
+- `release_root_digest` (optional): digest identifying the qualified
+  release/component manifest the calling runtime shipped in.
+- `plugin_manifest_sha256` and `plugin_library_sha256` (optional): the
+  activated plugin's manifest and exact library bytes.
+- `activation_config_sha256` (optional): the canonical activated-component
+  configuration digest. Raw configuration is not sent because it may contain
+  credentials.
+
+Mediation is evidence, not authorization input. Every present field is bound
+into the durable request identity and persisted on the durable record; the
+terminal receipt signs that request identity. It never selects the capability,
+route, authority, or outcome. A present `mediation` object missing either
+required field is refused.
+
+### Session object
+
+The `session` field carries the runtime-attestation binding — evidence the
+server verifies, never a grant:
+
+```json
+{
+  "id": "rts-…",
+  "proof": "base64 Ed25519 signature"
+}
+```
+
+- `id` (required when `session` is present): the attested session identifier
+  issued by the `attest_challenge`/`attest` handshake (see *Runtime
+  attestation* below).
+- `proof` (required when `session` is present): the runtime's Ed25519
+  signature over the pipe-joined request binding
+  `crabedence-session-proof-v1|session_id|capability|idempotency_key|principal|authority_ref|deadline|sha256(arguments)|sha256(mediation)`,
+  proving the sender holds the key the session attested — for THIS request.
+
+The session object is proof-of-possession, not authorization: a valid proof
+verifies which runtime sent the request and binds its identity onto the
+durable record as provenance; it never selects capability, route, assurance,
+or authority, and it is not part of the request digest — a request
+re-attested under a new session replays to the same execution identity.
+When the deployment requires attestation
+(`CRABEDENCE_ATTESTATION_REQUIRED`), an invocation without a verified
+session is DENIED. A present `session` object missing either field is
+refused.
 
 ### Authority object
 
@@ -67,14 +139,20 @@ The `authority` field groups identity and authorization material:
   claimed attribute unless the deployment enables peer authentication
   (`CRABEDENCE_PEER_PRINCIPALS`), in which case it is verified against
   the kernel-supplied Unix peer UID. Authorization derives from
-  resolving `authority_ref` against the principal; the two together
-  are checked by the authority store.
-- `authority_ref` (conditionally required): an unguessable bearer
-  reference to authority material. Crabedence resolves it internally.
-  Possession of the reference is the authorization proof — treat it
-  like a credential: never log it, never expose it to parties that
-  should not hold the authority, and provision it with entropy
-  comparable to a token (the built-in issuer uses 96-bit random IDs).
+  resolving `authority_ref` — or, when the request carries none, from
+  the service brokering the authenticated principal's live grants; in
+  both cases the authority store checks principal and grant together.
+- `authority_ref` (optional): an unguessable bearer reference to
+  authority material. Crabedence resolves it internally. When absent on
+  a grant-required capability, the request must arrive over an
+  authenticated peer channel and the service resolves which of the
+  principal's live grants admits it — exactly one must, or the request
+  is denied. When present, treat it like a credential: never log it,
+  never expose it to parties that should not hold the authority, never
+  place it on process arguments (argv is readable by every account on
+  the host — the `CRABEDENCE_AUTHORITY_REF` environment variable is the
+  caller-side channel), and provision it with entropy comparable to a
+  token (the built-in issuer uses 96-bit random IDs).
 - `grant_id` (deprecated alias): accepted for backward compatibility
   and mapped to `authority_ref` when `authority_ref` is absent.
 
@@ -118,16 +196,20 @@ before admission — it is never partially interpreted.
 | Root shape | The request must be a JSON object. |
 | Duplicate keys | Refused anywhere in the document — `encoding/json` and `JSON.parse` otherwise silently take the last value. |
 | Nesting depth | At most 64 open containers. |
-| Known fields | Root and `authority` accept only the documented fields. |
+| Known fields | Root, `authority`, `mediation`, and `session` accept only the documented fields. |
 | Null | Explicit `null` is refused for every known field; omit the field instead. `null` inside `arguments` is governed by the capability schema. |
 | Types | Known fields carry their declared JSON types. `authority_generation` must be a canonical JSON integer literal (no fraction, exponent, or leading zeros) that fits in a signed 64-bit integer. |
 
 `grant_id` remains a deliberate compatibility alias for
 `authority_ref`. `authority_generation` and `authority_digest` are
-accepted from the caller and overwritten by the server from the
-resolved grant; every other server-resolved field in the list above is
-outside the ABI, so sending one is an `unknown field` refusal rather
-than a silent ignore.
+tolerated on the wire for backward compatibility and carry **zero
+authority**: the server overwrites them unconditionally from the
+resolved grant before dispatch — a caller can neither forge authority
+binding nor omit it. "Present on the wire" must never be read as
+"trusted by the server". Every other server-resolved field in the list
+above is outside the ABI, so sending one is an `unknown field` refusal
+rather than a silent ignore. A future ABI version may reject the legacy
+authority fields outright; planners should omit them today.
 
 ## Unix Socket Transport Binding
 
@@ -144,6 +226,41 @@ over a Unix domain socket:
 The request body is the JSON object described above. There is no
 envelope, no `abi_version` field — the semantic contract is enforced
 by the capability registry, not a version tag on the wire.
+
+### Runtime attestation
+
+Two framed service messages sit beside the invocation frame — they are
+not capability invocations and are refused when attestation is not
+configured on the service:
+
+1. `{"type":"attest_challenge"}` → the service answers with a
+   single-use, short-lived `{"session_id","nonce","expires_at","protocol"}`.
+2. `{"type":"attest","session_id","runtime_identity":{…},"signature"}` →
+   the runtime signs the pipe-joined attestation envelope
+   (`crabedence-attestation-v1|session_id|nonce|runtime_key|release_digest|release_root_digest|plugin_manifest_digest|plugin_host_version|activation_digest|abi_version|runtime_config_digest`)
+   with its Ed25519 key, asserted inside `runtime_identity.runtime_key`.
+   The service verifies the signature against the approved-key set and
+   the asserted identity against the deployment's allowlists, binds the
+   session to the connection's kernel-supplied peer credentials — the
+   peer UID, and on Linux the peer executable resolved from
+   `/proc/<pid>/exe` — and answers
+   `{"status":"attested","session_id","runtime_identity_digest","expires_at"}`
+   or `{"status":"denied","error"}`.
+
+Each invocation then carries `session.id` + `session.proof` as above.
+Challenges are single-use, sessions expire, and a session bound to one
+peer cannot be exercised by another: a different peer UID is denied,
+and on Linux a same-UID process running a *different executable* is
+denied too — a sibling binary cannot ride a stolen session ID. Where
+the platform reports only the UID (BSD, macOS), the binding is the
+UID alone. Deployment controls:
+`CRABEDENCE_ATTESTATION_REQUIRED` (mandatory in production),
+`CRABEDENCE_APPROVED_RUNTIME_KEYS`,
+`CRABEDENCE_APPROVED_RELEASES`,
+`CRABEDENCE_APPROVED_PLUGIN_MANIFESTS`, `CRABEDENCE_APPROVED_ABI`,
+`CRABEDENCE_ATTESTATION_SESSION_TTL`, and the development-only
+`CRABEDENCE_ATTESTATION_RELAXED`. Attestation supplements peer
+authentication; it never replaces it.
 
 ## Why `authority_ref` instead of `grant_id`
 
@@ -163,30 +280,57 @@ authority_ref → workload identity (future)
 
 The ABI does not prescribe the authority mechanism.
 
-### Bearer semantics
+### Bearer and brokered semantics
 
-In the current model `authority_ref` is bearer authority: possession
+When `authority_ref` is present it is bearer authority: possession
 of the reference — plus a `principal` matching the resolved material —
-is the complete authorization proof. The planner supplies the
-`principal` string; the execution service does not independently
-authenticate it beyond the authority store's principal match. The
-trust boundary therefore rests on two controls:
+is the complete authorization proof. When it is absent on a
+grant-required capability, authority is *brokered*: the service
+enumerates the authenticated principal's live grants and admits iff
+exactly one covers the capability and its resource constraints (zero
+is denial; more than one is ambiguous denial). Brokered resolution
+exists only under peer authentication — an unverified `principal`
+claim is not an identity the service can broker against, and letting
+it enumerate grants would leak which principals hold authority for
+which capabilities.
+
+The trust boundary therefore rests on three controls:
 
 1. `authority_ref` values are unguessable and treated as secrets —
-   they must never appear in logs, receipts, or metrics.
+   they must never appear in logs, receipts, metrics, or process
+   arguments (argv is world-readable; `CRABEDENCE_AUTHORITY_REF` is
+   the caller-side environment channel for naming a specific grant).
 2. The transport boundary (a `0600` Unix socket today) restricts who
    can present references at all.
+3. Brokered resolution requires the authenticated peer principal —
+   the claim alone is insufficient.
 
 Deployments that need stronger principal authentication can enable
 peer authentication: `CRABEDENCE_PEER_PRINCIPALS` maps Unix peer UIDs
 to principals, the kernel supplies the UID over the socket, and a
 claim that disagrees with the mapping is denied — the authenticated
 principal replaces the claim before admission (see
-`docs/architecture/authority-model.md`). Production requires it:
-`CRABBOX_MODE=production` refuses to start without a nonempty map,
+`docs/architecture/authority-model.md`). A `uid:*` wildcard — a peer
+that may claim any principal — additionally requires the UID to be
+declared in `CRABEDENCE_TRUSTED_PROXY_UIDS`. The service requires
+`CRABBOX_MODE` to be declared at all — `development` or `production`,
+never assumed — so startup fails rather than guessing a posture.
+Production then requires the
+map: `CRABBOX_MODE=production` refuses to start without a nonempty
+one, and refuses a wildcard its trusted-proxy list does not cover,
 because an unverified claim is not an identity. Alternatively, an
 authenticated proxy or a future signed-session authority mechanism can
 front the socket.
+
+Whether or not peer authentication is configured, the service resolves
+the kernel-supplied peer credentials once per connection and persists
+them on the durable execution record as local-caller evidence — peer
+UID (every supported platform), plus peer PID and executable where the
+kernel reports them (Linux). This is provenance, not a policy input:
+it names which local process invoked the request, participates in the
+attestation session binding described above, and is never bound into
+the request digest, so the same request invoked by a different local
+process replays to the same execution identity.
 
 ## Three Orthogonal Dimensions
 
@@ -323,7 +467,9 @@ When a request arrives, Crabedence:
 2. Resolves the effect class (PURE, READ, MUTATION, CRITICAL).
 3. Resolves the assurance profile (NONE, STANDARD, DURABLE, HIGH_ASSURANCE).
 4. Resolves the argument schema and validates arguments.
-5. Resolves the authority policy and verifies `authority_ref`.
+5. Resolves the authority policy and verifies `authority_ref` — or, for
+   a peer-authenticated request carrying none, resolves which of the
+   principal's live grants admits the request.
 6. Resolves the adapter/provider via server-controlled policy.
 7. Checks idempotency requirements.
 8. Admits or denies.
@@ -367,6 +513,13 @@ that as an argument. Crabedence's registry owns provider selection.
 
 `IN_FLIGHT` is a valid wire status but is converted to `UNKNOWN`
 at the client boundary — it is not a terminal outcome for the caller.
+
+`EXECUTION_BUSY` is a pre-dispatch refusal: `FAILED` with
+`definitive_failure: true` and a machine-readable failure code, returned
+when an admission ceiling is reached (simultaneously open connections,
+or the smaller bound on unauthenticated/attestation handshakes). Nothing
+was dispatched, so nothing can have happened and a retry after the
+backlog drains is safe.
 
 ## Transport Bindings
 

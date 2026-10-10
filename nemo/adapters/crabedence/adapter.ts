@@ -60,6 +60,22 @@ export interface CapabilityInvocationRequest {
   readonly execution_class?: string;
   readonly idempotency_key?: string;
   readonly deadline?: string;
+  /**
+   * Caller-declared middleware provenance — evidence, never a policy
+   * input. middleware_set_digest names the exact middleware set that
+   * mediated the invocation; original_args_digest is the canonical
+   * digest of the arguments before middleware rewrote them; both are
+   * required when mediation is present. release_root_digest names the
+   * component manifest of the qualified runtime distribution.
+   */
+  readonly mediation?: {
+    readonly middleware_set_digest: string;
+    readonly original_args_digest: string;
+    readonly release_root_digest?: string;
+    readonly plugin_manifest_sha256?: string;
+    readonly plugin_library_sha256?: string;
+    readonly activation_config_sha256?: string;
+  };
 }
 
 /** @deprecated Use CapabilityInvocationRequest */
@@ -478,6 +494,26 @@ export class CrabedenceExecutionAdapter implements ExecutionPort {
       ...(request.executionClass && { execution_class: request.executionClass }),
       ...(request.idempotencyKey && { idempotency_key: request.idempotencyKey }),
       ...(request.deadline && { deadline: request.deadline }),
+      // Mediation is caller-declared provenance — forwarded verbatim,
+      // never synthesized or inspected here.
+      ...(request.mediation && {
+        mediation: {
+          middleware_set_digest: request.mediation.middlewareSetDigest,
+          original_args_digest: request.mediation.originalArgsDigest,
+          ...(request.mediation.releaseRootDigest && {
+            release_root_digest: request.mediation.releaseRootDigest,
+          }),
+          ...(request.mediation.pluginManifestSha256 && {
+            plugin_manifest_sha256: request.mediation.pluginManifestSha256,
+          }),
+          ...(request.mediation.pluginLibrarySha256 && {
+            plugin_library_sha256: request.mediation.pluginLibrarySha256,
+          }),
+          ...(request.mediation.activationConfigSha256 && {
+            activation_config_sha256: request.mediation.activationConfigSha256,
+          }),
+        },
+      }),
     };
 
     try {

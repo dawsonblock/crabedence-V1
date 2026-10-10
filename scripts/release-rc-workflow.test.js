@@ -30,7 +30,11 @@ test("clean-room verification gates publication", () => {
   // publish job, so a failed clean-room verification cannot publish.
   assert.doesNotMatch(job("build"), /git push origin|softprops\/action-gh-release/);
   assert.doesNotMatch(cleanRoom, /git push origin|softprops\/action-gh-release/);
-  assert.match(publish, /git push origin "\$RELEASE_VERSION"/);
+  // The tag push lives in the tested script the publish job delegates
+  // to — the workflow must not carry its own tag/push logic.
+  assert.match(publish, /scripts\/ensure-release-tag\.sh "\$RELEASE_VERSION" "\$COMMIT"/);
+  const ensureTag = fs.readFileSync(path.join(repoRoot, "scripts/ensure-release-tag.sh"), "utf8");
+  assert.match(ensureTag, /git push "\$REMOTE" "\$TAG"/);
   assert.match(publish, /softprops\/action-gh-release@/);
 });
 
@@ -143,12 +147,13 @@ test("tag creation is idempotent and never moves a published tag", () => {
   const tagStep = publish.indexOf("name: Tag release candidate");
   assert.ok(tagStep >= 0);
   const tagBlock = publish.slice(tagStep, publish.indexOf("\n      - name:", tagStep));
-  // An existing tag on the qualified commit is reused; any other target
-  // is a hard failure. A published release tag is never moved.
-  assert.match(tagBlock, /ls-remote origin "refs\/tags\/\$\{RELEASE_VERSION\}\^\{\}"/);
-  assert.match(tagBlock, /"\$existing" != "\$COMMIT"/);
-  assert.match(tagBlock, /exit 1/);
-  assert.match(tagBlock, /git tag -a "\$RELEASE_VERSION"/);
+  // The admission rule lives in a tested script: an existing tag on the
+  // qualified commit is reused, any other target is a hard failure, and
+  // a published release tag is never moved. The workflow must delegate
+  // to it with the qualified commit — never re-implement it inline.
+  assert.match(tagBlock, /bash scripts\/ensure-release-tag\.sh "\$RELEASE_VERSION" "\$COMMIT"/);
+  assert.doesNotMatch(tagBlock, /git tag -/);
+  assert.doesNotMatch(tagBlock, /git push/);
 });
 
 test("an existing release must already carry the qualified bytes", () => {
@@ -201,6 +206,23 @@ test("the clean room verifies the published evidence bundle, not the raw directo
   // The internal raw evidence artifact is not a verification input.
   assert.doesNotMatch(cleanRoom, /name: release-evidence/);
   assert.doesNotMatch(cleanRoom, /cp -r evidence/);
+});
+
+test("the public source bundle is produced by the verified packager, never git archive", () => {
+  // `git archive` emits blob bytes, which diverge from the qualified
+  // worktree wherever a text/eol attribute smudges the checkout (the
+  // runtime's *.cmd eol=crlf file is exactly that), and Git-derived
+  // packagers dropped provenance-covered paths Git did not track — the
+  // .claude/skills symlink defect. package-source-archive.sh reads
+  // worktree bytes over the unioned path set and verifies the emitted
+  // archive by extraction before anything downstream consumes it.
+  assert.doesNotMatch(workflow, /git archive/);
+  const build = job("build");
+  assert.match(build, /package-source-archive\.sh --format tar\.gz/);
+  assert.match(build, /package-source-archive\.sh --format zip/);
+  assert.match(build, /--prefix "crabedence-\$\{RELEASE_VERSION\}"/);
+  assert.match(build, /-o "dist\/crabedence-\$\{RELEASE_VERSION\}\.tar\.gz"/);
+  assert.match(build, /-o "dist\/crabedence-\$\{RELEASE_VERSION\}\.zip"/);
 });
 
 test("the release script suite gates the build", () => {
@@ -326,6 +348,33 @@ test("public reverification checks the SBOM and tree equivalence from public ass
   // not merely "some workflow in this repository".
   assert.match(reverify, /--signer-workflow "\$SIGNER_WORKFLOW"/);
   assert.match(reverify, /--source-digest "\$SOURCE_DIGEST"/);
+});
+
+test("clean-room installs materialize the pinned schema validator", () => {
+  // verify-release-artifact.sh resolves the JSON Schema validator from
+  // dirname(EVIDENCE_DIR)/nemo/scripts/validate-schema.mjs first — an
+  // extracted source tree carries no node_modules, so the workflow must
+  // place BOTH the installed dependencies and the validator script under
+  // clean-room/nemo. Dependencies without the script leave the candidate
+  // absent; the script without dependencies leaves its ajv import
+  // unresolvable.
+  for (const jobName of ["clean-room-verify", "public-reverify"]) {
+    const body = job(jobName);
+    const installAt = body.indexOf("- name: Install pinned verification dependencies");
+    assert.ok(installAt >= 0, `${jobName} installs pinned verification dependencies`);
+    const install = body.slice(installAt, installAt + 1200);
+    assert.match(
+      install,
+      /mkdir -p clean-room\/nemo\/scripts/,
+      `${jobName} creates the validator script directory`,
+    );
+    assert.match(
+      install,
+      /cp "clean-room\/tar-source\/crabedence-\$\{RELEASE_VERSION\}\/nemo\/scripts\/validate-schema\.mjs"/,
+      `${jobName} copies the pinned validator script beside its dependencies`,
+    );
+    assert.match(install, /npm ci --prefix clean-room\/nemo/, `${jobName} installs the pinned dependency set`);
+  }
 });
 
 test("neither release workflow writes an attestation inside the evidence closure", () => {

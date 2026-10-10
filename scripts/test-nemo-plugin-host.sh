@@ -81,6 +81,9 @@ TOML
 
 printf 'hosting the plugin through the runtime…\n'
 export NEMO_RELAY_PLUGIN_HOST="$host_bin"
+# A development tree has nothing to pin the ambient host's bytes against;
+# acknowledge the unverified override explicitly — it is refused otherwise.
+export NEMO_RELAY_PLUGIN_HOST_ALLOW_UNPINNED=1
 out="$("$runtime_bin" --plugin "$work_dir" --plugin-id fixture_intercept \
   --component fixture_intercept --tool example_tool --arguments '{"input":true}')"
 printf '%s\n' "$out"

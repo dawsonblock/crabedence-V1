@@ -12,6 +12,23 @@ artifacts and the scripts that consume them:
   validator, shared by release admission and the standalone verifier.
 - `scripts/check-release-admission.sh` — release admission.
 - `scripts/verify-release-artifact.sh` — standalone artifact verification.
+- `scripts/package-source-archive.sh` — the only source-bundle producer;
+  enforces the tracked-only provenance invariant
+  (provenance-covered ⇒ tracked ⇒ manifested ⇒ packaged ⇒ verifiable).
+- `scripts/verify-source-manifest.sh` and
+  `scripts/compare-source-trees.sh` — the bidirectional inventory check
+  and the tar/ZIP semantic-equivalence check.
+- `scripts/qualify-repository.sh` and
+  `scripts/qualify-source-distribution.sh` — the two qualification lanes:
+  Git-dependent gates and the `.git`-free extracted-source gates.
+- `scripts/generate-release-evidence.sh`,
+  `scripts/finalize-release-evidence.sh`, and
+  `scripts/generate-evidence-root.py` — the machine-readable evidence
+  chain: per-gate records, hashed logs, the generated report,
+  `SHA256SUMS`, the final evidence manifest, and `evidence-root.json`.
+- `scripts/ensure-release-tag.sh` — tag admission: reuse a tag on the
+  qualified commit, refuse a tag on any other commit, never move a
+  published tag.
 - `.github/workflows/release-rc.yml` — the RC build/verify/publish workflow.
 
 ## Human promotion sequence

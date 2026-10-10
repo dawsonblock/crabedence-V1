@@ -1,16 +1,19 @@
 package execution
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/openclaw/crabbox/internal/capability"
 	"github.com/openclaw/crabbox/internal/evidence"
 	"github.com/openclaw/crabbox/internal/idempotency"
+	"github.com/openclaw/crabbox/internal/providertransport"
 )
 
 // DispatchState tracks where an execution is in the dispatch lifecycle.
@@ -113,8 +116,10 @@ func durabilityContext(ctx context.Context, budget time.Duration) (context.Conte
 
 // requestDigestProtocolVersion is the digest ABI version. The
 // descriptor-identity binding is additive (zero values bind nothing),
-// so it does not require a protocol bump; the executor's legacy-digest
-// retry covers records created before descriptor identity existed.
+// so it does not require a protocol bump; records created before
+// descriptor identity existed are upgraded once by migrate-on-touch
+// (MigrateRequestDigest), after which the descriptor binding protects
+// them like any fresh record.
 const requestDigestProtocolVersion = 1
 
 // DispatchExecutor wraps a Handler with dispatch-point tracking and
@@ -240,6 +245,16 @@ func (e *DispatchExecutor) SetProviderGate(g *ProviderGate) {
 // provider-level health surface.
 func (e *DispatchExecutor) ProviderGate() *ProviderGate { return e.gate }
 
+// laneFor maps the resolved execution class onto the provider lane —
+// direct reads draw from the read lane, effect dispatches from the
+// mutation lane. Both share the bounded dispatch pool.
+func laneFor(desc capability.ResolvedDescriptor) ProviderLane {
+	if desc.ExecutionClass == capability.ClassRead {
+		return LaneRead
+	}
+	return LaneMutation
+}
+
 // observeProviderOutcome accounts one provider outcome on the gate.
 // Health is updated ONLY when the provider actually participated: an
 // executor refusal (open circuit, saturated bound, expired deadline)
@@ -248,20 +263,33 @@ func (e *DispatchExecutor) ProviderGate() *ProviderGate { return e.gate }
 // invocation that outlived the ceiling degrades the provider; a
 // definitive answer — success, definitive failure, or denial — proves
 // the provider is answering and resets the streak.
+//
+// UNKNOWN degradation is cause-aware: the dispatch provenance's
+// classified cause decides whether the ambiguity is attributable to
+// the provider. Provably local causes — executor cancellation, a
+// deadline that fired before dispatch, a policy refusal — are counted
+// without advancing the streak. An absent or unclassified cause stays
+// conservative: an unattributed ambiguity is provider-side.
 func (e *DispatchExecutor) observeProviderOutcome(
 	desc capability.ResolvedDescriptor,
 	outcome DispatchOutcome,
 	state idempotency.State,
+	provResp Response,
 ) {
 	if !outcome.ProviderInvoked {
 		return
 	}
 	if state == idempotency.StateUnknown {
-		e.gate.RecordAmbiguous(desc.AdapterID, "post-dispatch ambiguity (UNKNOWN)")
+		cause := providertransport.AmbiguityCause("")
+		if provResp.Dispatch != nil {
+			cause = providertransport.AmbiguityCause(provResp.Dispatch.Cause)
+		}
+		providerSide := cause == "" || cause == providertransport.CauseUnknown || cause.ProviderSide()
+		e.gate.RecordAmbiguousOutcome(desc.AdapterID, providerSide, "post-dispatch ambiguity (UNKNOWN)")
 		return
 	}
 	if outcome.TimedOut {
-		e.gate.RecordAmbiguous(desc.AdapterID, "provider exceeded the executor ceiling")
+		e.gate.RecordAmbiguousOutcome(desc.AdapterID, true, "provider exceeded the executor ceiling")
 		return
 	}
 	e.gate.RecordSuccess(desc.AdapterID)
@@ -283,7 +311,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	if desc.ExecutionClass == capability.ClassPure || desc.ExecutionClass == capability.ClassRead {
 		outcome := e.dispatch(ctx, req, desc, nil)
 		state, _ := classifyPostDispatch(outcome.Response, desc)
-		e.observeProviderOutcome(desc, outcome, state)
+		e.observeProviderOutcome(desc, outcome, state, outcome.Response)
 		return outcome.Response
 	}
 
@@ -324,7 +352,23 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 			Error:       fmt.Sprintf("failed to compute descriptor digest: %v", err),
 		}
 	}
-	digest, err := idempotency.ComputeDigestFromRawWithDescriptor(
+	// Caller-declared middleware provenance: bound into the request
+	// digest so the durable record commits to which middleware set
+	// produced the dispatched arguments, and persisted verbatim at
+	// acquisition. Evidence only — it never selects route, provider,
+	// assurance, or authority.
+	var mediation *idempotency.MediationBinding
+	if req.Mediation != nil {
+		mediation = &idempotency.MediationBinding{
+			MiddlewareSetDigest:    req.Mediation.MiddlewareSetDigest,
+			OriginalArgsDigest:     req.Mediation.OriginalArgsDigest,
+			ReleaseRootDigest:      req.Mediation.ReleaseRootDigest,
+			PluginManifestSHA256:   req.Mediation.PluginManifestSHA256,
+			PluginLibrarySHA256:    req.Mediation.PluginLibrarySHA256,
+			ActivationConfigSHA256: req.Mediation.ActivationConfigSHA256,
+		}
+	}
+	digest, err := idempotency.ComputeDigestFromRawWithMediation(
 		requestDigestProtocolVersion,
 		req.Authority.Principal,
 		req.Capability,
@@ -337,6 +381,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		string(desc.ExecutionRoute),
 		desc.DescriptorVersion,
 		descriptorDigest,
+		mediation,
 	)
 	if err != nil {
 		return Response{
@@ -358,23 +403,62 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		Generation: req.Authority.AuthorityGeneration,
 		Digest:     req.Authority.AuthorityDigest,
 	}
-	acq, err := e.store.AcquireWithAuthority(ctx, req.IdempotencyKey, req.Authority.Principal, req.Capability, digest,
-		authorityBinding, string(desc.ExecutionClass), leaseDuration)
+	// Server-verified runtime provenance: resolved by the service from
+	// the attestation session — never the caller's claim. It is bound
+	// onto the record at insert; it is NOT part of the request digest,
+	// so a request re-attested under a new session replays to the same
+	// execution identity.
+	var attestation *idempotency.AttestationBinding
+	if req.Attestation != nil {
+		attestation = &idempotency.AttestationBinding{
+			SessionID:      req.Attestation.SessionID,
+			IdentityDigest: req.Attestation.IdentityDigest,
+			KeyFingerprint: req.Attestation.KeyFingerprint,
+		}
+	}
+	// Kernel-supplied local-caller evidence: resolved once on the
+	// connection — which OS-level process invoked. Like attestation it
+	// is evidence only, never bound into the request digest.
+	var peer *idempotency.PeerBinding
+	if req.Peer != nil {
+		peer = &idempotency.PeerBinding{
+			UID:        req.Peer.UID,
+			PID:        req.Peer.PID,
+			Executable: req.Peer.Executable,
+		}
+	}
+	provenance := idempotency.AcquireProvenance{
+		Authority:   authorityBinding,
+		Mediation:   mediation,
+		Attestation: attestation,
+		Peer:        peer,
+	}
+	acq, err := e.store.AcquireWithProvenance(ctx, req.IdempotencyKey, req.Authority.Principal, req.Capability, digest,
+		provenance, string(desc.ExecutionClass), leaseDuration)
 	if err != nil {
 		return Response{
 			Status:      StatusFailed,
 			FailureCode: string(capability.FailureInternalError),
-			Error:       fmt.Sprintf("idempotency acquire failed: %v", err),
+			Error:       wireStoreError("idempotency acquire failed", err),
 		}
 	}
 
-	// Compatibility window for records created before descriptor
-	// identity was bound: their stored digest is the legacy digest, so
-	// the descriptor-bound digest conflicts. Recompute the legacy
-	// digest and retry the acquisition exactly once — a genuine
-	// conflict (neither digest matches the stored record) still fails
-	// closed, and new records always store the descriptor-bound digest.
-	if acq.Kind == idempotency.IdempotencyConflict {
+	// Records created before descriptor identity was bound carry the
+	// prefix-format (legacy) request digest, so a first acquire under
+	// the descriptor-bound digest conflicts even when the request is
+	// the same. Recompute the legacy digest and offer the record a
+	// one-time migrate-on-touch: the store rewrites request_digest to
+	// the descriptor-bound identity only while the stored digest still
+	// equals the legacy digest, no live lease protects the record, and
+	// the stored mediation matches — then the acquisition runs again
+	// under the new identity. After migration the descriptor binding
+	// protects the record exactly like a fresh one: a registry policy
+	// change is a conflict, never a silent replay. A record that cannot
+	// be migrated yet (a live lease is held, or its recorded mediation
+	// differs) keeps its stored identity and is classified under the
+	// legacy digest — in-flight, recovery, or replay — exactly as the
+	// pre-migration path classified it.
+	if acq.Kind == idempotency.IdempotencyConflict && acq.Record != nil {
 		legacyDigest, legacyErr := idempotency.ComputeDigestFromRawWithAuthority(
 			requestDigestProtocolVersion,
 			req.Authority.Principal,
@@ -387,11 +471,55 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 			string(desc.AssuranceProfile),
 			string(desc.ExecutionRoute),
 		)
-		if legacyErr == nil && legacyDigest != digest {
-			if legacyAcq, legacyAcquireErr := e.store.AcquireWithAuthority(ctx, req.IdempotencyKey,
-				req.Authority.Principal, req.Capability, legacyDigest, authorityBinding,
-				string(desc.ExecutionClass), leaseDuration); legacyAcquireErr == nil {
-				acq = legacyAcq
+		if legacyErr == nil && legacyDigest != digest && acq.Record.RequestDigest == legacyDigest {
+			migrated, migErr := e.store.MigrateRequestDigest(ctx,
+				acq.Record.ExecutionID, legacyDigest, digest, mediation)
+			if migErr != nil {
+				return Response{
+					Status:      StatusFailed,
+					FailureCode: string(capability.FailureInternalError),
+					Error:       wireStoreError("request digest migration failed", migErr),
+				}
+			}
+			acquireDigest := digest
+			if !migrated {
+				// The store refused the migration. A live lease is the
+				// benign refusal: the record keeps its stored identity and
+				// the request is classified under the legacy digest —
+				// in-flight, recovery, or replay — exactly as it was before
+				// descriptor-bound digests existed. A *mediation* mismatch is
+				// different: the recorded mediation is evidence for another
+				// invocation, so the record is not this request's identity at
+				// all — the acquisition must stay a conflict rather than
+				// replay a terminal outcome across a mediation boundary.
+				storedMediation := []byte(nil)
+				if len(acq.Record.RequestMediation) > 0 {
+					storedMediation = []byte(acq.Record.RequestMediation)
+				}
+				var callerMediation []byte
+				if mediation != nil {
+					if encoded, encErr := json.Marshal(mediation); encErr == nil {
+						callerMediation = encoded
+					}
+				}
+				if !bytes.Equal(storedMediation, callerMediation) {
+					acquireDigest = ""
+				} else {
+					acquireDigest = legacyDigest
+				}
+			}
+			if acquireDigest != "" {
+				if reacq, reErr := e.store.AcquireWithProvenance(ctx, req.IdempotencyKey,
+					req.Authority.Principal, req.Capability, acquireDigest,
+					provenance, string(desc.ExecutionClass), leaseDuration); reErr == nil {
+					acq = reacq
+				} else {
+					return Response{
+						Status:      StatusFailed,
+						FailureCode: string(capability.FailureInternalError),
+						Error:       wireStoreError("idempotency acquire failed", reErr),
+					}
+				}
 			}
 		}
 	}
@@ -502,7 +630,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	// reservation is abandoned rather than consumed — the record
 	// returns to claimable PREPARED, so a retry with the same key
 	// reacquires and, once capacity exists, dispatches for real.
-	providerLease, err := e.gate.Acquire(desc.AdapterID)
+	providerLease, err := e.gate.Acquire(desc.AdapterID, laneFor(desc))
 	if err != nil {
 		e.abandonPreDispatch(ctx, executionID, leaseToken, leaseGen)
 		return e.providerRefusedResponse(err)
@@ -523,7 +651,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		return Response{
 			Status:      StatusFailed,
 			FailureCode: string(capability.FailureInternalError),
-			Error:       fmt.Sprintf("failed to begin execution (lease lost or state changed): %v", err),
+			Error:       wireStoreError("failed to begin execution (lease lost or state changed)", err),
 		}
 	}
 	e.fireCrashPoint(CrashAfterBeginExecution)
@@ -568,7 +696,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		return Response{
 			Status:      StatusFailed,
 			FailureCode: string(capability.FailureInternalError),
-			Error:       fmt.Sprintf("failed to transition to IN_FLIGHT (lease lost or state changed): %v", err),
+			Error:       wireStoreError("failed to transition to IN_FLIGHT (lease lost or state changed)", err),
 		}
 	}
 	e.fireCrashPoint(CrashAfterMarkInFlight)
@@ -685,7 +813,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 
 	// ─── TERMINAL DECISION — single post-dispatch decision table ─────────
 	state, resp := classifyPostDispatch(providerResp, desc)
-	e.observeProviderOutcome(desc, outcome, state)
+	e.observeProviderOutcome(desc, outcome, state, providerResp)
 
 	evidenceDigest := ""
 	receiptVersion := 0
@@ -710,10 +838,10 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		recErr := e.enterRecovery(ctx, executionID, providerResp, desc)
 		errMsg := "post-dispatch ambiguity: entered recovery (side effect may have occurred)"
 		if recErr != nil {
-			errMsg = fmt.Sprintf("post-dispatch ambiguity: %v", recErr)
+			errMsg = wireStoreError("post-dispatch ambiguity", recErr)
 		}
 		if obsErr != nil {
-			errMsg += fmt.Sprintf("; provider observation NOT persisted: %v", obsErr)
+			errMsg += "; " + wireStoreError("provider observation NOT persisted", obsErr)
 		}
 		return Response{
 			Status:      StatusUnknown,
@@ -735,9 +863,9 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 	// contradiction into an immutable terminal state.
 	if obsErr != nil {
 		recErr := e.enterRecovery(ctx, executionID, providerResp, desc)
-		errMsg := fmt.Sprintf("provider observation not persisted: %v", obsErr)
+		errMsg := wireStoreError("provider observation not persisted", obsErr)
 		if recErr != nil {
-			errMsg += fmt.Sprintf("; %v", recErr)
+			errMsg += "; " + wireStoreError("recovery transition failed", recErr)
 		}
 		return Response{
 			Status:      StatusUnknown,
@@ -830,9 +958,9 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 			// Cannot produce the required proof — treat as post-dispatch
 			// uncertainty, not a terminal outcome.
 			recErr := e.enterRecovery(ctx, executionID, providerResp, desc)
-			errMsg := fmt.Sprintf("failed to sign CRITICAL evidence receipt: %v", signErr)
+			errMsg := wireStoreError("failed to sign CRITICAL evidence receipt", signErr)
 			if recErr != nil {
-				errMsg += fmt.Sprintf("; %v", recErr)
+				errMsg += "; " + wireStoreError("recovery transition failed", recErr)
 			}
 			return Response{
 				Status:      StatusUnknown,
@@ -853,7 +981,7 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		return Response{
 			Status:      StatusUnknown,
 			FailureCode: string(capability.FailureExecutionUnknown),
-			Error:       fmt.Sprintf("failed to lookup execution for finalize: %v", err),
+			Error:       wireStoreError("failed to lookup execution for finalize", err),
 			Execution: &ExecutionMeta{
 				Provider: desc.AdapterID,
 				RunID:    executionID,
@@ -872,14 +1000,14 @@ func (e *DispatchExecutor) ExecuteWithIdempotency(ctx context.Context, req Reque
 		// transition below also writes it atomically. Report persistence
 		// honestly — never claim the observation was stored if it wasn't.
 		recErr := e.enterRecovery(ctx, executionID, providerResp, desc)
-		errMsg := fmt.Sprintf("failed to finalize execution after dispatch: %v", err)
+		errMsg := wireStoreError("failed to finalize execution after dispatch", err)
 		if recErr == nil {
 			errMsg += " (provider observation persisted)"
 		} else {
-			errMsg += fmt.Sprintf(" (%v)", recErr)
+			errMsg += fmt.Sprintf(" (%s)", wireStoreError("recovery transition failed", recErr))
 		}
 		if obsErr != nil {
-			errMsg += fmt.Sprintf("; earlier observation write failed: %v", obsErr)
+			errMsg += "; " + wireStoreError("earlier observation write failed", obsErr)
 		}
 		return Response{
 			Status:      StatusUnknown,
@@ -953,7 +1081,7 @@ func (e *DispatchExecutor) dispatch(ctx context.Context, req Request, desc capab
 	// the outcome is a provable no-effect failure — never post-dispatch
 	// ambiguity.
 	if lease == nil {
-		acquired, err := e.gate.Acquire(desc.AdapterID)
+		acquired, err := e.gate.Acquire(desc.AdapterID, laneFor(desc))
 		if err != nil {
 			return DispatchOutcome{Response: e.providerRefusedResponse(err), ProvableNoEffect: true}
 		}
@@ -1187,6 +1315,10 @@ func buildObservation(resp Response, desc capability.ResolvedDescriptor) idempot
 	if resp.Evidence != nil {
 		obs.EvidenceDigest = resp.Evidence.Digest
 		obs.ReceiptVersion = resp.Evidence.ReceiptVersion
+	}
+	if resp.Dispatch != nil {
+		obs.AmbiguityCause = resp.Dispatch.Cause
+		obs.DispatchMilestone = resp.Dispatch.Milestone
 	}
 	return obs
 }
@@ -1464,4 +1596,20 @@ func (e *DispatchExecutor) leaseHeartbeat(ctx context.Context, executionID, leas
 			}
 		}
 	}
+}
+
+// wireStoreError renders an internal-infrastructure error for the
+// response Error field. Typed lease-contract errors carry fixed,
+// client-meaningful messages (state conflicts, fencing, epoch
+// mismatches) and pass through; everything else — driver errors that
+// can embed SQL text, DSN fragments, or I/O details — is logged
+// server-side and reduced to a generic phrase so internals never
+// cross the wire.
+func wireStoreError(prefix string, err error) string {
+	var leaseErr idempotency.LeaseError
+	if errors.As(err, &leaseErr) {
+		return fmt.Sprintf("%s: %v", prefix, err)
+	}
+	log.Printf("dispatch executor: %s: %v", prefix, err)
+	return prefix
 }

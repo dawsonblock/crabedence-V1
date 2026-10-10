@@ -21,8 +21,10 @@ import { validateInvocationRequest } from "../contracts/invocation-abi";
 
 interface SchemaField {
   readonly type?: string;
+  readonly pattern?: string;
   readonly additionalProperties?: boolean;
   readonly properties?: Record<string, SchemaField>;
+  readonly required?: string[];
 }
 
 interface InvocationSchema {
@@ -42,11 +44,26 @@ const schema: InvocationSchema = JSON.parse(
   ),
 ) as InvocationSchema;
 
-/** A structurally valid value for one schema-declared field type. */
+/**
+ * A structurally valid value for one schema-declared field type.
+ * Objects carry every `required` subfield so the synthesized value
+ * satisfies presence rules like the mediation object's digest pair.
+ * A declared `pattern` is honored for the digest shape the schema
+ * uses; any other pattern fails here so a new constraint is noticed.
+ */
 function valueFor(field: SchemaField): unknown {
+  if (field.pattern !== undefined) {
+    expect(field.pattern).toBe("^[0-9a-f]{64}$");
+    return "0".repeat(64);
+  }
   switch (field.type) {
-    case "object":
-      return {};
+    case "object": {
+      const value: Record<string, unknown> = {};
+      for (const key of field.required ?? []) {
+        value[key] = valueFor(field.properties?.[key] ?? {});
+      }
+      return value;
+    }
     case "integer":
       return 1;
     default:
@@ -90,6 +107,26 @@ describe("capability invocation schema", () => {
         authority: { [name]: valueFor(field) },
       });
       expect(accepts(wire), `authority.${name} must be accepted`).toBe(true);
+    }
+  });
+
+  it("accepts every mediation field the schema describes", () => {
+    const mediation = schema.properties?.mediation;
+    expect(mediation?.type).toBe("object");
+    expect(mediation?.additionalProperties).toBe(false);
+    // The schema must declare the two digests the validators require —
+    // a mediation object without both is malformed evidence (R9).
+    for (const name of ["middleware_set_digest", "original_args_digest"]) {
+      expect(mediation?.required, `mediation.${name} must be required`).toContain(name);
+    }
+    for (const [name, field] of Object.entries(mediation?.properties ?? {})) {
+      const mediationValue = valueFor(mediation ?? {}) as Record<string, unknown>;
+      mediationValue[name] = valueFor(field);
+      const wire = JSON.stringify({
+        capability: "system.echo",
+        mediation: mediationValue,
+      });
+      expect(accepts(wire), `mediation.${name} must be accepted`).toBe(true);
     }
   });
 

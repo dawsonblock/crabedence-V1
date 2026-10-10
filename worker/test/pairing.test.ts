@@ -802,7 +802,7 @@ async function pairingFixture(
     CRABBOX_SHARED_TOKEN: "shared-token",
     CRABBOX_SHARED_OWNER: "automation@example.com",
     CRABBOX_ADMIN_TOKEN: "admin-token",
-    CRABBOX_SESSION_SECRET: "session-secret",
+    CRABBOX_SESSION_SECRET: "test-session-secret-with-32-characters",
     CRABBOX_DEFAULT_ORG: org,
     CRABBOX_GITHUB_ALLOWED_ORG: org,
     CRABBOX_GITHUB_MEMBERSHIP_CACHE_SECONDS: "0",

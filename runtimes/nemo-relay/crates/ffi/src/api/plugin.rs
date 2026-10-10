@@ -260,15 +260,17 @@ pub unsafe extern "C" fn nemo_relay_initialize_with_dynamic_plugins(
     // resolves the discovered configuration, activates what this process runs,
     // starts the native plugins in a host process, and rolls the whole thing back
     // if any stage fails. What this function adds is the C-shaped error mapping.
-    let activation =
-        match tokio_runtime().block_on(ActivatedPluginRuntime::activate_with_discovered_config(
-            config,
-            dynamic_plugins,
-            IsolationPolicy::for_runtime("nemo-relay-ffi").with_native_isolation(isolation),
-        )) {
-            Ok(activation) => activation,
-            Err(error) => return status_from_activation_error(&error),
-        };
+    let mut policy =
+        IsolationPolicy::for_runtime("nemo-relay-ffi").with_native_isolation(isolation);
+    if let Some(host) = crate::plugin_host_location::resolved_host() {
+        policy = policy.with_host(host);
+    }
+    let activation = match tokio_runtime().block_on(
+        ActivatedPluginRuntime::activate_with_discovered_config(config, dynamic_plugins, policy),
+    ) {
+        Ok(activation) => activation,
+        Err(error) => return status_from_activation_error(&error),
+    };
     let report_json = match serde_json::to_value(activation.report()) {
         Ok(value) => value,
         Err(error) => {

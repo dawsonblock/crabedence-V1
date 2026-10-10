@@ -48,6 +48,9 @@ pub struct DynamicPluginManifest {
     /// Optional integrity/authenticity evidence references.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub integrity: Option<DynamicPluginManifestIntegrity>,
+    /// Optional security requirements the hosting environment must satisfy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security: Option<DynamicPluginManifestSecurity>,
     /// Optional human-oriented description.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -239,6 +242,22 @@ pub struct DynamicPluginManifestIntegrity {
     /// Optional signature reference.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+}
+
+/// Security requirements block for authored manifests.
+///
+/// Requirements declared here travel inside the artifact's own digest, so an
+/// approved artifact's requirements are the requirements its approval covered
+/// — a deployment cannot edit them away without breaking the approval.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct DynamicPluginManifestSecurity {
+    /// The artifact refuses a host policy that does not confine it. A
+    /// deployment offering `trusted-process` must fail the plugin's session
+    /// rather than run its code unconfined; without this declaration the
+    /// artifact accepts whatever isolation the deployment selected.
+    #[serde(default)]
+    pub requires_confinement: bool,
 }
 
 impl DynamicPluginManifest {
@@ -450,6 +469,18 @@ impl DynamicPluginManifest {
                 ..DynamicPluginStatus::default()
             },
         })
+    }
+
+    /// Whether the artifact refuses a host policy that does not confine it.
+    ///
+    /// A declared `[security] requires_confinement` is the artifact carrying
+    /// its own trust floor: the plugin cannot be hosted under
+    /// `trusted-process` even when a deployment's isolation policy would
+    /// otherwise allow one.
+    pub fn requires_confinement(&self) -> bool {
+        self.security
+            .as_ref()
+            .is_some_and(|security| security.requires_confinement)
     }
 
     /// Produces the initial validation status for a successfully validated manifest.

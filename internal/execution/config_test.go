@@ -1,6 +1,11 @@
 package execution
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"strings"
 	"testing"
 	"time"
@@ -17,13 +22,35 @@ func clearServiceEnv(t *testing.T) {
 		"CRABBOX_GITHUB_TOKEN", "GITHUB_TOKEN", "CRABBOX_GITHUB_ENABLED", "CRABBOX_GITHUB_API_URL",
 		"CRABEDENCE_QUAL_PROVIDER_URL",
 		"CRABBOX_EVIDENCE_KEY", "CRABBOX_EVIDENCE_TRUSTED_SIGNERS",
-		"CRABEDENCE_PEER_PRINCIPALS",
+		"CRABEDENCE_PEER_PRINCIPALS", "CRABEDENCE_TRUSTED_PROXY_UIDS",
 		"CRABEDENCE_PROVIDER_EXECUTION_MAX",
 		"CRABEDENCE_PROVIDER_MAX_CONCURRENT", "CRABEDENCE_PROVIDER_DEGRADED_AFTER",
 		"CRABEDENCE_PROVIDER_OPEN_AFTER", "CRABEDENCE_PROVIDER_OPEN_COOLDOWN",
+		"CRABEDENCE_ATTESTATION_REQUIRED", "CRABEDENCE_ATTESTATION_RELAXED",
+		"CRABEDENCE_ATTESTATION_SESSION_TTL", "CRABEDENCE_APPROVED_RUNTIME_KEYS",
+		"CRABEDENCE_APPROVED_RELEASES", "CRABEDENCE_APPROVED_PLUGIN_MANIFESTS",
+		"CRABEDENCE_APPROVED_ABI",
+		"CRABEDENCE_CHECKPOINT_PATH", "CRABEDENCE_CHECKPOINT_CUSTODY_PATH",
+		"CRABEDENCE_CHECKPOINT_INTERVAL",
+		"CRABBOX_ALLOW_INSECURE_TEST_PROVIDER_ORIGIN",
 	} {
 		t.Setenv(name, "")
 	}
+	// LoadServiceConfig requires an explicitly declared deployment
+	// mode — tests exercise development defaults, so declare it.
+	t.Setenv("CRABBOX_MODE", "development")
+}
+
+// testApprovedRuntimeKey returns a valid
+// <fingerprint>:<base64-key> entry for CRABEDENCE_APPROVED_RUNTIME_KEYS.
+func testApprovedRuntimeKey(t *testing.T) string {
+	t.Helper()
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(pub)
+	return hex.EncodeToString(sum[:]) + ":" + base64.StdEncoding.EncodeToString(pub)
 }
 
 func TestLoadServiceConfigDevelopmentDefaults(t *testing.T) {
@@ -69,6 +96,26 @@ func TestLoadServiceConfigResolvesOverrides(t *testing.T) {
 	if cfg.ProviderGate.MaxConcurrent != 8 || cfg.ProviderGate.OpenCooldown != 2*time.Minute {
 		t.Fatalf("provider gate = %+v, want the overrides applied", cfg.ProviderGate)
 	}
+	t.Setenv("CRABEDENCE_CHECKPOINT_PATH", "/var/lib/crabedence/evidence-checkpoint.json")
+	t.Setenv("CRABEDENCE_CHECKPOINT_INTERVAL", "90s")
+	cfg, err = LoadServiceConfig(ServeOptions{})
+	if err != nil {
+		t.Fatalf("load with checkpoint: %v", err)
+	}
+	if cfg.CheckpointPath != "/var/lib/crabedence/evidence-checkpoint.json" ||
+		cfg.CheckpointInterval != 90*time.Second {
+		t.Fatalf("checkpoint config = %q/%s", cfg.CheckpointPath, cfg.CheckpointInterval)
+	}
+	// Unset: checkpoint emission is off and the interval is the default.
+	t.Setenv("CRABEDENCE_CHECKPOINT_PATH", "")
+	t.Setenv("CRABEDENCE_CHECKPOINT_INTERVAL", "")
+	cfg, err = LoadServiceConfig(ServeOptions{})
+	if err != nil {
+		t.Fatalf("load without checkpoint: %v", err)
+	}
+	if cfg.CheckpointPath != "" || cfg.CheckpointInterval != DefaultCheckpointInterval {
+		t.Fatalf("checkpoint defaults = %q/%s", cfg.CheckpointPath, cfg.CheckpointInterval)
+	}
 	// A DSN resolves "auto" to postgres.
 	t.Setenv("CRABEDENCE_STORE_BACKEND", "auto")
 	cfg, err = LoadServiceConfig(ServeOptions{DatabaseURL: "postgres://example/db"})
@@ -86,6 +133,8 @@ func TestLoadServiceConfigFailsClosed(t *testing.T) {
 		setup   func(t *testing.T)
 		wantErr string
 	}{
+		{"mode undeclared", func(t *testing.T) { t.Setenv("CRABBOX_MODE", "") }, "CRABBOX_MODE must be declared"},
+		{"unknown mode", func(t *testing.T) { t.Setenv("CRABBOX_MODE", "staging") }, "unknown CRABBOX_MODE"},
 		{"unknown backend", func(t *testing.T) { t.Setenv("CRABEDENCE_STORE_BACKEND", "mysql") }, "unknown CRABEDENCE_STORE_BACKEND"},
 		{"malformed replica count", func(t *testing.T) { t.Setenv("CRABBOX_REPLICAS", "2x") }, "not a positive integer"},
 		{"unknown topology", func(t *testing.T) { t.Setenv("CRABBOX_TOPOLOGY", "sharded") }, "unknown CRABBOX_TOPOLOGY"},
@@ -100,6 +149,7 @@ func TestLoadServiceConfigFailsClosed(t *testing.T) {
 			t.Setenv("CRABBOX_REPLICAS", "3")
 		}, "contradicts CRABBOX_REPLICAS"},
 		{"malformed executor ceiling", func(t *testing.T) { t.Setenv("CRABEDENCE_PROVIDER_EXECUTION_MAX", "soon") }, "not a positive Go duration"},
+		{"malformed checkpoint interval", func(t *testing.T) { t.Setenv("CRABEDENCE_CHECKPOINT_INTERVAL", "often") }, "CRABEDENCE_CHECKPOINT_INTERVAL"},
 		{"malformed max concurrent", func(t *testing.T) { t.Setenv("CRABEDENCE_PROVIDER_MAX_CONCURRENT", "many") }, "not a positive integer"},
 		{"contradictory gate thresholds", func(t *testing.T) {
 			t.Setenv("CRABEDENCE_PROVIDER_DEGRADED_AFTER", "9")
@@ -107,7 +157,38 @@ func TestLoadServiceConfigFailsClosed(t *testing.T) {
 		}, "cannot exceed CRABEDENCE_PROVIDER_OPEN_AFTER"},
 		{"malformed trusted signer", func(t *testing.T) { t.Setenv("CRABBOX_EVIDENCE_TRUSTED_SIGNERS", "not-a-fingerprint") }, "is not a SHA-256 fingerprint"},
 		{"malformed peer principals", func(t *testing.T) { t.Setenv("CRABEDENCE_PEER_PRINCIPALS", "not-a-uid:alice") }, "CRABEDENCE_PEER_PRINCIPALS"},
+		{"malformed trusted proxies", func(t *testing.T) { t.Setenv("CRABEDENCE_TRUSTED_PROXY_UIDS", "not-a-uid") }, "CRABEDENCE_TRUSTED_PROXY_UIDS"},
+		{"production wildcard without trusted proxy", func(t *testing.T) {
+			t.Setenv("CRABBOX_MODE", "production")
+			t.Setenv("CRABBOX_TOPOLOGY", "single")
+			t.Setenv("CRABEDENCE_PEER_PRINCIPALS", "0:*")
+		}, "CRABEDENCE_TRUSTED_PROXY_UIDS"},
 		{"github enabled without token", func(t *testing.T) { t.Setenv("CRABBOX_GITHUB_ENABLED", "true") }, "no CRABBOX_GITHUB_TOKEN or GITHUB_TOKEN"},
+		{"production without attestation", func(t *testing.T) {
+			t.Setenv("CRABBOX_MODE", "production")
+			t.Setenv("CRABBOX_TOPOLOGY", "single")
+			t.Setenv("CRABEDENCE_PEER_PRINCIPALS", "1000:alice@example.com")
+		}, "requires runtime attestation"},
+		{"production with relaxed attestation", func(t *testing.T) {
+			t.Setenv("CRABBOX_MODE", "production")
+			t.Setenv("CRABBOX_TOPOLOGY", "single")
+			t.Setenv("CRABEDENCE_PEER_PRINCIPALS", "1000:alice@example.com")
+			t.Setenv("CRABEDENCE_ATTESTATION_REQUIRED", "true")
+			t.Setenv("CRABEDENCE_ATTESTATION_RELAXED", "true")
+		}, "RELAXED is development-only"},
+		{"required attestation without keys", func(t *testing.T) {
+			t.Setenv("CRABEDENCE_ATTESTATION_REQUIRED", "true")
+		}, "CRABEDENCE_APPROVED_RUNTIME_KEYS"},
+		{"identity allowlist without keys", func(t *testing.T) {
+			t.Setenv("CRABEDENCE_APPROVED_RELEASES", strings.Repeat("a", 64))
+		}, "require CRABEDENCE_APPROVED_RUNTIME_KEYS or CRABEDENCE_ATTESTATION_RELAXED"},
+		{"malformed runtime key", func(t *testing.T) {
+			t.Setenv("CRABEDENCE_APPROVED_RUNTIME_KEYS", "not-an-entry")
+		}, "CRABEDENCE_APPROVED_RUNTIME_KEYS"},
+		{"malformed session ttl", func(t *testing.T) {
+			t.Setenv("CRABEDENCE_ATTESTATION_RELAXED", "true")
+			t.Setenv("CRABEDENCE_ATTESTATION_SESSION_TTL", "soon")
+		}, "CRABEDENCE_ATTESTATION_SESSION_TTL"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -137,9 +218,14 @@ func TestProductionRequiresAuthenticatedPrincipals(t *testing.T) {
 	}
 
 	t.Setenv("CRABEDENCE_PEER_PRINCIPALS", "1000:alice@example.com")
+	t.Setenv("CRABEDENCE_ATTESTATION_REQUIRED", "true")
+	t.Setenv("CRABEDENCE_APPROVED_RUNTIME_KEYS", testApprovedRuntimeKey(t))
 	cfg, err := LoadServiceConfig(ServeOptions{})
 	if err != nil {
-		t.Fatalf("production with a peer map must load: %v", err)
+		t.Fatalf("production with a peer map and attestation must load: %v", err)
+	}
+	if cfg.Attestation == nil || !cfg.Attestation.Required || len(cfg.Attestation.ApprovedKeys) != 1 {
+		t.Fatalf("attestation policy = %+v, want required with one approved key", cfg.Attestation)
 	}
 	if !cfg.Production() {
 		t.Fatal("the config must report production mode")
@@ -179,5 +265,45 @@ func TestServiceConfigReportExcludesSecrets(t *testing.T) {
 		if !strings.Contains(report, want) {
 			t.Errorf("startup report is missing %q:\n%s", want, report)
 		}
+	}
+}
+
+// TestLoadServiceConfigAmbientGitHubTokenDoesNotEnable proves an
+// ambient GITHUB_TOKEN — present in many shells and CI environments
+// without intent — cannot switch on the adapter by itself: capability
+// availability is configuration, not credential discovery. The
+// service-specific CRABBOX_GITHUB_TOKEN is itself a declaration and
+// still enables implicitly; CRABBOX_GITHUB_ENABLED=true makes an
+// ambient token usable.
+func TestLoadServiceConfigAmbientGitHubTokenDoesNotEnable(t *testing.T) {
+	clearServiceEnv(t)
+	t.Setenv("GITHUB_TOKEN", "ghp_ambient_only")
+	cfg, err := LoadServiceConfig(ServeOptions{})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.GitHubEnabled {
+		t.Fatal("ambient GITHUB_TOKEN must not enable the github adapter")
+	}
+
+	// Explicit opt-in admits the ambient token as the credential.
+	t.Setenv("CRABBOX_GITHUB_ENABLED", "true")
+	cfg, err = LoadServiceConfig(ServeOptions{})
+	if err != nil {
+		t.Fatalf("load with explicit enable: %v", err)
+	}
+	if !cfg.GitHubEnabled || cfg.GitHubToken != "ghp_ambient_only" {
+		t.Fatalf("explicit enable must admit the ambient token: enabled=%v", cfg.GitHubEnabled)
+	}
+
+	// The service-specific variable is itself a declaration.
+	t.Setenv("CRABBOX_GITHUB_ENABLED", "")
+	t.Setenv("CRABBOX_GITHUB_TOKEN", "ghp_declared")
+	cfg, err = LoadServiceConfig(ServeOptions{})
+	if err != nil {
+		t.Fatalf("load with CRABBOX_GITHUB_TOKEN: %v", err)
+	}
+	if !cfg.GitHubEnabled || cfg.GitHubToken != "ghp_declared" {
+		t.Fatalf("CRABBOX_GITHUB_TOKEN must enable the adapter and win the credential: enabled=%v", cfg.GitHubEnabled)
 	}
 }

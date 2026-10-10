@@ -68,6 +68,21 @@ pub(crate) fn init_python_test_locked(lock: MutexGuard<'static, ()>) -> PythonTe
         std::env::set_var(XDG_CONFIG_HOME_ENV, isolated_config_home);
     }
     Python::initialize();
+    // The pyo3 async runtime is a process-wide OnceLock: the first
+    // `get_runtime()` call freezes it for the whole test binary. `_native`
+    // module init installs the 8 MiB worker stack, but a test that reaches the
+    // async path before any `_native` call freezes the lazy default (2 MiB)
+    // instead — which is where the guardrails coverage tests overflowed. This
+    // lock serializes python tests, so initializing here pins the sized
+    // runtime before any test can freeze the default.
+    pyo3_async_runtimes::tokio::init({
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder
+            .enable_all()
+            .thread_stack_size(crate::PYTHON_FUTURE_STACK_BYTES);
+        builder
+    });
+    let _ = pyo3_async_runtimes::tokio::get_runtime();
     Python::attach(|py| {
         let sys_modules = py
             .import("sys")
@@ -110,4 +125,22 @@ pub(crate) fn init_python_test_locked(lock: MutexGuard<'static, ()>) -> PythonTe
 
 pub(crate) fn init_python_test() -> PythonTestGuard {
     init_python_test_locked(lock_python_test())
+}
+
+/// Runs a test body on a thread with the stack a deep managed call needs.
+///
+/// A managed call that reaches Python callbacks runs through bounded but deep
+/// layers — `block_on` polls, middleware invokes the Python callback, and the
+/// callback re-enters the runtime inside the same chain — which measurably
+/// exceeds the ~2 MiB stack libtest gives a test thread. The binding's own
+/// runtime workers already carry `PYTHON_FUTURE_STACK_BYTES` for the same
+/// reason; tests that host the call on the test thread get the same budget
+/// here, stated in one place rather than smuggled through RUST_MIN_STACK.
+pub(crate) fn with_test_stack(test: impl FnOnce() + Send + 'static) {
+    std::thread::Builder::new()
+        .stack_size(crate::PYTHON_FUTURE_STACK_BYTES)
+        .spawn(test)
+        .expect("the test thread spawns")
+        .join()
+        .expect("the test body completes");
 }

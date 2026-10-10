@@ -53,7 +53,11 @@ The CLI and Python, Node.js, and FFI activation entry points share one policy
 parser. Leave `NEMO_RELAY_NATIVE_ISOLATION` unset for the compatible
 `trusted-process` default, or set it to `restricted-macos` to require the verified
 App Sandbox bundle. Unknown values fail activation; they do not fall back to the
-trusted policy. The setting applies to native plugin hosting in that process.
+trusted policy. The hostile-class spellings — `hostile`, `hostile-vm`, `vm` —
+are recognised and refused by name rather than treated as unknown values: the
+refusal states that the class needs a VM-grade backend this build does not
+provide, and why the restricted levels cannot stand in for it. The setting
+applies to native plugin hosting in that process.
 
 ```sh
 export NEMO_RELAY_NATIVE_ISOLATION=restricted-macos
@@ -70,7 +74,12 @@ export NEMO_RELAY_PLUGIN_HOST_TEAM_ID=TEAMID1234
 That is a narrower claim than "hostile-safe", and the difference is worth stating
 in the same breath. App Sandbox is kernel-enforced confinement of a same-kernel
 process; it materially reduces what a malicious plugin can reach, and it is not
-the boundary for code assumed adversarial. The three levels are:
+the boundary for code assumed adversarial. It also confines the *host process*,
+not the plugin's access to that process: the plugin's code runs inside the
+sandboxed host and shares its memory, its file descriptors and the session
+credential the host answers the kernel with, so a plugin that can corrupt its
+host can act as that host within everything the sandbox permits. The three
+levels are:
 
 ```text
 TRUSTED      ordinary child process
@@ -237,6 +246,12 @@ still requires a VM boundary or an independently enforced resource controller.
   way is not accepted by the system's own checks.
 - **Security architecture: the entitlements.** Deny by default, with the weakened
   library-validation variant as a separate bundle rather than a flag.
-- **Distribution: Developer ID and notarization.** Tracked as its own row in the
-  qualification matrix rather than assumed, because it is a CI and key-custody
-  decision and not an architecture one.
+- **Distribution: Developer ID and notarization.** `package-plugin-host-app.py`
+  carries the release lane itself — `--signing-identity "Developer ID
+  Application: <Team>" --notary-profile <keychain-profile>` signs with the
+  hardened runtime and secure timestamp, submits the bundle to the notary
+  service and waits, staples the ticket, and re-verifies. `--verify-release`
+  is the admission side: strict signature validity, a `Developer ID
+  Application` authority rather than an ad-hoc one, the hardened-runtime flag,
+  a stapled ticket, and Gatekeeper acceptance, each a hard refusal rather than
+  a warning. A bundle that is only ad-hoc signed fails that check by name.
