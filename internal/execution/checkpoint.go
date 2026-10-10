@@ -123,23 +123,41 @@ func emitCheckpoint(ctx context.Context, store idempotency.EffectStore, signer *
 		fmt.Fprintf(os.Stderr, "evidence checkpoint: cannot write %s: %v\n", path, err)
 	}
 	if custodyPath != "" {
-		mirrorCheckpointCustody(custodyPath, logPath, payload, seq)
+		mirrorCheckpointCustody(custodyPath, logPath, payload, seq, signer.Fingerprint())
 	}
 }
 
 // mirrorCheckpointCustody carries one emission to the custody path. The
-// custody log must verify under the same stream invariants as the local
-// journal, so a custody copy that fell behind is first backfilled with
-// the missing retained entries rather than left with a sequence gap it
-// could never honestly explain. A custody log that is corrupt, forked
-// or ahead of the local stream is refused loudly — appending over
-// divergent custody would launder the divergence.
-func mirrorCheckpointCustody(custodyPath, localLogPath string, payload []byte, seq int64) {
+// custody log is verified under the same full stream invariants as the
+// local journal before it is extended — a corrupted, forged, reordered
+// or gap-carrying historical entry under an intact tail is refused
+// loudly, never silently inherited. A custody copy that fell behind is
+// first backfilled with the missing retained entries rather than left
+// with a sequence gap it could never honestly explain. A custody log
+// that is corrupt, forked or ahead of the local stream is refused —
+// appending over divergent custody would launder the divergence.
+func mirrorCheckpointCustody(custodyPath, localLogPath string, payload []byte, seq int64, signerFP string) {
 	custodyLog := retainedCheckpointLogPath(custodyPath)
-	custodySeq, err := custodyTailSequence(custodyLog)
+	journal, err := verifyRetainedJournal(custodyLog, signerFP)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "evidence checkpoint: custody log %s is unreadable — refusing to extend possible divergent custody: %v\n", custodyLog, err)
+		fmt.Fprintf(os.Stderr, "evidence checkpoint: custody log %s failed verification — refusing to extend possible divergent custody: %v\n", custodyLog, err)
 		return
+	}
+	var custodySeq int64
+	if journal == nil {
+		// A custody latest file with no retained log claims sequence
+		// continuity nothing verifies — divergent custody an operator
+		// must arbitrate, never silently overwritten.
+		if _, err := os.Stat(custodyPath); !errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintf(os.Stderr, "evidence checkpoint: custody checkpoint %s exists but retained log %s is missing or empty — divergent custody needs an operator\n", custodyPath, custodyLog)
+			return
+		}
+	} else {
+		custodySeq = journal.lastSequence
+		if err := reconcileLatestCheckpoint(custodyPath, journal); err != nil {
+			fmt.Fprintf(os.Stderr, "evidence checkpoint: custody checkpoint %s diverged from its retained log — refusing to extend forked custody: %v\n", custodyPath, err)
+			return
+		}
 	}
 	if custodySeq >= seq {
 		fmt.Fprintf(os.Stderr, "evidence checkpoint: custody log %s is at sequence %d, emission %d not appended — divergent custody needs an operator\n", custodyLog, custodySeq, seq)
@@ -165,28 +183,6 @@ func mirrorCheckpointCustody(custodyPath, localLogPath string, payload []byte, s
 	if err := writeFileAtomic(custodyPath, append(payload, '\n'), 0o600); err != nil {
 		fmt.Fprintf(os.Stderr, "evidence checkpoint: cannot write custody checkpoint %s: %v\n", custodyPath, err)
 	}
-}
-
-// custodyTailSequence returns the sequence of the custody log's last
-// retained entry, or 0 when no usable log exists. An existing log whose
-// tail cannot be parsed is reported so the caller can refuse to extend
-// possibly divergent custody.
-func custodyTailSequence(custodyLog string) (int64, error) {
-	line, err := lastLogLine(custodyLog)
-	if errors.Is(err, os.ErrNotExist) {
-		return 0, nil
-	}
-	if err != nil {
-		return 0, err
-	}
-	if len(line) == 0 {
-		return 0, nil
-	}
-	var cp evidence.Checkpoint
-	if err := json.Unmarshal(line, &cp); err != nil {
-		return 0, fmt.Errorf("last entry not parseable: %w", err)
-	}
-	return cp.Sequence, nil
 }
 
 // retainedLinesAfter reads the retained entries in (after, before) out
@@ -526,25 +522,6 @@ func journalLastLine(fh *os.File, size int64) (int64, []byte, error) {
 		offset += int64(idx) + 1
 	}
 	return offset, buf[offset-(size-window):], nil
-}
-
-// lastLogLine reads the final newline-terminated line of a log file,
-// tolerating a missing file.
-func lastLogLine(path string) ([]byte, error) {
-	fh, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer fh.Close()
-	info, err := fh.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if info.Size() == 0 {
-		return nil, nil
-	}
-	_, line, err := journalLastLine(fh, info.Size())
-	return line, err
 }
 
 // readCheckpointCursor loads the persisted cursor; a missing or

@@ -251,3 +251,171 @@ func TestEmitCheckpointMirrorsCustodyPath(t *testing.T) {
 		t.Fatal("custody retained log differs from local retained log")
 	}
 }
+
+func newCheckpointTestStore(t *testing.T) idempotency.EffectStore {
+	t.Helper()
+	db, err := idempotency.OpenSQLiteDB(filepath.Join(t.TempDir(), "db", "cp.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	store, err := idempotency.NewSQLiteStore(db)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	return store
+}
+
+// A custody log whose middle entry is corrupt under an intact tail is
+// refused: the mirror verifies the full retained history before
+// extending, so tampering anywhere in custody surfaces loudly instead
+// of the next append laundering it.
+func TestEmitCheckpointCustodyRefusesCorruptHistory(t *testing.T) {
+	store := newCheckpointTestStore(t)
+	signer, _ := evidence.GenerateSigner()
+	localDir := t.TempDir()
+	custodyDir := t.TempDir()
+	path := filepath.Join(localDir, "evidence-checkpoint.json")
+	custody := filepath.Join(custodyDir, "evidence-checkpoint.json")
+
+	emitCheckpoint(context.Background(), store, signer, path, custody)
+	emitCheckpoint(context.Background(), store, signer, path, custody)
+	emitCheckpoint(context.Background(), store, signer, path, custody)
+
+	// Flip one byte inside the middle entry's signature: the tail stays
+	// intact and parseable while the history no longer verifies.
+	custodyLog := custody + ".jsonl"
+	raw, err := os.ReadFile(custodyLog)
+	if err != nil {
+		t.Fatalf("read custody log: %v", err)
+	}
+	lines := bytes.Split(raw, []byte{'\n'})
+	sigIdx := bytes.Index(lines[1], []byte(`"signature"`))
+	if sigIdx < 0 {
+		t.Fatal("custody entry carries no signature field")
+	}
+	pos := sigIdx + len(`"signature":"`)
+	if lines[1][pos] != 'A' {
+		lines[1][pos] = 'A'
+	} else {
+		lines[1][pos] = 'B'
+	}
+	corrupt := bytes.Join(lines, []byte{'\n'})
+	if err := os.WriteFile(custodyLog, corrupt, 0o600); err != nil {
+		t.Fatalf("plant corrupt custody log: %v", err)
+	}
+
+	emitCheckpoint(context.Background(), store, signer, path, custody)
+
+	after, err := os.ReadFile(custodyLog)
+	if err != nil {
+		t.Fatalf("re-read custody log: %v", err)
+	}
+	if !bytes.Equal(after, corrupt) {
+		t.Fatal("custody log was extended over corrupt history")
+	}
+	var cp evidence.Checkpoint
+	held, err := os.ReadFile(custody)
+	if err != nil {
+		t.Fatalf("read custody latest: %v", err)
+	}
+	if err := json.Unmarshal(held, &cp); err != nil {
+		t.Fatalf("custody latest unparseable: %v", err)
+	}
+	if cp.Sequence != 3 {
+		t.Fatalf("custody latest advanced to %d over corrupt history", cp.Sequence)
+	}
+	var local evidence.Checkpoint
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read local latest: %v", err)
+	}
+	if err := json.Unmarshal(data, &local); err != nil {
+		t.Fatalf("local latest unparseable: %v", err)
+	}
+	if local.Sequence != 4 {
+		t.Fatalf("local stream stalled at %d — custody refusal must not block local emission", local.Sequence)
+	}
+}
+
+// A custody copy that fell behind is backfilled from the verified local
+// journal rather than left with a sequence gap.
+func TestEmitCheckpointCustodyBackfillsLag(t *testing.T) {
+	store := newCheckpointTestStore(t)
+	signer, _ := evidence.GenerateSigner()
+	localDir := t.TempDir()
+	custodyDir := t.TempDir()
+	path := filepath.Join(localDir, "evidence-checkpoint.json")
+	custody := filepath.Join(custodyDir, "evidence-checkpoint.json")
+
+	emitCheckpoint(context.Background(), store, signer, path, custody)
+	emitCheckpoint(context.Background(), store, signer, path, custody)
+
+	// Lag custody to a verified prefix: keep the first retained entry,
+	// drop the latest-file pointer so only the journal arbitrates.
+	custodyLog := custody + ".jsonl"
+	raw, err := os.ReadFile(custodyLog)
+	if err != nil {
+		t.Fatalf("read custody log: %v", err)
+	}
+	idx := bytes.IndexByte(raw, '\n')
+	if idx < 0 {
+		t.Fatal("custody log holds no complete entry")
+	}
+	if err := os.WriteFile(custodyLog, raw[:idx+1], 0o600); err != nil {
+		t.Fatalf("truncate custody log: %v", err)
+	}
+	if err := os.Remove(custody); err != nil {
+		t.Fatalf("remove custody latest: %v", err)
+	}
+
+	emitCheckpoint(context.Background(), store, signer, path, custody)
+
+	localLog, err := os.ReadFile(path + ".jsonl")
+	if err != nil {
+		t.Fatalf("read local log: %v", err)
+	}
+	after, err := os.ReadFile(custodyLog)
+	if err != nil {
+		t.Fatalf("re-read custody log: %v", err)
+	}
+	if !bytes.Equal(after, localLog) {
+		t.Fatal("custody did not backfill to the local stream")
+	}
+}
+
+// A custody latest file with no retained log claims continuity nothing
+// verifies — divergent custody an operator must arbitrate, never
+// silently overwritten.
+func TestEmitCheckpointCustodyRefusesOrphanLatest(t *testing.T) {
+	store := newCheckpointTestStore(t)
+	signer, _ := evidence.GenerateSigner()
+	localDir := t.TempDir()
+	custodyDir := t.TempDir()
+	path := filepath.Join(localDir, "evidence-checkpoint.json")
+	custody := filepath.Join(custodyDir, "evidence-checkpoint.json")
+
+	emitCheckpoint(context.Background(), store, signer, path, custody)
+	emitCheckpoint(context.Background(), store, signer, path, custody)
+
+	if err := os.Remove(custody + ".jsonl"); err != nil {
+		t.Fatalf("remove custody log: %v", err)
+	}
+	heldBefore, err := os.ReadFile(custody)
+	if err != nil {
+		t.Fatalf("read custody latest: %v", err)
+	}
+
+	emitCheckpoint(context.Background(), store, signer, path, custody)
+
+	if _, err := os.Stat(custody + ".jsonl"); !os.IsNotExist(err) {
+		t.Fatal("custody log recreated over orphan latest")
+	}
+	heldAfter, err := os.ReadFile(custody)
+	if err != nil {
+		t.Fatalf("re-read custody latest: %v", err)
+	}
+	if !bytes.Equal(heldAfter, heldBefore) {
+		t.Fatal("custody latest overwritten while its retained log was missing")
+	}
+}

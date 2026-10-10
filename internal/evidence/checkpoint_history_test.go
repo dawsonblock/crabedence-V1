@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"strings"
 	"testing"
 )
@@ -349,4 +350,34 @@ func TestVerifyCheckpointHistoryLineBound(t *testing.T) {
 	}); err == nil || !strings.Contains(err.Error(), "line bound") {
 		t.Fatalf("oversized entry mishandled: %v", err)
 	}
+}
+
+// The bound is enforced during the read, not after the whole line has
+// been buffered: a hostile log that streams megabytes without a newline
+// is refused at the bound and the verifier stops pulling input there.
+func TestVerifyCheckpointHistoryLineBoundStopsReading(t *testing.T) {
+	const maxLine = 1 << 20
+	var served int64
+	r := &countingReader{r: bytes.NewReader(bytes.Repeat([]byte{'x'}, 4*maxLine)), n: &served}
+	_, err := VerifyCheckpointHistory(r, CheckpointHistoryOptions{
+		TrustedSigners: map[string]bool{"unused": true},
+		MaxLineBytes:   maxLine,
+	})
+	if err == nil || !strings.Contains(err.Error(), "line bound") {
+		t.Fatalf("oversized stream mishandled: %v", err)
+	}
+	if served > maxLine+128*1024 {
+		t.Fatalf("verifier buffered %d bytes past the %d-byte line bound", served, maxLine)
+	}
+}
+
+type countingReader struct {
+	r io.Reader
+	n *int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	*c.n += int64(n)
+	return n, err
 }

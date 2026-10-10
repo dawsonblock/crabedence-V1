@@ -95,6 +95,32 @@ type CheckpointHistorySummary struct {
 	Last *Checkpoint
 }
 
+// errCheckpointLineTooLong marks a retained-log line that crossed the
+// byte bound while it was still being read — accumulation stops at the
+// bound instead of buffering the whole hostile line first.
+var errCheckpointLineTooLong = errors.New("checkpoint line exceeds the byte bound")
+
+// readCheckpointLine returns one newline-terminated line with the bound
+// enforced during the read: accumulation fails as soon as the line
+// exceeds maxLine, so a corrupt or hostile log cannot make the verifier
+// allocate past the bound before rejection. A final fragment with no
+// terminating newline is returned with io.EOF for the caller to treat
+// as a torn write.
+func readCheckpointLine(br *bufio.Reader, maxLine int64) ([]byte, error) {
+	var buf []byte
+	for {
+		frag, err := br.ReadSlice('\n')
+		buf = append(buf, frag...)
+		if int64(len(buf)) > maxLine {
+			return nil, errCheckpointLineTooLong
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		return buf, err
+	}
+}
+
 // VerifyCheckpointHistory verifies a retained checkpoint log
 // end-to-end under the stream invariants. The reader is consumed
 // sequentially, so arbitrarily long histories verify in bounded memory.
@@ -130,7 +156,10 @@ func VerifyCheckpointHistory(r io.Reader, opts CheckpointHistoryOptions) (*Check
 	br := bufio.NewReaderSize(r, 64*1024)
 	var offset int64
 	for {
-		line, err := br.ReadBytes('\n')
+		line, err := readCheckpointLine(br, maxLine)
+		if errors.Is(err, errCheckpointLineTooLong) {
+			return nil, fmt.Errorf("entry %d exceeds the %d-byte line bound", summary.Entries+1, maxLine)
+		}
 		if errors.Is(err, io.EOF) {
 			if len(line) > 0 {
 				return nil, fmt.Errorf("entry %d at byte %d is not newline-terminated — torn write or truncated log",
@@ -142,9 +171,6 @@ func VerifyCheckpointHistory(r io.Reader, opts CheckpointHistoryOptions) (*Check
 			return nil, fmt.Errorf("read retained log: %w", err)
 		}
 		offset += int64(len(line))
-		if int64(len(line)) > maxLine {
-			return nil, fmt.Errorf("entry %d exceeds the %d-byte line bound", summary.Entries+1, maxLine)
-		}
 		if len(bytes.TrimSpace(line)) == 0 {
 			return nil, fmt.Errorf("entry %d is empty", summary.Entries+1)
 		}
