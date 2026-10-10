@@ -422,6 +422,31 @@ jobs:
           ref: ${{ env.COMMIT }}
           persist-credentials: false
 
+      # The nemo-transfer-provenance gate verifies the shipped runtime
+      # against a frozen reference tree declared at the repository-external
+      # sibling path ../NEMO-feat-native-plugin-isolation. Those bytes are
+      # tracked in the umbrella repository, not this one; the gate
+      # recomputes source.sha256 itself, so a wrong or mutated fetch fails
+      # closed at admission time.
+      - name: Check out frozen reference
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: dawsonblock/NEMO-CONTROL
+          ref: 6f933b8bd623d8063a4fbc12b800fade4b75add2
+          path: .frozen-reference
+          sparse-checkout: NEMO-feat-native-plugin-isolation
+          persist-credentials: false
+
+      # The scratch checkout carries a nested .git and sits inside the
+      # tree; copy the payload out (symlinks and modes preserved) and
+      # remove the scratch before evidence generation sees the worktree.
+      - name: Place the reference at the declared sibling path
+        run: |
+          dest="$GITHUB_WORKSPACE/../NEMO-feat-native-plugin-isolation"
+          mkdir -p "$dest"
+          cp -a ".frozen-reference/NEMO-feat-native-plugin-isolation/." "$dest/"
+          rm -rf .frozen-reference
+
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:

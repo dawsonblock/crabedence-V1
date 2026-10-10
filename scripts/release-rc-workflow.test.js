@@ -310,8 +310,10 @@ test("release permissions are scoped per job, not granted globally", () => {
 test("read-only checkouts drop the persistent credential", () => {
   // Every checkout that does not push a tag must not leave a credential in
   // .git/config. The publish checkout keeps it for the tag push.
-  const checkouts = workflow.match(/- name: Check out\n        uses: actions\/checkout@[\s\S]*?(?=\n      -|\n\n      #|\n  [a-z])/g) ?? [];
+  const checkouts = workflow.match(/- name: Check out[^\n]*\n        uses: actions\/checkout@[\s\S]*?(?=\n      -|\n\n      #|\n  [a-z])/g) ?? [];
   assert.ok(checkouts.length >= 8, "checkouts are enumerated");
+  const referenceCheckout = job("build").match(/- name: Check out frozen reference[\s\S]*?(?=\n      -)/);
+  assert.match(referenceCheckout[0], /persist-credentials: false/, "frozen-reference checkout drops credentials");
   const publishCheckout = job("publish").match(/- name: Check out[\s\S]*?persist-credentials[^\n]*/);
   for (const name of [
     "provenance",
