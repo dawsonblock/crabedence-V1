@@ -26,12 +26,15 @@ const (
 // Request is a single client frame. Token authenticates the
 // connection against the shared submission token (when the server is
 // configured with one); the peer's kernel UID is resolved out-of-band
-// and is never read from the frame.
+// and is never read from the frame. A request carries exactly one of
+// Job (unsigned, refused when authority keys are configured) or
+// SignedJob (the SandboxJobV1 envelope).
 type Request struct {
-	Version int            `json:"version"`
-	Type    string         `json:"type"`
-	Token   string         `json:"token,omitempty"`
-	Job     *JobSubmission `json:"job,omitempty"`
+	Version   int               `json:"version"`
+	Type      string            `json:"type"`
+	Token     string            `json:"token,omitempty"`
+	Job       *JobSubmission    `json:"job,omitempty"`
+	SignedJob *ContractEnvelope `json:"signed_job,omitempty"`
 }
 
 // JobSubmission is the PR-03 job shape — the minimum a submit needs

@@ -2,6 +2,10 @@ package sandboxexecutor
 
 import (
 	"bufio"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -9,39 +13,41 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
-// JobRecord is the executor's account of one accepted submission —
-// which authenticated submitter sent it, which principal it claims,
-// and when it arrived. Records are in-memory in PR-03; the durable
-// lifecycle ledger lands with reconciliation in PR-06.
-type JobRecord struct {
-	JobID      string    `json:"job_id"`
-	Submitter  string    `json:"submitter"`
-	Principal  string    `json:"principal"`
-	Image      string    `json:"image"`
-	State      string    `json:"state"`
-	ReceivedAt time.Time `json:"received_at"`
-}
-
-// JobStateRecorded marks a job the executor accepted into its registry.
-// Nothing runs it yet — admission without a signed contract is recorded
-// intent, never execution authority.
+// JobStateRecorded marks a job the executor accepted into its durable
+// registry. Admission without dispatch is recorded intent, never
+// execution — the ledger entry exists before any backend is asked.
 const JobStateRecorded = "RECORDED"
 
-// maxJobs bounds the in-memory registry. The spike has no eviction or
-// durable ledger, so a permitted peer could otherwise grow it without
-// limit; refusal is louder than silent memory exhaustion.
+// maxJobs bounds the registry. Refusal is louder than silent growth —
+// a permitted peer cannot turn the executor's bookkeeping into a
+// memory or disk exhaustion vector.
 const maxJobs = 4096
 
-// Backend is where an authenticated submission would go for execution.
-// PR-03 wires no backend — the type exists so the auth boundary is
-// exercised against the same call shape the real executor will take.
-type Backend interface {
-	Submit(job *JobSubmission, submitter string) (string, error)
-}
+// Default bounds. Every executor resource is bounded; these are the
+// values an operator gets without asking.
+const (
+	// defaultMaxConns caps simultaneous client connections — the
+	// goroutine pool can never grow past it regardless of flood.
+	defaultMaxConns = 64
+	// maxPeerConns caps how many of those slots one submitter
+	// identity may hold, so one misbehaving peer cannot starve the
+	// others.
+	maxPeerConns = 32
+	// connIdleDeadline bounds a connection's total lifetime. One
+	// absolute deadline means a slow-drip reader and a fast pipeline
+	// get the same eviction.
+	connIdleDeadline = 30 * time.Second
+	// defaultDispatchTimeout bounds the synchronous launch call —
+	// a wedged backend cannot pin an admission slot forever.
+	defaultDispatchTimeout = 45 * time.Second
+	// defaultMaxContractTTL bounds how far past issued_at a contract
+	// may remain valid — long-lived contracts are long-lived forgery
+	// windows.
+	defaultMaxContractTTL = time.Hour
+)
 
 // AuditSink receives one structured line per admission decision —
 // accepted or refused — so a silent gate is never silent.
@@ -58,21 +64,52 @@ type Config struct {
 	// token leg; the startup line reports it so the weaker posture is
 	// observable rather than implied.
 	Token *SubmissionToken
-	// Backend receives authenticated submissions; nil means jobs are
-	// recorded but never executed (PR-03's intended state).
+	// AuthorityKeys is the contract trust set (fingerprint → public
+	// key). When non-empty, every submission must carry a valid
+	// signed SandboxJobV1 contract — unsigned submissions refuse.
+	// When empty the server runs in the weaker unsigned-admission
+	// posture, which the startup line reports.
+	AuthorityKeys AuthorityKeys
+	// Backend receives authorized, persisted jobs for execution. It
+	// requires AuthorityKeys — a backend that ran unsigned jobs would
+	// execute workloads with no per-job authorization, which is the
+	// exact gap this architecture exists to close. Nil means jobs
+	// are recorded but never executed.
 	Backend Backend
+	// LedgerPath is the durable job registry. Empty defaults to
+	// <SocketDir>/executor-ledger.db. The ledger opens before the
+	// socket binds so a daemon that cannot persist never accepts.
+	LedgerPath string
+	// MaxConns bounds simultaneous client connections. Zero uses the
+	// default; negative refuses startup.
+	MaxConns int
+	// DispatchTimeout bounds one backend Dispatch call. Zero uses
+	// the default.
+	DispatchTimeout time.Duration
+	// MaxContractTTL bounds contract validity windows. Zero uses the
+	// default; negative disables the bound.
+	MaxContractTTL time.Duration
+	// ResourceCeiling optionally bounds what any contract may
+	// request; a contract exceeding a non-zero ceiling field refuses.
+	// Nil imposes no ceiling beyond structural sanity.
+	ResourceCeiling *ResourceBudget
 	// Audit receives decision lines; nil discards them.
 	Audit AuditSink
+	// now is the wall clock — injectable for tests.
+	now func() time.Time
 }
 
 // Server is the sandbox executor daemon: a bounded Unix socket that
 // accepts job submissions only from kernel-verified peer identities
-// carrying the shared submission token. It holds no authority keys,
-// cannot mint admissions, and never executes what it cannot record.
+// carrying the shared submission token, and — when configured —
+// authority-signed job contracts. It holds no signing keys, persists
+// every admitted job before dispatch, and never executes what it
+// cannot record.
 type Server struct {
 	cfg    Config
 	audit  AuditSink
 	socket string
+	now    func() time.Time
 
 	mu       sync.Mutex
 	listener *net.UnixListener
@@ -80,10 +117,15 @@ type Server struct {
 	started  bool
 	stopped  bool
 	acceptWg sync.WaitGroup
+	conns    map[*net.UnixConn]string // live conn → authenticated submitter ("" until known)
+	slots    chan struct{}
+	peerLoad map[string]int
 
-	jobs   map[string]*JobRecord
-	seq    atomic.Uint64
-	closed chan struct{}
+	ledger     *Ledger
+	monitorWg  sync.WaitGroup
+	shutdown   context.Context
+	shutdownFn context.CancelFunc
+	closed     chan struct{}
 }
 
 // NewServer validates the config and returns a runnable server.
@@ -94,25 +136,58 @@ func NewServer(cfg Config) (*Server, error) {
 	if len(cfg.Peers) == 0 {
 		return nil, fmt.Errorf("peer allowlist is required — the executor refuses to run without a named submitter")
 	}
+	if cfg.Backend != nil && len(cfg.AuthorityKeys) == 0 {
+		return nil, fmt.Errorf("a backend requires configured authority keys — unsigned jobs must never reach execution")
+	}
+	if cfg.MaxConns < 0 {
+		return nil, fmt.Errorf("max connections must not be negative")
+	}
+	if cfg.LedgerPath == "" {
+		cfg.LedgerPath = filepath.Join(cfg.SocketDir, "executor-ledger.db")
+	}
+	if cfg.MaxConns == 0 {
+		cfg.MaxConns = defaultMaxConns
+	}
+	if cfg.DispatchTimeout == 0 {
+		cfg.DispatchTimeout = defaultDispatchTimeout
+	}
+	if cfg.MaxContractTTL == 0 {
+		cfg.MaxContractTTL = defaultMaxContractTTL
+	}
+	now := cfg.now
+	if now == nil {
+		now = func() time.Time { return time.Now().UTC() }
+	}
 	audit := cfg.Audit
 	if audit == nil {
 		audit = func(string, ...any) {}
 	}
+	shutdown, cancel := context.WithCancel(context.Background())
 	return &Server{
-		cfg:    cfg,
-		audit:  audit,
-		socket: filepath.Join(cfg.SocketDir, "executor.sock"),
-		jobs:   map[string]*JobRecord{},
-		closed: make(chan struct{}),
+		cfg:        cfg,
+		audit:      audit,
+		socket:     filepath.Join(cfg.SocketDir, "executor.sock"),
+		now:        now,
+		conns:      map[*net.UnixConn]string{},
+		slots:      make(chan struct{}, cfg.MaxConns),
+		peerLoad:   map[string]int{},
+		shutdown:   shutdown,
+		shutdownFn: cancel,
+		closed:     make(chan struct{}),
 	}, nil
 }
 
 // SocketPath reports the bound path once started.
 func (s *Server) SocketPath() string { return s.socket }
 
-// Start binds the socket inside the owner-only directory and begins
-// accepting. It runs at most once: a stopped or started server refuses
-// a second Start — there is no restart cycle to race cleanup with.
+// Ledger exposes the durable registry — job identities live there,
+// not in process memory.
+func (s *Server) Ledger() *Ledger { return s.ledger }
+
+// Start opens the ledger (fencing, epoch, reconcile), binds the
+// socket inside the owner-only directory, and begins accepting. It
+// runs at most once: a stopped or started server refuses a second
+// Start — there is no restart cycle to race cleanup with.
 func (s *Server) Start() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -125,12 +200,30 @@ func (s *Server) Start() error {
 	if err := ensureSocketDir(s.cfg.SocketDir); err != nil {
 		return err
 	}
-	if err := clearStaleSocket(s.socket); err != nil {
+	// The ledger opens first: an executor that cannot persist an
+	// admission must never accept one. Open bumps the fence epoch and
+	// reconciles any previous lifetime's in-flight states.
+	ledger, err := OpenLedger(s.cfg.LedgerPath)
+	if err != nil {
 		return err
+	}
+	s.ledger = ledger
+	if n := ledger.Reconciled(); n > 0 {
+		s.audit("reconciled %d job(s) from a previous lifetime to %s", n, JobStateDispatchAmbig)
+	}
+	// Any failure past this point must release the ledger — a server
+	// that never started still holds the fence lock until it does.
+	failStart := func(err error) error {
+		_ = s.ledger.Close()
+		s.ledger = nil
+		return err
+	}
+	if err := clearStaleSocket(s.socket); err != nil {
+		return failStart(err)
 	}
 	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: s.socket, Net: "unix"})
 	if err != nil {
-		return fmt.Errorf("bind executor socket %s: %w", s.socket, err)
+		return failStart(fmt.Errorf("bind executor socket %s: %w", s.socket, err))
 	}
 	// The finalizer owns unlinking — never let the listener itself
 	// remove a path that might no longer be ours.
@@ -139,26 +232,35 @@ func (s *Server) Start() error {
 	// accept; the identity check below verifies the result.
 	if err := os.Chmod(s.socket, 0o600); err != nil {
 		_ = listener.Close()
-		return fmt.Errorf("secure executor socket %s: %w", s.socket, err)
+		return failStart(fmt.Errorf("secure executor socket %s: %w", s.socket, err))
 	}
 	ident, err := socketIdentityFor(s.socket)
 	if err != nil {
 		_ = listener.Close()
-		return err
+		return failStart(err)
 	}
 	s.listener, s.ident, s.started = listener, ident, true
 	tokenPosture := "shared-token"
 	if s.cfg.Token == nil {
 		tokenPosture = "peer-uid-only (token disabled)"
 	}
-	s.audit("sandbox-executord listening on %s (peers=%d, auth=%s, backend=%t)",
-		s.socket, len(s.cfg.Peers), tokenPosture, s.cfg.Backend != nil)
+	authPosture := "unsigned-admission (no authority keys)"
+	if len(s.cfg.AuthorityKeys) > 0 {
+		authPosture = fmt.Sprintf("signed-contracts (%d authority keys)", len(s.cfg.AuthorityKeys))
+	}
+	s.audit("sandbox-executord listening on %s (peers=%d, auth=%s, jobs=%s, backend=%t, max_conns=%d, ledger=%s epoch=%d)",
+		s.socket, len(s.cfg.Peers), tokenPosture, authPosture,
+		s.cfg.Backend != nil, s.cfg.MaxConns, s.cfg.LedgerPath, ledger.Epoch())
 	s.acceptWg.Add(1)
 	go s.acceptLoop(listener)
 	return nil
 }
 
-// Stop closes the listener and removes the socket — once. A second
+// Stop shuts the server down in drain order: cancel monitors'
+// context, close the listener, drop live connections, wait for every
+// handler and monitor to finish, then close the ledger and remove the
+// socket. Done() only closes after all of that completes — a caller
+// that observes Done() never sees a handler still in flight. A second
 // Stop is a no-op.
 func (s *Server) Stop() error {
 	s.mu.Lock()
@@ -170,43 +272,125 @@ func (s *Server) Stop() error {
 	listener, ident := s.listener, s.ident
 	s.mu.Unlock()
 
+	s.shutdownFn()
 	err := listener.Close()
+	s.closeLiveConns()
+	s.acceptWg.Wait()
+	s.monitorWg.Wait()
+
+	var ledgerErr error
+	if s.ledger != nil {
+		// A clean stop distinguishes "was running when we stopped"
+		// from "crashed mid-watch" — both still need operator
+		// reconciliation, only the provenance differs.
+		if n, ierr := s.ledger.InterruptRunning(); ierr != nil {
+			ledgerErr = ierr
+		} else if n > 0 {
+			s.audit("marked %d running job(s) %s at shutdown", n, JobStateInterrupted)
+		}
+		if cerr := s.ledger.Close(); ledgerErr == nil {
+			ledgerErr = cerr
+		}
+	}
 	if rmErr := removeOwnedSocket(s.socket, ident); rmErr != nil && err == nil {
 		err = rmErr
 	}
+	if ledgerErr != nil && err == nil {
+		err = ledgerErr
+	}
 	close(s.closed)
-	s.acceptWg.Wait()
 	return err
 }
 
-// Done closes when the server has stopped.
+// Done closes when the server has fully stopped — listener closed,
+// every connection handler drained, every job monitor finished,
+// ledger closed. It never reports completion while work is in flight.
 func (s *Server) Done() <-chan struct{} { return s.closed }
 
-// Jobs returns a snapshot of the recorded registry.
+// Jobs returns a snapshot of the durable registry in admission order.
 func (s *Server) Jobs() []*JobRecord {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]*JobRecord, 0, len(s.jobs))
-	for _, j := range s.jobs {
-		cpy := *j
-		out = append(out, &cpy)
+	jobs, err := s.ledger.List()
+	if err != nil {
+		return nil
+	}
+	out := make([]*JobRecord, 0, len(jobs))
+	for _, j := range jobs {
+		out = append(out, &JobRecord{
+			JobID:      j.JobID,
+			Submitter:  j.Submitter,
+			Principal:  j.Principal,
+			Image:      j.Image,
+			State:      j.State,
+			ReceivedAt: j.ReceivedAt,
+		})
 	}
 	return out
 }
 
+// JobRecord is the executor's account of one accepted submission.
+// The ledger row carries the full state; this is the read model.
+type JobRecord struct {
+	JobID      string    `json:"job_id"`
+	Submitter  string    `json:"submitter"`
+	Principal  string    `json:"principal"`
+	Image      string    `json:"image"`
+	State      string    `json:"state"`
+	ReceivedAt time.Time `json:"received_at"`
+}
+
 func (s *Server) acceptLoop(listener *net.UnixListener) {
 	defer s.acceptWg.Done()
+	backoff := 0
 	for {
 		conn, err := listener.AcceptUnix()
 		if err != nil {
 			if s.isStopped() || errors.Is(err, net.ErrClosed) {
 				return
 			}
-			s.audit("accept error: %v", err)
+			// Transient accept failures (EMFILE under flood, ENOMEM)
+			// must not spin the accept loop at 100% — bounded backoff,
+			// still audited, still accepting.
+			backoff++
+			delay := time.Duration(backoff) * 25 * time.Millisecond
+			if delay > time.Second {
+				delay = time.Second
+			}
+			s.audit("accept error (backoff %s): %v", delay, err)
+			select {
+			case <-time.After(delay):
+			case <-s.shutdown.Done():
+				return
+			}
 			continue
 		}
+		backoff = 0
+
+		select {
+		case s.slots <- struct{}{}:
+		default:
+			// The executor is at its connection bound — refuse loudly
+			// rather than queue a handler the caller will wait on.
+			_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+			_ = writeResponse(conn, &Response{OK: false, Error: "executor at connection limit"})
+			conn.Close()
+			s.audit("refused connection: executor at connection limit (%d)", s.cfg.MaxConns)
+			continue
+		}
+		s.mu.Lock()
+		s.conns[conn] = ""
+		s.mu.Unlock()
 		s.acceptWg.Add(1)
 		go s.serve(conn)
+	}
+}
+
+// closeLiveConns interrupts every in-flight handler so Stop's drain
+// is bounded by shutdown, not by the conn deadline.
+func (s *Server) closeLiveConns() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for conn := range s.conns {
+		conn.Close()
 	}
 }
 
@@ -216,12 +400,30 @@ func (s *Server) isStopped() bool {
 	return s.stopped
 }
 
+// releaseConn returns a handler's slot and untracks the connection.
+func (s *Server) releaseConn(conn *net.UnixConn) {
+	s.mu.Lock()
+	submitter := s.conns[conn]
+	if submitter != "" {
+		if n := s.peerLoad[submitter] - 1; n <= 0 {
+			delete(s.peerLoad, submitter)
+		} else {
+			s.peerLoad[submitter] = n
+		}
+	}
+	delete(s.conns, conn)
+	s.mu.Unlock()
+	<-s.slots
+}
+
 // serve handles one connection: resolve the kernel peer, authorize,
-// read one bounded frame, authenticate, record, respond.
+// read bounded frames, verify admission (token, then contract),
+// persist, dispatch, respond.
 func (s *Server) serve(conn *net.UnixConn) {
 	defer s.acceptWg.Done()
+	defer s.releaseConn(conn)
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+	_ = conn.SetDeadline(time.Now().Add(connIdleDeadline))
 
 	creds, credErr := unixPeerCredentials(conn)
 	submitter := "<unauthenticated>"
@@ -233,6 +435,13 @@ func (s *Server) serve(conn *net.UnixConn) {
 		s.audit("refused connection from %s: %s", submitter, reason)
 		_ = writeResponse(conn, &Response{OK: false, Error: reason})
 	}
+	// failJob reports a refusal on an already-recorded job: the
+	// response carries the job's durable state so the caller learns
+	// what the ledger holds, not just that it said no.
+	failJob := func(jobID, state, reason string) {
+		s.audit("job %s from %s -> %s: %s", jobID, submitter, state, reason)
+		_ = writeResponse(conn, &Response{OK: false, JobID: jobID, State: state, Error: reason})
+	}
 
 	if credErr != nil {
 		fail(fmt.Sprintf("peer credentials unavailable: %v", credErr))
@@ -243,6 +452,18 @@ func (s *Server) serve(conn *net.UnixConn) {
 		fail(fmt.Sprintf("peer uid %d is not a permitted submitter", creds.UID))
 		return
 	}
+
+	// Per-peer occupancy bound: one submitter may not hold every
+	// slot while others wait.
+	s.mu.Lock()
+	if s.peerLoad[submitter] >= maxPeerConns {
+		s.mu.Unlock()
+		fail(fmt.Sprintf("submitter %s holds too many connections (%d)", submitter, maxPeerConns))
+		return
+	}
+	s.peerLoad[submitter]++
+	s.conns[conn] = submitter
+	s.mu.Unlock()
 
 	reader := bufio.NewReader(conn)
 	for {
@@ -262,55 +483,194 @@ func (s *Server) serve(conn *net.UnixConn) {
 			fail("submission token mismatch")
 			return
 		}
-		if err := req.Job.Validate(); err != nil {
-			fail(fmt.Sprintf("invalid job: %v", err))
+		if req.Job != nil && req.SignedJob != nil {
+			fail("request must carry exactly one of job or signed_job")
 			return
 		}
 
-		s.mu.Lock()
-		if _, dup := s.jobs[req.Job.JobID]; dup {
-			s.mu.Unlock()
-			fail(fmt.Sprintf("job_id %q already submitted", req.Job.JobID))
+		var (
+			jobID, principal, image, contractJSON, contractHash string
+			contract                                            *JobContractV1
+		)
+		switch {
+		case req.SignedJob != nil:
+			if len(s.cfg.AuthorityKeys) == 0 {
+				fail("signed job submitted but no authority keys are configured")
+				return
+			}
+			c, err := VerifyContract(req.SignedJob, s.cfg.AuthorityKeys, submitter, s.now(), s.cfg.MaxContractTTL)
+			if err != nil {
+				fail(fmt.Sprintf("job contract refused: %v", err))
+				return
+			}
+			if cerr := s.checkCeiling(c); cerr != nil {
+				fail(fmt.Sprintf("job contract refused: %v", cerr))
+				return
+			}
+			contract = c
+			jobID, principal, image = c.JobID, c.Principal, c.Image
+			contractHash = ContractHash(c)
+			raw, _ := json.Marshal(c)
+			contractJSON = string(raw)
+		case req.Job != nil:
+			if len(s.cfg.AuthorityKeys) > 0 {
+				fail("unsigned job refused: a signed job contract is required")
+				return
+			}
+			if err := req.Job.Validate(); err != nil {
+				fail(fmt.Sprintf("invalid job: %v", err))
+				return
+			}
+			jobID, principal, image = req.Job.JobID, req.Job.Principal, req.Job.Image
+			raw, _ := json.Marshal(req.Job)
+			contractJSON = string(raw)
+			sum := sha256.Sum256(append([]byte("unsigned\x00"), jobID...))
+			contractHash = hex.EncodeToString(sum[:])
+		default:
+			fail("request carries no job")
 			return
 		}
-		if len(s.jobs) >= maxJobs {
-			s.mu.Unlock()
+
+		// The registry bound is checked against durable state — the
+		// ledger is the registry, not a cache of it.
+		if count, err := s.ledger.Count(); err != nil {
+			fail(fmt.Sprintf("registry unavailable: %v", err))
+			return
+		} else if count >= maxJobs {
 			fail(fmt.Sprintf("job registry full (%d records)", maxJobs))
 			return
 		}
-		rec := &JobRecord{
-			JobID:      req.Job.JobID,
-			Submitter:  submitter,
-			Principal:  req.Job.Principal,
-			Image:      req.Job.Image,
-			State:      JobStateRecorded,
-			ReceivedAt: time.Now().UTC(),
-		}
-		s.jobs[rec.JobID] = rec
-		s.seq.Add(1)
-		s.mu.Unlock()
 
-		// A configured backend takes the submission next — outside
-		// the registry lock, so a slow executor never stalls other
-		// admissions. The slot is reserved up front: a refused
-		// hand-off is unrecorded rather than left half-registered.
-		if s.cfg.Backend != nil {
-			state, err := s.cfg.Backend.Submit(req.Job, submitter)
-			s.mu.Lock()
-			if err != nil {
-				delete(s.jobs, rec.JobID)
-				s.mu.Unlock()
-				fail(fmt.Sprintf("backend refused job %q: %v", req.Job.JobID, err))
+		// Persist before dispatch. If the process dies after this
+		// commit, the job identity survives — that is the point of
+		// the ledger.
+		_, err = s.ledger.InsertJob(jobID, contractHash, submitter, principal, image, contractJSON)
+		if err != nil {
+			switch {
+			case errors.Is(err, ErrDuplicateJobID):
+				fail(fmt.Sprintf("job_id %q already submitted", jobID))
+			case errors.Is(err, ErrContractReplay):
+				fail(fmt.Sprintf("job contract is a replay: %v", err))
+			default:
+				fail(fmt.Sprintf("record job %q: %v", jobID, err))
+			}
+			return
+		}
+
+		if s.cfg.Backend == nil {
+			s.audit("accepted job %s from %s (principal=%s image=%s signed=%t)",
+				jobID, submitter, principal, image, contract != nil)
+			if err := writeResponse(conn, &Response{OK: true, JobID: jobID, State: JobStateRecorded}); err != nil {
 				return
 			}
-			rec.State = state
-			s.mu.Unlock()
+			continue
 		}
 
-		s.audit("accepted job %s from %s (principal=%s image=%s)",
-			rec.JobID, submitter, rec.Principal, rec.Image)
-		if err := writeResponse(conn, &Response{OK: true, JobID: rec.JobID, State: rec.State}); err != nil {
+		// Persisted intent to dispatch before the backend sees
+		// anything — a crash between dispatch and result leaves a
+		// DISPATCHING row, which reconcile marks ambiguous rather
+		// than guessing.
+		if err := s.ledger.Transition(jobID, JobStateDispatching, []string{JobStateRecorded}, nil); err != nil {
+			fail(fmt.Sprintf("persist dispatch intent for %q: %v", jobID, err))
+			return
+		}
+		dispatchCtx, cancel := context.WithTimeout(s.shutdown, s.cfg.DispatchTimeout)
+		handle, derr := s.cfg.Backend.Dispatch(dispatchCtx, contract)
+		cancel()
+		switch {
+		case derr == nil:
+			err := s.ledger.Transition(jobID, JobStateRunning, []string{JobStateDispatching},
+				func(j *LedgerJob) error { j.BackendHandle = handle; return nil })
+			if err != nil {
+				fail(fmt.Sprintf("persist dispatch of %q: %v", jobID, err))
+				return
+			}
+			s.audit("accepted job %s from %s (principal=%s image=%s signed=%t handle=%s)",
+				jobID, submitter, principal, image, contract != nil, handle)
+			s.monitorWg.Add(1)
+			go s.monitor(jobID, handle)
+			if err := writeResponse(conn, &Response{OK: true, JobID: jobID, State: JobStateRunning}); err != nil {
+				return
+			}
+		case errors.Is(derr, ErrAmbiguousDispatch):
+			// The job may already be running. Record everything we
+			// know and refuse the retry path outright — an operator
+			// reconciles against the backend, never a blind relaunch.
+			_ = s.ledger.Transition(jobID, JobStateDispatchAmbig, []string{JobStateDispatching},
+				func(j *LedgerJob) error {
+					j.BackendHandle = handle
+					j.Error = derr.Error()
+					return nil
+				})
+			failJob(jobID, JobStateDispatchAmbig, fmt.Sprintf("dispatch outcome uncertain — reconciling manually; the job will NOT be retried: %v", derr))
+			return
+		default:
+			// Definitive refusal: nothing launched, but the job
+			// identity stays recorded — a backend error must never
+			// erase an acknowledged job.
+			_ = s.ledger.Transition(jobID, JobStateDispatchFailed, []string{JobStateDispatching},
+				func(j *LedgerJob) error { j.Error = derr.Error(); return nil })
+			failJob(jobID, JobStateDispatchFailed, fmt.Sprintf("backend refused job: %v", derr))
 			return
 		}
 	}
+}
+
+// monitor collects one dispatched job's terminal result and binds it
+// to the ledger row. Context cancellation means the daemon is
+// stopping — the ledger row stays RUNNING and the next lifetime's
+// reconcile marks it ambiguous; it never reports a result it did not
+// observe.
+func (s *Server) monitor(jobID, handle string) {
+	defer s.monitorWg.Done()
+	res, err := s.cfg.Backend.Wait(s.shutdown, handle)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || s.isStopped() {
+			return
+		}
+		s.audit("job %s monitor error: %v", jobID, err)
+		_ = s.ledger.Transition(jobID, JobStateFailed, []string{JobStateRunning},
+			func(j *LedgerJob) error { j.Error = err.Error(); return nil })
+		return
+	}
+	state := JobStateSucceeded
+	if res.ExitCode != 0 {
+		state = JobStateFailed
+	}
+	resultJSON, _ := json.Marshal(res)
+	exit := int64(res.ExitCode)
+	if err := s.ledger.Transition(jobID, state, []string{JobStateRunning},
+		func(j *LedgerJob) error {
+			j.ExitCode = &exit
+			j.ResultJSON = string(resultJSON)
+			return nil
+		}); err != nil {
+		s.audit("job %s finished %s but the ledger refused the transition: %v", jobID, state, err)
+	}
+	s.audit("job %s finished: state=%s exit=%d output_sha256=%s", jobID, state, res.ExitCode, res.OutputSHA256)
+}
+
+// checkCeiling refuses contracts whose declared budget exceeds a
+// configured ceiling — the operator's bound on the authority's grant.
+func (s *Server) checkCeiling(c *JobContractV1) error {
+	ceil := s.cfg.ResourceCeiling
+	if ceil == nil {
+		return nil
+	}
+	if ceil.CPUs > 0 && c.Resources.CPUs > ceil.CPUs {
+		return fmt.Errorf("cpus %g exceeds the executor ceiling %g", c.Resources.CPUs, ceil.CPUs)
+	}
+	if ceil.MemoryMB > 0 && c.Resources.MemoryMB > ceil.MemoryMB {
+		return fmt.Errorf("memory_mb %d exceeds the executor ceiling %d", c.Resources.MemoryMB, ceil.MemoryMB)
+	}
+	if ceil.Pids > 0 && c.Resources.Pids > ceil.Pids {
+		return fmt.Errorf("pids %d exceeds the executor ceiling %d", c.Resources.Pids, ceil.Pids)
+	}
+	if ceil.TimeoutSeconds > 0 && c.Resources.TimeoutSeconds > ceil.TimeoutSeconds {
+		return fmt.Errorf("timeout_seconds %d exceeds the executor ceiling %d", c.Resources.TimeoutSeconds, ceil.TimeoutSeconds)
+	}
+	if ceil.MaxOutputBytes > 0 && c.Resources.MaxOutputBytes > ceil.MaxOutputBytes {
+		return fmt.Errorf("max_output_bytes %d exceeds the executor ceiling %d", c.Resources.MaxOutputBytes, ceil.MaxOutputBytes)
+	}
+	return nil
 }

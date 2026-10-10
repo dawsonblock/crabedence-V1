@@ -2,6 +2,9 @@ package sandboxexecutor
 
 import (
 	"bufio"
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -340,59 +343,152 @@ func TestStopKeepsForeignOccupant(t *testing.T) {
 }
 
 type stubBackend struct {
-	state string
-	err   error
-	got   *JobSubmission
-	gotBy string
+	handle string
+	err    error
+	got    *JobContractV1
+	wait   chan *ExecResult
+	werr   error
 }
 
-func (b *stubBackend) Submit(job *JobSubmission, submitter string) (string, error) {
+func (b *stubBackend) Dispatch(ctx context.Context, job *JobContractV1) (string, error) {
 	cpy := *job
 	b.got = &cpy
-	b.gotBy = submitter
 	if b.err != nil {
-		return "", b.err
+		// Ambiguous dispatches return the handle too — the caller
+		// must record where the job may already be live.
+		return b.handle, b.err
 	}
-	return b.state, nil
+	if b.handle == "" {
+		return "stub-handle", nil
+	}
+	return b.handle, nil
+}
+
+func (b *stubBackend) Wait(ctx context.Context, handle string) (*ExecResult, error) {
+	if b.wait != nil {
+		select {
+		case res := <-b.wait:
+			return res, b.werr
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return &ExecResult{ExitCode: 0, FinishedAt: time.Now().UTC()}, b.werr
+}
+
+func (b *stubBackend) Inspect(ctx context.Context, handle string) (bool, error) {
+	return false, nil
+}
+
+func (b *stubBackend) Close() error { return nil }
+
+// Signed-job plumbing for backend tests: a backend can only be
+// configured when authority keys exist, so every dispatch test signs
+// its jobs.
+func testAuthority(t *testing.T) (ed25519.PrivateKey, AuthorityKeys) {
+	t.Helper()
+	_, key, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub := key.Public().(ed25519.PublicKey)
+	return key, AuthorityKeys{AuthorityFingerprint(pub): pub}
+}
+
+func signedJobReq(t *testing.T, key ed25519.PrivateKey, mutate func(*JobContractV1)) map[string]any {
+	t.Helper()
+	pub := key.Public().(ed25519.PublicKey)
+	now := time.Now().UTC()
+	c := &JobContractV1{
+		Version:   ContractVersion,
+		JobID:     "job-1",
+		Principal: "alice",
+		Image:     "python:3.12@sha256:abc",
+		Argv:      []string{"python3", "-c", "print(1)"},
+		Resources: ResourceBudget{TimeoutSeconds: 60},
+		Network:   NetworkPolicy{Mode: NetworkNone},
+		IssuedAt:  now.Unix() - 5,
+		ExpiresAt: now.Unix() + 300,
+		Nonce:     "nonce-1",
+		Authority: AuthorityFingerprint(pub),
+	}
+	if mutate != nil {
+		mutate(c)
+	}
+	env, err := SignContract(key, c)
+	if err != nil {
+		t.Fatalf("sign contract: %v", err)
+	}
+	return map[string]any{
+		"version": ProtocolVersion,
+		"type":    RequestTypeSubmit,
+		"signed_job": map[string]any{
+			"contract":  json.RawMessage(env.Contract),
+			"signature": env.Signature,
+		},
+	}
 }
 
 func TestBackendHandoff(t *testing.T) {
 	dir := socketDir(t)
+	key, keys := testAuthority(t)
 
-	t.Run("backend state recorded", func(t *testing.T) {
-		be := &stubBackend{state: "QUEUED"}
-		srv := startServer(t, Config{SocketDir: dir, Peers: selfPeer(t), Backend: be})
+	t.Run("dispatch recorded running", func(t *testing.T) {
+		// Hold the job in RUNNING: the monitor transitions on Wait's
+		// return, so Wait must block until the test is done looking.
+		be := &stubBackend{handle: "vm-1", wait: make(chan *ExecResult)}
+		t.Cleanup(func() { close(be.wait) })
+		srv := startServer(t, Config{SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys, Backend: be})
 		conn, reader := connect(t, srv.SocketPath())
-		resp := sendJob(t, conn, reader, validJob())
-		if !resp.OK || resp.State != "QUEUED" {
+		resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV1) { c.JobID = "job-run"; c.Nonce = "n-run" }))
+		if !resp.OK || resp.State != JobStateRunning {
 			t.Fatalf("unexpected response: %+v", resp)
 		}
-		if be.got == nil || be.gotBy != "crabedence" || be.got.Image == "" {
-			t.Fatalf("backend saw %+v from %q", be.got, be.gotBy)
+		if be.got == nil || be.got.JobID != "job-run" {
+			t.Fatalf("backend saw %+v", be.got)
 		}
 		jobs := srv.Jobs()
-		if len(jobs) != 1 || jobs[0].State != "QUEUED" {
+		var found *JobRecord
+		for _, j := range jobs {
+			if j.JobID == "job-run" {
+				found = j
+			}
+		}
+		if found == nil || found.State != JobStateRunning {
 			t.Fatalf("registry = %+v", jobs)
 		}
 	})
 
-	t.Run("backend refusal unrecords", func(t *testing.T) {
+	t.Run("backend refusal keeps the job recorded", func(t *testing.T) {
 		be := &stubBackend{err: fmt.Errorf("no sandbox available")}
-		srv := startServer(t, Config{SocketDir: dir, Peers: selfPeer(t), Backend: be})
+		srv := startServer(t, Config{SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys, Backend: be})
 		conn, reader := connect(t, srv.SocketPath())
-		resp := sendJob(t, conn, reader, validJob())
-		if resp.OK || !strings.Contains(resp.Error, "backend refused") {
+		resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV1) { c.JobID = "job-fail"; c.Nonce = "n-fail" }))
+		if resp.OK || resp.State != JobStateDispatchFailed {
 			t.Fatalf("unexpected response: %+v", resp)
 		}
-		if len(srv.Jobs()) != 0 {
-			t.Fatal("a refused hand-off must leave no record")
+		// The defect this repairs: a backend error must not erase an
+		// acknowledged job identity.
+		lj, err := srv.Ledger().Get("job-fail")
+		if err != nil || lj == nil {
+			t.Fatalf("ledger lost the refused job: %v", err)
 		}
-		// The job_id is reusable after a refused hand-off.
-		be.err = nil
-		be.state = "QUEUED"
-		conn2, reader2 := connect(t, srv.SocketPath())
-		if resp := sendJob(t, conn2, reader2, validJob()); !resp.OK {
-			t.Fatalf("resubmission after refusal failed: %+v", resp)
+		if lj.State != JobStateDispatchFailed {
+			t.Fatalf("job state = %q", lj.State)
+		}
+	})
+
+	t.Run("ambiguous dispatch never retries", func(t *testing.T) {
+		be := &stubBackend{err: ErrAmbiguousDispatch, handle: "vm-maybe"}
+		srv := startServer(t, Config{SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys, Backend: be})
+		conn, reader := connect(t, srv.SocketPath())
+		resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV1) { c.JobID = "job-ambig"; c.Nonce = "n-ambig" }))
+		if resp.OK || resp.State != JobStateDispatchAmbig {
+			t.Fatalf("unexpected response: %+v", resp)
+		}
+		lj, _ := srv.Ledger().Get("job-ambig")
+		if lj == nil || lj.BackendHandle != "vm-maybe" {
+			t.Fatalf("ambiguous job lost its handle: %+v", lj)
 		}
 	})
 }
