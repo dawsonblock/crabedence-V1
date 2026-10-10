@@ -271,16 +271,26 @@ const (
 // StateStopping until a later Stop observes the drains complete.
 var ErrShutdownTimeout = errors.New("execution service shutdown timed out")
 
-// Service is the persistent Crabedence execution service.
-type Service struct {
-	registry   *capability.Registry
-	handler    Handler
-	socketPath string
-	listener   net.Listener
-	mu         sync.Mutex
-	state      ServiceState
+// lifecycleGeneration is the immutable state of one Start→Stop
+// lifecycle. Every per-lifecycle handle lives here so a stop finalizer
+// from an old lifecycle can never consult — or damage — state a later
+// Start installed: the generation a finalizer cleans up is the one it
+// captured at the STOPPING transition, not whatever the service fields
+// may hold by then.
+type lifecycleGeneration struct {
+	// id is the service-local generation counter, assigned at Start;
+	// diagnostics only.
+	id uint64
+	// listener is this lifecycle's bound socket, closed at the STOPPING
+	// transition. socketIdent is its filesystem identity (device +
+	// inode), captured at Start: the finalizer removes the path only
+	// while it still names that same object — a successor's socket or
+	// a foreign replacement fails the identity check and is never
+	// unlinked by this lifecycle.
+	listener    net.Listener
+	socketIdent *socketFileID
 	// acceptDone is closed by the accept loop when it exits — created
-	// fresh on each Start so a second lifecycle never waits on a
+	// fresh per generation so a second lifecycle never waits on a
 	// previous loop. Stop joins it before waiting on the handler
 	// group: while the accept loop runs it can still call
 	// handlers.Add(1), so a drain observed without the join can never
@@ -294,17 +304,46 @@ type Service struct {
 	// handler were started with. Stop invokes it at the STOPPING
 	// transition so in-flight work learns the service is draining.
 	intakeCancel context.CancelFunc
-	// stopDeadline is the shared bound for both drain phases, fixed
-	// at the first Stop. A retried Stop re-waits against the same
-	// deadline rather than extending it; once the drains have
-	// completed the wait returns immediately, so a retry does finish
-	// the transition to StateStopped.
+	// stopDeadline is the shared bound for the whole stop sequence —
+	// both drain phases and the cleanup wait — fixed at the first
+	// Stop. A retried Stop re-waits against the same deadline rather
+	// than extending it.
 	stopDeadline time.Time
-	// socketIdent is the filesystem identity (device + inode) of the
-	// socket this service bound, captured at Start. Stop removes the
-	// path only when it still names that same object — a replaced or
-	// foreign file is left for the operator.
-	socketIdent   *socketFileID
+	// attempt is the in-flight (or most recently finished) owned-socket
+	// cleanup attempt — immutable once completed, so a waiter always
+	// reads the result of the attempt it joined, never a torn or
+	// recycled outcome. cleanupBusy marks an attempt running (under
+	// s.mu): exactly one caller finalizes at a time; every other
+	// concurrent Stop waits on the attempt's done channel for the same
+	// truthful result.
+	attempt     *cleanupAttempt
+	cleanupBusy bool
+}
+
+// cleanupAttempt is one owned-socket cleanup run. err is written before
+// done closes and read only after it does — the channel close is the
+// happens-before edge, so no mutex is needed to read the result.
+type cleanupAttempt struct {
+	done chan struct{}
+	err  error
+}
+
+// Service is the persistent Crabedence execution service.
+type Service struct {
+	registry   *capability.Registry
+	handler    Handler
+	socketPath string
+	mu         sync.Mutex
+	state      ServiceState
+	// gen is the current lifecycle's per-generation state — listener,
+	// drain channels, socket identity and cleanup bookkeeping. It is
+	// installed by Start, captured by the stop finalizer, and replaced
+	// only by a later Start after the previous lifecycle finalized:
+	// while the service is STOPPING the generation a cleanup consults
+	// is still the one being finalized.
+	gen    *lifecycleGeneration
+	genSeq uint64
+	// grantResolver resolves authority references for admission.
 	grantResolver capability.GrantResolver
 	// adapterAvailability is the deployment's runtime adapter state. It
 	// is nil when the caller did not declare one (tests that construct
@@ -338,6 +377,13 @@ type Service struct {
 	// regression can hold a connection inside that window
 	// deterministically; nil in production.
 	acceptGate func()
+	// stopCleanupGate, when non-nil, runs at the head of the stop
+	// finalizer's owned-socket cleanup — the window between the drain
+	// completing and the bound socket's removal where a racing restart
+	// historically escaped. It exists so the stop/restart regression
+	// can hold a Stop inside that window deterministically; nil in
+	// production.
+	stopCleanupGate func()
 }
 
 // NewService creates a new execution service.
@@ -461,11 +507,19 @@ func (s *Service) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %w", s.socketPath, err)
 	}
+	// The socket file's removal belongs to the lifecycle's
+	// identity-checked finalizer, not to the listener: Go would
+	// otherwise unlink the path unconditionally at Close — whatever
+	// sits there, including a successor or foreign replacement.
+	if ul, ok := listener.(*net.UnixListener); ok {
+		ul.SetUnlinkOnClose(false)
+	}
 
 	// Restrict socket access to owner only, and verify the result — a
 	// socket that cannot be proven owner-only must not serve.
 	if err := os.Chmod(s.socketPath, 0o600); err != nil {
 		listener.Close()
+		os.Remove(s.socketPath)
 		return fmt.Errorf("secure socket permissions on %s: %w", s.socketPath, err)
 	}
 	ident, err := verifySocketFile(s.socketPath)
@@ -475,19 +529,24 @@ func (s *Service) Start(ctx context.Context) error {
 		return err
 	}
 
-	// Initialize the listener, drain channels, intake context and
-	// lifecycle state BEFORE publishing the accept goroutine: the loop
-	// reads them on entry, and everything it observes must already
-	// belong to this lifecycle.
-	s.listener = listener
-	s.socketIdent = ident
-	s.acceptDone = make(chan struct{})
-	s.handlersDrained = make(chan struct{})
+	// Initialize the generation — listener, socket identity, drain
+	// channels, intake context — BEFORE publishing the accept
+	// goroutine: the loop reads them on entry, and everything it
+	// observes must already belong to this lifecycle.
+	s.genSeq++
+	gen := &lifecycleGeneration{
+		id:              s.genSeq,
+		listener:        listener,
+		socketIdent:     ident,
+		acceptDone:      make(chan struct{}),
+		handlersDrained: make(chan struct{}),
+	}
 	intakeCtx, intakeCancel := context.WithCancel(ctx)
-	s.intakeCancel = intakeCancel
+	gen.intakeCancel = intakeCancel
+	s.gen = gen
 	s.state = StateRunning
 
-	go s.acceptLoop(intakeCtx)
+	go s.acceptLoop(gen, intakeCtx)
 
 	return nil
 }
@@ -527,10 +586,11 @@ func (s *Service) Stop() error {
 		return nil
 	case StateRunning:
 		s.state = StateStopping
-		s.stopDeadline = time.Now().Add(s.drainTimeout)
-		s.intakeCancel()
-		if s.listener != nil {
-			s.listener.Close()
+		gen := s.gen
+		gen.stopDeadline = time.Now().Add(s.drainTimeout)
+		gen.intakeCancel()
+		if gen.listener != nil {
+			gen.listener.Close()
 		}
 		// The single drain watcher for this lifecycle: every Stop call
 		// — concurrent or retried — waits on the same channel rather
@@ -538,30 +598,64 @@ func (s *Service) Stop() error {
 		go func(drained chan<- struct{}) {
 			s.handlers.Wait()
 			close(drained)
-		}(s.handlersDrained)
+		}(gen.handlersDrained)
 	}
-	acceptDone := s.acceptDone
-	handlersDrained := s.handlersDrained
-	deadline := s.stopDeadline
+	gen := s.gen
+	deadline := gen.stopDeadline
 	s.mu.Unlock()
 
 	// Barrier 1: the accept loop must terminate first. It is the only
 	// caller of handlers.Add(1), so once it is gone the handler count
 	// can never rise again while the drain is observed.
-	if !waitClosed(acceptDone, deadline) {
+	if !waitClosed(gen.acceptDone, deadline) {
 		return fmt.Errorf("%w: the accept loop did not terminate", ErrShutdownTimeout)
 	}
 	// Barrier 2: drain every handler admitted before the transition.
-	if !waitClosed(handlersDrained, deadline) {
+	if !waitClosed(gen.handlersDrained, deadline) {
 		return fmt.Errorf("%w: in-flight handlers did not drain", ErrShutdownTimeout)
 	}
 
+	// Barrier 3: owned-socket cleanup runs INSIDE the lifecycle — the
+	// service stays StateStopping while the bound socket's path is
+	// unresolved, so a racing Start can never bind a successor into the
+	// finalizer's window. Exactly one caller runs the attempt: the rest
+	// wait on the shared cleanupDone for the same truthful result. A
+	// failed attempt leaves the service STOPPING (degraded, never
+	// clean) and a later Stop retries; a timeout leaves it STOPPING
+	// too — timeouts never claim a clean drain.
 	s.mu.Lock()
-	s.state = StateStopped
+	if s.state == StateStopped {
+		s.mu.Unlock()
+		return nil
+	}
+	if gen.cleanupBusy {
+		attempt := gen.attempt
+		s.mu.Unlock()
+		if !waitClosed(attempt.done, deadline) {
+			return fmt.Errorf("%w: socket cleanup did not finish", ErrShutdownTimeout)
+		}
+		return attempt.err
+	}
+	gen.cleanupBusy = true
+	attempt := &cleanupAttempt{done: make(chan struct{})}
+	gen.attempt = attempt
 	s.mu.Unlock()
-	s.removeOwnedSocket()
 
-	return nil
+	// The generation the cleanup consults is THIS lifecycle's — the
+	// captured socket identity, never whatever a later Start may have
+	// installed. A successor's socket fails the identity check and is
+	// left alone.
+	cleanupErr := s.removeOwnedSocket(gen)
+
+	s.mu.Lock()
+	attempt.err = cleanupErr
+	gen.cleanupBusy = false
+	close(attempt.done)
+	if cleanupErr == nil && s.state == StateStopping {
+		s.state = StateStopped
+	}
+	s.mu.Unlock()
+	return cleanupErr
 }
 
 // waitClosed reports whether done closes before deadline. A channel
@@ -587,14 +681,15 @@ func waitClosed(done <-chan struct{}, deadline time.Time) bool {
 	}
 }
 
-func (s *Service) acceptLoop(ctx context.Context) {
-	// Bound to THIS lifecycle: the channels and listener were published
-	// before the goroutine started, and a later Start never reuses
-	// them. acceptDone closes exactly once, on every exit path — a
-	// listener-close, a persistent-error return, or an intake-context
-	// cancellation — so a joining Stop never hangs waiting for it.
-	done := s.acceptDone
-	listener := s.listener
+func (s *Service) acceptLoop(gen *lifecycleGeneration, ctx context.Context) {
+	// Bound to THIS lifecycle's generation: the channels and listener
+	// were published before the goroutine started, and a later Start
+	// never reuses them. acceptDone closes exactly once, on every exit
+	// path — a listener-close, a persistent-error return, or an
+	// intake-context cancellation — so a joining Stop never hangs
+	// waiting for it.
+	done := gen.acceptDone
+	listener := gen.listener
 	defer close(done)
 
 	// A persistent accept error (EMFILE, ENFILE, a transient kernel
