@@ -32,7 +32,7 @@ func runCheckpointContainerReviewContract(t *testing.T, repo, binary string) {
 	t.Helper()
 	docker := filepath.Join(t.TempDir(), "docker")
 	build := exec.Command("go", "build", "-trimpath", "-o", docker, "./internal/cli/testdata/checkpoint-container")
-	build.Dir = repo
+	build.Dir = checkpointTestModuleRoot(t)
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build fake Docker: %v\n%s", err, output)
 	}

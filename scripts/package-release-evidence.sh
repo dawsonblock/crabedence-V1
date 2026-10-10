@@ -13,6 +13,9 @@
 # Usage: ./scripts/package-release-evidence.sh <evidence-dir> <output.tar.gz>
 set -euo pipefail
 
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+source "$REPO_ROOT/scripts/lib/evidence-inventory.sh"
+
 EVIDENCE_DIR="${1:?usage: package-release-evidence.sh <evidence-dir> <output.tar.gz>}"
 OUTPUT="${2:?usage: package-release-evidence.sh <evidence-dir> <output.tar.gz>}"
 
@@ -26,6 +29,14 @@ if [ ! -f "$EVIDENCE_DIR/SHA256SUMS" ]; then
 fi
 if [ ! -f "$EVIDENCE_DIR/evidence-manifest.json" ]; then
   echo "ERROR: evidence is not finalized: evidence-manifest.json missing" >&2
+  exit 1
+fi
+
+# The same membership rule the finalizer ran: a hidden scratch entry or a
+# non-regular member is never evidence and never ships. Refused here before
+# any manifest comparison so a rejected tree is rejected for the same reason
+# at every stage.
+if ! evidence_refuse_strays "$EVIDENCE_DIR" "packaging"; then
   exit 1
 fi
 
@@ -57,12 +68,14 @@ if ! (cd "$EVIDENCE_DIR" && shasum -a 256 -c SHA256SUMS >/dev/null 2>&1); then
   exit 1
 fi
 
-# The reverse direction too: every regular file being packaged must be listed
-# in SHA256SUMS. A file added after finalization — or a non-regular member the
+# The reverse direction too: every canonical member being packaged must be
+# listed in SHA256SUMS. A file added after finalization — or a member the
 # checksum walk skipped — would otherwise ship inside the bundle without a
-# checksum, breaking the "complete finalized set" guarantee. SHA256SUMS and
-# evidence-manifest.json are legitimately uncovered (self-reference), and the
-# checksum walk only covers regular files, so both are excluded here as well.
+# checksum, breaking the "complete finalized set" guarantee. The canonical
+# inventory (scripts/lib/evidence-inventory.sh) decides membership: SHA256SUMS
+# and evidence-manifest.json are legitimately uncovered (self-reference), and
+# anything under `attestation` is the external seal, verified by
+# `gh attestation verify` rather than the checksum manifest.
 covered_list="$(mktemp)"
 ondisk_list="$(mktemp)"
 uncovered_list="$(mktemp)"
@@ -72,9 +85,8 @@ while read -r _sha entry || [ -n "$_sha" ]; do
   entry="${entry#./}"
   [ -n "$entry" ] && printf '%s\n' "$entry"
 done < "$EVIDENCE_DIR/SHA256SUMS" | LC_ALL=C sort > "$covered_list"
-(cd "$EVIDENCE_DIR" \
-  && find . -type f ! -name SHA256SUMS ! -name evidence-manifest.json -print \
-  | sed 's|^\./||' | LC_ALL=C sort) > "$ondisk_list"
+evidence_checksum_members "$EVIDENCE_DIR" \
+  | tr '\0' '\n' | sed 's|^\./||' | LC_ALL=C sort > "$ondisk_list"
 # Materialize the set difference, then test the FILE. Piping comm into a
 # short-circuiting consumer (grep -q, head) lets the consumer exit after the
 # first line, comm dies with SIGPIPE, and pipefail inverts the branch — so a

@@ -88,7 +88,9 @@ cannot use organization rulesets, so the equivalent control is a required
 status check plus `CODEOWNERS` protection on the workflow file that produces
 it — a pull request cannot redefine the check that gates its own merge without
 owner review. A separate active no-bypass tag ruleset must
-cover every `refs/tags/v*` release tag and prevent deletion and updates.
+cover every `refs/tags/v*` release tag and prevent deletion and updates; the
+NEMO distribution family requires the equivalent coverage for `refs/tags/nemo-v*`
+(see "NEMO Distribution Family" below).
 
 GitHub omits ruleset bypass actors from the ordinary workflow token. Configure
 `CRABBOX_RULESET_READ_TOKEN` as a fine-grained repository secret scoped only to
@@ -641,6 +643,135 @@ state. It proves the actual published tag is remotely resolvable, unlike the
 preproduction hermetic fixture. Do not substitute a checkout, `replace`,
 pseudo-version, local proxy, or `,direct` fallback. Record channel smoke failures
 and retry the affected check, not production or publication.
+
+## NEMO Distribution Family
+
+The `nemo-control_*` artifacts are a separate bound release family, not part of
+the `crabbox_*` inventory above. `scripts/release-provenance.mjs` and
+`scripts/publish-release.sh` stay exactly scoped to the eight-file kernel
+release; the family has its own signed tag, its own authorization record, and
+its own proof-gated publisher. Never add `nemo-control_*` names to the kernel
+asset list or the candidate manifest.
+
+The family tag is `nemo-vX.Y.Z`: an annotated signed tag spelling the same
+version as the kernel release it accompanies, created at the same source
+commit after the kernel tag machinery completes:
+
+```sh
+git tag -s "nemo-$TAG" -m "nemo-$TAG" "$TAG_COMMIT"
+git push origin "refs/tags/nemo-$TAG"
+```
+
+The tag annotation must equal the bare `nemo-vX.Y.Z` spelling —
+`scripts/verify-release-source.sh` requires the tag subject to equal the tag —
+and the family tag needs the same signer-registration precondition as `v*`:
+a maintainer SSH key listed in `.github/release-allowed-signers` and registered
+on the account as a signing key. Confirm
+`gh api repos/dawsonblock/crabedence-V1/git/tags/<tag-object> --jq .verification`
+reports `verified` immediately after the push, before building anything.
+
+A separate active no-bypass tag ruleset must cover `refs/tags/nemo-v*` and
+prevent deletion and updates, exactly as `refs/tags/v*` is covered for the
+kernel family. The publisher's policy check fails closed until that coverage
+exists.
+
+`.github/workflows/nemo-distribution.yml` runs on both `v*` and `nemo-v*` tag
+pushes and strips the `nemo-` prefix when naming artifacts, so a family tag
+rebuilds the identical `nemo-control_X.Y.Z_*` inventory. Signing is mandatory
+on every tag push (`signing_required`); only manual `workflow_dispatch` runs
+may produce unsigned output. The family's proof chain is:
+
+- four per-target tarballs, each built and qualified on its native runner;
+- one bound qualification attestation per tarball
+  (`<tarball>.qualification.json`), pinning the archive SHA-256, the source
+  commit, the version, the component/transfer manifest digests, and the exact
+  five-gate set the installed-distribution suite emits — every gate passing,
+  no others present;
+- `nemo-control_X.Y.Z_SHA256SUMS` covering exactly the four tarballs and
+  their four qualification attestations — the attestations are signed
+  content, not unsigned metadata beside an authenticated archive;
+- `nemo-control_X.Y.Z_SHA256SUMS.sig`, an SSH signature over the manifest in
+  the `nemo-control-release` namespace by the release signer.
+
+Source bundles (`NEMO-CONTROL-*.zip` / `*.tar.gz`) are produced by
+`scripts/package-source-archive.sh` — never by an ad-hoc `zip -r` of a
+checkout. The packager enforces the tracked-only provenance invariant:
+
+> provenance-covered ⇒ tracked ⇒ source-manifested ⇒ packaged ⇒
+> independently verifiable
+
+It enumerates every provenance-covered regular file and symlink and requires
+each to be represented by the release commit; a covered-but-untracked path
+fails packaging before an archive exists — it is never silently added. (This
+is the gate the missing `runtimes/nemo-relay/.claude/skills` symlink taught
+us: the fix is to *commit* the covered path, not to union it into the
+artifact.) The package set is the Git HEAD path set read as worktree bytes,
+so `eol`/`text` smudges are preserved byte-for-byte.
+
+Additional packager gates, all of which fail before any archive command
+runs:
+
+- the archive prefix is restricted to `[A-Za-z0-9][A-Za-z0-9._+-]*` — an
+  option-lookalike, a path component, or a control character can never reach
+  `tar`/`zip` as an argument;
+- path enumeration is NUL-delimited end to end (`git ls-tree -z`, the
+  digest tool's `-list -z`, `sort -z`, tar `--null -T`) plus a hard
+  release-path filename policy, so names the toolchain cannot carry
+  byte-for-byte are rejected rather than mangled;
+- tar members are written in GNU format so non-ASCII filenames are not
+  Unicode-normalized inside the archive; the flag is spelled per
+  implementation (`gnu` on GNU tar, `gnutar` on libarchive) so the
+  packager runs on both Linux and macOS toolchains;
+- the generated source manifest is embedded in the archive at
+  `release-evidence/source-tree-sha256.txt`, so the artifact is
+  self-verifying without a side channel;
+- the emitted archive is extracted into a clean directory and verified
+  against the source manifest and the transfer manifest — the package
+  fails rather than ships when the two disagree.
+
+Qualification then runs in two explicit lanes. `scripts/qualify-repository.sh`
+carries the Git-dependent gates (history, attributes, tracked files, clean
+worktree). `scripts/qualify-source-distribution.sh` runs on a clean
+extraction with no `.git` — it refuses a `.git` entry in the tree — and
+verifies the embedded source manifest, path policy, symlinks, generated
+content, and build inputs. The RC workflow copies only the published
+archives into a clean-room job with no checkout and runs the distribution
+suite shipped inside each archive, then `verify-release-artifact.sh --mode
+release` on the same bytes; a post-publication job repeats the whole check
+against the publicly downloadable assets only.
+
+After the distribution run succeeds on the family tag, merge its authorization
+record to `main` — `release/records/nemo-vX.Y.Z.json`, same schema as the
+kernel records with `tag` set to the family spelling — binding the family tag
+object and source commit. Then run the publisher from a clean checkout whose
+`HEAD` is the protected workflow commit that merged the record:
+
+```sh
+scripts/publish-nemo-release.sh \
+  "nemo-$TAG" "$NEMO_TAG_OBJECT" "$TAG_COMMIT" \
+  "$VERIFIER_COMMIT" "$WORKFLOW_COMMIT" \
+  "$NEMO_DIST_RUN_ID" "nemo-$TAG"
+```
+
+The publisher re-verifies the remote signed tag object and peeled commit,
+the ruleset inventory (including `nemo-v*` coverage), the authorization record,
+and protected-tooling cleanliness; binds the supplied run to a successful
+`nemo-distribution.yml` push at the pinned source commit; downloads every run
+artifact by exact GitHub digest; authenticates `SHA256SUMS` under
+`.github/release-allowed-signers` before trusting it; requires each tarball
+*and* each attestation file to match its signed manifest line, and each
+attestation's content to bind the same archive digest, version, and source
+commit with the qualification suite's exact five gates all passing — a subset,
+superset, or unrelated all-pass list is not the suite's evidence. It then creates the
+draft on the family tag with a deterministic bound-stub body, uploads exactly
+the ten family assets (four tarballs, four attestations, manifest, signature),
+re-reads the remote inventory by name/size/digest, and publishes with the same
+single-PATCH discipline as the kernel publisher. A release already bound to
+the family tag, a missing or extra asset, an unsigned or mis-signed manifest,
+a mismatched archive digest, a non-pass or incomplete gate set, or a foreign
+source commit all fail closed before mutation.
+
+There is no Homebrew tap for the family; publication is the terminal step.
 
 ## Cancellation And Recovery
 

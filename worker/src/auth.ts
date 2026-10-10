@@ -276,24 +276,35 @@ export async function requestWithAdminGrantVersion(
   return new Request(request, { headers });
 }
 
+// Headers that carry or assert server-side trust. Every one of these
+// is set by the coordinator itself (authenticatedCoordinatorRequest,
+// requestWithAdminGrantVersion, internal synthetic requests inside the
+// Durable Object) — a request arriving at the entry boundary that
+// carries one is a caller asserting an identity it was never granted,
+// so unauthenticated pass-through routes must never forward them.
+const trustedInternalHeaders = [
+  "x-crabbox-auth",
+  "x-crabbox-admin",
+  "x-crabbox-owner",
+  "x-crabbox-org",
+  "x-crabbox-github-login",
+  "x-crabbox-token-expires-at",
+  "x-crabbox-internal",
+  "x-crabbox-proxy-secret",
+  "x-crabbox-admin-grant-version",
+  "x-crabbox-github-token-id",
+  "x-crabbox-github-sealed-credential",
+  "x-crabbox-portal-session",
+] as const;
+
 export function requestWithoutTrustedHeaders(request: Request): Request {
-  if (
-    !request.headers.has("x-crabbox-internal") &&
-    !request.headers.has("x-crabbox-proxy-secret") &&
-    !request.headers.has("x-crabbox-admin-grant-version") &&
-    !request.headers.has("x-crabbox-github-token-id") &&
-    !request.headers.has("x-crabbox-github-sealed-credential") &&
-    !request.headers.has("x-crabbox-portal-session")
-  ) {
+  if (!trustedInternalHeaders.some((name) => request.headers.has(name))) {
     return request;
   }
   const headers = new Headers(request.headers);
-  headers.delete("x-crabbox-internal");
-  headers.delete("x-crabbox-proxy-secret");
-  headers.delete("x-crabbox-admin-grant-version");
-  headers.delete("x-crabbox-github-token-id");
-  headers.delete("x-crabbox-github-sealed-credential");
-  headers.delete("x-crabbox-portal-session");
+  for (const name of trustedInternalHeaders) {
+    headers.delete(name);
+  }
   return new Request(request, { headers });
 }
 
@@ -362,7 +373,11 @@ async function issueSignedUserToken(
     login: input.login,
     githubCredential: await sealGitHubCredential(input.githubAccessToken, sessionSecret(env)),
     iat: now,
-    exp: now + (input.ttlSeconds ?? 30 * 24 * 60 * 60),
+    // Default session lifetime: 7 days. The token carries a sealed but
+    // live GitHub credential for its whole TTL — a stolen token is
+    // credential-equivalent until exp, so the default stays short of a
+    // month even though callers may opt into longer lives.
+    exp: now + (input.ttlSeconds ?? 7 * 24 * 60 * 60),
   };
   if (input.name) {
     payload.name = input.name;
@@ -578,6 +593,13 @@ export function userTokenSigningConfigurationError(
   ) {
     return "CRABBOX_SESSION_SECRET must differ from CRABBOX_SHARED_TOKEN";
   }
+  // The secret signs bearer tokens that carry a sealed GitHub
+  // credential for their whole TTL — anything guessable makes every
+  // issued token forgeable. 32 characters is the documented minimum
+  // (see the durable-provisioning gate in fleet.ts).
+  if (env.CRABBOX_SESSION_SECRET.length < 32) {
+    return "CRABBOX_SESSION_SECRET must be at least 32 characters for signed user tokens";
+  }
   return undefined;
 }
 
@@ -593,11 +615,13 @@ function trustedProxyIdentity(
     "CRABBOX_TRUSTED_USER_HEADER" | "CRABBOX_TRUSTED_USER_ORG" | "CRABBOX_TRUSTED_PROXY_SECRET"
   >,
 ): AuthContext | undefined {
-  const requiredSecret = env.CRABBOX_TRUSTED_PROXY_SECRET;
+  // Trusted-proxy identity is assertion of an authenticated identity by
+  // an upstream proxy, so it must fail closed: enabling the header
+  // without a shared secret would let any caller claim any owner.
+  const requiredSecret = env.CRABBOX_TRUSTED_PROXY_SECRET?.trim();
   if (
-    requiredSecret !== undefined &&
-    (!requiredSecret ||
-      !timingSafeEqual(request.headers.get("x-crabbox-proxy-secret") ?? "", requiredSecret))
+    !requiredSecret ||
+    !timingSafeEqual(request.headers.get("x-crabbox-proxy-secret") ?? "", requiredSecret)
   ) {
     return undefined;
   }

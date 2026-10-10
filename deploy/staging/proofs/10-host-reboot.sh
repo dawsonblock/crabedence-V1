@@ -66,6 +66,7 @@ User=crabedence
 RuntimeDirectory=crabedence
 Environment=CRABBOX_MODE=production
 Environment=CRABEDENCE_PEER_PRINCIPALS=0:*
+Environment=CRABEDENCE_TRUSTED_PROXY_UIDS=0
 Environment=CRABEDENCE_STORE_BACKEND=postgres
 EnvironmentFile=/etc/crabedence/staging.env
 ExecStart=/usr/local/bin/crabbox serve-exec --socket /run/crabedence/execution.sock
@@ -83,8 +84,8 @@ cexec() { docker exec "$CONTAINER" bash -c "$1"; }
 cexec 'for i in $(seq 30); do [ -S /run/crabedence/execution.sock ] && break; sleep 1; done'
 GID=$(cexec 'set -a; . /etc/crabedence/staging.env; set +a; issue-grant --principal '"$PRINCIPAL"' --capability test.counter.increment' | grep -o '"grant_id": *"[^"]*"' | cut -d'"' -f4)
 RK="reboot-proof-$(date +%s%N)"
-cexec "crabbox invoke --socket /run/crabedence/execution.sock --capability test.counter.increment \
-  --principal $PRINCIPAL --authority-ref $GID --idempotency-key $RK \
+cexec "CRABEDENCE_AUTHORITY_REF=$GID crabbox invoke --socket /run/crabedence/execution.sock --capability test.counter.increment \
+  --principal $PRINCIPAL --idempotency-key $RK \
   --arguments '{\"counter\":\"reboot\",\"by\":1}'" | grep -q '"status": "SUCCEEDED"' \
   || fail "nested-host mutation failed before reboot"
 
@@ -100,8 +101,8 @@ cexec 'for i in $(seq 30); do [ -S /run/crabedence/execution.sock ] && break; sl
 # same idempotency key must not dispatch again.
 rows=$(psql_db "SELECT count(*) FROM execution_requests WHERE idempotency_key='$RK'")
 [ "$rows" = "1" ] || fail "expected 1 durable row for $RK after reboot, got $rows"
-resp=$(cexec "crabbox invoke --socket /run/crabedence/execution.sock --capability test.counter.increment \
-  --principal $PRINCIPAL --authority-ref $GID --idempotency-key $RK \
+resp=$(cexec "CRABEDENCE_AUTHORITY_REF=$GID crabbox invoke --socket /run/crabedence/execution.sock --capability test.counter.increment \
+  --principal $PRINCIPAL --idempotency-key $RK \
   --arguments '{\"counter\":\"reboot\",\"by\":1}'")
 state=$(psql_db "SELECT state FROM execution_requests WHERE idempotency_key='$RK'")
 [ "$(psql_db "SELECT count(*) FROM execution_requests WHERE idempotency_key='$RK'")" = "1" ] \

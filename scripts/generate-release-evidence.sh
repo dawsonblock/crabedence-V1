@@ -26,13 +26,15 @@ source "$REPO_ROOT/scripts/lib/live-gate.sh"
 # Gate logs record the command line; credential-bearing KEY=value tokens
 # are redacted so a secret never lands in the evidence bundle.
 source "$REPO_ROOT/scripts/lib/redact.sh"
+source "$REPO_ROOT/scripts/lib/evidence-inventory.sh"
 
 # Clean previous generated artifacts.
 rm -f "$EVIDENCE_DIR"/*.json "$EVIDENCE_DIR"/SHA256SUMS \
   "$EVIDENCE_DIR"/source-tree-sha256.txt "$EVIDENCE_DIR"/source-tree-git-blobs.txt \
   "$EVIDENCE_DIR"/provenance.json "$EVIDENCE_DIR"/artifact.json \
-  "$EVIDENCE_DIR"/toolchains.json "$EVIDENCE_DIR"/environment.json
-rm -rf "$EVIDENCE_DIR/gate-results"
+  "$EVIDENCE_DIR"/toolchains.json "$EVIDENCE_DIR"/environment.json \
+  "$EVIDENCE_DIR"/FINAL_QUALIFICATION_REPORT.md
+rm -rf "$EVIDENCE_DIR/gate-results" "$EVIDENCE_DIR/gates"
 mkdir -p "$EVIDENCE_DIR/gate-results"
 
 # ─── Gate tracking ─────────────────────────────────────────────────────────
@@ -139,6 +141,13 @@ COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 TREE="$(git -C "$REPO_ROOT" rev-parse HEAD^{tree})"
 BRANCH="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD)"
 
+# One timestamp for the whole qualification run. Every derived artifact
+# (qualification provenance, evidence manifest, evidence root, report)
+# binds THIS value — downstream regeneration reads it back from the
+# records instead of sampling the clock again, which is what makes
+# re-finalization byte-identical.
+EVIDENCE_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
 cat > "$EVIDENCE_DIR/provenance.json" << EOF
 {
   "commit": "$COMMIT",
@@ -182,9 +191,12 @@ bash "$REPO_ROOT/scripts/generate-source-manifest.sh" \
   "$EVIDENCE_DIR/source-tree-sha256.txt" "$REPO_ROOT" 2>&1 | \
   tee "$EVIDENCE_DIR/gate-results/source-manifest-generate.log"
 
-# Git blob manifest: path → git_blob_id (for Git-native verification)
+# Git blob manifest: path → git_blob_id (for Git-native verification).
+# ls-files reports paths relative to REPO_ROOT, while "HEAD:$file"
+# resolves against the repository root; the "./" form keeps the lookup
+# anchored at REPO_ROOT in both standalone and nested checkouts.
 git -C "$REPO_ROOT" ls-files -z -- . ':(exclude)release-evidence/' ':(exclude)dist/' | sort -z | while IFS= read -r -d '' file; do
-  blob="$(git -C "$REPO_ROOT" rev-parse "HEAD:$file")"
+  blob="$(git -C "$REPO_ROOT" rev-parse "HEAD:./$file")"
   echo "$blob  $file"
 done > "$EVIDENCE_DIR/source-tree-git-blobs.txt"
 
@@ -356,6 +368,14 @@ run_gate effect-fabric-race TEST env -u CRABBOX_TEST_DATABASE_URL \
 # value and the runtime serves it: qualified policy = released policy =
 # runtime policy.
 run_gate registry-digest PROVENANCE go run ./cmd/registry-digest
+
+# NeMo transfer provenance: the format-2 manifest must verify against the
+# frozen reference source — file content, executable bits, symlink targets,
+# typed delta. -require-source makes a missing reference a hard failure,
+# which is what release admission means here.
+run_gate nemo-transfer-provenance PROVENANCE \
+  bash "$REPO_ROOT/scripts/verify-nemo-provenance.sh" --require-source
+
 REGISTRY_SHA256="$(sed -n 's/^\([0-9a-f]\{64\}\)$/\1/p' "$EVIDENCE_DIR/gate-results/registry-digest.log" | tail -1)"
 if [ -z "$REGISTRY_SHA256" ]; then
   echo "ERROR: registry-digest gate produced no digest — the release cannot bind its policy identity" >&2
@@ -1150,7 +1170,7 @@ cat > "$EVIDENCE_DIR/qualification.json" << EOF
     "commit": "$COMMIT",
     "tree": "$TREE",
     "branch": "$BRANCH",
-    "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    "timestamp": "$EVIDENCE_TIMESTAMP"
   },
   "toolchains": {
     "go": "$GO_VERSION",
@@ -1186,6 +1206,17 @@ if ! GATE_FINDINGS="$(validate_qualification_gates "$EVIDENCE_DIR/qualification.
     exit 1
   fi
 fi
+
+# ─── Phase 16b: Per-gate records ────────────────────────────────────────────
+# qualification.json is the canonical admission record; gates/<id>.json
+# explodes each gate into a standalone record so a single gate's result
+# and log binding can be examined and verified independently.
+mkdir -p "$EVIDENCE_DIR/gates"
+jq -r '.gates[].gate_id' "$EVIDENCE_DIR/qualification.json" | while IFS= read -r gid; do
+  jq --arg gid "$gid" \
+    '.gates[] | select(.gate_id == $gid) | {schema_version: 2, record_type: "gate"} + .' \
+    "$EVIDENCE_DIR/qualification.json" > "$EVIDENCE_DIR/gates/$gid.json"
+done
 
 # ─── Phase 23: Generate qualification matrix from JSON ──────────────────────
 "$REPO_ROOT/scripts/generate-qualification-matrix.sh"
@@ -1324,13 +1355,39 @@ cat > "$EVIDENCE_DIR/sbom.spdx.json" << EOF
 }
 EOF
 
+# ─── Phase 19: Manifest copy, evidence root, then the generated report ───
+# The component manifest ships inside the bundle so the evidence root
+# binds it without reaching back into the repository.
+cp "$REPO_ROOT/runtimes/nemo-transfer-manifest.json" "$EVIDENCE_DIR/nemo-transfer-manifest.json"
+
+# The semantic closure: binds every identity the run produced — commit,
+# source manifest, runtime and component digests, every gate's log
+# digest — reduced to a single signable root_sha256. The artifact
+# binding lands at finalization.
+python3 "$REPO_ROOT/scripts/generate-evidence-root.py" "$EVIDENCE_DIR" --repo-root "$REPO_ROOT"
+
+# FINAL_QUALIFICATION_REPORT.md is generated from qualification.json /
+# release-manifest.json / evidence-root.json — never written by hand,
+# so a PASS cannot be asserted in prose the records do not support. It
+# runs after the root so the report can display the signed digest.
+"$REPO_ROOT/scripts/generate-qualification-report.sh" "$EVIDENCE_DIR"
+
 # ─── Phase 20: SHA256SUMS for evidence bundle ──────────────────────────────
 # Must be generated AFTER all other files (including release-manifest.json
 # and sbom.spdx.json) so that every file in the evidence directory is covered.
 # evidence-manifest.json is EXCLUDED because its digest is computed FROM
 # this SHA256SUMS — including it would create a self-invalidating cycle.
 cd "$EVIDENCE_DIR"
-find . -type f ! -name SHA256SUMS ! -name evidence-manifest.json ! -name artifact.json -print0 | sort -z | xargs -0 shasum -a 256 > SHA256SUMS
+# Every stage agrees on membership (scripts/lib/evidence-inventory.sh):
+# a hidden scratch entry or a non-regular member is never evidence and
+# never ships, so finding one here refuses the bundle rather than
+# producing a tree finalization or packaging would reject downstream.
+evidence_refuse_strays "$EVIDENCE_DIR" "evidence generation"
+# artifact.json is excluded: the release workflow writes it after the
+# archive is built — it cannot exist yet. The sort is byte-wise so the
+# manifest does not depend on the host locale.
+evidence_checksum_members "$EVIDENCE_DIR" artifact.json \
+  | xargs -0 shasum -a 256 > SHA256SUMS
 
 # ─── Phase 25: Generate evidence-manifest.json ──────────────────────────────
 # The evidence bundle digest is the SHA-256 of the SHA256SUMS manifest,
@@ -1355,7 +1412,7 @@ cat > "$EVIDENCE_DIR/evidence-manifest.json" << EOF
   "commit": "$COMMIT",
   "tree": "$TREE",
   "branch": "$BRANCH",
-  "generated_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  "generated_at": "$EVIDENCE_TIMESTAMP"
 }
 EOF
 

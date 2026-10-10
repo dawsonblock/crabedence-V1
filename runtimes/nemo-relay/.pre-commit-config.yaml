@@ -111,6 +111,15 @@ repos:
         pass_filenames: false
         files: '^(Cargo\.lock|Cargo\.toml|crates/.*/Cargo\.toml|security/layers\.toml)$'
 
+      - id: invariants-report
+        name: invariant citations
+        entry: python3 scripts/tcb/invariants.py
+        language: system
+        pass_filenames: false
+        # Anything that can move a definition the document pins: the sources it
+        # cites, the tests it names, the document itself, and the gate.
+        files: '^(crates/.*\.rs|bridges/.*\.rs|security/INVARIANTS\.md|scripts/tcb/invariants\.py|scripts/tcb/test_invariants\.py)$'
+
   # Documentation — external link validation
   - repo: https://github.com/lycheeverse/lychee.git
     rev: lychee-v0.23.0

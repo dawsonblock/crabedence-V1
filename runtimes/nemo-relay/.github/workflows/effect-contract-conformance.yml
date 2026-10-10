@@ -129,7 +129,6 @@ jobs:
           cargo clippy --locked -p nemo-relay-authority --all-targets --features unstable-hardening -- -D warnings
           cargo clippy --locked -p nemo-relay-executor --all-targets --features unstable-hardening -- -D warnings
           cargo clippy --locked -p nemo-relay-ledger --all-targets --features unstable-hardening-testkit,unstable-postgres -- -D warnings
-          cargo clippy --locked -p nemo-relay --all-targets --features unstable-hardening -- -D warnings
           cargo clippy --locked -p nemo-effect-qualification --all-targets -- -D warnings
           cargo clippy --locked -p nemo-effect-runtime --all-targets -- -D warnings
 

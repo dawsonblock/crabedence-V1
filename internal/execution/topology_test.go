@@ -31,9 +31,8 @@ func TestResolveTopologyParsing(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv("CRABBOX_MODE", tc.mode)
 			t.Setenv("CRABBOX_TOPOLOGY", tc.topology)
-			got, err := resolveTopology()
+			got, err := resolveTopology(tc.mode == "production")
 			if tc.wantErrText != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.wantErrText) {
 					t.Fatalf("resolveTopology() = %q, %v; want an error containing %q", got, err, tc.wantErrText)

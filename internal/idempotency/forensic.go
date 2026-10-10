@@ -54,6 +54,10 @@ const (
 	EventAbandonedPreDispatch    = "ABANDONED_PRE_DISPATCH"
 	EventLeaseLost               = "LEASE_LOST"
 	EventClaimLost               = "CLAIM_LOST"
+	// EventDigestMigrated records the one-time migrate-on-touch that
+	// rewrites a legacy (pre-descriptor) record's request_digest to the
+	// descriptor-bound identity — see Store.MigrateRequestDigest.
+	EventDigestMigrated = "DIGEST_MIGRATED"
 )
 
 // Observation kinds recorded in effect_provider_observations.
@@ -116,6 +120,10 @@ type ObservationRecord struct {
 	EvidenceSHA256        string          `json:"evidence_sha256,omitempty"`
 	ReceiptVersion        int             `json:"receipt_version,omitempty"`
 	ObservedAt            time.Time       `json:"observed_at"`
+	// AmbiguityCause/DispatchMilestone are the UNKNOWN-causality
+	// provenance the observation carried — see Record.AmbiguityCause.
+	AmbiguityCause    string `json:"ambiguity_cause,omitempty"`
+	DispatchMilestone string `json:"dispatch_milestone,omitempty"`
 }
 
 // sha256Hex returns the lowercase hex SHA-256 of b, or "" for empty

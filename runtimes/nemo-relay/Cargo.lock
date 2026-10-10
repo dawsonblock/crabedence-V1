@@ -1800,7 +1800,6 @@ name = "nemo-effect-qualification"
 version = "0.9.1-rc.4"
 dependencies = [
  "nemo-effect-runtime",
- "nemo-relay",
  "nemo-relay-authority",
  "nemo-relay-executor",
  "nemo-relay-ledger",
@@ -1824,12 +1823,19 @@ dependencies = [
 name = "nemo-effect-runtime"
 version = "0.9.1-rc.4"
 dependencies = [
+ "chrono",
  "nemo-relay",
  "nemo-relay-authority",
  "nemo-relay-executor",
  "nemo-relay-ledger",
+ "nemo-relay-plugin-protocol",
  "postgres",
  "serde_json",
+ "serde_json_canonicalizer",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -1842,9 +1848,6 @@ dependencies = [
  "futures-util",
  "hyper-util",
  "log",
- "nemo-relay-authority",
- "nemo-relay-executor",
- "nemo-relay-ledger",
  "nemo-relay-native-loader",
  "nemo-relay-plugin-protocol",
  "nemo-relay-types",
@@ -2044,6 +2047,7 @@ dependencies = [
  "futures",
  "futures-util",
  "hyper-util",
+ "libc",
  "libloading",
  "log",
  "nemo-relay",
@@ -2125,6 +2129,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.3.4",
  "hyper-util",
+ "libc",
  "nemo-relay",
  "nemo-relay-native-loader",
  "nemo-relay-plugin-proto",

@@ -113,6 +113,7 @@ def test_repository_policy_places_every_workspace_crate() -> None:
         "kernel",
         "adapters",
         "runtime",
+        "bridges",
         "surfaces",
         "qualification",
     }

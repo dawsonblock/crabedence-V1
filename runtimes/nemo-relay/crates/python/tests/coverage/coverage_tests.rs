@@ -108,6 +108,10 @@ fn with_event_loop<T>(py: Python<'_>, f: impl FnOnce(Bound<'_, PyAny>) -> T) -> 
 
 #[test]
 fn test_native_module_registers_types_and_api_functions() {
+    crate::test_support::with_test_stack(test_native_module_registers_types_and_api_functions_inner);
+}
+
+fn test_native_module_registers_types_and_api_functions_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         let module = PyModule::new(py, "_native_test").unwrap();
@@ -125,6 +129,10 @@ fn test_native_module_registers_types_and_api_functions() {
 
 #[test]
 fn test_native_pymodule_entrypoint_registers_bindings() {
+    crate::test_support::with_test_stack(test_native_pymodule_entrypoint_registers_bindings_inner);
+}
+
+fn test_native_pymodule_entrypoint_registers_bindings_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         let module = PyModule::new(py, "_native_entrypoint").unwrap();
@@ -137,6 +145,10 @@ fn test_native_pymodule_entrypoint_registers_bindings() {
 
 #[test]
 fn test_python_test_guard_restores_existing_runtime_env() {
+    crate::test_support::with_test_stack(test_python_test_guard_restores_existing_runtime_env_inner);
+}
+
+fn test_python_test_guard_restores_existing_runtime_env_inner() {
     let lock = crate::test_support::lock_python_test();
     unsafe {
         std::env::set_var("NEMO_RELAY_BINDING_KIND", "python");
@@ -156,6 +168,10 @@ fn test_python_test_guard_restores_existing_runtime_env() {
 
 #[test]
 fn test_python_test_guard_keeps_absent_runtime_env_absent() {
+    crate::test_support::with_test_stack(test_python_test_guard_keeps_absent_runtime_env_absent_inner);
+}
+
+fn test_python_test_guard_keeps_absent_runtime_env_absent_inner() {
     let lock = crate::test_support::lock_python_test();
     unsafe {
         std::env::remove_var("NEMO_RELAY_BINDING_KIND");
@@ -187,6 +203,10 @@ fn test_python_test_guard_keeps_absent_runtime_env_absent() {
 
 #[test]
 fn test_convert_helpers_error_on_non_json_python_objects() {
+    crate::test_support::with_test_stack(test_convert_helpers_error_on_non_json_python_objects_inner);
+}
+
+fn test_convert_helpers_error_on_non_json_python_objects_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         let builtins = PyModule::import(py, "builtins").unwrap();
@@ -202,6 +222,10 @@ fn test_convert_helpers_error_on_non_json_python_objects() {
 
 #[test]
 fn test_convert_helpers_roundtrip_optional_and_none_paths() {
+    crate::test_support::with_test_stack(test_convert_helpers_roundtrip_optional_and_none_paths_inner);
+}
+
+fn test_convert_helpers_roundtrip_optional_and_none_paths_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         let module = load_module(
@@ -240,6 +264,10 @@ payload = {"nested": {"value": 7}, "items": [1, 2, 3]}
 
 #[test]
 fn test_py_api_forward_stream_to_channel_exits_when_receiver_is_dropped() {
+    crate::test_support::with_test_stack(test_py_api_forward_stream_to_channel_exits_when_receiver_is_dropped_inner);
+}
+
+fn test_py_api_forward_stream_to_channel_exits_when_receiver_is_dropped_inner() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
         let stream = crate::py_api::RustJsonStream::new(tokio_stream::iter(vec![
@@ -257,6 +285,10 @@ fn test_py_api_forward_stream_to_channel_exits_when_receiver_is_dropped() {
 
 #[test]
 fn test_register_exposes_all_native_api_functions() {
+    crate::test_support::with_test_stack(test_register_exposes_all_native_api_functions_inner);
+}
+
+fn test_register_exposes_all_native_api_functions_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         let module = PyModule::new(py, "_api_test").unwrap();
@@ -356,6 +388,10 @@ fn test_register_exposes_all_native_api_functions() {
 
 #[test]
 fn test_py_adaptive_binding_rejects_zero_sensitivity() {
+    crate::test_support::with_test_stack(test_py_adaptive_binding_rejects_zero_sensitivity_inner);
+}
+
+fn test_py_adaptive_binding_rejects_zero_sensitivity_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         let module = PyModule::new(py, "_adaptive_binding").unwrap();
@@ -378,6 +414,10 @@ fn test_py_adaptive_binding_rejects_zero_sensitivity() {
 
 #[test]
 fn test_plugin_bindings_validate_configure_and_clear() {
+    crate::test_support::with_test_stack(test_plugin_bindings_validate_configure_and_clear_inner);
+}
+
+fn test_plugin_bindings_validate_configure_and_clear_inner() {
     let _python = crate::test_support::init_python_test();
     let _plugin_test_state = crate::py_plugin::lock_plugin_test_state_for_tests();
     let _working_directory = CurrentDirectoryGuard::move_to_temporary_directory();
@@ -632,6 +672,10 @@ async def initialize_plugins(module, config):
 
 #[test]
 fn test_sync_wrapper_fallbacks_and_helpers() {
+    crate::test_support::with_test_stack(test_sync_wrapper_fallbacks_and_helpers_inner);
+}
+
+fn test_sync_wrapper_fallbacks_and_helpers_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         let module = load_module(
@@ -800,6 +844,10 @@ def event_fail(event):
 
 #[test]
 fn test_async_exec_and_intercept_wrappers() {
+    crate::test_support::with_test_stack(test_async_exec_and_intercept_wrappers_inner);
+}
+
+fn test_async_exec_and_intercept_wrappers_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         let module = load_module(
@@ -891,6 +939,10 @@ async def llm_intercept(name, request, next):
 
 #[test]
 fn test_stream_wrappers_cover_async_iterator_paths() {
+    crate::test_support::with_test_stack(test_stream_wrappers_cover_async_iterator_paths_inner);
+}
+
+fn test_stream_wrappers_cover_async_iterator_paths_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         let module = load_module(
@@ -945,6 +997,10 @@ async def llm_stream_intercept(request, next):
 
 #[test]
 fn test_async_wrapper_error_paths_and_sync_stream_intercept() {
+    crate::test_support::with_test_stack(test_async_wrapper_error_paths_and_sync_stream_intercept_inner);
+}
+
+fn test_async_wrapper_error_paths_and_sync_stream_intercept_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         let module = load_module(

@@ -902,7 +902,7 @@ impl PluginTeardownCompletion {
 }
 
 enum PluginHostCloseStatus {
-    Active(Option<ActivatedPluginRuntime>),
+    Active(Option<Box<ActivatedPluginRuntime>>),
     Closing,
     Closed,
 }
@@ -915,7 +915,7 @@ struct PluginHostCloseState {
 impl PluginHostCloseState {
     fn new(activation: ActivatedPluginRuntime) -> Self {
         Self {
-            status: Mutex::new(PluginHostCloseStatus::Active(Some(activation))),
+            status: Mutex::new(PluginHostCloseStatus::Active(Some(Box::new(activation)))),
             completion: PluginTeardownCompletion::new(),
         }
     }
@@ -927,7 +927,7 @@ impl PluginHostCloseState {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match &*status {
             PluginHostCloseStatus::Active(activation) => activation
-                .as_ref()
+                .as_deref()
                 .is_some_and(ActivatedPluginRuntime::is_active),
             PluginHostCloseStatus::Closing | PluginHostCloseStatus::Closed => false,
         }
@@ -940,7 +940,7 @@ impl PluginHostCloseState {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match &*status {
             PluginHostCloseStatus::Active(activation) => activation
-                .as_ref()
+                .as_deref()
                 .and_then(ActivatedPluginRuntime::native_process_id),
             PluginHostCloseStatus::Closing | PluginHostCloseStatus::Closed => None,
         }

@@ -215,7 +215,9 @@ jobs:
         image: postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94
         env:
           POSTGRES_USER: crabbox
-          POSTGRES_PASSWORD: crabbox
+          # Ephemeral service container on this job's runner — trust auth
+          # keeps credentials out of the workflow file.
+          POSTGRES_HOST_AUTH_METHOD: trust
           POSTGRES_DB: crabbox_test
         ports:
           - 5432:5432
@@ -225,7 +227,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     env:
-      CRABBOX_TEST_DATABASE_URL: postgres://crabbox:crabbox@localhost:5432/crabbox_test
+      CRABBOX_TEST_DATABASE_URL: postgres://crabbox@localhost:5432/crabbox_test
     steps:
       - name: Check out
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -396,7 +398,9 @@ jobs:
         image: postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94
         env:
           POSTGRES_USER: crabbox
-          POSTGRES_PASSWORD: crabbox
+          # Ephemeral service container on this job's runner — trust auth
+          # keeps credentials out of the workflow file.
+          POSTGRES_HOST_AUTH_METHOD: trust
           POSTGRES_DB: crabbox_test
         ports:
           - 5432:5432
@@ -410,13 +414,38 @@ jobs:
       RELEASE_NAME: crabedence-${{ inputs.version }}
       COMMIT: ${{ needs.provenance.outputs.commit }}
       TREE: ${{ needs.provenance.outputs.tree }}
-      CRABBOX_TEST_DATABASE_URL: postgres://crabbox:crabbox@localhost:5432/crabbox_test
+      CRABBOX_TEST_DATABASE_URL: postgres://crabbox@localhost:5432/crabbox_test
     steps:
       - name: Check out
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ env.COMMIT }}
           persist-credentials: false
+
+      # The nemo-transfer-provenance gate verifies the shipped runtime
+      # against a frozen reference tree declared at the repository-external
+      # sibling path ../NEMO-feat-native-plugin-isolation. Those bytes are
+      # tracked in the umbrella repository, not this one; the gate
+      # recomputes source.sha256 itself, so a wrong or mutated fetch fails
+      # closed at admission time.
+      - name: Check out frozen reference
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: dawsonblock/NEMO-CONTROL
+          ref: 6f933b8bd623d8063a4fbc12b800fade4b75add2
+          path: .frozen-reference
+          sparse-checkout: NEMO-feat-native-plugin-isolation
+          persist-credentials: false
+
+      # The scratch checkout carries a nested .git and sits inside the
+      # tree; copy the payload out (symlinks and modes preserved) and
+      # remove the scratch before evidence generation sees the worktree.
+      - name: Place the reference at the declared sibling path
+        run: |
+          dest="$GITHUB_WORKSPACE/../NEMO-feat-native-plugin-isolation"
+          mkdir -p "$dest"
+          cp -a ".frozen-reference/NEMO-feat-native-plugin-isolation/." "$dest/"
+          rm -rf .frozen-reference
 
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
@@ -458,14 +487,26 @@ jobs:
         run: bash scripts/check-release-admission.sh
 
       # ─── Build artifact from the same clean checkout ──────────────────
+      # The public source bundle is produced ONLY by
+      # package-source-archive.sh. Git's archive plumbing emits blob
+      # bytes, which differ from the qualified checkout wherever a
+      # text/eol attribute smudges the worktree (runtimes/nemo-relay
+      # carries *.cmd eol=crlf), and every Git-derived packager dropped
+      # provenance-covered untracked paths (the .claude/skills symlink
+      # defect). The packager reads worktree bytes over the HEAD path
+      # set unioned with the provenance enumeration, then verifies the
+      # EMITTED archive by extraction against the source and transfer
+      # manifests before anything downstream sees it.
       - name: Build source archive
         shell: bash
         run: |
           mkdir -p dist
-          git archive --format=tar.gz --prefix="crabedence-${RELEASE_VERSION}/" \
-            -o "dist/crabedence-${RELEASE_VERSION}.tar.gz" HEAD
-          git archive --format=zip --prefix="crabedence-${RELEASE_VERSION}/" \
-            -o "dist/crabedence-${RELEASE_VERSION}.zip" HEAD
+          bash scripts/package-source-archive.sh --format tar.gz \
+            --prefix "crabedence-${RELEASE_VERSION}" \
+            -o "dist/crabedence-${RELEASE_VERSION}.tar.gz"
+          bash scripts/package-source-archive.sh --format zip \
+            --prefix "crabedence-${RELEASE_VERSION}" \
+            -o "dist/crabedence-${RELEASE_VERSION}.zip"
 
       # ─── Generate SBOM (fail-closed, pinned version) ──────────────────
       # The SBOM is generated BEFORE artifact.json so the release object
@@ -705,10 +746,14 @@ jobs:
           # Install OUTSIDE the extracted source. The verifier walks the
           # source tree to prove it equals the packaged archive, so an
           # install inside it would add node_modules the archive does not
-          # contain. The verifier resolves ajv from the parent directory.
-          mkdir -p clean-room/nemo
+          # contain. The verifier resolves ajv from the parent directory
+          # of the evidence directory — the validator script is copied
+          # next to the installed dependencies so it resolves them.
+          mkdir -p clean-room/nemo/scripts
           cp "clean-room/tar-source/crabedence-${RELEASE_VERSION}/nemo/package.json" \
              "clean-room/tar-source/crabedence-${RELEASE_VERSION}/nemo/package-lock.json" clean-room/nemo/
+          cp "clean-room/tar-source/crabedence-${RELEASE_VERSION}/nemo/scripts/validate-schema.mjs" \
+             clean-room/nemo/scripts/
           npm ci --prefix clean-room/nemo
 
       # Each extracted tree must independently reproduce the source
@@ -733,6 +778,20 @@ jobs:
           bash "clean-room/tar-source/crabedence-${RELEASE_VERSION}/scripts/compare-source-trees.sh" \
             "clean-room/tar-source/crabedence-${RELEASE_VERSION}" \
             "clean-room/zip-source/crabedence-${RELEASE_VERSION}"
+
+      # The distribution lane: the suite the archive ships runs against
+      # its own extraction — the same qualification a downstream
+      # consumer can run from the archive alone (embedded source
+      # manifest, path policy, symlinks, generated content, build
+      # inputs). This job has no checkout, so no parent repository is
+      # visible to it.
+      - name: Run the distribution suite on each extracted tree
+        run: |
+          for tree in tar-source zip-source; do
+            src="clean-room/${tree}/crabedence-${RELEASE_VERSION}"
+            echo "=== distribution suite: $tree ==="
+            bash "$src/scripts/qualify-source-distribution.sh" "$src"
+          done
 
       - name: Verify release artifact (standalone, no .git)
         run: |
@@ -939,27 +998,15 @@ jobs:
 
       # Tag creation is idempotent: an existing tag on the qualified
       # commit is reused, an existing tag on any other commit is a hard
-      # failure. A published release tag is never moved.
+      # failure. A published release tag is never moved. The admission
+      # rule lives in a script so it is exercised by the test suite, not
+      # only by the workflow.
       - name: Tag release candidate
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          existing="$(git ls-remote origin "refs/tags/${RELEASE_VERSION}^{}" | cut -f1)"
-          if [ -z "$existing" ]; then
-            existing="$(git ls-remote origin "refs/tags/${RELEASE_VERSION}" | cut -f1)"
-          fi
-          if [ -n "$existing" ]; then
-            if [ "$existing" != "$COMMIT" ]; then
-              echo "ERROR: tag $RELEASE_VERSION already exists at $existing, which is not the qualified commit $COMMIT" >&2
-              echo "A published release tag is never moved; cut a new RC instead." >&2
-              exit 1
-            fi
-            echo "tag $RELEASE_VERSION already points at the qualified commit; reusing it"
-          else
-            git tag -a "$RELEASE_VERSION" -m "Crabedence $RELEASE_VERSION"
-            git push origin "$RELEASE_VERSION"
-          fi
+          bash scripts/ensure-release-tag.sh "$RELEASE_VERSION" "$COMMIT"
 
       # ─── Publish as GitHub prerelease ────────────────────────────────
       - name: Check for an existing release
@@ -1001,50 +1048,59 @@ jobs:
             echo "Published $f matches the qualified bytes"
           done
 
+      # Publication is draft-first by necessity: on a repository that
+      # enforces immutable releases, assets can only be attached while the
+      # release is still a draft — a publish-then-upload flow is refused
+      # outright. The draft is created with the same body and file set the
+      # action previously declared, then publishing freezes exactly the
+      # verified bytes.
       - name: Create GitHub prerelease
         if: steps.existing_release.outputs.exists != 'true'
-        uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.2
-        with:
-          tag_name: ${{ env.RELEASE_VERSION }}
-          name: Crabedence ${{ env.RELEASE_VERSION }}
-          prerelease: true
-          body: |
-            ## Crabedence ${{ env.RELEASE_VERSION }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cat > release-notes.md <<'BODY_EOF'
+          ## Crabedence ${{ env.RELEASE_VERSION }}
 
-            ### Source provenance
-            - **Commit:** `${{ env.COMMIT }}`
-            - **Tree:** `${{ env.TREE }}`
-            - **Branch:** `${{ github.ref_name }}`
+          ### Source provenance
+          - **Commit:** `${{ env.COMMIT }}`
+          - **Tree:** `${{ env.TREE }}`
+          - **Branch:** `${{ github.ref_name }}`
 
-            ### Artifact hashes
-            - **tar.gz SHA-256:** `${{ needs.build.outputs.tar_sha256 }}`
-            - **zip SHA-256:** `${{ needs.build.outputs.zip_sha256 }}`
-            - **release-evidence.tar.gz SHA-256:** `${{ needs.build.outputs.evidence_archive_sha256 }}`
+          ### Artifact hashes
+          - **tar.gz SHA-256:** `${{ needs.build.outputs.tar_sha256 }}`
+          - **zip SHA-256:** `${{ needs.build.outputs.zip_sha256 }}`
+          - **release-evidence.tar.gz SHA-256:** `${{ needs.build.outputs.evidence_archive_sha256 }}`
 
-            ### Verification
-            See [VERIFY-RELEASE.md](./VERIFY-RELEASE.md) for instructions on how to verify this release artifact.
+          ### Verification
+          See [VERIFY-RELEASE.md](./VERIFY-RELEASE.md) for instructions on how to verify this release artifact.
 
-            ```bash
-            # Verify artifact attestation
-            gh attestation verify dist/crabedence-${{ env.RELEASE_VERSION }}.tar.gz \
-              --repo ${{ github.repository }}
-            ```
+          ```bash
+          # Verify artifact attestation
+          gh attestation verify dist/crabedence-${{ env.RELEASE_VERSION }}.tar.gz \
+            --repo ${{ github.repository }}
+          ```
 
-            ### Qualification
-            All mandatory gates passed. See `qualification.json` for the exact gate count and per-gate status.
+          ### Qualification
+          All mandatory gates passed. See `qualification.json` for the exact gate count and per-gate status.
+          BODY_EOF
+          gh release create "$RELEASE_VERSION" --repo "${{ github.repository }}" \
+            --draft --prerelease --target "$COMMIT" \
+            --title "Crabedence ${RELEASE_VERSION}" --notes-file release-notes.md
           # The COMPLETE finalized evidence tree ships as one immutable
           # archive. Publishing a hand-maintained subset would leave the
           # published set unable to verify itself: SHA256SUMS references
           # every evidence file, so a partial upload cannot be checked.
-          files: |
-            dist/crabedence-${{ env.RELEASE_VERSION }}.tar.gz
-            dist/crabedence-${{ env.RELEASE_VERSION }}.tar.gz.sha256
-            dist/crabedence-${{ env.RELEASE_VERSION }}.zip
-            dist/crabedence-${{ env.RELEASE_VERSION }}.zip.sha256
-            dist/crabedence-${{ env.RELEASE_VERSION }}.bom.json
-            dist/crabedence-${{ env.RELEASE_VERSION }}.bom.json.sha256
-            dist/crabedence-${{ env.RELEASE_VERSION }}-release-evidence.tar.gz
-            dist/crabedence-${{ env.RELEASE_VERSION }}-release-evidence.tar.gz.sha256
+          gh release upload "$RELEASE_VERSION" --repo "${{ github.repository }}" --clobber \
+            "dist/crabedence-${RELEASE_VERSION}.tar.gz" \
+            "dist/crabedence-${RELEASE_VERSION}.tar.gz.sha256" \
+            "dist/crabedence-${RELEASE_VERSION}.zip" \
+            "dist/crabedence-${RELEASE_VERSION}.zip.sha256" \
+            "dist/crabedence-${RELEASE_VERSION}.bom.json" \
+            "dist/crabedence-${RELEASE_VERSION}.bom.json.sha256" \
+            "dist/crabedence-${RELEASE_VERSION}-release-evidence.tar.gz" \
+            "dist/crabedence-${RELEASE_VERSION}-release-evidence.tar.gz.sha256"
+          gh release edit "$RELEASE_VERSION" --repo "${{ github.repository }}" --draft=false
 
   # ─── Public reverify (distribution integrity) ────────────────────────
   # After publication, download the PUBLIC bytes and verify them against
@@ -1124,10 +1180,14 @@ jobs:
           # Install OUTSIDE the extracted source. The verifier walks the
           # source tree to prove it equals the packaged archive, so an
           # install inside it would add node_modules the archive does not
-          # contain. The verifier resolves ajv from the parent directory.
-          mkdir -p clean-room/nemo
+          # contain. The verifier resolves ajv from the parent directory
+          # of the evidence directory — the validator script is copied
+          # next to the installed dependencies so it resolves them.
+          mkdir -p clean-room/nemo/scripts
           cp "clean-room/tar-source/crabedence-${RELEASE_VERSION}/nemo/package.json" \
              "clean-room/tar-source/crabedence-${RELEASE_VERSION}/nemo/package-lock.json" clean-room/nemo/
+          cp "clean-room/tar-source/crabedence-${RELEASE_VERSION}/nemo/scripts/validate-schema.mjs" \
+             clean-room/nemo/scripts/
           npm ci --prefix clean-room/nemo
 
       - name: Verify both public source trees

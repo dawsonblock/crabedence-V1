@@ -19,6 +19,7 @@ import (
 	"github.com/openclaw/crabbox/internal/capability"
 	"github.com/openclaw/crabbox/internal/evidence"
 	"github.com/openclaw/crabbox/internal/idempotency"
+	"github.com/openclaw/crabbox/internal/providertransport"
 	"github.com/openclaw/crabbox/internal/reconcile"
 )
 
@@ -63,12 +64,39 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	// enables it implicitly, and enabling without a token fails closed
 	// before this point.
 	var githubHandler *GitHubIssueHandler
+	var githubCommentHandler *GitHubCommentHandler
+	var githubIssueCloseHandler *GitHubIssueCloseHandler
+	var githubIssueUpdateHandler *GitHubIssueUpdateHandler
+	var githubPullCreateHandler *GitHubPullCreateHandler
+	var githubPullMergeHandler *GitHubPullMergeHandler
 	var githubReads *GitHubReads
 	if cfg.GitHubEnabled {
-		githubHandler = NewGitHubIssueHandler(cfg.GitHubAPIURL, cfg.GitHubToken)
-		// The observational read shares the provider identity and
-		// configuration with the mutation adapter.
-		githubReads = NewGitHubReads(cfg.GitHubAPIURL, cfg.GitHubToken)
+		// One trusted transport serves every GitHub capability: the
+		// declared API URL is validated as a canonical HTTPS origin
+		// (plaintext loopback needs the explicit test exception, which
+		// production refuses), the bearer token is attached only after
+		// destination and DLP checks pass, and no handler ever holds the
+		// credential or chooses a destination.
+		githubTransport, err := newGitHubTransportForService(cfg, providerAuditSink)
+		if err != nil {
+			return err
+		}
+		githubHandler = NewGitHubIssueHandler("", "")
+		githubCommentHandler = NewGitHubCommentHandler("", "")
+		githubIssueCloseHandler = NewGitHubIssueCloseHandler("", "")
+		githubIssueUpdateHandler = NewGitHubIssueUpdateHandler("", "")
+		githubPullCreateHandler = NewGitHubPullCreateHandler("", "")
+		githubPullMergeHandler = NewGitHubPullMergeHandler("", "")
+		githubReads = NewGitHubReads("", "")
+		for _, h := range []interface {
+			SetTransport(*providertransport.Transport)
+		}{
+			githubHandler, githubCommentHandler, githubIssueCloseHandler,
+			githubIssueUpdateHandler, githubPullCreateHandler, githubPullMergeHandler,
+			githubReads,
+		} {
+			h.SetTransport(githubTransport)
+		}
 	}
 
 	// Qualification extension: CRABEDENCE_QUAL_PROVIDER_URL wires the
@@ -211,7 +239,7 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	var signer *evidence.Signer
 	if store != nil {
 		keyPath := cfg.EvidenceKeyPath
-		if err := validateEvidenceKeyPolicy(cfg.Topology, keyPath); err != nil {
+		if err := validateEvidenceKeyPolicy(cfg); err != nil {
 			return err
 		}
 		if keyPath == "" {
@@ -248,7 +276,17 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 		"system-info":  infoHandler,
 	}
 	if githubHandler != nil {
-		handlers["github"] = githubHandler
+		// The github adapter fronts several durable capabilities — the
+		// mux keeps one adapter identity in evidence while dispatching on
+		// the capability.
+		handlers["github"] = &githubAdapter{
+			issue:       githubHandler,
+			comment:     githubCommentHandler,
+			issueClose:  githubIssueCloseHandler,
+			issueUpdate: githubIssueUpdateHandler,
+			pullCreate:  githubPullCreateHandler,
+			pullMerge:   githubPullMergeHandler,
+		}
 	}
 	if qualAdapter != nil {
 		handlers[QualificationAdapterID] = qualAdapter
@@ -330,6 +368,11 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	// routing change).
 	service.SetAdapterAvailability(adapterStates)
 
+	// Admission ceilings: bounded by the validated configuration, so a
+	// malformed, idle, or adversarial client cannot allocate unbounded
+	// handler goroutines, memory, or file descriptors.
+	service.SetAdmissionLimits(cfg.MaxConnections, cfg.MaxHandshakeConnections)
+
 	// Wire production authority: PostgreSQL-backed grant resolution.
 	// Without this, the service defaults to NoopGrantResolver which
 	// denies all grant-required capabilities in production.
@@ -347,6 +390,24 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	if cfg.PeerPrincipals != nil {
 		service.SetPeerAuth(cfg.PeerPrincipals)
 		fmt.Fprintf(os.Stderr, "Peer authentication: strict UID→principal map (%d entries)\n", len(cfg.PeerPrincipals))
+	}
+
+	// Runtime attestation: the Ed25519 challenge-response the runtime
+	// completes before its invocations are admitted. The verified
+	// runtime identity — release, plugin manifest, ABI — is bound to
+	// the session and persisted on each execution record. Attestation
+	// supplements peer authentication; it never replaces it.
+	if cfg.Attestation != nil {
+		service.SetAttestation(*cfg.Attestation)
+		mode := "strict"
+		if cfg.Attestation.Relaxed {
+			mode = "relaxed (development)"
+		}
+		req := "optional"
+		if cfg.Attestation.Required {
+			req = "required"
+		}
+		fmt.Fprintf(os.Stderr, "Runtime attestation: %s, %s (%d approved keys)\n", req, mode, len(cfg.Attestation.ApprovedKeys))
 	}
 
 	// Handle signals
@@ -367,6 +428,11 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 		worker.RegisterResolver("test.counter.increment", providerGate.ObserveResolver("test-counter", counterHandler))
 		if githubHandler != nil {
 			worker.RegisterResolver("github.issue.create", providerGate.ObserveResolver("github", githubHandler))
+			worker.RegisterResolver("github.issue.comment", providerGate.ObserveResolver("github", githubCommentHandler))
+			worker.RegisterResolver("github.issue.close", providerGate.ObserveResolver("github", githubIssueCloseHandler))
+			worker.RegisterResolver("github.issue.update", providerGate.ObserveResolver("github", githubIssueUpdateHandler))
+			worker.RegisterResolver("github.pr.create", providerGate.ObserveResolver("github", githubPullCreateHandler))
+			worker.RegisterResolver("github.pr.merge", providerGate.ObserveResolver("github", githubPullMergeHandler))
 		}
 		if qualAdapter != nil {
 			worker.RegisterResolver(QualificationCapabilityID, providerGate.ObserveResolver(QualificationAdapterID, qualAdapter))
@@ -401,6 +467,16 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 				fmt.Fprintf(os.Stderr, "reconciliation supervisor stopped: %v\n", err)
 			}
 		}()
+
+		// Evidence checkpoint: periodically commit the canonical
+		// terminal-evidence enumeration to a signed retained sequence —
+		// the anchor that proves the store still contains everything it
+		// covered (cmd/evidence-checkpoint verifies). Disabled unless a
+		// path is configured; independent custody requires the custody
+		// path to live outside this host's failure domain.
+		if cfg.CheckpointPath != "" {
+			go runCheckpointLoop(ctx, store, signer, cfg.CheckpointPath, cfg.CheckpointCustodyPath, cfg.CheckpointInterval)
+		}
 	}
 
 	// Start service
@@ -641,12 +717,14 @@ const (
 // resolveTopology parses CRABBOX_TOPOLOGY. Outside production an unset
 // value resolves to single; production must declare the topology
 // explicitly. CRABBOX_REPLICAS remains a declared replica count and a
-// consistency check — never the source of truth.
-func resolveTopology() (Topology, error) {
+// consistency check — never the source of truth. The deployment mode
+// arrives already resolved: configuration decided at load is held in the
+// ServiceConfig snapshot rather than re-read from the environment.
+func resolveTopology(production bool) (Topology, error) {
 	raw := strings.ToLower(strings.TrimSpace(os.Getenv("CRABBOX_TOPOLOGY")))
 	switch raw {
 	case "":
-		if productionMode() {
+		if production {
 			return "", fmt.Errorf("CRABBOX_TOPOLOGY must be explicitly declared in production (single or cluster): a missing topology is never assumed to mean one production replica")
 		}
 		return TopologySingle, nil
@@ -675,24 +753,23 @@ func replicaCount() (int, error) {
 	return n, nil
 }
 
-// replicatedDeployment reports whether the operator declared a
-// multi-replica topology via CRABBOX_REPLICAS > 1. Replicated mode
-// tightens evidence-key requirements — a cryptographic cluster
-// identity must never be accidentally host-local. A malformed
-// CRABBOX_REPLICAS counts as replicated here (fail closed); Serve
-// rejects it outright via replicaCount before this runs.
-func replicatedDeployment() bool {
-	n, err := replicaCount()
-	return err != nil || n > 1
-}
-
-// productionMode reports whether the operator declared production
-// via CRABBOX_MODE=production. Production forbids auto-generating a
-// signing identity — the trust root must be provisioned (mounted
-// Ed25519 key, KMS/HSM signer, or an explicitly configured secret),
-// never silently created per host.
-func productionMode() bool {
-	return strings.EqualFold(strings.TrimSpace(os.Getenv("CRABBOX_MODE")), "production")
+// resolveDeploymentMode resolves CRABBOX_MODE at service startup. The
+// execution service is the consequential surface: every production
+// requirement — peer authentication, attestation, provisioned
+// evidence keys, plaintext-transport refusals — keys off the declared
+// mode, so an omitted or misspelled value must never quietly resolve
+// to development semantics. The ordinary crabbox CLI is unaffected;
+// only serve-exec reaches LoadServiceConfig.
+func resolveDeploymentMode() (string, error) {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv("CRABBOX_MODE")))
+	switch raw {
+	case "production", "development":
+		return raw, nil
+	case "":
+		return "", fmt.Errorf("CRABBOX_MODE must be declared (development or production): the execution service's security posture keys off it, so an unset mode is never assumed to be development")
+	default:
+		return "", fmt.Errorf("unknown CRABBOX_MODE %q (want development or production)", raw)
+	}
 }
 
 // validateEvidenceKeyPolicy enforces the provisioned-key requirement
@@ -701,9 +778,11 @@ func productionMode() bool {
 // (CRABBOX_REPLICAS > 1), and production (CRABBOX_MODE=production).
 // All require CRABBOX_EVIDENCE_KEY to point at an existing provisioned
 // key; auto-creation remains available only in single-node development
-// mode.
-func validateEvidenceKeyPolicy(topology Topology, keyPath string) error {
-	if topology == TopologyCluster {
+// mode. Every input comes from the validated startup snapshot — the
+// environment is never re-read on the execution path.
+func validateEvidenceKeyPolicy(cfg *ServiceConfig) error {
+	keyPath := cfg.EvidenceKeyPath
+	if cfg.Topology == TopologyCluster {
 		if keyPath == "" {
 			return fmt.Errorf("cluster topology (CRABBOX_TOPOLOGY=cluster) requires CRABBOX_EVIDENCE_KEY pointing to a provisioned key shared across replicas")
 		}
@@ -712,16 +791,16 @@ func validateEvidenceKeyPolicy(topology Topology, keyPath string) error {
 		}
 		return nil
 	}
-	if replicatedDeployment() {
+	if cfg.Replicas > 1 {
 		if keyPath == "" {
-			return fmt.Errorf("multi-replica deployment (CRABBOX_REPLICAS=%s) requires CRABBOX_EVIDENCE_KEY pointing to a provisioned key shared across replicas", os.Getenv("CRABBOX_REPLICAS"))
+			return fmt.Errorf("multi-replica deployment (CRABBOX_REPLICAS=%d) requires CRABBOX_EVIDENCE_KEY pointing to a provisioned key shared across replicas", cfg.Replicas)
 		}
 		if _, err := os.Stat(keyPath); err != nil {
 			return fmt.Errorf("multi-replica deployment requires an existing evidence key at CRABBOX_EVIDENCE_KEY=%s (key auto-creation is disabled for replicas): %w", keyPath, err)
 		}
 		return nil
 	}
-	if productionMode() {
+	if cfg.Production() {
 		if keyPath == "" {
 			return fmt.Errorf("production mode (CRABBOX_MODE=production) requires CRABBOX_EVIDENCE_KEY pointing to a provisioned signing key — key auto-generation is development-only")
 		}

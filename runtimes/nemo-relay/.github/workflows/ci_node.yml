@@ -488,16 +488,35 @@ jobs:
   # prove the addon finds the host its platform package ships and runs a plugin
   # there, and it has no Rust toolchain to build the fixture that would show it.
   # This lane has one, so it runs the installed-artifact recipes against the
-  # package the build just produced.
+  # package the build just produced. Windows ships no plugin-hosting package —
+  # the isolated runtime is not implemented there — so the matrix covers every
+  # platform that carries one.
   InstalledArtifact:
-    name: Installed artifact hosts a plugin (linux-amd64)
+    name: Installed artifact hosts a plugin (${{ matrix.platform }})
     needs: [Package]
     if: ${{ inputs.run_package && !cancelled() && needs.Package.result == 'success' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     permissions:
       contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux-amd64
+            runner: ubuntu-latest
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+          - platform: macos-arm64
+            runner: macos-15
     steps:
+      - name: Remove untrusted Homebrew tap
+        if: ${{ runner.os == 'macOS' }}
+        run: |
+          if [ -d "$(brew --repository aws/tap)" ]; then
+            brew untap aws/tap
+          fi
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -514,7 +533,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          shared-key: nemo-relay-rust-linux-amd64-${{ steps.ci-config.outputs.rust_version }}-release
+          shared-key: nemo-relay-rust-${{ matrix.platform }}-${{ steps.ci-config.outputs.rust_version }}-release
           workspaces: . -> target
           cache-all-crates: true
           cache-bin: false
@@ -537,7 +556,7 @@ jobs:
       - name: Download Node package artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: node-npm-package-linux-amd64
+          name: node-npm-package-${{ matrix.platform }}
           path: node-packages/
 
       - name: Build the native plugin fixture
@@ -562,3 +581,91 @@ jobs:
           test -n "$metapackage"
           test -n "$native"
           just verify-installed-node-plugin "$metapackage" "$native" refused
+
+  # The musl packages host plugins under musl, so the same recipes run inside
+  # the distribution's own libc: the fixture is built for the musl target on
+  # the runner, and the verify scripts — pure Python and stdlib — run in the
+  # alpine image the package targets.
+  InstalledArtifactMusl:
+    name: Installed artifact hosts a plugin (${{ matrix.platform }})
+    needs: [Package]
+    if: ${{ inputs.run_package && !cancelled() && needs.Package.result == 'success' }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux-musl-amd64
+            runner: ubuntu-latest
+            rust_target: x86_64-unknown-linux-musl
+            container_image: node:24-alpine3.22@sha256:191c9f0080fcbbc6547a85dc0ff7988072214a355aabdc1d2ec55a7dae5eea8a
+          - platform: linux-musl-arm64
+            runner: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-musl
+            container_image: node:24-alpine3.22@sha256:191c9f0080fcbbc6547a85dc0ff7988072214a355aabdc1d2ec55a7dae5eea8a
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Load CI tool versions
+        id: ci-config
+        uses: ./.github/actions/load-ci-tool-versions
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+          toolchain: ${{ steps.ci-config.outputs.rust_version }}
+
+      - name: Install the musl toolchain for the fixture
+        run: |
+          set -e
+          rustup target add ${{ matrix.rust_target }}
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 install -y musl-tools
+
+      - name: Build the native plugin fixture for musl
+        run: |
+          set -euo pipefail
+          cc_var="CC_$(printf '%s' "${{ matrix.rust_target }}" | tr '-' '_')"
+          export "$cc_var=musl-gcc"
+          cargo build --locked \
+            --manifest-path crates/core/tests/fixtures/native_plugin/Cargo.toml \
+            --target ${{ matrix.rust_target }} \
+            --target-dir target/test-plugin-fixtures-musl
+
+      - name: Download Node package artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: node-npm-package-${{ matrix.platform }}
+          path: node-packages/
+
+      - name: Prove an installed musl Node package hosts a native plugin out of process
+        env:
+          MUSL_IMAGE: ${{ matrix.container_image }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --volume "${{ github.workspace }}:${{ github.workspace }}" \
+            --workdir "${{ github.workspace }}" \
+            "$MUSL_IMAGE" \
+            /bin/sh -ec '
+              set -e
+              apk add --no-cache python3 >/dev/null
+              metapackage="$(find node-packages -maxdepth 1 -name "nemo-relay-node-npm-[0-9]*.tgz" -print -quit)"
+              native="$(find node-packages -maxdepth 1 -name "nemo-relay-node-npm-*-*-[0-9]*.tgz" -print -quit)"
+              test -n "$metapackage"
+              test -n "$native"
+              fixture="$(find target/test-plugin-fixtures-musl -name "libnemo_relay_plugin_fixture.so" -print -quit)"
+              test -n "$fixture"
+              python3 scripts/verify-installed-node-plugin.py \
+                --metapackage "$metapackage" --native "$native" \
+                --fixture "$fixture" --expect runs
+              python3 scripts/verify-installed-node-plugin.py \
+                --metapackage "$metapackage" --native "$native" \
+                --fixture "$fixture" --expect refused
+            '

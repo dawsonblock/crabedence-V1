@@ -1,0 +1,110 @@
+{
+  "policy": "nemo-runtime-provenance-policy",
+  "policy_version": 1,
+  "provenance_format_version": 2,
+  "purpose": "One machine-readable definition of the canonical NEMO source tree: what counts as source, what is generated, and exactly how the tree is enumerated and hashed. The transfer manifest binds this file by SHA-256 so the rules cannot drift silently.",
+
+  "artifact_classes": {
+    "canonical_source": {
+      "definition": "Authoritative source material only: regular files and symlinks the project maintains by hand. A clean checkout has exactly one canonical source identity.",
+      "examples": ["Rust/Python/Go/Node source", "checked-in configs, docs, and scripts", "checked-in symlinks such as crates/*/LICENSE, CLAUDE.md, integrations/pi/*"],
+      "rule": "Running a build must not change this identity. Generated output never enters it."
+    },
+    "generated_build": {
+      "definition": "Files derived deterministically from canonical source during a build or package step. They are reproducible; they are not source.",
+      "examples": [
+        "python/plugin/src/nemo_relay_plugin/_proto/plugin_worker_pb2{,_grpc}.py (grpc_tools.protoc from crates/worker-proto/proto/nemo/relay/worker/v1/plugin_worker.proto via python/plugin/build_backend.py)",
+        "python/nemo_relay/_native*.so / *.pyd (maturin/PyO3 extension)",
+        "crates/node/index.js, index.d.ts, *.node (napi-rs output)",
+        "target/, node_modules/, .venv/, __pycache__/, .pytest_cache/, .ruff_cache/, .mypy_cache/, dist/, build/, *.egg-info/"
+      ],
+      "rule": "Enumerated out of canonical identity on BOTH trees. Presence or absence on disk must not change the digest or the transfer delta."
+    },
+    "release_artifact": {
+      "definition": "The packaged distribution produced from canonical source plus deterministic generation/build steps. The exact bytes tested are the exact bytes signed and published.",
+      "examples": ["dist/nemo-control_<version>_<os>_<arch>", "wheels, tarballs, component manifests"],
+      "rule": "Qualified, hashed, and signed as immutable artifacts — never rebuilt between test and publish."
+    }
+  },
+
+  "canonical_stream": {
+    "algorithm": "sha256",
+    "record_formats": {
+      "file": "FILE<TAB><path><TAB><sha256-of-content-hex><TAB><exec>",
+      "symlink": "SYMLINK<TAB><path><TAB><target>"
+    },
+    "exec_field": "'x' when any owner/group/other execute bit is set, '-' otherwise. The bit is security-relevant for shipped scripts (install.sh, scripts/qualification/*, packaging entry points); it is recorded explicitly rather than left implicit.",
+    "path_encoding": "Slash-separated, './'-prefixed, relative to the tree root. Raw filesystem bytes are preserved verbatim (os strings); no Unicode normalization is applied.",
+    "ordering": "Records are emitted in byte-wise lexicographic order of the normalized path (LC_ALL=C ordering). One normalized path produces exactly one record; a duplicate is rejected as a malformed enumeration.",
+    "line_ending": "Each record is terminated by a single LF (\\n). No CRLF normalization exists anywhere: file CONTENT is hashed byte-verbatim, so line endings inside files are bound by the content digest.",
+    "timestamps": "Never hashed. mtime, atime, ctime, and archive metadata are not part of identity.",
+    "other_objects": "Anything that is neither a regular file nor a symlink (fifo, socket, device) is a malformed-tree condition, not a silent skip."
+  },
+
+  "enumeration": {
+    "excluded_dir_names": [
+      "target", ".git", "node_modules", ".venv", ".uv-cache", "__pycache__",
+      ".pytest_cache", ".ruff_cache", ".mypy_cache", ".scannerwork",
+      "dist", "build", ".test-dist", ".tox", ".nox"
+    ],
+    "excluded_dir_suffixes": [".egg-info", ".dSYM"],
+    "excluded_file_names": [
+      ".DS_Store", "Thumbs.db", "ehthumbs.db", "Desktop.ini", ".directory",
+      ".coverage", "coverage.out", "junit.xml", "go_junit_report.xml"
+    ],
+    "excluded_file_suffixes": [".pyc", ".pyo", ".profraw", ".profdata", ".lnk"],
+    "generated_paths": [
+      "python/plugin/src/nemo_relay_plugin/_proto/plugin_worker_pb2.py",
+      "python/plugin/src/nemo_relay_plugin/_proto/plugin_worker_pb2_grpc.py",
+      "python/nemo_relay/_native*.so",
+      "python/nemo_relay/_native*.pyd",
+      "crates/node/index.js",
+      "crates/node/index.d.ts",
+      "crates/node/*.node",
+      "crates/node/coverage/",
+      "go/nemo_relay/nemo_relay_test",
+      "go/nemo_relay/nemo_relay_test.exe",
+      "go/nemo_relay/coverage.out",
+      "go/nemo_relay/nemo-relay-events-*.jsonl",
+      "integrations/openclaw/dist/",
+      "integrations/openclaw/.test-dist/",
+      "examples/**/relay-plugin.local.toml",
+      "docs/_build/",
+      "docs/reference/api/nodejs-library-reference/",
+      "docs/reference/api/python-library-reference/",
+      "docs/reference/api/rust-library-reference/",
+      "docs/reference/api/**/_generated/",
+      "docs/reference/api/**/_source/",
+      "**/release-notes.md",
+      "CHANGELOG.md",
+      ".cache/pre-commit/",
+      ".tmp/",
+      ".planning/",
+      ".codex/",
+      ".cursor/",
+      ".env",
+      "benchmarks/",
+      ".nemo-relay/",
+      "artifacts/",
+      "release/artifacts/",
+      "reports/",
+      "go_junit_report.xml"
+    ],
+    "generated_path_semantics": "Tree-relative slash patterns. A trailing '/' names a directory subtree. '*' does not cross '/', '**' does. Entries are excluded from canonical enumeration on BOTH trees identically, so a generated file can never appear as an addition, removal, or modification in the transfer delta.",
+    "forbidden_transient": "Any filesystem object inside the canonical tree that is not excluded above and not declared by the transfer manifest is a verification failure — provenance fails loudly rather than silently absorbing local state. Notably, '.claude/' is deliberately NOT excluded: it is tracked in the frozen reference (.claude/skills symlink) and its removal from the canonical tree is a declared delta entry."
+  },
+
+  "delta": {
+    "classes": [
+      "modified_files", "added_files", "removed_files",
+      "added_symlinks", "removed_symlinks", "retargeted_symlinks",
+      "retyped_paths", "mode_changes"
+    ],
+    "rule": "The declared delta must equal the computed delta between the frozen reference and the canonical tree exactly — every class, exhaustively."
+  },
+
+  "verification_modes": {
+    "shipping_tree": "Does this runtime match its own declared canonical digest? May run without the frozen source (informational).",
+    "transfer_qualification": "Can this runtime be proven to be the exact declared transformation from the frozen reference? REQUIRES the frozen source on disk; absence is a hard failure. Official release admission runs this mode."
+  }
+}

@@ -26,9 +26,10 @@ import (
 //	R3  the request is a JSON object
 //	R4  no object repeats a key
 //	R5  nesting depth is at most maxInvocationDepth
-//	R6  root and authority keys are from the known sets
+//	R6  root, authority, and mediation keys are from the known sets
 //	R7  explicit null is rejected for every known field
 //	R8  known fields carry their declared JSON types
+//	R9  a present mediation object carries both required digests
 const maxInvocationDepth = 64
 
 // abiFieldType is the declared JSON type of a known ABI field.
@@ -51,6 +52,8 @@ var abiRootFields = map[string]abiFieldType{
 	"execution_class": abiString,
 	"idempotency_key": abiString,
 	"deadline":        abiString,
+	"mediation":       abiObject,
+	"session":         abiObject,
 }
 
 var abiAuthorityFields = map[string]abiFieldType{
@@ -61,10 +64,36 @@ var abiAuthorityFields = map[string]abiFieldType{
 	"authority_digest":     abiString,
 }
 
+// abiMediationFields is the known-field set of the mediation object —
+// caller-declared middleware provenance carried into durable evidence.
+var abiMediationFields = map[string]abiFieldType{
+	"middleware_set_digest":    abiString,
+	"original_args_digest":     abiString,
+	"release_root_digest":      abiString,
+	"plugin_manifest_sha256":   abiString,
+	"plugin_library_sha256":    abiString,
+	"activation_config_sha256": abiString,
+}
+
+// abiSessionFields is the known-field set of the runtime-attestation
+// session binding: the session ID the handshake issued and the
+// runtime's proof-of-possession signature for this request.
+var abiSessionFields = map[string]abiFieldType{
+	"id":    abiString,
+	"proof": abiString,
+}
+
 // abiIntegerLiteral is the canonical JSON integer form. Fractions,
 // exponents, and leading zeros are refused so both runtimes read the
 // field identically.
 var abiIntegerLiteral = regexp.MustCompile(`^-?(0|[1-9][0-9]*)$`)
+
+// abiSHA256Digest is the canonical spelling of a SHA-256 digest. Mediation
+// digests are evidence that must name a real computation — an empty or
+// malformed value would persist as provenance while binding nothing, and
+// digest computation treats an empty field as absent, so a present digest
+// field has to carry the full 64 lowercase hex characters.
+var abiSHA256Digest = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 // ParseInvocationRequest parses wire bytes into a Request under the strict
 // ABI rules.
@@ -95,6 +124,57 @@ func parseInvocationRequest(data []byte) (Request, error) {
 	if _, err := dec.Token(); err != io.EOF {
 		return req, fmt.Errorf("trailing data after the invocation object")
 	}
+	// R9: a present mediation object must carry both required digests.
+	// The structural scan validates present fields but cannot enforce
+	// presence, and encoding/json cannot distinguish a missing field
+	// from an empty one — so presence is probed on the raw object.
+	// This mirrors the Rust ABI, where serde rejects a mediation
+	// object that omits either required field.
+	if req.Mediation != nil {
+		var envelope struct {
+			Mediation map[string]json.RawMessage `json:"mediation"`
+		}
+		if err := json.Unmarshal(data, &envelope); err != nil {
+			return req, fmt.Errorf("invalid mediation object: %w", err)
+		}
+		if _, ok := envelope.Mediation["middleware_set_digest"]; !ok {
+			return req, fmt.Errorf("request.mediation.middleware_set_digest is required")
+		}
+		if _, ok := envelope.Mediation["original_args_digest"]; !ok {
+			return req, fmt.Errorf("request.mediation.original_args_digest is required")
+		}
+		// Every digest key carries a declared SHA-256 in canonical form.
+		// The structural scan has already refused null and non-strings, so
+		// each surviving value is a string that must carry the full digest —
+		// an empty field declares evidence it cannot name.
+		for name, raw := range envelope.Mediation {
+			var value string
+			if err := json.Unmarshal(raw, &value); err != nil {
+				continue
+			}
+			if !abiSHA256Digest.MatchString(value) {
+				return req, fmt.Errorf(
+					"request.mediation.%s must be a 64-character lowercase SHA-256 hex digest", name)
+			}
+		}
+	}
+	// A present session object must carry both binding fields: a
+	// session ID without a proof is a bare claim, and a proof without
+	// a session ID binds nothing.
+	if req.Session != nil {
+		var envelope struct {
+			Session map[string]json.RawMessage `json:"session"`
+		}
+		if err := json.Unmarshal(data, &envelope); err != nil {
+			return req, fmt.Errorf("invalid session object: %w", err)
+		}
+		if _, ok := envelope.Session["id"]; !ok {
+			return req, fmt.Errorf("request.session.id is required")
+		}
+		if _, ok := envelope.Session["proof"]; !ok {
+			return req, fmt.Errorf("request.session.proof is required")
+		}
+	}
 	return req, nil
 }
 
@@ -110,14 +190,16 @@ const (
 	abiKindArray
 )
 
-// abiFrameKind identifies the root and authority objects — the only
-// containers with a known-field set.
+// abiFrameKind identifies the root, authority, and mediation objects —
+// the only containers with a known-field set.
 type abiFrameKind int
 
 const (
 	abiFrameUnknown abiFrameKind = iota
 	abiFrameRoot
 	abiFrameAuthority
+	abiFrameMediation
+	abiFrameSession
 )
 
 // abiScanFrame is one open container during the structural scan.
@@ -193,6 +275,14 @@ func scanInvocationStructure(data []byte) error {
 					if top.kind == abiFrameRoot && top.key == "authority" {
 						child.kind = abiFrameAuthority
 						child.fields = abiAuthorityFields
+					}
+					if top.kind == abiFrameRoot && top.key == "mediation" {
+						child.kind = abiFrameMediation
+						child.fields = abiMediationFields
+					}
+					if top.kind == abiFrameRoot && top.key == "session" {
+						child.kind = abiFrameSession
+						child.fields = abiSessionFields
 					}
 					top.pending = false
 				} else if top.object {

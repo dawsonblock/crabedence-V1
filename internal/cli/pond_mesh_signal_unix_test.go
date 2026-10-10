@@ -13,10 +13,32 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 )
+
+// pondMeshLockedBuffer is the child's output collector: exec writes
+// stdout/stderr from its own goroutine while the test polls the
+// buffer on the failure path, so every access goes through the mutex.
+// A plain bytes.Buffer here is a data race the detector reports.
+type pondMeshLockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *pondMeshLockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *pondMeshLockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
 
 func TestRunPondMeshForwardsUnexpectedSuccessKillsDescendants(t *testing.T) {
 	binDir := t.TempDir()
@@ -83,7 +105,7 @@ func TestRunPondMeshForwardsTerminalInterruptIsClean(t *testing.T) {
 				"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
 			)
 			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-			var output bytes.Buffer
+			var output pondMeshLockedBuffer
 			cmd.Stdout = &output
 			cmd.Stderr = &output
 			if err := cmd.Start(); err != nil {

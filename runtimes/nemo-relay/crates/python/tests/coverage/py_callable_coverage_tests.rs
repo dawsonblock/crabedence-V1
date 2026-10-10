@@ -112,6 +112,10 @@ fn with_event_loop<T>(py: Python<'_>, f: impl FnOnce(Bound<'_, PyAny>) -> T) -> 
 
 #[test]
 fn sync_wrappers_and_codec_errors_cover_remaining_branches() {
+    crate::test_support::with_test_stack(sync_wrappers_and_codec_errors_cover_remaining_branches_inner);
+}
+
+fn sync_wrappers_and_codec_errors_cover_remaining_branches_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         let module = load_module(
@@ -367,6 +371,10 @@ class RaisingResponseCodec:
 
 #[test]
 fn async_iter_helpers_cover_stop_error_and_dropped_receiver_paths() {
+    crate::test_support::with_test_stack(async_iter_helpers_cover_stop_error_and_dropped_receiver_paths_inner);
+}
+
+fn async_iter_helpers_cover_stop_error_and_dropped_receiver_paths_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         let module = load_module(
@@ -574,6 +582,10 @@ async def coro_non_json():
 
 #[test]
 fn continuation_scope_lookup_supports_native_only_embeddings() {
+    crate::test_support::with_test_stack(continuation_scope_lookup_supports_native_only_embeddings_inner);
+}
+
+fn continuation_scope_lookup_supports_native_only_embeddings_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         assert!(
@@ -589,6 +601,10 @@ fn continuation_scope_lookup_supports_native_only_embeddings() {
 
 #[test]
 fn next_wrappers_cover_success_and_error_paths() {
+    crate::test_support::with_test_stack(next_wrappers_cover_success_and_error_paths_inner);
+}
+
+fn next_wrappers_cover_success_and_error_paths_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         let tool_args = crate::convert::json_to_py(py, &json!({"x": 7})).unwrap();
@@ -806,6 +822,10 @@ async def collect_stream(awaitable):
 
 #[test]
 fn event_sanitize_wrapper_covers_conversion_success_and_error_propagation() {
+    crate::test_support::with_test_stack(event_sanitize_wrapper_covers_conversion_success_and_error_propagation_inner);
+}
+
+fn event_sanitize_wrapper_covers_conversion_success_and_error_propagation_inner() {
     use nemo_relay::api::event::{BaseEvent, MarkEvent};
 
     let _python = crate::test_support::init_python_test();
@@ -886,6 +906,10 @@ def invalid(event, fields):
 
 #[test]
 fn event_metadata_injector_wrapper_covers_sync_async_and_invalid_results() {
+    crate::test_support::with_test_stack(event_metadata_injector_wrapper_covers_sync_async_and_invalid_results_inner);
+}
+
+fn event_metadata_injector_wrapper_covers_sync_async_and_invalid_results_inner() {
     use nemo_relay::api::event::{BaseEvent, MarkEvent};
 
     let _python = crate::test_support::init_python_test();
@@ -937,6 +961,10 @@ def invalid(event):
 
 #[test]
 fn awaitable_middleware_wrappers_cover_success_and_failure() {
+    crate::test_support::with_test_stack(awaitable_middleware_wrappers_cover_success_and_failure_inner);
+}
+
+fn awaitable_middleware_wrappers_cover_success_and_failure_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         let module = load_module(
@@ -990,6 +1018,10 @@ async def llm_fail(request):
 
 #[test]
 fn background_middleware_accepts_custom_awaitables() {
+    crate::test_support::with_test_stack(background_middleware_accepts_custom_awaitables_inner);
+}
+
+fn background_middleware_accepts_custom_awaitables_inner() {
     let _python = crate::test_support::init_python_test();
     let (_context_module, llm_custom) = Python::attach(|py| {
         let context_module = install_event_sanitizer_context_module(py);
@@ -1018,6 +1050,10 @@ def llm_custom_awaitable(request):
 
 #[test]
 fn execution_next_context_restores_scope() {
+    crate::test_support::with_test_stack(execution_next_context_restores_scope_inner);
+}
+
+fn execution_next_context_restores_scope_inner() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
         let scope_stack = nemo_relay::api::runtime::create_scope_stack();

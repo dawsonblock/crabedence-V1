@@ -67,6 +67,21 @@ impl Default for PluginHostLimits {
     }
 }
 
+/// How far the supervisor's supplementary descriptor sweep reaches when it
+/// marks what a host must not inherit.
+///
+/// This is deliberately not the containment boundary. The boundary is the
+/// parent-side inventory of open descriptors — or, on Linux, `close_range`,
+/// which covers every descriptor number — so nothing the kernel reported can
+/// be missed. The bounded sweep exists for the one case those cannot see: a
+/// descriptor another thread opened without `CLOEXEC` between the inventory
+/// snapshot and `exec`. A newly opened descriptor lands at the lowest free
+/// number, so anything opened in that window sits far inside this bound on
+/// any realistic table. It is a best-effort backstop that keeps the worst
+/// case of the loop bounded, and it lives here because a bound belongs with
+/// the other bounds, not inside the spawn path that applies it.
+pub const SUPPLEMENTARY_DESCRIPTOR_SWEEP_BOUND: u64 = 65_536;
+
 /// The address-space ceiling the shipped profile asks for, where it is one the
 /// platform can honour.
 ///

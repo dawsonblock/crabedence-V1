@@ -28,6 +28,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=lib/release-paths.sh
+. "$SCRIPT_DIR/lib/release-paths.sh"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 OUTPUT="${1:-$REPO_ROOT/dist/release-evidence/source-tree-sha256.txt}"
 SOURCE_DIR="${2:-$REPO_ROOT}"
@@ -52,11 +54,20 @@ if [ "$(cd "$(dirname "$OUTPUT")" && pwd)" = "$(pwd -P)" ]; then
 fi
 
 # git ls-tree -z emits "<mode> <type> <object>\t<path>\0" per entry, so
-# paths containing spaces or non-ASCII characters survive intact.
+# paths containing spaces or non-ASCII characters survive intact. Every
+# path is then checked against the release-path filename policy — a
+# name that could not survive the manifest/archive toolchain byte-for
+# -byte (control characters, backslashes, "-"-leading or
+# whitespace-edged components) fails the release, it is never silently
+# written into a record it would corrupt.
 git -C "$SOURCE_DIR" ls-tree -r -z HEAD | while IFS= read -r -d '' record; do
   meta="${record%%$'\t'*}"
   path="${record#*$'\t'}"
   [ -z "$path" ] && continue
+  if ! release_path_check "$path"; then
+    printf 'ERROR: release path policy violation: %q\n' "$path" >&2
+    exit 1
+  fi
   if [ -n "$OUTPUT_RELPATH" ] && [ "$path" = "$OUTPUT_RELPATH" ]; then
     continue
   fi

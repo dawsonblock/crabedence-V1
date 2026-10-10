@@ -20,19 +20,19 @@ import (
 // saturated provider is refused instead of accumulating goroutines.
 func TestProviderGateBoundsConcurrency(t *testing.T) {
 	gate := NewProviderGate(ProviderGateConfig{MaxConcurrent: 2})
-	l1, err := gate.Acquire("prov")
+	l1, err := gate.Acquire("prov", LaneMutation)
 	if err != nil {
 		t.Fatalf("first acquire: %v", err)
 	}
-	l2, err := gate.Acquire("prov")
+	l2, err := gate.Acquire("prov", LaneMutation)
 	if err != nil {
 		t.Fatalf("second acquire: %v", err)
 	}
-	if _, err := gate.Acquire("prov"); !errors.Is(err, ErrProviderSaturated) {
+	if _, err := gate.Acquire("prov", LaneMutation); !errors.Is(err, ErrProviderSaturated) {
 		t.Fatalf("third acquire = %v, want ErrProviderSaturated", err)
 	}
 	l1.Release()
-	l3, err := gate.Acquire("prov")
+	l3, err := gate.Acquire("prov", LaneMutation)
 	if err != nil {
 		t.Fatalf("acquire after release: %v", err)
 	}
@@ -40,7 +40,7 @@ func TestProviderGateBoundsConcurrency(t *testing.T) {
 	l3.Release()
 
 	// Capacity is per provider: another adapter has its own budget.
-	l4, err := gate.Acquire("other")
+	l4, err := gate.Acquire("other", LaneMutation)
 	if err != nil {
 		t.Fatalf("independent provider acquire: %v", err)
 	}
@@ -70,18 +70,18 @@ func TestProviderGateHealthTransitions(t *testing.T) {
 	if got := gate.Health("prov"); got != ProviderOpen {
 		t.Fatalf("three failures = %s, want open", got)
 	}
-	if _, err := gate.Acquire("prov"); !errors.Is(err, ErrProviderCircuitOpen) {
+	if _, err := gate.Acquire("prov", LaneMutation); !errors.Is(err, ErrProviderCircuitOpen) {
 		t.Fatalf("open circuit acquire = %v, want ErrProviderCircuitOpen", err)
 	}
 
 	// The cooldown admits exactly one probe; a second concurrent
 	// acquisition is refused while the probe is unresolved.
 	now = now.Add(time.Minute)
-	probe, err := gate.Acquire("prov")
+	probe, err := gate.Acquire("prov", LaneMutation)
 	if err != nil {
 		t.Fatalf("probe acquire: %v", err)
 	}
-	if _, err := gate.Acquire("prov"); !errors.Is(err, ErrProviderCircuitOpen) {
+	if _, err := gate.Acquire("prov", LaneMutation); !errors.Is(err, ErrProviderCircuitOpen) {
 		t.Fatalf("second concurrent probe = %v, want ErrProviderCircuitOpen", err)
 	}
 
@@ -91,7 +91,7 @@ func TestProviderGateHealthTransitions(t *testing.T) {
 	if got := gate.Health("prov"); got != ProviderHealthy {
 		t.Fatalf("after successful probe health = %s, want healthy", got)
 	}
-	l, err := gate.Acquire("prov")
+	l, err := gate.Acquire("prov", LaneMutation)
 	if err != nil {
 		t.Fatalf("healthy acquire: %v", err)
 	}
@@ -108,17 +108,17 @@ func TestProviderGateFailingProbeReopensCircuit(t *testing.T) {
 
 	gate.RecordAmbiguous("prov", "ambiguous outcome")
 	now = now.Add(time.Minute)
-	probe, err := gate.Acquire("prov")
+	probe, err := gate.Acquire("prov", LaneMutation)
 	if err != nil {
 		t.Fatalf("probe acquire: %v", err)
 	}
 	gate.RecordAmbiguous("prov", "ambiguous outcome")
 	probe.Release()
-	if _, err := gate.Acquire("prov"); !errors.Is(err, ErrProviderCircuitOpen) {
+	if _, err := gate.Acquire("prov", LaneMutation); !errors.Is(err, ErrProviderCircuitOpen) {
 		t.Fatalf("acquire after failing probe = %v, want ErrProviderCircuitOpen", err)
 	}
 	now = now.Add(time.Minute)
-	next, err := gate.Acquire("prov")
+	next, err := gate.Acquire("prov", LaneMutation)
 	if err != nil {
 		t.Fatalf("probe after second cooldown: %v", err)
 	}
@@ -130,7 +130,7 @@ func TestProviderGateFailingProbeReopensCircuit(t *testing.T) {
 // counted as wedged (and keeps its slot) until its goroutine returns.
 func TestProviderGateSnapshotAccountsWedgedAndTimeouts(t *testing.T) {
 	gate := NewProviderGate(ProviderGateConfig{MaxConcurrent: 1})
-	lease, err := gate.Acquire("prov")
+	lease, err := gate.Acquire("prov", LaneMutation)
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
@@ -147,7 +147,7 @@ func TestProviderGateSnapshotAccountsWedgedAndTimeouts(t *testing.T) {
 	}
 	// The wedged call still holds its only slot: capacity is not
 	// silently freed while the goroutine runs.
-	if _, err := gate.Acquire("prov"); !errors.Is(err, ErrProviderSaturated) {
+	if _, err := gate.Acquire("prov", LaneMutation); !errors.Is(err, ErrProviderSaturated) {
 		t.Fatalf("acquire while wedged = %v, want ErrProviderSaturated", err)
 	}
 
@@ -312,7 +312,7 @@ func (r *countingResolver) Resolve(context.Context, *idempotency.Record) (idempo
 // is counted without changing dispatch health.
 func TestReconciliationIgnoresDispatchCapacity(t *testing.T) {
 	gate := NewProviderGate(ProviderGateConfig{MaxConcurrent: 1, DegradedAfter: 1, OpenAfter: 1})
-	lease, err := gate.Acquire("prov")
+	lease, err := gate.Acquire("prov", LaneMutation)
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
@@ -345,4 +345,76 @@ func TestReconciliationIgnoresDispatchCapacity(t *testing.T) {
 		t.Fatalf("reconciliation changed dispatch health to %s, want open", snap[0].Health)
 	}
 	lease.Release()
+}
+
+// TestReconciliationLaneHasReservedCapacity proves the recon lane is a
+// separate budget: it stays open while the dispatch pool is saturated
+// AND the circuit is open, and it is itself bounded.
+func TestReconciliationLaneHasReservedCapacity(t *testing.T) {
+	gate := NewProviderGate(ProviderGateConfig{MaxConcurrent: 1, ReconMaxConcurrent: 2, DegradedAfter: 1, OpenAfter: 1})
+	dispatch, err := gate.Acquire("prov", LaneMutation)
+	if err != nil {
+		t.Fatalf("dispatch acquire: %v", err)
+	}
+	defer dispatch.Release()
+	gate.RecordAmbiguous("prov", "ambiguous outcome")
+	if got := gate.Health("prov"); got != ProviderOpen {
+		t.Fatalf("precondition: health = %s, want open", got)
+	}
+
+	// Dispatch capacity is exhausted and the circuit is open — a
+	// dispatch acquisition is refused.
+	if _, err := gate.Acquire("prov", LaneMutation); !errors.Is(err, ErrProviderCircuitOpen) {
+		t.Fatalf("dispatch acquire = %v, want ErrProviderCircuitOpen", err)
+	}
+	// The reconciliation lane admits up to its own reserved budget.
+	r1, err := gate.Acquire("prov", LaneReconciliation)
+	if err != nil {
+		t.Fatalf("recon acquire 1: %v", err)
+	}
+	r2, err := gate.Acquire("prov", LaneReconciliation)
+	if err != nil {
+		t.Fatalf("recon acquire 2: %v", err)
+	}
+	if _, err := gate.Acquire("prov", LaneReconciliation); !errors.Is(err, ErrProviderSaturated) {
+		t.Fatalf("recon acquire 3 = %v, want ErrProviderSaturated", err)
+	}
+	r1.Release()
+	r2.Release()
+
+	snap := gate.Snapshot()
+	if len(snap) != 1 || snap[0].ReconInFlight != 0 {
+		t.Fatalf("recon lane did not drain: %+v", snap)
+	}
+	if snap[0].InFlight != 1 {
+		t.Fatalf("recon leases consumed dispatch capacity: %+v", snap[0])
+	}
+}
+
+// TestLocalCauseDoesNotDegradeProvider proves cause-aware accounting:
+// ambiguity whose cause is provably local — executor cancellation,
+// pre-dispatch deadline, DLP refusal — is counted for visibility but
+// never advances the failure streak, while provider-side causes
+// degrade exactly as before.
+func TestLocalCauseDoesNotDegradeProvider(t *testing.T) {
+	gate := NewProviderGate(ProviderGateConfig{DegradedAfter: 1, OpenAfter: 2})
+
+	gate.RecordAmbiguousOutcome("prov", false, "local executor cancel")
+	gate.RecordAmbiguousOutcome("prov", false, "deadline before dispatch")
+	if got := gate.Health("prov"); got != ProviderHealthy {
+		t.Fatalf("local ambiguity degraded health to %s, want healthy", got)
+	}
+	snap := gate.Snapshot()
+	if snap[0].LocalAmbiguities != 2 || snap[0].ConsecutiveFailures != 0 {
+		t.Fatalf("local ambiguity accounting wrong: %+v", snap[0])
+	}
+
+	gate.RecordAmbiguousOutcome("prov", true, "provider timeout")
+	if got := gate.Health("prov"); got != ProviderDegraded {
+		t.Fatalf("provider-side ambiguity health = %s, want degraded", got)
+	}
+	gate.RecordAmbiguousOutcome("prov", true, "provider timeout")
+	if got := gate.Health("prov"); got != ProviderOpen {
+		t.Fatalf("provider-side ambiguity health = %s, want open", got)
+	}
 }

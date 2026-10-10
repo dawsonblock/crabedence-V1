@@ -85,7 +85,7 @@ func TestLiveConcurrentIdenticalMutationSingleDispatch(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(N)
 
-	var successCount, failCount, inFlightCount int64
+	var successCount, failCount, inFlightCount, refusedCount int64
 	var firstResult []byte
 	var resultMu sync.Mutex
 
@@ -110,7 +110,17 @@ func TestLiveConcurrentIdenticalMutationSingleDispatch(t *testing.T) {
 				},
 				IdempotencyKey: key,
 			}
-			resp := sendRequest(t, conn, req)
+			// A burst beyond the admission ceiling is refused, not
+			// queued: the service answers EXECUTION_BUSY (a definitive
+			// pre-dispatch denial — retry-safe, no effect) or closes the
+			// connection before the frame completes. Both are refusals,
+			// not transport failures of a mutation, so the tolerant
+			// sender classifies them instead of failing the test.
+			resp, gotResponse := sendRequestTolerant(conn, req)
+			if !gotResponse {
+				atomic.AddInt64(&refusedCount, 1)
+				return
+			}
 
 			switch resp.Status {
 			case StatusSucceeded:
@@ -121,6 +131,10 @@ func TestLiveConcurrentIdenticalMutationSingleDispatch(t *testing.T) {
 				}
 				resultMu.Unlock()
 			case StatusFailed:
+				if resp.FailureCode == string(capability.FailureServiceBusy) {
+					atomic.AddInt64(&refusedCount, 1)
+					break
+				}
 				atomic.AddInt64(&failCount, 1)
 			case StatusInFlight:
 				atomic.AddInt64(&inFlightCount, 1)
@@ -201,8 +215,15 @@ func TestLiveConcurrentIdenticalMutationSingleDispatch(t *testing.T) {
 		}
 	}
 
-	t.Logf("100-way concurrent mutation: success=%d, fail=%d, in-flight/unknown=%d, counter=%d",
-		successCount, failCount, inFlightCount, finalCount)
+	// A caller refused at the admission ceiling never reached dispatch,
+	// so the refusal is retry-safe and cannot have produced the effect:
+	// the exactly-one-dispatch invariant is unaffected by the ceiling.
+	if refusedCount > 0 {
+		t.Logf("admission ceiling refused %d of %d concurrent connections (pre-dispatch, retry-safe)", refusedCount, N)
+	}
+
+	t.Logf("100-way concurrent mutation: success=%d, fail=%d, in-flight/unknown=%d, refused=%d, counter=%d",
+		successCount, failCount, inFlightCount, refusedCount, finalCount)
 
 	// Clean up.
 	db.ExecContext(ctx, `DELETE FROM execution_requests WHERE idempotency_key = $1`, key)

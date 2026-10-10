@@ -20,6 +20,53 @@ pub(crate) fn enable_operational_logs() {
     });
 }
 
+/// Asserts the synthetic-home contract a generated MCP `env` block must
+/// carry: a private `HOME` inside the pinned user config directory, every
+/// XDG root inside that home, and the operator's real home recorded for the
+/// install-level opt-out. Environment-independent — it validates the
+/// boundary's internal consistency rather than any concrete machine path.
+#[track_caller]
+pub(crate) fn assert_managed_home_env(env: &serde_json::Value) {
+    use std::path::Path;
+
+    let config_dir = env["NEMO_RELAY_USER_CONFIG_DIR"]
+        .as_str()
+        .expect("managed MCP env must pin NEMO_RELAY_USER_CONFIG_DIR");
+    let home = env["HOME"]
+        .as_str()
+        .expect("managed MCP env must set a synthetic HOME");
+    assert_eq!(
+        Path::new(home),
+        Path::new(config_dir).join("mcp-home"),
+        "synthetic HOME must live inside the pinned config directory"
+    );
+    for name in [
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "XDG_RUNTIME_DIR",
+    ] {
+        let value = env[name]
+            .as_str()
+            .unwrap_or_else(|| panic!("managed MCP env must set {name}"));
+        assert!(
+            Path::new(value).starts_with(Path::new(home)),
+            "{name} must resolve inside the synthetic home"
+        );
+    }
+    let real_home = env["NEMO_RELAY_REAL_HOME"]
+        .as_str()
+        .expect("managed MCP env must record the operator's real home");
+    assert_ne!(
+        real_home, home,
+        "the recorded real home must differ from the synthetic one"
+    );
+}
+
 #[must_use]
 pub(crate) struct CwdTestScope {
     _guard: MutexGuard<'static, ()>,

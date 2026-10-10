@@ -17,6 +17,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -39,6 +40,42 @@ type Request struct {
 	ExecutionClass string           `json:"execution_class,omitempty"` // advisory; registry is authoritative
 	IdempotencyKey string           `json:"idempotency_key,omitempty"`
 	Deadline       string           `json:"deadline,omitempty"`
+	// Mediation carries caller-declared middleware provenance — the
+	// middleware set that ran and the pre-mediation argument digest.
+	// It is evidence, never a policy input: it binds into the request
+	// digest and is persisted on the durable record, but cannot select
+	// route, provider, assurance, or authority.
+	Mediation *RequestMediation `json:"mediation,omitempty"`
+	// Session carries the runtime-attestation binding: the session ID
+	// issued by the challenge/attest handshake and the runtime's
+	// proof-of-possession signature for THIS request. Like
+	// AuthorityGeneration it is caller-supplied material the server
+	// verifies — it grants nothing by itself.
+	Session *RequestSession `json:"session,omitempty"`
+	// Attestation is the server-verified runtime identity resolved
+	// from Session — assigned by the service after proof verification,
+	// never trusted from the wire. It is provenance bound onto the
+	// durable execution record.
+	Attestation *AttestedRuntime `json:"-"`
+	// Peer is the kernel-supplied local-caller evidence resolved once
+	// per connection — assigned by the service, never trusted from the
+	// wire. It is provenance bound onto the durable execution record.
+	Peer *PeerEvidence `json:"-"`
+}
+
+// RequestSession is the caller-supplied attestation binding.
+type RequestSession struct {
+	ID    string `json:"id"`
+	Proof string `json:"proof"`
+}
+
+// AttestedRuntime is the verified runtime provenance bound onto the
+// durable record — the attested session ID and the digest of the
+// runtime identity that attested it.
+type AttestedRuntime struct {
+	SessionID      string
+	IdentityDigest string
+	KeyFingerprint string
 }
 
 // RequestAuthority carries the principal and authority reference.
@@ -68,6 +105,25 @@ type RequestAuthority struct {
 	// grant-free capabilities).
 	AuthorityGeneration int64  `json:"authority_generation,omitempty"`
 	AuthorityDigest     string `json:"authority_digest,omitempty"`
+}
+
+// RequestMediation is the caller-declared middleware provenance object
+// the NEMO runtime attaches when middleware (including trusted native
+// plugins) mediated the invocation. MiddlewareSetDigest names the exact
+// middleware set that ran — activated plugin identities, registration
+// descriptors, activation configuration, and host identity.
+// OriginalArgsDigest is the canonical digest of the arguments before
+// middleware rewrote them. ReleaseRootDigest names the component
+// manifest of the qualified distribution the runtime shipped in, when
+// it runs inside one. Both required fields mirror the Rust ABI, which
+// rejects a mediation object that omits them.
+type RequestMediation struct {
+	MiddlewareSetDigest    string `json:"middleware_set_digest"`
+	OriginalArgsDigest     string `json:"original_args_digest"`
+	ReleaseRootDigest      string `json:"release_root_digest,omitempty"`
+	PluginManifestSHA256   string `json:"plugin_manifest_sha256,omitempty"`
+	PluginLibrarySHA256    string `json:"plugin_library_sha256,omitempty"`
+	ActivationConfigSHA256 string `json:"activation_config_sha256,omitempty"`
 }
 
 // Response is the wire-format execution response.
@@ -103,6 +159,27 @@ type Response struct {
 	// artifact cannot be attested and fails closed to UNKNOWN.
 	// Transient: never serialized to the wire or the ledger.
 	EvidenceArtifact []byte `json:"-"`
+
+	// Dispatch carries the outbound transport's dispatch provenance —
+	// how far the provider request actually got and, for failures, the
+	// classified cause — so an UNKNOWN transition records WHY it is
+	// ambiguous rather than a bare fact of ambiguity. Transient: set
+	// by the trusted transport, consumed by the executor's observation
+	// ledger, never serialized.
+	Dispatch *DispatchProvenance `json:"-"`
+}
+
+// DispatchProvenance is the ambiguity provenance one outbound dispatch
+// produced: the furthest milestone reached and the classified cause.
+// It distinguishes "provably never dispatched" (definite no-effect)
+// from every shape of post-dispatch uncertainty.
+type DispatchProvenance struct {
+	// Milestone is the furthest dispatch milestone reached
+	// (providertransport.DispatchMilestone).
+	Milestone string
+	// Cause is the classified ambiguity cause
+	// (providertransport.AmbiguityCause).
+	Cause string
 }
 
 // EvidenceRef is the evidence reference returned to the caller.
@@ -140,14 +217,94 @@ type Handler interface {
 	Execute(ctx context.Context, req Request, desc capability.ResolvedDescriptor) Response
 }
 
+// Admission ceilings. The connection ceiling bounds simultaneously
+// open connections (and therefore handler goroutines, memory, and file
+// descriptors); the handshake ceiling is a smaller, separate bound on
+// the unauthenticated phase — attestation handshakes and peer
+// authentication — whose work (signature verification, session
+// bookkeeping) an unauthenticated peer can trigger.
+const (
+	DefaultMaxConnections          = 64
+	DefaultMaxHandshakeConnections = 16
+	// DefaultCheckpointInterval paces the periodic signed evidence
+	// checkpoint the service emits when CRABEDENCE_CHECKPOINT_PATH is
+	// configured.
+	DefaultCheckpointInterval = 5 * time.Minute
+	// refusalWorkerLimit bounds concurrently delivered BUSY refusals:
+	// refusing a connection means consuming its frame so the client can
+	// read the answer, and that work is bounded like any other.
+	refusalWorkerLimit = 8
+	// headerReadTimeout bounds the length prefix of a request: a
+	// connection that does not speak is a slowloris attempt, not a
+	// request. The body keeps the full request lifetime.
+	headerReadTimeout = 5 * time.Second
+	// busyWriteTimeout bounds delivering a refusal.
+	busyWriteTimeout = 5 * time.Second
+	// shutdownDrainTimeout bounds how long Stop waits for in-flight
+	// handlers before returning.
+	shutdownDrainTimeout = 5 * time.Second
+)
+
+// ServiceState is the lifecycle phase of the execution service,
+// transitioned under s.mu.
+type ServiceState int
+
+const (
+	// StateNew is the zero state: constructed, never started.
+	StateNew ServiceState = iota
+	// StateRunning: the accept loop admits connections and handlers
+	// register with the drain group.
+	StateRunning
+	// StateStopping: shutdown began — intake is cancelled and the
+	// listener closed; the accept loop and admitted handlers may still
+	// be draining. A service in this state is degraded, never clean:
+	// health surfaces must not report it as stopped.
+	StateStopping
+	// StateStopped: the accept loop terminated and every admitted
+	// handler completed. Only then may a clean stop be reported.
+	StateStopped
+)
+
+// ErrShutdownTimeout is returned by Stop when the accept loop or the
+// admitted handlers do not finish within the shared stop deadline. It
+// is a typed failure, never a clean drain: the service remains in
+// StateStopping until a later Stop observes the drains complete.
+var ErrShutdownTimeout = errors.New("execution service shutdown timed out")
+
 // Service is the persistent Crabedence execution service.
 type Service struct {
-	registry      *capability.Registry
-	handler       Handler
-	socketPath    string
-	listener      net.Listener
-	mu            sync.Mutex
-	running       bool
+	registry   *capability.Registry
+	handler    Handler
+	socketPath string
+	listener   net.Listener
+	mu         sync.Mutex
+	state      ServiceState
+	// acceptDone is closed by the accept loop when it exits — created
+	// fresh on each Start so a second lifecycle never waits on a
+	// previous loop. Stop joins it before waiting on the handler
+	// group: while the accept loop runs it can still call
+	// handlers.Add(1), so a drain observed without the join can never
+	// be trusted.
+	acceptDone chan struct{}
+	// handlersDrained is closed by the one drain watcher spawned at
+	// the STOPPING transition, so every concurrent Stop call (and any
+	// retry after a timeout) waits on the same drain.
+	handlersDrained chan struct{}
+	// intakeCancel cancels the context the accept loop and every
+	// handler were started with. Stop invokes it at the STOPPING
+	// transition so in-flight work learns the service is draining.
+	intakeCancel context.CancelFunc
+	// stopDeadline is the shared bound for both drain phases, fixed
+	// at the first Stop. A retried Stop re-waits against the same
+	// deadline rather than extending it; once the drains have
+	// completed the wait returns immediately, so a retry does finish
+	// the transition to StateStopped.
+	stopDeadline time.Time
+	// socketIdent is the filesystem identity (device + inode) of the
+	// socket this service bound, captured at Start. Stop removes the
+	// path only when it still names that same object — a replaced or
+	// foreign file is left for the operator.
+	socketIdent   *socketFileID
 	grantResolver capability.GrantResolver
 	// adapterAvailability is the deployment's runtime adapter state. It
 	// is nil when the caller did not declare one (tests that construct
@@ -158,17 +315,82 @@ type Service struct {
 	// the claimed principal must agree with the mapping. nil preserves
 	// the bearer model's claimed principal (single-user local socket).
 	peerAuth PeerPrincipalMap
+	// attestation, when non-nil, is the runtime-attestation registry:
+	// challenges, verified sessions, and the deployment policy. nil
+	// means attestation is disabled (a non-required deployment); the
+	// handshake messages are refused rather than answered.
+	attestation *attestationRegistry
+	// connSlots bounds simultaneously open connections; handshakeSlots
+	// bounds the unauthenticated phase. Both are acquired before the
+	// work they bound and released after it.
+	connSlots      chan struct{}
+	handshakeSlots chan struct{}
+	refusalSlots   chan struct{}
+	// handlers tracks in-flight connection handlers so Stop can drain
+	// them instead of abandoning admitted work mid-flight.
+	handlers sync.WaitGroup
+	// drainTimeout bounds the Stop drain; overridable in tests.
+	drainTimeout time.Duration
+	// acceptGate, when non-nil, runs in the accept loop after a
+	// connection is accepted and its slot acquired but before its
+	// handler registers with the drain group — the exact window a
+	// racing Stop must own. It exists so the shutdown-barrier
+	// regression can hold a connection inside that window
+	// deterministically; nil in production.
+	acceptGate func()
 }
 
 // NewService creates a new execution service.
 func NewService(registry *capability.Registry, handler Handler, socketPath string) *Service {
 	return &Service{
-		registry:      registry,
-		handler:       handler,
-		socketPath:    socketPath,
-		grantResolver: capability.NoopGrantResolver{},
+		registry:       registry,
+		handler:        handler,
+		socketPath:     socketPath,
+		grantResolver:  capability.NoopGrantResolver{},
+		connSlots:      make(chan struct{}, DefaultMaxConnections),
+		handshakeSlots: make(chan struct{}, DefaultMaxHandshakeConnections),
+		refusalSlots:   make(chan struct{}, refusalWorkerLimit),
+		drainTimeout:   shutdownDrainTimeout,
 	}
 }
+
+// SetAdmissionLimits overrides the admission ceilings. Call it before
+// Start. Non-positive values leave the corresponding default in place;
+// production resolves both from the validated deployment configuration
+// (CRABEDENCE_MAX_CONNECTIONS, CRABEDENCE_MAX_HANDSHAKES).
+func (s *Service) SetAdmissionLimits(connections, handshakes int) {
+	if connections > 0 {
+		s.connSlots = make(chan struct{}, connections)
+	}
+	if handshakes > 0 {
+		s.handshakeSlots = make(chan struct{}, handshakes)
+	}
+}
+
+// tryAcquireConnection takes one connection slot without waiting.
+func (s *Service) tryAcquireConnection() bool {
+	select {
+	case s.connSlots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Service) releaseConnection() { <-s.connSlots }
+
+// tryAcquireHandshake takes one unauthenticated-phase slot without
+// waiting.
+func (s *Service) tryAcquireHandshake() bool {
+	select {
+	case s.handshakeSlots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Service) releaseHandshake() { <-s.handshakeSlots }
 
 // SetAdapterAvailability declares which adapters this deployment wired.
 // A known capability whose adapter is not AVAILABLE fails as
@@ -190,13 +412,36 @@ func (s *Service) SetPeerAuth(m PeerPrincipalMap) {
 	s.peerAuth = m
 }
 
+// SetAttestation enables the runtime-attestation handshake and session
+// verification under the deployment's policy. When policy.Required is
+// set, every invocation must carry a valid attested-session proof.
+func (s *Service) SetAttestation(policy AttestationPolicy) {
+	s.attestation = newAttestationRegistry(policy)
+}
+
+// LifecycleState reports the service's current lifecycle phase for
+// health and observability surfaces. A service whose state is
+// StateStopping is degraded — its drain has not finished — and must
+// never be reported as cleanly stopped.
+func (s *Service) LifecycleState() ServiceState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.state
+}
+
 // Start begins listening on the Unix socket.
 func (s *Service) Start(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.running {
+	switch s.state {
+	case StateRunning:
 		return fmt.Errorf("service already running")
+	case StateStopping:
+		// A stop in flight must complete before a new lifecycle can
+		// begin: the accept loop and handlers of the old one still own
+		// the socket and the drain group.
+		return fmt.Errorf("service is stopping; wait for the drain to complete")
 	}
 
 	// Secure the socket directory and clear any stale socket before
@@ -223,39 +468,135 @@ func (s *Service) Start(ctx context.Context) error {
 		listener.Close()
 		return fmt.Errorf("secure socket permissions on %s: %w", s.socketPath, err)
 	}
-	if err := verifySocketFile(s.socketPath); err != nil {
+	ident, err := verifySocketFile(s.socketPath)
+	if err != nil {
 		listener.Close()
 		os.Remove(s.socketPath)
 		return err
 	}
 
+	// Initialize the listener, drain channels, intake context and
+	// lifecycle state BEFORE publishing the accept goroutine: the loop
+	// reads them on entry, and everything it observes must already
+	// belong to this lifecycle.
 	s.listener = listener
-	s.running = true
+	s.socketIdent = ident
+	s.acceptDone = make(chan struct{})
+	s.handlersDrained = make(chan struct{})
+	intakeCtx, intakeCancel := context.WithCancel(ctx)
+	s.intakeCancel = intakeCancel
+	s.state = StateRunning
 
-	go s.acceptLoop(ctx)
+	go s.acceptLoop(intakeCtx)
 
 	return nil
 }
 
-// Stop closes the listener and stops accepting connections.
+// Stop closes the listener, stops accepting connections, and drains
+// in-flight handlers (bounded by the drain timeout) so a shutdown does
+// not abandon admitted work mid-flight. A dispatch that outlives the
+// drain is not silently lost: its durable record is already in flight
+// state for reconciliation, which is the designed recovery path.
+//
+// Ordering contract — the barrier that makes a clean return true:
+//
+//  1. STOPPING is set under the lifecycle mutex, the intake context is
+//     cancelled and the listener is closed. From this point the accept
+//     loop refuses every connection it has not yet registered, and —
+//     because handler registration happens under the same mutex — no
+//     new handlers.Add(1) can follow the transition.
+//  2. Stop joins the accept loop (acceptDone). While the loop was
+//     still running it could hold a connection between Accept() and
+//     registration; a drain observed without this join can watch a
+//     zero handler count while a handler registers one instant later.
+//  3. Only then does Stop wait on the handler group (handlersDrained).
+//
+// Both waits share one deadline fixed at the first Stop call. A wait
+// that expires returns ErrShutdownTimeout — a typed failure, never a
+// clean drain — and the service stays in StateStopping. A retried
+// Stop re-waits against the same deadline: once the drains complete
+// it returns immediately and finishes the transition to StateStopped,
+// so a retry does complete the drain. A dispatch that outlives the
+// deadline keeps its durable in-flight record; Stop never marks it
+// failed — UNKNOWN reconciliation decides its outcome.
 func (s *Service) Stop() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if !s.running {
+	switch s.state {
+	case StateNew, StateStopped:
+		s.mu.Unlock()
 		return nil
+	case StateRunning:
+		s.state = StateStopping
+		s.stopDeadline = time.Now().Add(s.drainTimeout)
+		s.intakeCancel()
+		if s.listener != nil {
+			s.listener.Close()
+		}
+		// The single drain watcher for this lifecycle: every Stop call
+		// — concurrent or retried — waits on the same channel rather
+		// than spawning its own WaitGroup waiter.
+		go func(drained chan<- struct{}) {
+			s.handlers.Wait()
+			close(drained)
+		}(s.handlersDrained)
+	}
+	acceptDone := s.acceptDone
+	handlersDrained := s.handlersDrained
+	deadline := s.stopDeadline
+	s.mu.Unlock()
+
+	// Barrier 1: the accept loop must terminate first. It is the only
+	// caller of handlers.Add(1), so once it is gone the handler count
+	// can never rise again while the drain is observed.
+	if !waitClosed(acceptDone, deadline) {
+		return fmt.Errorf("%w: the accept loop did not terminate", ErrShutdownTimeout)
+	}
+	// Barrier 2: drain every handler admitted before the transition.
+	if !waitClosed(handlersDrained, deadline) {
+		return fmt.Errorf("%w: in-flight handlers did not drain", ErrShutdownTimeout)
 	}
 
-	s.running = false
-	if s.listener != nil {
-		s.listener.Close()
-	}
-	os.Remove(s.socketPath)
+	s.mu.Lock()
+	s.state = StateStopped
+	s.mu.Unlock()
+	s.removeOwnedSocket()
 
 	return nil
+}
+
+// waitClosed reports whether done closes before deadline. A channel
+// that is already closed returns true even when the deadline has
+// passed, so a retried Stop after a completed drain still finishes.
+func waitClosed(done <-chan struct{}, deadline time.Time) bool {
+	select {
+	case <-done:
+		return true
+	default:
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return false
+	}
+	timer := time.NewTimer(remaining)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
 }
 
 func (s *Service) acceptLoop(ctx context.Context) {
+	// Bound to THIS lifecycle: the channels and listener were published
+	// before the goroutine started, and a later Start never reuses
+	// them. acceptDone closes exactly once, on every exit path — a
+	// listener-close, a persistent-error return, or an intake-context
+	// cancellation — so a joining Stop never hangs waiting for it.
+	done := s.acceptDone
+	listener := s.listener
+	defer close(done)
+
 	// A persistent accept error (EMFILE, ENFILE, a transient kernel
 	// condition) must not become a hot spin that pegs a core and floods
 	// the log. Mirror net/http: back off exponentially on consecutive
@@ -266,12 +607,12 @@ func (s *Service) acceptLoop(ctx context.Context) {
 	)
 	backoff := acceptBackoffMin
 	for {
-		conn, err := s.listener.Accept()
+		conn, err := listener.Accept()
 		if err != nil {
 			s.mu.Lock()
-			running := s.running
+			stopping := s.state != StateRunning
 			s.mu.Unlock()
-			if !running {
+			if stopping {
 				return
 			}
 			log.Printf("execution service: accept error: %v", err)
@@ -287,16 +628,63 @@ func (s *Service) acceptLoop(ctx context.Context) {
 		}
 		backoff = acceptBackoffMin
 
-		go s.handleConnection(ctx, conn)
+		// Bound admission before any goroutine exists: a connection at
+		// the ceiling is refused explicitly — a definitive pre-dispatch
+		// denial — instead of spawning unbounded handlers.
+		if !s.tryAcquireConnection() {
+			s.refuseBusyConnection(conn, "the execution service is at its connection ceiling")
+			continue
+		}
+
+		// A shutdown that began while this connection sat in the
+		// accept queue owns the window before the gate: the connection
+		// is refused and its slot released — no socket or semaphore is
+		// leaked to a stopped service.
+		s.mu.Lock()
+		if s.state != StateRunning {
+			s.mu.Unlock()
+			s.releaseConnection()
+			s.refuseBusyConnection(conn, "the execution service is shutting down")
+			continue
+		}
+		s.mu.Unlock()
+
+		if s.acceptGate != nil {
+			s.acceptGate()
+		}
+
+		// Registration with the drain group happens under the same
+		// mutex the STOPPING transition holds — so an Add that could
+		// escape a stopping drain cannot exist: either registration
+		// ran before the transition (and the drain counts it), or the
+		// transition already happened and the connection is refused
+		// instead of served.
+		s.mu.Lock()
+		if s.state != StateRunning {
+			s.mu.Unlock()
+			s.releaseConnection()
+			s.refuseBusyConnection(conn, "the execution service is shutting down")
+			continue
+		}
+		s.handlers.Add(1)
+		s.mu.Unlock()
+
+		go func() {
+			defer s.handlers.Done()
+			s.handleConnection(ctx, conn)
+		}()
 	}
 }
 
 func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
+	defer s.releaseConnection()
 
-	// Bound the whole connection: one request, one response, no
-	// indefinite holds.
-	_ = conn.SetDeadline(time.Now().Add(connectionLifetime))
+	start := time.Now()
+	// The length prefix must arrive promptly: a connection that never
+	// speaks is a slowloris attempt, not a request. The body keeps the
+	// full request lifetime.
+	_ = conn.SetReadDeadline(start.Add(headerReadTimeout))
 
 	// Read 4-byte big-endian length prefix
 	lenBuf := make([]byte, 4)
@@ -307,16 +695,48 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 	msgLen := binary.BigEndian.Uint32(lenBuf)
 	if msgLen > maxMessageBytes {
 		s.writeResponse(conn, Response{
-			Status:      StatusFailed,
-			FailureCode: string(capability.FailureInvalidRequest),
-			Error:       "message too large",
+			Status:            StatusFailed,
+			FailureCode:       string(capability.FailureInvalidRequest),
+			Error:             "message too large",
+			DefinitiveFailure: true,
 		}, "")
 		return
 	}
 
 	// Read message body
+	_ = conn.SetReadDeadline(start.Add(connectionLifetime))
 	msgBuf := make([]byte, msgLen)
 	if _, err := io.ReadFull(conn, msgBuf); err != nil {
+		return
+	}
+
+	// The unauthenticated phase — the attestation handshake, request
+	// parsing, attestation verification, and peer authentication — is
+	// bounded by a smaller, separate ceiling: it is the work an
+	// unauthenticated peer can trigger. The slot is released once the
+	// caller is authenticated (or the deployment authenticates nobody),
+	// before admission and dispatch.
+	if !s.tryAcquireHandshake() {
+		s.refuseUnauthenticated(conn, msgBuf)
+		return
+	}
+	handshakeHeld := true
+	defer func() {
+		if handshakeHeld {
+			s.releaseHandshake()
+		}
+	}()
+
+	// Attestation handshake messages are dispatched before the strict
+	// invocation ABI — they are service frames, not capability
+	// invocations. A handshake message when attestation is unconfigured
+	// is refused, not ignored.
+	if t := messageType(msgBuf); t == attestChallengeType || t == attestType {
+		if s.attestation == nil {
+			writeJSONFrame(conn, attestResponse{Status: "error", Error: "runtime attestation is not configured on this service"})
+			return
+		}
+		s.handleAttestation(conn, msgBuf, t)
 		return
 	}
 
@@ -327,11 +747,22 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 	req, err := parseInvocationRequest(msgBuf)
 	if err != nil {
 		s.writeResponse(conn, Response{
-			Status:      StatusFailed,
-			FailureCode: string(capability.FailureInvalidRequest),
-			Error:       fmt.Sprintf("invalid request: %v", err),
+			Status:            StatusFailed,
+			FailureCode:       string(capability.FailureInvalidRequest),
+			Error:             fmt.Sprintf("invalid request: %v", err),
+			DefinitiveFailure: true,
 		}, "")
 		return
+	}
+
+	// ─── Local-caller evidence ─────────────────────────────────────────
+	// Resolve the kernel-supplied peer credentials once: the same
+	// snapshot feeds the attestation session binding, peer principal
+	// authentication, and the durable provenance record — the recorded
+	// caller is exactly the caller that was authenticated.
+	peerCreds, peerErr := unixPeerCredentials(conn)
+	if peerErr == nil {
+		req.Peer = peerCreds.Evidence()
 	}
 
 	// ─── Peer authentication ────────────────────────────────────────────
@@ -342,8 +773,35 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 	// grant resolution, and the durable execution record — so authority
 	// binds to a kernel-authenticated identity, not a string the client
 	// wrote.
+	// ─── Runtime attestation ──────────────────────────────────────────
+	// Verified before peer authentication: the proof signs the request
+	// exactly as the runtime sent it, and peer authentication rewrites
+	// the principal claim — verifying after the rewrite would deny a
+	// correctly signed request. The session must exist, be unexpired,
+	// be bound to this connection's peer UID, and carry a valid
+	// proof-of-possession for this request. The verified identity — not
+	// the caller's claim — becomes the execution's runtime provenance.
+	if s.attestation != nil {
+		sess, err := s.attestation.verifyRequest(peerCreds, peerErr, req)
+		if err != nil {
+			s.writeResponse(conn, Response{
+				Status:      StatusDenied,
+				FailureCode: string(capability.FailureAdmissionDenied),
+				Error:       "runtime attestation failed: " + err.Error(),
+			}, "")
+			return
+		}
+		if sess != nil {
+			req.Attestation = &AttestedRuntime{
+				SessionID:      req.Session.ID,
+				IdentityDigest: sess.digest,
+				KeyFingerprint: sess.fingerprint,
+			}
+		}
+	}
+
 	if s.peerAuth != nil {
-		principal, err := s.peerAuth.authenticatePeer(conn, req.Authority.Principal)
+		principal, err := s.peerAuth.authenticatePeer(peerCreds, peerErr, req.Authority.Principal)
 		if err != nil {
 			s.writeResponse(conn, Response{
 				Status:      StatusDenied,
@@ -354,6 +812,12 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 		}
 		req.Authority.Principal = principal
 	}
+
+	// The caller is authenticated (or this deployment authenticates
+	// nobody): release the unauthenticated-phase bound before admission
+	// and dispatch.
+	s.releaseHandshake()
+	handshakeHeld = false
 
 	// Admit the request
 	decision := s.registry.Admit(capability.AdmissionRequest{
@@ -388,6 +852,10 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 			s.writeResponse(conn, Response{
 				Status:      StatusFailed,
 				FailureCode: string(capability.FailureCapabilityUnavailable),
+				// The gate runs before dispatch — no handler ran and no
+				// provider was contacted, so no effect is possible for
+				// any execution class. Definitive, not UNKNOWN.
+				DefinitiveFailure: true,
 				Error: fmt.Sprintf("capability %s requires adapter %q, which is not available in this deployment (reason=%s: %s)",
 					req.Capability, desc.AdapterID, status, reason),
 			}, "")
@@ -437,6 +905,24 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 	// Verify authority (grant resolution)
 	var resolvedGrant *capability.Grant
 	if decision.Descriptor.AuthorityPolicy.GrantRequired {
+		// A request that names no authority reference asks the service
+		// to broker the principal's authority. That is only as strong as
+		// the principal's authentication: under the bearer model anyone
+		// who can reach the socket could claim a principal holding
+		// grants, so the brokered path exists only when the peer map
+		// has authenticated who is asking. A caller-supplied reference
+		// remains valid — it must still resolve against the
+		// (authenticated or claimed) principal.
+		if req.Authority.EffectiveAuthorityRef() == "" && s.peerAuth == nil {
+			s.writeResponse(conn, Response{
+				Status:      StatusDenied,
+				FailureCode: string(capability.FailureUnauthorized),
+				Error: "no authority reference supplied and brokered authority requires peer " +
+					"authentication (CRABEDENCE_PEER_PRINCIPALS): without it the principal is an " +
+					"unverified claim the service cannot resolve grants against",
+			}, "")
+			return
+		}
 		grant, fc, reason := s.registry.VerifyAuthority(ctx, capability.AdmissionRequest{
 			Capability: req.Capability,
 			Arguments:  req.Arguments,
@@ -452,6 +938,13 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 			return
 		}
 		resolvedGrant = grant
+		// The resolved grant's identity is server-determined: when the
+		// caller carried no reference, the record binds the grant the
+		// store selected, so the durable execution names the authority
+		// that actually admitted it.
+		if req.Authority.EffectiveAuthorityRef() == "" {
+			req.Authority.AuthorityRef = resolvedGrant.ID
+		}
 	}
 
 	// Bind the verified authority material into the request before
@@ -468,10 +961,67 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 
 	// Dispatch to handler. The DispatchExecutor handles CRITICAL evidence
 	// validation internally — post-dispatch evidence failures become
-	// UNKNOWN (not FAILED) per the durable execution contract.
+	// UNKNOWN (not FAILED) per the durable execution contract. A stop
+	// that lands mid-dispatch cancels the intake context but never marks
+	// the durable record failed: an interrupted effect is UNKNOWN until
+	// reconciliation proves otherwise.
 	response := s.handler.Execute(ctx, req, decision.Descriptor)
 
 	s.writeResponse(conn, response, decision.Descriptor.ExecutionClass)
+}
+
+// refuseBusyConnection delivers a definitive BUSY response to a
+// connection the service cannot admit. The refusal itself is bounded
+// work: at most refusalWorkerLimit refusals are in flight, each bounded
+// by the header timeout and the frame bound. Beyond that pool the
+// connection is closed without a frame — still a pre-dispatch failure,
+// because nothing was dispatched and nothing can have happened.
+func (s *Service) refuseBusyConnection(conn net.Conn, reason string) {
+	select {
+	case s.refusalSlots <- struct{}{}:
+	default:
+		conn.Close()
+		return
+	}
+	go func() {
+		defer func() { <-s.refusalSlots }()
+		defer conn.Close()
+		_ = conn.SetReadDeadline(time.Now().Add(headerReadTimeout))
+		// Consume the request frame (bounded) so the client's write
+		// completes and it can read the refusal.
+		lenBuf := make([]byte, 4)
+		if _, err := io.ReadFull(conn, lenBuf); err != nil {
+			return
+		}
+		if n := binary.BigEndian.Uint32(lenBuf); n <= maxMessageBytes {
+			_, _ = io.CopyN(io.Discard, conn, int64(n))
+		}
+		s.writeBusy(conn, reason)
+	}()
+}
+
+// refuseUnauthenticated delivers an explicit refusal for a connection
+// that could not take an unauthenticated-phase slot, shaped for the
+// frame the caller sent.
+func (s *Service) refuseUnauthenticated(conn net.Conn, msgBuf []byte) {
+	if t := messageType(msgBuf); t == attestChallengeType || t == attestType {
+		writeJSONFrame(conn, attestResponse{
+			Status: "error",
+			Error:  "execution service busy: the attestation handshake ceiling is reached — retry when the backlog drains",
+		})
+		return
+	}
+	s.writeBusy(conn, "the authentication and attestation concurrency ceiling is reached")
+}
+
+// writeBusy writes a definitive pre-dispatch refusal.
+func (s *Service) writeBusy(conn net.Conn, reason string) {
+	s.writeResponseDeadline(conn, Response{
+		Status:            StatusFailed,
+		FailureCode:       string(capability.FailureServiceBusy),
+		Error:             "execution service busy: " + reason + " — the request was not dispatched; retry when the backlog drains",
+		DefinitiveFailure: true,
+	}, "", busyWriteTimeout)
 }
 
 // writeResponse writes one framed response. executedClass is the
@@ -483,6 +1033,10 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
 // result, so a MUTATION/CRITICAL response becomes UNKNOWN. A PURE/READ
 // execution can prove no effect occurred, so FAILED stays truthful.
 func (s *Service) writeResponse(conn net.Conn, resp Response, executedClass capability.ExecutionClass) {
+	s.writeResponseDeadline(conn, resp, executedClass, responseWriteTimeout)
+}
+
+func (s *Service) writeResponseDeadline(conn net.Conn, resp Response, executedClass capability.ExecutionClass, writeTimeout time.Duration) {
 	payload, err := json.Marshal(resp)
 	if err != nil {
 		log.Printf("execution service: marshal error: %v", err)
@@ -491,13 +1045,16 @@ func (s *Service) writeResponse(conn net.Conn, resp Response, executedClass capa
 
 	if len(payload) > maxMessageBytes {
 		status, failureCode := StatusFailed, capability.FailureInternalError
+		definitive := true
 		if executedClass == capability.ClassMutation || executedClass == capability.ClassCritical {
 			status, failureCode = StatusUnknown, capability.FailureExecutionUnknown
+			definitive = false
 		}
 		payload, err = json.Marshal(Response{
-			Status:      status,
-			FailureCode: string(failureCode),
-			Error:       fmt.Sprintf("response exceeds the %d-byte frame bound", maxMessageBytes),
+			Status:            status,
+			FailureCode:       string(failureCode),
+			Error:             fmt.Sprintf("response exceeds the %d-byte frame bound", maxMessageBytes),
+			DefinitiveFailure: definitive,
 		})
 		if err != nil {
 			log.Printf("execution service: marshal error: %v", err)
@@ -506,7 +1063,7 @@ func (s *Service) writeResponse(conn net.Conn, resp Response, executedClass capa
 	}
 
 	// Set write deadline to prevent blocking on hung clients
-	if err := conn.SetWriteDeadline(time.Now().Add(30 * time.Second)); err != nil {
+	if err := conn.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
 		log.Printf("execution service: set write deadline: %v", err)
 		return
 	}
@@ -526,14 +1083,17 @@ func (s *Service) writeResponse(conn net.Conn, resp Response, executedClass capa
 // the ABI's declared maximum.
 const maxMessageBytes = 4 * 1024 * 1024
 
-// connectionLifetime bounds the REQUEST side of a client connection:
-// the read that must produce one request frame, with no indefinite
-// holds. It deliberately does not bound the response: the provider
-// budget is minutes, and writeResponse sets its own write deadline, so
-// an invocation that finishes after this lifetime still delivers its
-// definitive answer rather than stranding the caller with an ambiguity
-// it did not have.
+// connectionLifetime bounds the BODY side of a client connection: the
+// read that must produce one request frame after its length prefix, with
+// no indefinite holds. It deliberately does not bound the response: the
+// provider budget is minutes, and writeResponse sets its own write
+// deadline, so an invocation that finishes after this lifetime still
+// delivers its definitive answer rather than stranding the caller with
+// an ambiguity it did not have.
 const connectionLifetime = 60 * time.Second
+
+// responseWriteTimeout bounds delivering a response to a caller.
+const responseWriteTimeout = 30 * time.Second
 
 // writeFull writes the entire buffer. A Unix stream write may accept
 // fewer bytes than requested, and a truncated frame would corrupt the

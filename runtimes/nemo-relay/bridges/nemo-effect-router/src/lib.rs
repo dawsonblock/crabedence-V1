@@ -21,7 +21,7 @@
 //!
 //! ```text
 //! LOCAL      ⇒ PURE + NONE     (ValidateDescriptorCompatibility)
-//! DIRECT     ⇒ READ            (and never MUTATION/CRITICAL)
+//! DIRECT     ⇒ no MUTATION/CRITICAL, no DURABLE/HIGH_ASSURANCE
 //! CRABEDENCE ⇒ everything else
 //! ```
 //!
@@ -71,14 +71,17 @@ pub enum RouteDecision {
     Local,
     /// Crosses the Crabedence execution kernel.
     Crabedence,
-    /// An approved read path, which this build does not wire.
-    DirectUnavailable,
+    /// Crosses the socket to the approved read path: admission and schema
+    /// validation in the service, no durable mutation ledger. The registry
+    /// guarantees no `MUTATION`/`CRITICAL` class and no `DURABLE`/
+    /// `HIGH_ASSURANCE` profile on this route.
+    Direct,
 }
 
 impl RouteDecision {
     /// Whether this decision leaves the process.
     pub const fn crosses_the_kernel(self) -> bool {
-        matches!(self, Self::Crabedence)
+        matches!(self, Self::Crabedence | Self::Direct)
     }
 }
 
@@ -146,19 +149,42 @@ impl<L, K> EffectRouter<L, K> {
                 // The registry refuses LOCAL for anything but PURE + NONE at
                 // registration. Re-checking here means a snapshot that somehow
                 // carried it fails closed instead of executing locally.
-                if descriptor.execution_class != RegistryExecutionClass::Pure {
+                if descriptor.execution_class != RegistryExecutionClass::Pure
+                    || descriptor.assurance_profile != "NONE"
+                {
                     return Err(refused_request(
                         "EXECUTION_ROUTE_MISMATCH",
                         format!(
-                            "capability {capability_id} is pinned LOCAL but classified {} — LOCAL execution is only legal for PURE",
-                            descriptor.execution_class
+                            "capability {capability_id} is pinned LOCAL but classified {} with {} assurance — LOCAL execution is only legal for PURE + NONE",
+                            descriptor.execution_class, descriptor.assurance_profile
                         ),
                     ));
                 }
                 Ok(RouteDecision::Local)
             }
             RegistryExecutionRoute::Crabedence => Ok(RouteDecision::Crabedence),
-            RegistryExecutionRoute::Direct => Ok(RouteDecision::DirectUnavailable),
+            RegistryExecutionRoute::Direct => {
+                // Registration refuses DIRECT for consequential classes and
+                // for assurance the read path cannot carry. Re-checking here
+                // means a snapshot that somehow violated it fails closed
+                // instead of dispatching down the non-durable route.
+                if matches!(
+                    descriptor.execution_class,
+                    RegistryExecutionClass::Mutation | RegistryExecutionClass::Critical
+                ) || matches!(
+                    descriptor.assurance_profile.as_str(),
+                    "DURABLE" | "HIGH_ASSURANCE"
+                ) {
+                    return Err(refused_request(
+                        "EXECUTION_ROUTE_MISMATCH",
+                        format!(
+                            "capability {capability_id} is pinned DIRECT but classified {} with {} assurance — DIRECT carries only non-consequential reads at STANDARD or below",
+                            descriptor.execution_class, descriptor.assurance_profile
+                        ),
+                    ));
+                }
+                Ok(RouteDecision::Direct)
+            }
         }
     }
 
@@ -201,13 +227,10 @@ where
                 self.class_agrees(request, &capability_id)?;
                 self.local.execute(request)
             }
-            RouteDecision::Crabedence => self.kernel.execute(request),
-            RouteDecision::DirectUnavailable => Err(refused_request(
-                "CAPABILITY_UNAVAILABLE",
-                format!(
-                    "capability {capability_id} is pinned to the DIRECT route and no approved read path is wired in this build"
-                ),
-            )),
+            // Both kernel-crossing routes dispatch over the socket; the
+            // service's own dispatcher resolves DIRECT versus CRABEDENCE
+            // from its registry, not from anything this request asserts.
+            RouteDecision::Crabedence | RouteDecision::Direct => self.kernel.execute(request),
         }
     }
 }

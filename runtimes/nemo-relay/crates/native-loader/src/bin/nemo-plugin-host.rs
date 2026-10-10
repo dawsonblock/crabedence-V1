@@ -9,6 +9,10 @@ use std::process::ExitCode;
 #[path = "unix/nemo-plugin-host.rs"]
 mod unix_host;
 
+#[cfg(target_os = "linux")]
+#[path = "unix/linux_sandbox.rs"]
+mod linux_sandbox;
+
 #[cfg(unix)]
 fn main() -> ExitCode {
     unix_host::run()

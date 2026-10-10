@@ -250,6 +250,26 @@ impl PluginHostSupervisor {
                 })?,
             )
         };
+        // The confined Linux host cannot connect anywhere: its seccomp filter
+        // answers `connect` with EPERM, so the kernel callback channel has to
+        // exist before the sandbox does. The supervisor connects to the
+        // listener it just bound and hands the child the connected descriptor;
+        // the callback executor accepts it like any other connection when it
+        // starts serving. The path itself is never given to the confined host.
+        #[cfg(unix)]
+        let kernel_channel = if config.isolation
+            == crate::isolation_policy::NativeIsolationPolicy::RestrictedLinux
+        {
+            Some(
+                std::os::unix::net::UnixStream::connect(&kernel_endpoint).map_err(|error| {
+                    unavailable(format!(
+                        "failed to open the kernel channel the confined host is handed: {error}"
+                    ))
+                })?,
+            )
+        } else {
+            None
+        };
         let mut command = Command::new(&executable);
         // The bounds the child runs under, applied between `fork` and `exec`.
         // This is the only point at which they can be applied and the only point
@@ -258,12 +278,43 @@ impl PluginHostSupervisor {
         #[cfg(unix)]
         {
             let limits = config.limits;
+            // The kernel channel descriptor has to survive `exec`: it is opened
+            // CLOEXEC by the std socket call and the confined child's only copy
+            // of it is the descriptor it inherits.
+            let channel_fd = kernel_channel
+                .as_ref()
+                .map(std::os::unix::io::AsRawFd::as_raw_fd);
+            // The descriptor table is enumerated here, in the parent, where
+            // allocation and directory walks are safe; the closure below only
+            // reads the snapshot. An enumeration that cannot run means the
+            // boundary cannot be established — a host started without it is
+            // worse than none, so the launch is refused.
+            let descriptor_inventory = open_descriptor_inventory().map_err(|error| {
+                unavailable(format!(
+                    "cannot enumerate the descriptors a plugin host must not inherit: {error}"
+                ))
+            })?;
             // Safety: the closure runs in the forked child before `exec`, and
-            // calls `setrlimit` (and, on Linux, `prctl`) and nothing else: it
-            // allocates nothing, takes no locks, and returns only an error the
-            // spawn reports.
+            // calls `setrlimit` (and, on Linux, `prctl`, `fcntl` and
+            // `close_range`), `close`, and nothing else: it reads the captured
+            // inventory without mutating it, allocates nothing, takes no
+            // locks, and returns only an error the spawn reports.
             unsafe {
-                command.pre_exec(move || crate::limits::apply(&limits));
+                command.pre_exec(move || {
+                    if let Some(fd) = channel_fd {
+                        let descriptor = rustix::fd::BorrowedFd::borrow_raw(fd);
+                        if let Err(error) =
+                            rustix::io::fcntl_setfd(descriptor, rustix::io::FdFlags::empty())
+                        {
+                            return Err(error.into());
+                        }
+                    }
+                    // Everything above stdio that the supervisor holds is the
+                    // supervisor's, not the host's — except the channel above,
+                    // which is the confined host's only copy of it.
+                    mark_inherited_descriptors_close_on_exec(channel_fd, &descriptor_inventory)?;
+                    crate::limits::apply(&limits)
+                });
             }
         }
         // A filtered environment: the child gets what it needs to be this host
@@ -277,7 +328,6 @@ impl PluginHostSupervisor {
             )
             .env("NEMO_RELAY_PLUGIN_HOST_SOCKET", &socket)
             .env("NEMO_RELAY_PLUGIN_HOST_CREDENTIAL", &credential)
-            .env("NEMO_RELAY_KERNEL_SOCKET", &kernel_endpoint)
             .env("NEMO_RELAY_KERNEL_CREDENTIAL", &kernel_credential)
             .env(
                 "NEMO_RELAY_PLUGIN_HOST_BINDING",
@@ -305,6 +355,47 @@ impl PluginHostSupervisor {
             })
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
+        if config.isolation == crate::isolation_policy::NativeIsolationPolicy::RestrictedLinux {
+            // The confined host's HOME is a directory inside its own session:
+            // staging and scratch land in the one place the filesystem
+            // allow-list leaves writable, and nothing the account owns is
+            // visible under the name HOME suggests.
+            let home = socket_dir.join("home");
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            builder.create(&home).map_err(|error| {
+                unavailable(format!(
+                    "failed to create the confined host's home '{}': {error}",
+                    home.display()
+                ))
+            })?;
+            command.env("HOME", &home);
+        }
+        // Which kernel channel the child is offered depends on what it may do
+        // once confined: a confined Linux host gets a descriptor it inherits —
+        // its `connect` is dead — and everything else gets the path it dials.
+        #[cfg(unix)]
+        if config.isolation == crate::isolation_policy::NativeIsolationPolicy::RestrictedLinux {
+            let Some(stream) = kernel_channel.as_ref() else {
+                return Err(unavailable(
+                    "the confined host's kernel channel was not prepared",
+                ));
+            };
+            command.env(
+                "NEMO_RELAY_KERNEL_FD",
+                std::os::unix::io::AsRawFd::as_raw_fd(stream).to_string(),
+            );
+        } else {
+            command.env("NEMO_RELAY_KERNEL_SOCKET", &kernel_endpoint);
+        }
+        #[cfg(not(unix))]
+        {
+            command.env("NEMO_RELAY_KERNEL_SOCKET", &kernel_endpoint);
+        }
         let child = command.spawn().map_err(|error| {
             // A host that is not there is a deployment that received a runtime
             // without the executable that makes isolation possible, so the
@@ -330,6 +421,11 @@ impl PluginHostSupervisor {
                 executable.display(),
             ))
         })?;
+        // The kernel channel's other end belongs to the child now: the
+        // supervisor's copy of the descriptor is closed, and the connection the
+        // callback executor will accept lives on in the confined host.
+        #[cfg(unix)]
+        drop(kernel_channel);
         let process_id = child.id();
         let mut child = child;
         // Held, not used: the host reads it, and what it observes is the moment
@@ -1048,9 +1144,9 @@ impl PluginExecutionBackend for ProcessPluginBackend {
         context: PluginExecutionContext,
     ) -> PluginExecutionFuture<'a, PluginLoadResponse> {
         Box::pin(async move {
-            if self.config.isolation
-                == crate::isolation_policy::NativeIsolationPolicy::RestrictedMacOS
-            {
+            if self.config.isolation.confines_resources() {
+                // A confined host cannot open a path the kernel hands it — the
+                // artifact has to arrive over the authenticated session instead.
                 request.artifact = self.transfer_artifact(&request, &context).await?;
             }
             let budget = Self::budget(&context, now_unix_ms()?)?;
@@ -1596,6 +1692,244 @@ async fn handshake(
     Ok(identity)
 }
 
+/// Mark every descriptor above stdio that the host must not inherit
+/// close-on-exec.
+///
+/// The standard library opens its own descriptors close-on-exec, but an
+/// inherited descriptor is not the supervisor's to trust: anything the kernel
+/// process was handed without CLOEXEC — a launcher's log file, another
+/// service's socket, a credential the deployment thought it had put away —
+/// would otherwise cross into the host, and through the host into every plugin
+/// it loads. The one deliberate exception is the confined host's kernel channel
+/// descriptor, which is the child's only copy of that channel; it is named by
+/// `preserve` and is left alone (the spawn clears its flag separately).
+///
+/// Coverage is complete by construction, not by bound. On Linux `close_range`
+/// marks the entire descriptor space in one syscall, above any ceiling a loop
+/// could stop at. Where the kernel lacks that call the boundary is
+/// `inventory`: the open-descriptor snapshot the parent took before `fork`,
+/// so every descriptor the kernel reported open is marked. The bounded sweep
+/// after it is only a backstop for a descriptor opened in the narrow window
+/// between snapshot and `exec`, and it is not what the guarantee stands on.
+///
+/// Marking rather than closing is deliberate. The standard library keeps a
+/// private close-on-exec pipe between parent and child so a failed `exec` is
+/// reported instead of looking like a successful spawn; a loop that *closed*
+/// descriptors would close that pipe before the `exec` attempt and turn every
+/// exec failure into a host that silently never starts. Setting the flag is
+/// idempotent for descriptors that already carry it — including that pipe —
+/// so the child's table gains exactly the property this boundary is about and
+/// the machinery around it keeps working.
+///
+/// Runs between `fork` and `exec`: every call here is a raw syscall or a read
+/// of the captured inventory, so it allocates nothing and cannot deadlock
+/// against a lock another thread held at fork time. A marking failure other
+/// than EBADF is returned, not ignored: a host that cannot establish the
+/// boundary is a host that does not start.
+#[cfg(unix)]
+fn mark_inherited_descriptors_close_on_exec(
+    preserve: Option<std::os::fd::RawFd>,
+    inventory: &[std::os::fd::RawFd],
+) -> std::io::Result<()> {
+    // The complete mechanism first: one call covers every descriptor number
+    // the kernel can mint, including any opened after the inventory was
+    // taken. A kernel without it — or without the CLOEXEC flag for it —
+    // falls through to the inventory path rather than running unconfined.
+    #[cfg(target_os = "linux")]
+    if close_range_cloexec(preserve)? {
+        return Ok(());
+    }
+
+    // The inventory is the boundary: every descriptor the parent observed
+    // open gets marked, however high its number.
+    for &descriptor in inventory {
+        if descriptor < 3 || Some(descriptor) == preserve {
+            continue;
+        }
+        mark_cloexec(descriptor)?;
+    }
+    // The backstop for the snapshot-to-exec window. It stays bounded on
+    // purpose — the guarantee above does not stand on it — and a slot that
+    // was never open answers EBADF, the expected result.
+    let bound = supplementary_sweep_bound();
+    for descriptor in 3..bound {
+        if Some(descriptor) == preserve {
+            continue;
+        }
+        mark_cloexec(descriptor)?;
+    }
+    Ok(())
+}
+
+/// One `F_SETFD` for the boundary. `EBADF` is the expected answer for a slot
+/// that was never open; anything else is a containment failure the spawn
+/// reports rather than ignores.
+#[cfg(unix)]
+fn mark_cloexec(descriptor: std::os::fd::RawFd) -> std::io::Result<()> {
+    // Safety: the raw descriptor is borrowed for the duration of the call
+    // and never closed here.
+    let borrowed = unsafe { rustix::fd::BorrowedFd::borrow_raw(descriptor) };
+    match rustix::io::fcntl_setfd(borrowed, rustix::io::FdFlags::CLOEXEC) {
+        Ok(()) | Err(rustix::io::Errno::BADF) => Ok(()),
+        Err(error) => Err(std::io::Error::other(format!(
+            "descriptor {descriptor} could not be marked close-on-exec: {error}"
+        ))),
+    }
+}
+
+/// The bound on the supplementary sweep — the smaller of the process's hard
+/// descriptor limit and the shipped constant. Neither is the boundary; this
+/// only bounds the backstop's worst case.
+#[cfg(unix)]
+fn supplementary_sweep_bound() -> std::os::fd::RawFd {
+    let bound = crate::limits::SUPPLEMENTARY_DESCRIPTOR_SWEEP_BOUND;
+    let hard = rustix::process::getrlimit(rustix::process::Resource::Nofile)
+        .maximum
+        .unwrap_or(bound);
+    hard.min(bound) as std::os::fd::RawFd
+}
+
+/// Mark every descriptor above stdio close-on-exec in one kernel call, or
+/// report that this kernel cannot.
+///
+/// `Ok(true)` means the entire descriptor space is covered and no fallback
+/// is needed. `Ok(false)` means the kernel lacks the call or the
+/// `CLOSE_RANGE_CLOEXEC` flag and the caller should fall back to the
+/// inventory. `Err` is a real failure: a boundary that cannot be established
+/// is a host that does not start.
+#[cfg(target_os = "linux")]
+fn close_range_cloexec(preserve: Option<std::os::fd::RawFd>) -> std::io::Result<bool> {
+    // `<sys/close_range.h>`: CLOSE_RANGE_CLOEXEC.
+    const CLOSE_RANGE_CLOEXEC: libc::c_int = 1 << 3;
+    // The call is unsigned; a preserved descriptor outside the marked space
+    // needs no range carved around it.
+    let preserve = preserve
+        .filter(|descriptor| *descriptor >= 3)
+        .map(|descriptor| descriptor as u32);
+    let spans: [(u32, u32); 2] = match preserve {
+        Some(preserved) if preserved > 3 && preserved < u32::MAX => {
+            [(3, preserved - 1), (preserved + 1, u32::MAX)]
+        }
+        Some(3) => [(4, u32::MAX), (0, 0)],
+        Some(_) => [(3, u32::MAX - 1), (0, 0)],
+        None => [(3, u32::MAX), (0, 0)],
+    };
+    for (first, last) in spans {
+        if first > last {
+            continue;
+        }
+        // Safety: `close_range` touches no memory and marks only this
+        // process's own descriptors; the arguments are within range by
+        // construction.
+        if unsafe { libc::syscall(libc::SYS_close_range, first, last, CLOSE_RANGE_CLOEXEC) } != 0 {
+            let error = std::io::Error::last_os_error();
+            return match error.raw_os_error() {
+                // Kernel older than 5.9 has no such call; 5.9–5.10 has it
+                // without the CLOEXEC flag and answers EINVAL. Both mean the
+                // inventory is the boundary here, not that the boundary
+                // failed.
+                Some(libc::ENOSYS) | Some(libc::EINVAL) => Ok(false),
+                _ => Err(error),
+            };
+        }
+    }
+    Ok(true)
+}
+
+/// The process's open descriptors, enumerated in the parent before `fork`.
+///
+/// The fallback boundary marks against a real table rather than a guessed
+/// bound: whatever the kernel reports open here is what the child marks
+/// close-on-exec. An enumeration that cannot run is a containment failure —
+/// a host started without the boundary is worse than none.
+#[cfg(unix)]
+fn open_descriptor_inventory() -> std::io::Result<Vec<std::os::fd::RawFd>> {
+    descriptor_inventory_impl()
+}
+
+/// Linux enumerates `/proc/self/fd`, with `/dev/fd` as the fallback for
+/// kernels or containers where procfs is not mounted.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn descriptor_inventory_impl() -> std::io::Result<Vec<std::os::fd::RawFd>> {
+    fd_dir_inventory("/proc/self/fd").or_else(|_| fd_dir_inventory("/dev/fd"))
+}
+
+/// macOS has neither close_range nor a reliable descriptor filesystem:
+/// `proc_pidinfo` reports the real table, and the buffer grows until the
+/// kernel says it fit.
+#[cfg(target_os = "macos")]
+fn descriptor_inventory_impl() -> std::io::Result<Vec<std::os::fd::RawFd>> {
+    let mut capacity = 1024usize;
+    loop {
+        let mut records = vec![
+            libc::proc_fdinfo {
+                proc_fd: 0,
+                proc_fdtype: 0,
+            };
+            capacity
+        ];
+        // Safety: `records` is a live buffer of exactly the advertised size.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                libc::getpid(),
+                libc::PROC_PIDLISTFDS,
+                0,
+                records.as_mut_ptr().cast::<libc::c_void>(),
+                (capacity * std::mem::size_of::<libc::proc_fdinfo>()) as libc::c_int,
+            )
+        };
+        if written < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let count = written as usize / std::mem::size_of::<libc::proc_fdinfo>();
+        if count < capacity {
+            records.truncate(count);
+            return Ok(records.into_iter().map(|record| record.proc_fd).collect());
+        }
+        capacity = capacity.saturating_mul(4);
+        if capacity > (1 << 22) {
+            return Err(std::io::Error::other(
+                "the descriptor table kept growing past four million entries",
+            ));
+        }
+    }
+}
+
+/// Every other unix target enumerates `/dev/fd` — the per-process view the
+/// descriptor filesystem serves where it is mounted. Where it is not, the
+/// spawn refuses rather than starting a host without the boundary.
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android", target_os = "macos"))
+))]
+fn descriptor_inventory_impl() -> std::io::Result<Vec<std::os::fd::RawFd>> {
+    fd_dir_inventory("/dev/fd")
+}
+
+/// Read a descriptor directory (`/proc/self/fd`, `/dev/fd`) into numbers.
+/// A non-numeric entry is skipped rather than failing the inventory; a
+/// directory that cannot be read fails it.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn fd_dir_inventory(path: &str) -> std::io::Result<Vec<std::os::fd::RawFd>> {
+    let entries = std::fs::read_dir(path).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("cannot enumerate {path} for descriptor containment: {error}"),
+        )
+    })?;
+    let mut descriptors = Vec::new();
+    for entry in entries {
+        if let Ok(descriptor) = entry?
+            .file_name()
+            .to_string_lossy()
+            .parse::<std::os::fd::RawFd>()
+        {
+            descriptors.push(descriptor);
+        }
+    }
+    Ok(descriptors)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1714,4 +2048,302 @@ mod tests {
     // `a_host_beside_the_process_is_found_when_nothing_names_one` and
     // `a_host_that_is_nowhere_is_named_rather_than_invented`. What stays here is
     // what the supervisor does with the answer, which is the test above.
+
+    /// The descriptor boundary, exercised through real fork/execs: the parent
+    /// opens descriptors without CLOEXEC — the shape a launcher's file or
+    /// another service's socket has — the child runs the boundary, and a
+    /// grandchild proves what actually crossed the second `exec`.
+    #[test]
+    fn inherited_descriptors_do_not_cross_exec() {
+        use std::os::fd::AsRawFd;
+
+        let directory = std::env::temp_dir().join(format!(
+            "nemo-descriptor-boundary-{}",
+            nemo_relay_plugin_protocol::Uuid::now_v7().simple()
+        ));
+        std::fs::create_dir_all(&directory).expect("a directory for the descriptor fixture");
+        let leaked = std::fs::File::create(directory.join("leaked")).expect("the leaked file");
+        let preserved =
+            std::fs::File::create(directory.join("preserved")).expect("the preserved file");
+        // The standard library opens descriptors close-on-exec; clear the flag
+        // so both have the shape this boundary exists for.
+        for file in [&leaked, &preserved] {
+            rustix::io::fcntl_setfd(file, rustix::io::FdFlags::empty())
+                .expect("clearing close-on-exec");
+        }
+
+        let witness = directory.join("witness");
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("the test binary's own path"),
+        )
+        .arg("--exact")
+        .arg("supervisor::tests::descriptor_boundary_child")
+        .arg("--nocapture")
+        .env(
+            "NEMO_DESCRIPTOR_BOUNDARY_LEAKED",
+            leaked.as_raw_fd().to_string(),
+        )
+        .env(
+            "NEMO_DESCRIPTOR_BOUNDARY_PRESERVED",
+            preserved.as_raw_fd().to_string(),
+        )
+        .env("NEMO_DESCRIPTOR_BOUNDARY_WITNESS", &witness)
+        .env("NEMO_DESCRIPTOR_BOUNDARY_DIRECTORY", &directory)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("the child test binary runs");
+
+        let ran = witness.exists();
+        std::fs::remove_dir_all(&directory).ok();
+        assert!(
+            ran,
+            "the child never ran the boundary: the test filter matched nothing"
+        );
+        assert!(
+            status.success(),
+            "the child reported the descriptor boundary did not hold"
+        );
+    }
+
+    /// The child half of `inherited_descriptors_do_not_cross_exec`: it runs
+    /// the boundary, asserts the flag the boundary sets, and re-execs a
+    /// grandchild so the property that actually matters — the descriptor is
+    /// gone after `exec` — is observed rather than inferred.
+    #[test]
+    fn descriptor_boundary_child() {
+        let Ok(leaked) = std::env::var("NEMO_DESCRIPTOR_BOUNDARY_LEAKED") else {
+            return;
+        };
+        let leaked: std::os::fd::RawFd = leaked.parse().expect("a leaked descriptor number");
+        let preserved: std::os::fd::RawFd = std::env::var("NEMO_DESCRIPTOR_BOUNDARY_PRESERVED")
+            .expect("a preserved descriptor number")
+            .parse()
+            .expect("a preserved descriptor number");
+        let witness = std::env::var("NEMO_DESCRIPTOR_BOUNDARY_WITNESS")
+            .expect("a witness path for the parent");
+        let directory =
+            std::env::var("NEMO_DESCRIPTOR_BOUNDARY_DIRECTORY").expect("the fixture directory");
+
+        let inventory = open_descriptor_inventory()
+            .expect("the child's descriptor table enumerates for the boundary");
+        mark_inherited_descriptors_close_on_exec(Some(preserved), &inventory)
+            .expect("the descriptor boundary applies");
+
+        // Safety: the descriptors were inherited from the parent and are only
+        // interrogated here.
+        let (leaked_flags, preserved_flags) = unsafe {
+            (
+                rustix::io::fcntl_getfd(rustix::fd::BorrowedFd::borrow_raw(leaked)).ok(),
+                rustix::io::fcntl_getfd(rustix::fd::BorrowedFd::borrow_raw(preserved)).ok(),
+            )
+        };
+        std::fs::write(
+            &witness,
+            format!("leaked={leaked_flags:?} preserved={preserved_flags:?}"),
+        )
+        .expect("the witness file");
+        let leaked_flags = leaked_flags.expect("the leaked descriptor is still open before exec");
+        assert!(
+            leaked_flags.contains(rustix::io::FdFlags::CLOEXEC),
+            "an inherited descriptor was left crossing exec"
+        );
+        assert!(
+            !preserved_flags
+                .expect("the preserved descriptor is still open")
+                .contains(rustix::io::FdFlags::CLOEXEC),
+            "the preserved descriptor was marked for closing"
+        );
+
+        // The property itself: a descriptor marked close-on-exec is gone in
+        // the next process, and one that was preserved is still there.
+        let grandchild_witness = std::path::Path::new(&directory).join("grandchild-witness");
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("the test binary's own path"),
+        )
+        .arg("--exact")
+        .arg("supervisor::tests::descriptor_boundary_grandchild")
+        .arg("--nocapture")
+        .env("NEMO_DESCRIPTOR_BOUNDARY_LEAKED", leaked.to_string())
+        .env("NEMO_DESCRIPTOR_BOUNDARY_PRESERVED", preserved.to_string())
+        .env("NEMO_DESCRIPTOR_BOUNDARY_WITNESS", &grandchild_witness)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("the grandchild test binary runs");
+        assert!(
+            grandchild_witness.exists(),
+            "the grandchild never ran: the test filter matched nothing"
+        );
+        assert!(
+            status.success(),
+            "the grandchild reported a descriptor crossed exec"
+        );
+    }
+
+    /// The grandchild half of `inherited_descriptors_do_not_cross_exec`; a
+    /// no-op when the harness runs it as part of the ordinary suite.
+    #[test]
+    fn descriptor_boundary_grandchild() {
+        let Ok(leaked) = std::env::var("NEMO_DESCRIPTOR_BOUNDARY_LEAKED") else {
+            return;
+        };
+        let leaked: std::os::fd::RawFd = leaked.parse().expect("a leaked descriptor number");
+        let preserved: std::os::fd::RawFd = std::env::var("NEMO_DESCRIPTOR_BOUNDARY_PRESERVED")
+            .expect("a preserved descriptor number")
+            .parse()
+            .expect("a preserved descriptor number");
+        let witness = std::env::var("NEMO_DESCRIPTOR_BOUNDARY_WITNESS")
+            .expect("a witness path for the parent");
+
+        // Safety: the descriptors were inherited from the parent process and
+        // are only interrogated here.
+        let (leaked_open, preserved_open) = unsafe {
+            (
+                rustix::io::fcntl_getfd(rustix::fd::BorrowedFd::borrow_raw(leaked)).is_ok(),
+                rustix::io::fcntl_getfd(rustix::fd::BorrowedFd::borrow_raw(preserved)).is_ok(),
+            )
+        };
+        std::fs::write(
+            &witness,
+            format!("leaked={leaked_open} preserved={preserved_open}"),
+        )
+        .expect("the grandchild witness file");
+        assert!(
+            !leaked_open,
+            "a descriptor the host must not inherit crossed exec"
+        );
+        assert!(
+            preserved_open,
+            "the preserved descriptor did not cross exec"
+        );
+    }
+
+    /// The sweep's own bound is part of the boundary's contract: a
+    /// descriptor planted ABOVE the historical 65,536 ceiling, left
+    /// inheritable, is still the supervisor's responsibility — whatever
+    /// the launcher handed this process is exactly what the confined
+    /// host would otherwise inherit.
+    ///
+    /// Hosts whose descriptor hard limit cannot place an fd that high
+    /// cannot run this check; they print SKIP and return. A skip is a
+    /// qualification gap to close on a capable runner, never evidence
+    /// that the guarantee held on this host.
+    #[test]
+    fn inherited_descriptor_above_the_legacy_ceiling_is_marked() {
+        use std::os::fd::AsRawFd;
+
+        const PLANTED_FD: std::os::fd::RawFd = 70_000;
+
+        let rlimit = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+        if let Some(hard) = rlimit.maximum {
+            if hard <= PLANTED_FD as u64 {
+                eprintln!(
+                    "SKIP: descriptor hard limit {hard} cannot place fd {PLANTED_FD} — \
+                     this host cannot qualify the high-descriptor boundary"
+                );
+                return;
+            }
+        }
+        let needed = PLANTED_FD as u64 + 1024;
+        if rlimit.current.is_some_and(|soft| soft < needed) {
+            if let Err(error) = rustix::process::setrlimit(
+                rustix::process::Resource::Nofile,
+                rustix::process::Rlimit {
+                    current: Some(needed),
+                    maximum: rlimit.maximum,
+                },
+            ) {
+                eprintln!(
+                    "SKIP: raising the soft descriptor limit for the planted fd failed: \
+                     {error} — this host cannot qualify the high-descriptor boundary"
+                );
+                return;
+            }
+        }
+
+        let directory = std::env::temp_dir().join(format!(
+            "nemo-descriptor-high-fd-{}",
+            nemo_relay_plugin_protocol::Uuid::now_v7().simple()
+        ));
+        std::fs::create_dir_all(&directory).expect("a directory for the high-fd fixture");
+        let source = std::fs::File::create(directory.join("planted"))
+            .expect("the planted descriptor's file");
+
+        // F_DUPFD places the duplicate at the first free number at or
+        // above the floor; clearing the flag then gives it the shape a
+        // launcher's log file or a credential handle arrives in. A
+        // kernel that cannot place a descriptor there — macOS caps a
+        // process below the legacy ceiling outright — cannot run the
+        // check and reports SKIP rather than pretending to.
+        let planted = match rustix::io::fcntl_dupfd_cloexec(&source, PLANTED_FD) {
+            Ok(fd) => fd,
+            Err(error) => {
+                eprintln!(
+                    "SKIP: the kernel cannot plant a descriptor at {PLANTED_FD} \
+                     ({error}) — this host cannot qualify the high-descriptor boundary"
+                );
+                std::fs::remove_dir_all(&directory).ok();
+                return;
+            }
+        };
+        rustix::io::fcntl_setfd(&planted, rustix::io::FdFlags::empty())
+            .expect("the planted descriptor starts inheritable");
+        let planted_fd = planted.as_raw_fd();
+        assert!(
+            planted_fd >= PLANTED_FD,
+            "the planted descriptor landed at {planted_fd}, below the legacy ceiling"
+        );
+        assert!(
+            !rustix::io::fcntl_getfd(&planted)
+                .expect("the planted descriptor is open")
+                .contains(rustix::io::FdFlags::CLOEXEC),
+            "the fixture must start inheritable"
+        );
+
+        // The inventory is taken after planting: on the fallback path the
+        // planted descriptor is above every bound the sweep could reach, so
+        // only the inventory — or Linux's complete `close_range` — can cover
+        // it. That is the property this test qualifies.
+        let inventory =
+            open_descriptor_inventory().expect("the descriptor table enumerates for the boundary");
+        mark_inherited_descriptors_close_on_exec(None, &inventory)
+            .expect("the descriptor boundary applies");
+
+        let flags = rustix::io::fcntl_getfd(&planted)
+            .expect("the planted descriptor stays open until exec");
+        drop(planted);
+        drop(source);
+        std::fs::remove_dir_all(&directory).ok();
+        assert!(
+            flags.contains(rustix::io::FdFlags::CLOEXEC),
+            "descriptor {planted_fd} above the legacy sweep ceiling was left inheritable — \
+             it would cross exec into the confined host"
+        );
+    }
+
+    /// The fallback boundary stands on the inventory, so the inventory must
+    /// actually see what is open: a descriptor planted inheritable is in the
+    /// snapshot. This is the qualification the macOS fallback runs on — the
+    /// high-descriptor test above can only run where the kernel can place
+    /// one.
+    #[test]
+    fn the_inventory_reports_an_open_descriptor() {
+        use std::os::fd::AsRawFd;
+
+        let file = std::fs::File::create(
+            std::env::temp_dir().join("nemo-inventory-witness"),
+        )
+        .expect("a file for the inventory check");
+        rustix::io::fcntl_setfd(&file, rustix::io::FdFlags::empty())
+            .expect("the descriptor starts inheritable");
+        let inventory =
+            open_descriptor_inventory().expect("the descriptor table enumerates for the boundary");
+        assert!(
+            inventory.contains(&file.as_raw_fd()),
+            "an open descriptor is absent from the inventory the boundary marks against"
+        );
+    }
 }

@@ -1,0 +1,140 @@
+{
+  "schemaVersion": 1,
+  "record": "v0.54.0-rc.3 corrective baseline freeze (PR-01)",
+  "purpose": "Auditable before/after boundary for the rc.3 corrective cycle: source identity, defect register, red-test inventory, and the observed non-determinism of the release evidence pipeline on the pre-repair tree. Nothing in this cycle edits the baseline record in place.",
+  "capturedAt": "2026-10-09T08:34:00Z",
+  "repository": "NEMO-CONTROL umbrella (dawsonblock/NEMO-CONTROL)",
+  "projectRoot": "crabedence-V1-fix-integration-integrity",
+  "baselineBranch": "fix/execution-admission-and-qualprovider-durability",
+  "baselineCommit": "33c587e668daa7a190960d83e9eeb56ce637dd2e",
+  "baselineTree": "130ee478107facc8f44e28fc1e971757ae4af6cf",
+  "versions": {
+    "crabedence": "0.54.0-rc.1",
+    "proposedRelease": "0.54.0-rc.3",
+    "nemoRuntime": "0.9.1-rc.4",
+    "nemoRustToolchain": "1.96.1",
+    "idempotencyRequiredSchemaVersion": 17,
+    "checkpointSchemaVersion": 2,
+    "receiptSchemaVersion": 3
+  },
+  "toolchains": {
+    "go": "go1.26.5 darwin/arm64",
+    "node": "v24.16.0",
+    "python3": "3.12.0",
+    "cargo": "1.95.0 (rust-toolchain.toml pins 1.96.1; rustup resolves on demand)",
+    "platform": "macOS 26.2 arm64 (Darwin 25.2.0)",
+    "hostDescriptorCeiling": "kern.maxfilesperproc=61440 — a descriptor above the 65,536 legacy sweep bound cannot exist on this host; the high-fd regression reports SKIP here and is mandatory on a qualified Linux runner"
+  },
+  "defectFileDigests": {
+    "internal/qualprovider/server.go": "54405fd92fa52f49a898cb485ded442f289a0133ea48ee4177524f6f21bfdc70",
+    "internal/qualprovider/durable.go": "634f448a23034a1721edaf94a38991ff3a7077f4c437c41f8d296e88a588d891",
+    "internal/execution/service.go": "01c72a753f198af2d79eb1c4b2eff1ba3f8ef2906ea1c9ba131a8605f3cead02",
+    "internal/evidence/checkpoint.go": "1a67539a394e4ee7019c79e6601e98b3a5808653dcaa54cdb4e91b1066d687e1",
+    "internal/evidence/evidence.go": "b889c134cf3dc77f82426e8ed78e263002b6c212ba333c1d93770e4eee42d434",
+    "internal/idempotency/sqlite.go": "5c6ea81d63ec4981689117c02bbde62779f035528335178fcbb314c109512729",
+    "internal/idempotency/store.go": "033c4b5d37b6aa4f1537ec8bdf607c877d35a2e7f13fc233c1d216fe42c0203a",
+    "scripts/finalize-release-evidence.sh": "a0b86074a1101ba082948c3766746f8921b4ba3d24f180ed3a7e2eb0cb45829c",
+    "scripts/generate-evidence-root.py": "c741af982bdf43ad9273e3a297d69704303bd2a196f90b73fe95029e8e028d74",
+    "scripts/generate-qualification-report.sh": "623adaae9b4ae3092ffba11530a937442c320294f44baa522b610d5ccf994357",
+    "runtimes/nemo-relay/crates/plugin-host/src/supervisor.rs": "829a1b52ad67e9d89da4d1e1bc628af3ea214ef68e9e34682b784100ff611417",
+    "runtimes/nemo-relay/crates/plugin-host/src/limits.rs": "08bf7f8a2888f00df106eb199e643de7a2d618d7da7fd4d60fff2b25f8007c60"
+  },
+  "defectRegister": [
+    {
+      "id": "F-001",
+      "severity": "high",
+      "state": "corrective v2 implementation present; independent real-store qualification incomplete",
+      "redTests": ["existing: internal/idempotency/checkpoint_test.go", "existing: internal/evidence/checkpoint_test.go", "new: TestGoldenCheckpointChainDigestV2 / V1 / SigningPayload / Signature freeze the signed meaning so repair work cannot silently redefine it"]
+    },
+    {
+      "id": "F-002",
+      "severity": "high",
+      "state": "confirmed unresolved on baseline — startup silently skips malformed provider-log.jsonl lines (server.go:216-226); GET /effects performs a best-effort rescan that can serve records the server never acknowledged (server.go:688-694); an unreadable ledger silently becomes an empty map",
+      "redTests": ["TestLegacyEffectsCorruptedStartupRejects", "TestLegacyEffectsAcknowledgedReplayAfterCrash", "TestLegacyEffectsGetRejectsCorruptState"],
+      "observedOnBaseline": "all three tests FAIL on the baseline tree; the unreadable-ledger case demonstrably mints a second durable record for the acknowledged token"
+    },
+    {
+      "id": "F-003",
+      "severity": "high",
+      "state": "confirmed unresolved — see refinalizationObservedDiff",
+      "redTests": ["scripts/finalize-release-evidence.test.js 're-finalization is stable' (passes only because both runs land in the same second)", "PR-03 adds a test that sleeps past the timestamp granularity"]
+    },
+    {
+      "id": "F-004",
+      "severity": "medium-high",
+      "state": "confirmed coverage bound — limits.rs INHERITED_DESCRIPTOR_SWEEP_CEILING = 65_536; a descriptor planted above it is never marked close-on-exec",
+      "redTests": ["supervisor::tests::inherited_descriptor_above_the_legacy_ceiling_is_marked — SKIP on this macOS host (kernel ceiling 61440 < 70000); red on a Linux runner that can place the descriptor"]
+    },
+    {
+      "id": "F-005",
+      "severity": "medium",
+      "state": "confirmed — Stop() starts handlers.Wait() while acceptLoop can still reach handlers.Add(1); a connection accepted in that window is served after the service reports stopped",
+      "redTests": ["TestStopBarrierCoversAcceptedConnection — deterministically red on baseline: the held connection dispatched and served a request after Stop returned"]
+    },
+    {
+      "id": "F-006",
+      "severity": "operational/high impact",
+      "state": "no independent checkpoint custody mechanism — local checkpoint file is the only copy",
+      "redTests": ["deferred to PR-07 (external custody is infrastructure, not a unit test)"]
+    },
+    {
+      "id": "F-007",
+      "severity": "high",
+      "state": "release identity mismatch — VERSION says 0.54.0-rc.1 while the bundled qualification record describes rc.2 corrective work",
+      "redTests": ["deferred to PR-08 (release identity binding)"]
+    },
+    {
+      "id": "F-008",
+      "severity": "high for production",
+      "state": "mandatory clean-room and platform qualification not proven",
+      "redTests": ["deferred to PR-09 (adversarial qualification matrix)"]
+    }
+  ],
+  "refinalizationObservedDiff": {
+    "method": "fixture per scripts/finalize-release-evidence.test.js; finalize; sleep 2; finalize again; byte-diff of covered files",
+    "changedFiles": {
+      "evidence-root.json": "generated_at 2026-10-09T08:34:31Z -> 08:34:33Z — the field is excluded from root_sha256 but the FILE BYTES change, so SHA256SUMS changes",
+      "FINAL_QUALIFICATION_REPORT.md": "'Report regenerated at' line advances with wall clock",
+      "SHA256SUMS": "recomputed digests for the two regenerated files; also sweeps dot-directories (./.run1/*) into the manifest — traversal does not exclude hidden entries",
+      "evidence-manifest.json": "sha256, file_count and generated_at all change"
+    },
+    "conclusion": "re-finalization of identical inputs does NOT produce byte-identical canonical evidence whenever the wall clock crosses a second boundary — the existing test cannot see it at second granularity"
+  },
+  "redTestInventory": {
+    "internal/qualprovider/legacy_effects_test.go": [
+      "TestLegacyEffectsCorruptedStartupRejects (15 corruption subtests red; 2 positive controls green)",
+      "TestLegacyEffectsAcknowledgedReplayAfterCrash (torn-tail and unreadable-ledger subtests red; clean-restart green)",
+      "TestLegacyEffectsGetRejectsCorruptState (out-of-band record served as truth — red)"
+    ],
+    "internal/execution/stop_accept_race_test.go": [
+      "TestStopBarrierCoversAcceptedConnection — deterministically red (served after Stop returned)",
+      "TestRepeatedStopIsIdempotent — green guard"
+    ],
+    "internal/qualprovider/recovery_test.go": "faultFS gained a 'read' target and a pathSuffix filter so injection can be scoped to the effects log rather than the operations ledger",
+    "runtimes/nemo-relay/.../supervisor.rs": [
+      "inherited_descriptor_above_the_legacy_ceiling_is_marked — SKIP on macOS (kernel cap), red on a capable Linux host"
+    ],
+    "internal/evidence/checkpoint_golden_test.go": [
+      "TestGoldenCheckpointChainDigestV2",
+      "TestGoldenCheckpointChainDigestV1",
+      "TestGoldenCheckpointSigningPayload",
+      "TestGoldenCheckpointSignature — freeze the checkpoint v2 ABI so repair work cannot silently redefine signed meaning"
+    ],
+    "internal/execution/service.go": "acceptGate test seam (nil in production) so the accept-before-register window is exercisable deterministically"
+  },
+  "threatModelScope": {
+    "inScope": [
+      "provider-side durable acknowledgement state (JSON-lines ledgers under a private state directory)",
+      "release evidence determinism and signature custody",
+      "the execution service accept/drain lifecycle",
+      "plugin-host inherited descriptor containment at the exec boundary",
+      "checkpoint v2 canonical evidence and the v16 -> v17 store migration"
+    ],
+    "outOfScopeForRC3": [
+      "VM-grade hostile-code isolation (restricted process mode is not a hostile-code sandbox)",
+      "new provider matrix entries, model backends, RSI promotion",
+      "a second authority kernel or orchestration framework"
+    ],
+    "adversary": "a corrupted or unreadable durable ledger, a torn write at any commit boundary, an out-of-band edit of provider state, a racing Stop, an inherited descriptor above the legacy sweep bound, a stale or mutable release attestation, and a rolled-back database plus local checkpoint pair — each must fail closed at an observable boundary"
+  }
+}

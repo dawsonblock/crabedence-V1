@@ -800,8 +800,24 @@ func TestLiveCriticalQualificationTokenPayloadCollision(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read ledger: %v", err)
 	}
-	if lines := strings.Count(strings.TrimSpace(string(ledger)), "\n") + 1; lines != 1 {
-		t.Fatalf("ledger entries = %d, want 1", lines)
+	// The two-phase commit writes exactly one PREPARED and one COMMITTED
+	// record per operation; the colliding request must add neither.
+	var phases []string
+	for _, line := range strings.Split(strings.TrimSpace(string(ledger)), "\n") {
+		var rec struct {
+			Phase string `json:"phase"`
+			Token string `json:"token"`
+		}
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("ledger line is not valid JSON: %q: %v", line, err)
+		}
+		if rec.Token != "collision-token" {
+			t.Fatalf("ledger holds a record for an unexpected token: %q", line)
+		}
+		phases = append(phases, rec.Phase)
+	}
+	if len(phases) != 2 || phases[0] != "PREPARED" || phases[1] != "COMMITTED" {
+		t.Fatalf("ledger phases = %v, want exactly [PREPARED COMMITTED] — the collision must not add a record", phases)
 	}
 }
 

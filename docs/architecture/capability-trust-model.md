@@ -68,7 +68,7 @@ identities. A policy change is never invisible to idempotency.
 | Route | Intended semantics | Status |
 |---|---|---|
 | `LOCAL` | Deterministic / contained functions in the caller's process — no socket hop, no durability, no admission. Bound to `PURE` + `NONE`. | Implemented: `FunctionHookRegistry` executes hooks in-process under the LOCAL contract (PURE-only, input validation, bounded runtime, bounded payload, well-formed JSON results, audit record). Hooks receive data only — no store, dispatcher, or effect-fabric client — so `PURE` is an execution boundary, not an assertion. |
-| `DIRECT` | Observational external operations with admission, schema validation, authority, timeouts, and audit — but without the durable mutation ledger. Bound to `READ` + `STANDARD`. | Implemented: `DirectReadRegistry` executes reads under the in-process contract (READ-only, argument validation, bounded runtime, bounded payload, projected results, audit record). First real capability: `github.issue.get`. A failed read is a safe `FAILED`, never `UNKNOWN`. |
+| `DIRECT` | Observational external operations with admission, schema validation, authority, timeouts, and audit — but without the durable mutation ledger. Bound to `READ` + `STANDARD`. | Implemented: `DirectReadRegistry` executes reads under the in-process contract (READ-only, argument validation, bounded runtime, bounded payload, projected results, audit record). First real capabilities: `github.issue.get` and `github.issue.list`. A failed read is a safe `FAILED`, never `UNKNOWN`. |
 | `CRABEDENCE` | The durable execution kernel: authority, idempotency, dispatch, evidence, reconciliation. Required for `MUTATION`/`CRITICAL` and for `DURABLE`/`HIGH_ASSURANCE`. | Implemented (`crabbox serve-exec`) |
 
 `RouteDispatcher` is the single dispatch point: it reads
@@ -76,9 +76,12 @@ identities. A policy change is never invisible to idempotency.
 class/route invariant at dispatch time as defense in depth (a
 `MUTATION`/`CRITICAL` on a non-durable route is denied even if a
 registry bug produced the descriptor), and fails closed on an unknown
-route. Until the `DIRECT` leg lands, `READ` capabilities that declare
-it fail with `CAPABILITY_UNAVAILABLE` rather than silently taking a
-different path.
+route. From NeMo Relay, a `DIRECT`-pinned capability crosses the same socket
+as `CRABEDENCE` — the wire carries no route field, so the route is decided
+here, twice (the runtime's router re-checks the class/assurance invariant
+against the verified snapshot; the dispatcher re-checks it against its own
+registry). A `MUTATION`/`CRITICAL` descriptor somehow pinned `DIRECT` is
+denied at both layers.
 
 ## The planner boundary
 
@@ -162,6 +165,15 @@ principal.
   and artifact binding exist, regenerating `SHA256SUMS` (which now covers
   `artifact.json`) and `evidence-manifest.json`; the verifier fails a
   bundle whose checksum manifest does not cover the artifact binding.
+  Finalization is deterministic — unchanged inputs produce byte-identical
+  `evidence-root.json`, `FINAL_QUALIFICATION_REPORT.md`, `SHA256SUMS` and
+  `evidence-manifest.json` at any wall-clock time, locale, timezone or
+  path (every generated timestamp binds the qualification record's own
+  timestamp, and the checksum traversal prunes hidden/temporary entries
+  and sorts byte-wise). `--verify` recomputes every final artifact
+  read-only and byte-compares it; a bundle carrying an `attestation/` is
+  sealed — finalization refuses to rewrite or silently remove it, so
+  signed history is never revised underneath its attestation.
 - The attestation terminates the chain: its subject is the final
   `evidence-manifest.json` and its predicate carries the manifest digest
   (`evidence_sha256`), which the verifier cross-checks. An attestation of

@@ -203,6 +203,7 @@ fn collect_configuration(
         })
         .collect(),
         plugin_resolution: plugin_diagnostics.resolution.clone(),
+        native_plugin_isolation: native_plugin_isolation_check(),
         resolution,
         // `default_agent` is reserved in the design for Phase 2 dispatch; not currently parsed
         // out of FileConfig. Doctor reports `None` until that lands.
@@ -282,6 +283,68 @@ fn plugin_resolution_check(
                 "plugins.toml not configured; run `nemo-relay plugins edit` to configure plugins"
                     .into(),
         }
+    }
+}
+
+/// The host isolation policy the next native activation in this environment
+/// would select, with the trust class it delivers rather than the one a
+/// deployment might believe it configured.
+///
+/// A malformed value and a hostile-class request are the same outcome at
+/// activation — refusal — so both surface as Fail rather than a selection the
+/// runtime would not actually honor. On Windows every selection is reported
+/// against the platform fact, because native hosting itself is unsupported
+/// there and a confinement level could never take effect.
+fn native_plugin_isolation_check() -> Check {
+    native_isolation_check_for(
+        nemo_relay_plugin_host::isolation_policy::NativeIsolationPolicy::from_environment(),
+    )
+}
+
+fn native_isolation_check_for(
+    resolved: Result<nemo_relay_plugin_host::isolation_policy::NativeIsolationPolicy, String>,
+) -> Check {
+    const NAME: &str = "Native isolation";
+    let policy = match resolved {
+        Ok(policy) => policy,
+        Err(error) => {
+            return Check {
+                name: NAME,
+                status: Status::Fail,
+                details: format!(
+                    "{error}; fix or unset {NATIVE_ISOLATION_ENV}",
+                    NATIVE_ISOLATION_ENV =
+                        nemo_relay_plugin_host::isolation_policy::NATIVE_ISOLATION_ENV
+                ),
+            };
+        }
+    };
+    let model = policy.trust_model();
+    if cfg!(target_os = "windows") {
+        return Check {
+            name: NAME,
+            status: if policy.confines_resources() {
+                Status::Fail
+            } else {
+                Status::Info
+            },
+            details: format!(
+                "'{}' selected but native plugin hosting is unsupported on this platform",
+                model.policy
+            ),
+        };
+    }
+    Check {
+        name: NAME,
+        status: if model.confines_ambient_resources {
+            Status::Pass
+        } else {
+            Status::Info
+        },
+        details: format!(
+            "'{}' ({} class): {}",
+            model.policy, model.trust_class, model.note
+        ),
     }
 }
 

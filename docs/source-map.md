@@ -30,9 +30,13 @@ Crabbox has three implementation surfaces:
 - Kong command tree and top-level help: `internal/cli/cli_kong.go`, `internal/cli/app.go`
 - Per-command `flag` parsing, shared lease-create flags, and exit helpers:
   `internal/cli/flags.go`, `internal/cli/lease_flags.go`, `internal/cli/errors.go`, `internal/cli/fmt.go`
-- Config defaults, YAML keys, env overrides, and per-provider config sections:
-  `internal/cli/config.go`, `worker/src/config.ts`
-- Target selection (linux/macos/windows) and class maps: `internal/cli/target.go`, `internal/cli/config.go`
+- Config model and per-provider config sections: `internal/cli/config_types.go`,
+  `worker/src/config.ts`; defaults and provider-selection pipeline:
+  `internal/cli/config.go`; YAML keys and file application: `internal/cli/config_file_types.go`,
+  `internal/cli/config_file.go`; env overrides: `internal/cli/config_env.go`;
+  explicitness markers: `internal/cli/config_explicitness.go`; cache volumes:
+  `internal/cli/config_cache.go`
+- Target selection (linux/macos/windows) and class maps: `internal/cli/target.go`, `internal/cli/config_machine.go`
 - Network target resolution and Tailscale metadata: `internal/cli/network.go`
 - Named profiles: `internal/cli/profiles.go`
 - `crabbox init` generated repo files (workflow, skill, config): `internal/cli/init.go`, `internal/cli/init_detect.go`
@@ -103,11 +107,11 @@ SSH-lease providers:
 - Azure VM: `internal/providers/azure`, with CLI helpers in `internal/cli/azure.go`
 - Google Cloud (Compute Engine): `internal/providers/gcp`, with CLI helpers in `internal/cli/gcp.go`
 - Hetzner Cloud: `internal/providers/hetzner`, with CLI helpers in `internal/cli/hcloud.go`
-- DigitalOcean Droplets: `internal/providers/digitalocean`, with config glue in `internal/cli/config.go`
-- Vultr instances: `internal/providers/vultr`, with config glue in `internal/cli/config.go`
-- OVHcloud Public Cloud: `internal/providers/ovh`, with config glue in `internal/cli/config.go`
+- DigitalOcean Droplets: `internal/providers/digitalocean`, with config glue in `internal/cli/config_types.go`
+- Vultr instances: `internal/providers/vultr`, with config glue in `internal/cli/config_types.go`
+- OVHcloud Public Cloud: `internal/providers/ovh`, with config glue in `internal/cli/config_types.go`
 - GitHub Codespaces: `internal/providers/githubcodespaces`, with config glue
-  and env overrides in `internal/cli/config.go`
+  and env overrides in `internal/cli/config_types.go`, `internal/cli/config_env.go`
 - Parallels (macOS VM host): `internal/providers/parallels`, with CLI helpers in `internal/cli/parallels.go`
 - Proxmox VE: `internal/providers/proxmox`, with CLI helpers in `internal/cli/proxmox.go`
 - XCP-ng (`xcp-ng`): `internal/providers/xcpng`
@@ -121,7 +125,7 @@ SSH-lease providers:
   macOS CI/release jobs
 - Boxd KVM microVMs via the HTTPS console API, authenticated WSS guest
   bootstrap, and per-lease SSH trust: `internal/providers/boxd`; config wiring
-  lives in `internal/cli/config.go`; explicit HTTPS device login lives in
+  lives in `internal/cli/config_types.go`; explicit HTTPS device login lives in
   `scripts/boxd-login.mjs`
 - Canonical Multipass local Ubuntu VM: `internal/providers/multipass`
 - Cirrus Labs tart local macOS VM: `internal/providers/tart`
@@ -265,7 +269,7 @@ Provider docs:
 
 ## Cross-cutting Feature Docs
 
-- Configuration precedence and YAML schema: `docs/features/configuration.md` (code: `internal/cli/config.go`, `internal/cli/config_cmd.go`)
+- Configuration precedence and YAML schema: `docs/features/configuration.md` (code: `internal/cli/config.go`, `internal/cli/config_file_types.go`, `internal/cli/config_file.go`, `internal/cli/config_env.go`, `internal/cli/config_cmd.go`)
 - Jobs: `docs/features/jobs.md` (code: `internal/cli/job.go`)
 - Identifiers (lease IDs, slugs, claims, run IDs): `docs/features/identifiers.md` (code: `internal/cli/lease.go`, `internal/cli/slug.go`, `internal/cli/claim.go`)
 - Doctor checks: `docs/features/doctor.md` (code: `internal/cli/doctor.go`; readiness API in `worker/src/fleet.ts`)

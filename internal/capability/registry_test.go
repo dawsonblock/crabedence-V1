@@ -205,6 +205,10 @@ func TestAdmitMissingPrincipal(t *testing.T) {
 	}
 }
 
+// A grant-required capability with no authority reference is no longer
+// an admission failure: the request asks the service to broker the
+// principal's authority, and VerifyAuthority decides whether the store
+// admits it. Presence of a reference is not an admission fact.
 func TestAdmitMissingGrantID(t *testing.T) {
 	r := NewRegistry()
 	// A grant-required capability must use a route whose admission
@@ -224,13 +228,10 @@ func TestAdmitMissingGrantID(t *testing.T) {
 	decision := r.Admit(AdmissionRequest{
 		Capability: "test.nogrant",
 		Principal:  "alice@example.com",
-		// Missing GrantID
+		// Missing GrantID — the brokered path decides
 	})
-	if decision.Allowed {
-		t.Fatal("expected not allowed for missing grant_id")
-	}
-	if decision.FailureCode != FailureUnauthorized {
-		t.Errorf("expected UNAUTHORIZED, got %s", decision.FailureCode)
+	if !decision.Allowed {
+		t.Fatal("a request without an authority reference must reach grant resolution")
 	}
 }
 

@@ -21,11 +21,24 @@ What the bundle is for:
   the default: the weaker one exists for plugins signed by someone else and is
   chosen explicitly.
 
-Signing here is ad hoc (`codesign --sign -`). That is what makes the *security
-architecture* implementable and testable on a machine with no Apple certificate,
-and it is not a distribution story: an ad-hoc signature is not notarizable and
-not accepted for a downloaded artifact, so shipping this to users still needs a
-Developer ID and a notarization step in CI.
+The default signature is ad hoc (`codesign --sign -`). That is what makes the
+*security architecture* implementable and testable on a machine with no Apple
+certificate, and it is not a distribution story: an ad-hoc signature is not
+notarizable and not accepted for a downloaded artifact. The release lane is
+the same script with a real identity:
+
+    package-plugin-host-app.py --host-binary ... --output-directory ... \
+        --version ... \
+        --signing-identity "Developer ID Application: <Team>" \
+        --notary-profile <keychain-profile>
+
+That lane signs with the Developer ID and the hardened runtime, submits the
+bundle to the notary service and waits, staples the ticket, and then verifies
+the result the way `--verify-release` does: strict signature validity, an
+`Authority=Developer ID Application:` chain rather than an ad-hoc one, the
+hardened-runtime flag, a stapled ticket, and Gatekeeper acceptance. Release
+qualification is `--verify-release` alone, which fails on anything less —
+including a bundle that is only ad-hoc signed.
 """
 
 from __future__ import annotations
@@ -125,14 +138,16 @@ def sign_bundle(
     entitlements: Path,
     *,
     bundle_identifier: str = BUNDLE_IDENTIFIER,
+    signing_identity: str = "-",
     run: Callable[[Sequence[str]], subprocess.CompletedProcess[bytes]] = subprocess.run,
 ) -> None:
-    """Sign the bundle ad hoc with `entitlements`.
+    """Sign the bundle with `entitlements` and `signing_identity`.
 
-    Ad hoc (`--sign -`) on purpose: the entitlement is what the sandbox is read
-    from, and requiring an Apple certificate to *test* the architecture would put
-    the security design behind a purchasing decision. Distribution is a separate
-    step with a real identity and notarization, and this signature is not one.
+    Ad hoc (`--sign -`) on purpose by default: the entitlement is what the
+    sandbox is read from, and requiring an Apple certificate to *test* the
+    architecture would put the security design behind a purchasing decision.
+    A real identity turns this into the release signature — same entitlements,
+    same hardened runtime, plus the secure timestamp a notarization needs.
     """
     if not entitlements.is_file():
         raise ValueError(f"entitlements file does not exist: {entitlements}")
@@ -140,15 +155,17 @@ def sign_bundle(
         "codesign",
         "--force",
         "--sign",
-        "-",
+        signing_identity,
         "--options",
         "runtime",
         "--identifier",
         bundle_identifier,
         "--entitlements",
         str(entitlements),
-        str(bundle),
     ]
+    if signing_identity != "-":
+        command += ["--timestamp"]
+    command += [str(bundle)]
     completed = run(command)
     if completed.returncode != 0:
         raise ValueError(f"codesign failed for {bundle}: {completed.stderr.decode(errors='replace')}")
@@ -178,6 +195,95 @@ def verify_hardened_runtime(
         raise ValueError(f"cannot inspect the signature for {bundle}: {details}")
     if not re.search(r"(?m)^CodeDirectory\b[^\r\n]*\bflags=[^\r\n]*\bruntime\b", details):
         raise ValueError(f"the signature for {bundle} does not enable Hardened Runtime")
+
+
+def verify_release_signature(
+    bundle: Path,
+    *,
+    run: Callable[..., subprocess.CompletedProcess[bytes]] = subprocess.run,
+) -> None:
+    """Require the signature to be a Developer ID, not an ad-hoc fallback."""
+    completed = run(["codesign", "--display", "--verbose=4", str(bundle)], capture_output=True)
+    details = (completed.stdout + completed.stderr).decode(errors="replace")
+    if completed.returncode != 0:
+        raise ValueError(f"cannot inspect the signature for {bundle}: {details}")
+    if re.search(r"(?m)^Signature=adhoc\b", details):
+        raise ValueError(
+            f"{bundle} is only ad-hoc signed; a release artifact requires a "
+            "Developer ID Application signature and a notarized ticket"
+        )
+    if not re.search(r"(?m)^Authority=Developer ID Application:", details):
+        raise ValueError(
+            f"the signature for {bundle} is not anchored at a Developer ID "
+            "Application identity"
+        )
+
+
+def verify_notarized_and_stapled(
+    bundle: Path,
+    *,
+    run: Callable[..., subprocess.CompletedProcess[bytes]] = subprocess.run,
+) -> None:
+    """Require a stapled notarization ticket and Gatekeeper acceptance."""
+    stapler = run(["xcrun", "stapler", "validate", str(bundle)], capture_output=True)
+    if stapler.returncode != 0:
+        raise ValueError(
+            f"{bundle} has no valid stapled notarization ticket: "
+            f"{(stapler.stdout + stapler.stderr).decode(errors='replace').strip()}"
+        )
+    assess = run(
+        ["spctl", "--assess", "--type", "execute", "--verbose=4", str(bundle)],
+        capture_output=True,
+    )
+    if assess.returncode != 0:
+        raise ValueError(
+            f"Gatekeeper does not accept {bundle}: "
+            f"{(assess.stdout + assess.stderr).decode(errors='replace').strip()}"
+        )
+
+
+def notarize_and_staple(
+    bundle: Path,
+    notary_profile: str,
+    *,
+    run: Callable[[Sequence[str]], subprocess.CompletedProcess[bytes]] = subprocess.run,
+) -> None:
+    """Submit `bundle` to the notary service and staple the granted ticket.
+
+    The profile is a `xcrun notarytool store-credentials` keychain profile:
+    credentials stay in the keychain and never reach this command line.
+    """
+    archive = bundle.parent / f"{bundle.name}.notary.zip"
+    try:
+        zipped = run(
+            ["ditto", "-c", "-k", "--keepParent", str(bundle), str(archive)],
+            capture_output=True,
+        )
+        if zipped.returncode != 0:
+            raise ValueError(
+                f"cannot package {bundle} for notarization: "
+                f"{(zipped.stdout + zipped.stderr).decode(errors='replace').strip()}"
+            )
+        submitted = run(
+            [
+                "xcrun", "notarytool", "submit", str(archive),
+                "--keychain-profile", notary_profile, "--wait",
+            ],
+            capture_output=True,
+        )
+        if submitted.returncode != 0:
+            raise ValueError(
+                f"notarization failed for {bundle}: "
+                f"{(submitted.stdout + submitted.stderr).decode(errors='replace').strip()}"
+            )
+        stapled = run(["xcrun", "stapler", "staple", str(bundle)], capture_output=True)
+        if stapled.returncode != 0:
+            raise ValueError(
+                f"cannot staple the notarization ticket to {bundle}: "
+                f"{(stapled.stdout + stapled.stderr).decode(errors='replace').strip()}"
+            )
+    finally:
+        archive.unlink(missing_ok=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -211,25 +317,67 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="lay the bundle out without signing it, for packaging tests",
     )
+    parser.add_argument(
+        "--signing-identity",
+        default="-",
+        help="the codesign identity; '-' (default) is ad hoc, 'Developer ID "
+        "Application: <Team>' is the release identity",
+    )
+    parser.add_argument(
+        "--notary-profile",
+        default=None,
+        help="the `xcrun notarytool store-credentials` keychain profile for "
+        "notarization; required for a release signature",
+    )
+    parser.add_argument(
+        "--verify-release",
+        action="store_true",
+        help="verify an existing bundle instead of packaging: strict signature, "
+        "Developer ID authority, hardened runtime, stapled ticket, Gatekeeper",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     """Package the host named on the command line as a signed bundle."""
     args = parse_args()
-    if sys.platform != "darwin" and not args.no_sign:
+    if sys.platform != "darwin" and not (args.no_sign and not args.verify_release):
         raise SystemExit(
-            "the macOS plugin host bundle is signed with codesign, which is only available on "
-            "macOS; pass --no-sign to lay out the bundle without a signature"
+            "the macOS plugin host bundle is signed and verified with codesign, "
+            "which is only available on macOS; pass --no-sign to lay out the "
+            "bundle without a signature"
         )
     try:
+        if args.verify_release:
+            bundle = args.output_directory / BUNDLE_NAME
+            verify_bundle_signature(bundle)
+            verify_hardened_runtime(bundle)
+            verify_release_signature(bundle)
+            verify_notarized_and_stapled(bundle)
+            print(f"release-verified {bundle}", file=sys.stderr)
+            return
         bundle = write_bundle(
             args.host_binary,
             args.output_directory,
             version=args.version,
         )
         if not args.no_sign:
-            sign_bundle(bundle, entitlements_for(args.variant))
+            if args.signing_identity != "-" and not args.notary_profile:
+                raise ValueError(
+                    "--signing-identity names a release signature; a release "
+                    "bundle must also be notarized — pass --notary-profile"
+                )
+            sign_bundle(
+                bundle,
+                entitlements_for(args.variant),
+                signing_identity=args.signing_identity,
+            )
+            verify_bundle_signature(bundle)
+            verify_hardened_runtime(bundle)
+            if args.signing_identity != "-":
+                notarize_and_staple(bundle, args.notary_profile)
+                verify_release_signature(bundle)
+                verify_notarized_and_stapled(bundle)
     except ValueError as error:
         raise SystemExit(str(error)) from error
     print(f"packaged {bundle}", file=sys.stderr)

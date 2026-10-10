@@ -21,6 +21,7 @@ import (
 // it, so a snapshot written before startup would fail with ENOENT and
 // take the whole service down.
 func TestServeWritesRegistrySnapshotOnAFreshDirectory(t *testing.T) {
+	t.Setenv("CRABBOX_MODE", "development")
 	t.Setenv("CRABEDENCE_STORE_BACKEND", "none")
 	t.Setenv("CRABEDENCE_QUAL_PROVIDER_URL", "")
 	t.Setenv("CRABEDENCE_PEER_PRINCIPALS", "")
@@ -88,7 +89,7 @@ func TestServeWritesRegistrySnapshotOnAFreshDirectory(t *testing.T) {
 			ids[id] = true
 		}
 	}
-	for _, want := range []string{"system.echo", "system.info", "test.counter.increment", "github.issue.create", "github.issue.get"} {
+	for _, want := range []string{"system.echo", "system.info", "test.counter.increment", "github.issue.create", "github.issue.comment", "github.issue.get", "github.issue.list", "github.issue.close", "github.issue.update", "github.pr.create", "github.pr.merge"} {
 		if !ids[want] {
 			t.Fatalf("registry snapshot is missing %s (registry membership must not depend on deployment configuration)", want)
 		}
@@ -108,6 +109,7 @@ func TestServeWritesRegistrySnapshotOnAFreshDirectory(t *testing.T) {
 // the registry digest, covers the exact canonical bytes it ships with,
 // and records only normalized, non-secret configuration.
 func TestServeWritesVerifiableRuntimeIdentity(t *testing.T) {
+	t.Setenv("CRABBOX_MODE", "development")
 	t.Setenv("CRABEDENCE_STORE_BACKEND", "none")
 	t.Setenv("CRABEDENCE_QUAL_PROVIDER_URL", "")
 	t.Setenv("CRABEDENCE_PEER_PRINCIPALS", "")
@@ -203,6 +205,7 @@ func TestServeWritesVerifiableRuntimeIdentity(t *testing.T) {
 // them — a retry landing on a peer replica would derive a different
 // provider token and could dispatch the same effect twice.
 func TestServeRejectsReplicatedDeploymentWithoutSharedStore(t *testing.T) {
+	t.Setenv("CRABBOX_MODE", "development")
 	t.Setenv("CRABBOX_GITHUB_ENABLED", "false")
 	t.Setenv("CRABBOX_GITHUB_TOKEN", "")
 	t.Setenv("GITHUB_TOKEN", "")

@@ -633,7 +633,7 @@ describe("coordinator runtimes", () => {
       CRABBOX_GITHUB_CLIENT_ID: "github-client",
       CRABBOX_GITHUB_CLIENT_SECRET: "github-secret",
       CRABBOX_SHARED_TOKEN: "shared",
-      CRABBOX_SESSION_SECRET: "session-secret",
+      CRABBOX_SESSION_SECRET: "test-session-secret-with-32-characters",
     } as Env;
     const start = await githubAuthRoute(
       new Request("https://coordinator.test/v1/auth/github/start", {

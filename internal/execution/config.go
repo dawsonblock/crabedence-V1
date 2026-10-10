@@ -3,6 +3,7 @@ package execution
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -33,8 +34,42 @@ type ServiceConfig struct {
 
 	// Peer authentication and execution budgets.
 	PeerPrincipals   PeerPrincipalMap
+	TrustedProxyUIDs map[uint32]struct{}
 	ExecutorTimeouts ExecutorTimeouts
 	ProviderGate     ProviderGateConfig
+
+	// Admission ceilings: simultaneously open connections and the
+	// smaller, separate bound on the unauthenticated phase
+	// (attestation handshakes and peer authentication).
+	MaxConnections          int
+	MaxHandshakeConnections int
+
+	// CheckpointPath, when set, is where the service writes its
+	// periodically emitted signed evidence checkpoint — the latest
+	// emission (replaced atomically) beside a retained append-only
+	// sequence log (<path>.jsonl) an operator archives.
+	// CheckpointCustodyPath, when set, is a second emission target
+	// with the same layout; it only provides independent custody when
+	// its storage lives outside this host's failure domain (an
+	// independent mount or custody-backed path) — a property the
+	// service cannot verify, so local-only retention is scoped as not
+	// independent custody. CheckpointInterval is the emission period
+	// (default DefaultCheckpointInterval).
+	CheckpointPath        string
+	CheckpointCustodyPath string
+	CheckpointInterval    time.Duration
+
+	// Attestation is the resolved runtime-attestation policy. nil
+	// means the handshake is disabled and invocations carry no
+	// session requirement — a development-only posture, since
+	// production requires attestation.
+	Attestation *AttestationPolicy
+
+	// production is the deployment mode validated by
+	// resolveDeploymentMode at load — CRABBOX_MODE=production. Held
+	// rather than re-read so the config reflects exactly what startup
+	// enforced.
+	production bool
 }
 
 // LoadServiceConfig resolves and validates the deployment configuration.
@@ -42,12 +77,22 @@ type ServiceConfig struct {
 // enforced (topology must be declared, cluster requires PostgreSQL and
 // a provisioned key) rather than assumed.
 func LoadServiceConfig(opts ServeOptions) (*ServiceConfig, error) {
+	// The deployment mode gates every security posture below — peer
+	// authentication, attestation, evidence-key policy. An omitted
+	// CRABBOX_MODE must never resolve to development semantics on the
+	// authority service, so the mode is declared explicitly here or
+	// startup fails.
+	mode, err := resolveDeploymentMode()
+	if err != nil {
+		return nil, err
+	}
 	cfg := &ServiceConfig{
 		DatabaseURL:      opts.DatabaseURL,
 		ExecutorTimeouts: DefaultExecutorTimeouts(),
+		production:       mode == "production",
 	}
 
-	topology, err := resolveTopology()
+	topology, err := resolveTopology(cfg.production)
 	if err != nil {
 		return nil, err
 	}
@@ -79,22 +124,26 @@ func LoadServiceConfig(opts ServeOptions) (*ServiceConfig, error) {
 	}
 	cfg.StorePath = os.Getenv("CRABEDENCE_STORE_PATH")
 
-	// Adapter wiring: CRABBOX_GITHUB_ENABLED forces the adapter on, a
-	// token enables it implicitly, and enabling without a token still
-	// fails closed at startup. GITHUB_TOKEN is ambient in many dev
-	// shells and CI environments, so an explicit
-	// CRABBOX_GITHUB_ENABLED=false/0/no must disable the adapter even
-	// when a token is present.
+	// Adapter wiring: capability availability is configuration, never
+	// a side effect of credential discovery. CRABBOX_GITHUB_TOKEN —
+	// the service's own variable — enables the adapter implicitly
+	// because setting it is itself a declaration. Ambient GITHUB_TOKEN
+	// (present in many dev shells and CI environments without intent)
+	// supplies the credential only once CRABBOX_GITHUB_ENABLED opted
+	// the adapter in; enabling without any token still fails closed at
+	// startup, and CRABBOX_GITHUB_ENABLED=false/0/no always disables.
 	githubToken := os.Getenv("CRABBOX_GITHUB_TOKEN")
 	if githubToken == "" {
 		githubToken = os.Getenv("GITHUB_TOKEN")
 	}
-	githubEnabled := githubToken != ""
+	var githubEnabled bool
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("CRABBOX_GITHUB_ENABLED"))) {
 	case "true", "1", "yes":
 		githubEnabled = true
 	case "false", "0", "no":
 		githubEnabled = false
+	default:
+		githubEnabled = os.Getenv("CRABBOX_GITHUB_TOKEN") != ""
 	}
 	if githubEnabled && githubToken == "" {
 		return nil, fmt.Errorf("github adapter enabled (CRABBOX_GITHUB_ENABLED) but no CRABBOX_GITHUB_TOKEN or GITHUB_TOKEN configured")
@@ -121,12 +170,56 @@ func LoadServiceConfig(opts ServeOptions) (*ServiceConfig, error) {
 	if err != nil {
 		return nil, fmt.Errorf("CRABEDENCE_PEER_PRINCIPALS: %w", err)
 	}
+	trustedProxies, err := ParseTrustedProxyUIDs(os.Getenv("CRABEDENCE_TRUSTED_PROXY_UIDS"))
+	if err != nil {
+		return nil, err
+	}
 	// Production must authenticate the principal, not merely receive
-	// it: an unverified claim is any local process's to choose.
-	if err := validatePeerAuthPolicy(productionMode(), peerMap); err != nil {
+	// it: an unverified claim is any local process's to choose. And a
+	// wildcard mapping — a peer that may claim any principal — is a
+	// stronger privilege than an exact one, gated on its own list.
+	if err := validatePeerAuthPolicy(cfg.production, peerMap, trustedProxies); err != nil {
 		return nil, err
 	}
 	cfg.PeerPrincipals = peerMap
+	cfg.TrustedProxyUIDs = trustedProxies
+
+	attestation, err := attestationPolicyFromEnv(cfg.production)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Attestation = attestation
+
+	// Admission ceilings. Bounded by default: a malformed, idle, or
+	// adversarial client cannot allocate unbounded handler goroutines,
+	// memory, or file descriptors.
+	maxConnections, err := positiveIntEnv("CRABEDENCE_MAX_CONNECTIONS", DefaultMaxConnections)
+	if err != nil {
+		return nil, err
+	}
+	cfg.MaxConnections = maxConnections
+	maxHandshakes, err := positiveIntEnv("CRABEDENCE_MAX_HANDSHAKES", DefaultMaxHandshakeConnections)
+	if err != nil {
+		return nil, err
+	}
+	cfg.MaxHandshakeConnections = maxHandshakes
+
+	// Evidence checkpoint: the service periodically commits the
+	// terminal-evidence enumeration to a signed retained sequence an
+	// operator archives (CRABEDENCE_CHECKPOINT_PATH to enable,
+	// CRABEDENCE_CHECKPOINT_CUSTODY_PATH to mirror onto independent
+	// storage, CRABEDENCE_CHECKPOINT_INTERVAL to pace; default every
+	// 5m).
+	cfg.CheckpointPath = strings.TrimSpace(os.Getenv("CRABEDENCE_CHECKPOINT_PATH"))
+	cfg.CheckpointCustodyPath = strings.TrimSpace(os.Getenv("CRABEDENCE_CHECKPOINT_CUSTODY_PATH"))
+	cfg.CheckpointInterval = DefaultCheckpointInterval
+	if raw := strings.TrimSpace(os.Getenv("CRABEDENCE_CHECKPOINT_INTERVAL")); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d <= 0 {
+			return nil, fmt.Errorf("CRABEDENCE_CHECKPOINT_INTERVAL %q is not a positive Go duration (e.g. 60s, 5m)", raw)
+		}
+		cfg.CheckpointInterval = d
+	}
 
 	// The executor-owned provider ceiling applies on top of any caller
 	// deadline: a provider that exceeds it — including one that ignores
@@ -149,8 +242,79 @@ func LoadServiceConfig(opts ServeOptions) (*ServiceConfig, error) {
 	return cfg, nil
 }
 
-// Production reports whether the deployment declared production mode.
-func (c *ServiceConfig) Production() bool { return productionMode() }
+// attestationPolicyFromEnv resolves the runtime-attestation policy.
+//
+//	CRABEDENCE_ATTESTATION_REQUIRED — require every invocation to
+//	  carry a verified session proof. Mandatory in production.
+//	CRABEDENCE_APPROVED_RUNTIME_KEYS — comma-separated
+//	  <sha256-fingerprint>:<base64-ed25519-key> entries; the strict
+//	  allowlist of runtime attestation keys.
+//	CRABEDENCE_APPROVED_RELEASES / CRABEDENCE_APPROVED_PLUGIN_MANIFESTS
+//	  / CRABEDENCE_APPROVED_ABI — optional identity allowlists the
+//	  asserted release digest, plugin manifest digest, and ABI version
+//	  are checked against.
+//	CRABEDENCE_ATTESTATION_SESSION_TTL — attested-session lifetime
+//	  (default 10m).
+//	CRABEDENCE_ATTESTATION_RELAXED — development only: accept any
+//	  well-formed signed attestation regardless of allowlists.
+//	  Refused in production.
+func attestationPolicyFromEnv(production bool) (*AttestationPolicy, error) {
+	required := envTruthy("CRABEDENCE_ATTESTATION_REQUIRED")
+	relaxed := envTruthy("CRABEDENCE_ATTESTATION_RELAXED")
+	keys, err := ParseApprovedRuntimeKeys(os.Getenv("CRABEDENCE_APPROVED_RUNTIME_KEYS"))
+	if err != nil {
+		return nil, fmt.Errorf("CRABEDENCE_APPROVED_RUNTIME_KEYS: %w", err)
+	}
+	policy := &AttestationPolicy{
+		Required:          required,
+		Relaxed:           relaxed,
+		ApprovedKeys:      keys,
+		ApprovedReleases:  parseDigestSet(os.Getenv("CRABEDENCE_APPROVED_RELEASES")),
+		ApprovedManifests: parseDigestSet(os.Getenv("CRABEDENCE_APPROVED_PLUGIN_MANIFESTS")),
+		ApprovedABI:       parseDigestSet(os.Getenv("CRABEDENCE_APPROVED_ABI")),
+	}
+	if raw := strings.TrimSpace(os.Getenv("CRABEDENCE_ATTESTATION_SESSION_TTL")); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d <= 0 {
+			return nil, fmt.Errorf("CRABEDENCE_ATTESTATION_SESSION_TTL %q is not a positive Go duration", raw)
+		}
+		policy.SessionTTL = d
+	}
+	if production {
+		if !required {
+			return nil, fmt.Errorf("production mode requires runtime attestation: set CRABEDENCE_ATTESTATION_REQUIRED=true")
+		}
+		if relaxed {
+			return nil, fmt.Errorf("CRABEDENCE_ATTESTATION_RELAXED is development-only and is refused in production")
+		}
+	}
+	if required && !relaxed && len(keys) == 0 {
+		return nil, fmt.Errorf("CRABEDENCE_ATTESTATION_REQUIRED with no CRABEDENCE_APPROVED_RUNTIME_KEYS would refuse every runtime — provision the approved key set or use relaxed development mode")
+	}
+	configured := required || relaxed || len(keys) > 0 ||
+		policy.ApprovedReleases != nil || policy.ApprovedManifests != nil || policy.ApprovedABI != nil
+	if !configured {
+		return nil, nil
+	}
+	if !relaxed && !required && len(keys) == 0 {
+		// Identity allowlists without a key allowlist cannot verify
+		// anything — a misconfigured deployment, not an opt-in.
+		return nil, fmt.Errorf("runtime attestation identity allowlists require CRABEDENCE_APPROVED_RUNTIME_KEYS or CRABEDENCE_ATTESTATION_RELAXED")
+	}
+	return policy, nil
+}
+
+func envTruthy(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "true", "1", "yes":
+		return true
+	}
+	return false
+}
+
+// Production reports whether the deployment declared production mode
+// — the value validated at load, never a re-read of the environment.
+func (c *ServiceConfig) Production() bool { return c.production }
 
 // EvidenceKeySource describes where the signing identity comes from
 // without revealing the path: a provisioned key is a deployment
@@ -186,11 +350,48 @@ func (c *ServiceConfig) Report() string {
 	fmt.Fprintf(&b, "  evidence key:     %s\n", c.EvidenceKeySource())
 	fmt.Fprintf(&b, "  github adapter:   %s\n", github)
 	fmt.Fprintf(&b, "  qualification:    %s\n", qualification)
-	fmt.Fprintf(&b, "  peer auth:        %d mapped UIDs\n", len(c.PeerPrincipals))
+	fmt.Fprintf(&b, "  peer auth:        %d mapped UIDs (%d trusted proxies)\n", len(c.PeerPrincipals), len(c.TrustedProxyUIDs))
+	fmt.Fprintf(&b, "  admission:        %d connections / %d handshakes\n", c.MaxConnections, c.MaxHandshakeConnections)
+	checkpoint := "disabled"
+	if c.CheckpointPath != "" {
+		checkpoint = fmt.Sprintf("%s every %s", c.CheckpointPath, c.CheckpointInterval)
+		if c.CheckpointCustodyPath != "" {
+			checkpoint += fmt.Sprintf(" (custody %s)", c.CheckpointCustodyPath)
+		} else {
+			checkpoint += " (local retention only — not independent custody)"
+		}
+	}
+	fmt.Fprintf(&b, "  checkpoint:       %s\n", checkpoint)
+	attestation := "disabled"
+	if c.Attestation != nil {
+		attestation = "enabled (optional)"
+		if c.Attestation.Required {
+			attestation = "required"
+		}
+		if c.Attestation.Relaxed {
+			attestation += " relaxed"
+		}
+	}
+	fmt.Fprintf(&b, "  attestation:      %s\n", attestation)
 	fmt.Fprintf(&b, "  provider ceiling: %s\n", c.ExecutorTimeouts.ProviderExecution)
 	fmt.Fprintf(&b, "  provider gate:    max %d concurrent; degraded after %d consecutive ambiguous outcomes; circuit opens after %d (cooldown %s)\n",
 		c.ProviderGate.MaxConcurrent, c.ProviderGate.DegradedAfter, c.ProviderGate.OpenAfter, c.ProviderGate.OpenCooldown)
 	return b.String()
+}
+
+// positiveIntEnv resolves a positive integer environment value,
+// falling back to def when unset. A present but malformed or
+// non-positive value is a startup error, never a silent fallback.
+func positiveIntEnv(name string, def int) (int, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 {
+		return 0, fmt.Errorf("%s %q is not a positive integer", name, raw)
+	}
+	return n, nil
 }
 
 // resolveStoreBackend resolves CRABEDENCE_STORE_BACKEND. "auto"/unset

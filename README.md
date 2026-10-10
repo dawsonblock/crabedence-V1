@@ -190,7 +190,11 @@ single production replica, and a declaration that contradicts the replica
 count or store backend is refused. Production also requires an authenticated
 local identity: `CRABEDENCE_PEER_PRINCIPALS` must map the kernel-supplied
 peer UIDs to principals, because the bearer model's principal is otherwise an
-unverified claim any process running as the service user could make. Signer
+unverified claim any process running as the service user could make. A
+`uid:*` wildcard entry — a peer that may claim any principal — is a
+stronger privilege and separately declared: production requires each
+wildcard's UID to also appear in `CRABEDENCE_TRUSTED_PROXY_UIDS`, and a
+declared list is authoritative in every mode. Signer
 publication is crash-durable — atomic no-clobber write, file sync, directory
 sync — and rotation keeps retired fingerprints in the trusted ring so
 historical receipts remain verifiable.
@@ -251,8 +255,10 @@ NeMo connects to this service over the Unix socket — no per-call subprocess
 spawn.
 
 ```sh
-# Start the persistent execution service
-crabbox serve-exec
+# Start the persistent execution service. The deployment mode is a
+# required declaration — CRABBOX_MODE=development|production, never
+# assumed; an unset or misspelled value refuses startup.
+CRABBOX_MODE=development crabbox serve-exec
 
 # The service listens on the canonical per-user Unix socket:
 #   $XDG_RUNTIME_DIR/crabedence/execution.sock when XDG_RUNTIME_DIR is set,
@@ -301,6 +307,10 @@ Built-in capabilities:
 - `system.echo` (PURE) — returns arguments as echo result
 - `system.info` (READ) — returns system information (goes through remote port)
 - `test.counter.increment` (MUTATION) — harmless mutation with idempotency
+- `github.issue.create` / `github.issue.comment` / `github.issue.close` / `github.issue.update` (MUTATION) — durable GitHub issue operations (when a GitHub adapter is configured)
+- `github.pr.create` / `github.pr.merge` (MUTATION) — durable GitHub pull-request operations (when a GitHub adapter is configured)
+- `github.issue.get` / `github.issue.list` (READ) — bounded GitHub issue reads over the DIRECT route (when a GitHub adapter is configured)
+- `qualification.critical.commit` (CRITICAL) — release-gate qualification commits, registered only when `CRABEDENCE_QUAL_PROVIDER_URL` wires the qualification provider
 
 ### NEMO
 

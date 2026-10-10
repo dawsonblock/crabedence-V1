@@ -160,4 +160,35 @@ go run ./cmd/nemo-component-manifest \
   -transfer-manifest "$out/manifests/nemo-transfer-manifest.json" \
   -verify
 
+# Release-origin authentication: when NEMO_RELEASE_SIGNING_KEY names a
+# private key, sign the release-root sidecar so the packed artifact carries
+# proof of who released it. The .sig cannot be declared inside the manifest
+# (it signs the sidecar that binds the manifest), so it joins the manifest's
+# own artifacts in the exhaustive check's exempt set.
+if [[ -n "${NEMO_RELEASE_SIGNING_KEY:-}" ]]; then
+  [[ -f "$NEMO_RELEASE_SIGNING_KEY" ]] \
+    || { printf 'FAIL: NEMO_RELEASE_SIGNING_KEY %s is not a file\n' "$NEMO_RELEASE_SIGNING_KEY" >&2; exit 1; }
+  ssh-keygen -Y sign -n nemo-control-release \
+    -f "$NEMO_RELEASE_SIGNING_KEY" \
+    "$out/manifests/component-manifest.sha256" \
+    || { printf 'FAIL: release-root signing failed\n' >&2; exit 1; }
+  printf 'signed the release root: %s\n' "$out/manifests/component-manifest.sha256.sig"
+  # A signed artifact is immediately verified against the allowed-signers
+  # file — a release signature that does not authenticate is a failure,
+  # not a ship.
+  if [[ -n "${NEMO_RELEASE_ALLOWED_SIGNERS:-}" && -n "${NEMO_RELEASE_SIGNER:-}" ]]; then
+    go run ./cmd/nemo-component-manifest \
+      -root "$out" \
+      -transfer-manifest "$out/manifests/nemo-transfer-manifest.json" \
+      -verify -allowed-signers "$NEMO_RELEASE_ALLOWED_SIGNERS" \
+      -signer-identity "$NEMO_RELEASE_SIGNER" \
+      || { printf 'FAIL: the signed release root does not authenticate\n' >&2; exit 1; }
+  fi
+elif [[ -f "$out/manifests/component-manifest.sha256.sig" ]]; then
+  printf 'FAIL: %s carries a signature but no signing key was configured — the artifact is stale or tampered\n' "$out" >&2
+  exit 1
+else
+  printf 'note: unsigned release root (set NEMO_RELEASE_SIGNING_KEY to sign)\n'
+fi
+
 printf 'distribution assembled at %s\n' "$out"

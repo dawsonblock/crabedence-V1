@@ -2,6 +2,7 @@ package execution
 
 import (
 	"context"
+	"crypto/ed25519"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -97,6 +98,12 @@ type Client struct {
 	socketPath  string
 	timeout     time.Duration
 	dialTimeout time.Duration
+	// sessionID and sessionKey carry the runtime-attestation binding
+	// established by Attest: every request is proof-signed before
+	// transmission. Nil key means unattested — admitted only when the
+	// deployment's policy does not require attestation.
+	sessionID  string
+	sessionKey ed25519.PrivateKey
 }
 
 // NewClient returns a client for the execution service at socketPath.
@@ -110,11 +117,98 @@ func NewClient(socketPath string, opts ClientOptions) *Client {
 	return &Client{socketPath: socketPath, timeout: opts.Timeout, dialTimeout: opts.DialTimeout}
 }
 
+// SetSessionBinding attaches the attested session to every request:
+// the proof-of-possession is re-signed per invocation over that
+// request's fields, so a replayed frame never carries a stale proof.
+func (c *Client) SetSessionBinding(sessionID string, key ed25519.PrivateKey) {
+	c.sessionID = sessionID
+	c.sessionKey = key
+}
+
+// Attest runs the two-round challenge/attest handshake against the
+// service and binds the resulting session to this client. The runtime
+// identity is asserted with the supplied key, which the deployment's
+// approved-key set must admit.
+func (c *Client) Attest(ctx context.Context, key ed25519.PrivateKey, id RuntimeIdentity) (string, error) {
+	// Round 1: challenge.
+	var ch challengeResponse
+	if err := c.exchange(ctx, map[string]string{"type": attestChallengeType}, &ch); err != nil {
+		return "", fmt.Errorf("attestation challenge: %w", err)
+	}
+	if ch.SessionID == "" || ch.Nonce == "" {
+		return "", errors.New("attestation challenge: incomplete challenge response")
+	}
+	// Round 2: signed attestation.
+	var ar attestResponse
+	err := c.exchange(ctx, attestRequest{
+		Type:            attestType,
+		SessionID:       ch.SessionID,
+		RuntimeIdentity: id,
+		Signature:       AttestSignature(key, ch.SessionID, ch.Nonce, id),
+	}, &ar)
+	if err != nil {
+		return "", fmt.Errorf("attestation: %w", err)
+	}
+	if ar.Status != "attested" {
+		return "", fmt.Errorf("attestation denied: %s", ar.Error)
+	}
+	c.SetSessionBinding(ch.SessionID, key)
+	return ch.SessionID, nil
+}
+
+// exchange writes one framed message and reads one framed response —
+// the handshake's round trip. Non-invocation frames are classified
+// PRE_DISPATCH on failure: nothing was dispatched.
+func (c *Client) exchange(ctx context.Context, msg any, out any) error {
+	payload, err := json.Marshal(msg)
+	if err != nil {
+		return &TransportError{Kind: TransportPreDispatch, Err: err}
+	}
+	if len(payload) > maxMessageBytes {
+		return &TransportError{Kind: TransportPreDispatch, Err: errors.New("message exceeds the frame bound")}
+	}
+	frame := make([]byte, 4+len(payload))
+	binary.BigEndian.PutUint32(frame[:4], uint32(len(payload)))
+	copy(frame[4:], payload)
+
+	dialer := net.Dialer{Timeout: c.dialTimeout}
+	conn, err := dialer.DialContext(ctx, "unix", c.socketPath)
+	if err != nil {
+		return &TransportError{Kind: TransportPreDispatch, Err: err}
+	}
+	defer conn.Close()
+	deadline := time.Now().Add(c.timeout)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	_ = conn.SetDeadline(deadline)
+	if _, err := writeFrame(conn, frame); err != nil {
+		return &TransportError{Kind: TransportPreDispatch, Err: err}
+	}
+	lenBuf := make([]byte, 4)
+	if _, err := io.ReadFull(conn, lenBuf); err != nil {
+		return &TransportError{Kind: TransportPreDispatch, Err: err}
+	}
+	n := binary.BigEndian.Uint32(lenBuf)
+	if n > maxMessageBytes {
+		return &TransportError{Kind: TransportPreDispatch, Err: errors.New("response exceeds the frame bound")}
+	}
+	body := make([]byte, n)
+	if _, err := io.ReadFull(conn, body); err != nil {
+		return &TransportError{Kind: TransportPreDispatch, Err: err}
+	}
+	return json.Unmarshal(body, out)
+}
+
 // Invoke transmits one request and returns the parsed response. A
 // failure is returned as a *TransportError: PRE_DISPATCH failures are
 // safe to retry, while POST_DISPATCH and PROTOCOL failures mean the
 // outcome is UNKNOWN and must be reconciled, not reported as FAILED.
 func (c *Client) Invoke(ctx context.Context, req Request) (Response, error) {
+	if c.sessionKey != nil {
+		req.Session = &RequestSession{ID: c.sessionID}
+		req.Session.Proof = SessionProof(c.sessionKey, req)
+	}
 	frame, err := encodeRequestFrame(req)
 	if err != nil {
 		return Response{}, &TransportError{Kind: TransportPreDispatch, Err: err}

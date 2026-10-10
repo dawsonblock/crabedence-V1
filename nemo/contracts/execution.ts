@@ -97,6 +97,27 @@ export interface KernelExecutionRequest {
   readonly idempotencyKey?: string;
   /** Optional deadline (ISO 8601). Crabedence rejects after this time. */
   readonly deadline?: string;
+  /**
+   * Middleware provenance — evidence, never a policy input. Present
+   * when middleware mediated the invocation; bound into the request
+   * digest and persisted on the durable record by Crabedence.
+   */
+  readonly mediation?: KernelMediation;
+}
+
+/**
+ * Middleware provenance carried on a mediated invocation. Names the
+ * exact middleware set that ran and the pre-mediation argument digest —
+ * both required when present. `releaseRootDigest` names the component
+ * manifest of the qualified runtime distribution, when one exists.
+ */
+export interface KernelMediation {
+  readonly middlewareSetDigest: string;
+  readonly originalArgsDigest: string;
+  readonly releaseRootDigest?: string;
+  readonly pluginManifestSha256?: string;
+  readonly pluginLibrarySha256?: string;
+  readonly activationConfigSha256?: string;
 }
 
 // ─── Execution outcome ───────────────────────────────────────────────

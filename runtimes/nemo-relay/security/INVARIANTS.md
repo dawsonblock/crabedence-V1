@@ -15,8 +15,11 @@ that enforcement is structural (a type or a total `match` makes violation
 unrepresentable), checked (a runtime predicate rejects it), or merely
 conventional. Structural enforcement is the target; convention is a gap.
 
-Line numbers are anchors into the tree at the revision recorded in
-[BASELINE.md](./BASELINE.md). Symbol names are the durable reference.
+Symbol names are the durable reference; line numbers are pointers regenerated
+by `scripts/tcb/invariants.py --write`. The same gate resolves every path,
+symbol and test name this document cites against the tree, so a moved item or
+a renamed test turns the citation red instead of leaving it pointing at
+whatever landed on the line.
 
 ## Status summary
 
@@ -44,12 +47,12 @@ Line numbers are anchors into the tree at the revision recorded in
 A lifecycle state may only advance along the declared graph.
 
 **Enforced by** `ExecutionState::is_valid_lifecycle_transition`
-(`crates/ledger/src/lib.rs:87`), plus narrower predicates for each operation:
-`is_valid_authorization_transition`, `is_valid_generic_transition`
-(`crates/ledger/src/lib.rs:127`), and `is_valid_leased_transition`
-(`crates/ledger/src/lib.rs:141`). The abstract graph is deliberately wider than
-any single operation, so each store method must apply the predicate for what it
-does.
+(`crates/ledger/src/lib.rs:107`), plus narrower predicates for each operation:
+`is_valid_authorization_transition` (`crates/ledger/src/lib.rs:133`),
+`is_valid_generic_transition` (`crates/ledger/src/lib.rs:147`), and
+`is_valid_leased_transition` (`crates/ledger/src/lib.rs:161`). The abstract
+graph is deliberately wider than any single operation, so each store method
+must apply the predicate for what it does.
 
 **Verified by** `reference_store_rejects_authorization_and_lease_contract_misuse`
 (`crates/ledger/src/lib.rs`).
@@ -69,7 +72,7 @@ line 1240), which separates observing evidence from granting it authority.
 `terminal_fault_boundaries_leave_the_complete_old_state`
 (`crates/ledger/src/lib.rs`); `recovery_reports_contradictory_evidence_without_rewriting_unknown_state`
 and `persisted_receipt_conflicts_block_provider_reconciliation_before_dispatch`
-(`crates/core/src/kernel.rs`).
+(`crates/effect-runtime/src/kernel.rs`).
 
 ## K-003 — An idempotency key cannot refer to two incompatible fingerprints
 
@@ -77,7 +80,7 @@ Claiming an idempotency key that already exists is only a success when the
 fingerprint matches; otherwise the claim is rejected as a conflict.
 
 **Enforced by** `PrepareActionResult::IdempotencyConflict`
-(`crates/ledger/src/lib.rs:429`) and the claim path that returns it.
+(`crates/ledger/src/lib.rs:459`) and the claim path that returns it.
 
 **Verified by** the idempotency-claim cases in the store conformance suite
 (`crates/ledger/src/lib.rs`).
@@ -107,7 +110,7 @@ is a durable claim about missing evidence, not an alias for failure.
 
 **Verified by** `ambiguous_dispatch_is_persisted_as_unknown_then_reconciled` and
 `recovery_marks_stale_dispatching_without_a_receipt_unknown`
-(`crates/core/src/kernel.rs`).
+(`crates/effect-runtime/src/kernel.rs`).
 
 ## K-006 — `UNKNOWN` does not authorize redispatch
 
@@ -120,7 +123,7 @@ redispatch the effect.
 
 **Verified by** `retry_of_an_unknown_action_returns_its_reconciliation_handle_without_redispatch`
 and `unknown_actions_reconcile_through_external_effect_fabric`
-(`crates/core/src/kernel.rs`).
+(`crates/effect-runtime/src/kernel.rs`).
 
 ## K-007 — A grant binds to the exact runtime identity
 
@@ -130,7 +133,7 @@ and `action_id`. The digest canonically covers deployment identity, environment,
 and session provenance.
 
 **Verified by** `runtime_environment_and_session_binding_are_grant_bound`
-(`crates/core/src/kernel.rs`).
+(`crates/effect-runtime/src/kernel.rs`).
 
 ## K-008 — A grant binds to the exact capability generation
 
@@ -146,7 +149,7 @@ grant therefore cannot be replayed against rewritten arguments or a substituted
 backend route.
 
 **Verified by** `mismatched_grants_cancel_the_pre_dispatch_action`
-(`crates/core/src/kernel.rs`).
+(`crates/effect-runtime/src/kernel.rs`).
 
 ## K-010 — Capability routing cannot change after sealing
 
@@ -163,7 +166,7 @@ discouraged.
 
 ## K-011 — Production kernel construction requires verified components
 
-**Enforced by** `Kernel::new_production` (`crates/core/src/kernel.rs`), which
+**Enforced by** `Kernel::new_production` (`crates/effect-runtime/src/kernel.rs`), which
 requires a sealed registry containing at least one admitted consequential
 capability, a `production` environment, and a store bound by the sealed
 `ProductionEffectStore` trait that attests readiness. The sealed supertrait
@@ -200,7 +203,7 @@ effect schema or its relations, alongside the existing grant checks, including
 verified against the PostgreSQL release the repository pins for qualification,
 by escalating one property at a time and asserting the specific rejection.
 
-**Verified by** `a_production_kernel_composes_only_with_the_durable_store`,
+**Verified by** `a_verified_transport_composes_a_production_kernel`,
 `production_composition_is_fail_closed`, and `the_production_store_trait_is_sealed`
 (`crates/effect-runtime/tests/production_composition.rs`).
 
@@ -212,7 +215,7 @@ and cancels the claimed action when the decision is not an exact binding
 `Allow`.
 
 **Verified by** `mismatched_grants_cancel_the_pre_dispatch_action` and
-`fast_paths_bypass_authority_and_effect_stores` (`crates/core/src/kernel.rs`).
+`fast_paths_bypass_authority_and_effect_stores` (`crates/effect-runtime/src/kernel.rs`).
 
 **Caveat:** the second test is deliberate scope, not a gap. `Pure` and `Read`
 classes take a fast path that calls no authority and touches no durable store.
@@ -228,7 +231,7 @@ terminal transition.
 
 **Verified by** `reconciliation_receipts_bind_the_original_principal_and_grant`
 and `recovery_rejects_split_receipt_and_dispatching_state`
-(`crates/core/src/kernel.rs`).
+(`crates/effect-runtime/src/kernel.rs`).
 
 ## K-014 — Policy version/epoch cannot change between authorization and dispatch
 
@@ -242,27 +245,27 @@ A terminal `FAILED` from the dispatching phase is only legal for a proven
 pre-dispatch failure, and a provider receipt is never accepted on that path.
 
 **Enforced by** `is_valid_pre_dispatch_failure_finalization`
-(`crates/ledger/src/lib.rs:210`) and the requirement that
+(`crates/ledger/src/lib.rs:230`) and the requirement that
 `finalize_pre_dispatch_failure` carry `PreDispatchFailureEvidence` rather than a
 receipt. `is_valid_leased_transition` excludes `Dispatching -> Failed`, so the
 fenced receipt path cannot produce it either.
 
 **Verified by** `confirmed_pre_dispatch_failure_returns_the_durable_action_status`
-(`crates/core/src/kernel.rs`).
+(`crates/effect-runtime/src/kernel.rs`).
 
 ## K-016 — A possibly-dispatched action enters `UNKNOWN` rather than `FAILED`
 
-**Enforced by** `state_for_error` (`crates/executor/src/lib.rs:228`). The
+**Enforced by** `state_for_error` (`crates/executor/src/lib.rs:249`). The
 `match` is total with no catch-all: `FAILED` requires exactly
 `NotDispatched` with `ConfirmedFailure`. `DispatchAttempted`,
 `DispatchConfirmed`, and any `Unknown` certainty all resolve to `UNKNOWN`. The
 kernel then routes through `unknown_after_dispatching`
-(`crates/core/src/kernel.rs:1897`) instead of terminalizing.
+(`crates/effect-runtime/src/kernel.rs:1928`) instead of terminalizing.
 
 **Verified by** `ambiguous_dispatch_is_persisted_as_unknown_then_reconciled`,
 `post_dispatch_receipt_failure_returns_a_reconciliation_handle`, and
 `failed_unknown_persistence_returns_state_recovery_with_real_action_id`
-(`crates/core/src/kernel.rs`).
+(`crates/effect-runtime/src/kernel.rs`).
 
 The same destination covers a trusted deadline that expires before the outcome
 can be persisted. A committed provider effect whose receipt cannot be written
@@ -278,24 +281,16 @@ These are gaps between the invariant set and the current tree. They are recorded
 here rather than fixed quietly, because each one changes what may move out of
 the kernel.
 
-- **The TCB is not isolated by crate.** `nemo-relay` currently depends on
+- **The measured surface is wider than the enforcing surface.**
+  `security/tcb.toml` measures three tiers: 82,952 source lines in the six
+  crates that enforce an invariant (`nemo-relay`, `nemo-relay-types`,
   `nemo-relay-authority`, `nemo-relay-executor`, `nemo-relay-ledger`,
-  `nemo-relay-plugin`, `nemo-relay-types`, and `nemo-relay-worker-proto`. Under
-  the layering in `security/layers.toml`, five of those six point upward, so the
-  invariants live across four crates rather than one auditable core. K-008
-  through K-014 are enforced in code the kernel does not own. `just layer-report`
-  fails if a new upward edge appears, and fails on a grandfathered entry that no
-  longer exists, so the five can only shrink and the exception cannot outlive
-  the debt it excused.
-- **The measured surface is wider than the enforcing surface.** `nemo-relay`
-  carries 299 `unsafe` occurrences, dominated by the dynamic native plugin
-  loader, and `nemo-relay-plugin` carries another 315. The plugin crates enforce
-  none of these invariants, but they run in the same process, so a memory-safety
-  bug there can subvert a correct state machine. `security/tcb.toml` therefore
-  measures two tiers: 85,027 source lines in the crates that enforce an
-  invariant, and 114,091 lines / 617 `unsafe` occurrences in everything sharing
-  the kernel's process. The second number, not the first, is the current
-  attack surface.
+  `nemo-effect-runtime`), 131,776 lines / 27 `unsafe` occurrences in the crates
+  sharing the kernel's process, and 41,985 lines / 660 `unsafe` occurrences in
+  the plugin-host target the kernel is protected *from*. The second and third
+  numbers, not the first, are the current attack surface: code that enforces
+  none of these invariants can still subvert a correct state machine wherever
+  it shares a process with one.
 - **There is more than one production construction path.** K-011 governs
   `Kernel::new_production`, and
   `DurableRuntime::bootstrap` is the composition root. Both are public, so a

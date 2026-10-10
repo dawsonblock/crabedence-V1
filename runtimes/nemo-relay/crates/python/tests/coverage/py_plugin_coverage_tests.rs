@@ -48,6 +48,10 @@ fn with_event_loop<T>(py: Python<'_>, f: impl FnOnce(Bound<'_, PyAny>) -> T) -> 
 
 #[test]
 fn plugin_context_helpers_and_error_conversion_work() {
+    crate::test_support::with_test_stack(plugin_context_helpers_and_error_conversion_work_inner);
+}
+
+fn plugin_context_helpers_and_error_conversion_work_inner() {
     let _python = crate::test_support::init_python_test();
 
     let context = PyPluginContext {
@@ -69,6 +73,10 @@ fn plugin_context_helpers_and_error_conversion_work() {
 
 #[test]
 fn plugin_context_rejects_legacy_and_uninspectable_llm_sanitizers() {
+    crate::test_support::with_test_stack(plugin_context_rejects_legacy_and_uninspectable_llm_sanitizers_inner);
+}
+
+fn plugin_context_rejects_legacy_and_uninspectable_llm_sanitizers_inner() {
     let _python = crate::test_support::init_python_test();
     let context = PyPluginContext {
         registrations: Arc::new(Mutex::new(vec![])),
@@ -99,6 +107,10 @@ def one_argument(payload):
 
 #[test]
 fn register_adds_plugin_management_bindings() {
+    crate::test_support::with_test_stack(register_adds_plugin_management_bindings_inner);
+}
+
+fn register_adds_plugin_management_bindings_inner() {
     let _python = crate::test_support::init_python_test();
     let _plugin_test_state = lock_plugin_test_state_for_tests();
     Python::attach(|py| {
@@ -162,6 +174,10 @@ fn register_adds_plugin_management_bindings() {
 
 #[test]
 fn async_clear_binding_completes_on_python_event_loop() {
+    crate::test_support::with_test_stack(async_clear_binding_completes_on_python_event_loop_inner);
+}
+
+fn async_clear_binding_completes_on_python_event_loop_inner() {
     let _python = crate::test_support::init_python_test();
     let _plugin_test_state = lock_plugin_test_state_for_tests();
     Python::attach(|py| {
@@ -200,6 +216,10 @@ async def clear(module):
 
 #[test]
 fn stale_async_clear_completion_keeps_the_newer_state() {
+    crate::test_support::with_test_stack(stale_async_clear_completion_keeps_the_newer_state_inner);
+}
+
+fn stale_async_clear_completion_keeps_the_newer_state_inner() {
     let _plugin_test_state = lock_plugin_test_state_for_tests();
     let older = plugin_configuration_clear_state();
     let newer = Arc::new(PluginConfigurationClearState::new());
@@ -420,6 +440,10 @@ async def tool_execution_intercept(name, value, next):
 
 #[test]
 fn python_plugin_validation_and_initialization_cover_error_paths() {
+    crate::test_support::with_test_stack(python_plugin_validation_and_initialization_cover_error_paths_inner);
+}
+
+fn python_plugin_validation_and_initialization_cover_error_paths_inner() {
     let _python = crate::test_support::init_python_test();
     let _plugin_test_state = lock_plugin_test_state_for_tests();
     Python::attach(|py| {
@@ -712,6 +736,10 @@ async def initialize_plugins(module, config):
 
 #[test]
 fn plugin_context_rollback_from_non_runtime_owner_covers_deregistration_error_mappers() {
+    crate::test_support::with_test_stack(plugin_context_rollback_from_non_runtime_owner_covers_deregistration_error_mappers_inner);
+}
+
+fn plugin_context_rollback_from_non_runtime_owner_covers_deregistration_error_mappers_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         let helpers = load_module(
@@ -872,6 +900,10 @@ async def tool_execution_intercept(name, value, next):
 
 #[test]
 fn forced_plugin_conversion_and_context_allocation_failures_are_covered() {
+    crate::test_support::with_test_stack(forced_plugin_conversion_and_context_allocation_failures_are_covered_inner);
+}
+
+fn forced_plugin_conversion_and_context_allocation_failures_are_covered_inner() {
     let _python = crate::test_support::init_python_test();
     let _plugin_test_state = lock_plugin_test_state_for_tests();
     Python::attach(|py| {
@@ -952,6 +984,10 @@ async def initialize_plugins(module, config):
 
 #[test]
 fn invoke_python_plugin_register_rolls_back_partial_registrations_on_error() {
+    crate::test_support::with_test_stack(invoke_python_plugin_register_rolls_back_partial_registrations_on_error_inner);
+}
+
+fn invoke_python_plugin_register_rolls_back_partial_registrations_on_error_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         let helpers = load_module(
@@ -997,6 +1033,10 @@ class FailingPlugin:
 
 #[test]
 fn plugin_context_lock_poisoning_covers_error_paths() {
+    crate::test_support::with_test_stack(plugin_context_lock_poisoning_covers_error_paths_inner);
+}
+
+fn plugin_context_lock_poisoning_covers_error_paths_inner() {
     let _python = crate::test_support::init_python_test();
     Python::attach(|py| {
         let helpers = load_module(
