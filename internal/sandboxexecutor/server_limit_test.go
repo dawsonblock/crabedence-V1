@@ -2,11 +2,16 @@ package sandboxexecutor
 
 import (
 	"bufio"
+	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 // The PR-04/05/06 gates at the socket: connection floods cannot
@@ -216,5 +221,158 @@ func TestCrashRecoveryAcrossRestart(t *testing.T) {
 	// The ledger carries a new fence epoch for the new lifetime.
 	if srv2.Ledger().Epoch() <= 1 {
 		t.Fatal("fence epoch did not advance")
+	}
+}
+
+// One submitter identity must not hold every connection slot while
+// others wait — the per-peer ceiling is lower than the global bound.
+func TestPerPeerConnectionCap(t *testing.T) {
+	dir := socketDir(t)
+	srv := startServer(t, Config{SocketDir: dir, Peers: selfPeer(t), MaxConns: maxPeerConns + 8})
+
+	held := make([]net.Conn, 0, maxPeerConns)
+	for i := 0; i < maxPeerConns; i++ {
+		conn, err := net.Dial("unix", srv.SocketPath())
+		if err != nil {
+			t.Fatalf("dial %d: %v", i, err)
+		}
+		defer conn.Close()
+		held = append(held, conn)
+		time.Sleep(15 * time.Millisecond) // let serve() account the peer
+	}
+	conn, err := net.Dial("unix", srv.SocketPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	resp := readResp(t, conn)
+	if resp.OK || !strings.Contains(resp.Error, "too many connections") {
+		t.Fatalf("peer over its cap: %+v", resp)
+	}
+	// The refusal freed nothing — the server is still inside its
+	// global bound, so a released peer slot admits again.
+	held[0].Close()
+	time.Sleep(50 * time.Millisecond)
+	conn2, err := net.Dial("unix", srv.SocketPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn2.Close()
+	reader := bufio.NewReader(conn2)
+	if resp := sendJob(t, conn2, reader, validJob()); !resp.OK {
+		t.Fatalf("freed peer slot did not admit: %+v", resp)
+	}
+}
+
+// A persistent client is not one-shot: the admission loop must keep
+// serving further jobs on the same connection.
+func TestPipelinedJobsShareOneConnection(t *testing.T) {
+	dir := socketDir(t)
+	key, keys := testAuthority(t)
+	srv := startServer(t, Config{SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys})
+	conn, reader := connect(t, srv.SocketPath())
+	defer conn.Close()
+
+	for i, jobID := range []string{"pipe-1", "pipe-2"} {
+		resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV1) {
+			c.JobID, c.Nonce = jobID, jobID
+		}))
+		if !resp.OK || resp.JobID != jobID {
+			t.Fatalf("pipelined job %d: %+v", i, resp)
+		}
+	}
+	if n, _ := srv.Ledger().Count(); n != 2 {
+		t.Fatalf("registry = %d rows, want 2", n)
+	}
+}
+
+// The registry bound is durable: once the ledger holds maxJobs
+// records, admission refuses before any new identity can be created.
+func TestJobRegistryBound(t *testing.T) {
+	dir := socketDir(t)
+	srv := startServer(t, Config{SocketDir: dir, Peers: selfPeer(t)})
+
+	// Fill the registry directly — InsertJob's contract-hash
+	// uniqueness is orthogonal to what the bound checks.
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(dir, "executor-ledger.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().UnixMilli()
+	for i := 0; i < maxJobs; i++ {
+		if _, err := db.Exec(
+			`INSERT INTO jobs (job_id, contract_hash, seq, submitter, principal, image,
+			 contract_json, state, fence_epoch, received_at, updated_at)
+			 VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+			fmt.Sprintf("fill-%d", i), fmt.Sprintf("h%d", i), i+1, "t", "p", "img",
+			"{}", JobStateRecorded, 1, now, now); err != nil {
+			t.Fatalf("fill row %d: %v", i, err)
+		}
+	}
+	db.Close()
+
+	conn, reader := connect(t, srv.SocketPath())
+	defer conn.Close()
+	resp := sendJob(t, conn, reader, validJob())
+	if resp.OK || !strings.Contains(resp.Error, "registry full") {
+		t.Fatalf("over-full registry admitted: %+v", resp)
+	}
+}
+
+// A signed contract replayed across a daemon restart must refuse —
+// replay protection is durable, not per-lifetime.
+func TestReplayAcrossRestart(t *testing.T) {
+	dir := socketDir(t)
+	key, keys := testAuthority(t)
+
+	srv1 := startServer(t, Config{SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys})
+	conn, reader := connect(t, srv1.SocketPath())
+	env := signedJobReq(t, key, func(c *JobContractV1) {
+		c.JobID, c.Nonce = "replay-1", "replay-nonce"
+	})
+	if resp := sendJob(t, conn, reader, env); !resp.OK {
+		t.Fatalf("submit: %+v", resp)
+	}
+	conn.Close()
+	if err := srv1.Stop(); err != nil {
+		t.Fatal(err)
+	}
+
+	srv2 := startServer(t, Config{SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys})
+	conn2, reader2 := connect(t, srv2.SocketPath())
+	defer conn2.Close()
+	resp := sendJob(t, conn2, reader2, env)
+	if resp.OK || !strings.Contains(resp.Error, "already submitted") {
+		t.Fatalf("replayed contract admitted after restart: %+v", resp)
+	}
+}
+
+// The operator ceiling is a hard bound on the authority's grant: a
+// validly-signed contract asking for more than the ceiling refuses.
+func TestCeilingRefusesOverBudgetContract(t *testing.T) {
+	dir := socketDir(t)
+	key, keys := testAuthority(t)
+	srv := startServer(t, Config{
+		SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys,
+		ResourceCeiling: &ResourceBudget{CPUs: 2, MemoryMB: 512, TimeoutSeconds: 60},
+	})
+
+	for name, mutate := range map[string]func(*JobContractV1){
+		"cpus":   func(c *JobContractV1) { c.Resources.CPUs = 8 },
+		"memory": func(c *JobContractV1) { c.Resources.MemoryMB = 1024 },
+		"ttl":    func(c *JobContractV1) { c.Resources.TimeoutSeconds = 600 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			// A refusal ends the connection — each case gets its own.
+			conn, reader := connect(t, srv.SocketPath())
+			defer conn.Close()
+			resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV1) {
+				c.JobID, c.Nonce = "ceil-"+name, "ceil-n-"+name
+				mutate(c)
+			}))
+			if resp.OK || !strings.Contains(resp.Error, "ceiling") {
+				t.Fatalf("over-ceiling %s admitted: %+v", name, resp)
+			}
+		})
 	}
 }

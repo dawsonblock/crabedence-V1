@@ -398,6 +398,9 @@ func (b *MSBBackend) Wait(ctx context.Context, handle string) (*ExecResult, erro
 // reconciles their sandbox handles.
 func (b *MSBBackend) Close() error { return nil }
 
+// Name is the provider identity receipts and ledger rows attest.
+func (b *MSBBackend) Name() string { return "microsandbox" }
+
 // artifactHead reads a small prefix of a failed launch's captured
 // output for the refusal message — bounded, never the whole file.
 func artifactHead(path string) string {

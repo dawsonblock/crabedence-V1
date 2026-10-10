@@ -14,6 +14,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/openclaw/crabbox/internal/evidence"
 )
 
 // JobStateRecorded marks a job the executor accepted into its durable
@@ -93,6 +95,17 @@ type Config struct {
 	// request; a contract exceeding a non-zero ceiling field refuses.
 	// Nil imposes no ceiling beyond structural sanity.
 	ResourceCeiling *ResourceBudget
+	// EvidenceDir holds the executor's execution-evidence chain:
+	// receipts.jsonl, signed checkpoints, and the evidence signer
+	// key. Empty defaults to <SocketDir>/evidence. Every terminal
+	// job emits a signed receipt before its ledger transition —
+	// evidence precedes the claim it supports.
+	EvidenceDir string
+	// EvidenceKeyPath is the executor's evidence-signing key (PKCS8
+	// PEM, created durably if absent). Empty defaults to
+	// <EvidenceDir>/executor-evidence.pem. This key attests that
+	// work ran — it can never authorize work.
+	EvidenceKeyPath string
 	// Audit receives decision lines; nil discards them.
 	Audit AuditSink
 	// now is the wall clock — injectable for tests.
@@ -126,6 +139,12 @@ type Server struct {
 	shutdown   context.Context
 	shutdownFn context.CancelFunc
 	closed     chan struct{}
+
+	// evidence is the append-only execution-evidence chain; nil only
+	// before Start or after a failed Start. backendName is the
+	// provider identity attested in receipts.
+	evidence    *EvidenceLog
+	backendName string
 }
 
 // NewServer validates the config and returns a runnable server.
@@ -153,6 +172,12 @@ func NewServer(cfg Config) (*Server, error) {
 	}
 	if cfg.MaxContractTTL == 0 {
 		cfg.MaxContractTTL = defaultMaxContractTTL
+	}
+	if cfg.EvidenceDir == "" {
+		cfg.EvidenceDir = filepath.Join(cfg.SocketDir, "evidence")
+	}
+	if cfg.EvidenceKeyPath == "" {
+		cfg.EvidenceKeyPath = DefaultEvidenceKeyPath(cfg.EvidenceDir)
 	}
 	now := cfg.now
 	if now == nil {
@@ -211,12 +236,38 @@ func (s *Server) Start() error {
 	if n := ledger.Reconciled(); n > 0 {
 		s.audit("reconciled %d job(s) from a previous lifetime to %s", n, JobStateDispatchAmbig)
 	}
-	// Any failure past this point must release the ledger — a server
-	// that never started still holds the fence lock until it does.
-	failStart := func(err error) error {
+	// Failures before the evidence chain exists still owe the ledger
+	// its close — a server that never started holds the fence lock
+	// until this runs.
+	failLedger := func(err error) error {
 		_ = s.ledger.Close()
 		s.ledger = nil
 		return err
+	}
+	// The evidence chain opens before the socket binds: an executor
+	// that cannot produce evidence must never accept work. The
+	// evidence signer is executor-local and distinct from every
+	// authority key — it attests outcomes, it cannot grant them.
+	backendName := "none"
+	if s.cfg.Backend != nil {
+		backendName = s.cfg.Backend.Name()
+	}
+	signer, err := evidence.LoadOrCreateSigner(s.cfg.EvidenceKeyPath)
+	if err != nil {
+		return failLedger(err)
+	}
+	evLog, err := OpenEvidenceLog(s.cfg.EvidenceDir, signer, backendName)
+	if err != nil {
+		return failLedger(err)
+	}
+	s.evidence, s.backendName = evLog, backendName
+	// Any failure past this point must release the evidence log too —
+	// the fence lock and an open receipts file both stay held
+	// otherwise.
+	failStart := func(err error) error {
+		_ = s.evidence.Close(nil)
+		s.evidence = nil
+		return failLedger(err)
 	}
 	if err := clearStaleSocket(s.socket); err != nil {
 		return failStart(err)
@@ -248,9 +299,10 @@ func (s *Server) Start() error {
 	if len(s.cfg.AuthorityKeys) > 0 {
 		authPosture = fmt.Sprintf("signed-contracts (%d authority keys)", len(s.cfg.AuthorityKeys))
 	}
-	s.audit("sandbox-executord listening on %s (peers=%d, auth=%s, jobs=%s, backend=%t, max_conns=%d, ledger=%s epoch=%d)",
+	s.audit("sandbox-executord listening on %s (peers=%d, auth=%s, jobs=%s, backend=%t, max_conns=%d, ledger=%s epoch=%d, evidence_dir=%s evidence_signer=%s)",
 		s.socket, len(s.cfg.Peers), tokenPosture, authPosture,
-		s.cfg.Backend != nil, s.cfg.MaxConns, s.cfg.LedgerPath, ledger.Epoch())
+		s.cfg.Backend != nil, s.cfg.MaxConns, s.cfg.LedgerPath, ledger.Epoch(),
+		s.cfg.EvidenceDir, evLog.SignerFingerprint())
 	s.acceptWg.Add(1)
 	go s.acceptLoop(listener)
 	return nil
@@ -287,6 +339,18 @@ func (s *Server) Stop() error {
 			ledgerErr = ierr
 		} else if n > 0 {
 			s.audit("marked %d running job(s) %s at shutdown", n, JobStateInterrupted)
+		}
+		// The final checkpoint must precede the ledger close — it
+		// commits to the terminal enumeration this lifetime leaves
+		// behind.
+		if s.evidence != nil {
+			refs, rerr := s.ledger.TerminalRefs()
+			if rerr != nil {
+				ledgerErr = rerr
+			} else if cerr := s.evidence.Close(refs); cerr != nil && ledgerErr == nil {
+				ledgerErr = cerr
+			}
+			s.evidence = nil
 		}
 		if cerr := s.ledger.Close(); ledgerErr == nil {
 			ledgerErr = cerr
@@ -580,7 +644,10 @@ func (s *Server) serve(conn *net.UnixConn) {
 		switch {
 		case derr == nil:
 			err := s.ledger.Transition(jobID, JobStateRunning, []string{JobStateDispatching},
-				func(j *LedgerJob) error { j.BackendHandle = handle; return nil })
+				func(j *LedgerJob) error {
+					j.BackendID, j.BackendHandle = s.backendName, handle
+					return nil
+				})
 			if err != nil {
 				fail(fmt.Sprintf("persist dispatch of %q: %v", jobID, err))
 				return
@@ -607,9 +674,22 @@ func (s *Server) serve(conn *net.UnixConn) {
 		default:
 			// Definitive refusal: nothing launched, but the job
 			// identity stays recorded — a backend error must never
-			// erase an acknowledged job.
+			// erase an acknowledged job. The NO_EFFECT receipt
+			// attests the refusal itself.
+			receiptSHA, rerr := s.emitReceipt(&LedgerJob{
+				JobID: jobID, Principal: principal, ContractHash: contractHash,
+			}, evidence.OutcomeNoEffect, "", handle)
+			if rerr != nil {
+				s.audit("job %s: evidence emission failed (%v) — refusing the terminal claim too", jobID, rerr)
+				fail(fmt.Sprintf("backend refused and evidence emission failed for %q: %v", jobID, rerr))
+				return
+			}
 			_ = s.ledger.Transition(jobID, JobStateDispatchFailed, []string{JobStateDispatching},
-				func(j *LedgerJob) error { j.Error = derr.Error(); return nil })
+				func(j *LedgerJob) error {
+					j.Error, j.BackendID, j.ReceiptSHA256 = derr.Error(), s.backendName, receiptSHA
+					return nil
+				})
+			s.checkpoint()
 			failJob(jobID, JobStateDispatchFailed, fmt.Sprintf("backend refused job: %v", derr))
 			return
 		}
@@ -624,12 +704,25 @@ func (s *Server) serve(conn *net.UnixConn) {
 func (s *Server) monitor(jobID, handle string) {
 	defer s.monitorWg.Done()
 	res, err := s.cfg.Backend.Wait(s.shutdown, handle)
+
+	// The receipt needs the row's bound identity — principal and
+	// contract hash are what the signature attests. If the row
+	// cannot be read, the transition below would fail anyway, so
+	// fail together rather than attest a partial identity.
+	job, jerr := s.ledger.Get(jobID)
+	if jerr != nil || job == nil {
+		s.audit("job %s: cannot read ledger row for terminal evidence: %v", jobID, jerr)
+		return
+	}
+
 	if err != nil {
 		if errors.Is(err, context.Canceled) || s.isStopped() {
 			return
 		}
 		s.audit("job %s monitor error: %v", jobID, err)
-		_ = s.ledger.Transition(jobID, JobStateFailed, []string{JobStateRunning},
+		// The job ran (it was RUNNING); a lost monitor is still a
+		// terminated run — COMPLETED with no captured artifact.
+		s.finishTerminal(job, JobStateFailed, evidence.OutcomeCompleted, handle, "",
 			func(j *LedgerJob) error { j.Error = err.Error(); return nil })
 		return
 	}
@@ -639,15 +732,65 @@ func (s *Server) monitor(jobID, handle string) {
 	}
 	resultJSON, _ := json.Marshal(res)
 	exit := int64(res.ExitCode)
-	if err := s.ledger.Transition(jobID, state, []string{JobStateRunning},
+	s.finishTerminal(job, state, evidence.OutcomeCompleted, handle, res.OutputSHA256,
 		func(j *LedgerJob) error {
 			j.ExitCode = &exit
 			j.ResultJSON = string(resultJSON)
+			j.ArtifactSHA256 = res.OutputSHA256
 			return nil
-		}); err != nil {
-		s.audit("job %s finished %s but the ledger refused the transition: %v", jobID, state, err)
-	}
+		})
 	s.audit("job %s finished: state=%s exit=%d output_sha256=%s", jobID, state, res.ExitCode, res.OutputSHA256)
+}
+
+// emitReceipt signs and durably appends one terminal receipt to the
+// evidence chain. It must succeed before its ledger transition —
+// evidence precedes the claim it supports, or the claim does not get
+// made.
+func (s *Server) emitReceipt(job *LedgerJob, outcome, artifactSHA, runID string) (string, error) {
+	if s.evidence == nil {
+		return "", fmt.Errorf("evidence chain not open")
+	}
+	return s.evidence.EmitForJob(job, outcome, artifactSHA, runID)
+}
+
+// finishTerminal is the shared terminal write: sign the receipt, then
+// commit the transition binding the receipt digest, then checkpoint
+// the post-transition enumeration. A failure at any stage leaves the
+// job non-terminal — the next reconcile marks it ambiguous for an
+// operator, never silently terminal or silently lost.
+func (s *Server) finishTerminal(job *LedgerJob, state, outcome, handle, artifactSHA string, mutate func(*LedgerJob) error) {
+	receiptSHA, rerr := s.emitReceipt(job, outcome, artifactSHA, handle)
+	if rerr != nil {
+		s.audit("job %s: evidence emission failed (%v) — staying non-terminal for reconcile", job.JobID, rerr)
+		return
+	}
+	err := s.ledger.Transition(job.JobID, state, []string{JobStateRunning},
+		func(j *LedgerJob) error {
+			j.ReceiptSHA256 = receiptSHA
+			return mutate(j)
+		})
+	if err != nil {
+		s.audit("job %s finished %s but the ledger refused the transition: %v", job.JobID, state, err)
+		return
+	}
+	s.checkpoint()
+}
+
+// checkpoint issues a signed checkpoint over the current terminal
+// enumeration. Failure is loud — the receipt and row already stand,
+// but the missing checkpoint is a coverage gap a verifier flags.
+func (s *Server) checkpoint() {
+	if s.evidence == nil {
+		return
+	}
+	refs, err := s.ledger.TerminalRefs()
+	if err != nil {
+		s.audit("evidence checkpoint failed: cannot enumerate terminal records: %v", err)
+		return
+	}
+	if err := s.evidence.Checkpoint(refs); err != nil {
+		s.audit("evidence checkpoint failed: %v", err)
+	}
 }
 
 // checkCeiling refuses contracts whose declared budget exceeds a

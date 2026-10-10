@@ -34,8 +34,20 @@
 //	                 negative disables)
 //	-ceil-cpus/-ceil-memory-mb/-ceil-timeout-secs
 //	                 operator resource ceilings for contracts
+//	-evidence-dir    execution-evidence chain directory: receipts,
+//	                 signed checkpoints and the evidence signer key
+//	                 (defaults to <socket-dir>/evidence). Every
+//	                 terminal job emits a signed receipt before its
+//	                 ledger transition; checkpoints commit to the
+//	                 durable terminal enumeration so deletion, rewrite
+//	                 or rollback is independently detectable.
+//	-evidence-key    evidence signer PKCS8 PEM (defaults to
+//	                 <evidence-dir>/executor-evidence.pem, created
+//	                 durably if absent). It attests outcomes — it can
+//	                 never authorize jobs.
 //
-// The daemon logs every admission decision to stderr.
+// The daemon logs every admission decision to stderr, including the
+// evidence signer fingerprint an operator should pin for verifiers.
 package main
 
 import (
@@ -65,6 +77,8 @@ func main() {
 	ceilCPUs := flag.Float64("ceil-cpus", 0, "contract cpus ceiling (0 = no operator ceiling)")
 	ceilMemMB := flag.Uint64("ceil-memory-mb", 0, "contract memory_mb ceiling (0 = no operator ceiling)")
 	ceilTimeout := flag.Uint("ceil-timeout-secs", 0, "contract timeout_seconds ceiling (0 = no operator ceiling)")
+	evidenceDir := flag.String("evidence-dir", os.Getenv("SANDBOX_EXECUTOR_EVIDENCE_DIR"), "execution-evidence chain directory (or SANDBOX_EXECUTOR_EVIDENCE_DIR)")
+	evidenceKey := flag.String("evidence-key", os.Getenv("SANDBOX_EXECUTOR_EVIDENCE_KEY"), "evidence signer PKCS8 PEM path (or SANDBOX_EXECUTOR_EVIDENCE_KEY)")
 	flag.Parse()
 
 	peers, err := sandboxexecutor.ParsePeerAllowlist(*peerUIDs)
@@ -132,6 +146,8 @@ func main() {
 		DispatchTimeout: *dispatchTimeout,
 		MaxContractTTL:  *contractMaxTTL,
 		ResourceCeiling: ceiling,
+		EvidenceDir:     *evidenceDir,
+		EvidenceKeyPath: *evidenceKey,
 		Audit:           func(format string, args ...any) { log.Printf(format, args...) },
 	})
 	if err != nil {

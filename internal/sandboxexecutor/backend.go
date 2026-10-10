@@ -23,6 +23,11 @@ var ErrAmbiguousDispatch = errors.New("dispatch outcome uncertain — the job ma
 // ambiguous) while result collection happens asynchronously in a
 // monitor goroutine.
 type Backend interface {
+	// Name is the backend's stable provider identity — attested in
+	// execution receipts and recorded on the ledger row so evidence
+	// binds who ran the job, not just what ran.
+	Name() string
+
 	// Dispatch starts the job and returns the backend's handle for
 	// it (e.g. the sandbox name). Returned errors classify as:
 	//   nil           — launched, handle valid

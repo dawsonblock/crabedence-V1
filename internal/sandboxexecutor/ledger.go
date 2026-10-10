@@ -2,7 +2,9 @@ package sandboxexecutor
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -11,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gofrs/flock"
+	"github.com/openclaw/crabbox/internal/evidence"
 	_ "modernc.org/sqlite"
 )
 
@@ -81,12 +84,28 @@ type LedgerJob struct {
 	ContractJSON  string
 	State         string
 	FenceEpoch    uint64
+	BackendID     string
 	BackendHandle string
 	ReceivedAt    time.Time
 	UpdatedAt     time.Time
 	ExitCode      *int64
 	Error         string
 	ResultJSON    string
+	// TerminalSeq is the job's position in the durable terminal
+	// enumeration — assigned transactionally with the terminal write
+	// so the enumeration checkpoints commit to is append-only by
+	// construction. Zero while the job is non-terminal.
+	TerminalSeq int64
+	// ReceiptSHA256 is the digest of the signed execution receipt
+	// emitted at the terminal transition; the evidence chain's link
+	// back into this row.
+	ReceiptSHA256  string
+	ArtifactSHA256 string
+
+	receivedAtRaw int64
+	updatedAtRaw  int64
+	exitRaw       sql.NullInt64
+	termSeqRaw    sql.NullInt64
 }
 
 // OpenLedger opens (creating if needed) the durable registry at path,
@@ -180,7 +199,16 @@ func (l *Ledger) Reconciled() int { return l.reconciled }
 // Epoch is the current fencing token.
 func (l *Ledger) Epoch() uint64 { return l.epoch }
 
+// ledgerSchemaVersion bumps when the schema gains columns; pre-v2
+// ledgers (from the admission-only spike) get their new columns via
+// ALTER TABLE rather than a destructive rebuild.
+const ledgerSchemaVersion = 2
+
 func (l *Ledger) migrate() error {
+	var version int
+	if err := l.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		return fmt.Errorf("read ledger schema version: %w", err)
+	}
 	_, err := l.db.Exec(`
 		CREATE TABLE IF NOT EXISTS executor_meta (
 			key   TEXT PRIMARY KEY,
@@ -196,16 +224,38 @@ func (l *Ledger) migrate() error {
 			contract_json  TEXT NOT NULL,
 			state          TEXT NOT NULL,
 			fence_epoch    INTEGER NOT NULL,
+			backend_id     TEXT NOT NULL DEFAULT '',
 			backend_handle TEXT NOT NULL DEFAULT '',
 			received_at    INTEGER NOT NULL,
 			updated_at     INTEGER NOT NULL,
 			exit_code      INTEGER,
 			error          TEXT NOT NULL DEFAULT '',
-			result_json    TEXT NOT NULL DEFAULT ''
+			result_json    TEXT NOT NULL DEFAULT '',
+			terminal_seq   INTEGER,
+			receipt_sha256 TEXT NOT NULL DEFAULT '',
+			artifact_sha256 TEXT NOT NULL DEFAULT ''
 		);
 	`)
 	if err != nil {
 		return fmt.Errorf("migrate ledger: %w", err)
+	}
+	if version < 2 {
+		// v1 → v2: evidence columns. ADD COLUMN is additive-only —
+		// existing rows keep their history with empty digests, which
+		// checkpoint verification treats honestly as unattested.
+		for _, ddl := range []string{
+			`ALTER TABLE jobs ADD COLUMN backend_id TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE jobs ADD COLUMN terminal_seq INTEGER`,
+			`ALTER TABLE jobs ADD COLUMN receipt_sha256 TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE jobs ADD COLUMN artifact_sha256 TEXT NOT NULL DEFAULT ''`,
+		} {
+			if _, err := l.db.Exec(ddl); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+				return fmt.Errorf("migrate ledger v%d→v2: %w", version, err)
+			}
+		}
+		if _, err := l.db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, ledgerSchemaVersion)); err != nil {
+			return fmt.Errorf("stamp ledger schema version: %w", err)
+		}
 	}
 	return nil
 }
@@ -359,54 +409,59 @@ func (l *Ledger) hashExistsTx(tx *sql.Tx, hash string) bool {
 	return n > 0
 }
 
+// jobColumns is the canonical SELECT list for a full jobs row.
+const jobColumns = `job_id, contract_hash, seq, submitter, principal, image, contract_json,
+	state, fence_epoch, backend_id, backend_handle, received_at, updated_at,
+	exit_code, error, result_json, terminal_seq, receipt_sha256, artifact_sha256`
+
 func (l *Ledger) getTx(tx *sql.Tx, jobID string) (*LedgerJob, error) {
 	j := &LedgerJob{}
-	var exit sql.NullInt64
-	var receivedAt, updatedAt int64
 	err := tx.QueryRow(
-		`SELECT job_id, contract_hash, seq, submitter, principal, image, contract_json,
-		 state, fence_epoch, backend_handle, received_at, updated_at,
-		 exit_code, error, result_json
-		 FROM jobs WHERE job_id = ?`, jobID).Scan(
-		&j.JobID, &j.ContractHash, &j.Seq, &j.Submitter, &j.Principal, &j.Image,
-		&j.ContractJSON, &j.State, &j.FenceEpoch, &j.BackendHandle,
-		&receivedAt, &updatedAt, &exit, &j.Error, &j.ResultJSON)
+		`SELECT `+jobColumns+` FROM jobs WHERE job_id = ?`, jobID).
+		Scan(scanFields(j)...)
 	if err != nil {
 		return nil, err
 	}
-	j.ReceivedAt = time.UnixMilli(receivedAt).UTC()
-	j.UpdatedAt = time.UnixMilli(updatedAt).UTC()
-	if exit.Valid {
-		j.ExitCode = &exit.Int64
+	return j, finishScan(j)
+}
+
+// scanFields exposes the scan destinations in jobColumns order so
+// QueryRow.Scan, getTx and List share exactly one column mapping.
+func scanFields(j *LedgerJob) []any {
+	return []any{
+		&j.JobID, &j.ContractHash, &j.Seq, &j.Submitter, &j.Principal, &j.Image,
+		&j.ContractJSON, &j.State, &j.FenceEpoch, &j.BackendID, &j.BackendHandle,
+		&j.receivedAtRaw, &j.updatedAtRaw, &j.exitRaw, &j.Error, &j.ResultJSON,
+		&j.termSeqRaw, &j.ReceiptSHA256, &j.ArtifactSHA256,
 	}
-	return j, nil
+}
+
+// finishScan converts the raw scanned values into the typed fields.
+func finishScan(j *LedgerJob) error {
+	j.ReceivedAt = time.UnixMilli(j.receivedAtRaw).UTC()
+	j.UpdatedAt = time.UnixMilli(j.updatedAtRaw).UTC()
+	if j.exitRaw.Valid {
+		j.ExitCode = &j.exitRaw.Int64
+	}
+	if j.termSeqRaw.Valid {
+		j.TerminalSeq = j.termSeqRaw.Int64
+	}
+	return nil
 }
 
 // Get returns one job, or nil when absent.
 func (l *Ledger) Get(jobID string) (*LedgerJob, error) {
 	j := &LedgerJob{}
-	var exit sql.NullInt64
-	var receivedAt, updatedAt int64
 	err := l.db.QueryRow(
-		`SELECT job_id, contract_hash, seq, submitter, principal, image, contract_json,
-		 state, fence_epoch, backend_handle, received_at, updated_at,
-		 exit_code, error, result_json
-		 FROM jobs WHERE job_id = ?`, jobID).Scan(
-		&j.JobID, &j.ContractHash, &j.Seq, &j.Submitter, &j.Principal, &j.Image,
-		&j.ContractJSON, &j.State, &j.FenceEpoch, &j.BackendHandle,
-		&receivedAt, &updatedAt, &exit, &j.Error, &j.ResultJSON)
+		`SELECT `+jobColumns+` FROM jobs WHERE job_id = ?`, jobID).
+		Scan(scanFields(j)...)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	j.ReceivedAt = time.UnixMilli(receivedAt).UTC()
-	j.UpdatedAt = time.UnixMilli(updatedAt).UTC()
-	if exit.Valid {
-		j.ExitCode = &exit.Int64
-	}
-	return j, nil
+	return j, finishScan(j)
 }
 
 // Count reports the durable registry size.
@@ -420,11 +475,7 @@ func (l *Ledger) Count() (int, error) {
 
 // List returns every recorded job in sequence order.
 func (l *Ledger) List() ([]*LedgerJob, error) {
-	rows, err := l.db.Query(
-		`SELECT job_id, contract_hash, seq, submitter, principal, image, contract_json,
-		 state, fence_epoch, backend_handle, received_at, updated_at,
-		 exit_code, error, result_json
-		 FROM jobs ORDER BY seq`)
+	rows, err := l.db.Query(`SELECT ` + jobColumns + ` FROM jobs ORDER BY seq`)
 	if err != nil {
 		return nil, err
 	}
@@ -432,18 +483,11 @@ func (l *Ledger) List() ([]*LedgerJob, error) {
 	var out []*LedgerJob
 	for rows.Next() {
 		j := &LedgerJob{}
-		var exit sql.NullInt64
-		var receivedAt, updatedAt int64
-		if err := rows.Scan(
-			&j.JobID, &j.ContractHash, &j.Seq, &j.Submitter, &j.Principal, &j.Image,
-			&j.ContractJSON, &j.State, &j.FenceEpoch, &j.BackendHandle,
-			&receivedAt, &updatedAt, &exit, &j.Error, &j.ResultJSON); err != nil {
+		if err := rows.Scan(scanFields(j)...); err != nil {
 			return nil, err
 		}
-		j.ReceivedAt = time.UnixMilli(receivedAt).UTC()
-		j.UpdatedAt = time.UnixMilli(updatedAt).UTC()
-		if exit.Valid {
-			j.ExitCode = &exit.Int64
+		if err := finishScan(j); err != nil {
+			return nil, err
 		}
 		out = append(out, j)
 	}
@@ -493,16 +537,31 @@ func (l *Ledger) Transition(jobID, to string, from []string, mutate func(*Ledger
 			return err
 		}
 	}
+	// A terminal write joins the durable terminal enumeration: the
+	// sequence is allocated inside the same transaction so a crash
+	// can never leave a number skipped — the enumeration a
+	// checkpoint covers is dense and append-only.
+	var termSeq any
+	if isTerminalState(to) {
+		next, err := l.nextTerminalSeq(tx)
+		if err != nil {
+			return fmt.Errorf("transition %s: %w", jobID, err)
+		}
+		job.TerminalSeq = next
+		termSeq = next
+	}
 	var exit any
 	if job.ExitCode != nil {
 		exit = *job.ExitCode
 	}
 	res, err := tx.Exec(
-		`UPDATE jobs SET state = ?, fence_epoch = ?, backend_handle = ?,
-		 updated_at = ?, exit_code = ?, error = ?, result_json = ?
+		`UPDATE jobs SET state = ?, fence_epoch = ?, backend_id = ?, backend_handle = ?,
+		 updated_at = ?, exit_code = ?, error = ?, result_json = ?,
+		 terminal_seq = ?, receipt_sha256 = ?, artifact_sha256 = ?
 		 WHERE job_id = ? AND seq = ?`,
-		job.State, job.FenceEpoch, job.BackendHandle,
+		job.State, job.FenceEpoch, job.BackendID, job.BackendHandle,
 		time.Now().UTC().UnixMilli(), exit, job.Error, job.ResultJSON,
+		termSeq, job.ReceiptSHA256, job.ArtifactSHA256,
 		jobID, job.Seq)
 	if err != nil {
 		return fmt.Errorf("transition %s: %w", jobID, err)
@@ -513,12 +572,115 @@ func (l *Ledger) Transition(jobID, to string, from []string, mutate func(*Ledger
 	return tx.Commit()
 }
 
+// isTerminalState reports whether a state closes the job's lifecycle
+// and joins the checkpointable terminal enumeration. INTERRUPTED and
+// DISPATCH_AMBIGUOUS are deliberately excluded — they mean "an
+// operator must reconcile", not "the outcome is known"; enrolling
+// them would let a checkpoint certify uncertainty as fact.
+func isTerminalState(state string) bool {
+	switch state {
+	case JobStateSucceeded, JobStateFailed, JobStateDispatchFailed:
+		return true
+	}
+	return false
+}
+
+// nextTerminalSeq allocates the monotonic terminal-sequence counter —
+// persisted in executor_meta so ordering survives restarts and
+// concurrent terminal writes serialize through the IMMEDIATE tx.
+func (l *Ledger) nextTerminalSeq(tx *sql.Tx) (int64, error) {
+	var raw string
+	err := tx.QueryRow(`SELECT value FROM executor_meta WHERE key = 'next_terminal_seq'`).Scan(&raw)
+	var seq int64
+	switch {
+	case err == sql.ErrNoRows:
+		seq = 0
+	case err != nil:
+		return 0, fmt.Errorf("read terminal seq: %w", err)
+	default:
+		if _, err := fmt.Sscanf(raw, "%d", &seq); err != nil {
+			return 0, fmt.Errorf("corrupt terminal seq %q: %w", raw, err)
+		}
+	}
+	seq++
+	if _, err := tx.Exec(
+		`INSERT INTO executor_meta (key, value) VALUES ('next_terminal_seq', ?)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`, fmt.Sprint(seq)); err != nil {
+		return 0, err
+	}
+	return seq, nil
+}
+
+// TerminalRefs returns the durable terminal enumeration in
+// terminal_seq order — the exact set a checkpoint commits to and a
+// verifier recomputes. Non-terminal jobs (RECORDED, RUNNING,
+// DISPATCHING, INTERRUPTED, DISPATCH_AMBIGUOUS) are excluded: a
+// checkpoint must never certify an outcome the executor has not
+// attested.
+func (l *Ledger) TerminalRefs() ([]evidence.TerminalRef, error) {
+	return terminalRefs(l.db)
+}
+
+func terminalRefs(q interface {
+	Query(query string, args ...any) (*sql.Rows, error)
+}) ([]evidence.TerminalRef, error) {
+	rows, err := q.Query(
+		`SELECT terminal_seq, job_id, state, contract_hash, result_json,
+		 artifact_sha256, receipt_sha256, backend_id, backend_handle, updated_at
+		 FROM jobs WHERE terminal_seq IS NOT NULL ORDER BY terminal_seq`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []evidence.TerminalRef
+	for rows.Next() {
+		var ref evidence.TerminalRef
+		var resultJSON string
+		var updatedAt int64
+		if err := rows.Scan(&ref.Seq, &ref.ExecutionID, &ref.State, &ref.RequestDigest,
+			&resultJSON, &ref.TerminalEvidenceDigest, &ref.TerminalReceiptDigest,
+			&ref.ProviderID, &ref.ProviderRunID, &updatedAt); err != nil {
+			return nil, err
+		}
+		sum := sha256.Sum256([]byte(resultJSON))
+		ref.TerminalResultDigest = hex.EncodeToString(sum[:])
+		ref.UpdatedAt = time.UnixMilli(updatedAt).UTC().Format(time.RFC3339Nano)
+		out = append(out, ref)
+	}
+	return out, rows.Err()
+}
+
+// InspectLedger opens a ledger read-only for independent audit: no
+// flock, no epoch bump, no reconcile, no schema writes. A verifier
+// must never mutate the store it is checking — including the
+// side-effects a normal open performs. The returned Ledger is usable
+// only through TerminalRefs/List/Get; writes will fail against the
+// read-only connection.
+func InspectLedger(path string) (*Ledger, error) {
+	if strings.ContainsAny(path, "?#") {
+		return nil, fmt.Errorf("ledger path must not contain '?' or '#': %q", path)
+	}
+	dsn := fmt.Sprintf("file:%s?mode=ro&_pragma=query_only(1)&_pragma=busy_timeout(5000)", path)
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, err
+	}
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("inspect ledger %s: %w", path, err)
+	}
+	return &Ledger{db: db}, nil
+}
+
 // Close releases the ledger: database first, then the fence lock —
-// order matters, the lock must outlive the last write.
+// order matters, the lock must outlive the last write. An inspected
+// (read-only) ledger has no lock to release.
 func (l *Ledger) Close() error {
 	err := l.db.Close()
-	if uerr := l.lock.Unlock(); err == nil {
-		err = uerr
+	if l.lock != nil {
+		if uerr := l.lock.Unlock(); err == nil {
+			err = uerr
+		}
 	}
 	return err
 }

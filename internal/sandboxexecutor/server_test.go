@@ -382,6 +382,8 @@ func (b *stubBackend) Inspect(ctx context.Context, handle string) (bool, error) 
 
 func (b *stubBackend) Close() error { return nil }
 
+func (b *stubBackend) Name() string { return "stub" }
+
 // Signed-job plumbing for backend tests: a backend can only be
 // configured when authority keys exist, so every dispatch test signs
 // its jobs.
