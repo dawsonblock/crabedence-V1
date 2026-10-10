@@ -13,10 +13,11 @@ import (
 	"github.com/openclaw/crabbox/internal/idempotency"
 )
 
-// End-to-end: a checkpoint emitted over a real store verifies through
-// the CLI path; a tampered enumeration fails with exit 1; bad usage
-// fails with exit 2.
-func TestVerifyCLIEndToEnd(t *testing.T) {
+// seededStore builds a SQLite effect store holding one committed
+// terminal record and returns its path with the terminal enumeration a
+// checkpoint would commit to.
+func seededStore(t *testing.T) (string, []evidence.TerminalRef) {
+	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "db", "store.db")
 	db, err := idempotency.OpenSQLiteDB(dbPath)
 	if err != nil {
@@ -59,28 +60,27 @@ func TestVerifyCLIEndToEnd(t *testing.T) {
 		idempotency.StateInFlight, receipt); err != nil {
 		t.Fatalf("finalize: %v", err)
 	}
+	refs, err := store.TerminalEvidence(ctx)
+	if err != nil {
+		t.Fatalf("enumerate: %v", err)
+	}
 	db.Close()
+	if len(refs) != 1 {
+		t.Fatalf("enumerated %d refs, want 1", len(refs))
+	}
+	return dbPath, refs
+}
+
+// End-to-end: a checkpoint emitted over a real store verifies through
+// the CLI path; a tampered enumeration fails with exit 1; bad usage
+// fails with exit 2.
+func TestVerifyCLIEndToEnd(t *testing.T) {
+	dbPath, refs := seededStore(t)
 
 	// Emit the checkpoint with a signer (this is what the service does).
 	signer, err := evidence.GenerateSigner()
 	if err != nil {
 		t.Fatalf("signer: %v", err)
-	}
-	vdb, err := idempotency.OpenSQLiteDB(dbPath)
-	if err != nil {
-		t.Fatalf("reopen: %v", err)
-	}
-	vstore, err := idempotency.NewSQLiteStore(vdb)
-	if err != nil {
-		t.Fatalf("verify store: %v", err)
-	}
-	refs, err := vstore.TerminalEvidence(ctx)
-	if err != nil {
-		t.Fatalf("enumerate: %v", err)
-	}
-	vdb.Close()
-	if len(refs) != 1 {
-		t.Fatalf("enumerated %d refs, want 1", len(refs))
 	}
 	cp := signer.SignCheckpoint(1, refs)
 	cpPath := filepath.Join(t.TempDir(), "cp.json")
@@ -123,6 +123,66 @@ func TestVerifyCLIEndToEnd(t *testing.T) {
 	// Missing required flags → 2.
 	if code := run([]string{"-checkpoint", cpPath, "-trusted", "x"}, out, out); code != 2 {
 		t.Fatalf("usage: exit %d, want 2", code)
+	}
+}
+
+// The same CLI path verifies a whole retained journal: every entry's
+// signature plus the stream's continuity invariants, and the head's
+// chain against the live store — or every entry's with -chains. Any
+// tampered entry fails with exit 1.
+func TestVerifyCLIJournal(t *testing.T) {
+	dbPath, refs := seededStore(t)
+	signer, err := evidence.GenerateSigner()
+	if err != nil {
+		t.Fatalf("signer: %v", err)
+	}
+	journalPath := filepath.Join(t.TempDir(), "cp.json.jsonl")
+	writeJournal := func(lines [][]byte) {
+		t.Helper()
+		var buf []byte
+		for _, line := range lines {
+			buf = append(buf, line...)
+			buf = append(buf, '\n')
+		}
+		if err := os.WriteFile(journalPath, buf, 0o600); err != nil {
+			t.Fatalf("write journal: %v", err)
+		}
+	}
+	var lines [][]byte
+	for seq := int64(1); seq <= 3; seq++ {
+		payload, err := json.Marshal(signer.SignCheckpoint(seq, refs))
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		lines = append(lines, payload)
+	}
+	writeJournal(lines)
+	out := &discardWriter{}
+
+	code := run([]string{"-store", dbPath, "-checkpoint", journalPath, "-trusted", signer.Fingerprint()}, out, out)
+	if code != 0 {
+		t.Fatalf("valid journal: exit %d", code)
+	}
+	code = run([]string{"-store", dbPath, "-checkpoint", journalPath, "-trusted", signer.Fingerprint(), "-chains"}, out, out)
+	if code != 0 {
+		t.Fatalf("valid journal with chains: exit %d", code)
+	}
+
+	// A tampered mid-history entry invalidates the journal — custody
+	// rests on the whole stream, not just the head.
+	tampered := append([]byte{}, lines[1]...)
+	tampered[len(tampered)/2] ^= 0x20
+	writeJournal([][]byte{lines[0], tampered, lines[2]})
+	code = run([]string{"-store", dbPath, "-checkpoint", journalPath, "-trusted", signer.Fingerprint()}, out, out)
+	if code != 1 {
+		t.Fatalf("tampered journal: exit %d, want 1", code)
+	}
+
+	// A missing entry breaks contiguity the same way.
+	writeJournal([][]byte{lines[0], lines[2]})
+	code = run([]string{"-store", dbPath, "-checkpoint", journalPath, "-trusted", signer.Fingerprint()}, out, out)
+	if code != 1 {
+		t.Fatalf("gapped journal: exit %d, want 1", code)
 	}
 }
 

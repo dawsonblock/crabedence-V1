@@ -213,8 +213,23 @@ func checkpointSigningBytes(cp Checkpoint) []byte {
 // assert append-only ordering. Only v2 checkpoints carry that
 // guarantee.
 func VerifyCheckpoint(cp *Checkpoint, current []TerminalRef, trustedSigners map[string]bool) error {
+	legacy, err := verifyCheckpointShape(cp, trustedSigners)
+	if err != nil {
+		return err
+	}
+	return verifyCheckpointAgainstStore(cp, current, legacy)
+}
+
+// verifyCheckpointShape carries the checkpoint's intrinsic checks:
+// schema identity, plausible field shapes, a signer fingerprint bound
+// to the presented public key and present in the trusted set, and an
+// ed25519 signature over the canonical payload. It answers "this is a
+// genuine checkpoint from a trusted signer" without consulting the
+// store, and reports whether the checkpoint carries v1 semantics so the
+// caller can verify the chain under the matching canon.
+func verifyCheckpointShape(cp *Checkpoint, trustedSigners map[string]bool) (bool, error) {
 	if cp == nil {
-		return errors.New("checkpoint is nil")
+		return false, errors.New("checkpoint is nil")
 	}
 	legacy := false
 	switch {
@@ -222,37 +237,45 @@ func VerifyCheckpoint(cp *Checkpoint, current []TerminalRef, trustedSigners map[
 	case cp.CheckpointType == checkpointTypeV1 && cp.SchemaVersion == checkpointSchemaVersionV1:
 		legacy = true
 	default:
-		return fmt.Errorf("unsupported checkpoint schema %q version %d", cp.CheckpointType, cp.SchemaVersion)
+		return false, fmt.Errorf("unsupported checkpoint schema %q version %d", cp.CheckpointType, cp.SchemaVersion)
 	}
 	if cp.Sequence < 0 {
-		return fmt.Errorf("invalid sequence %d", cp.Sequence)
+		return false, fmt.Errorf("invalid sequence %d", cp.Sequence)
 	}
 	if cp.RecordCount < 0 {
-		return fmt.Errorf("invalid record_count %d", cp.RecordCount)
+		return false, fmt.Errorf("invalid record_count %d", cp.RecordCount)
 	}
 	if _, err := time.Parse(time.RFC3339Nano, cp.IssuedAt); err != nil {
-		return fmt.Errorf("invalid issued_at")
+		return false, fmt.Errorf("invalid issued_at")
 	}
 	if _, err := hex.DecodeString(cp.ChainDigest); err != nil || len(cp.ChainDigest) != 2*sha256.Size {
-		return fmt.Errorf("invalid chain_digest")
+		return false, fmt.Errorf("invalid chain_digest")
 	}
 	pub, err := base64.StdEncoding.DecodeString(cp.PublicKey)
 	if err != nil || len(pub) != ed25519.PublicKeySize {
-		return fmt.Errorf("invalid public_key")
+		return false, fmt.Errorf("invalid public_key")
 	}
 	if cp.Signer != Fingerprint(pub) {
-		return fmt.Errorf("signer fingerprint does not match public_key")
+		return false, fmt.Errorf("signer fingerprint does not match public_key")
 	}
 	if !trustedSigners[cp.Signer] {
-		return fmt.Errorf("signer %s not trusted", cp.Signer)
+		return false, fmt.Errorf("signer %s not trusted", cp.Signer)
 	}
 	sig, err := base64.StdEncoding.DecodeString(cp.Signature)
 	if err != nil || len(sig) != ed25519.SignatureSize {
-		return fmt.Errorf("invalid signature")
+		return false, fmt.Errorf("invalid signature")
 	}
 	if !ed25519.Verify(pub, checkpointSigningBytes(*cp), sig) {
-		return fmt.Errorf("invalid signature")
+		return false, fmt.Errorf("invalid signature")
 	}
+	return legacy, nil
+}
+
+// verifyCheckpointAgainstStore carries the coverage checks: the store
+// must still hold at least the committed records and the covered prefix
+// must recompute to the committed chain digest, under the schema's own
+// enumeration semantics.
+func verifyCheckpointAgainstStore(cp *Checkpoint, current []TerminalRef, legacy bool) error {
 	if len(current) < cp.RecordCount {
 		return fmt.Errorf("store holds %d terminal records but the checkpoint commits to %d — records deleted or the store rolled back",
 			len(current), cp.RecordCount)
