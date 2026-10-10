@@ -108,9 +108,33 @@ fi
 # Gate 2 — NEMO transfer provenance on the shipped tree.
 if [ -f "$ROOT/runtimes/nemo-transfer-manifest.json" ]; then
   if [ -n "$REQUIRE_SOURCE" ]; then
+    # The verifier's --require-source is a strictness flag, not a
+    # path: the frozen baseline must sit at the source path the
+    # manifest declares, resolved against the extracted root. Link
+    # the caller's tree there — the same arrangement the packager's
+    # clean-room check uses.
+    req_abs="$(cd "$REQUIRE_SOURCE" 2>/dev/null && pwd -P)" || {
+      echo "qualify-source-distribution: --require-source is not a directory: $REQUIRE_SOURCE" >&2
+      exit 2
+    }
+    # A manifest python cannot parse is the verifier's job to report —
+    # leave the layout untouched and let the gate fail it properly.
+    src_rel="$(python3 -c 'import json,sys; print((json.load(open(sys.argv[1])).get("source") or {}).get("path",""))' \
+      "$ROOT/runtimes/nemo-transfer-manifest.json" 2>/dev/null)" || src_rel=""
+    if [ -n "$src_rel" ]; then
+      src_parent="$ROOT/$(dirname "$src_rel")"
+      mkdir -p "$src_parent"
+      src_dest="$(cd "$src_parent" && pwd -P)/$(basename "$src_rel")"
+      if [ -L "$src_dest" ] || [ ! -e "$src_dest" ]; then
+        ln -sfn "$req_abs" "$src_dest"
+      elif [ "$(cd "$src_dest" 2>/dev/null && pwd -P)" != "$req_abs" ]; then
+        echo "qualify-source-distribution: declared source path $src_dest exists and is not --require-source" >&2
+        exit 2
+      fi
+    fi
     gate "nemo-transfer-manifest" \
       python3 "$ROOT/scripts/verify-nemo-transfer.py" \
-        --require-source "$REQUIRE_SOURCE" "$ROOT/runtimes/nemo-transfer-manifest.json"
+        --require-source "$ROOT/runtimes/nemo-transfer-manifest.json"
   else
     gate "nemo-transfer-manifest" \
       python3 "$ROOT/scripts/verify-nemo-transfer.py" "$ROOT/runtimes/nemo-transfer-manifest.json"

@@ -263,3 +263,112 @@ test("generated content smuggled into the tree fails", { skip: !prerequisites &&
   assert.notEqual(r.status, 0);
   assert.match(r.stdout + r.stderr, /generated directory|FAIL: no-generated-content/);
 });
+
+// --require-source <dir> is the caller's frozen baseline. The declared
+// source path resolves against the extracted root's parent, so the
+// suite links the baseline there (the arrangement the packager's
+// clean-room check makes) and hands the verifier the boolean flag —
+// the directory must never reach it as a positional argument. The
+// manifest fixture lands post-extraction because a manifest without a
+// tree cannot survive the packager's own clean-room verification.
+function injectTransferFixture(extracted) {
+  const py = path.join(extracted, "scripts", "verify-nemo-transfer.py");
+  fs.copyFileSync(path.join(scripts, "verify-nemo-transfer.py"), py);
+  fs.chmodSync(py, 0o755);
+  fs.mkdirSync(path.join(extracted, "runtimes"), { recursive: true });
+  fs.writeFileSync(
+    path.join(extracted, "runtimes", "nemo-transfer-manifest.json"),
+    JSON.stringify({ source: { path: "../frozen-src", required: true } }),
+  );
+}
+
+function qualifyRequireSource(extracted, req) {
+  return spawnSync(
+    "bash",
+    [path.join(extracted, "scripts", "qualify-source-distribution.sh"),
+      extracted, "--require-source", req],
+    { encoding: "utf8" },
+  );
+}
+
+test("--require-source links the baseline at the declared source path", { skip: !prerequisites && skipReason }, (t) => {
+  const { root } = makeRepo(t);
+  const out = outDir(t);
+  const archive = path.join(out, "fixture.tar.gz");
+  pack(root, archive);
+  const extracted = extract(archive, path.join(out, "room"));
+  injectTransferFixture(extracted);
+  const frozen = outDir(t);
+  const r = qualifyRequireSource(extracted, frozen);
+  // The manifest fixture has no tree, so the verifier refuses its
+  // CONTENT — proof the directory never reached it as the manifest
+  // operand (the old bug surfaced there as "Is a directory").
+  assert.equal(r.status, 1, `${r.stdout}\n${r.stderr}`);
+  assert.match(r.stdout + r.stderr, /FAIL: nemo-transfer-manifest/);
+  assert.match(r.stdout + r.stderr, /declares no tree/);
+  assert.doesNotMatch(r.stdout + r.stderr, /Is a directory/);
+  const dest = path.join(path.dirname(extracted), "frozen-src");
+  assert.ok(fs.lstatSync(dest).isSymbolicLink(), `expected ${dest} to be a symlink`);
+  assert.equal(fs.realpathSync(dest), fs.realpathSync(frozen));
+});
+
+test("--require-source refuses a non-directory", { skip: !prerequisites && skipReason }, (t) => {
+  const { root } = makeRepo(t);
+  const out = outDir(t);
+  const archive = path.join(out, "fixture.tar.gz");
+  pack(root, archive);
+  const extracted = extract(archive, path.join(out, "room"));
+  injectTransferFixture(extracted);
+  const r = qualifyRequireSource(extracted, path.join(out, "missing"));
+  assert.equal(r.status, 2, `${r.stdout}\n${r.stderr}`);
+  assert.match(r.stderr, /is not a directory/);
+});
+
+test("--require-source accepts the baseline already at the declared path", { skip: !prerequisites && skipReason }, (t) => {
+  const { root } = makeRepo(t);
+  const out = outDir(t);
+  const archive = path.join(out, "fixture.tar.gz");
+  pack(root, archive);
+  const room = path.join(out, "room");
+  const extracted = extract(archive, room);
+  injectTransferFixture(extracted);
+  // A real directory — not a symlink — already occupying the declared
+  // path and IS the caller's baseline: used as-is, never clobbered.
+  const frozen = path.join(room, "frozen-src");
+  fs.mkdirSync(frozen);
+  const r = qualifyRequireSource(extracted, frozen);
+  assert.equal(r.status, 1, `${r.stdout}\n${r.stderr}`);
+  assert.match(r.stdout + r.stderr, /declares no tree/);
+});
+
+test("--require-source with a malformed manifest fails the gate, not the suite", { skip: !prerequisites && skipReason }, (t) => {
+  const { root } = makeRepo(t);
+  const out = outDir(t);
+  const archive = path.join(out, "fixture.tar.gz");
+  pack(root, archive);
+  const extracted = extract(archive, path.join(out, "room"));
+  injectTransferFixture(extracted);
+  fs.writeFileSync(
+    path.join(extracted, "runtimes", "nemo-transfer-manifest.json"),
+    "{not json",
+  );
+  const r = qualifyRequireSource(extracted, outDir(t));
+  assert.equal(r.status, 1, `${r.stdout}\n${r.stderr}`);
+  assert.match(r.stdout + r.stderr, /FAIL: nemo-transfer-manifest/);
+  assert.match(r.stdout + r.stderr, /not a valid transfer manifest/);
+});
+
+test("--require-source refuses to clobber a real directory", { skip: !prerequisites && skipReason }, (t) => {
+  const { root } = makeRepo(t);
+  const out = outDir(t);
+  const archive = path.join(out, "fixture.tar.gz");
+  pack(root, archive);
+  const room = path.join(out, "room");
+  const extracted = extract(archive, room);
+  injectTransferFixture(extracted);
+  fs.mkdirSync(path.join(room, "frozen-src"));
+  const frozen = outDir(t);
+  const r = qualifyRequireSource(extracted, frozen);
+  assert.equal(r.status, 2, `${r.stdout}\n${r.stderr}`);
+  assert.match(r.stderr, /exists and is not --require-source/);
+});
