@@ -287,3 +287,61 @@ test("--verify does not reject a sealed bundle", (t) => {
   const result = finalize(root, ["--verify"]);
   assert.equal(result.status, 0, result.stderr);
 });
+
+// ─── F-012: the attestation namespace is typed ───────────────────────
+// Only the single root seal directory holding declared members exempts
+// content from SHA256SUMS. The name `attestation` on anything else is
+// refused at every stage — a regular file by that name would otherwise
+// ship unchecksummed.
+
+test("finalization refuses a regular file named attestation at the root (F-012)", (t) => {
+  const root = fixture(t);
+  // A regular file by the seal's name is neither hidden nor non-regular
+  // — without a typed namespace it would finalize uncovered and ship.
+  fs.writeFileSync(path.join(root, "attestation"), "forged seal\n");
+  const result = finalize(root);
+  assert.notEqual(result.status, 0, "a stray attestation file must refuse finalization");
+  assert.match(result.stderr, /attestation/);
+  assert.equal(fs.readFileSync(path.join(root, "SHA256SUMS"), "utf8"), "", "the refusal leaves the bundle untouched");
+});
+
+test("finalization refuses attestation entries nested outside the root seal", (t) => {
+  const root = fixture(t);
+  fs.writeFileSync(path.join(root, "gate-results", "attestation"), "forged\n");
+  const result = finalize(root);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /attestation/);
+});
+
+test("--verify refuses a stray attestation member on a finalized bundle", (t) => {
+  const root = fixture(t);
+  assert.equal(finalize(root).status, 0);
+  fs.writeFileSync(path.join(root, "attestation"), "forged seal\n");
+  const result = finalize(root, ["--verify"]);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /attestation/);
+});
+
+test("--verify refuses undeclared members inside the attestation seal", (t) => {
+  const root = fixture(t);
+  assert.equal(finalize(root).status, 0);
+  fs.mkdirSync(path.join(root, "attestation"));
+  fs.writeFileSync(path.join(root, "attestation", "extra.bin"), "x");
+  const result = finalize(root, ["--verify"]);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /attestation\/extra\.bin|declared reference members/);
+});
+
+test("--verify accepts the complete declared seal set", (t) => {
+  const root = fixture(t);
+  assert.equal(finalize(root).status, 0);
+  fs.mkdirSync(path.join(root, "attestation"));
+  fs.writeFileSync(
+    path.join(root, "attestation", "attestation.json"),
+    JSON.stringify({ attestation_url: "https://example.invalid/att" }),
+  );
+  fs.writeFileSync(path.join(root, "attestation", "attestation-id.txt"), "123456789\n");
+  fs.writeFileSync(path.join(root, "attestation", "attestation-url.txt"), "https://example.invalid/att\n");
+  const result = finalize(root, ["--verify"]);
+  assert.equal(result.status, 0, result.stderr);
+});

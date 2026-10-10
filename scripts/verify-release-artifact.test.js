@@ -206,6 +206,28 @@ test("an attestation of a superseded manifest fails closed", (t) => {
   assert.match(output, /Attestation binds the final evidence manifest\s+FAIL/);
 });
 
+// ─── F-012: the attestation namespace is typed ───────────────────────
+// The verifier applies the same membership rule generation,
+// finalization and packaging enforce: a member exempt from SHA256SUMS
+// must live inside the single root seal directory as a declared seal
+// member. Anything else named `attestation` ships with no integrity
+// coverage and fails closed here too.
+test("a stray regular file named attestation fails closed (F-012)", (t) => {
+  const { root } = bundle(t, { attestation: null });
+  fs.writeFileSync(path.join(root, "attestation"), "forged seal\n");
+  const { output } = verify(root, qualificationArgs(root));
+  assert.match(output, /Evidence bundle membership\s+FAIL/);
+  assert.match(output, /\.\/attestation/);
+});
+
+test("undeclared members inside the attestation seal fail closed", (t) => {
+  const { root } = bundle(t);
+  fs.writeFileSync(path.join(root, "attestation", "extra.bin"), "x");
+  const { output } = verify(root, qualificationArgs(root));
+  assert.match(output, /Evidence bundle membership\s+FAIL/);
+  assert.match(output, /attestation\/extra\.bin/);
+});
+
 test("an attestation of a different subject fails closed", (t) => {
   const { root } = bundle(t, { attestation: { subject: "dist/release-evidence/qualification.json" } });
   const { output } = verify(root, qualificationArgs(root));

@@ -47,6 +47,11 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # admission. The archive ships it next to this script.
 # shellcheck source=lib/qualification-gates.sh
 source "$SCRIPT_DIR/lib/qualification-gates.sh"
+# The evidence-bundle membership rule is the same inventory generation,
+# finalization and packaging share — verification must refuse what they
+# refuse, never accept a bundle another stage would reject.
+# shellcheck source=lib/evidence-inventory.sh
+source "$SCRIPT_DIR/lib/evidence-inventory.sh"
 
 MODE=""
 EVIDENCE_DIR=""
@@ -395,6 +400,19 @@ if [ -f "$EVIDENCE_DIR/SHA256SUMS" ]; then
   fi
 else
   check "Artifact checksums (missing)" "FAIL"
+fi
+
+# 1a. Bundle membership — negative as well as positive. Every member of
+# the evidence tree must be either a covered checksum member or a
+# declared seal member: hidden entries, non-regular files, an
+# `attestation` member outside the single root seal directory, and
+# undeclared seal contents are all refused — the same inventory rule the
+# generator, finalizer and packager enforce, so a rejected tree is
+# rejected for the same reason here.
+if evidence_refuse_strays "$EVIDENCE_DIR" "verification"; then
+  check "Evidence bundle membership" "PASS"
+else
+  check "Evidence bundle membership" "FAIL"
 fi
 
 # 1b. artifact.json must be COVERED by the checksum manifest, not merely
