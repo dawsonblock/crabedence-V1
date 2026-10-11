@@ -31,6 +31,15 @@
 //	                 guest exit event observable independently of any
 //	                 CLI process exit code, and that semantics is
 //	                 version-qualified, never assumed
+//	-msb-deployment-profile
+//	                 host-runtime isolation profile every sandbox
+//	                 boots under (default single-tenant); the booted
+//	                 configuration must carry exactly this profile,
+//	                 and the host's own prerequisite check (msb
+//	                 doctor) must pass — an executor that cannot
+//	                 prove its host is supported refuses to run
+//	                 rather than downgrading the isolation it was
+//	                 configured for
 //	-msb-pull        image fetch policy: never (default — the pinned
 //	                 image must be present locally, and a missing one
 //	                 refuses fast instead of fetching mid-dispatch) or
@@ -74,11 +83,24 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/openclaw/crabbox/internal/sandboxexecutor"
 )
+
+// lastLine returns the final non-empty line of a diagnostic block —
+// the startup report wants the verdict, not the whole checklist.
+func lastLine(s string) string {
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if line := strings.TrimSpace(lines[i]); line != "" {
+			return line
+		}
+	}
+	return ""
+}
 
 func main() {
 	socketDir := flag.String("socket-dir", os.Getenv("SANDBOX_EXECUTOR_SOCKET_DIR"), "owner-only directory for executor.sock (or SANDBOX_EXECUTOR_SOCKET_DIR)")
@@ -88,6 +110,7 @@ func main() {
 	backendName := flag.String("backend", os.Getenv("SANDBOX_EXECUTOR_BACKEND"), "execution backend: \"\" or \"microsandbox\" (or SANDBOX_EXECUTOR_BACKEND)")
 	msbBin := flag.String("msb-bin", os.Getenv("SANDBOX_EXECUTOR_MSB_BIN"), "path to the msb binary (or SANDBOX_EXECUTOR_MSB_BIN)")
 	msbVersion := flag.String("msb-version", sandboxexecutor.PinnedMSBVersion, "pinned Microsandbox runtime version the adapter is qualified against")
+	msbProfile := flag.String("msb-deployment-profile", sandboxexecutor.DeploymentSingleTenant, "host-runtime isolation profile every sandbox boots under (single-tenant or multi-tenant)")
 	msbPull := flag.String("msb-pull", "never", "image fetch policy for the microsandbox backend: never (require the pinned image locally) or if-missing")
 	stateDir := flag.String("state-dir", os.Getenv("SANDBOX_EXECUTOR_STATE_DIR"), "artifact directory for captured output (or SANDBOX_EXECUTOR_STATE_DIR)")
 	ledgerPath := flag.String("ledger", os.Getenv("SANDBOX_EXECUTOR_LEDGER"), "durable job ledger path (or SANDBOX_EXECUTOR_LEDGER)")
@@ -153,7 +176,10 @@ func main() {
 		if artifacts == "" {
 			artifacts = filepath.Join(*socketDir, "artifacts")
 		}
-		mb := &sandboxexecutor.MSBBackend{Bin: bin, StateDir: artifacts, PullPolicy: *msbPull, RequiredVersion: *msbVersion}
+		mb := &sandboxexecutor.MSBBackend{
+			Bin: bin, StateDir: artifacts, PullPolicy: *msbPull,
+			RequiredVersion: *msbVersion, DeploymentProfile: *msbProfile,
+		}
 		// The pinned runtime is part of the execution policy: the
 		// adapter's structured-observation semantics are qualified
 		// against one runtime version, so a different one refuses
@@ -166,6 +192,16 @@ func main() {
 			log.Fatalf("sandbox-executord: %v", verr)
 		}
 		log.Printf("sandbox-executord: microsandbox runtime %s verified at %s", got, bin)
+		// The host confinement profile is the other half of the
+		// policy: an unsupported host refuses startup rather than
+		// running without the isolation the executor promises.
+		hostCtx, hostCancel := context.WithTimeout(context.Background(), 60*time.Second)
+		hostOut, herr := mb.VerifyHost(hostCtx)
+		hostCancel()
+		if herr != nil {
+			log.Fatalf("sandbox-executord: %v", herr)
+		}
+		log.Printf("sandbox-executord: host confinement verified (%s; profile %s)", lastLine(hostOut), *msbProfile)
 		backend = mb
 	default:
 		log.Fatalf("sandbox-executord: unknown backend %q (want \"\" or \"microsandbox\")", *backendName)

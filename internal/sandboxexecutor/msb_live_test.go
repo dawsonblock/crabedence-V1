@@ -76,19 +76,32 @@ func liveImageDigest(t *testing.T, bin string) string {
 	return ""
 }
 
+// verifyLiveBackend proves the live runtime and host are the ones the
+// suite is qualified against: the pinned runtime version and a host
+// the runtime's own prerequisite check accepts.
+func verifyLiveBackend(t *testing.T, backend *MSBBackend) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := backend.VerifyRuntime(ctx); err != nil {
+		t.Fatalf("live suite requires the pinned runtime: %v", err)
+	}
+	if _, err := backend.VerifyHost(ctx); err != nil {
+		t.Fatalf("live suite requires a supported host: %v", err)
+	}
+}
+
 // liveServer stands up a real server backed by a real MSBBackend and
-// returns it with its directory and authority key. The runtime pin is
-// verified first: the live suite qualifies the pinned runtime, so a
-// different one refuses the run instead of silently qualifying
-// behavior the adapter was never tested against.
+// returns it with its directory and authority key. The runtime pin and
+// host confinement are verified first: the live suite qualifies the
+// pinned runtime on a supported host, so anything else refuses the run
+// instead of silently qualifying behavior the adapter was never tested
+// against.
 func liveServer(t *testing.T, bin string) (*Server, string, ed25519.PrivateKey) {
 	t.Helper()
 	key, keys := testAuthority(t)
 	dir := socketDir(t)
 	backend := &MSBBackend{Bin: bin, StateDir: filepath.Join(dir, "artifacts")}
-	if _, err := backend.VerifyRuntime(context.Background()); err != nil {
-		t.Fatalf("live suite requires the pinned runtime: %v", err)
-	}
+	verifyLiveBackend(t, backend)
 	srv := startServer(t, Config{
 		SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys,
 		Backend: backend,
@@ -718,9 +731,7 @@ func TestMSBLiveRecoveryResumesInterruptedJob(t *testing.T) {
 	key, keys := testAuthority(t)
 	dir := socketDir(t)
 	backend := &MSBBackend{Bin: bin, StateDir: filepath.Join(dir, "artifacts")}
-	if _, err := backend.VerifyRuntime(context.Background()); err != nil {
-		t.Fatalf("live suite requires the pinned runtime: %v", err)
-	}
+	verifyLiveBackend(t, backend)
 	jobID := "msb-live-recover"
 	name := "sx-" + jobID
 

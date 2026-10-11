@@ -47,18 +47,19 @@ type fakeSandbox struct {
 }
 
 type fakeSandboxConfig struct {
-	Name            string            `json:"name"`
-	Labels          map[string]string `json:"labels"`
-	ManifestDigest  string            `json:"manifest_digest"`
-	PullPolicy      string            `json:"pull_policy"`
-	Env             []fakeEnvVar      `json:"env"`
-	Resources       fakeResources     `json:"resources"`
-	Lifecycle       fakeLifecycle     `json:"lifecycle"`
-	Runtime         fakeRuntime       `json:"runtime"`
-	SecurityProfile string            `json:"security_profile"`
-	Network         fakeNetwork       `json:"network"`
-	Mounts          []fakeMount       `json:"mounts"`
-	Image           fakeImage         `json:"image"`
+	Name              string            `json:"name"`
+	Labels            map[string]string `json:"labels"`
+	ManifestDigest    string            `json:"manifest_digest"`
+	PullPolicy        string            `json:"pull_policy"`
+	DeploymentProfile string            `json:"deployment_profile"`
+	Env               []fakeEnvVar      `json:"env"`
+	Resources         fakeResources     `json:"resources"`
+	Lifecycle         fakeLifecycle     `json:"lifecycle"`
+	Runtime           fakeRuntime       `json:"runtime"`
+	SecurityProfile   string            `json:"security_profile"`
+	Network           fakeNetwork       `json:"network"`
+	Mounts            []fakeMount       `json:"mounts"`
+	Image             fakeImage         `json:"image"`
 }
 
 type fakeEnvVar struct {
@@ -147,12 +148,13 @@ type fakeFailure struct {
 
 func fakeDefaultConfig() fakeSandboxConfig {
 	return fakeSandboxConfig{
-		Labels:          map[string]string{},
-		ManifestDigest:  testImageDigest,
-		Resources:       fakeResources{CPUs: 1, MaxCPUs: 1, MemoryMiB: 512, MaxMemoryMiB: 512},
-		Lifecycle:       fakeLifecycle{},
-		Runtime:         fakeRuntime{Shell: "/bin/sh"},
-		SecurityProfile: SecurityDefault,
+		Labels:            map[string]string{},
+		ManifestDigest:    testImageDigest,
+		DeploymentProfile: "single_tenant",
+		Resources:         fakeResources{CPUs: 1, MaxCPUs: 1, MemoryMiB: 512, MaxMemoryMiB: 512},
+		Lifecycle:         fakeLifecycle{},
+		Runtime:           fakeRuntime{Shell: "/bin/sh"},
+		SecurityProfile:   SecurityDefault,
 		Network: fakeNetwork{Enabled: true, Policy: fakePolicy{
 			DefaultEgress: "deny", DefaultIngress: "deny",
 		}},
@@ -195,6 +197,14 @@ func fakeMSBMain() int {
 			version = PinnedMSBVersion
 		}
 		fmt.Printf("msb %s\n", version)
+		return 0
+	case "doctor":
+		if os.Getenv("MSB_FAKE_DOCTOR_FAIL") != "" {
+			fmt.Fprintln(os.Stdout, "  ✗ Architecture        unsupported host (no virtual extension)")
+			fmt.Fprintln(os.Stderr, "error: host setup is not ready")
+			return 1
+		}
+		fmt.Fprintln(os.Stdout, "  ✓ Host setup is ready.")
 		return 0
 	case "create":
 		return fakeCreate(dir, rest)
@@ -324,6 +334,9 @@ func fakeCreate(dir string, args []string) int {
 		case "--pull":
 			i++
 			conf.PullPolicy = args[i]
+		case "--deployment-profile":
+			i++
+			conf.DeploymentProfile = strings.ReplaceAll(args[i], "-", "_")
 		case "--max-cpus", "--max-memory", "--hostname":
 			i++
 		default:
@@ -349,6 +362,8 @@ func fakeCreate(dir string, args []string) int {
 		conf.Network.Policy = fakePublicPolicy()
 		conf.Network.Policy.Rules = append(conf.Network.Policy.Rules,
 			fakeRule{Action: "allow", Direction: "egress", Destination: fakeTarget{Group: "private"}})
+	} else if tamper == "deployment_multi" {
+		conf.DeploymentProfile = "multi_tenant"
 	}
 	if os.Getenv("MSB_FAKE_CREATE_FAIL") != "" {
 		fmt.Fprintln(os.Stderr, "error: invalid config: sandbox refused before boot")
@@ -1121,6 +1136,9 @@ func TestMSBDispatchMapsContractToSandbox(t *testing.T) {
 	if conf.PullPolicy != PullNever {
 		t.Fatalf("image fetch policy = %q, want the deterministic default %q", conf.PullPolicy, PullNever)
 	}
+	if conf.DeploymentProfile != "single_tenant" {
+		t.Fatalf("deployment profile not pinned: %q", conf.DeploymentProfile)
+	}
 	if len(conf.Mounts) != 1 || conf.Mounts[0].Guest != "/src" {
 		t.Fatalf("mounts not mapped: %+v", conf.Mounts)
 	}
@@ -1623,6 +1641,94 @@ func TestMSBResumeRefusesAmbiguousAdoption(t *testing.T) {
 		}
 		if _, _, err := backend.Resume(testContext(t), job, disp.Handle, ""); !errors.Is(err, ErrExecutionUnobserved) {
 			t.Fatalf("resume with two matches = %v, want unobserved", err)
+		}
+	})
+}
+
+// ─── Host confinement: deployment profile + host readiness ──────────
+
+// TestMSBPinsDeploymentProfile: every sandbox boots under the pinned
+// host-runtime isolation profile, and the booted configuration must
+// carry it — a runtime that quietly downgraded confinement refuses
+// before any guest command runs.
+func TestMSBPinsDeploymentProfile(t *testing.T) {
+	t.Run("default single-tenant is pinned and verified", func(t *testing.T) {
+		key, _ := testAuthority(t)
+		bin, stateDir := fakeMSB(t, nil)
+		backend := testBackend(bin, filepath.Join(t.TempDir(), "artifacts"))
+		job := testContract(t, key, func(c *JobContractV2) { c.JobID = "prof-1"; c.Nonce = "n-prof" })
+		disp, err := backend.Dispatch(testContext(t), job)
+		if err != nil {
+			t.Fatalf("dispatch: %v", err)
+		}
+		if got := readFakeSandbox(t, stateDir, disp.Handle).Config.DeploymentProfile; got != "single_tenant" {
+			t.Fatalf("deployment profile = %q, want single_tenant", got)
+		}
+		if _, err := backend.Wait(testContext(t), job, disp.Handle, disp.RunID); err != nil {
+			t.Fatalf("wait: %v", err)
+		}
+	})
+	t.Run("downgraded booted profile refuses", func(t *testing.T) {
+		key, _ := testAuthority(t)
+		bin, stateDir := fakeMSB(t, map[string]string{"MSB_FAKE_TAMPER": "deployment_multi"})
+		backend := testBackend(bin, filepath.Join(t.TempDir(), "artifacts"))
+		job := testContract(t, key, func(c *JobContractV2) { c.JobID = "prof-2"; c.Nonce = "n-prof-2" })
+		name := backend.msbJobName(job.JobID)
+		_, err := backend.Dispatch(testContext(t), job)
+		if err == nil || !strings.Contains(err.Error(), "deployment profile") {
+			t.Fatalf("a downgraded deployment profile was accepted: %v", err)
+		}
+		if _, serr := os.Stat(fakeStatePath(stateDir, name)); serr == nil {
+			t.Fatal("the downgraded VM was not destroyed")
+		}
+	})
+	t.Run("explicit multi-tenant pin is honored", func(t *testing.T) {
+		key, _ := testAuthority(t)
+		bin, stateDir := fakeMSB(t, nil)
+		backend := testBackend(bin, filepath.Join(t.TempDir(), "artifacts"))
+		backend.DeploymentProfile = DeploymentMultiTenant
+		job := testContract(t, key, func(c *JobContractV2) { c.JobID = "prof-3"; c.Nonce = "n-prof-3" })
+		disp, err := backend.Dispatch(testContext(t), job)
+		if err != nil {
+			t.Fatalf("dispatch: %v", err)
+		}
+		if got := readFakeSandbox(t, stateDir, disp.Handle).Config.DeploymentProfile; got != "multi_tenant" {
+			t.Fatalf("deployment profile = %q, want multi_tenant", got)
+		}
+	})
+	t.Run("unknown profile refuses", func(t *testing.T) {
+		key, _ := testAuthority(t)
+		bin, _ := fakeMSB(t, nil)
+		backend := testBackend(bin, filepath.Join(t.TempDir(), "artifacts"))
+		backend.DeploymentProfile = "yolo-tenant"
+		job := testContract(t, key, func(c *JobContractV2) { c.JobID = "prof-4"; c.Nonce = "n-prof-4" })
+		if _, err := backend.Dispatch(testContext(t), job); err == nil || !strings.Contains(err.Error(), "unknown deployment profile") {
+			t.Fatalf("unknown profile accepted: %v", err)
+		}
+	})
+}
+
+// TestMSBVerifyHost: the host's own prerequisite check gates startup —
+// an executor that cannot prove its host is supported refuses to run.
+func TestMSBVerifyHost(t *testing.T) {
+	t.Run("ready host passes", func(t *testing.T) {
+		bin, _ := fakeMSB(t, nil)
+		backend := testBackend(bin, t.TempDir())
+		out, err := backend.VerifyHost(testContext(t))
+		if err != nil {
+			t.Fatalf("ready host refused: %v", err)
+		}
+		if !strings.Contains(out, "Host setup is ready") {
+			t.Fatalf("host check output = %q", out)
+		}
+	})
+	t.Run("unsupported host refuses", func(t *testing.T) {
+		bin, _ := fakeMSB(t, map[string]string{"MSB_FAKE_DOCTOR_FAIL": "1"})
+		backend := testBackend(bin, t.TempDir())
+		if _, err := backend.VerifyHost(testContext(t)); err == nil {
+			t.Fatal("an unsupported host was accepted")
+		} else if !strings.Contains(err.Error(), "host confinement check failed") {
+			t.Fatalf("host refusal = %v", err)
 		}
 	})
 }

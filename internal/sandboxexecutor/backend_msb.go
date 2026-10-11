@@ -59,6 +59,18 @@ const (
 	PullIfMissing = "if-missing"
 )
 
+// Deployment profiles a backend may pin — the host-runtime isolation
+// profile the sandbox boots under. The executor's model is one fresh,
+// exclusively owned VM per job, so the default is the strongest local
+// profile; anything else must be an explicit operator decision and is
+// verified against the booted configuration like every other policy
+// dimension. The flag spells it with a hyphen, the inspect document
+// with an underscore.
+const (
+	DeploymentSingleTenant = "single-tenant"
+	DeploymentMultiTenant  = "multi-tenant"
+)
+
 // jobIDPattern is the runtime's job identity shape, enforced by the
 // CLI's own validator: "job_" plus 32 lowercase hex digits.
 var jobIDPattern = regexp.MustCompile(`^job_[0-9a-f]{32}$`)
@@ -123,6 +135,13 @@ type MSBBackend struct {
 	// collection — a forensics posture; default removes them since
 	// the artifact store is the durable evidence.
 	KeepSandboxes bool
+	// DeploymentProfile pins the host-runtime isolation profile every
+	// sandbox boots under ("single-tenant", the default, or
+	// "multi-tenant"). It is part of the verified policy: the booted
+	// configuration must carry exactly this profile, so a runtime
+	// that quietly downgraded confinement refuses before any guest
+	// command runs.
+	DeploymentProfile string
 	// RequiredVersion pins the runtime the adapter is qualified
 	// against; empty means PinnedMSBVersion. VerifyRuntime refuses
 	// any other version.
@@ -143,6 +162,42 @@ func (b *MSBBackend) requiredVersion() string {
 		return b.RequiredVersion
 	}
 	return PinnedMSBVersion
+}
+
+// deploymentProfile is the effective host-runtime isolation profile.
+func (b *MSBBackend) deploymentProfile() string {
+	if b.DeploymentProfile != "" {
+		return b.DeploymentProfile
+	}
+	return DeploymentSingleTenant
+}
+
+// deploymentProfileJSON renders the profile as the inspect document
+// spells it. Unknown values refuse: "the profile the operator forgot"
+// is never silently the runtime's default.
+func deploymentProfileJSON(profile string) (string, error) {
+	switch profile {
+	case DeploymentSingleTenant:
+		return "single_tenant", nil
+	case DeploymentMultiTenant:
+		return "multi_tenant", nil
+	default:
+		return "", fmt.Errorf("unknown deployment profile %q (want %q or %q)", profile, DeploymentSingleTenant, DeploymentMultiTenant)
+	}
+}
+
+// VerifyHost proves the host can run the confined microVMs this
+// adapter promises: the runtime's own prerequisite check (virtual
+// extension, libkrunfw, root-clone support) must pass. An executor
+// that cannot say its host is supported refuses to run rather than
+// downgrading the isolation it was configured for.
+func (b *MSBBackend) VerifyHost(ctx context.Context) (string, error) {
+	out, err := b.runOnce(ctx, "doctor")
+	text := strings.TrimSpace(string(out))
+	if err != nil {
+		return text, fmt.Errorf("host confinement check failed (msb doctor): %v: %s", err, text)
+	}
+	return text, nil
 }
 
 // VerifyRuntime proves the configured msb binary is the pinned
@@ -293,6 +348,10 @@ func vmMaxDuration(job *JobContractV2) time.Duration {
 // plus the dispatch labels that bind the VM to this contract.
 func (b *MSBBackend) createArgs(job *JobContractV2, name, nonce string) ([]string, error) {
 	args := []string{"create", "-q", "-n", name}
+	if _, err := deploymentProfileJSON(b.deploymentProfile()); err != nil {
+		return nil, err
+	}
+	args = append(args, "--deployment-profile", b.deploymentProfile())
 	if job.Resources.CPUs > 0 {
 		args = append(args, "--cpus", fmt.Sprintf("%g", job.Resources.CPUs))
 	}
@@ -487,7 +546,7 @@ func (b *MSBBackend) Dispatch(ctx context.Context, job *JobContractV2) (Dispatch
 		b.destroy(name)
 		return DispatchResult{}, fmt.Errorf("verify sandbox %s before execution: %w", name, ierr)
 	}
-	if verr := verifySandboxPolicy(job, name, nonce, doc); verr != nil {
+	if verr := verifySandboxPolicy(job, name, nonce, b.deploymentProfile(), doc); verr != nil {
 		b.destroy(name)
 		return DispatchResult{}, fmt.Errorf("sandbox %s failed policy verification — destroyed before execution: %w", name, verr)
 	}
@@ -969,25 +1028,25 @@ func ruleTarget(dest map[string]any) (kind, value string) {
 // must match, or a setting that was accepted but never applied (or is
 // pending a restart) would appear authorized while the guest runs
 // without it.
-func verifySandboxPolicy(job *JobContractV2, name, nonce string, doc map[string]any) error {
+func verifySandboxPolicy(job *JobContractV2, name, nonce, deploymentProfile string, doc map[string]any) error {
 	cfg, ok := doc["config"].(map[string]any)
 	if !ok {
 		return fmt.Errorf("inspect document carries no config object")
 	}
-	if err := verifySandboxConfig(job, name, nonce, cfg); err != nil {
+	if err := verifySandboxConfig(job, name, nonce, deploymentProfile, cfg); err != nil {
 		return err
 	}
 	active, ok := doc["active_config"].(map[string]any)
 	if !ok {
 		return fmt.Errorf("sandbox has no resolved active configuration — refusing to execute in a VM that is not running its authorized policy")
 	}
-	if err := verifySandboxConfig(job, name, nonce, active); err != nil {
+	if err := verifySandboxConfig(job, name, nonce, deploymentProfile, active); err != nil {
 		return fmt.Errorf("booted configuration diverges from the authorized policy: %w", err)
 	}
 	return nil
 }
 
-func verifySandboxConfig(job *JobContractV2, name, nonce string, cfg map[string]any) error {
+func verifySandboxConfig(job *JobContractV2, name, nonce, deploymentProfile string, cfg map[string]any) error {
 	if got := jsonString(cfg, "name"); got != name {
 		return fmt.Errorf("sandbox name %q does not match the authorized handle %q", got, name)
 	}
@@ -1033,6 +1092,13 @@ func verifySandboxConfig(job *JobContractV2, name, nonce string, cfg map[string]
 	}
 	if got := jsonString(cfg, "security_profile"); got != job.Security {
 		return fmt.Errorf("sandbox security profile %q does not match the authorized %q", got, job.Security)
+	}
+	wantProfile, perr := deploymentProfileJSON(deploymentProfile)
+	if perr != nil {
+		return perr
+	}
+	if got := jsonString(cfg, "deployment_profile"); got != wantProfile {
+		return fmt.Errorf("sandbox deployment profile %q does not match the required %q — refusing to run under a downgraded host confinement", got, wantProfile)
 	}
 	if err := verifyNetworkPolicy(job, cfg); err != nil {
 		return err
