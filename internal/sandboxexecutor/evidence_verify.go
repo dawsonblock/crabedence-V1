@@ -267,6 +267,29 @@ func (r *VerifyReport) verifyArtifacts(jobs []*LedgerJob) {
 			r.fail("job %s: artifact %s digest changed — recorded %s, found %s",
 				j.JobID, res.OutputPath, j.ArtifactSHA256, got)
 		}
+		// The artifact must also agree with the result's own size
+		// and with the bound the authority signed: bytes beyond the
+		// contract's max_output_bytes, or a truncation flag that
+		// disagrees with the stored size, is an integrity failure
+		// even when the digest matches.
+		info, serr := os.Stat(res.OutputPath)
+		if serr != nil {
+			r.fail("job %s: artifact %s stat failed: %v", j.JobID, res.OutputPath, serr)
+			continue
+		}
+		if res.OutputBytes > 0 && info.Size() != res.OutputBytes {
+			r.fail("job %s: artifact %s holds %d bytes but the result reports %d",
+				j.JobID, res.OutputPath, info.Size(), res.OutputBytes)
+		}
+		if c, cerr := ParseContract(json.RawMessage(j.ContractJSON)); cerr == nil && c.Resources.MaxOutputBytes > 0 {
+			if uint64(info.Size()) > c.Resources.MaxOutputBytes {
+				r.fail("job %s: artifact %s is %d bytes, beyond the contract's %d-byte bound",
+					j.JobID, res.OutputPath, info.Size(), c.Resources.MaxOutputBytes)
+			} else if res.Truncated && uint64(info.Size()) != c.Resources.MaxOutputBytes {
+				r.fail("job %s: artifact %s reports truncation but holds %d of the %d-byte bound",
+					j.JobID, res.OutputPath, info.Size(), c.Resources.MaxOutputBytes)
+			}
+		}
 	}
 }
 

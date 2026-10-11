@@ -1,5 +1,5 @@
 // Command sandbox-job-sign is the authority-side counterpart of
-// sandbox-executord: it signs a SandboxJobV1 contract with an
+// sandbox-executord: it signs a SandboxJobV2 contract with an
 // Ed25519 key and emits the wire envelope the executor accepts.
 // Signing keys, approval logic, and privileged credentials live
 // here — outside the executor's process and outside every guest VM.
@@ -37,7 +37,7 @@ import (
 
 func main() {
 	keyFile := flag.String("key-file", "", "PKCS8 PEM Ed25519 private key")
-	contractFile := flag.String("contract", "", "SandboxJobV1 contract JSON to sign")
+	contractFile := flag.String("contract", "", "SandboxJobV2 contract JSON to sign")
 	generate := flag.Bool("generate", false, "generate a new key at -key-file (refuses to clobber)")
 	printPubkey := flag.Bool("print-pubkey", false, "print the base64 public key and fingerprint, then exit")
 	flag.Parse()

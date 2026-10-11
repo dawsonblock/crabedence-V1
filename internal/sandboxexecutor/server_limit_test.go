@@ -126,7 +126,7 @@ func TestSignedJobAcceptedEndToEnd(t *testing.T) {
 	srv := startServer(t, Config{SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys})
 	conn, reader := connect(t, srv.SocketPath())
 
-	resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV1) {
+	resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV2) {
 		c.JobID = "signed-1"
 		c.Nonce = "nonce-x"
 	}))
@@ -144,7 +144,7 @@ func TestSignedJobAcceptedEndToEnd(t *testing.T) {
 	// Replay: the same signed envelope again — refused as duplicate
 	// (job_id) or replay (contract hash); either way not re-run.
 	conn2, reader2 := connect(t, srv.SocketPath())
-	resp2 := sendJob(t, conn2, reader2, signedJobReq(t, key, func(c *JobContractV1) {
+	resp2 := sendJob(t, conn2, reader2, signedJobReq(t, key, func(c *JobContractV2) {
 		c.JobID = "signed-1"
 		c.Nonce = "nonce-x"
 	}))
@@ -163,9 +163,9 @@ func TestForgedJobRefusedEndToEnd(t *testing.T) {
 	conn, reader := connect(t, srv.SocketPath())
 
 	// Sign with the real key, then tamper argv — signature fails.
-	req := signedJobReq(t, key, func(c *JobContractV1) { c.JobID = "forged-1" })
+	req := signedJobReq(t, key, func(c *JobContractV2) { c.JobID = "forged-1" })
 	sj := req["signed_job"].(map[string]any)
-	var c JobContractV1
+	var c JobContractV2
 	if err := json.Unmarshal(sj["contract"].(json.RawMessage), &c); err != nil {
 		t.Fatal(err)
 	}
@@ -197,7 +197,7 @@ func TestCrashRecoveryAcrossRestart(t *testing.T) {
 
 	srv1 := startServer(t, Config{SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys})
 	conn, reader := connect(t, srv1.SocketPath())
-	resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV1) {
+	resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV2) {
 		c.JobID = "durable-1"
 		c.Nonce = "d-nonce"
 	}))
@@ -274,7 +274,7 @@ func TestPipelinedJobsShareOneConnection(t *testing.T) {
 	defer conn.Close()
 
 	for i, jobID := range []string{"pipe-1", "pipe-2"} {
-		resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV1) {
+		resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV2) {
 			c.JobID, c.Nonce = jobID, jobID
 		}))
 		if !resp.OK || resp.JobID != jobID {
@@ -327,7 +327,7 @@ func TestReplayAcrossRestart(t *testing.T) {
 
 	srv1 := startServer(t, Config{SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys})
 	conn, reader := connect(t, srv1.SocketPath())
-	env := signedJobReq(t, key, func(c *JobContractV1) {
+	env := signedJobReq(t, key, func(c *JobContractV2) {
 		c.JobID, c.Nonce = "replay-1", "replay-nonce"
 	})
 	if resp := sendJob(t, conn, reader, env); !resp.OK {
@@ -359,7 +359,7 @@ func TestReconcileInspectsUnresolvedHandles(t *testing.T) {
 	be1 := &stubBackend{handle: "vm-orphan", wait: make(chan *ExecResult)}
 	srv1 := startServer(t, Config{SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys, Backend: be1})
 	conn, reader := connect(t, srv1.SocketPath())
-	resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV1) {
+	resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV2) {
 		c.JobID, c.Nonce = "orphan-1", "orphan-n"
 	}))
 	conn.Close()
@@ -401,16 +401,16 @@ func TestCeilingRefusesOverBudgetContract(t *testing.T) {
 		ResourceCeiling: &ResourceBudget{CPUs: 2, MemoryMB: 512, TimeoutSeconds: 60},
 	})
 
-	for name, mutate := range map[string]func(*JobContractV1){
-		"cpus":   func(c *JobContractV1) { c.Resources.CPUs = 8 },
-		"memory": func(c *JobContractV1) { c.Resources.MemoryMB = 1024 },
-		"ttl":    func(c *JobContractV1) { c.Resources.TimeoutSeconds = 600 },
+	for name, mutate := range map[string]func(*JobContractV2){
+		"cpus":   func(c *JobContractV2) { c.Resources.CPUs = 8 },
+		"memory": func(c *JobContractV2) { c.Resources.MemoryMB = 1024 },
+		"ttl":    func(c *JobContractV2) { c.Resources.TimeoutSeconds = 600 },
 	} {
 		t.Run(name, func(t *testing.T) {
 			// A refusal ends the connection — each case gets its own.
 			conn, reader := connect(t, srv.SocketPath())
 			defer conn.Close()
-			resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV1) {
+			resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV2) {
 				c.JobID, c.Nonce = "ceil-"+name, "ceil-n-"+name
 				mutate(c)
 			}))

@@ -1,6 +1,7 @@
 package sandboxexecutor
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -170,6 +171,90 @@ func TestLedgerInterruptRunning(t *testing.T) {
 	j2, _ := l.Get("j2")
 	if j2.State != JobStateRecorded {
 		t.Fatalf("recorded job disturbed: %s", j2.State)
+	}
+}
+
+// TestActiveUsageReservesAndReleases is the durable half of the PR-05
+// gate: a reservation exists exactly while a VM may exist, and the
+// aggregate is recomputed from rows — not from process memory.
+func TestActiveUsageReservesAndReleases(t *testing.T) {
+	l, _ := openLedger(t)
+	key, _ := testAuthority(t)
+	c := testContract(t, key, func(c *JobContractV2) {
+		c.JobID = "usage-1"
+		c.Resources = ResourceBudget{TimeoutSeconds: 60, CPUs: 2, MemoryMB: 512, DiskMB: 1024, MaxOutputBytes: 4096}
+	})
+	raw, err := json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if usage, err := l.ActiveUsage(); err != nil || usage.VMs != 0 {
+		t.Fatalf("fresh ledger usage = %+v (%v)", usage, err)
+	}
+	if _, err := l.InsertJob(c.JobID, ContractHash(c), "s", "alice", c.Image, string(raw)); err != nil {
+		t.Fatal(err)
+	}
+	// RECORDED is not yet in flight — it holds no reservation.
+	if usage, _ := l.ActiveUsage(); usage.VMs != 0 {
+		t.Fatalf("a recorded job holds a reservation: %+v", usage)
+	}
+	if err := l.Transition(c.JobID, JobStateDispatching, []string{JobStateRecorded}, nil); err != nil {
+		t.Fatal(err)
+	}
+	usage, err := l.ActiveUsage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage.VMs != 1 || usage.CPUs != 2 || usage.MemoryMB != 512 || usage.DiskMB != 1024 || usage.OutputBytes != 4096 {
+		t.Fatalf("usage = %+v", usage)
+	}
+	if usage.PerSubmitter["s"] != 1 {
+		t.Fatalf("per-submitter usage = %+v", usage.PerSubmitter)
+	}
+	if err := l.Transition(c.JobID, JobStateRunning, []string{JobStateDispatching}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if usage, _ := l.ActiveUsage(); usage.VMs != 1 {
+		t.Fatalf("a running job lost its reservation: %+v", usage)
+	}
+	// Terminal: the reservation is released.
+	if err := l.Transition(c.JobID, JobStateSucceeded, []string{JobStateRunning},
+		func(j *LedgerJob) error { j.ResultJSON = "{}"; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if usage, _ := l.ActiveUsage(); usage.VMs != 0 || usage.CPUs != 0 || usage.PerSubmitter["s"] != 0 {
+		t.Fatalf("a terminal job still reserves: %+v", usage)
+	}
+}
+
+// TestActiveUsageHoldsUnresolvedReservations: an ambiguous or
+// interrupted row means a VM may still be live under its own contract
+// timeout, so its reservation is held until an operator reconciles it.
+func TestActiveUsageHoldsUnresolvedReservations(t *testing.T) {
+	l, path := openLedger(t)
+	key, _ := testAuthority(t)
+	c := testContract(t, key, func(c *JobContractV2) { c.JobID = "usage-ambig" })
+	raw, _ := json.Marshal(c)
+	if _, err := l.InsertJob(c.JobID, ContractHash(c), "s", "alice", c.Image, string(raw)); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Transition(c.JobID, JobStateDispatching, []string{JobStateRecorded}, nil); err != nil {
+		t.Fatal(err)
+	}
+	l.Close()
+
+	l2, err := OpenLedger(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l2.Close()
+	lj, _ := l2.Get(c.JobID)
+	if lj.State != JobStateDispatchAmbig {
+		t.Fatalf("state = %s", lj.State)
+	}
+	if usage, _ := l2.ActiveUsage(); usage.VMs != 1 {
+		t.Fatalf("an unresolved VM was released from the pool: %+v", usage)
 	}
 }
 

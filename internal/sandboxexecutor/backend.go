@@ -34,7 +34,7 @@ type Backend interface {
 	//   ErrAmbiguousDispatch (wrapped) — outcome unknown; the handle,
 	//                   if also returned, may be live
 	//   other error   — definitive refusal, nothing launched
-	Dispatch(ctx context.Context, job *JobContractV1) (handle string, err error)
+	Dispatch(ctx context.Context, job *JobContractV2) (handle string, err error)
 
 	// Wait blocks until the job finishes or ctx is canceled, then
 	// reports the bound result. A ctx cancellation means the monitor

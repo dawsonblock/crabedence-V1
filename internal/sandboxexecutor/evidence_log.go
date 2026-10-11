@@ -35,8 +35,10 @@ import (
 
 const (
 	// EvidenceCapability is the receipt capability for sandbox jobs —
-	// the action class the signer attests, versioned with the contract.
-	EvidenceCapability = "sandbox-job-v1"
+	// the action class the signer attests, versioned with the
+	// contract it reports on. A V2 contract's receipt can never be
+	// presented as evidence for a V1 job, and vice versa.
+	EvidenceCapability = "sandbox-job-v2"
 
 	receiptsFile  = "receipts.jsonl"
 	checkpointDir = "checkpoints"

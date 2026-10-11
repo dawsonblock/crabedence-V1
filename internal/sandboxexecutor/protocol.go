@@ -28,7 +28,7 @@ const (
 // configured with one); the peer's kernel UID is resolved out-of-band
 // and is never read from the frame. A request carries exactly one of
 // Job (unsigned, refused when authority keys are configured) or
-// SignedJob (the SandboxJobV1 envelope).
+// SignedJob (the SandboxJobV2 envelope).
 type Request struct {
 	Version   int               `json:"version"`
 	Type      string            `json:"type"`
@@ -38,7 +38,7 @@ type Request struct {
 }
 
 // JobSubmission is the PR-03 job shape — the minimum a submit needs
-// to be recorded. The signed admission contract (SandboxJobV1) binds
+// to be recorded. The signed admission contract (SandboxJobV2) binds
 // these fields to an authority signature in PR-04; until then the
 // executor records but does not run them.
 type JobSubmission struct {

@@ -359,13 +359,13 @@ func TestStopKeepsForeignOccupant(t *testing.T) {
 type stubBackend struct {
 	handle string
 	err    error
-	got    *JobContractV1
+	got    *JobContractV2
 	wait   chan *ExecResult
 	werr   error
 	live   bool
 }
 
-func (b *stubBackend) Dispatch(ctx context.Context, job *JobContractV1) (string, error) {
+func (b *stubBackend) Dispatch(ctx context.Context, job *JobContractV2) (string, error) {
 	cpy := *job
 	b.got = &cpy
 	if b.err != nil {
@@ -412,22 +412,24 @@ func testAuthority(t *testing.T) (ed25519.PrivateKey, AuthorityKeys) {
 	return key, AuthorityKeys{AuthorityFingerprint(pub): pub}
 }
 
-func signedJobReq(t *testing.T, key ed25519.PrivateKey, mutate func(*JobContractV1)) map[string]any {
+func signedJobReq(t *testing.T, key ed25519.PrivateKey, mutate func(*JobContractV2)) map[string]any {
 	t.Helper()
 	pub := key.Public().(ed25519.PublicKey)
 	now := time.Now().UTC()
-	c := &JobContractV1{
-		Version:   ContractVersion,
-		JobID:     "job-1",
-		Principal: "alice",
-		Image:     "python:3.12@sha256:abc",
-		Argv:      []string{"python3", "-c", "print(1)"},
-		Resources: ResourceBudget{TimeoutSeconds: 60},
-		Network:   NetworkPolicy{Mode: NetworkNone},
-		IssuedAt:  now.Unix() - 5,
-		ExpiresAt: now.Unix() + 300,
-		Nonce:     "nonce-1",
-		Authority: AuthorityFingerprint(pub),
+	c := &JobContractV2{
+		Version:     ContractVersion,
+		JobID:       "job-1",
+		Principal:   "alice",
+		Image:       "python:3.12",
+		ImageDigest: testImageDigest,
+		Argv:        []string{"python3", "-c", "print(1)"},
+		Resources:   ResourceBudget{TimeoutSeconds: 60},
+		Network:     NetworkPolicy{Mode: NetworkNone},
+		Security:    SecurityDefault,
+		IssuedAt:    now.Unix() - 5,
+		ExpiresAt:   now.Unix() + 300,
+		Nonce:       "nonce-1",
+		Authority:   AuthorityFingerprint(pub),
 	}
 	if mutate != nil {
 		mutate(c)
@@ -457,7 +459,7 @@ func TestBackendHandoff(t *testing.T) {
 		t.Cleanup(func() { close(be.wait) })
 		srv := startServer(t, Config{SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys, Backend: be})
 		conn, reader := connect(t, srv.SocketPath())
-		resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV1) { c.JobID = "job-run"; c.Nonce = "n-run" }))
+		resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV2) { c.JobID = "job-run"; c.Nonce = "n-run" }))
 		if !resp.OK || resp.State != JobStateRunning {
 			t.Fatalf("unexpected response: %+v", resp)
 		}
@@ -480,7 +482,7 @@ func TestBackendHandoff(t *testing.T) {
 		be := &stubBackend{err: fmt.Errorf("no sandbox available")}
 		srv := startServer(t, Config{SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys, Backend: be})
 		conn, reader := connect(t, srv.SocketPath())
-		resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV1) { c.JobID = "job-fail"; c.Nonce = "n-fail" }))
+		resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV2) { c.JobID = "job-fail"; c.Nonce = "n-fail" }))
 		if resp.OK || resp.State != JobStateDispatchFailed {
 			t.Fatalf("unexpected response: %+v", resp)
 		}
@@ -499,7 +501,7 @@ func TestBackendHandoff(t *testing.T) {
 		be := &stubBackend{err: ErrAmbiguousDispatch, handle: "vm-maybe"}
 		srv := startServer(t, Config{SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys, Backend: be})
 		conn, reader := connect(t, srv.SocketPath())
-		resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV1) { c.JobID = "job-ambig"; c.Nonce = "n-ambig" }))
+		resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV2) { c.JobID = "job-ambig"; c.Nonce = "n-ambig" }))
 		if resp.OK || resp.State != JobStateDispatchAmbig {
 			t.Fatalf("unexpected response: %+v", resp)
 		}
@@ -508,6 +510,113 @@ func TestBackendHandoff(t *testing.T) {
 			t.Fatalf("ambiguous job lost its handle: %+v", lj)
 		}
 	})
+}
+
+// TestLostMonitorNeverCompletes is the PR-04 regression: a monitor
+// that loses its watch while the workload may still be running must
+// leave the job unresolved — no terminal state, no receipt, no
+// fabricated COMPLETED outcome.
+func TestLostMonitorNeverCompletes(t *testing.T) {
+	dir := socketDir(t)
+	key, keys := testAuthority(t)
+	be := &stubBackend{handle: "vm-lost", wait: make(chan *ExecResult), werr: fmt.Errorf("watch lost: transport reset")}
+	srv := startServer(t, Config{SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys, Backend: be})
+	conn, reader := connect(t, srv.SocketPath())
+	resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV2) { c.JobID = "job-lost"; c.Nonce = "n-lost" }))
+	if !resp.OK || resp.State != JobStateRunning {
+		t.Fatalf("unexpected response: %+v", resp)
+	}
+
+	// The watch dies while the workload may still be running.
+	close(be.wait)
+
+	deadline := time.Now().Add(5 * time.Second)
+	var lj *LedgerJob
+	for time.Now().Before(deadline) {
+		lj, _ = srv.Ledger().Get("job-lost")
+		if lj != nil && lj.State == JobStateDispatchAmbig {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if lj == nil || lj.State != JobStateDispatchAmbig {
+		t.Fatalf("a lost monitor must leave the job unresolved, got %+v", lj)
+	}
+	if lj.BackendHandle != "vm-lost" {
+		t.Fatalf("unresolved job lost its handle: %+v", lj)
+	}
+	if lj.ExitCode != nil || lj.ResultJSON != "" || lj.ReceiptSHA256 != "" {
+		t.Fatalf("a lost monitor fabricated a result or receipt: %+v", lj)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "evidence", "receipts.jsonl"))
+	if err != nil {
+		t.Fatalf("receipts log: %v", err)
+	}
+	if strings.Contains(string(raw), "job-lost") {
+		t.Fatal("evidence attests an outcome the executor never observed")
+	}
+}
+
+// TestResourcePoolBoundsAdmission is the PR-05 gate: concurrent
+// workloads cannot exceed the operator's aggregate pool, and a
+// pool-refused job never reaches the registry.
+func TestResourcePoolBoundsAdmission(t *testing.T) {
+	dir := socketDir(t)
+	key, keys := testAuthority(t)
+	// The stub holds every admitted job RUNNING, so the pool fills up.
+	be := &stubBackend{handle: "vm-pool", wait: make(chan *ExecResult)}
+	t.Cleanup(func() { close(be.wait) })
+	srv := startServer(t, Config{
+		SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys, Backend: be,
+		ResourcePool: &ResourcePool{MaxConcurrentVMs: 2, MaxSubmitterVMs: 2},
+	})
+	admit := func(id string) Response {
+		conn, reader := connect(t, srv.SocketPath())
+		return sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV2) {
+			c.JobID = id
+			c.Nonce = "n-" + id
+		}))
+	}
+	if resp := admit("pool-1"); !resp.OK {
+		t.Fatalf("first admission refused: %+v", resp)
+	}
+	if resp := admit("pool-2"); !resp.OK {
+		t.Fatalf("second admission refused: %+v", resp)
+	}
+	resp := admit("pool-3")
+	if resp.OK || !strings.Contains(resp.Error, "pool") {
+		t.Fatalf("pool overflow admitted: %+v", resp)
+	}
+	if lj, _ := srv.Ledger().Get("pool-3"); lj != nil {
+		t.Fatal("a pool-refused job reached the ledger")
+	}
+	usage, err := srv.Ledger().ActiveUsage()
+	if err != nil || usage.VMs != 2 {
+		t.Fatalf("usage = %+v (%v)", usage, err)
+	}
+}
+
+// TestResourcePoolRequiresDeclaredBudgets: a configured dimension
+// bounds only what contracts declare, so an undeclared budget refuses
+// rather than counting as free.
+func TestResourcePoolRequiresDeclaredBudgets(t *testing.T) {
+	dir := socketDir(t)
+	key, keys := testAuthority(t)
+	be := &stubBackend{handle: "vm-budget", wait: make(chan *ExecResult)}
+	t.Cleanup(func() { close(be.wait) })
+	srv := startServer(t, Config{
+		SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys, Backend: be,
+		ResourcePool: &ResourcePool{TotalMemoryMB: 1024},
+	})
+	conn, reader := connect(t, srv.SocketPath())
+	// The default test contract declares no memory.
+	resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV2) { c.JobID = "no-mem"; c.Nonce = "n-no-mem" }))
+	if resp.OK || !strings.Contains(resp.Error, "declares none") {
+		t.Fatalf("undeclared budget admitted under a bounded pool: %+v", resp)
+	}
+	if lj, _ := srv.Ledger().Get("no-mem"); lj != nil {
+		t.Fatal("a pool-refused job reached the ledger")
+	}
 }
 
 func TestDeadlineDoesNotHang(t *testing.T) {

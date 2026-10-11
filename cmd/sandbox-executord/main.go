@@ -2,7 +2,7 @@
 // bounded Unix socket that accepts job submissions only from
 // kernel-verified peer identities carrying the shared submission
 // token — and, when authority keys are configured, a valid
-// Ed25519-signed SandboxJobV1 contract. It runs as a dedicated
+// Ed25519-signed SandboxJobV2 contract. It runs as a dedicated
 // unprivileged identity with an isolated HOME and no ambient
 // credentials — and holds no signing keys, so compromising it cannot
 // mint admissions or rewrite evidence.
@@ -32,8 +32,13 @@
 //	-dispatch-timeout bound on one backend launch call (default 45s)
 //	-contract-max-ttl bound on contract validity window (default 1h,
 //	                 negative disables)
-//	-ceil-cpus/-ceil-memory-mb/-ceil-timeout-secs
+//	-ceil-cpus/-ceil-memory-mb/-ceil-disk-mb/-ceil-output-bytes/-ceil-timeout-secs
 //	                 operator resource ceilings for contracts
+//	-pool-vms/-pool-submitter-vms/-pool-cpus/-pool-memory-mb/-pool-disk-mb/-pool-output-bytes
+//	                 aggregate bounds across all in-flight jobs; a
+//	                 configured dimension requires every contract to
+//	                 declare it (undeclared refuses rather than
+//	                 counting as free)
 //	-evidence-dir    execution-evidence chain directory: receipts,
 //	                 signed checkpoints and the evidence signer key
 //	                 (defaults to <socket-dir>/evidence). Every
@@ -76,7 +81,15 @@ func main() {
 	contractMaxTTL := flag.Duration("contract-max-ttl", 0, "bound on contract validity window (default 1h; negative disables)")
 	ceilCPUs := flag.Float64("ceil-cpus", 0, "contract cpus ceiling (0 = no operator ceiling)")
 	ceilMemMB := flag.Uint64("ceil-memory-mb", 0, "contract memory_mb ceiling (0 = no operator ceiling)")
+	ceilDiskMB := flag.Uint64("ceil-disk-mb", 0, "contract disk_mb ceiling (0 = no operator ceiling)")
+	ceilOutput := flag.Uint64("ceil-output-bytes", 0, "contract max_output_bytes ceiling (0 = no operator ceiling)")
 	ceilTimeout := flag.Uint("ceil-timeout-secs", 0, "contract timeout_seconds ceiling (0 = no operator ceiling)")
+	poolVMs := flag.Int("pool-vms", 0, "aggregate bound on concurrent VMs (0 = unbounded)")
+	poolSubmitterVMs := flag.Int("pool-submitter-vms", 0, "aggregate bound on concurrent VMs per submitter (0 = unbounded)")
+	poolCPUs := flag.Float64("pool-cpus", 0, "aggregate bound on declared cpus (0 = unbounded)")
+	poolMemMB := flag.Uint64("pool-memory-mb", 0, "aggregate bound on declared memory in MiB (0 = unbounded)")
+	poolDiskMB := flag.Uint64("pool-disk-mb", 0, "aggregate bound on declared disk in MiB (0 = unbounded)")
+	poolOutput := flag.Uint64("pool-output-bytes", 0, "aggregate bound on declared output in bytes (0 = unbounded)")
 	evidenceDir := flag.String("evidence-dir", os.Getenv("SANDBOX_EXECUTOR_EVIDENCE_DIR"), "execution-evidence chain directory (or SANDBOX_EXECUTOR_EVIDENCE_DIR)")
 	evidenceKey := flag.String("evidence-key", os.Getenv("SANDBOX_EXECUTOR_EVIDENCE_KEY"), "evidence signer PKCS8 PEM path (or SANDBOX_EXECUTOR_EVIDENCE_KEY)")
 	flag.Parse()
@@ -127,11 +140,29 @@ func main() {
 	}
 
 	var ceiling *sandboxexecutor.ResourceBudget
-	if *ceilCPUs > 0 || *ceilMemMB > 0 || *ceilTimeout > 0 {
+	if *ceilCPUs > 0 || *ceilMemMB > 0 || *ceilDiskMB > 0 || *ceilOutput > 0 || *ceilTimeout > 0 {
 		ceiling = &sandboxexecutor.ResourceBudget{
 			CPUs:           *ceilCPUs,
 			MemoryMB:       *ceilMemMB,
+			DiskMB:         *ceilDiskMB,
+			MaxOutputBytes: *ceilOutput,
 			TimeoutSeconds: uint32(*ceilTimeout),
+		}
+	}
+
+	// The aggregate pool bounds what all in-flight jobs may consume
+	// together; a configured dimension also requires every contract
+	// to declare it, so an agent can never consume more than its
+	// authorization names.
+	var pool *sandboxexecutor.ResourcePool
+	if *poolVMs > 0 || *poolSubmitterVMs > 0 || *poolCPUs > 0 || *poolMemMB > 0 || *poolDiskMB > 0 || *poolOutput > 0 {
+		pool = &sandboxexecutor.ResourcePool{
+			MaxConcurrentVMs: *poolVMs,
+			MaxSubmitterVMs:  *poolSubmitterVMs,
+			TotalCPUs:        *poolCPUs,
+			TotalMemoryMB:    *poolMemMB,
+			TotalDiskMB:      *poolDiskMB,
+			TotalOutputBytes: *poolOutput,
 		}
 	}
 
@@ -146,6 +177,7 @@ func main() {
 		DispatchTimeout: *dispatchTimeout,
 		MaxContractTTL:  *contractMaxTTL,
 		ResourceCeiling: ceiling,
+		ResourcePool:    pool,
 		EvidenceDir:     *evidenceDir,
 		EvidenceKeyPath: *evidenceKey,
 		Audit:           func(format string, args ...any) { log.Printf(format, args...) },

@@ -68,7 +68,7 @@ type Config struct {
 	Token *SubmissionToken
 	// AuthorityKeys is the contract trust set (fingerprint → public
 	// key). When non-empty, every submission must carry a valid
-	// signed SandboxJobV1 contract — unsigned submissions refuse.
+	// signed SandboxJobV2 contract — unsigned submissions refuse.
 	// When empty the server runs in the weaker unsigned-admission
 	// posture, which the startup line reports.
 	AuthorityKeys AuthorityKeys
@@ -95,6 +95,13 @@ type Config struct {
 	// request; a contract exceeding a non-zero ceiling field refuses.
 	// Nil imposes no ceiling beyond structural sanity.
 	ResourceCeiling *ResourceBudget
+	// ResourcePool optionally bounds the executor's aggregate
+	// in-flight consumption: concurrent VMs and the summed declared
+	// CPU, memory, disk and output budgets. A configured dimension
+	// also requires every admitted contract to declare it — an
+	// aggregate bound over undeclared budgets bounds nothing. Nil
+	// imposes no aggregate bound beyond the per-contract ceilings.
+	ResourcePool *ResourcePool
 	// EvidenceDir holds the executor's execution-evidence chain:
 	// receipts.jsonl, signed checkpoints, and the evidence signer
 	// key. Empty defaults to <SocketDir>/evidence. Every terminal
@@ -133,6 +140,10 @@ type Server struct {
 	conns    map[*net.UnixConn]string // live conn → authenticated submitter ("" until known)
 	slots    chan struct{}
 	peerLoad map[string]int
+	// admitMu serializes pool check → ledger insert → dispatch
+	// intent, so two concurrent admissions can never both pass the
+	// same budget. Released before the backend is asked to launch.
+	admitMu sync.Mutex
 
 	ledger     *Ledger
 	monitorWg  sync.WaitGroup
@@ -160,6 +171,11 @@ func NewServer(cfg Config) (*Server, error) {
 	}
 	if cfg.MaxConns < 0 {
 		return nil, fmt.Errorf("max connections must not be negative")
+	}
+	if p := cfg.ResourcePool; p != nil {
+		if p.MaxConcurrentVMs < 0 || p.MaxSubmitterVMs < 0 || p.TotalCPUs < 0 {
+			return nil, fmt.Errorf("resource pool bounds must not be negative")
+		}
 	}
 	if cfg.LedgerPath == "" {
 		cfg.LedgerPath = filepath.Join(cfg.SocketDir, "executor-ledger.db")
@@ -592,7 +608,7 @@ func (s *Server) serve(conn *net.UnixConn) {
 
 		var (
 			jobID, principal, image, contractJSON, contractHash string
-			contract                                            *JobContractV1
+			contract                                            *JobContractV2
 		)
 		switch {
 		case req.SignedJob != nil:
@@ -633,26 +649,18 @@ func (s *Server) serve(conn *net.UnixConn) {
 			return
 		}
 
-		// The registry bound is checked against durable state — the
-		// ledger is the registry, not a cache of it.
-		if count, err := s.ledger.Count(); err != nil {
-			fail(fmt.Sprintf("registry unavailable: %v", err))
-			return
-		} else if count >= maxJobs {
-			fail(fmt.Sprintf("job registry full (%d records)", maxJobs))
-			return
-		}
-
-		// Persist before dispatch. If the process dies after this
-		// commit, the job identity survives — that is the point of
-		// the ledger.
-		_, err = s.ledger.InsertJob(jobID, contractHash, submitter, principal, image, contractJSON)
-		if err != nil {
+		// Persist before dispatch, under the pool reservation: if the
+		// process dies after this commit, the job identity survives —
+		// that is the point of the ledger.
+		if err := s.admitJob(jobID, contractHash, submitter, principal, image, contractJSON, contractBudget(contract)); err != nil {
 			switch {
 			case errors.Is(err, ErrDuplicateJobID):
 				fail(fmt.Sprintf("job_id %q already submitted", jobID))
 			case errors.Is(err, ErrContractReplay):
 				fail(fmt.Sprintf("job contract is a replay: %v", err))
+			case errors.Is(err, ErrPoolExhausted):
+				s.audit("refused job %s from %s: %v", jobID, submitter, err)
+				fail(fmt.Sprintf("job refused: %v", err))
 			default:
 				fail(fmt.Sprintf("record job %q: %v", jobID, err))
 			}
@@ -668,14 +676,6 @@ func (s *Server) serve(conn *net.UnixConn) {
 			continue
 		}
 
-		// Persisted intent to dispatch before the backend sees
-		// anything — a crash between dispatch and result leaves a
-		// DISPATCHING row, which reconcile marks ambiguous rather
-		// than guessing.
-		if err := s.ledger.Transition(jobID, JobStateDispatching, []string{JobStateRecorded}, nil); err != nil {
-			fail(fmt.Sprintf("persist dispatch intent for %q: %v", jobID, err))
-			return
-		}
 		dispatchCtx, cancel := context.WithTimeout(s.shutdown, s.cfg.DispatchTimeout)
 		handle, derr := s.cfg.Backend.Dispatch(dispatchCtx, contract)
 		cancel()
@@ -758,11 +758,19 @@ func (s *Server) monitor(jobID, handle string) {
 		if errors.Is(err, context.Canceled) || s.isStopped() {
 			return
 		}
-		s.audit("job %s monitor error: %v", jobID, err)
-		// The job ran (it was RUNNING); a lost monitor is still a
-		// terminated run — COMPLETED with no captured artifact.
-		s.finishTerminal(job, JobStateFailed, evidence.OutcomeCompleted, handle, "",
-			func(j *LedgerJob) error { j.Error = err.Error(); return nil })
+		// The watch was lost while the workload may still be running.
+		// No receipt, no terminal state: the row becomes
+		// DISPATCH_AMBIGUOUS — "may still be live, never retried
+		// blind, operator reconciles". Attesting COMPLETED here would
+		// fabricate an outcome this executor never observed.
+		s.audit("job %s monitor lost: %v — leaving the job unresolved, never COMPLETED", jobID, err)
+		if terr := s.ledger.Transition(jobID, JobStateDispatchAmbig, []string{JobStateRunning},
+			func(j *LedgerJob) error {
+				j.Error = fmt.Sprintf("monitor lost before the outcome was observed: %v", err)
+				return nil
+			}); terr != nil {
+			s.audit("job %s: could not record the lost monitor: %v", jobID, terr)
+		}
 		return
 	}
 	state := JobStateSucceeded
@@ -834,7 +842,7 @@ func (s *Server) checkpoint() {
 
 // checkCeiling refuses contracts whose declared budget exceeds a
 // configured ceiling — the operator's bound on the authority's grant.
-func (s *Server) checkCeiling(c *JobContractV1) error {
+func (s *Server) checkCeiling(c *JobContractV2) error {
 	ceil := s.cfg.ResourceCeiling
 	if ceil == nil {
 		return nil
@@ -855,4 +863,128 @@ func (s *Server) checkCeiling(c *JobContractV1) error {
 		return fmt.Errorf("max_output_bytes %d exceeds the executor ceiling %d", c.Resources.MaxOutputBytes, ceil.MaxOutputBytes)
 	}
 	return nil
+}
+
+// ResourcePool is the operator's aggregate budget across every job
+// whose VM may exist — the bound that keeps N authorized jobs from
+// consuming N× the machine. Usage is recomputed from durable ledger
+// rows on every admission, so the bound survives restarts and crashes
+// rather than living in process memory.
+type ResourcePool struct {
+	// MaxConcurrentVMs bounds jobs in a state where a VM may exist
+	// (DISPATCHING, RUNNING, DISPATCH_AMBIGUOUS, INTERRUPTED).
+	MaxConcurrentVMs int
+	// MaxSubmitterVMs bounds that same count per submitter identity.
+	MaxSubmitterVMs int
+	// TotalCPUs, TotalMemoryMB, TotalDiskMB and TotalOutputBytes
+	// bound the summed declared budgets of in-flight jobs. Zero
+	// disables the dimension; a configured dimension requires every
+	// admitted contract to declare it.
+	TotalCPUs        float64
+	TotalMemoryMB    uint64
+	TotalDiskMB      uint64
+	TotalOutputBytes uint64
+}
+
+// check refuses one admission that would exceed the pool. Every
+// configured dimension is a hard bound; a contract that leaves a
+// bounded dimension undeclared refuses rather than being counted as
+// free.
+func (p *ResourcePool) check(usage *PoolUsage, submitter string, budget *ResourceBudget) error {
+	if p == nil {
+		return nil
+	}
+	if p.MaxConcurrentVMs > 0 && usage.VMs+1 > p.MaxConcurrentVMs {
+		return fmt.Errorf("concurrent VMs would exceed the pool bound (%d/%d)", usage.VMs+1, p.MaxConcurrentVMs)
+	}
+	if p.MaxSubmitterVMs > 0 && usage.PerSubmitter[submitter]+1 > p.MaxSubmitterVMs {
+		return fmt.Errorf("submitter %s would exceed its concurrent VM bound (%d/%d)",
+			submitter, usage.PerSubmitter[submitter]+1, p.MaxSubmitterVMs)
+	}
+	if p.TotalCPUs > 0 {
+		if budget.CPUs <= 0 {
+			return fmt.Errorf("the pool bounds cpus but the contract declares none")
+		}
+		if usage.CPUs+budget.CPUs > p.TotalCPUs {
+			return fmt.Errorf("cpus would exceed the pool bound (%g+%g > %g)", usage.CPUs, budget.CPUs, p.TotalCPUs)
+		}
+	}
+	if p.TotalMemoryMB > 0 {
+		if budget.MemoryMB == 0 {
+			return fmt.Errorf("the pool bounds memory but the contract declares none")
+		}
+		if usage.MemoryMB+budget.MemoryMB > p.TotalMemoryMB {
+			return fmt.Errorf("memory would exceed the pool bound (%d+%d > %d MiB)",
+				usage.MemoryMB, budget.MemoryMB, p.TotalMemoryMB)
+		}
+	}
+	if p.TotalDiskMB > 0 {
+		if budget.DiskMB == 0 {
+			return fmt.Errorf("the pool bounds disk but the contract declares none")
+		}
+		if usage.DiskMB+budget.DiskMB > p.TotalDiskMB {
+			return fmt.Errorf("disk would exceed the pool bound (%d+%d > %d MiB)",
+				usage.DiskMB, budget.DiskMB, p.TotalDiskMB)
+		}
+	}
+	if p.TotalOutputBytes > 0 {
+		if budget.MaxOutputBytes == 0 {
+			return fmt.Errorf("the pool bounds output but the contract declares none")
+		}
+		if usage.OutputBytes+budget.MaxOutputBytes > p.TotalOutputBytes {
+			return fmt.Errorf("output would exceed the pool bound (%d+%d > %d bytes)",
+				usage.OutputBytes, budget.MaxOutputBytes, p.TotalOutputBytes)
+		}
+	}
+	return nil
+}
+
+// ErrPoolExhausted marks an admission refused by the aggregate
+// resource pool — distinct from a malformed or replayed submission.
+var ErrPoolExhausted = errors.New("executor resource pool exhausted")
+
+// contractBudget extracts the budget admission reserves. A signed
+// contract carries it; the unsigned submission shape declares none
+// (and can never reach a backend anyway).
+func contractBudget(c *JobContractV2) *ResourceBudget {
+	if c != nil {
+		return &c.Resources
+	}
+	return &ResourceBudget{}
+}
+
+// admitJob reserves the job against the aggregate pool and persists
+// it, all inside one critical section: bound → pool check → ledger
+// insert → dispatch intent. A concurrent admission's check observes
+// this job's durable DISPATCHING row, so two jobs can never both pass
+// the same budget. The lock is released before any backend launch.
+func (s *Server) admitJob(jobID, contractHash, submitter, principal, image, contractJSON string, budget *ResourceBudget) error {
+	s.admitMu.Lock()
+	defer s.admitMu.Unlock()
+	// The registry bound is checked against durable state — the
+	// ledger is the registry, not a cache of it.
+	if count, err := s.ledger.Count(); err != nil {
+		return fmt.Errorf("registry unavailable: %w", err)
+	} else if count >= maxJobs {
+		return fmt.Errorf("job registry full (%d records)", maxJobs)
+	}
+	if s.cfg.ResourcePool != nil {
+		usage, err := s.ledger.ActiveUsage()
+		if err != nil {
+			return fmt.Errorf("read pool usage: %w", err)
+		}
+		if err := s.cfg.ResourcePool.check(usage, submitter, budget); err != nil {
+			return fmt.Errorf("%w: %v", ErrPoolExhausted, err)
+		}
+	}
+	if _, err := s.ledger.InsertJob(jobID, contractHash, submitter, principal, image, contractJSON); err != nil {
+		return err
+	}
+	if s.cfg.Backend == nil {
+		return nil
+	}
+	// Persisted intent to dispatch before the backend sees anything —
+	// a crash between dispatch and result leaves a DISPATCHING row,
+	// which reconcile marks ambiguous rather than guessing.
+	return s.ledger.Transition(jobID, JobStateDispatching, []string{JobStateRecorded}, nil)
 }

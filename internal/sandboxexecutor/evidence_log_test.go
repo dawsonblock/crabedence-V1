@@ -61,7 +61,7 @@ func submitSigned(t *testing.T, srv *Server, key ed25519.PrivateKey, jobID strin
 	t.Helper()
 	conn, reader := connect(t, srv.SocketPath())
 	defer conn.Close()
-	resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV1) {
+	resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV2) {
 		c.JobID, c.Nonce = jobID, "n-"+jobID
 	}))
 	return resp.State
@@ -289,13 +289,64 @@ func TestEvidenceDetectsCorruption(t *testing.T) {
 			t.Fatal(err)
 		}
 		sum := sha256.Sum256([]byte("original"))
-		res, _ := json.Marshal(ExecResult{ExitCode: 0, OutputPath: artPath, OutputSHA256: hex.EncodeToString(sum[:])})
+		res, _ := json.Marshal(ExecResult{ExitCode: 0, OutputPath: artPath, OutputSHA256: hex.EncodeToString(sum[:]), OutputBytes: 8})
 		tamper(t, ledger, `UPDATE jobs SET result_json = ?, artifact_sha256 = ? WHERE job_id='job-a'`,
 			string(res), hex.EncodeToString(sum[:]))
 		if err := os.WriteFile(artPath, []byte("substituted"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}, "digest changed")
+}
+
+// TestVerifyDetectsArtifactBeyondContractBound: the artifact is
+// hashed correctly and its digest matches the ledger, but it holds
+// more bytes than the signed contract's max_output_bytes allowed — a
+// bound violation a verifier must still flag.
+func TestVerifyDetectsArtifactBeyondContractBound(t *testing.T) {
+	dir := socketDir(t)
+	be := &stubBackend{handle: "vm-bound", wait: make(chan *ExecResult, 1)}
+	be.wait <- &ExecResult{ExitCode: 0, OutputBytes: 12, FinishedAt: time.Now().UTC()}
+	srv, key := startEvidenceServer(t, dir, be)
+	conn, reader := connect(t, srv.SocketPath())
+	resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV2) {
+		c.JobID, c.Nonce = "job-bound", "n-job-bound"
+		c.Resources.MaxOutputBytes = 4
+	}))
+	if !resp.OK {
+		t.Fatalf("dispatch refused: %+v", resp)
+	}
+	waitJob(t, srv.Ledger(), "job-bound", JobStateSucceeded)
+	srv.Stop()
+
+	// A verifier's baseline must be clean before the tamper.
+	ledger, evdir := ledgerPathOf(dir), evidenceDirOf(dir)
+	if rep := VerifyEvidenceDir(ledger, evdir, "", trustedSigner(t, dir)); len(rep.Failures) != 0 {
+		t.Fatalf("baseline verification failed: %v", rep.Failures)
+	}
+
+	artPath := filepath.Join(dir, "oversized.out")
+	data := []byte("way beyond the bound")
+	if err := os.WriteFile(artPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(data)
+	res, _ := json.Marshal(ExecResult{
+		ExitCode: 0, OutputPath: artPath,
+		OutputSHA256: hex.EncodeToString(sum[:]), OutputBytes: int64(len(data)),
+	})
+	tamper(t, ledger, `UPDATE jobs SET result_json = ?, artifact_sha256 = ? WHERE job_id='job-bound'`,
+		string(res), hex.EncodeToString(sum[:]))
+
+	rep := VerifyEvidenceDir(ledger, evdir, "", trustedSigner(t, dir))
+	found := false
+	for _, f := range rep.Failures {
+		if strings.Contains(f, "beyond the contract") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("failures %v missing the contract-bound finding", rep.Failures)
+	}
 }
 
 func TestCheckpointPrefixProperty(t *testing.T) {

@@ -17,13 +17,17 @@ import (
 // contractSigningDomain separates executor job signatures from every
 // other Ed25519 payload in the system — a signature minted for
 // evidence receipts or release records can never be replayed as a job
-// contract, and vice versa.
-const contractSigningDomain = "crabedence.sandbox-job.v1\x00"
+// contract, and vice versa. The v2 domain also separates V2 contracts
+// from every V1 signature ever minted: a V1 contract can never be
+// replayed as V2, and vice versa.
+const contractSigningDomain = "crabedence.sandbox-job.v2\x00"
 
 // ContractVersion is the only job contract shape this executor
 // honors. A contract that does not declare it is malformed, not
-// "probably v1".
-const ContractVersion = 1
+// "probably v1" — V1 contracts refused because they cannot pin an
+// immutable image digest or a security profile, so honoring one would
+// silently widen the policy the authority signed.
+const ContractVersion = 2
 
 // Sanity ceilings on contract fields. They catch malformed input —
 // they are not the resource policy. The operator's configured
@@ -39,12 +43,23 @@ const (
 	maxContractEnvBytes     = 4096
 	maxContractMounts       = 32
 	maxContractPathBytes    = 4096
+	maxContractImageBytes   = 1024
 	maxContractNetAllow     = 64
 	maxContractCPUs         = 64
 	maxContractMemoryMB     = 64 * 1024
+	maxContractDiskMB       = 1 << 20
 	maxContractTimeoutSecs  = 24 * 60 * 60
 	maxContractOutputBytes  = 1 << 30
 	contractClockSkewLeeway = 60 * time.Second
+)
+
+// Security profiles a contract may select. The profile is part of the
+// signed policy — the backend passes it to the VM and verifies the
+// booted sandbox carries it, so "the backend's default" is never
+// silently substituted for what the authority approved.
+const (
+	SecurityDefault    = "default"
+	SecurityRestricted = "restricted"
 )
 
 // Network modes a contract may select. Anything else is refused:
@@ -67,11 +82,13 @@ const (
 // configured ceilings on top.
 type ResourceBudget struct {
 	// TimeoutSeconds bounds wall-clock execution. Required: an
-	// unbounded job is an unbounded VM.
+	// unbounded job is an unbounded VM. It is also the VM's own
+	// --max-duration, so an abandoned sandbox cannot outlive it.
 	TimeoutSeconds uint32  `json:"timeout_seconds"`
 	CPUs           float64 `json:"cpus,omitempty"`
 	MemoryMB       uint64  `json:"memory_mb,omitempty"`
 	Pids           uint32  `json:"pids,omitempty"`
+	DiskMB         uint64  `json:"disk_mb,omitempty"`
 	MaxOutputBytes uint64  `json:"max_output_bytes,omitempty"`
 }
 
@@ -96,18 +113,24 @@ type NetworkPolicy struct {
 	Allow []string `json:"allow,omitempty"`
 }
 
-// JobContractV1 is the signed unit of execution authority. The
-// signature covers every field below — the image, the exact argv, the
-// environment, the filesystem and network policy, the resource
-// budget, the validity window, and the replay nonce. Anything the
-// signature does not cover, the executor does not honor.
-type JobContractV1 struct {
-	Version   int      `json:"version"`
-	JobID     string   `json:"job_id"`
-	Principal string   `json:"principal"`
-	Submitter string   `json:"submitter,omitempty"`
-	Image     string   `json:"image"`
-	Argv      []string `json:"argv"`
+// JobContractV2 is the signed unit of execution authority. The
+// signature covers every field below — the image and its immutable
+// digest, the exact argv, the environment, the filesystem, network
+// and security policy, the resource budget, the validity window, and
+// the replay nonce. Anything the signature does not cover, the
+// executor does not honor.
+type JobContractV2 struct {
+	Version   int    `json:"version"`
+	JobID     string `json:"job_id"`
+	Principal string `json:"principal"`
+	Submitter string `json:"submitter,omitempty"`
+	Image     string `json:"image"`
+	// ImageDigest pins the exact image the authority approved
+	// ("sha256:<64 hex>"). The backend boots this digest and refuses
+	// a VM whose manifest digest differs — a mutable tag can never
+	// silently become the execution environment.
+	ImageDigest string   `json:"image_digest"`
+	Argv        []string `json:"argv"`
 	// Env is the complete guest environment allowlist (KEY=VALUE).
 	// The authority controls it — a submitter cannot add secrets the
 	// contract did not name.
@@ -115,6 +138,10 @@ type JobContractV1 struct {
 	Resources  ResourceBudget   `json:"resources"`
 	Network    NetworkPolicy    `json:"network"`
 	Filesystem FilesystemPolicy `json:"filesystem"`
+	// Security is the in-guest security profile ("default" or
+	// "restricted"). Required and signed: the backend passes it to
+	// the VM and verifies it, so the profile is never implied.
+	Security string `json:"security"`
 	// IssuedAt/ExpiresAt bound the contract's validity window in
 	// unix seconds. Expired or not-yet-valid contracts refuse.
 	IssuedAt  int64 `json:"issued_at"`
@@ -143,7 +170,7 @@ type ContractEnvelope struct {
 // domain prefix followed by length-prefixed field values in a fixed
 // order — the same construction as evidence receipts, so signature
 // verification never depends on JSON serialization details.
-func contractSigningBytes(c *JobContractV1) []byte {
+func contractSigningBytes(c *JobContractV2) []byte {
 	var payload bytes.Buffer
 	payload.WriteString(contractSigningDomain)
 	var length [4]byte
@@ -181,11 +208,13 @@ func contractSigningBytes(c *JobContractV1) []byte {
 	putString(c.Principal)
 	putString(c.Submitter)
 	putString(c.Image)
+	putString(c.ImageDigest)
 	putStrings(c.Argv)
 	putStrings(c.Env)
 	putJSON(c.Resources)
 	putJSON(c.Network)
 	putJSON(c.Filesystem)
+	putString(c.Security)
 	putInt(c.IssuedAt)
 	putInt(c.ExpiresAt)
 	putString(c.Nonce)
@@ -196,7 +225,7 @@ func contractSigningBytes(c *JobContractV1) []byte {
 // ContractHash is the stable content identity of a contract — what
 // the ledger indexes to refuse replays and what execution evidence
 // binds to.
-func ContractHash(c *JobContractV1) string {
+func ContractHash(c *JobContractV2) string {
 	sum := sha256.Sum256(contractSigningBytes(c))
 	return hex.EncodeToString(sum[:])
 }
@@ -205,7 +234,7 @@ func ContractHash(c *JobContractV1) string {
 // The contract's Authority field must already name this key's
 // fingerprint — a signer refuses to attest a contract that names a
 // different authority.
-func SignContract(key ed25519.PrivateKey, c *JobContractV1) (*ContractEnvelope, error) {
+func SignContract(key ed25519.PrivateKey, c *JobContractV2) (*ContractEnvelope, error) {
 	if len(key) != ed25519.PrivateKeySize {
 		return nil, fmt.Errorf("invalid ed25519 private key")
 	}
@@ -239,8 +268,8 @@ func AuthorityFingerprint(pub ed25519.PublicKey) string {
 // JSON handling: bounded size, single object, duplicate keys refused,
 // unknown fields refused. A contract that hides fields from the
 // verifier is a forgery surface.
-func ParseContract(data json.RawMessage) (*JobContractV1, error) {
-	var c JobContractV1
+func ParseContract(data json.RawMessage) (*JobContractV2, error) {
+	var c JobContractV2
 	if len(data) == 0 {
 		return nil, fmt.Errorf("missing job contract")
 	}
@@ -271,27 +300,35 @@ func ParseContract(data json.RawMessage) (*JobContractV1, error) {
 // requires — before the signature is even consulted. It cannot prove
 // authority (the signature does that) but it refuses contracts that
 // could never be honored.
-func (c *JobContractV1) ValidateStructure() error {
+func (c *JobContractV2) ValidateStructure() error {
 	if c == nil {
 		return fmt.Errorf("missing job contract")
 	}
 	if c.Version != ContractVersion {
 		return fmt.Errorf("unsupported contract version %d", c.Version)
 	}
-	if strings.TrimSpace(c.JobID) == "" {
-		return fmt.Errorf("job_id is required")
-	}
-	if len(c.JobID) > maxContractJobIDBytes {
-		return fmt.Errorf("job_id exceeds %d bytes", maxContractJobIDBytes)
-	}
-	if strings.ContainsAny(c.JobID, "/\x00") {
-		return fmt.Errorf("job_id must not contain '/' or NUL — it names backend objects")
+	if !isJobID(c.JobID) {
+		return fmt.Errorf("job_id must be 1-%d bytes of [A-Za-z0-9._-] starting alphanumeric — it names backend objects and labels", maxContractJobIDBytes)
 	}
 	if strings.TrimSpace(c.Principal) == "" {
 		return fmt.Errorf("principal is required")
 	}
 	if strings.TrimSpace(c.Image) == "" {
 		return fmt.Errorf("image is required")
+	}
+	if len(c.Image) > maxContractImageBytes {
+		return fmt.Errorf("image exceeds %d bytes", maxContractImageBytes)
+	}
+	if strings.ContainsAny(c.Image, "@\x00 \t\n") {
+		return fmt.Errorf("image must be a bare repository reference — pin the digest in image_digest, not in the image string")
+	}
+	if !isSHA256Digest(c.ImageDigest) {
+		return fmt.Errorf("image_digest must be a lowercase sha256:<64 hex> digest — an unpinned image is a mutable execution environment")
+	}
+	switch c.Security {
+	case SecurityDefault, SecurityRestricted:
+	default:
+		return fmt.Errorf("security must be %q or %q", SecurityDefault, SecurityRestricted)
 	}
 	if len(c.Argv) == 0 {
 		return fmt.Errorf("argv is required")
@@ -307,6 +344,7 @@ func (c *JobContractV1) ValidateStructure() error {
 	if len(c.Env) > maxContractEnv {
 		return fmt.Errorf("env exceeds %d entries", maxContractEnv)
 	}
+	seenEnv := map[string]bool{}
 	for i, kv := range c.Env {
 		if len(kv) > maxContractEnvBytes {
 			return fmt.Errorf("env[%d] exceeds %d bytes", i, maxContractEnvBytes)
@@ -315,6 +353,10 @@ func (c *JobContractV1) ValidateStructure() error {
 		if !found || strings.TrimSpace(key) == "" || strings.ContainsAny(key, "\x00=") {
 			return fmt.Errorf("env[%d] is not KEY=VALUE", i)
 		}
+		if seenEnv[key] {
+			return fmt.Errorf("env[%d] duplicates key %q", i, key)
+		}
+		seenEnv[key] = true
 	}
 	if c.Resources.TimeoutSeconds == 0 {
 		return fmt.Errorf("resources.timeout_seconds is required — an unbounded job is an unbounded VM")
@@ -327,6 +369,9 @@ func (c *JobContractV1) ValidateStructure() error {
 	}
 	if c.Resources.MemoryMB > maxContractMemoryMB {
 		return fmt.Errorf("resources.memory_mb exceeds %d", maxContractMemoryMB)
+	}
+	if c.Resources.DiskMB > maxContractDiskMB {
+		return fmt.Errorf("resources.disk_mb exceeds %d", maxContractDiskMB)
 	}
 	if c.Resources.MaxOutputBytes > maxContractOutputBytes {
 		return fmt.Errorf("resources.max_output_bytes exceeds %d", maxContractOutputBytes)
@@ -348,14 +393,20 @@ func (c *JobContractV1) ValidateStructure() error {
 	if len(c.Network.Allow) > maxContractNetAllow {
 		return fmt.Errorf("network allow list exceeds %d entries", maxContractNetAllow)
 	}
+	seenAllow := map[string]bool{}
 	for i, a := range c.Network.Allow {
-		if strings.TrimSpace(a) == "" || strings.ContainsAny(a, "\x00\n,") {
-			return fmt.Errorf("network allow[%d] is malformed", i)
+		if !isDomainPattern(a) {
+			return fmt.Errorf("network allow[%d] %q must be a lowercase domain or *.domain pattern", i, a)
 		}
+		if seenAllow[a] {
+			return fmt.Errorf("network allow[%d] duplicates %q", i, a)
+		}
+		seenAllow[a] = true
 	}
 	if len(c.Filesystem.Mounts) > maxContractMounts {
 		return fmt.Errorf("filesystem mounts exceed %d entries", maxContractMounts)
 	}
+	seenDest := map[string]bool{}
 	for i, m := range c.Filesystem.Mounts {
 		if len(m.Source) == 0 || len(m.Source) > maxContractPathBytes {
 			return fmt.Errorf("mount[%d] source is required and must be ≤ %d bytes", i, maxContractPathBytes)
@@ -369,6 +420,10 @@ func (c *JobContractV1) ValidateStructure() error {
 		if strings.ContainsAny(m.Source+m.Options, "\x00,") {
 			return fmt.Errorf("mount[%d] fields must not contain NUL or ','", i)
 		}
+		if seenDest[m.Dest] {
+			return fmt.Errorf("mount[%d] duplicates dest %q", i, m.Dest)
+		}
+		seenDest[m.Dest] = true
 	}
 	if c.Filesystem.Workdir != "" && !strings.HasPrefix(c.Filesystem.Workdir, "/") {
 		return fmt.Errorf("filesystem workdir must be absolute")
@@ -404,7 +459,7 @@ func (c *JobContractV1) ValidateStructure() error {
 //
 // keys is the configured authority set (fingerprint → public key).
 // maxTTL bounds expires_at-issued_at; zero disables the bound.
-func VerifyContract(env *ContractEnvelope, keys map[string]ed25519.PublicKey, submitter string, now time.Time, maxTTL time.Duration) (*JobContractV1, error) {
+func VerifyContract(env *ContractEnvelope, keys map[string]ed25519.PublicKey, submitter string, now time.Time, maxTTL time.Duration) (*JobContractV2, error) {
 	if env == nil {
 		return nil, fmt.Errorf("missing signed job")
 	}
@@ -449,6 +504,59 @@ func isHexFingerprint(s string) bool {
 	for _, ch := range s {
 		if !((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')) {
 			return false
+		}
+	}
+	return true
+}
+
+// isJobID bounds job identities to a charset that is safe as a
+// backend object name, a sandbox label value and an artifact
+// filename: [A-Za-z0-9._-], starting alphanumeric.
+func isJobID(s string) bool {
+	if len(s) == 0 || len(s) > maxContractJobIDBytes {
+		return false
+	}
+	for i, ch := range s {
+		switch {
+		case ch >= 'a' && ch <= 'z', ch >= 'A' && ch <= 'Z', ch >= '0' && ch <= '9':
+		case (ch == '.' || ch == '_' || ch == '-') && i > 0:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// isSHA256Digest reports whether s is a lowercase "sha256:<64 hex>"
+// image digest.
+func isSHA256Digest(s string) bool {
+	rest, ok := strings.CutPrefix(s, "sha256:")
+	return ok && isHexFingerprint(rest)
+}
+
+// isDomainPattern reports whether s is a lowercase DNS name or
+// "*.name" wildcard — the only allowlist targets the backend can map
+// onto an msb rule and verify byte-for-byte after boot.
+func isDomainPattern(s string) bool {
+	rest, ok := strings.CutPrefix(s, "*.")
+	if ok {
+		s = rest
+	}
+	labels := strings.Split(s, ".")
+	if len(labels) < 2 {
+		return false
+	}
+	for _, label := range labels {
+		if len(label) == 0 || len(label) > 63 {
+			return false
+		}
+		for i, ch := range label {
+			switch {
+			case ch >= 'a' && ch <= 'z', ch >= '0' && ch <= '9':
+			case ch == '-' && i > 0 && i < len(label)-1:
+			default:
+				return false
+			}
 		}
 	}
 	return true

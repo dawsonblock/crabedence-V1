@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -30,7 +31,7 @@ const (
 	JobStateSucceeded      = "SUCCEEDED"          // exit 0, result bound
 	JobStateFailed         = "FAILED"             // ran, non-zero exit or backend-reported failure
 	JobStateDispatchFailed = "DISPATCH_FAILED"    // backend definitively refused — job identity persists
-	JobStateDispatchAmbig  = "DISPATCH_AMBIGUOUS" // dispatch outcome unknown — never auto-retry
+	JobStateDispatchAmbig  = "DISPATCH_AMBIGUOUS" // outcome unknown (dispatch or lost monitor) — never auto-retry
 	JobStateInterrupted    = "INTERRUPTED"        // was RUNNING when the daemon stopped
 )
 
@@ -495,6 +496,53 @@ func (l *Ledger) ReconcileCandidates(limit int) ([]*LedgerJob, error) {
 		out = append(out, j)
 	}
 	return out, rows.Err()
+}
+
+// PoolUsage is the aggregate declared consumption of every job whose
+// VM may exist — the set admission must subtract from the operator's
+// resource pool. It is computed from durable rows, so the bound holds
+// across restarts and crashes rather than living in process memory.
+type PoolUsage struct {
+	VMs          int
+	CPUs         float64
+	MemoryMB     uint64
+	DiskMB       uint64
+	OutputBytes  uint64
+	PerSubmitter map[string]int
+}
+
+// ActiveUsage aggregates the declared budgets of every job in a state
+// where a VM may exist: DISPATCHING and RUNNING are in flight;
+// DISPATCH_AMBIGUOUS and INTERRUPTED mean a VM may still be live under
+// its own contract timeout, so their reservation is held until an
+// operator reconciles the row — releasing it would let uncertainty
+// consume budget twice. A row whose contract cannot be parsed counts
+// as one VM with no declared dimensions: fail closed on the VM bound
+// rather than silently free.
+func (l *Ledger) ActiveUsage() (*PoolUsage, error) {
+	rows, err := l.db.Query(
+		`SELECT submitter, contract_json FROM jobs WHERE state IN (?, ?, ?, ?)`,
+		JobStateDispatching, JobStateRunning, JobStateDispatchAmbig, JobStateInterrupted)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	usage := &PoolUsage{PerSubmitter: map[string]int{}}
+	for rows.Next() {
+		var submitter, raw string
+		if err := rows.Scan(&submitter, &raw); err != nil {
+			return nil, err
+		}
+		usage.VMs++
+		usage.PerSubmitter[submitter]++
+		if c, err := ParseContract(json.RawMessage(raw)); err == nil {
+			usage.CPUs += c.Resources.CPUs
+			usage.MemoryMB += c.Resources.MemoryMB
+			usage.DiskMB += c.Resources.DiskMB
+			usage.OutputBytes += c.Resources.MaxOutputBytes
+		}
+	}
+	return usage, rows.Err()
 }
 
 // Count reports the durable registry size.
