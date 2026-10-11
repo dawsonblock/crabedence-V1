@@ -2,6 +2,7 @@ package sandboxexecutor
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -219,6 +220,14 @@ func (r *VerifyReport) verifyCheckpoint(evidenceDir, arg string, refs []evidence
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&cp); err != nil {
 		r.fail("parse checkpoint %s: %v", path, err)
+		return
+	}
+	// A checkpoint file is emitter bytes, not merely parseable claims:
+	// case-insensitive JSON field matching means "public_kEy" would
+	// decode to the untouched checkpoint, so non-canonical bytes are a
+	// byte-level rewrite even when the decoded claims are identical.
+	if canon, err := json.Marshal(&cp); err != nil || !bytes.Equal(bytes.TrimSpace(raw), canon) {
+		r.fail("checkpoint %s is not in canonical emitter form — a byte-level rewrite of signed evidence", path)
 		return
 	}
 	r.CheckpointCount = cp.RecordCount

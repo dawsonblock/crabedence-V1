@@ -178,6 +178,16 @@ func VerifyCheckpointHistory(r io.Reader, opts CheckpointHistoryOptions) (*Check
 		if err := json.Unmarshal(line, &cp); err != nil {
 			return nil, fmt.Errorf("entry %d is not parseable: %w", summary.Entries+1, err)
 		}
+		// The retained bytes are the evidence, not only their decoded
+		// claims: the line must re-marshal to its own bytes in emitter
+		// canonical form. Go's JSON field matching is case-insensitive —
+		// "public_kEy" would otherwise verify as an untouched checkpoint
+		// — and injected fields, whitespace or key reorder would equally
+		// parse into identical claims while editing the record.
+		canon, err := json.Marshal(&cp)
+		if err != nil || !bytes.Equal(bytes.TrimSpace(line), canon) {
+			return nil, fmt.Errorf("entry %d is not in canonical emitter form — a byte-level rewrite of signed evidence", summary.Entries+1)
+		}
 		legacy, err := verifyCheckpointShape(&cp, opts.TrustedSigners)
 		if err != nil {
 			return nil, fmt.Errorf("entry %d (sequence %d): %w", summary.Entries+1, cp.Sequence, err)

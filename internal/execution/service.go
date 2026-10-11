@@ -624,7 +624,15 @@ func (s *Service) Stop() error {
 	// clean) and a later Stop retries; a timeout leaves it STOPPING
 	// too — timeouts never claim a clean drain.
 	s.mu.Lock()
-	if s.state == StateStopped {
+	if s.state == StateStopped || s.gen != gen {
+		// The lifecycle this call waited on has already finalized:
+		// StateStopped is the terminal answer; a different generation
+		// means a successor Start installed new per-lifecycle state
+		// after the finalization — this stale caller must never run
+		// the superseded lifecycle's cleanup against a path its
+		// successor now owns (an identity collision would unlink the
+		// successor's socket), nor wait on bookkeeping the successor
+		// replaced.
 		s.mu.Unlock()
 		return nil
 	}

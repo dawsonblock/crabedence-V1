@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -323,7 +324,13 @@ func TestVerifyCheckpointHistoryLongStream(t *testing.T) {
 	var buf bytes.Buffer
 	const n = 5000
 	for i := 0; i < n; i++ {
-		payload, _ := json.Marshal(signer.SignCheckpoint(int64(i+1), refs))
+		// issued_at is synthetic and strictly increasing: the property
+		// under test is streaming verification, not the wall clock —
+		// real-time SignCheckpoint stamps in a tight loop legitimately
+		// step backwards on platforms whose clock slews.
+		cp := signCheckpointAt(signer, int64(i+1), refs,
+			fmt.Sprintf("2026-10-09T05:00:00.%09dZ", i))
+		payload, _ := json.Marshal(cp)
 		buf.Write(payload)
 		buf.WriteByte('\n')
 	}

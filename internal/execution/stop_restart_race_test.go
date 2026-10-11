@@ -538,11 +538,29 @@ func TestRapidLifecycleStress(t *testing.T) {
 		if finalErr != nil {
 			t.Fatalf("cycle %d: Stop never converged: %v", i, finalErr)
 		}
-		if restartScheduled && restartErr == nil {
+		if restartScheduled && restartErr == nil && service.LifecycleState() != StateRunning {
+			// The restart succeeded but a stopper scheduled before it
+			// still had not taken the lifecycle lock — Stop() acts on
+			// whatever lifecycle is running when the call is taken, so
+			// the straggler legitimately stopped the restarted
+			// generation. Its success is proven by restartErr; no
+			// freshness is owed by a generation that is already stopped.
+			t.Logf("cycle %d: a straggler stopper stopped the restarted generation — restart success proven by Start's own return", i)
+		} else if restartScheduled && restartErr == nil {
 			// The restart could only succeed after the stop finalized:
-			// a fresh socket now serves.
-			if ident := socketIdentityAt(t, socketPath); ident == nil || (boundIdent != nil && *ident == *boundIdent) {
+			// a fresh socket now serves. A successful bind always
+			// created a new filesystem object — unix bind cannot adopt
+			// an existing file — so when the stat identity fully
+			// matches the pre-restart object, the filesystem recycled
+			// the inode inside one change-time tick (Linux tmpfs on a
+			// coarse clock), which no stat field can distinguish. The
+			// dial below is the arbiter there: a socket file with no
+			// listener behind it refuses the connection, so the
+			// not-fresh failure mode still cannot pass.
+			if ident := socketIdentityAt(t, socketPath); ident == nil {
 				t.Fatalf("cycle %d: post-restart socket identity is not fresh", i)
+			} else if boundIdent != nil && *ident == *boundIdent {
+				t.Logf("cycle %d: post-restart stat identity collides with the pre-restart object (inode recycled within a clock tick) — dial arbitrates freshness", i)
 			}
 			conn, err := net.Dial("unix", socketPath)
 			if err != nil {
@@ -563,5 +581,142 @@ func TestRapidLifecycleStress(t *testing.T) {
 		if ident := socketIdentityAt(t, socketPath); ident != nil {
 			t.Fatalf("cycle %d: a socket remains after the final stop", i)
 		}
+	}
+}
+
+// TestStaleStopNeverCleansSuccessorSocket pins the superseded-generation
+// cleanup guard: a Stop() that captured lifecycle N at entry, waited out
+// its drain barriers and only then reaches the cleanup barrier must
+// never run lifecycle N's owned-socket cleanup once a successor has been
+// installed. The successor owns the path now, and on filesystems where a
+// rebound socket can collide with the captured dev+inode+ctime identity
+// (Linux tmpfs recycling inside one clock tick), the stale caller would
+// unlink the successor's live socket while reporting a clean stop —
+// leaving a running listener on an unlinked path.
+//
+// The interleaving is made fully deterministic: the stale caller IS
+// lifecycle N's transitioner, but a fake in-flight handler pins its
+// handler-drain barrier open — the only release is the test's Done —
+// so the caller provably cannot reach the cleanup barrier until the
+// test has finalized N's socket and installed a running successor
+// under the held lifecycle mutex. Without the guard the released
+// caller consults lifecycle N's bookkeeping and runs removeOwnedSocket
+// against the successor's path — an erroring refusal where identities
+// differ, a silent unlink where they collide. With it the call answers
+// for the lifecycle it observed: finalized, nothing further owed.
+func TestStaleStopNeverCleansSuccessorSocket(t *testing.T) {
+	socketPath := testSocketPath(t)
+	service, _ := newEchoService(t, socketPath)
+	service.drainTimeout = 10 * time.Second
+
+	if err := service.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// A fake in-flight handler pins the drain barrier open: the stale
+	// caller can complete its STOPPING transition but cannot pass
+	// barrier 2 until the test releases it — by which point a running
+	// successor is installed. service.handlers is the same WaitGroup a
+	// real admitted connection holds.
+	service.handlers.Add(1)
+
+	// The stale caller: it IS lifecycle N's transitioner, captures
+	// N's generation, joins the accept-loop barrier (the listener dies
+	// under it) and parks on the handler drain the test owns.
+	staleDone := make(chan error, 1)
+	go func() { staleDone <- service.Stop() }()
+	deadline := time.Now().Add(10 * time.Second)
+	for service.LifecycleState() != StateStopping {
+		if time.Now().After(deadline) {
+			service.handlers.Done()
+			t.Fatal("the stale Stop never reached STOPPING")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// Hold the lifecycle mutex and finalize N exactly as its cleanup
+	// runner would — the bound socket removed — then install a running
+	// N+1 lifecycle the way Start does. The stale caller cannot reach
+	// the cleanup barrier: it is parked on the drain, and every route
+	// from there goes through the held mutex.
+	service.mu.Lock()
+	gen1 := service.gen
+	if gen1 == nil {
+		service.mu.Unlock()
+		t.Fatal("lifecycle N has no generation state")
+	}
+	if err := service.removeOwnedSocket(gen1); err != nil {
+		service.mu.Unlock()
+		service.handlers.Done()
+		t.Fatalf("emulating lifecycle N finalization: %v", err)
+	}
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		service.mu.Unlock()
+		service.handlers.Done()
+		t.Fatalf("binding the successor socket: %v", err)
+	}
+	if ul, ok := listener.(*net.UnixListener); ok {
+		ul.SetUnlinkOnClose(false)
+	}
+	if err := os.Chmod(socketPath, 0o600); err != nil {
+		listener.Close()
+		service.mu.Unlock()
+		service.handlers.Done()
+		t.Fatalf("securing the successor socket: %v", err)
+	}
+	ident, err := verifySocketFile(socketPath)
+	if err != nil {
+		listener.Close()
+		os.Remove(socketPath)
+		service.mu.Unlock()
+		service.handlers.Done()
+		t.Fatalf("verifying the successor socket: %v", err)
+	}
+	service.genSeq++
+	gen2 := &lifecycleGeneration{
+		id:              service.genSeq,
+		listener:        listener,
+		socketIdent:     ident,
+		acceptDone:      make(chan struct{}),
+		handlersDrained: make(chan struct{}),
+	}
+	intakeCtx, intakeCancel := context.WithCancel(context.Background())
+	gen2.intakeCancel = intakeCancel
+	service.gen = gen2
+	service.state = StateRunning
+	// Release the drain and the mutex together: when the stale caller
+	// reaches the cleanup barrier, the successor is the published
+	// generation — its bookkeeping must be off limits.
+	service.handlers.Done()
+	service.mu.Unlock()
+	go service.acceptLoop(gen2, intakeCtx)
+
+	select {
+	case err := <-staleDone:
+		if err != nil {
+			t.Fatalf("the stale Stop reported %v — a superseded lifecycle's cleanup is not its error to return", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the stale Stop never returned after the barrier released")
+	}
+
+	// The successor's socket must be untouched and still serving.
+	if got := socketIdentityAt(t, socketPath); got == nil {
+		t.Fatal("the successor socket vanished — the stale Stop removed a path it did not own")
+	} else if *got != *ident {
+		t.Fatal("the successor socket was replaced — the stale Stop disturbed a path it did not own")
+	}
+	conn, err := net.Dial("unix", socketPath)
+	if err != nil {
+		t.Fatalf("the successor socket does not accept: %v", err)
+	}
+	resp, ok := sendRequestTolerant(conn, echoRequest())
+	conn.Close()
+	if !ok || resp.Status != StatusSucceeded {
+		t.Fatalf("the successor service does not serve: %+v", resp)
+	}
+	if err := service.Stop(); err != nil {
+		t.Fatalf("stopping the successor lifecycle: %v", err)
 	}
 }

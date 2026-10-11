@@ -125,13 +125,22 @@ func verifySocketFile(path string) (*socketFileID, error) {
 	return socketFileIdentity(info), nil
 }
 
-// socketFileID identifies one filesystem object by device and inode.
-// A path that later names a different object — the socket was deleted
-// and a successor or attacker re-created the name — fails the identity
-// comparison even though the name matches.
+// socketFileID identifies one filesystem object by device, inode and
+// inode change time. A path that later names a different object — the
+// socket was deleted and a successor or attacker re-created the name —
+// fails the identity comparison even though the name matches. The
+// change time matters on filesystems that aggressively recycle inode
+// numbers (Linux tmpfs returns the just-freed inode to the next create,
+// where APFS does not): device+inode alone cannot tell the recycled
+// successor apart from the object this lifecycle bound, but a new
+// object never inherits the original's ctime.
 type socketFileID struct {
 	dev uint64
 	ino uint64
+	// ctim is the inode change time in nanoseconds, or 0 on platforms
+	// where Stat_t does not expose it — the comparison then degrades to
+	// device+inode as before.
+	ctim int64
 }
 
 // removeOwnedSocket deletes the socket path gen bound, and only that

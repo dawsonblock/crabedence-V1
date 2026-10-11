@@ -72,7 +72,21 @@ func sendJob(t *testing.T, conn net.Conn, reader *bufio.Reader, req map[string]a
 		t.Fatal(err)
 	}
 	if _, err := conn.Write(append(line, '\n')); err != nil {
-		t.Fatalf("write: %v", err)
+		// A refusal that precedes the write — the server verified peer
+		// credentials and closed before the frame flushed — surfaces
+		// here as EPIPE/ECONNRESET while its refusal frame is still
+		// readable. Read it: the semantic answer, not the transport
+		// symptom, is what every caller asserts on. If nothing is
+		// readable either, the write error is the real failure.
+		respBytes, rerr := readBoundedLine(reader, maxFrameBytes)
+		if rerr != nil {
+			t.Fatalf("write: %v (and no refusal frame readable: %v)", err, rerr)
+		}
+		var resp Response
+		if uerr := json.Unmarshal(respBytes, &resp); uerr != nil {
+			t.Fatalf("write: %v (and refusal frame unparseable: %v)", err, uerr)
+		}
+		return resp
 	}
 	respBytes, err := readBoundedLine(reader, maxFrameBytes)
 	if err != nil {
