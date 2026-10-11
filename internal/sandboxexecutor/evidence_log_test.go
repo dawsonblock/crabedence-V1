@@ -296,6 +296,25 @@ func TestEvidenceDetectsCorruption(t *testing.T) {
 			t.Fatal(err)
 		}
 	}, "digest changed")
+
+	expectFailure(t, "artifact size not reported", func(ledger, _ string) {
+		// The result claims zero bytes while the artifact holds data:
+		// the recorded digest matches the file, but the size claim is
+		// still an integrity failure — zero is an exact size, not an
+		// absent one.
+		artPath := filepath.Join(filepath.Dir(ledger), "unreported.out")
+		data := []byte("data")
+		if err := os.WriteFile(artPath, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		sum := sha256.Sum256(data)
+		res, _ := json.Marshal(ExecResult{
+			ExitCode: 0, OutputPath: artPath,
+			OutputSHA256: hex.EncodeToString(sum[:]), OutputBytes: 0,
+		})
+		tamper(t, ledger, `UPDATE jobs SET result_json = ?, artifact_sha256 = ? WHERE job_id='job-a'`,
+			string(res), hex.EncodeToString(sum[:]))
+	}, "holds 4 bytes but the result reports 0")
 }
 
 // TestVerifyDetectsArtifactBeyondContractBound: the artifact is

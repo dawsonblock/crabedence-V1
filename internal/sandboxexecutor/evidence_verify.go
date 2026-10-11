@@ -277,7 +277,7 @@ func (r *VerifyReport) verifyArtifacts(jobs []*LedgerJob) {
 			r.fail("job %s: artifact %s stat failed: %v", j.JobID, res.OutputPath, serr)
 			continue
 		}
-		if res.OutputBytes > 0 && info.Size() != res.OutputBytes {
+		if info.Size() != res.OutputBytes {
 			r.fail("job %s: artifact %s holds %d bytes but the result reports %d",
 				j.JobID, res.OutputPath, info.Size(), res.OutputBytes)
 		}

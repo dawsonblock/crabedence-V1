@@ -38,9 +38,10 @@ func TestMain(m *testing.M) {
 }
 
 type fakeSandbox struct {
-	Name   string            `json:"name"`
-	Status string            `json:"status"`
-	Config fakeSandboxConfig `json:"config"`
+	Name         string             `json:"name"`
+	Status       string             `json:"status"`
+	Config       fakeSandboxConfig  `json:"config"`
+	ActiveConfig *fakeSandboxConfig `json:"active_config"`
 }
 
 type fakeSandboxConfig struct {
@@ -270,6 +271,14 @@ func fakeCreate(dir string, args []string) int {
 		conf.Network.Policy = fakePublicPolicy()
 	} else if tamper == "ingress_allow" {
 		conf.Network.Policy.DefaultIngress = "allow"
+	} else if tamper == "public_plus_private" {
+		conf.Network.Policy = fakePublicPolicy()
+		conf.Network.Policy.Rules = append(conf.Network.Policy.Rules,
+			fakeRule{Action: "allow", Direction: "egress", Destination: fakeTarget{Group: "private"}})
+	}
+	if os.Getenv("MSB_FAKE_CREATE_FAIL") != "" {
+		fmt.Fprintln(os.Stderr, "error: invalid config: sandbox refused before boot")
+		return 1
 	}
 	// Exclusive creation, exactly like the real CLI: an existing
 	// sandbox is an error, never a silent reuse.
@@ -280,8 +289,18 @@ func fakeCreate(dir string, args []string) int {
 		return 1
 	}
 	defer f.Close()
-	raw, _ := json.Marshal(fakeSandbox{Name: name, Status: "Running", Config: conf})
+	active := conf
+	if os.Getenv("MSB_FAKE_TAMPER") == "active_diverges" {
+		active.Network.Policy = fakePublicPolicy()
+	}
+	raw, _ := json.Marshal(fakeSandbox{Name: name, Status: "Running", Config: conf, ActiveConfig: &active})
 	_, _ = f.Write(raw)
+	if os.Getenv("MSB_FAKE_CREATE_FAIL_AFTER") != "" {
+		// Mirrors a create that booted the VM and then failed guest
+		// validation: the sandbox record survives the failure.
+		fmt.Fprintln(os.Stderr, "error: invalid config: could not validate workdir in guest")
+		return 1
+	}
 	return 0
 }
 
@@ -445,7 +464,7 @@ func testContext(t *testing.T) context.Context {
 func writeFakeSandbox(t *testing.T, dir, name string, conf fakeSandboxConfig) {
 	t.Helper()
 	conf.Name = name
-	raw, err := json.Marshal(fakeSandbox{Name: name, Status: "Running", Config: conf})
+	raw, err := json.Marshal(fakeSandbox{Name: name, Status: "Running", Config: conf, ActiveConfig: &conf})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -678,6 +697,104 @@ func TestMSBDispatchAmbiguousCreateLeaksNothing(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Fatalf("a stalled dispatch left %d artifact file(s)", len(entries))
+	}
+}
+
+// TestMSBDispatchRefusesUnauthorizedPublicRules: `--net public`
+// composes exactly the gateway DNS rule and the public egress allow —
+// any extra rule is reachability the contract never authorized.
+func TestMSBDispatchRefusesUnauthorizedPublicRules(t *testing.T) {
+	t.Run("authorized public rules accepted", func(t *testing.T) {
+		key, _ := testAuthority(t)
+		bin, _ := fakeMSB(t, nil)
+		backend := &MSBBackend{Bin: bin, StateDir: filepath.Join(t.TempDir(), "artifacts")}
+		job := testContract(t, key, func(c *JobContractV2) {
+			c.JobID = "pub-ok"
+			c.Nonce = "n-pub-ok"
+			c.Network = NetworkPolicy{Mode: NetworkPublic}
+		})
+		handle, err := backend.Dispatch(testContext(t), job)
+		if err != nil {
+			t.Fatalf("authorized public network refused: %v", err)
+		}
+		if _, err := backend.Wait(testContext(t), handle); err != nil {
+			t.Fatalf("wait: %v", err)
+		}
+	})
+	t.Run("extra private rule refused", func(t *testing.T) {
+		key, _ := testAuthority(t)
+		bin, stateDir := fakeMSB(t, map[string]string{"MSB_FAKE_TAMPER": "public_plus_private"})
+		backend := &MSBBackend{Bin: bin, StateDir: filepath.Join(t.TempDir(), "artifacts")}
+		job := testContract(t, key, func(c *JobContractV2) {
+			c.JobID = "pub-extra"
+			c.Nonce = "n-pub-extra"
+			c.Network = NetworkPolicy{Mode: NetworkPublic}
+		})
+		name := backend.msbJobName(job.JobID)
+		_, err := backend.Dispatch(testContext(t), job)
+		if err == nil || !strings.Contains(err.Error(), "did not authorize") {
+			t.Fatalf("an unauthorized public rule was accepted: %v", err)
+		}
+		if _, serr := os.Stat(fakeStatePath(stateDir, name)); serr == nil {
+			t.Fatal("the unauthorized VM was not destroyed")
+		}
+	})
+}
+
+// TestMSBDispatchVerifiesBootedConfiguration: the persisted config
+// can say one thing while the booted VM runs another; verification
+// must read the resolved active configuration too.
+func TestMSBDispatchVerifiesBootedConfiguration(t *testing.T) {
+	key, _ := testAuthority(t)
+	bin, stateDir := fakeMSB(t, map[string]string{"MSB_FAKE_TAMPER": "active_diverges"})
+	backend := &MSBBackend{Bin: bin, StateDir: filepath.Join(t.TempDir(), "artifacts")}
+	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "active-1"; c.Nonce = "n-active" })
+	name := backend.msbJobName(job.JobID)
+
+	_, err := backend.Dispatch(testContext(t), job)
+	if err == nil || !strings.Contains(err.Error(), "booted configuration diverges") {
+		t.Fatalf("a VM running an unauthorized booted policy was accepted: %v", err)
+	}
+	if _, serr := os.Stat(fakeStatePath(stateDir, name)); serr == nil {
+		t.Fatal("the divergent VM was not destroyed")
+	}
+}
+
+// TestMSBDispatchFailedCreateRemovesItsOwnLeftover: a create can fail
+// after the VM was booted (guest validation, for instance). The
+// leftover carries this dispatch's identity label, so it is ours to
+// remove — a failed dispatch must not orphan a VM.
+func TestMSBDispatchFailedCreateRemovesItsOwnLeftover(t *testing.T) {
+	key, _ := testAuthority(t)
+	bin, stateDir := fakeMSB(t, map[string]string{"MSB_FAKE_CREATE_FAIL_AFTER": "1"})
+	backend := &MSBBackend{Bin: bin, StateDir: filepath.Join(t.TempDir(), "artifacts")}
+	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "orphan-own"; c.Nonce = "n-orphan" })
+	name := backend.msbJobName(job.JobID)
+
+	if _, err := backend.Dispatch(testContext(t), job); err == nil {
+		t.Fatal("a failed create was accepted")
+	}
+	if _, err := os.Stat(fakeStatePath(stateDir, name)); err == nil {
+		t.Fatal("a failed create left its own partially-created VM behind")
+	}
+}
+
+// TestMSBDispatchFailedCreateLeavesForeignSandboxAlone: a failed
+// create must not destroy a sandbox it did not create — the
+// pre-existing trap belongs to whoever made it.
+func TestMSBDispatchFailedCreateLeavesForeignSandboxAlone(t *testing.T) {
+	key, _ := testAuthority(t)
+	bin, stateDir := fakeMSB(t, map[string]string{"MSB_FAKE_CREATE_FAIL": "1"})
+	backend := &MSBBackend{Bin: bin, StateDir: filepath.Join(t.TempDir(), "artifacts")}
+	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "orphan-foreign"; c.Nonce = "n-foreign" })
+	name := backend.msbJobName(job.JobID)
+	writeFakeSandbox(t, stateDir, name, fakeDefaultConfig())
+
+	if _, err := backend.Dispatch(testContext(t), job); err == nil {
+		t.Fatal("a failed create was accepted")
+	}
+	if _, err := os.Stat(fakeStatePath(stateDir, name)); err != nil {
+		t.Fatal("a failed create destroyed a sandbox it did not create")
 	}
 }
 

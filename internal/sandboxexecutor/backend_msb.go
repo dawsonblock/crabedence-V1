@@ -344,6 +344,11 @@ func (b *MSBBackend) Dispatch(ctx context.Context, job *JobContractV2) (string, 
 			return refuse(fmt.Errorf("sandbox %q already exists — refusing to reuse a VM this dispatch did not create: %s",
 				name, artifactHead(artifactPath)))
 		}
+		// A create can fail after the VM was already booted (a guest
+		// validation error, for instance). Destroy the leftover only
+		// when it carries this dispatch's identity label — proof it
+		// came from this create, not from someone else.
+		b.destroyIfOurs(name, nonce)
 		return refuse(fmt.Errorf("msb create failed: %v: %s", cerr, strings.TrimSpace(string(out))))
 	}
 
@@ -408,6 +413,24 @@ func (b *MSBBackend) destroy(name string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	_, _ = b.runOnce(ctx, "rm", "-f", name)
+}
+
+// destroyIfOurs removes a sandbox left behind by a failed create, but
+// only when its labels carry this dispatch's identity — a sandbox
+// without that proof is not ours to remove (it may be a pre-existing
+// trap the job is supposed to refuse, not adopt).
+func (b *MSBBackend) destroyIfOurs(name, nonce string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	doc, err := b.inspectRaw(ctx, name)
+	if err != nil {
+		return
+	}
+	cfg, _ := doc["config"].(map[string]any)
+	labels, _ := cfg["labels"].(map[string]any)
+	if jsonString(labels, "crabedence.dispatch") == nonce {
+		b.destroy(name)
+	}
 }
 
 func (b *MSBBackend) dropProc(name string) {
@@ -538,11 +561,31 @@ func ruleTarget(dest map[string]any) (kind, value string) {
 	return "", ""
 }
 
+// verifySandboxPolicy proves the booted sandbox carries exactly the
+// policy the signed contract authorized. The persisted `config` is
+// the desired policy; `active_config` is what actually booted — both
+// must match, or a setting that was accepted but never applied (or is
+// pending a restart) would appear authorized while the guest runs
+// without it.
 func verifySandboxPolicy(job *JobContractV2, name, nonce string, doc map[string]any) error {
 	cfg, ok := doc["config"].(map[string]any)
 	if !ok {
 		return fmt.Errorf("inspect document carries no config object")
 	}
+	if err := verifySandboxConfig(job, name, nonce, cfg); err != nil {
+		return err
+	}
+	active, ok := doc["active_config"].(map[string]any)
+	if !ok {
+		return fmt.Errorf("sandbox has no resolved active configuration — refusing to execute in a VM that is not running its authorized policy")
+	}
+	if err := verifySandboxConfig(job, name, nonce, active); err != nil {
+		return fmt.Errorf("booted configuration diverges from the authorized policy: %w", err)
+	}
+	return nil
+}
+
+func verifySandboxConfig(job *JobContractV2, name, nonce string, cfg map[string]any) error {
 	if got := jsonString(cfg, "name"); got != name {
 		return fmt.Errorf("sandbox name %q does not match the authorized handle %q", got, name)
 	}
@@ -643,18 +686,27 @@ func verifyNetworkPolicy(job *JobContractV2, cfg map[string]any) error {
 		if egress != "deny" {
 			return fmt.Errorf("network mode public but the sandbox default egress is %q", egress)
 		}
-		found := false
-		for _, raw := range rules {
+		// `--net public` composes exactly two rules: the gateway DNS
+		// rule (group host) and the public egress allow. Any other
+		// rule is reachability the contract never authorized.
+		public := false
+		for i, raw := range rules {
 			rule, _ := raw.(map[string]any)
 			if jsonString(rule, "action") != "allow" || jsonString(rule, "direction") != "egress" {
-				continue
+				return fmt.Errorf("sandbox rule %d is not an egress allow", i)
 			}
 			dest, _ := rule["destination"].(map[string]any)
-			if kind, value := ruleTarget(dest); kind == "group" && value == "public" {
-				found = true
+			kind, value := ruleTarget(dest)
+			switch {
+			case kind == "group" && value == "public":
+				public = true
+			case kind == "group" && value == "host":
+				// the sandbox's own DNS gateway
+			default:
+				return fmt.Errorf("sandbox rule %d permits %s:%s, which the contract did not authorize", i, kind, value)
 			}
 		}
-		if !found {
+		if !public {
 			return fmt.Errorf("network mode public but the sandbox carries no public egress rule")
 		}
 	}
