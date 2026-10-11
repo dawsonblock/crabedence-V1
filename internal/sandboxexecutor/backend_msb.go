@@ -6,21 +6,49 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"hash"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
-	"sync"
 	"time"
 )
 
 // defaultMaxOutputBytes bounds captured output when a contract
 // declares no max_output_bytes.
 const defaultMaxOutputBytes = 8 << 20
+
+// PinnedMSBVersion is the Microsandbox runtime this backend is
+// qualified against. The runtime-owned job protocol it carries is
+// what makes a guest exit event observable independently of any CLI
+// process exit code; an adapter that cannot say which runtime
+// behavior it was tested against cannot claim that property, so a
+// different version is refused, never assumed compatible.
+const PinnedMSBVersion = "0.7.8"
+
+// maxDurationGrace extends the sandbox's own --max-duration beyond
+// the contract timeout. Without it, the VM's death races the
+// runtime's terminal job-record write and a contract timeout
+// degrades to lost/UNKNOWN; with it, the runtime kills the command at
+// the contract deadline while the VM still lives to record the
+// outcome. The grace is fixed and bounded — an abandoned VM outlives
+// its authorization by at most this, and never by an unbounded
+// amount.
+const maxDurationGrace = 30 * time.Second
+
+// jobPollInterval paces Wait's observation of the runtime's job
+// record. The record is the only evidence Wait trusts, so polling is
+// deliberately boring: one bounded `inspect --job` call per tick.
+const jobPollInterval = 500 * time.Millisecond
+
+// captureMargin bounds the artifact capture after a terminal
+// observation: reading the runtime's retained output and publishing
+// it durably. A capture that cannot finish inside the margin leaves
+// the job unresolved rather than terminal-without-evidence.
+const captureMargin = 60 * time.Second
 
 // Image fetch policies a backend may pin. The default is never: the
 // executor refuses a job whose authorized image is not present
@@ -31,13 +59,18 @@ const (
 	PullIfMissing = "if-missing"
 )
 
+// jobIDPattern is the runtime's job identity shape, enforced by the
+// CLI's own validator: "job_" plus 32 lowercase hex digits.
+var jobIDPattern = regexp.MustCompile(`^job_[0-9a-f]{32}$`)
+
 // MSBBackend executes signed job contracts in Microsandbox microVMs
 // (libkrun on Apple Silicon / Linux KVM). The executor hands it a
 // verified contract; the backend maps the contract's declared limits
 // onto msb flags exactly — a limit the contract did not authorize is
 // never invented, and a contract's declared limit is never widened.
 //
-// Execution model — every job gets a fresh, exclusively created VM:
+// Execution model — every job gets a fresh, exclusively created VM
+// whose workload is a runtime-owned job:
 //
 //  1. `msb create` boots an idle microVM under the job's deterministic
 //     handle. `create` refuses an existing handle outright; `msb run`
@@ -49,17 +82,23 @@ const (
 //     resources, workdir, security profile, and the dispatch labels
 //     that bind this VM to this contract. A mismatch destroys the VM
 //     before any guest command runs.
-//  3. `msb exec` runs the contract's argv as a managed child,
-//     streaming output into the bounded artifact file. The child's
-//     exit code, the artifact digest and truncation are collected
-//     from that one child.
+//  3. `msb exec -d` starts the contract's argv as a runtime-owned
+//     job. The runtime — not this adapter, and not a CLI process
+//     exit code — records the job's terminal state: exited with the
+//     guest's code, timed_out, failed (the guest rejected the
+//     command before it started), or lost. Wait observes that record
+//     until it is terminal; an outcome that cannot be observed is
+//     never invented.
+//  4. The job's retained output is captured into a bounded artifact:
+//     written to a private temp file, fsynced, atomically published,
+//     and re-read to prove the digest the ledger will bind.
 //
-// The sandbox's --max-duration is pinned to the contract timeout, so
-// even an abandoned VM (daemon crash, lost monitor) cannot outlive
-// its authorization. Shutdown never kills a job's child: the VM's own
-// --max-duration bounds it, the ledger marks the watch interrupted,
-// and the deterministic sandbox name lets a restarted executor
-// reconcile what survived.
+// The sandbox's --max-duration is pinned to the contract timeout plus
+// a fixed observation grace, so even an abandoned VM cannot outlive
+// its authorization by more than that bound. Shutdown never kills a
+// job's VM: the ledger marks the watch interrupted and the
+// deterministic sandbox name lets a restarted executor reconcile
+// what survived.
 type MSBBackend struct {
 	// Bin is the msb binary path (e.g. ~/.microsandbox/bin/msb).
 	Bin string
@@ -84,97 +123,113 @@ type MSBBackend struct {
 	// collection — a forensics posture; default removes them since
 	// the artifact store is the durable evidence.
 	KeepSandboxes bool
-
-	mu    sync.Mutex
-	procs map[string]*msbProc
+	// RequiredVersion pins the runtime the adapter is qualified
+	// against; empty means PinnedMSBVersion. VerifyRuntime refuses
+	// any other version.
+	RequiredVersion string
+	// PollInterval paces Wait's observation polls; zero uses
+	// jobPollInterval.
+	PollInterval time.Duration
+	// ObservationSlack extends the contract timeout for the
+	// observation window; zero uses maxDurationGrace + captureMargin.
+	// It exists so tests can exercise unobserved-outcome paths in
+	// bounded time — operators leave it at the default.
+	ObservationSlack time.Duration
 }
 
-// msbProc is one running job's managed exec child plus its bounded
-// artifact capture. finished closes exactly once when the child is
-// reaped; outcome is written before the close so every reader —
-// Dispatch's launch arbitration and Wait alike — sees the same
-// result. A single-consumer channel here would let Dispatch steal a
-// fast job's outcome and starve the monitor forever.
-type msbProc struct {
-	cmd       *exec.Cmd
-	collector *outputCollector
-	finished  chan struct{}
-	outcome   msbOutcome
-}
-
-type msbOutcome struct {
-	code      int
-	err       error
-	sha256    string
-	nbytes    int64
-	truncated bool
-}
-
-// outputCollector is the backend's single bounded artifact sink.
-// stdout and stderr both arrive on separate copier goroutines, so the
-// collector is internally synchronized and every byte is stored and
-// hashed under the same lock — the digest covers exactly the bytes
-// the artifact file holds, and a bound the contract set is never
-// exceeded on disk. Bytes past the bound are drained and discarded,
-// never hashed: a digest over unstored bytes would attest output the
-// evidence cannot reproduce.
-type outputCollector struct {
-	mu        sync.Mutex
-	f         *os.File
-	hasher    hash.Hash
-	remaining int64
-	written   int64
-	truncated bool
-}
-
-func newOutputCollector(f *os.File, bound int64) *outputCollector {
-	if bound <= 0 {
-		bound = defaultMaxOutputBytes
+// requiredVersion is the effective runtime pin.
+func (b *MSBBackend) requiredVersion() string {
+	if b.RequiredVersion != "" {
+		return b.RequiredVersion
 	}
-	return &outputCollector{f: f, hasher: sha256.New(), remaining: bound}
+	return PinnedMSBVersion
 }
 
-func (c *outputCollector) Write(p []byte) (int, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.remaining <= 0 {
-		if len(p) > 0 {
-			c.truncated = true
-		}
-		return len(p), nil
-	}
-	chunk := p
-	if int64(len(chunk)) > c.remaining {
-		chunk = chunk[:c.remaining]
-		c.truncated = true
-	}
-	n, err := c.f.Write(chunk)
-	if n > 0 {
-		_, _ = c.hasher.Write(chunk[:n])
-		c.written += int64(n)
-		c.remaining -= int64(n)
-	}
+// VerifyRuntime proves the configured msb binary is the pinned
+// version — the adapter's observation semantics are qualified against
+// one runtime's job protocol, and a silent version drift would
+// invalidate exactly the properties this backend exists to provide.
+// It returns the observed version for the startup report.
+func (b *MSBBackend) VerifyRuntime(ctx context.Context) (string, error) {
+	out, err := b.runOnce(ctx, "--version")
 	if err != nil {
-		return n, err
+		return "", fmt.Errorf("probe msb version (%s): %v: %s", b.Bin, err, strings.TrimSpace(string(out)))
 	}
-	if n < len(chunk) {
-		return n, io.ErrShortWrite
+	fields := strings.Fields(strings.TrimSpace(string(out)))
+	if len(fields) < 2 || fields[0] != "msb" {
+		return "", fmt.Errorf("unrecognized msb version output %q", strings.TrimSpace(string(out)))
 	}
-	return len(p), nil
+	got := fields[1]
+	if got != b.requiredVersion() {
+		return got, fmt.Errorf("msb %s is not the pinned runtime %s — the adapter's job-protocol semantics are qualified against the pinned version; upgrade the runtime or pin the qualified version explicitly", got, b.requiredVersion())
+	}
+	return got, nil
 }
 
-// digest is the SHA-256 of the bytes stored in the artifact file —
-// the same value a verifier recomputes from the file itself.
-func (c *outputCollector) digest() string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return hex.EncodeToString(c.hasher.Sum(nil))
+// msbJobRecord is the runtime's durable job metadata as
+// `msb inspect --job <id> --format json` reports it. Only the fields
+// the classification depends on are decoded; unknown fields are
+// ignored so a compatible runtime can add metadata without breaking
+// observation.
+type msbJobRecord struct {
+	ID          string         `json:"id"`
+	RuntimeBoot string         `json:"runtime_boot_id"`
+	Command     []string       `json:"command"`
+	State       string         `json:"state"`
+	PID         *uint32        `json:"pid"`
+	CreatedAt   int64          `json:"created_at"`
+	StartedAt   *int64         `json:"started_at"`
+	FinishedAt  *int64         `json:"finished_at"`
+	ExitCode    *int           `json:"exit_code"`
+	Failure     *msbJobFailure `json:"failure"`
+	Error       *string        `json:"error"`
+	TimedOut    bool           `json:"timed_out"`
 }
 
-func (c *outputCollector) stats() (int64, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.written, c.truncated
+type msbJobFailure struct {
+	Kind      string `json:"kind"`
+	Errno     *int   `json:"errno"`
+	ErrnoName string `json:"errno_name"`
+	Message   string `json:"message"`
+	Stage     string `json:"stage"`
+}
+
+// finishedAt converts the runtime's finish timestamp, falling back to
+// observation time when the record carries none.
+func (r *msbJobRecord) finishedAt() time.Time {
+	if r.FinishedAt != nil {
+		return time.UnixMilli(*r.FinishedAt).UTC()
+	}
+	return time.Now().UTC()
+}
+
+// errorText renders the runtime's own explanation of a lost job.
+func (r *msbJobRecord) errorText() string {
+	if r.Error != nil && *r.Error != "" {
+		return *r.Error
+	}
+	return "the runtime did not confirm an exit result"
+}
+
+// failureText renders a typed spawn failure for the audit log.
+func (f *msbJobFailure) text() string {
+	if f == nil {
+		return "the guest rejected the command before it started"
+	}
+	parts := []string{}
+	if f.Kind != "" {
+		parts = append(parts, f.Kind)
+	}
+	if f.Message != "" {
+		parts = append(parts, f.Message)
+	}
+	if f.ErrnoName != "" {
+		parts = append(parts, "("+f.ErrnoName+")")
+	}
+	if len(parts) == 0 {
+		return "the guest rejected the command before it started"
+	}
+	return strings.Join(parts, ": ")
 }
 
 // msbJobName derives the deterministic sandbox handle for a job.
@@ -207,8 +262,8 @@ func dispatchNonce() (string, error) {
 	return hex.EncodeToString(raw[:]), nil
 }
 
-// runOnce executes a short msb utility call (create, inspect, rm)
-// under ctx.
+// runOnce executes a short msb utility call (create, inspect, jobs,
+// rm, exec -d) under ctx.
 func (b *MSBBackend) runOnce(ctx context.Context, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, b.Bin, args...)
 	cmd.Stdin = nil
@@ -227,6 +282,13 @@ func pinnedImage(job *JobContractV2) string {
 	return job.Image + "@" + job.ImageDigest
 }
 
+// vmMaxDuration is the sandbox's own hard bound: the contract timeout
+// plus the fixed observation grace, so the runtime can record a
+// timed-out job's terminal state while the VM still lives.
+func vmMaxDuration(job *JobContractV2) time.Duration {
+	return time.Duration(job.Resources.TimeoutSeconds)*time.Second + maxDurationGrace
+}
+
 // createArgs maps a verified contract onto `msb create` flags, 1:1,
 // plus the dispatch labels that bind the VM to this contract.
 func (b *MSBBackend) createArgs(job *JobContractV2, name, nonce string) ([]string, error) {
@@ -240,9 +302,7 @@ func (b *MSBBackend) createArgs(job *JobContractV2, name, nonce string) ([]strin
 	if job.Resources.DiskMB > 0 {
 		args = append(args, "--root-disk", fmt.Sprintf("%dM", job.Resources.DiskMB))
 	}
-	// --max-duration is the VM's own hard bound: even if this
-	// process dies, the sandbox cannot outlive the contract.
-	args = append(args, "--max-duration", fmt.Sprintf("%ds", job.Resources.TimeoutSeconds))
+	args = append(args, "--max-duration", fmt.Sprintf("%ds", int(vmMaxDuration(job)/time.Second)))
 	switch job.Network.Mode {
 	case NetworkNone:
 		args = append(args, "--net", "none")
@@ -289,11 +349,11 @@ func (b *MSBBackend) createArgs(job *JobContractV2, name, nonce string) ([]strin
 	return args, nil
 }
 
-// execArgs maps the contract's argv onto `msb exec` inside the
-// already-verified sandbox. The command timeout is pinned to the
-// contract's timeout — the same bound the VM itself carries.
-func (b *MSBBackend) execArgs(job *JobContractV2, name string) []string {
-	args := []string{"exec", "--no-tty", "--no-stdin",
+// launchArgs maps the contract's argv onto a runtime-owned detached
+// job. The command timeout is pinned to the contract's timeout — the
+// same deadline the VM itself carries (plus the observation grace).
+func (b *MSBBackend) launchArgs(job *JobContractV2, name string) []string {
+	args := []string{"exec", "-d", "--no-tty", "--no-stdin",
 		"--timeout", fmt.Sprintf("%ds", job.Resources.TimeoutSeconds)}
 	if job.Resources.Pids > 0 {
 		args = append(args, "--rlimit", fmt.Sprintf("nproc=%d", job.Resources.Pids))
@@ -303,7 +363,74 @@ func (b *MSBBackend) execArgs(job *JobContractV2, name string) []string {
 	return args
 }
 
-// Dispatch boots the job's microVM and starts its authorized command:
+// parseRunID extracts the runtime-owned job identity from a detached
+// launch's output. Exactly one well-formed identity must appear — a
+// launch that prints none (or several) cannot be correlated to a job.
+func parseRunID(out string) (string, bool) {
+	found := ""
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if !jobIDPattern.MatchString(line) {
+			continue
+		}
+		if found != "" && found != line {
+			return "", false
+		}
+		found = line
+	}
+	return found, found != ""
+}
+
+// listJobs returns the runtime's job records for a sandbox. It is the
+// recovery probe: when a detached launch fails without naming its job,
+// the sandbox may still hold one — the launch may have been admitted
+// and its identity lost in transport, and a blind re-launch would
+// duplicate it.
+func (b *MSBBackend) listJobs(ctx context.Context, name string) ([]msbJobRecord, error) {
+	out, err := b.runOnce(ctx, "jobs", "--all", "--format", "json", name)
+	if err != nil {
+		return nil, fmt.Errorf("msb jobs %s: %v: %s", name, err, strings.TrimSpace(string(out)))
+	}
+	var page struct {
+		Items []msbJobRecord `json:"items"`
+	}
+	if err := json.Unmarshal(out, &page); err != nil {
+		return nil, fmt.Errorf("msb jobs %s: malformed json: %w", name, err)
+	}
+	return page.Items, nil
+}
+
+// matchContractJobs returns the sandbox's jobs whose recorded command
+// is exactly the contract's argv. Our sandboxes are exclusive to one
+// dispatch, so a match is proof the job belongs to this contract.
+func matchContractJobs(jobs []msbJobRecord, job *JobContractV2) []msbJobRecord {
+	var matched []msbJobRecord
+	for _, rec := range jobs {
+		if !sameArgv(rec.Command, job.Argv) {
+			continue
+		}
+		matched = append(matched, rec)
+	}
+	return matched
+}
+
+// sameArgv compares a runtime job record's command against the
+// contract's argv element-wise — the correlation that proves an
+// observed job is the authorized command, not a lookalike.
+func sameArgv(recorded, authorized []string) bool {
+	if len(recorded) != len(authorized) {
+		return false
+	}
+	for i := range recorded {
+		if recorded[i] != authorized[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// Dispatch boots the job's microVM and starts its authorized command
+// as a runtime-owned job:
 //
 //  1. `msb create` — exclusive creation. An existing sandbox under
 //     the job's handle is a definitive refusal: the job never runs in
@@ -311,67 +438,46 @@ func (b *MSBBackend) execArgs(job *JobContractV2, name string) []string {
 //  2. `msb inspect` — the booted VM must carry exactly the policy the
 //     contract authorized; a mismatch destroys it before any guest
 //     command runs.
-//  3. `msb exec` — the contract's argv as a managed child whose
-//     stdout/stderr stream into the bounded artifact file.
+//  3. `msb exec -d` — the contract's argv as a runtime-owned job
+//     whose terminal state the runtime records durably. A launch that
+//     fails without naming its job is probed against the sandbox's
+//     job list before it is called a refusal: an admitted-but-unnamed
+//     job is adopted, never duplicated.
 //
 // A dispatch deadline that expires mid-create is ambiguous by
 // construction — the VM may exist — so the handle is returned for
 // reconcile, never a blind retry.
-func (b *MSBBackend) Dispatch(ctx context.Context, job *JobContractV2) (string, error) {
+func (b *MSBBackend) Dispatch(ctx context.Context, job *JobContractV2) (DispatchResult, error) {
 	if job == nil {
-		return "", fmt.Errorf("dispatch requires a signed job contract")
+		return DispatchResult{}, fmt.Errorf("dispatch requires a signed job contract")
 	}
 	name := b.msbJobName(job.JobID)
 	nonce, err := dispatchNonce()
 	if err != nil {
-		return "", err
+		return DispatchResult{}, err
 	}
 	createArgs, err := b.createArgs(job, name, nonce)
 	if err != nil {
-		return "", err
-	}
-
-	bound := int64(job.Resources.MaxOutputBytes)
-	if bound <= 0 {
-		bound = defaultMaxOutputBytes
-	}
-	if err := os.MkdirAll(b.StateDir, 0o700); err != nil {
-		return "", fmt.Errorf("create artifact dir %s: %w", b.StateDir, err)
-	}
-	artifactPath := filepath.Join(b.StateDir, name+".out")
-	file, err := os.OpenFile(artifactPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
-		return "", fmt.Errorf("create artifact %s: %w", artifactPath, err)
-	}
-	// refuse discards the artifact file a never-launched job would
-	// otherwise leave behind.
-	refuse := func(err error) (string, error) {
-		file.Close()
-		os.Remove(artifactPath)
-		return "", err
+		return DispatchResult{}, err
 	}
 
 	out, cerr := b.runOnce(ctx, createArgs...)
 	if cerr != nil {
 		if ctx.Err() != nil {
-			// The VM may exist, but this dispatch never reached exec —
-			// so the artifact can never receive output. Close and
-			// discard it: a stalled dispatch must leak neither a
-			// descriptor nor a stale file.
-			file.Close()
-			os.Remove(artifactPath)
-			return name, fmt.Errorf("%w: create deadline expired before the VM was proven: %v", ErrAmbiguousDispatch, ctx.Err())
+			// The VM may exist; the dispatch never reached a
+			// verified launch, so the handle is returned for
+			// reconcile, never a blind retry.
+			return DispatchResult{Handle: name}, fmt.Errorf("%w: create deadline expired before the VM was proven: %v", ErrAmbiguousDispatch, ctx.Err())
 		}
 		if strings.Contains(strings.ToLower(string(out)), "already exists") {
-			return refuse(fmt.Errorf("sandbox %q already exists — refusing to reuse a VM this dispatch did not create: %s",
-				name, artifactHead(artifactPath)))
+			return DispatchResult{}, fmt.Errorf("sandbox %q already exists — refusing to reuse a VM this dispatch did not create", name)
 		}
 		// A create can fail after the VM was already booted (a guest
 		// validation error, for instance). Destroy the leftover only
 		// when it carries this dispatch's identity label — proof it
 		// came from this create, not from someone else.
 		b.destroyIfOurs(name, nonce)
-		return refuse(fmt.Errorf("msb create failed: %v: %s", cerr, strings.TrimSpace(string(out))))
+		return DispatchResult{}, fmt.Errorf("msb create failed: %v: %s", cerr, strings.TrimSpace(string(out)))
 	}
 
 	// Pre-execution policy verification: the VM that boots must be
@@ -379,53 +485,52 @@ func (b *MSBBackend) Dispatch(ctx context.Context, job *JobContractV2) (string, 
 	doc, ierr := b.inspectRaw(ctx, name)
 	if ierr != nil {
 		b.destroy(name)
-		return refuse(fmt.Errorf("verify sandbox %s before execution: %w", name, ierr))
+		return DispatchResult{}, fmt.Errorf("verify sandbox %s before execution: %w", name, ierr)
 	}
 	if verr := verifySandboxPolicy(job, name, nonce, doc); verr != nil {
 		b.destroy(name)
-		return refuse(fmt.Errorf("sandbox %s failed policy verification — destroyed before execution: %w", name, verr))
+		return DispatchResult{}, fmt.Errorf("sandbox %s failed policy verification — destroyed before execution: %w", name, verr)
 	}
 
-	cmd := exec.Command(b.Bin, b.execArgs(job, name)...)
-	cmd.Stdin = nil
-	collector := newOutputCollector(file, bound)
-	cmd.Stdout = collector
-	cmd.Stderr = collector
-	if err := cmd.Start(); err != nil {
-		b.destroy(name)
-		return refuse(fmt.Errorf("spawn msb exec: %w", err))
+	lout, lerr := b.runOnce(ctx, b.launchArgs(job, name)...)
+	if lerr == nil {
+		if runID, ok := parseRunID(string(lout)); ok {
+			return DispatchResult{Handle: name, RunID: runID}, nil
+		}
 	}
-	proc := &msbProc{cmd: cmd, collector: collector, finished: make(chan struct{})}
-	go func() {
-		werr := cmd.Wait()
-		code := 0
-		if werr != nil {
-			var ee *exec.ExitError
-			if errors.As(werr, &ee) {
-				code = ee.ExitCode()
-			} else {
-				code = -1
+	// The launch did not name a job. It may still have been admitted:
+	// probe the sandbox before calling it a refusal, and adopt the
+	// job the runtime recorded rather than duplicating it.
+	probeCtx, cancel := context.WithTimeout(ctx, b.dispatchProbeTimeout())
+	defer cancel()
+	jobs, perr := b.listJobs(probeCtx, name)
+	switch {
+	case perr != nil:
+		// The probe failed too — the outcome is genuinely unknown.
+		return DispatchResult{Handle: name}, fmt.Errorf("%w: detached launch failed (%v: %s) and the job list could not be read: %v",
+			ErrAmbiguousDispatch, lerr, strings.TrimSpace(string(lout)), perr)
+	default:
+		matched := matchContractJobs(jobs, job)
+		switch len(matched) {
+		case 1:
+			// The launch was admitted; only its identity was lost.
+			return DispatchResult{Handle: name, RunID: matched[0].ID}, nil
+		case 0:
+			b.destroy(name)
+			if lerr != nil {
+				return DispatchResult{}, fmt.Errorf("msb exec -d failed: %v: %s", lerr, strings.TrimSpace(string(lout)))
 			}
+			return DispatchResult{}, fmt.Errorf("msb exec -d named no job and the sandbox records none: %s", strings.TrimSpace(string(lout)))
+		default:
+			return DispatchResult{Handle: name}, fmt.Errorf("%w: sandbox %s records %d jobs matching the authorized command — an operator must reconcile them",
+				ErrAmbiguousDispatch, name, len(matched))
 		}
-		file.Sync()
-		file.Close()
-		nbytes, truncated := collector.stats()
-		proc.outcome = msbOutcome{
-			code: code, err: werr,
-			sha256: collector.digest(),
-			nbytes: nbytes, truncated: truncated,
-		}
-		close(proc.finished)
-	}()
-
-	b.mu.Lock()
-	if b.procs == nil {
-		b.procs = map[string]*msbProc{}
 	}
-	b.procs[name] = proc
-	b.mu.Unlock()
-	return name, nil
 }
+
+// dispatchProbeTimeout bounds the post-failure job-list probe so a
+// wedged runtime cannot pin the admission path.
+func (b *MSBBackend) dispatchProbeTimeout() time.Duration { return 15 * time.Second }
 
 // destroy removes a sandbox this backend created. Failures are
 // ignored by design: the VM's own --max-duration is the backstop, and
@@ -455,12 +560,6 @@ func (b *MSBBackend) destroyIfOurs(name, nonce string) {
 	}
 }
 
-func (b *MSBBackend) dropProc(name string) {
-	b.mu.Lock()
-	delete(b.procs, name)
-	b.mu.Unlock()
-}
-
 // inspectRaw returns the parsed `msb inspect --format json` document.
 func (b *MSBBackend) inspectRaw(ctx context.Context, name string) (map[string]any, error) {
 	out, err := b.runOnce(ctx, "inspect", "--format", "json", name)
@@ -472,6 +571,22 @@ func (b *MSBBackend) inspectRaw(ctx context.Context, name string) (map[string]an
 		return nil, fmt.Errorf("msb inspect %s: malformed json: %w", name, err)
 	}
 	return doc, nil
+}
+
+// inspectJob returns the runtime's durable job record for one job.
+func (b *MSBBackend) inspectJob(ctx context.Context, name, runID string) (*msbJobRecord, error) {
+	out, err := b.runOnce(ctx, "inspect", "--job", runID, "--format", "json", name)
+	if err != nil {
+		return nil, fmt.Errorf("msb inspect --job %s %s: %v: %s", runID, name, err, strings.TrimSpace(string(out)))
+	}
+	var rec msbJobRecord
+	if err := json.Unmarshal(out, &rec); err != nil {
+		return nil, fmt.Errorf("msb inspect --job %s %s: malformed json: %w", runID, name, err)
+	}
+	if rec.ID != runID {
+		return nil, fmt.Errorf("msb inspect --job %s %s: record names job %q", runID, name, rec.ID)
+	}
+	return &rec, nil
 }
 
 // Inspect reports whether the handle names a live sandbox — the
@@ -499,44 +614,277 @@ func (b *MSBBackend) Inspect(ctx context.Context, handle string) (bool, error) {
 	}
 }
 
-// Wait blocks on the job's managed exec child, then reports the bound
-// result: guest exit code plus the artifact path, size, and SHA-256.
-// Context cancellation abandons the watch only — the child (and its
-// VM) is deliberately left alive under its contract timeout.
-func (b *MSBBackend) Wait(ctx context.Context, handle string) (*ExecResult, error) {
-	b.mu.Lock()
-	proc := b.procs[handle]
-	b.mu.Unlock()
-	if proc == nil {
-		return nil, fmt.Errorf("no managed run for handle %q (dispatch belonged to another lifetime?)", handle)
+// Wait observes the job's runtime-owned record until it is terminal,
+// then captures the job's retained output into a durable artifact.
+// The observation window is the contract timeout plus the fixed
+// grace the VM itself carries, plus the capture margin — an outcome
+// the runtime never records inside that window is unobserved, and
+// unobserved outcomes are never recorded as results.
+//
+// The returned result distinguishes what was actually observed:
+//   - ExitVerified: the runtime recorded the guest's termination.
+//   - TimedOut: the runtime killed the command at the deadline.
+//   - FailureKind: the guest rejected the command before it started.
+//
+// A terminal observation whose artifact cannot be finalized returns
+// the observation together with an error — the plan's "not fully
+// verified" — and anything unobservable returns
+// ErrExecutionUnobserved. Neither is ever a terminal claim.
+func (b *MSBBackend) Wait(ctx context.Context, job *JobContractV2, handle, runID string) (*ExecResult, error) {
+	if job == nil {
+		return nil, fmt.Errorf("wait requires the job's signed contract")
 	}
-	select {
-	case <-proc.finished:
-		out := proc.outcome
-		b.dropProc(handle)
-		res := &ExecResult{
-			ExitCode:     out.code,
-			OutputSHA256: out.sha256,
-			OutputPath:   filepath.Join(b.StateDir, handle+".out"),
-			OutputBytes:  out.nbytes,
-			Truncated:    out.truncated,
-			FinishedAt:   time.Now().UTC(),
+	if !jobIDPattern.MatchString(runID) {
+		return nil, fmt.Errorf("%w: run identity %q is not a runtime job id", ErrExecutionUnobserved, runID)
+	}
+	slack := b.ObservationSlack
+	if slack <= 0 {
+		slack = maxDurationGrace + captureMargin
+	}
+	window := time.Duration(job.Resources.TimeoutSeconds)*time.Second + slack
+	obsCtx, cancelObs := context.WithTimeout(ctx, window)
+	defer cancelObs()
+
+	res, err := b.observe(obsCtx, ctx, job, handle, runID)
+	if err != nil {
+		return nil, err
+	}
+
+	// The exit is observed; the artifact must now be finalized or
+	// the result is not fully verified. The capture gets its own
+	// bounded window so an observation that finished near the
+	// deadline does not doom the artifact.
+	capCtx, cancelCap := context.WithTimeout(ctx, captureMargin)
+	defer cancelCap()
+	cap, cerr := b.capture(capCtx, job, handle, runID)
+	if cerr != nil {
+		return res, fmt.Errorf("artifact finalization failed for job %s: %w", job.JobID, cerr)
+	}
+	res.CaptureSource = "runtime-job-log"
+	res.OutputPath = cap.path
+	res.OutputSHA256 = cap.sha256
+	res.OutputBytes = cap.nbytes
+	res.Truncated = cap.truncated
+	return res, nil
+}
+
+// observe polls the runtime's job record until it is terminal.
+// parent distinguishes a shutdown (its cancellation is returned as
+// such — the row stays RUNNING for reconcile) from the observation
+// deadline (an unobserved outcome).
+func (b *MSBBackend) observe(obsCtx, parent context.Context, job *JobContractV2, handle, runID string) (*ExecResult, error) {
+	interval := b.PollInterval
+	if interval <= 0 {
+		interval = jobPollInterval
+	}
+	var lastErr error
+	for {
+		rec, err := b.inspectJob(obsCtx, handle, runID)
+		if err == nil {
+			if !sameArgv(rec.Command, job.Argv) {
+				return nil, fmt.Errorf("%w: job %s records a different command than the contract authorized", ErrExecutionUnobserved, runID)
+			}
+			switch rec.State {
+			case "exited":
+				res := &ExecResult{RuntimeState: rec.State, RunID: runID, FinishedAt: rec.finishedAt()}
+				switch {
+				case rec.TimedOut:
+					// The runtime killed the command at the deadline:
+					// an observed outcome, but not a guest exit.
+					res.TimedOut = true
+				case rec.ExitCode != nil:
+					res.ExitVerified = true
+					res.ExitCode = *rec.ExitCode
+				default:
+					return nil, fmt.Errorf("%w: job %s is exited without an exit code and without a timeout", ErrExecutionUnobserved, runID)
+				}
+				return res, nil
+			case "failed":
+				kind := "unknown"
+				if rec.Failure != nil && rec.Failure.Kind != "" {
+					kind = rec.Failure.Kind
+				}
+				return &ExecResult{
+					RuntimeState:   rec.State,
+					RunID:          runID,
+					FailureKind:    kind,
+					FailureMessage: rec.Failure.text(),
+					FinishedAt:     rec.finishedAt(),
+				}, nil
+			case "lost":
+				return nil, fmt.Errorf("%w: the runtime lost job %s: %s", ErrExecutionUnobserved, runID, rec.errorText())
+			}
+		} else {
+			lastErr = err
 		}
-		if !b.KeepSandboxes {
-			b.destroy(handle)
+		select {
+		case <-obsCtx.Done():
+			if parent.Err() != nil {
+				return nil, parent.Err()
+			}
+			if lastErr != nil {
+				return nil, fmt.Errorf("%w: no terminal record for job %s within its observation window (last error: %v)", ErrExecutionUnobserved, runID, lastErr)
+			}
+			return nil, fmt.Errorf("%w: job %s did not reach a terminal state within its observation window", ErrExecutionUnobserved, runID)
+		case <-time.After(interval):
 		}
-		return res, nil
-	case <-ctx.Done():
-		// The daemon is stopping: the job's ledger row stays RUNNING
-		// and reconcile marks it ambiguous next open. The child keeps
-		// running under its own contract timeout.
-		return nil, ctx.Err()
 	}
 }
 
-// Close abandons watches without touching the managed children —
-// their contract timeouts bound them, and the next ledger lifetime
-// reconciles their sandbox handles.
+// captureResult is one finalized artifact.
+type captureResult struct {
+	path      string
+	sha256    string
+	nbytes    int64
+	truncated bool
+}
+
+// capture reads the runtime's retained capture of the job's
+// stdout+stderr — bounded by the contract's max_output_bytes — and
+// publishes it durably: a private temp file, fsync, close, atomic
+// rename, then a read-back hash that must equal the digest computed
+// while streaming. The artifact is exactly the bytes on disk; the
+// digest that lands in evidence is recomputed from the published
+// file, never carried over from memory.
+func (b *MSBBackend) capture(ctx context.Context, job *JobContractV2, name, runID string) (*captureResult, error) {
+	bound := int64(job.Resources.MaxOutputBytes)
+	if bound <= 0 {
+		bound = defaultMaxOutputBytes
+	}
+	if err := os.MkdirAll(b.StateDir, 0o700); err != nil {
+		return nil, fmt.Errorf("create artifact dir %s: %w", b.StateDir, err)
+	}
+	finalPath := filepath.Join(b.StateDir, name+".out")
+	tmp, err := os.CreateTemp(b.StateDir, "."+name+".out-*")
+	if err != nil {
+		return nil, fmt.Errorf("create artifact temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	published := false
+	defer func() {
+		if !published {
+			tmp.Close()
+			os.Remove(tmpPath)
+		}
+	}()
+
+	cmd := exec.CommandContext(ctx, b.Bin, "logs", "--job", runID, name)
+	cmd.Stdin = nil
+	collector := &boundedArtifactWriter{f: tmp, hasher: sha256.New(), remaining: bound}
+	cmd.Stdout = collector
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("spawn msb logs: %w", err)
+	}
+	werr := cmd.Wait()
+	if werr != nil {
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("artifact capture interrupted: %w", ctx.Err())
+		}
+		return nil, fmt.Errorf("msb logs --job %s failed: %v: %s", runID, werr, strings.TrimSpace(stderr.String()))
+	}
+	nbytes, truncated := collector.stats()
+	if err := tmp.Sync(); err != nil {
+		return nil, fmt.Errorf("sync artifact: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return nil, fmt.Errorf("close artifact: %w", err)
+	}
+	if err := os.Rename(tmpPath, finalPath); err != nil {
+		return nil, fmt.Errorf("publish artifact %s: %w", finalPath, err)
+	}
+	published = true
+	if dir, err := os.Open(b.StateDir); err == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
+	// Read-back: the digest bound to evidence must be the digest of
+	// the published bytes, not of a stream that was written.
+	readBack, rerr := hashFileSHA256(finalPath)
+	if rerr != nil {
+		return nil, fmt.Errorf("read back artifact %s: %w", finalPath, rerr)
+	}
+	if readBack != collector.digest() {
+		return nil, fmt.Errorf("artifact %s changed between write and read-back (wrote %s, read %s)", finalPath, collector.digest(), readBack)
+	}
+	if info, serr := os.Stat(finalPath); serr != nil {
+		return nil, fmt.Errorf("stat artifact %s: %w", finalPath, serr)
+	} else if info.Size() != nbytes {
+		return nil, fmt.Errorf("artifact %s holds %d bytes after publication, wrote %d", finalPath, info.Size(), nbytes)
+	}
+	return &captureResult{path: finalPath, sha256: readBack, nbytes: nbytes, truncated: truncated}, nil
+}
+
+// boundedArtifactWriter stores at most bound bytes of the runtime's
+// retained output and hashes exactly the stored bytes. Bytes past the
+// bound are drained and discarded — never hashed — so the digest
+// always covers the artifact's content, and truncation is an explicit
+// observation rather than a silent cut.
+type boundedArtifactWriter struct {
+	f         *os.File
+	hasher    hash.Hash
+	remaining int64
+	written   int64
+	truncated bool
+}
+
+func (w *boundedArtifactWriter) Write(p []byte) (int, error) {
+	if w.remaining <= 0 {
+		if len(p) > 0 {
+			w.truncated = true
+		}
+		return len(p), nil
+	}
+	chunk := p
+	if int64(len(chunk)) > w.remaining {
+		chunk = chunk[:w.remaining]
+		w.truncated = true
+	}
+	n, err := w.f.Write(chunk)
+	if n > 0 {
+		_, _ = w.hasher.Write(chunk[:n])
+		w.written += int64(n)
+		w.remaining -= int64(n)
+	}
+	if err != nil {
+		return n, err
+	}
+	if n < len(chunk) {
+		return n, io.ErrShortWrite
+	}
+	return len(p), nil
+}
+
+func (w *boundedArtifactWriter) digest() string {
+	return hex.EncodeToString(w.hasher.Sum(nil))
+}
+
+func (w *boundedArtifactWriter) stats() (int64, bool) {
+	return w.written, w.truncated
+}
+
+// Cleanup removes the sandbox a finished job leaves behind. A sandbox
+// that is already gone is a success — the goal is absence. The
+// operator's forensics posture (KeepSandboxes) turns cleanup into a
+// no-op.
+func (b *MSBBackend) Cleanup(ctx context.Context, handle string) error {
+	if b.KeepSandboxes {
+		return nil
+	}
+	out, err := b.runOnce(ctx, "rm", "-f", handle)
+	if err != nil {
+		if strings.Contains(strings.ToLower(string(out)), "not found") {
+			return nil
+		}
+		return fmt.Errorf("remove sandbox %s: %v: %s", handle, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// Close releases backend resources. Nothing is long-lived: every
+// observation is a bounded CLI call, and a running job belongs to the
+// runtime, not this process.
 func (b *MSBBackend) Close() error { return nil }
 
 // Name is the provider identity receipts and ledger rows attest.
@@ -641,9 +989,9 @@ func verifySandboxConfig(job *JobContractV2, name, nonce string, cfg map[string]
 		}
 	}
 	lc, _ := cfg["lifecycle"].(map[string]any)
-	if got, ok := jsonNumber(lc, "max_duration_secs"); !ok || uint32(got) != job.Resources.TimeoutSeconds {
-		return fmt.Errorf("sandbox max_duration_secs = %v, contract authorized %d — the VM could outlive its authorization",
-			got, job.Resources.TimeoutSeconds)
+	if got, ok := jsonNumber(lc, "max_duration_secs"); !ok || uint32(got) != uint32(vmMaxDuration(job)/time.Second) {
+		return fmt.Errorf("sandbox max_duration_secs = %v, contract authorized %d plus the %s observation grace",
+			got, job.Resources.TimeoutSeconds, maxDurationGrace)
 	}
 	if job.Filesystem.Workdir != "" {
 		rt, _ := cfg["runtime"].(map[string]any)
@@ -798,19 +1146,6 @@ func verifyMounts(job *JobContractV2, cfg map[string]any) error {
 		delete(authorized, key)
 	}
 	return nil
-}
-
-// artifactHead reads a small prefix of a failed launch's captured
-// output for the refusal message — bounded, never the whole file.
-func artifactHead(path string) string {
-	f, err := os.Open(path)
-	if err != nil {
-		return ""
-	}
-	defer f.Close()
-	buf := make([]byte, 512)
-	n, _ := f.Read(buf)
-	return strings.TrimSpace(string(buf[:n]))
 }
 
 var _ Backend = (*MSBBackend)(nil)

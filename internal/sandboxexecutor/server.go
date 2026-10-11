@@ -329,6 +329,10 @@ func (s *Server) Start() error {
 	// trigger.
 	s.acceptWg.Add(1)
 	go s.inspectUnresolved()
+	// Retry removals that were recorded as pending — a VM whose job
+	// already has a terminal result is cleaned up, never forgotten.
+	s.acceptWg.Add(1)
+	go s.retryCleanups()
 	return nil
 }
 
@@ -358,6 +362,39 @@ func (s *Server) inspectUnresolved() {
 			s.audit("reconcile: job %s (%s) backend %s handle %s is STILL RUNNING — operator must inspect/remove it (evidence preserved, never auto-destroyed)", j.JobID, j.State, j.BackendID, j.BackendHandle)
 		default:
 			s.audit("reconcile: job %s (%s) backend %s handle %s is gone", j.JobID, j.State, j.BackendID, j.BackendHandle)
+		}
+		if s.isStopped() {
+			return
+		}
+	}
+}
+
+// retryCleanups retries removal for terminal jobs whose backend
+// resources could not be removed after their result was observed —
+// cleanup is tracked separately from the outcome, so a VM that
+// outlived its job is reconciled rather than forgotten. It never
+// touches a job whose outcome is unresolved: those VMs may still be
+// running the workload and are for an operator to inspect.
+func (s *Server) retryCleanups() {
+	defer s.acceptWg.Done()
+	if s.cfg.Backend == nil {
+		return
+	}
+	jobs, err := s.ledger.CleanupCandidates(64)
+	if err != nil {
+		s.audit("cleanup retry failed: cannot enumerate pending cleanups: %v", err)
+		return
+	}
+	for _, j := range jobs {
+		ctx, cancel := context.WithTimeout(s.shutdown, 15*time.Second)
+		cerr := s.cfg.Backend.Cleanup(ctx, j.BackendHandle)
+		cancel()
+		if cerr != nil {
+			s.audit("cleanup retry: job %s handle %s still pending: %v", j.JobID, j.BackendHandle, cerr)
+		} else if err := s.ledger.ClearCleanupPending(j.JobID); err != nil {
+			s.audit("cleanup retry: job %s removed but the ledger refused the clear: %v", j.JobID, err)
+		} else {
+			s.audit("cleanup retry: job %s handle %s removed", j.JobID, j.BackendHandle)
 		}
 		if s.isStopped() {
 			return
@@ -691,23 +728,23 @@ func (s *Server) serve(conn *net.UnixConn) {
 		}
 
 		dispatchCtx, cancel := context.WithTimeout(s.shutdown, s.cfg.DispatchTimeout)
-		handle, derr := s.cfg.Backend.Dispatch(dispatchCtx, contract)
+		disp, derr := s.cfg.Backend.Dispatch(dispatchCtx, contract)
 		cancel()
 		switch {
 		case derr == nil:
 			err := s.ledger.Transition(jobID, JobStateRunning, []string{JobStateDispatching},
 				func(j *LedgerJob) error {
-					j.BackendID, j.BackendHandle = s.backendName, handle
+					j.BackendID, j.BackendHandle, j.BackendJobID = s.backendName, disp.Handle, disp.RunID
 					return nil
 				})
 			if err != nil {
 				fail(fmt.Sprintf("persist dispatch of %q: %v", jobID, err))
 				return
 			}
-			s.audit("accepted job %s from %s (principal=%s image=%s signed=%t handle=%s)",
-				jobID, submitter, principal, image, contract != nil, handle)
+			s.audit("accepted job %s from %s (principal=%s image=%s signed=%t handle=%s run_id=%s)",
+				jobID, submitter, principal, image, contract != nil, disp.Handle, disp.RunID)
 			s.monitorWg.Add(1)
-			go s.monitor(jobID, handle)
+			go s.monitor(jobID, disp.Handle, disp.RunID)
 			if err := writeResponse(conn, &Response{OK: true, JobID: jobID, State: JobStateRunning}); err != nil {
 				return
 			}
@@ -717,7 +754,7 @@ func (s *Server) serve(conn *net.UnixConn) {
 			// reconciles against the backend, never a blind relaunch.
 			_ = s.ledger.Transition(jobID, JobStateDispatchAmbig, []string{JobStateDispatching},
 				func(j *LedgerJob) error {
-					j.BackendID, j.BackendHandle = s.backendName, handle
+					j.BackendID, j.BackendHandle, j.BackendJobID = s.backendName, disp.Handle, disp.RunID
 					j.Error = derr.Error()
 					return nil
 				})
@@ -730,7 +767,7 @@ func (s *Server) serve(conn *net.UnixConn) {
 			// attests the refusal itself.
 			receiptSHA, rerr := s.emitReceipt(&LedgerJob{
 				JobID: jobID, Principal: principal, ContractHash: contractHash,
-			}, evidence.OutcomeNoEffect, "", handle)
+			}, evidence.OutcomeNoEffect, "", disp.Handle)
 			if rerr != nil {
 				s.audit("job %s: evidence emission failed (%v) — refusing the terminal claim too", jobID, rerr)
 				fail(fmt.Sprintf("backend refused and evidence emission failed for %q: %v", jobID, rerr))
@@ -739,7 +776,7 @@ func (s *Server) serve(conn *net.UnixConn) {
 			_ = s.ledger.Transition(jobID, JobStateDispatchFailed, []string{JobStateDispatching},
 				func(j *LedgerJob) error {
 					j.Error, j.BackendID, j.BackendHandle, j.ReceiptSHA256 =
-						derr.Error(), s.backendName, handle, receiptSHA
+						derr.Error(), s.backendName, disp.Handle, receiptSHA
 					return nil
 				})
 			s.checkpoint()
@@ -749,58 +786,163 @@ func (s *Server) serve(conn *net.UnixConn) {
 	}
 }
 
-// monitor collects one dispatched job's terminal result and binds it
-// to the ledger row. Context cancellation means the daemon is
-// stopping — the ledger row stays RUNNING and the next lifetime's
-// reconcile marks it ambiguous; it never reports a result it did not
-// observe.
-func (s *Server) monitor(jobID, handle string) {
+// monitor observes one dispatched job's terminal outcome and binds it
+// to the ledger row. The outcome comes from the backend's structured
+// observation of the runtime's own record — never from a CLI process
+// exit code. Context cancellation means the daemon is stopping — the
+// ledger row stays RUNNING and the next lifetime's reconcile marks it
+// ambiguous; it never reports a result it did not observe.
+func (s *Server) monitor(jobID, handle, runID string) {
 	defer s.monitorWg.Done()
-	res, err := s.cfg.Backend.Wait(s.shutdown, handle)
 
-	// The receipt needs the row's bound identity — principal and
-	// contract hash are what the signature attests. If the row
-	// cannot be read, the transition below would fail anyway, so
-	// fail together rather than attest a partial identity.
+	// The observation needs the row's bound identity — the stored
+	// contract is what the runtime's record must correlate against,
+	// and principal and contract hash are what the receipt attests.
+	// If the row cannot be read or parsed, nothing can be observed,
+	// so the job is left unresolved rather than guessed at.
 	job, jerr := s.ledger.Get(jobID)
 	if jerr != nil || job == nil {
-		s.audit("job %s: cannot read ledger row for terminal evidence: %v", jobID, jerr)
+		s.audit("job %s: cannot read ledger row for observation: %v", jobID, jerr)
+		return
+	}
+	contract, cerr := ParseContract(json.RawMessage(job.ContractJSON))
+	if cerr != nil {
+		s.audit("job %s: stored contract is unreadable (%v) — leaving the job unresolved", jobID, cerr)
+		s.markUnobserved(jobID, fmt.Sprintf("stored contract is unreadable: %v", cerr))
 		return
 	}
 
-	if err != nil {
-		if errors.Is(err, context.Canceled) || s.isStopped() {
-			return
-		}
-		// The watch was lost while the workload may still be running.
-		// No receipt, no terminal state: the row becomes
-		// DISPATCH_AMBIGUOUS — "may still be live, never retried
-		// blind, operator reconciles". Attesting COMPLETED here would
-		// fabricate an outcome this executor never observed.
-		s.audit("job %s monitor lost: %v — leaving the job unresolved, never COMPLETED", jobID, err)
-		if terr := s.ledger.Transition(jobID, JobStateDispatchAmbig, []string{JobStateRunning},
-			func(j *LedgerJob) error {
-				j.Error = fmt.Sprintf("monitor lost before the outcome was observed: %v", err)
-				return nil
-			}); terr != nil {
-			s.audit("job %s: could not record the lost monitor: %v", jobID, terr)
-		}
+	res, werr := s.cfg.Backend.Wait(s.shutdown, contract, handle, runID)
+	switch {
+	case werr == nil:
+		// A fully observed outcome — classified below.
+	case errors.Is(werr, context.Canceled) || s.isStopped():
+		// The daemon is stopping: the job may still be live in the
+		// runtime, whose own record survives for the next lifetime
+		// to reconcile. The row stays RUNNING.
+		return
+	case res != nil:
+		// The exit was observed but the artifact could not be
+		// finalized: "result not fully verified" — the job stays
+		// unresolved rather than terminal without its evidence.
+		s.audit("job %s: exit observed but artifact finalization failed: %v — leaving the job unresolved", jobID, werr)
+		s.markUnobserved(jobID, fmt.Sprintf("exit observed but artifact finalization failed: %v", werr))
+		return
+	default:
+		// The outcome was never observed. No receipt, no terminal
+		// state: the row becomes DISPATCH_AMBIGUOUS — "may still be
+		// live, never retried blind, operator reconciles". Attesting
+		// an outcome this executor never observed would fabricate it.
+		s.audit("job %s outcome unobserved: %v — leaving the job unresolved, never a fabricated result", jobID, werr)
+		s.markUnobserved(jobID, fmt.Sprintf("outcome unobserved: %v", werr))
 		return
 	}
-	state := JobStateSucceeded
-	if res.ExitCode != 0 {
-		state = JobStateFailed
+
+	// Classify exactly what the runtime's record demonstrated. A
+	// backend that returns an outcome it cannot demonstrate — no
+	// verified exit, no timeout, no typed rejection — must not
+	// produce a terminal claim at all.
+	if !res.ExitVerified && res.FailureKind == "" && !res.TimedOut {
+		s.audit("job %s: backend returned an unverified outcome (%+v) — refusing the terminal claim", jobID, res)
+		s.markUnobserved(jobID, "backend returned an unverified outcome")
+		return
 	}
+	state, outcome := JobStateSucceeded, evidence.OutcomeCompleted
+	var exit *int64
+	var errText string
+	switch {
+	case res.FailureKind != "":
+		// The guest rejected the command before it started: the
+		// workload provably produced no effect, and the job identity
+		// persists for the audit.
+		state, outcome = JobStateDispatchFailed, evidence.OutcomeNoEffect
+		errText = fmt.Sprintf("command rejected before start (%s): %s", res.FailureKind, res.FailureMessage)
+	case res.TimedOut:
+		// The runtime killed the command at the contract deadline: an
+		// observed outcome, but not a guest exit — no exit code is
+		// invented for it.
+		state = JobStateFailed
+		errText = fmt.Sprintf("contract timeout: the runtime killed the command at %ds", contract.Resources.TimeoutSeconds)
+	case res.ExitVerified:
+		// The runtime recorded the guest's termination: the exit
+		// code is observed, never derived. Zero is success; any
+		// other code is a verified guest failure.
+		code := int64(res.ExitCode)
+		exit = &code
+		if res.ExitCode != 0 {
+			state = JobStateFailed
+		}
+	}
+
+	// The terminal write precedes cleanup and records the intent to
+	// clean up: a crash between the two leaves a terminal result with
+	// cleanup_pending set, which the next startup retries. The other
+	// order would let a crash strand a VM with nothing recorded — and
+	// a terminal row whose transition failed never destroys its VM,
+	// because an unresolved row's workload is for an operator to
+	// reconcile.
 	resultJSON, _ := json.Marshal(res)
-	exit := int64(res.ExitCode)
-	s.finishTerminal(job, state, evidence.OutcomeCompleted, handle, res.OutputSHA256,
+	if err := s.finishTerminal(job, state, outcome, runIdentity(job, res), res.OutputSHA256,
 		func(j *LedgerJob) error {
-			j.ExitCode = &exit
+			j.ExitCode = exit
+			j.Error = errText
 			j.ResultJSON = string(resultJSON)
 			j.ArtifactSHA256 = res.OutputSHA256
+			j.CleanupPending = true
 			return nil
-		})
-	s.audit("job %s finished: state=%s exit=%d output_sha256=%s", jobID, state, res.ExitCode, res.OutputSHA256)
+		}); err != nil {
+		return
+	}
+	cleanupPending := false
+	if err := s.cleanupBackend(handle); err != nil {
+		cleanupPending = true
+		s.audit("job %s: cleanup pending — %v", jobID, err)
+		if merr := s.ledger.MarkCleanupPending(jobID, err.Error()); merr != nil {
+			s.audit("job %s: could not record the pending cleanup: %v", jobID, merr)
+		}
+	} else if err := s.ledger.ClearCleanupPending(jobID); err != nil {
+		s.audit("job %s: cleaned up but the ledger refused the clear: %v", jobID, err)
+	}
+	exitText := "none"
+	if exit != nil {
+		exitText = fmt.Sprint(*exit)
+	}
+	s.audit("job %s finished: state=%s exit=%s timed_out=%t runtime_state=%s run_id=%s output_sha256=%s cleanup_pending=%t",
+		jobID, state, exitText, res.TimedOut, res.RuntimeState, res.RunID, res.OutputSHA256, cleanupPending)
+}
+
+// runIdentity is the runtime-owned run identity evidence binds to:
+// the backend's run id when it reported one, its handle otherwise.
+func runIdentity(job *LedgerJob, res *ExecResult) string {
+	if res != nil && res.RunID != "" {
+		return res.RunID
+	}
+	if job.BackendJobID != "" {
+		return job.BackendJobID
+	}
+	return job.BackendHandle
+}
+
+// cleanupBackend removes a finished job's backend resources under a
+// bounded deadline. A failure is recorded as cleanup pending, never
+// as a result change.
+func (s *Server) cleanupBackend(handle string) error {
+	ctx, cancel := context.WithTimeout(s.shutdown, 15*time.Second)
+	defer cancel()
+	return s.cfg.Backend.Cleanup(ctx, handle)
+}
+
+// markUnobserved records a job whose outcome could not be
+// demonstrated as DISPATCH_AMBIGUOUS — may still be live, never
+// retried blind, operator reconciles. It never emits a receipt.
+func (s *Server) markUnobserved(jobID, reason string) {
+	if terr := s.ledger.Transition(jobID, JobStateDispatchAmbig, []string{JobStateRunning},
+		func(j *LedgerJob) error {
+			j.Error = reason
+			return nil
+		}); terr != nil {
+		s.audit("job %s: could not record the unresolved outcome: %v", jobID, terr)
+	}
 }
 
 // emitReceipt signs and durably appends one terminal receipt to the
@@ -818,12 +960,13 @@ func (s *Server) emitReceipt(job *LedgerJob, outcome, artifactSHA, runID string)
 // commit the transition binding the receipt digest, then checkpoint
 // the post-transition enumeration. A failure at any stage leaves the
 // job non-terminal — the next reconcile marks it ambiguous for an
-// operator, never silently terminal or silently lost.
-func (s *Server) finishTerminal(job *LedgerJob, state, outcome, handle, artifactSHA string, mutate func(*LedgerJob) error) {
+// operator, never silently terminal or silently lost — and the caller
+// must not treat the job's resources as disposable.
+func (s *Server) finishTerminal(job *LedgerJob, state, outcome, handle, artifactSHA string, mutate func(*LedgerJob) error) error {
 	receiptSHA, rerr := s.emitReceipt(job, outcome, artifactSHA, handle)
 	if rerr != nil {
 		s.audit("job %s: evidence emission failed (%v) — staying non-terminal for reconcile", job.JobID, rerr)
-		return
+		return rerr
 	}
 	err := s.ledger.Transition(job.JobID, state, []string{JobStateRunning},
 		func(j *LedgerJob) error {
@@ -832,9 +975,10 @@ func (s *Server) finishTerminal(job *LedgerJob, state, outcome, handle, artifact
 		})
 	if err != nil {
 		s.audit("job %s finished %s but the ledger refused the transition: %v", job.JobID, state, err)
-		return
+		return err
 	}
 	s.checkpoint()
+	return nil
 }
 
 // checkpoint issues a signed checkpoint over the current terminal

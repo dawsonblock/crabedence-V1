@@ -1,6 +1,7 @@
 package sandboxexecutor
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
@@ -76,14 +77,21 @@ func liveImageDigest(t *testing.T, bin string) string {
 }
 
 // liveServer stands up a real server backed by a real MSBBackend and
-// returns it with its directory and authority key.
+// returns it with its directory and authority key. The runtime pin is
+// verified first: the live suite qualifies the pinned runtime, so a
+// different one refuses the run instead of silently qualifying
+// behavior the adapter was never tested against.
 func liveServer(t *testing.T, bin string) (*Server, string, ed25519.PrivateKey) {
 	t.Helper()
 	key, keys := testAuthority(t)
 	dir := socketDir(t)
+	backend := &MSBBackend{Bin: bin, StateDir: filepath.Join(dir, "artifacts")}
+	if _, err := backend.VerifyRuntime(context.Background()); err != nil {
+		t.Fatalf("live suite requires the pinned runtime: %v", err)
+	}
 	srv := startServer(t, Config{
 		SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys,
-		Backend: &MSBBackend{Bin: bin, StateDir: filepath.Join(dir, "artifacts")},
+		Backend: backend,
 	})
 	return srv, dir, key
 }
@@ -109,6 +117,7 @@ func liveJob(t *testing.T, key ed25519.PrivateKey, digest, jobID string, mutate 
 func waitLiveTerminal(t *testing.T, srv *Server, jobID string) *LedgerJob {
 	t.Helper()
 	deadline := time.Now().Add(180 * time.Second)
+	var terminal *LedgerJob
 	for time.Now().Before(deadline) {
 		lj, err := srv.Ledger().Get(jobID)
 		if err != nil {
@@ -117,13 +126,33 @@ func waitLiveTerminal(t *testing.T, srv *Server, jobID string) *LedgerJob {
 		if lj != nil {
 			switch lj.State {
 			case JobStateSucceeded, JobStateFailed, JobStateDispatchFailed:
-				return lj
+				terminal = lj
 			}
+		}
+		if terminal != nil {
+			break
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
-	lj, _ := srv.Ledger().Get(jobID)
-	t.Fatalf("job %s never reached a terminal state: %+v", jobID, lj)
+	if terminal == nil {
+		lj, _ := srv.Ledger().Get(jobID)
+		t.Fatalf("job %s never reached a terminal state: %+v", jobID, lj)
+	}
+	// The terminal write records cleanup intent before the removal
+	// runs; wait for it to settle so a test that ends right after
+	// the result cannot cancel the cleanup mid-flight and leave a
+	// sandbox behind for the next suite run to trip over.
+	for time.Now().Before(deadline) {
+		lj, err := srv.Ledger().Get(jobID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if lj != nil && !lj.CleanupPending {
+			return lj
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("job %s cleanup never settled: %+v", jobID, terminal)
 	return nil
 }
 
@@ -157,6 +186,14 @@ func TestMSBLiveJobLifecycle(t *testing.T) {
 		t.Fatalf("exit code = %+v", lj.ExitCode)
 	}
 	res := liveResult(t, lj)
+	// The result must carry the runtime's own observation, not a
+	// CLI process exit code: a verified exit from a named run.
+	if !res.ExitVerified || res.RuntimeState != "exited" {
+		t.Fatalf("result does not carry the runtime's verified exit: %+v", res)
+	}
+	if !jobIDPattern.MatchString(res.RunID) || lj.BackendJobID != res.RunID {
+		t.Fatalf("run identity not bound to the ledger: res=%q ledger=%q", res.RunID, lj.BackendJobID)
+	}
 	data, err := os.ReadFile(res.OutputPath)
 	if err != nil {
 		t.Fatalf("artifact missing: %v", err)
@@ -472,9 +509,10 @@ func TestMSBLiveMonitorInterruptedLeavesJobUncertain(t *testing.T) {
 	}
 
 	// The abandoned VM is bounded by its contract: --max-duration is
-	// pinned to the contract timeout, so it must stop on its own.
+	// pinned to the contract timeout plus the fixed observation
+	// grace, so it must stop on its own inside that bound.
 	bounded := false
-	deadline := time.Now().Add(25 * time.Second)
+	deadline := time.Now().Add(55 * time.Second)
 	for time.Now().Before(deadline) {
 		out, err := exec.Command(bin, "inspect", "--format", "json", name).Output()
 		if err != nil {
@@ -491,9 +529,111 @@ func TestMSBLiveMonitorInterruptedLeavesJobUncertain(t *testing.T) {
 		time.Sleep(500 * time.Millisecond)
 	}
 	if !bounded {
-		t.Fatal("the abandoned VM outlived its contract timeout")
+		t.Fatal("the abandoned VM outlived its contract timeout plus the observation grace")
 	}
 	_ = exec.Command(bin, "rm", "-f", name).Run()
+}
+
+// TestMSBLiveTransportFailureLeavesJobUncertain is the authenticity
+// scenario the repair exists for: the executor's observation of a
+// running job is destroyed mid-flight (the sandbox vanishes). The job
+// must stay unresolved — never a fabricated guest failure, never a
+// completed receipt — and the ledger must say reconciliation is owed.
+func TestMSBLiveTransportFailureLeavesJobUncertain(t *testing.T) {
+	bin := msbOrSkip(t)
+	digest := liveImageDigest(t, bin)
+	key, keys := testAuthority(t)
+	dir := socketDir(t)
+	backend := &MSBBackend{
+		Bin: bin, StateDir: filepath.Join(dir, "artifacts"),
+		// A short observation window keeps the test bounded; the
+		// production default is the contract timeout plus grace.
+		ObservationSlack: 5 * time.Second,
+	}
+	srv := startServer(t, Config{
+		SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys, Backend: backend,
+	})
+	jobID := "msb-live-transport"
+	name := "sx-" + jobID
+	conn, reader := connect(t, srv.SocketPath())
+	resp := sendJob(t, conn, reader, liveJob(t, key, digest, jobID, func(c *JobContractV2) {
+		c.Resources.TimeoutSeconds = 3
+		c.Argv = []string{"python3", "-c", "import time; print('started', flush=True); time.sleep(60)"}
+	}))
+	if !resp.OK {
+		t.Fatalf("live dispatch refused: %+v", resp)
+	}
+	time.Sleep(2 * time.Second)
+	// Destroy the runtime's record out from under the observation —
+	// the "transport failed" shape, which a CLI exit code alone
+	// would misreport as a guest failure.
+	if out, err := exec.Command(bin, "rm", "-f", name).CombinedOutput(); err != nil {
+		t.Fatalf("remove sandbox: %v: %s", err, out)
+	}
+
+	deadline := time.Now().Add(30 * time.Second)
+	var lj *LedgerJob
+	for time.Now().Before(deadline) {
+		var err error
+		lj, err = srv.Ledger().Get(jobID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if lj != nil && lj.State == JobStateDispatchAmbig {
+			break
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	if lj == nil || lj.State != JobStateDispatchAmbig {
+		t.Fatalf("an unobservable outcome was not left unresolved: %+v", lj)
+	}
+	if lj.ExitCode != nil || lj.ReceiptSHA256 != "" || lj.ResultJSON != "" {
+		t.Fatalf("an unobserved outcome produced a result: %+v", lj)
+	}
+	raw, err := os.ReadFile(filepath.Join(evidenceDirOf(dir), "receipts.jsonl"))
+	if err == nil && strings.Contains(string(raw), jobID) {
+		t.Fatal("evidence attests an outcome the executor never observed")
+	}
+}
+
+// TestMSBLiveContractTimeoutIsObserved: a job that outlives its
+// contract deadline is killed by the runtime at that deadline — an
+// observed outcome that is not a guest exit. The result must say
+// "timed out" and invent no exit code for it.
+func TestMSBLiveContractTimeoutIsObserved(t *testing.T) {
+	bin := msbOrSkip(t)
+	digest := liveImageDigest(t, bin)
+	srv, dir, key := liveServer(t, bin)
+	jobID := "msb-live-timeout"
+	conn, reader := connect(t, srv.SocketPath())
+	resp := sendJob(t, conn, reader, liveJob(t, key, digest, jobID, func(c *JobContractV2) {
+		c.Resources.TimeoutSeconds = 3
+		c.Argv = []string{"python3", "-c", "import time; print('started', flush=True); time.sleep(120)"}
+	}))
+	if !resp.OK {
+		t.Fatalf("live dispatch refused: %+v", resp)
+	}
+	lj := waitLiveTerminal(t, srv, jobID)
+	if lj.State != JobStateFailed {
+		t.Fatalf("timed-out job state = %s, want %s", lj.State, JobStateFailed)
+	}
+	if lj.ExitCode != nil {
+		t.Fatalf("a timed-out job fabricated exit code %d", *lj.ExitCode)
+	}
+	if !strings.Contains(lj.Error, "contract timeout") {
+		t.Fatalf("timeout reason = %q", lj.Error)
+	}
+	res := liveResult(t, lj)
+	if !res.TimedOut || res.ExitVerified {
+		t.Fatalf("timeout result = %+v", res)
+	}
+	// The workload demonstrably ran, so the receipt attests
+	// COMPLETED — the timeout is part of the observed outcome.
+	srv.Stop()
+	rep := VerifyEvidenceDir(ledgerPathOf(dir), evidenceDirOf(dir), "", trustedSigner(t, dir))
+	if len(rep.Failures) != 0 {
+		t.Fatalf("independent verification failed: %v", rep.Failures)
+	}
 }
 
 // TestMSBLiveMountIsReadOnly: an authorized host mount is visible in

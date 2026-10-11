@@ -24,6 +24,13 @@
 //	-backend         execution backend: "" (record only) or
 //	                 "microsandbox" (requires -job-pubkey-file)
 //	-msb-bin         path to the msb binary (microsandbox backend)
+//	-msb-version     pinned Microsandbox runtime version the adapter
+//	                 is qualified against (default 0.7.8); a runtime
+//	                 that is not the pinned version refuses startup —
+//	                 the runtime-owned job protocol is what makes a
+//	                 guest exit event observable independently of any
+//	                 CLI process exit code, and that semantics is
+//	                 version-qualified, never assumed
 //	-msb-pull        image fetch policy: never (default — the pinned
 //	                 image must be present locally, and a missing one
 //	                 refuses fast instead of fetching mid-dispatch) or
@@ -60,6 +67,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -67,6 +75,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/openclaw/crabbox/internal/sandboxexecutor"
 )
@@ -78,6 +87,7 @@ func main() {
 	pubkeyFile := flag.String("job-pubkey-file", os.Getenv("SANDBOX_EXECUTOR_JOB_PUBKEY_FILE"), "0600 owner-only authority public-key trust file (or SANDBOX_EXECUTOR_JOB_PUBKEY_FILE)")
 	backendName := flag.String("backend", os.Getenv("SANDBOX_EXECUTOR_BACKEND"), "execution backend: \"\" or \"microsandbox\" (or SANDBOX_EXECUTOR_BACKEND)")
 	msbBin := flag.String("msb-bin", os.Getenv("SANDBOX_EXECUTOR_MSB_BIN"), "path to the msb binary (or SANDBOX_EXECUTOR_MSB_BIN)")
+	msbVersion := flag.String("msb-version", sandboxexecutor.PinnedMSBVersion, "pinned Microsandbox runtime version the adapter is qualified against")
 	msbPull := flag.String("msb-pull", "never", "image fetch policy for the microsandbox backend: never (require the pinned image locally) or if-missing")
 	stateDir := flag.String("state-dir", os.Getenv("SANDBOX_EXECUTOR_STATE_DIR"), "artifact directory for captured output (or SANDBOX_EXECUTOR_STATE_DIR)")
 	ledgerPath := flag.String("ledger", os.Getenv("SANDBOX_EXECUTOR_LEDGER"), "durable job ledger path (or SANDBOX_EXECUTOR_LEDGER)")
@@ -143,7 +153,20 @@ func main() {
 		if artifacts == "" {
 			artifacts = filepath.Join(*socketDir, "artifacts")
 		}
-		backend = &sandboxexecutor.MSBBackend{Bin: bin, StateDir: artifacts, PullPolicy: *msbPull}
+		mb := &sandboxexecutor.MSBBackend{Bin: bin, StateDir: artifacts, PullPolicy: *msbPull, RequiredVersion: *msbVersion}
+		// The pinned runtime is part of the execution policy: the
+		// adapter's structured-observation semantics are qualified
+		// against one runtime version, so a different one refuses
+		// startup instead of silently degrading how results are
+		// observed.
+		verifyCtx, verifyCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		got, verr := mb.VerifyRuntime(verifyCtx)
+		verifyCancel()
+		if verr != nil {
+			log.Fatalf("sandbox-executord: %v", verr)
+		}
+		log.Printf("sandbox-executord: microsandbox runtime %s verified at %s", got, bin)
+		backend = mb
 	default:
 		log.Fatalf("sandbox-executord: unknown backend %q (want \"\" or \"microsandbox\")", *backendName)
 	}

@@ -73,7 +73,7 @@ func evidenceDirOf(dir string) string { return filepath.Join(dir, "evidence") }
 func TestEvidenceLifecycle(t *testing.T) {
 	dir := socketDir(t)
 	be := &stubBackend{handle: "vm-ev", wait: make(chan *ExecResult, 1)}
-	be.wait <- &ExecResult{ExitCode: 0, FinishedAt: time.Now().UTC()}
+	be.wait <- &ExecResult{ExitCode: 0, ExitVerified: true, FinishedAt: time.Now().UTC()}
 	srv, key := startEvidenceServer(t, dir, be)
 	if state := submitSigned(t, srv, key, "job-ev"); state != JobStateRunning {
 		t.Fatalf("dispatch state = %s", state)
@@ -156,8 +156,8 @@ func twoTerminalJobs(t *testing.T) (ledger, evdir, dir string) {
 	t.Helper()
 	dir = socketDir(t)
 	be := &stubBackend{handle: "vm-1", wait: make(chan *ExecResult, 2)}
-	be.wait <- &ExecResult{ExitCode: 0, FinishedAt: time.Now().UTC()}
-	be.wait <- &ExecResult{ExitCode: 3, FinishedAt: time.Now().UTC()}
+	be.wait <- &ExecResult{ExitCode: 0, ExitVerified: true, FinishedAt: time.Now().UTC()}
+	be.wait <- &ExecResult{ExitCode: 3, ExitVerified: true, FinishedAt: time.Now().UTC()}
 	srv, key := startEvidenceServer(t, dir, be)
 	submitSigned(t, srv, key, "job-a")
 	waitJob(t, srv.Ledger(), "job-a", JobStateSucceeded)
@@ -289,7 +289,7 @@ func TestEvidenceDetectsCorruption(t *testing.T) {
 			t.Fatal(err)
 		}
 		sum := sha256.Sum256([]byte("original"))
-		res, _ := json.Marshal(ExecResult{ExitCode: 0, OutputPath: artPath, OutputSHA256: hex.EncodeToString(sum[:]), OutputBytes: 8})
+		res, _ := json.Marshal(ExecResult{ExitCode: 0, ExitVerified: true, OutputPath: artPath, OutputSHA256: hex.EncodeToString(sum[:]), OutputBytes: 8})
 		tamper(t, ledger, `UPDATE jobs SET result_json = ?, artifact_sha256 = ? WHERE job_id='job-a'`,
 			string(res), hex.EncodeToString(sum[:]))
 		if err := os.WriteFile(artPath, []byte("substituted"), 0o600); err != nil {
@@ -324,7 +324,7 @@ func TestEvidenceDetectsCorruption(t *testing.T) {
 func TestVerifyDetectsArtifactBeyondContractBound(t *testing.T) {
 	dir := socketDir(t)
 	be := &stubBackend{handle: "vm-bound", wait: make(chan *ExecResult, 1)}
-	be.wait <- &ExecResult{ExitCode: 0, OutputBytes: 12, FinishedAt: time.Now().UTC()}
+	be.wait <- &ExecResult{ExitCode: 0, ExitVerified: true, OutputBytes: 12, FinishedAt: time.Now().UTC()}
 	srv, key := startEvidenceServer(t, dir, be)
 	conn, reader := connect(t, srv.SocketPath())
 	resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV2) {
@@ -371,8 +371,8 @@ func TestVerifyDetectsArtifactBeyondContractBound(t *testing.T) {
 func TestCheckpointPrefixProperty(t *testing.T) {
 	dir := socketDir(t)
 	be := &stubBackend{handle: "vm-1", wait: make(chan *ExecResult, 2)}
-	be.wait <- &ExecResult{ExitCode: 0, FinishedAt: time.Now().UTC()}
-	be.wait <- &ExecResult{ExitCode: 0, FinishedAt: time.Now().UTC()}
+	be.wait <- &ExecResult{ExitCode: 0, ExitVerified: true, FinishedAt: time.Now().UTC()}
+	be.wait <- &ExecResult{ExitCode: 0, ExitVerified: true, FinishedAt: time.Now().UTC()}
 	srv, key := startEvidenceServer(t, dir, be)
 	submitSigned(t, srv, key, "job-p1")
 	waitJob(t, srv.Ledger(), "job-p1", JobStateSucceeded)

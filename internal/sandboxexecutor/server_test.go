@@ -357,29 +357,31 @@ func TestStopKeepsForeignOccupant(t *testing.T) {
 }
 
 type stubBackend struct {
-	handle string
-	err    error
-	got    *JobContractV2
-	wait   chan *ExecResult
-	werr   error
-	live   bool
+	handle     string
+	err        error
+	got        *JobContractV2
+	wait       chan *ExecResult
+	werr       error
+	live       bool
+	cleanupErr error
+	cleaned    []string
 }
 
-func (b *stubBackend) Dispatch(ctx context.Context, job *JobContractV2) (string, error) {
+func (b *stubBackend) Dispatch(ctx context.Context, job *JobContractV2) (DispatchResult, error) {
 	cpy := *job
 	b.got = &cpy
 	if b.err != nil {
 		// Ambiguous dispatches return the handle too — the caller
 		// must record where the job may already be live.
-		return b.handle, b.err
+		return DispatchResult{Handle: b.handle, RunID: "job_" + strings.Repeat("0", 32)}, b.err
 	}
 	if b.handle == "" {
-		return "stub-handle", nil
+		return DispatchResult{Handle: "stub-handle", RunID: "job_" + strings.Repeat("0", 32)}, nil
 	}
-	return b.handle, nil
+	return DispatchResult{Handle: b.handle, RunID: "job_" + strings.Repeat("1", 32)}, nil
 }
 
-func (b *stubBackend) Wait(ctx context.Context, handle string) (*ExecResult, error) {
+func (b *stubBackend) Wait(ctx context.Context, job *JobContractV2, handle, runID string) (*ExecResult, error) {
 	if b.wait != nil {
 		select {
 		case res := <-b.wait:
@@ -388,11 +390,19 @@ func (b *stubBackend) Wait(ctx context.Context, handle string) (*ExecResult, err
 			return nil, ctx.Err()
 		}
 	}
-	return &ExecResult{ExitCode: 0, FinishedAt: time.Now().UTC()}, b.werr
+	return &ExecResult{ExitCode: 0, ExitVerified: true, RunID: runID, FinishedAt: time.Now().UTC()}, b.werr
 }
 
 func (b *stubBackend) Inspect(ctx context.Context, handle string) (bool, error) {
 	return b.live, nil
+}
+
+func (b *stubBackend) Cleanup(ctx context.Context, handle string) error {
+	if b.cleanupErr != nil {
+		return b.cleanupErr
+	}
+	b.cleaned = append(b.cleaned, handle)
+	return nil
 }
 
 func (b *stubBackend) Close() error { return nil }
@@ -652,4 +662,168 @@ func TestDeadlineDoesNotHang(t *testing.T) {
 	// Idle clients are cut by the 30s deadline — shrink the window by
 	// verifying the server doesn't leak the goroutine on close.
 	time.Sleep(50 * time.Millisecond)
+}
+
+// ─── PR-04: structured results and the durable state machine ────────
+
+// waitLedgerState blocks until the job reaches state, or fails.
+func waitLedgerState(t *testing.T, srv *Server, jobID, state string) *LedgerJob {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		lj, err := srv.Ledger().Get(jobID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if lj != nil && lj.State == state {
+			return lj
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	lj, _ := srv.Ledger().Get(jobID)
+	t.Fatalf("job %s never reached %s: %+v", jobID, state, lj)
+	return nil
+}
+
+// TestMonitorClassifiesObservedOutcomes: the ledger records exactly
+// what the backend observed — a verified exit, a runtime timeout, a
+// rejected spawn — and refuses to classify an outcome the backend
+// cannot demonstrate. Terminal claims carry a receipt; unresolved
+// outcomes carry nothing but the reason.
+func TestMonitorClassifiesObservedOutcomes(t *testing.T) {
+	exit := func(v int64) *int64 { return &v }
+	cases := []struct {
+		name       string
+		result     *ExecResult
+		werr       error
+		wantState  string
+		wantExit   *int64
+		wantErrSub string
+	}{
+		{
+			name:      "verified success",
+			result:    &ExecResult{ExitCode: 0, ExitVerified: true, RuntimeState: "exited"},
+			wantState: JobStateSucceeded, wantExit: exit(0),
+		},
+		{
+			name:      "verified failure",
+			result:    &ExecResult{ExitCode: 72, ExitVerified: true, RuntimeState: "exited"},
+			wantState: JobStateFailed, wantExit: exit(72),
+		},
+		{
+			name:      "runtime timeout",
+			result:    &ExecResult{TimedOut: true, RuntimeState: "exited"},
+			wantState: JobStateFailed, wantErrSub: "contract timeout",
+		},
+		{
+			name:      "spawn rejected",
+			result:    &ExecResult{FailureKind: "not_found", FailureMessage: "no such binary", RuntimeState: "failed"},
+			wantState: JobStateDispatchFailed, wantErrSub: "not_found",
+		},
+		{
+			name:      "unverified outcome refused",
+			result:    &ExecResult{ExitCode: 0},
+			wantState: JobStateDispatchAmbig, wantErrSub: "unverified",
+		},
+		{
+			name:      "artifact not finalized",
+			result:    &ExecResult{ExitCode: 0, ExitVerified: true},
+			werr:      fmt.Errorf("artifact finalization failed: disk full"),
+			wantState: JobStateDispatchAmbig, wantErrSub: "artifact",
+		},
+		{
+			name:      "outcome unobserved",
+			result:    nil,
+			werr:      ErrExecutionUnobserved,
+			wantState: JobStateDispatchAmbig, wantErrSub: "unobserved",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := socketDir(t)
+			key, keys := testAuthority(t)
+			be := &stubBackend{handle: "vm-class", wait: make(chan *ExecResult, 1), werr: tc.werr}
+			srv := startServer(t, Config{SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys, Backend: be})
+			conn, reader := connect(t, srv.SocketPath())
+			jobID := "class-" + strings.ReplaceAll(tc.name, " ", "-")
+			resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV2) {
+				c.JobID = jobID
+				c.Nonce = "n-" + jobID
+			}))
+			if !resp.OK {
+				t.Fatalf("submit: %+v", resp)
+			}
+			be.wait <- tc.result // nil models "no result, only an error"
+
+			lj := waitLedgerState(t, srv, jobID, tc.wantState)
+			if tc.wantExit == nil {
+				if lj.ExitCode != nil {
+					t.Fatalf("fabricated exit code %d for an unobserved outcome", *lj.ExitCode)
+				}
+			} else if lj.ExitCode == nil || *lj.ExitCode != *tc.wantExit {
+				t.Fatalf("exit code = %v, want %d", lj.ExitCode, *tc.wantExit)
+			}
+			if tc.wantErrSub != "" && !strings.Contains(lj.Error, tc.wantErrSub) {
+				t.Fatalf("error %q missing %q", lj.Error, tc.wantErrSub)
+			}
+			terminal := tc.wantState == JobStateSucceeded || tc.wantState == JobStateFailed || tc.wantState == JobStateDispatchFailed
+			if terminal && lj.ReceiptSHA256 == "" {
+				t.Fatal("a terminal claim without a receipt")
+			}
+			if !terminal && (lj.ReceiptSHA256 != "" || lj.ResultJSON != "") {
+				t.Fatalf("an unresolved outcome produced a result: %+v", lj)
+			}
+		})
+	}
+}
+
+// TestCleanupPendingIsRecordedAndRetried: a cleanup that fails after
+// the result is written is recorded on the terminal row and retried at
+// the next startup — a VM that outlived its job is reconciled, never
+// forgotten, and the failure never rewrites the observed result.
+func TestCleanupPendingIsRecordedAndRetried(t *testing.T) {
+	dir := socketDir(t)
+	key, keys := testAuthority(t)
+	be := &stubBackend{handle: "vm-cleanup", wait: make(chan *ExecResult, 1), cleanupErr: fmt.Errorf("sandbox busy")}
+	srv := startServer(t, Config{SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys, Backend: be})
+	conn, reader := connect(t, srv.SocketPath())
+	resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV2) {
+		c.JobID = "cleanup-1"
+		c.Nonce = "n-cleanup"
+	}))
+	if !resp.OK {
+		t.Fatalf("submit: %+v", resp)
+	}
+	be.wait <- &ExecResult{ExitCode: 0, ExitVerified: true, RuntimeState: "exited"}
+
+	lj := waitLedgerState(t, srv, "cleanup-1", JobStateSucceeded)
+	// The pending flag is written with the terminal transition; the
+	// failure reason lands once the cleanup attempt has run.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if lj.CleanupPending && strings.Contains(lj.CleanupError, "sandbox busy") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+		lj, _ = srv.Ledger().Get("cleanup-1")
+	}
+	if !lj.CleanupPending || !strings.Contains(lj.CleanupError, "sandbox busy") {
+		t.Fatalf("failed cleanup not recorded: %+v", lj)
+	}
+	if lj.ReceiptSHA256 == "" || lj.ArtifactSHA256 == "" && lj.ResultJSON == "" {
+		t.Fatalf("cleanup failure damaged the observed result: %+v", lj)
+	}
+
+	srv.Stop()
+	be.cleanupErr = nil
+	srv2 := startServer(t, Config{SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys, Backend: be})
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		lj, _ = srv2.Ledger().Get("cleanup-1")
+		if lj != nil && !lj.CleanupPending {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("pending cleanup never retried: %+v", lj)
 }

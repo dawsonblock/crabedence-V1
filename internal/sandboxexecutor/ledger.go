@@ -30,7 +30,7 @@ const (
 	JobStateRunning        = "RUNNING"            // backend acknowledged the launch
 	JobStateSucceeded      = "SUCCEEDED"          // exit 0, result bound
 	JobStateFailed         = "FAILED"             // ran, non-zero exit or backend-reported failure
-	JobStateDispatchFailed = "DISPATCH_FAILED"    // backend definitively refused — job identity persists
+	JobStateDispatchFailed = "DISPATCH_FAILED"    // definitively never ran: refused, or the guest rejected the command before it started
 	JobStateDispatchAmbig  = "DISPATCH_AMBIGUOUS" // outcome unknown (dispatch or lost monitor) — never auto-retry
 	JobStateInterrupted    = "INTERRUPTED"        // was RUNNING when the daemon stopped
 )
@@ -87,11 +87,15 @@ type LedgerJob struct {
 	FenceEpoch    uint64
 	BackendID     string
 	BackendHandle string
-	ReceivedAt    time.Time
-	UpdatedAt     time.Time
-	ExitCode      *int64
-	Error         string
-	ResultJSON    string
+	// BackendJobID is the runtime-owned run identity (e.g. the
+	// Microsandbox job id) the launch was observed through. Empty
+	// for backends without one.
+	BackendJobID string
+	ReceivedAt   time.Time
+	UpdatedAt    time.Time
+	ExitCode     *int64
+	Error        string
+	ResultJSON   string
 	// TerminalSeq is the job's position in the durable terminal
 	// enumeration — assigned transactionally with the terminal write
 	// so the enumeration checkpoints commit to is append-only by
@@ -102,11 +106,18 @@ type LedgerJob struct {
 	// back into this row.
 	ReceiptSHA256  string
 	ArtifactSHA256 string
+	// CleanupPending is set when the job's backend resources (its VM)
+	// could not be removed after the result was observed — tracked
+	// separately from the result so a cleanup failure never masks or
+	// rewrites what happened. CleanupError carries the reason.
+	CleanupPending bool
+	CleanupError   string
 
-	receivedAtRaw int64
-	updatedAtRaw  int64
-	exitRaw       sql.NullInt64
-	termSeqRaw    sql.NullInt64
+	receivedAtRaw     int64
+	updatedAtRaw      int64
+	exitRaw           sql.NullInt64
+	termSeqRaw        sql.NullInt64
+	cleanupPendingRaw int64
 }
 
 // OpenLedger opens (creating if needed) the durable registry at path,
@@ -202,8 +213,9 @@ func (l *Ledger) Epoch() uint64 { return l.epoch }
 
 // ledgerSchemaVersion bumps when the schema gains columns; pre-v2
 // ledgers (from the admission-only spike) get their new columns via
-// ALTER TABLE rather than a destructive rebuild.
-const ledgerSchemaVersion = 2
+// ALTER TABLE rather than a destructive rebuild, and v3 adds the
+// runtime run identity plus cleanup tracking.
+const ledgerSchemaVersion = 3
 
 func (l *Ledger) migrate() error {
 	var version int
@@ -227,6 +239,7 @@ func (l *Ledger) migrate() error {
 			fence_epoch    INTEGER NOT NULL,
 			backend_id     TEXT NOT NULL DEFAULT '',
 			backend_handle TEXT NOT NULL DEFAULT '',
+			backend_job_id TEXT NOT NULL DEFAULT '',
 			received_at    INTEGER NOT NULL,
 			updated_at     INTEGER NOT NULL,
 			exit_code      INTEGER,
@@ -234,7 +247,9 @@ func (l *Ledger) migrate() error {
 			result_json    TEXT NOT NULL DEFAULT '',
 			terminal_seq   INTEGER,
 			receipt_sha256 TEXT NOT NULL DEFAULT '',
-			artifact_sha256 TEXT NOT NULL DEFAULT ''
+			artifact_sha256 TEXT NOT NULL DEFAULT '',
+			cleanup_pending INTEGER NOT NULL DEFAULT 0,
+			cleanup_error   TEXT NOT NULL DEFAULT ''
 		);
 	`)
 	if err != nil {
@@ -254,6 +269,23 @@ func (l *Ledger) migrate() error {
 				return fmt.Errorf("migrate ledger v%d→v2: %w", version, err)
 			}
 		}
+	}
+	if version < 3 {
+		// v2 → v3: the runtime run identity and cleanup tracking.
+		// Existing rows keep empty identities — a job dispatched by a
+		// pre-v3 executor has no runtime job id to reconcile with,
+		// which its DISPATCH_AMBIGUOUS state already says.
+		for _, ddl := range []string{
+			`ALTER TABLE jobs ADD COLUMN backend_job_id TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE jobs ADD COLUMN cleanup_pending INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE jobs ADD COLUMN cleanup_error TEXT NOT NULL DEFAULT ''`,
+		} {
+			if _, err := l.db.Exec(ddl); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+				return fmt.Errorf("migrate ledger v%d→v3: %w", version, err)
+			}
+		}
+	}
+	if version < ledgerSchemaVersion {
 		if _, err := l.db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, ledgerSchemaVersion)); err != nil {
 			return fmt.Errorf("stamp ledger schema version: %w", err)
 		}
@@ -412,8 +444,9 @@ func (l *Ledger) hashExistsTx(tx *sql.Tx, hash string) bool {
 
 // jobColumns is the canonical SELECT list for a full jobs row.
 const jobColumns = `job_id, contract_hash, seq, submitter, principal, image, contract_json,
-	state, fence_epoch, backend_id, backend_handle, received_at, updated_at,
-	exit_code, error, result_json, terminal_seq, receipt_sha256, artifact_sha256`
+	state, fence_epoch, backend_id, backend_handle, backend_job_id, received_at, updated_at,
+	exit_code, error, result_json, terminal_seq, receipt_sha256, artifact_sha256,
+	cleanup_pending, cleanup_error`
 
 func (l *Ledger) getTx(tx *sql.Tx, jobID string) (*LedgerJob, error) {
 	j := &LedgerJob{}
@@ -432,8 +465,9 @@ func scanFields(j *LedgerJob) []any {
 	return []any{
 		&j.JobID, &j.ContractHash, &j.Seq, &j.Submitter, &j.Principal, &j.Image,
 		&j.ContractJSON, &j.State, &j.FenceEpoch, &j.BackendID, &j.BackendHandle,
-		&j.receivedAtRaw, &j.updatedAtRaw, &j.exitRaw, &j.Error, &j.ResultJSON,
+		&j.BackendJobID, &j.receivedAtRaw, &j.updatedAtRaw, &j.exitRaw, &j.Error, &j.ResultJSON,
 		&j.termSeqRaw, &j.ReceiptSHA256, &j.ArtifactSHA256,
+		&j.cleanupPendingRaw, &j.CleanupError,
 	}
 }
 
@@ -447,6 +481,7 @@ func finishScan(j *LedgerJob) error {
 	if j.termSeqRaw.Valid {
 		j.TerminalSeq = j.termSeqRaw.Int64
 	}
+	j.CleanupPending = j.cleanupPendingRaw != 0
 	return nil
 }
 
@@ -480,6 +515,75 @@ func (l *Ledger) ReconcileCandidates(limit int) ([]*LedgerJob, error) {
 		 WHERE state IN (?, ?) AND backend_handle != ''
 		 ORDER BY seq DESC LIMIT ?`,
 		JobStateDispatchAmbig, JobStateInterrupted, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*LedgerJob
+	for rows.Next() {
+		j := &LedgerJob{}
+		if err := rows.Scan(scanFields(j)...); err != nil {
+			return nil, err
+		}
+		if err := finishScan(j); err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
+// MarkCleanupPending records that a job's backend resources could not
+// be removed after its result was observed. It is a targeted update,
+// not a state transition: the outcome is already terminal and a
+// cleanup failure must never rewrite what happened — only say that
+// something was left behind.
+//
+// It deliberately does not touch updated_at: a terminal row's covered
+// fields are committed to by signed checkpoints, and mutating any of
+// them after the terminal write would invalidate the chain. Cleanup
+// state is operational bookkeeping, outside the attested result.
+func (l *Ledger) MarkCleanupPending(jobID, reason string) error {
+	res, err := l.db.Exec(
+		`UPDATE jobs SET cleanup_pending = 1, cleanup_error = ? WHERE job_id = ?`,
+		reason, jobID)
+	if err != nil {
+		return fmt.Errorf("mark cleanup pending for %s: %w", jobID, err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return fmt.Errorf("mark cleanup pending for %s: no such job", jobID)
+	}
+	return nil
+}
+
+// ClearCleanupPending records that a previously pending cleanup
+// finally succeeded. Like MarkCleanupPending it leaves every
+// checkpoint-covered field untouched.
+func (l *Ledger) ClearCleanupPending(jobID string) error {
+	res, err := l.db.Exec(
+		`UPDATE jobs SET cleanup_pending = 0, cleanup_error = '' WHERE job_id = ?`, jobID)
+	if err != nil {
+		return fmt.Errorf("clear cleanup pending for %s: %w", jobID, err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return fmt.Errorf("clear cleanup pending for %s: no such job", jobID)
+	}
+	return nil
+}
+
+// CleanupCandidates returns terminal jobs whose backend resources are
+// recorded as still present, newest first, capped at limit. The
+// startup pass retries their removal — tracked separately from the
+// result, so a VM that outlived its job is reconciled rather than
+// forgotten.
+func (l *Ledger) CleanupCandidates(limit int) ([]*LedgerJob, error) {
+	if limit <= 0 {
+		limit = 64
+	}
+	rows, err := l.db.Query(
+		`SELECT `+jobColumns+` FROM jobs
+		 WHERE cleanup_pending = 1 AND backend_handle != ''
+		 ORDER BY seq DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -652,14 +756,20 @@ func (l *Ledger) Transition(jobID, to string, from []string, mutate func(*Ledger
 	if job.ExitCode != nil {
 		exit = *job.ExitCode
 	}
+	cleanupPending := 0
+	if job.CleanupPending {
+		cleanupPending = 1
+	}
 	res, err := tx.Exec(
 		`UPDATE jobs SET state = ?, fence_epoch = ?, backend_id = ?, backend_handle = ?,
-		 updated_at = ?, exit_code = ?, error = ?, result_json = ?,
-		 terminal_seq = ?, receipt_sha256 = ?, artifact_sha256 = ?
+		 backend_job_id = ?, updated_at = ?, exit_code = ?, error = ?, result_json = ?,
+		 terminal_seq = ?, receipt_sha256 = ?, artifact_sha256 = ?,
+		 cleanup_pending = ?, cleanup_error = ?
 		 WHERE job_id = ? AND seq = ?`,
 		job.State, job.FenceEpoch, job.BackendID, job.BackendHandle,
-		time.Now().UTC().UnixMilli(), exit, job.Error, job.ResultJSON,
+		job.BackendJobID, time.Now().UTC().UnixMilli(), exit, job.Error, job.ResultJSON,
 		termSeq, job.ReceiptSHA256, job.ArtifactSHA256,
+		cleanupPending, job.CleanupError,
 		jobID, job.Seq)
 	if err != nil {
 		return fmt.Errorf("transition %s: %w", jobID, err)
