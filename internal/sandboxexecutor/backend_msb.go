@@ -39,6 +39,45 @@ const PinnedMSBVersion = "0.7.8"
 // amount.
 const maxDurationGrace = 30 * time.Second
 
+// maxCLIOutputBytes bounds the captured output of one adapter CLI
+// call. The adapter's own calls (version, doctor, create, inspect,
+// jobs, rm, exec -d) return small documents; a runtime that floods
+// them is broken or hostile, and the executor must not accumulate
+// without bound on its behalf. The artifact capture is bounded
+// separately by the contract's declared output budget.
+const maxCLIOutputBytes = 4 << 20
+
+// boundedBuffer collects at most limit bytes; further bytes are
+// dropped and flagged, never accumulated.
+type boundedBuffer struct {
+	buf        strings.Builder
+	limit      int
+	overflowed bool
+}
+
+func newBoundedBuffer(limit int) *boundedBuffer {
+	return &boundedBuffer{limit: limit}
+}
+
+func (w *boundedBuffer) Write(p []byte) (int, error) {
+	if w.buf.Len() >= w.limit {
+		if len(p) > 0 {
+			w.overflowed = true
+		}
+		return len(p), nil
+	}
+	room := w.limit - w.buf.Len()
+	if len(p) > room {
+		w.buf.Write(p[:room])
+		w.overflowed = true
+		return len(p), nil
+	}
+	w.buf.Write(p)
+	return len(p), nil
+}
+
+func (w *boundedBuffer) String() string { return w.buf.String() }
+
 // jobPollInterval paces Wait's observation of the runtime's job
 // record. The record is the only evidence Wait trusts, so polling is
 // deliberately boring: one bounded `inspect --job` call per tick.
@@ -318,13 +357,18 @@ func dispatchNonce() (string, error) {
 }
 
 // runOnce executes a short msb utility call (create, inspect, jobs,
-// rm, exec -d) under ctx.
+// rm, exec -d) under ctx, with its output bounded: a runtime that
+// floods a utility call is refused, never accumulated.
 func (b *MSBBackend) runOnce(ctx context.Context, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, b.Bin, args...)
 	cmd.Stdin = nil
-	var out strings.Builder
-	cmd.Stdout, cmd.Stderr = &out, &out
+	out := newBoundedBuffer(maxCLIOutputBytes)
+	cmd.Stdout, cmd.Stderr = out, out
 	err := cmd.Run()
+	if out.overflowed {
+		return []byte(out.String()), fmt.Errorf("msb %s produced more than %d bytes of output",
+			strings.Join(args, " "), maxCLIOutputBytes)
+	}
 	return []byte(out.String()), err
 }
 
@@ -863,8 +907,11 @@ func (b *MSBBackend) capture(ctx context.Context, job *JobContractV2, name, runI
 	cmd.Stdin = nil
 	collector := &boundedArtifactWriter{f: tmp, hasher: sha256.New(), remaining: bound}
 	cmd.Stdout = collector
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
+	// The CLI's diagnostics are only used for a refusal message —
+	// bounded so a broken runtime cannot flood the executor's memory
+	// through the failure path either.
+	stderr := newBoundedBuffer(64 * 1024)
+	cmd.Stderr = stderr
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("spawn msb logs: %w", err)
 	}

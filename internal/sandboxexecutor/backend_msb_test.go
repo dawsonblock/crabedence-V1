@@ -206,6 +206,13 @@ func fakeMSBMain() int {
 		}
 		fmt.Fprintln(os.Stdout, "  ✓ Host setup is ready.")
 		return 0
+	case "flood":
+		// A broken or hostile runtime that floods a utility call.
+		chunk := strings.Repeat("A", 64*1024)
+		for i := 0; i < 80; i++ { // 5 MiB, beyond the adapter's bound
+			fmt.Fprint(os.Stdout, chunk)
+		}
+		return 0
 	case "create":
 		return fakeCreate(dir, rest)
 	case "run":
@@ -1731,4 +1738,22 @@ func TestMSBVerifyHost(t *testing.T) {
 			t.Fatalf("host refusal = %v", err)
 		}
 	})
+}
+
+// TestMSBBoundsUtilityCallOutput: the adapter's own CLI calls are
+// bounded — a runtime that floods a utility call is refused, never
+// accumulated without bound on the executor's behalf.
+func TestMSBBoundsUtilityCallOutput(t *testing.T) {
+	bin, _ := fakeMSB(t, nil)
+	backend := testBackend(bin, t.TempDir())
+	out, err := backend.runOnce(testContext(t), "flood")
+	if err == nil {
+		t.Fatalf("a flooding call was accepted (%d bytes)", len(out))
+	}
+	if !strings.Contains(err.Error(), "more than") {
+		t.Fatalf("flood refusal = %v", err)
+	}
+	if len(out) > maxCLIOutputBytes {
+		t.Fatalf("captured %d bytes, over the %d-byte bound", len(out), maxCLIOutputBytes)
+	}
 }
