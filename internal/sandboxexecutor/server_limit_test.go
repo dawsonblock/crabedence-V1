@@ -386,11 +386,12 @@ func TestReconcileInspectsUnresolvedHandles(t *testing.T) {
 	}
 	srv1.Stop()
 
-	// Second lifetime: the audit sink must capture the reconcile
-	// line reporting the handle as STILL RUNNING.
+	// Second lifetime: the run is not resumable (the runtime lost it,
+	// say), so the audit sink must capture the reconcile line
+	// reporting the handle as STILL RUNNING.
 	audits := make(chan string, 64)
 	sink := func(format string, args ...any) { audits <- fmt.Sprintf(format, args...) }
-	be2 := &stubBackend{live: true}
+	be2 := &stubBackend{live: true, resumeErr: ErrExecutionUnobserved}
 	srv2 := startServer(t, Config{
 		SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys, Backend: be2, Audit: sink,
 	})

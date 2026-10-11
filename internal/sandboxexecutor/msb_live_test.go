@@ -705,3 +705,77 @@ func TestMSBLiveRefusalsAndCleanup(t *testing.T) {
 		}
 	})
 }
+
+// TestMSBLiveRecoveryResumesInterruptedJob: the executor restarts
+// while a job is still running in its VM. The run is runtime-owned, so
+// the next lifetime re-establishes observation from the runtime's own
+// record — recovering the terminal result, the artifact and the
+// receipt a live monitor would have produced, without ever
+// re-launching the job or losing the VM.
+func TestMSBLiveRecoveryResumesInterruptedJob(t *testing.T) {
+	bin := msbOrSkip(t)
+	digest := liveImageDigest(t, bin)
+	key, keys := testAuthority(t)
+	dir := socketDir(t)
+	backend := &MSBBackend{Bin: bin, StateDir: filepath.Join(dir, "artifacts")}
+	if _, err := backend.VerifyRuntime(context.Background()); err != nil {
+		t.Fatalf("live suite requires the pinned runtime: %v", err)
+	}
+	jobID := "msb-live-recover"
+	name := "sx-" + jobID
+
+	// First lifetime: the job is dispatched and the daemon stops while
+	// the guest is still running.
+	srv1 := startServer(t, Config{
+		SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys, Backend: backend,
+	})
+	conn, reader := connect(t, srv1.SocketPath())
+	resp := sendJob(t, conn, reader, liveJob(t, key, digest, jobID, func(c *JobContractV2) {
+		c.Resources.TimeoutSeconds = 6
+		c.Argv = []string{"python3", "-c", "import time; time.sleep(3); print('recovered-ok')"}
+	}))
+	if !resp.OK {
+		t.Fatalf("live dispatch refused: %+v", resp)
+	}
+	time.Sleep(1 * time.Second)
+	srv1.Stop()
+
+	// The guest finishes after the first lifetime is gone.
+	time.Sleep(4 * time.Second)
+
+	// Second lifetime: recovery resumes the run from the runtime's
+	// record — the outcome is observed, never re-dispatched.
+	srv2 := startServer(t, Config{
+		SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys, Backend: backend,
+	})
+	lj := waitLiveTerminal(t, srv2, jobID)
+	if lj.State != JobStateSucceeded {
+		t.Fatalf("recovered job state = %s: %+v", lj.State, lj)
+	}
+	if lj.ExitCode == nil || *lj.ExitCode != 0 {
+		t.Fatalf("recovered exit code = %v", lj.ExitCode)
+	}
+	if lj.ReceiptSHA256 == "" {
+		t.Fatal("a recovered job reached a terminal state without a receipt")
+	}
+	res := liveResult(t, lj)
+	data, err := os.ReadFile(res.OutputPath)
+	if err != nil {
+		t.Fatalf("recovered artifact missing: %v", err)
+	}
+	if !strings.Contains(string(data), "recovered-ok") {
+		t.Fatalf("recovered artifact does not hold the guest output: %q", data)
+	}
+	if !res.ExitVerified || res.RunID != lj.BackendJobID {
+		t.Fatalf("recovered result does not carry the runtime's observation: %+v", res)
+	}
+	// The recovered VM is cleaned up like any other settled job.
+	if out, err := exec.Command(bin, "inspect", "--format", "json", name).Output(); err == nil {
+		t.Fatalf("recovered sandbox survived cleanup: %s", out)
+	}
+	srv2.Stop()
+	rep := VerifyEvidenceDir(ledgerPathOf(dir), evidenceDirOf(dir), "", trustedSigner(t, dir))
+	if len(rep.Failures) != 0 {
+		t.Fatalf("independent verification failed: %v", rep.Failures)
+	}
+}

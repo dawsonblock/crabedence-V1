@@ -533,6 +533,27 @@ func (l *Ledger) ReconcileCandidates(limit int) ([]*LedgerJob, error) {
 	return out, rows.Err()
 }
 
+// AdoptBackendRun records the runtime-owned run identity a reconcile
+// pass recovered for a non-terminal row — the crash window between
+// the runtime admitting a job and the ledger naming it. It is only
+// ever called on unresolved rows: a terminal row's identity is
+// already committed to by its receipt and checkpoint.
+func (l *Ledger) AdoptBackendRun(jobID, runID string) error {
+	if runID == "" {
+		return fmt.Errorf("adopt run identity for %s: empty run id", jobID)
+	}
+	res, err := l.db.Exec(
+		`UPDATE jobs SET backend_job_id = ? WHERE job_id = ? AND terminal_seq IS NULL`,
+		runID, jobID)
+	if err != nil {
+		return fmt.Errorf("adopt run identity for %s: %w", jobID, err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return fmt.Errorf("adopt run identity for %s: no unresolved row", jobID)
+	}
+	return nil
+}
+
 // MarkCleanupPending records that a job's backend resources could not
 // be removed after its result was observed. It is a targeted update,
 // not a state transition: the outcome is already terminal and a

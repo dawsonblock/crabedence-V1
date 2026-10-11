@@ -365,6 +365,9 @@ type stubBackend struct {
 	live       bool
 	cleanupErr error
 	cleaned    []string
+	resumeErr  error
+	adoptRunID string
+	noRunID    bool
 }
 
 func (b *stubBackend) Dispatch(ctx context.Context, job *JobContractV2) (DispatchResult, error) {
@@ -377,6 +380,11 @@ func (b *stubBackend) Dispatch(ctx context.Context, job *JobContractV2) (Dispatc
 	}
 	if b.handle == "" {
 		return DispatchResult{Handle: "stub-handle", RunID: "job_" + strings.Repeat("0", 32)}, nil
+	}
+	if b.noRunID {
+		// Models the crash window: the runtime admitted the job, but
+		// the ledger row never learned its identity.
+		return DispatchResult{Handle: b.handle}, nil
 	}
 	return DispatchResult{Handle: b.handle, RunID: "job_" + strings.Repeat("1", 32)}, nil
 }
@@ -395,6 +403,20 @@ func (b *stubBackend) Wait(ctx context.Context, job *JobContractV2, handle, runI
 
 func (b *stubBackend) Inspect(ctx context.Context, handle string) (bool, error) {
 	return b.live, nil
+}
+
+func (b *stubBackend) Resume(ctx context.Context, job *JobContractV2, handle, runID string) (string, *ExecResult, error) {
+	if b.resumeErr != nil {
+		return runID, nil, b.resumeErr
+	}
+	if runID == "" {
+		if b.adoptRunID == "" {
+			return "", nil, ErrExecutionUnobserved
+		}
+		runID = b.adoptRunID
+	}
+	res, err := b.Wait(ctx, job, handle, runID)
+	return runID, res, err
 }
 
 func (b *stubBackend) Cleanup(ctx context.Context, handle string) error {
@@ -826,4 +848,100 @@ func TestCleanupPendingIsRecordedAndRetried(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("pending cleanup never retried: %+v", lj)
+}
+
+// ─── PR-05: reconciliation resumes what the runtime can prove ───────
+
+// TestReconcileResumesInterruptedRun: a run the runtime still records
+// is resumed at the next startup — reaching the same receipt and
+// artifact a live monitor would have produced — instead of waiting
+// for an operator. Recovery re-observes; it never re-dispatches.
+func TestReconcileResumesInterruptedRun(t *testing.T) {
+	dir := socketDir(t)
+	key, keys := testAuthority(t)
+
+	// First lifetime: the job reaches RUNNING, then the daemon stops.
+	be1 := &stubBackend{handle: "vm-resume", wait: make(chan *ExecResult)}
+	srv1 := startServer(t, Config{SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys, Backend: be1})
+	conn, reader := connect(t, srv1.SocketPath())
+	resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV2) {
+		c.JobID, c.Nonce = "resume-1", "resume-n"
+	}))
+	conn.Close()
+	if resp.State != JobStateRunning {
+		t.Fatalf("dispatch state = %s", resp.State)
+	}
+	srv1.Stop()
+
+	// Second lifetime: the run is still observable, so recovery
+	// settles it from the runtime's record.
+	audits := make(chan string, 64)
+	sink := func(format string, args ...any) { audits <- fmt.Sprintf(format, args...) }
+	be2 := &stubBackend{handle: "vm-resume"}
+	srv2 := startServer(t, Config{
+		SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys, Backend: be2, Audit: sink,
+	})
+	defer srv2.Stop()
+
+	lj := waitLedgerState(t, srv2, "resume-1", JobStateSucceeded)
+	if lj.ReceiptSHA256 == "" {
+		t.Fatal("a recovered job reached a terminal state without a receipt")
+	}
+	if lj.ExitCode == nil || *lj.ExitCode != 0 {
+		t.Fatalf("recovered exit code = %v", lj.ExitCode)
+	}
+	if lj.BackendJobID == "" {
+		t.Fatal("recovered row lost its run identity")
+	}
+	if be2.got != nil {
+		t.Fatalf("recovery re-dispatched the job: %+v", be2.got)
+	}
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case line := <-audits:
+			if strings.Contains(line, "resume-1") && strings.Contains(line, "resumed from run") {
+				return
+			}
+		case <-deadline:
+			t.Fatal("recovery never reported the resumed run")
+		}
+	}
+}
+
+// TestReconcileAdoptsLostRunIdentity: the crash window between the
+// runtime admitting a job and the ledger naming it is closed by
+// adopting the runtime's own record — the identity is persisted, and
+// the run settles from it, never by re-launching.
+func TestReconcileAdoptsLostRunIdentity(t *testing.T) {
+	dir := socketDir(t)
+	key, keys := testAuthority(t)
+
+	be1 := &stubBackend{handle: "vm-adopt", wait: make(chan *ExecResult), noRunID: true}
+	srv1 := startServer(t, Config{SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys, Backend: be1})
+	conn, reader := connect(t, srv1.SocketPath())
+	resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV2) {
+		c.JobID, c.Nonce = "adopt-1", "adopt-n"
+	}))
+	conn.Close()
+	if resp.State != JobStateRunning {
+		t.Fatalf("dispatch state = %s", resp.State)
+	}
+	srv1.Stop()
+
+	adopted := "job_" + strings.Repeat("2", 32)
+	be2 := &stubBackend{handle: "vm-adopt", adoptRunID: adopted}
+	srv2 := startServer(t, Config{SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys, Backend: be2})
+	defer srv2.Stop()
+
+	lj := waitLedgerState(t, srv2, "adopt-1", JobStateSucceeded)
+	if lj.BackendJobID != adopted {
+		t.Fatalf("adopted run identity = %q, want %q", lj.BackendJobID, adopted)
+	}
+	if lj.ReceiptSHA256 == "" {
+		t.Fatal("an adopted run reached a terminal state without a receipt")
+	}
+	if be2.got != nil {
+		t.Fatalf("recovery re-dispatched the job: %+v", be2.got)
+	}
 }

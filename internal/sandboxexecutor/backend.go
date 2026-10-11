@@ -74,6 +74,16 @@ type Backend interface {
 	// trigger.
 	Inspect(ctx context.Context, handle string) (live bool, err error)
 
+	// Resume re-establishes observation of a run a previous daemon
+	// lifetime left unresolved: it recovers the runtime-owned run
+	// identity — adopting the runtime's own record when the identity
+	// was lost with the crash — and observes the run to a terminal
+	// result, exactly as Wait would. It never launches anything: a
+	// run it cannot find is unobserved, never duplicated. The
+	// returned run id is the identity the observation was made from,
+	// so the caller can persist an adopted one.
+	Resume(ctx context.Context, job *JobContractV2, handle, runID string) (string, *ExecResult, error)
+
 	// Cleanup removes the backend resources a finished job leaves
 	// behind (e.g. its sandbox). A failure is recorded as cleanup
 	// pending — the VM's own contract bound is the backstop — and

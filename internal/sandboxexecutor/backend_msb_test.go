@@ -1552,3 +1552,77 @@ func TestMSBVerifyRuntimeHonorsExplicitPin(t *testing.T) {
 		t.Fatalf("explicit pin refused: %v", err)
 	}
 }
+
+// ─── Resume: recovering a run a restart left unresolved ─────────────
+
+// TestMSBResumeAdoptsTheRuntimesOwnRecord: the crash window between
+// the runtime admitting a job and the ledger naming it is recovered
+// from the runtime's own job list — one matching record is adopted,
+// and the run is observed to its terminal result exactly as a live
+// monitor would have observed it.
+func TestMSBResumeAdoptsTheRuntimesOwnRecord(t *testing.T) {
+	key, _ := testAuthority(t)
+	bin, _ := fakeMSB(t, map[string]string{"MSB_FAKE_EXIT": "7"})
+	backend := testBackend(bin, filepath.Join(t.TempDir(), "artifacts"))
+	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "resume-1"; c.Nonce = "n-resume" })
+
+	disp, err := backend.Dispatch(testContext(t), job)
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	// The identity was lost with the crash: resume without one.
+	runID, res, err := backend.Resume(testContext(t), job, disp.Handle, "")
+	if err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if runID != disp.RunID {
+		t.Fatalf("adopted run %q, want %q", runID, disp.RunID)
+	}
+	if res == nil || !res.ExitVerified || res.ExitCode != 7 {
+		t.Fatalf("resumed result = %+v", res)
+	}
+	if res.OutputSHA256 == "" || res.OutputPath == "" {
+		t.Fatalf("resumed artifact not captured: %+v", res)
+	}
+}
+
+// TestMSBResumeRefusesAmbiguousAdoption: zero or several matching
+// records are never guessed at — an unprovable run stays unobserved.
+func TestMSBResumeRefusesAmbiguousAdoption(t *testing.T) {
+	key, _ := testAuthority(t)
+	bin, stateDir := fakeMSB(t, nil)
+	backend := testBackend(bin, filepath.Join(t.TempDir(), "artifacts"))
+	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "resume-2"; c.Nonce = "n-resume-2" })
+
+	t.Run("no sandbox at all", func(t *testing.T) {
+		if _, _, err := backend.Resume(testContext(t), job, "sx-resume-absent", ""); !errors.Is(err, ErrExecutionUnobserved) {
+			t.Fatalf("resume without a sandbox = %v, want unobserved", err)
+		}
+	})
+
+	t.Run("no matching job record", func(t *testing.T) {
+		name := "sx-resume-empty"
+		writeFakeSandbox(t, stateDir, name, fakeDefaultConfig())
+		if err := fakeWriteJob(stateDir, name, []string{"some-other-command"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := backend.Resume(testContext(t), job, name, ""); !errors.Is(err, ErrExecutionUnobserved) {
+			t.Fatalf("resume with no match = %v, want unobserved", err)
+		}
+	})
+
+	t.Run("several matching job records", func(t *testing.T) {
+		disp, err := backend.Dispatch(testContext(t), job)
+		if err != nil {
+			t.Fatalf("dispatch: %v", err)
+		}
+		// A second identical launch on the same sandbox: two records
+		// matching the authorized argv are ambiguous, never adopted.
+		if err := fakeWriteJob(stateDir, disp.Handle, job.Argv); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := backend.Resume(testContext(t), job, disp.Handle, ""); !errors.Is(err, ErrExecutionUnobserved) {
+			t.Fatalf("resume with two matches = %v, want unobserved", err)
+		}
+	})
+}

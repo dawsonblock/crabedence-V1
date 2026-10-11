@@ -614,6 +614,38 @@ func (b *MSBBackend) Inspect(ctx context.Context, handle string) (bool, error) {
 	}
 }
 
+// Resume re-establishes observation of a run a previous lifetime left
+// unresolved. When the run identity was lost with the crash — the
+// window between the runtime admitting a job and the ledger naming it
+// — the runtime's own job list is the proof of what was admitted: a
+// single job matching the authorized argv is adopted; zero or several
+// are unobserved, never guessed at. The run is then observed exactly
+// as a live monitor would, so a recovered job reaches the same
+// terminal result and artifact it would have reached live.
+func (b *MSBBackend) Resume(ctx context.Context, job *JobContractV2, handle, runID string) (string, *ExecResult, error) {
+	if job == nil {
+		return runID, nil, fmt.Errorf("resume requires the job's signed contract")
+	}
+	if runID == "" {
+		jobs, err := b.listJobs(ctx, handle)
+		if err != nil {
+			return "", nil, fmt.Errorf("%w: cannot read the sandbox's job list: %v", ErrExecutionUnobserved, err)
+		}
+		matched := matchContractJobs(jobs, job)
+		switch len(matched) {
+		case 0:
+			return "", nil, fmt.Errorf("%w: sandbox %s records no job matching the authorized command", ErrExecutionUnobserved, handle)
+		case 1:
+			runID = matched[0].ID
+		default:
+			return "", nil, fmt.Errorf("%w: sandbox %s records %d jobs matching the authorized command — an operator must reconcile them",
+				ErrExecutionUnobserved, handle, len(matched))
+		}
+	}
+	res, err := b.Wait(ctx, job, handle, runID)
+	return runID, res, err
+}
+
 // Wait observes the job's runtime-owned record until it is terminal,
 // then captures the job's retained output into a durable artifact.
 // The observation window is the contract timeout plus the fixed
