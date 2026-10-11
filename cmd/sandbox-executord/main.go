@@ -24,6 +24,10 @@
 //	-backend         execution backend: "" (record only) or
 //	                 "microsandbox" (requires -job-pubkey-file)
 //	-msb-bin         path to the msb binary (microsandbox backend)
+//	-msb-pull        image fetch policy: never (default — the pinned
+//	                 image must be present locally, and a missing one
+//	                 refuses fast instead of fetching mid-dispatch) or
+//	                 if-missing
 //	-state-dir       artifact directory for captured output (defaults
 //	                 to <socket-dir>/artifacts)
 //	-ledger          durable job ledger path (defaults to
@@ -74,6 +78,7 @@ func main() {
 	pubkeyFile := flag.String("job-pubkey-file", os.Getenv("SANDBOX_EXECUTOR_JOB_PUBKEY_FILE"), "0600 owner-only authority public-key trust file (or SANDBOX_EXECUTOR_JOB_PUBKEY_FILE)")
 	backendName := flag.String("backend", os.Getenv("SANDBOX_EXECUTOR_BACKEND"), "execution backend: \"\" or \"microsandbox\" (or SANDBOX_EXECUTOR_BACKEND)")
 	msbBin := flag.String("msb-bin", os.Getenv("SANDBOX_EXECUTOR_MSB_BIN"), "path to the msb binary (or SANDBOX_EXECUTOR_MSB_BIN)")
+	msbPull := flag.String("msb-pull", "never", "image fetch policy for the microsandbox backend: never (require the pinned image locally) or if-missing")
 	stateDir := flag.String("state-dir", os.Getenv("SANDBOX_EXECUTOR_STATE_DIR"), "artifact directory for captured output (or SANDBOX_EXECUTOR_STATE_DIR)")
 	ledgerPath := flag.String("ledger", os.Getenv("SANDBOX_EXECUTOR_LEDGER"), "durable job ledger path (or SANDBOX_EXECUTOR_LEDGER)")
 	maxConns := flag.Int("max-conns", 0, "simultaneous connection bound (default 64)")
@@ -130,11 +135,15 @@ func main() {
 		if st, err := os.Stat(bin); err != nil || st.IsDir() {
 			log.Fatalf("sandbox-executord: msb binary not found at %s — pass -msb-bin", bin)
 		}
+		if *msbPull != sandboxexecutor.PullNever && *msbPull != sandboxexecutor.PullIfMissing {
+			log.Fatalf("sandbox-executord: -msb-pull must be %q or %q, got %q",
+				sandboxexecutor.PullNever, sandboxexecutor.PullIfMissing, *msbPull)
+		}
 		artifacts := *stateDir
 		if artifacts == "" {
 			artifacts = filepath.Join(*socketDir, "artifacts")
 		}
-		backend = &sandboxexecutor.MSBBackend{Bin: bin, StateDir: artifacts}
+		backend = &sandboxexecutor.MSBBackend{Bin: bin, StateDir: artifacts, PullPolicy: *msbPull}
 	default:
 		log.Fatalf("sandbox-executord: unknown backend %q (want \"\" or \"microsandbox\")", *backendName)
 	}

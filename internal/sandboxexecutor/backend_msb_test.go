@@ -48,6 +48,7 @@ type fakeSandboxConfig struct {
 	Name            string            `json:"name"`
 	Labels          map[string]string `json:"labels"`
 	ManifestDigest  string            `json:"manifest_digest"`
+	PullPolicy      string            `json:"pull_policy"`
 	Env             []fakeEnvVar      `json:"env"`
 	Resources       fakeResources     `json:"resources"`
 	Lifecycle       fakeLifecycle     `json:"lifecycle"`
@@ -250,7 +251,10 @@ func fakeCreate(dir string, args []string) int {
 			i++
 			key, value, _ := strings.Cut(args[i], "=")
 			conf.Labels[key] = value
-		case "--pull", "--max-cpus", "--max-memory", "--hostname":
+		case "--pull":
+			i++
+			conf.PullPolicy = args[i]
+		case "--max-cpus", "--max-memory", "--hostname":
 			i++
 		default:
 			if !strings.HasPrefix(a, "-") {
@@ -798,6 +802,42 @@ func TestMSBDispatchFailedCreateLeavesForeignSandboxAlone(t *testing.T) {
 	}
 }
 
+// TestMSBDispatchPullPolicy: the image fetch policy is pinned per
+// dispatch — never by default, so a missing image refuses fast instead
+// of fetching mid-dispatch and turning a launch into an ambiguity.
+func TestMSBDispatchPullPolicy(t *testing.T) {
+	t.Run("if-missing is passed through when configured", func(t *testing.T) {
+		key, _ := testAuthority(t)
+		bin, stateDir := fakeMSB(t, nil)
+		backend := &MSBBackend{Bin: bin, StateDir: filepath.Join(t.TempDir(), "artifacts"), PullPolicy: PullIfMissing}
+		job := testContract(t, key, func(c *JobContractV2) { c.JobID = "pull-1"; c.Nonce = "n-pull" })
+		handle, err := backend.Dispatch(testContext(t), job)
+		if err != nil {
+			t.Fatalf("dispatch: %v", err)
+		}
+		if got := readFakeSandbox(t, stateDir, handle).Config.PullPolicy; got != PullIfMissing {
+			t.Fatalf("pull policy = %q, want %q", got, PullIfMissing)
+		}
+		if _, err := backend.Wait(testContext(t), handle); err != nil {
+			t.Fatalf("wait: %v", err)
+		}
+	})
+	t.Run("unknown policy refuses", func(t *testing.T) {
+		key, _ := testAuthority(t)
+		bin, stateDir := fakeMSB(t, nil)
+		backend := &MSBBackend{Bin: bin, StateDir: filepath.Join(t.TempDir(), "artifacts"), PullPolicy: "yolo"}
+		job := testContract(t, key, func(c *JobContractV2) { c.JobID = "pull-2"; c.Nonce = "n-pull-2" })
+		_, err := backend.Dispatch(testContext(t), job)
+		if err == nil || !strings.Contains(err.Error(), "unknown image pull policy") {
+			t.Fatalf("unknown pull policy accepted: %v", err)
+		}
+		entries, rerr := os.ReadDir(stateDir)
+		if rerr == nil && len(entries) != 0 {
+			t.Fatalf("a refused dispatch left %d sandbox record(s)", len(entries))
+		}
+	})
+}
+
 func TestMSBDispatchMapsContractToSandbox(t *testing.T) {
 	key, _ := testAuthority(t)
 	bin, stateDir := fakeMSB(t, nil)
@@ -849,6 +889,9 @@ func TestMSBDispatchMapsContractToSandbox(t *testing.T) {
 	}
 	if conf.ManifestDigest != testImageDigest {
 		t.Fatalf("image digest not pinned: %q", conf.ManifestDigest)
+	}
+	if conf.PullPolicy != PullNever {
+		t.Fatalf("image fetch policy = %q, want the deterministic default %q", conf.PullPolicy, PullNever)
 	}
 	if len(conf.Mounts) != 1 || conf.Mounts[0].Guest != "/src" {
 		t.Fatalf("mounts not mapped: %+v", conf.Mounts)

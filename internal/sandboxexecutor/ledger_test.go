@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // The PR-06 gate: job identity is durable, the ledger is fenced
@@ -189,20 +190,20 @@ func TestActiveUsageReservesAndReleases(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if usage, err := l.ActiveUsage(); err != nil || usage.VMs != 0 {
+	if usage, err := l.ActiveUsage(time.Minute); err != nil || usage.VMs != 0 {
 		t.Fatalf("fresh ledger usage = %+v (%v)", usage, err)
 	}
 	if _, err := l.InsertJob(c.JobID, ContractHash(c), "s", "alice", c.Image, string(raw)); err != nil {
 		t.Fatal(err)
 	}
 	// RECORDED is not yet in flight — it holds no reservation.
-	if usage, _ := l.ActiveUsage(); usage.VMs != 0 {
+	if usage, _ := l.ActiveUsage(time.Minute); usage.VMs != 0 {
 		t.Fatalf("a recorded job holds a reservation: %+v", usage)
 	}
 	if err := l.Transition(c.JobID, JobStateDispatching, []string{JobStateRecorded}, nil); err != nil {
 		t.Fatal(err)
 	}
-	usage, err := l.ActiveUsage()
+	usage, err := l.ActiveUsage(time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +216,7 @@ func TestActiveUsageReservesAndReleases(t *testing.T) {
 	if err := l.Transition(c.JobID, JobStateRunning, []string{JobStateDispatching}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if usage, _ := l.ActiveUsage(); usage.VMs != 1 {
+	if usage, _ := l.ActiveUsage(time.Minute); usage.VMs != 1 {
 		t.Fatalf("a running job lost its reservation: %+v", usage)
 	}
 	// Terminal: the reservation is released.
@@ -223,7 +224,7 @@ func TestActiveUsageReservesAndReleases(t *testing.T) {
 		func(j *LedgerJob) error { j.ResultJSON = "{}"; return nil }); err != nil {
 		t.Fatal(err)
 	}
-	if usage, _ := l.ActiveUsage(); usage.VMs != 0 || usage.CPUs != 0 || usage.PerSubmitter["s"] != 0 {
+	if usage, _ := l.ActiveUsage(time.Minute); usage.VMs != 0 || usage.CPUs != 0 || usage.PerSubmitter["s"] != 0 {
 		t.Fatalf("a terminal job still reserves: %+v", usage)
 	}
 }
@@ -253,8 +254,46 @@ func TestActiveUsageHoldsUnresolvedReservations(t *testing.T) {
 	if lj.State != JobStateDispatchAmbig {
 		t.Fatalf("state = %s", lj.State)
 	}
-	if usage, _ := l2.ActiveUsage(); usage.VMs != 1 {
+	if usage, _ := l2.ActiveUsage(time.Minute); usage.VMs != 1 {
 		t.Fatalf("an unresolved VM was released from the pool: %+v", usage)
+	}
+}
+
+// TestActiveUsageReleasesProvablyDeadVMs: a VM cannot outlive its
+// contract (--max-duration is pinned to the declared timeout), so once
+// that timeout plus the dispatch grace has certainly elapsed the
+// reservation is released — the unresolved row stays for the
+// operator's audit, but it stops consuming budget forever.
+func TestActiveUsageReleasesProvablyDeadVMs(t *testing.T) {
+	l, path := openLedger(t)
+	key, _ := testAuthority(t)
+	c := testContract(t, key, func(c *JobContractV2) {
+		c.JobID = "usage-dead"
+		c.Resources.TimeoutSeconds = 5
+	})
+	raw, _ := json.Marshal(c)
+	if _, err := l.InsertJob(c.JobID, ContractHash(c), "s", "alice", c.Image, string(raw)); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Transition(c.JobID, JobStateDispatching, []string{JobStateRecorded}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if usage, _ := l.ActiveUsage(time.Minute); usage.VMs != 1 {
+		t.Fatalf("fresh dispatch not reserved: %+v", usage)
+	}
+	// The row's last transition is far older than its own contract
+	// timeout plus the grace: the VM provably cannot exist.
+	tamper(t, path, `UPDATE jobs SET updated_at = ? WHERE job_id = ?`,
+		time.Now().Add(-time.Hour).UnixMilli(), c.JobID)
+	if usage, _ := l.ActiveUsage(time.Minute); usage.VMs != 0 {
+		t.Fatalf("a provably dead VM still holds a reservation: %+v", usage)
+	}
+	// Inside the grace window the reservation is still held — the
+	// release must never outrun the VM's own bound.
+	tamper(t, path, `UPDATE jobs SET updated_at = ? WHERE job_id = ?`,
+		time.Now().Add(-time.Second).UnixMilli(), c.JobID)
+	if usage, _ := l.ActiveUsage(time.Hour); usage.VMs != 1 {
+		t.Fatalf("a VM inside the grace window was released: %+v", usage)
 	}
 }
 

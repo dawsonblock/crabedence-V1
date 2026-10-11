@@ -172,6 +172,9 @@ func NewServer(cfg Config) (*Server, error) {
 	if cfg.MaxConns < 0 {
 		return nil, fmt.Errorf("max connections must not be negative")
 	}
+	if cfg.DispatchTimeout < 0 {
+		return nil, fmt.Errorf("dispatch timeout must not be negative")
+	}
 	if p := cfg.ResourcePool; p != nil {
 		if p.MaxConcurrentVMs < 0 || p.MaxSubmitterVMs < 0 || p.TotalCPUs < 0 {
 			return nil, fmt.Errorf("resource pool bounds must not be negative")
@@ -872,9 +875,10 @@ func (s *Server) checkCeiling(c *JobContractV2) error {
 // whose VM may exist — the bound that keeps N authorized jobs from
 // consuming N× the machine. Usage is recomputed from durable ledger
 // rows on every admission, so the bound survives restarts and crashes
-// rather than living in process memory; unresolved rows
-// (DISPATCH_AMBIGUOUS, INTERRUPTED) keep their reservation until an
-// operator reconciles them.
+// rather than living in process memory; an unresolved row
+// (DISPATCH_AMBIGUOUS, INTERRUPTED) keeps its reservation until an
+// operator reconciles it or the VM's own contract timeout — the
+// backend pins --max-duration to it — has provably elapsed.
 type ResourcePool struct {
 	// MaxConcurrentVMs bounds jobs in a state where a VM may exist
 	// (DISPATCHING, RUNNING, DISPATCH_AMBIGUOUS, INTERRUPTED).
@@ -973,8 +977,11 @@ func (s *Server) admitJob(jobID, contractHash, submitter, principal, image, cont
 	} else if count >= maxJobs {
 		return fmt.Errorf("job registry full (%d records)", maxJobs)
 	}
-	if s.cfg.ResourcePool != nil {
-		usage, err := s.ledger.ActiveUsage()
+	// The pool bounds execution, so it applies only when a backend can
+	// execute: a record-only executor admits (and records) jobs it
+	// will never run.
+	if s.cfg.Backend != nil && s.cfg.ResourcePool != nil {
+		usage, err := s.ledger.ActiveUsage(s.cfg.DispatchTimeout + time.Minute)
 		if err != nil {
 			return fmt.Errorf("read pool usage: %w", err)
 		}

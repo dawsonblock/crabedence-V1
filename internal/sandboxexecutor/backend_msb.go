@@ -22,6 +22,15 @@ import (
 // declares no max_output_bytes.
 const defaultMaxOutputBytes = 8 << 20
 
+// Image fetch policies a backend may pin. The default is never: the
+// executor refuses a job whose authorized image is not present
+// locally, instead of fetching it mid-dispatch where a slow registry
+// turns a definitive launch into an ambiguous one.
+const (
+	PullNever     = "never"
+	PullIfMissing = "if-missing"
+)
+
 // MSBBackend executes signed job contracts in Microsandbox microVMs
 // (libkrun on Apple Silicon / Linux KVM). The executor hands it a
 // verified contract; the backend maps the contract's declared limits
@@ -65,6 +74,12 @@ type MSBBackend struct {
 	// Inspect refuses handles that lack it, so the backend can never
 	// be pointed at sandboxes it did not launch.
 	NamePrefix string
+	// PullPolicy pins the image-fetch policy on every create: "never"
+	// (default) requires the authorized image to be present locally
+	// and refuses fast otherwise; "if-missing" lets the CLI fetch the
+	// pinned digest, at the cost of a dispatch whose latency — and
+	// possible ambiguity — depends on the network.
+	PullPolicy string
 	// KeepSandboxes leaves stopped VMs in place after result
 	// collection — a forensics posture; default removes them since
 	// the artifact store is the durable evidence.
@@ -205,11 +220,10 @@ func (b *MSBBackend) runOnce(ctx context.Context, args ...string) ([]byte, error
 
 // pinnedImage renders the contract's image as the immutable
 // reference msb must boot: the authority-pinned digest, never a
-// mutable tag the registry could have moved.
+// mutable tag the registry could have moved. V2 validation refuses a
+// digest inside the image string, so the reference and the digest
+// compose unambiguously.
 func pinnedImage(job *JobContractV2) string {
-	if strings.Contains(job.Image, "@") {
-		return job.Image
-	}
 	return job.Image + "@" + job.ImageDigest
 }
 
@@ -262,6 +276,14 @@ func (b *MSBBackend) createArgs(job *JobContractV2, name, nonce string) ([]strin
 		"--label", "crabedence.job="+job.JobID,
 		"--label", "crabedence.dispatch="+nonce,
 	)
+	policy := b.PullPolicy
+	if policy == "" {
+		policy = PullNever
+	}
+	if policy != PullNever && policy != PullIfMissing {
+		return nil, fmt.Errorf("unknown image pull policy %q (want %q or %q)", policy, PullNever, PullIfMissing)
+	}
+	args = append(args, "--pull", policy)
 	args = append(args, b.ExtraArgs...)
 	args = append(args, pinnedImage(job))
 	return args, nil

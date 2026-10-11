@@ -590,7 +590,7 @@ func TestResourcePoolBoundsAdmission(t *testing.T) {
 	if lj, _ := srv.Ledger().Get("pool-3"); lj != nil {
 		t.Fatal("a pool-refused job reached the ledger")
 	}
-	usage, err := srv.Ledger().ActiveUsage()
+	usage, err := srv.Ledger().ActiveUsage(time.Minute)
 	if err != nil || usage.VMs != 2 {
 		t.Fatalf("usage = %+v (%v)", usage, err)
 	}
@@ -616,6 +616,28 @@ func TestResourcePoolRequiresDeclaredBudgets(t *testing.T) {
 	}
 	if lj, _ := srv.Ledger().Get("no-mem"); lj != nil {
 		t.Fatal("a pool-refused job reached the ledger")
+	}
+}
+
+// TestResourcePoolIgnoresRecordOnlyJobs: the pool bounds execution,
+// so a record-only executor (no backend) admits and records jobs the
+// pool would otherwise refuse for undeclared budgets.
+func TestResourcePoolIgnoresRecordOnlyJobs(t *testing.T) {
+	dir := socketDir(t)
+	srv := startServer(t, Config{
+		SocketDir: dir, Peers: selfPeer(t),
+		ResourcePool: &ResourcePool{MaxConcurrentVMs: 1, TotalMemoryMB: 1024},
+	})
+	conn, reader := connect(t, srv.SocketPath())
+	resp := sendJob(t, conn, reader, validJob())
+	if !resp.OK || resp.State != JobStateRecorded {
+		t.Fatalf("record-only job refused by the pool: %+v", resp)
+	}
+}
+
+func TestNegativeDispatchTimeoutRefused(t *testing.T) {
+	if _, err := NewServer(Config{SocketDir: t.TempDir(), Peers: selfPeer(t), DispatchTimeout: -time.Second}); err == nil {
+		t.Fatal("a negative dispatch timeout was accepted")
 	}
 }
 

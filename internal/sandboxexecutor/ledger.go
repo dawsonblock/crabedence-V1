@@ -513,29 +513,46 @@ type PoolUsage struct {
 
 // ActiveUsage aggregates the declared budgets of every job in a state
 // where a VM may exist: DISPATCHING and RUNNING are in flight;
-// DISPATCH_AMBIGUOUS and INTERRUPTED mean a VM may still be live under
-// its own contract timeout, so their reservation is held until an
-// operator reconciles the row — releasing it would let uncertainty
-// consume budget twice. A row whose contract cannot be parsed counts
-// as one VM with no declared dimensions: fail closed on the VM bound
-// rather than silently free.
-func (l *Ledger) ActiveUsage() (*PoolUsage, error) {
+// DISPATCH_AMBIGUOUS and INTERRUPTED mean a VM may still be live, so
+// their reservation is held until an operator reconciles the row or
+// the bound below proves the VM gone.
+//
+// grace is the longest interval between a row's last transition and
+// the creation of the VM it may represent — the caller's dispatch
+// timeout plus a margin. A VM cannot outlive its contract (the
+// backend pins --max-duration to the declared timeout), so once that
+// timeout plus grace has certainly elapsed the reservation is
+// released even though the row stays unresolved for the operator's
+// audit. A row whose contract cannot be parsed counts as one VM with
+// no declared dimensions: fail closed on the VM bound rather than
+// silently free.
+func (l *Ledger) ActiveUsage(grace time.Duration) (*PoolUsage, error) {
 	rows, err := l.db.Query(
-		`SELECT submitter, contract_json FROM jobs WHERE state IN (?, ?, ?, ?)`,
+		`SELECT submitter, contract_json, updated_at FROM jobs WHERE state IN (?, ?, ?, ?)`,
 		JobStateDispatching, JobStateRunning, JobStateDispatchAmbig, JobStateInterrupted)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+	now := time.Now().UTC()
 	usage := &PoolUsage{PerSubmitter: map[string]int{}}
 	for rows.Next() {
 		var submitter, raw string
-		if err := rows.Scan(&submitter, &raw); err != nil {
+		var updatedAt int64
+		if err := rows.Scan(&submitter, &raw, &updatedAt); err != nil {
 			return nil, err
+		}
+		c, cerr := ParseContract(json.RawMessage(raw))
+		if cerr == nil && c.Resources.TimeoutSeconds > 0 {
+			deadline := time.UnixMilli(updatedAt).
+				Add(time.Duration(c.Resources.TimeoutSeconds)*time.Second + grace)
+			if now.After(deadline) {
+				continue
+			}
 		}
 		usage.VMs++
 		usage.PerSubmitter[submitter]++
-		if c, err := ParseContract(json.RawMessage(raw)); err == nil {
+		if cerr == nil {
 			usage.CPUs += c.Resources.CPUs
 			usage.MemoryMB += c.Resources.MemoryMB
 			usage.DiskMB += c.Resources.DiskMB
