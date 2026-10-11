@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -186,6 +187,9 @@ func fakeMSBMain() int {
 func fakeStatePath(dir, name string) string { return filepath.Join(dir, name+".json") }
 
 func fakeCreate(dir string, args []string) int {
+	if secs := fakeEnvInt("MSB_FAKE_CREATE_SLEEP", 0); secs > 0 {
+		time.Sleep(time.Duration(secs) * time.Second)
+	}
 	conf := fakeDefaultConfig()
 	var name, image string
 	for i := 0; i < len(args); i++ {
@@ -264,6 +268,8 @@ func fakeCreate(dir string, args []string) int {
 	conf.Image.Oci.Reference = image
 	if tamper := os.Getenv("MSB_FAKE_TAMPER"); tamper == "net_public" {
 		conf.Network.Policy = fakePublicPolicy()
+	} else if tamper == "ingress_allow" {
+		conf.Network.Policy.DefaultIngress = "allow"
 	}
 	// Exclusive creation, exactly like the real CLI: an existing
 	// sandbox is an error, never a silent reuse.
@@ -621,24 +627,57 @@ func TestMSBDispatchRefusesPreexistingSandbox(t *testing.T) {
 // VM's policy between create and exec: verification must destroy it
 // before any guest command runs.
 func TestMSBDispatchVerifiesPolicyBeforeExec(t *testing.T) {
-	key, _ := testAuthority(t)
-	bin, stateDir := fakeMSB(t, map[string]string{"MSB_FAKE_TAMPER": "net_public"})
-	backend := &MSBBackend{Bin: bin, StateDir: filepath.Join(t.TempDir(), "artifacts")}
-	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "verify-1"; c.Nonce = "n-verify" })
-	name := backend.msbJobName(job.JobID)
+	for _, tamper := range []string{"net_public", "ingress_allow"} {
+		t.Run(tamper, func(t *testing.T) {
+			key, _ := testAuthority(t)
+			bin, stateDir := fakeMSB(t, map[string]string{"MSB_FAKE_TAMPER": tamper})
+			backend := &MSBBackend{Bin: bin, StateDir: filepath.Join(t.TempDir(), "artifacts")}
+			job := testContract(t, key, func(c *JobContractV2) { c.JobID = "verify-1"; c.Nonce = "n-verify" })
+			name := backend.msbJobName(job.JobID)
 
-	_, err := backend.Dispatch(testContext(t), job)
-	if err == nil {
-		t.Fatal("dispatch accepted a VM that failed policy verification")
+			_, err := backend.Dispatch(testContext(t), job)
+			if err == nil {
+				t.Fatal("dispatch accepted a VM that failed policy verification")
+			}
+			if !strings.Contains(err.Error(), "policy verification") {
+				t.Fatalf("unexpected refusal: %v", err)
+			}
+			if _, err := os.Stat(filepath.Join(stateDir, name+".exec")); err == nil {
+				t.Fatal("exec ran inside an unverified VM")
+			}
+			if _, err := os.Stat(fakeStatePath(stateDir, name)); err == nil {
+				t.Fatal("the unverified VM was not destroyed")
+			}
+		})
 	}
-	if !strings.Contains(err.Error(), "policy verification") {
-		t.Fatalf("unexpected refusal: %v", err)
+}
+
+// TestMSBDispatchAmbiguousCreateLeaksNothing: a dispatch deadline
+// that expires mid-create is ambiguous by construction (the VM may
+// exist), but no exec was ever spawned — so the artifact file and its
+// descriptor must not survive the stalled dispatch.
+func TestMSBDispatchAmbiguousCreateLeaksNothing(t *testing.T) {
+	key, _ := testAuthority(t)
+	bin, _ := fakeMSB(t, map[string]string{"MSB_FAKE_CREATE_SLEEP": "5"})
+	dir := t.TempDir()
+	backend := &MSBBackend{Bin: bin, StateDir: filepath.Join(dir, "artifacts")}
+	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "ambig-create"; c.Nonce = "n-ambig" })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	handle, err := backend.Dispatch(ctx, job)
+	if err == nil || !errors.Is(err, ErrAmbiguousDispatch) {
+		t.Fatalf("want an ambiguous dispatch, got handle=%q err=%v", handle, err)
 	}
-	if _, err := os.Stat(filepath.Join(stateDir, name+".exec")); err == nil {
-		t.Fatal("exec ran inside an unverified VM")
+	if handle != backend.msbJobName(job.JobID) {
+		t.Fatalf("ambiguous handle = %q", handle)
 	}
-	if _, err := os.Stat(fakeStatePath(stateDir, name)); err == nil {
-		t.Fatal("the unverified VM was not destroyed")
+	entries, rerr := os.ReadDir(filepath.Join(dir, "artifacts"))
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("a stalled dispatch left %d artifact file(s)", len(entries))
 	}
 }
 

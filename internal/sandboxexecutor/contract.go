@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"strings"
 	"time"
 )
@@ -367,6 +368,9 @@ func (c *JobContractV2) ValidateStructure() error {
 	if c.Resources.CPUs < 0 || c.Resources.CPUs > maxContractCPUs {
 		return fmt.Errorf("resources.cpus out of range (0..%d)", maxContractCPUs)
 	}
+	if c.Resources.CPUs != math.Trunc(c.Resources.CPUs) {
+		return fmt.Errorf("resources.cpus must be a whole number — the backend allocates whole vCPUs")
+	}
 	if c.Resources.MemoryMB > maxContractMemoryMB {
 		return fmt.Errorf("resources.memory_mb exceeds %d", maxContractMemoryMB)
 	}
@@ -410,6 +414,9 @@ func (c *JobContractV2) ValidateStructure() error {
 	for i, m := range c.Filesystem.Mounts {
 		if len(m.Source) == 0 || len(m.Source) > maxContractPathBytes {
 			return fmt.Errorf("mount[%d] source is required and must be ≤ %d bytes", i, maxContractPathBytes)
+		}
+		if !strings.HasPrefix(m.Source, "/") {
+			return fmt.Errorf("mount[%d] source %q must be an absolute host path — a bare name is a named volume, not the path the authority signed", i, m.Source)
 		}
 		if len(m.Dest) == 0 || len(m.Dest) > maxContractPathBytes {
 			return fmt.Errorf("mount[%d] dest is required and must be ≤ %d bytes", i, maxContractPathBytes)

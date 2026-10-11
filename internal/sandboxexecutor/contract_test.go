@@ -230,6 +230,7 @@ func TestContractStructuralRefusals(t *testing.T) {
 		"bad security":         func(c *JobContractV2) { c.Security = "yolo" },
 		"empty argv":           func(c *JobContractV2) { c.Argv = nil },
 		"no timeout":           func(c *JobContractV2) { c.Resources.TimeoutSeconds = 0 },
+		"fractional cpus":      func(c *JobContractV2) { c.Resources.CPUs = 0.5 },
 		"disk too large":       func(c *JobContractV2) { c.Resources.DiskMB = maxContractDiskMB + 1 },
 		"allow on none-net":    func(c *JobContractV2) { c.Network = NetworkPolicy{Mode: NetworkNone, Allow: []string{"x.com"}} },
 		"empty allowlist":      func(c *JobContractV2) { c.Network = NetworkPolicy{Mode: NetworkAllowlist} },
@@ -249,6 +250,9 @@ func TestContractStructuralRefusals(t *testing.T) {
 		"duplicate env key": func(c *JobContractV2) { c.Env = []string{"A=1", "A=2"} },
 		"duplicate mount dest": func(c *JobContractV2) {
 			c.Filesystem.Mounts = []Mount{{Source: "/a", Dest: "/x"}, {Source: "/b", Dest: "/x"}}
+		},
+		"rel mount source": func(c *JobContractV2) {
+			c.Filesystem.Mounts = []Mount{{Source: "relsrc", Dest: "/data"}}
 		},
 		"rel mount dest":  func(c *JobContractV2) { c.Filesystem.Mounts = []Mount{{Source: "/a", Dest: "rel"}} },
 		"dotdot dest":     func(c *JobContractV2) { c.Filesystem.Mounts = []Mount{{Source: "/a", Dest: "/x/../y"}} },

@@ -853,6 +853,9 @@ func (s *Server) checkCeiling(c *JobContractV2) error {
 	if ceil.MemoryMB > 0 && c.Resources.MemoryMB > ceil.MemoryMB {
 		return fmt.Errorf("memory_mb %d exceeds the executor ceiling %d", c.Resources.MemoryMB, ceil.MemoryMB)
 	}
+	if ceil.DiskMB > 0 && c.Resources.DiskMB > ceil.DiskMB {
+		return fmt.Errorf("disk_mb %d exceeds the executor ceiling %d", c.Resources.DiskMB, ceil.DiskMB)
+	}
 	if ceil.Pids > 0 && c.Resources.Pids > ceil.Pids {
 		return fmt.Errorf("pids %d exceeds the executor ceiling %d", c.Resources.Pids, ceil.Pids)
 	}
@@ -869,7 +872,9 @@ func (s *Server) checkCeiling(c *JobContractV2) error {
 // whose VM may exist — the bound that keeps N authorized jobs from
 // consuming N× the machine. Usage is recomputed from durable ledger
 // rows on every admission, so the bound survives restarts and crashes
-// rather than living in process memory.
+// rather than living in process memory; unresolved rows
+// (DISPATCH_AMBIGUOUS, INTERRUPTED) keep their reservation until an
+// operator reconciles them.
 type ResourcePool struct {
 	// MaxConcurrentVMs bounds jobs in a state where a VM may exist
 	// (DISPATCHING, RUNNING, DISPATCH_AMBIGUOUS, INTERRUPTED).

@@ -332,6 +332,12 @@ func (b *MSBBackend) Dispatch(ctx context.Context, job *JobContractV2) (string, 
 	out, cerr := b.runOnce(ctx, createArgs...)
 	if cerr != nil {
 		if ctx.Err() != nil {
+			// The VM may exist, but this dispatch never reached exec —
+			// so the artifact can never receive output. Close and
+			// discard it: a stalled dispatch must leak neither a
+			// descriptor nor a stale file.
+			file.Close()
+			os.Remove(artifactPath)
 			return name, fmt.Errorf("%w: create deadline expired before the VM was proven: %v", ErrAmbiguousDispatch, ctx.Err())
 		}
 		if strings.Contains(strings.ToLower(string(out)), "already exists") {
@@ -607,8 +613,8 @@ func verifyNetworkPolicy(job *JobContractV2, cfg map[string]any) error {
 			return fmt.Errorf("network mode none but the sandbox carries %d network rule(s)", len(rules))
 		}
 	case NetworkAllowlist:
-		if egress != "deny" {
-			return fmt.Errorf("network allowlist but the sandbox default egress is %q", egress)
+		if egress != "deny" || ingress != "deny" {
+			return fmt.Errorf("network allowlist but the sandbox default policy is egress=%q ingress=%q", egress, ingress)
 		}
 		if len(rules) != len(job.Network.Allow) {
 			return fmt.Errorf("network allowlist has %d entries but the sandbox carries %d rule(s)", len(job.Network.Allow), len(rules))

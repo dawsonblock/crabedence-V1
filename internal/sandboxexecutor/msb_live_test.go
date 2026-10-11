@@ -459,8 +459,9 @@ func TestMSBLiveMonitorInterruptedLeavesJobUncertain(t *testing.T) {
 		t.Fatalf("job lost across the interrupted lifetime: %v", err)
 	}
 	switch lj.State {
-	case JobStateSucceeded, JobStateFailed:
-		t.Fatalf("an unobserved outcome was attested as terminal: %+v", lj)
+	case JobStateInterrupted, JobStateDispatchAmbig:
+	default:
+		t.Fatalf("an unobserved outcome was not left uncertain: %+v", lj)
 	}
 	if lj.ReceiptSHA256 != "" {
 		t.Fatalf("a receipt was emitted for an unobserved outcome: %+v", lj)
@@ -472,19 +473,25 @@ func TestMSBLiveMonitorInterruptedLeavesJobUncertain(t *testing.T) {
 
 	// The abandoned VM is bounded by its contract: --max-duration is
 	// pinned to the contract timeout, so it must stop on its own.
+	bounded := false
 	deadline := time.Now().Add(25 * time.Second)
 	for time.Now().Before(deadline) {
 		out, err := exec.Command(bin, "inspect", "--format", "json", name).Output()
 		if err != nil {
-			break // the sandbox is gone — bounded and reaped
+			bounded = true // the sandbox is gone — bounded and reaped
+			break
 		}
 		var doc map[string]any
 		if json.Unmarshal(out, &doc) == nil {
 			if status, _ := doc["status"].(string); !strings.EqualFold(status, "running") {
+				bounded = true
 				break
 			}
 		}
 		time.Sleep(500 * time.Millisecond)
+	}
+	if !bounded {
+		t.Fatal("the abandoned VM outlived its contract timeout")
 	}
 	_ = exec.Command(bin, "rm", "-f", name).Run()
 }

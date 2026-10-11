@@ -398,12 +398,14 @@ func TestCeilingRefusesOverBudgetContract(t *testing.T) {
 	key, keys := testAuthority(t)
 	srv := startServer(t, Config{
 		SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys,
-		ResourceCeiling: &ResourceBudget{CPUs: 2, MemoryMB: 512, TimeoutSeconds: 60},
+		ResourceCeiling: &ResourceBudget{CPUs: 2, MemoryMB: 512, DiskMB: 2048, MaxOutputBytes: 8192, TimeoutSeconds: 60},
 	})
 
 	for name, mutate := range map[string]func(*JobContractV2){
 		"cpus":   func(c *JobContractV2) { c.Resources.CPUs = 8 },
 		"memory": func(c *JobContractV2) { c.Resources.MemoryMB = 1024 },
+		"disk":   func(c *JobContractV2) { c.Resources.DiskMB = 4096 },
+		"output": func(c *JobContractV2) { c.Resources.MaxOutputBytes = 16384 },
 		"ttl":    func(c *JobContractV2) { c.Resources.TimeoutSeconds = 600 },
 	} {
 		t.Run(name, func(t *testing.T) {
