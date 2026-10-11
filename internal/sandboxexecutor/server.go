@@ -537,6 +537,17 @@ func (s *Server) releaseConn(conn *net.UnixConn) {
 	<-s.slots
 }
 
+// peerConns reports how many live connections the submitter currently
+// holds. The per-peer bound is accounted in the handler goroutine —
+// the peer's kernel identity is unknown at accept — so this is the
+// observable a test waits on before asserting the refusal that
+// accounting produces; a fixed sleep is not a synchronization.
+func (s *Server) peerConns(submitter string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.peerLoad[submitter]
+}
+
 // serve handles one connection: resolve the kernel peer, authorize,
 // read bounded frames, verify admission (token, then contract),
 // persist, dispatch, respond.

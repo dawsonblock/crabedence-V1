@@ -230,6 +230,10 @@ func TestPerPeerConnectionCap(t *testing.T) {
 	dir := socketDir(t)
 	srv := startServer(t, Config{SocketDir: dir, Peers: selfPeer(t), MaxConns: maxPeerConns + 8})
 
+	// The per-peer bound is accounted in the handler goroutine (the
+	// kernel identity is unknown at accept), so each held connection
+	// must be observed as counted before the next is dialed — a fixed
+	// sleep is not a synchronization and loses under -race load.
 	held := make([]net.Conn, 0, maxPeerConns)
 	for i := 0; i < maxPeerConns; i++ {
 		conn, err := net.Dial("unix", srv.SocketPath())
@@ -238,7 +242,7 @@ func TestPerPeerConnectionCap(t *testing.T) {
 		}
 		defer conn.Close()
 		held = append(held, conn)
-		time.Sleep(15 * time.Millisecond) // let serve() account the peer
+		waitForPeerConns(t, srv, "crabedence", i+1)
 	}
 	conn, err := net.Dial("unix", srv.SocketPath())
 	if err != nil {
@@ -252,7 +256,7 @@ func TestPerPeerConnectionCap(t *testing.T) {
 	// The refusal freed nothing — the server is still inside its
 	// global bound, so a released peer slot admits again.
 	held[0].Close()
-	time.Sleep(50 * time.Millisecond)
+	waitForPeerConns(t, srv, "crabedence", maxPeerConns-1)
 	conn2, err := net.Dial("unix", srv.SocketPath())
 	if err != nil {
 		t.Fatal(err)
@@ -262,6 +266,20 @@ func TestPerPeerConnectionCap(t *testing.T) {
 	if resp := sendJob(t, conn2, reader, validJob()); !resp.OK {
 		t.Fatalf("freed peer slot did not admit: %+v", resp)
 	}
+}
+
+// waitForPeerConns blocks until the server has accounted exactly
+// want live connections for the submitter, or fails the test.
+func waitForPeerConns(t *testing.T, srv *Server, submitter string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if srv.peerConns(submitter) == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("submitter %s holds %d connection(s), want %d", submitter, srv.peerConns(submitter), want)
 }
 
 // A persistent client is not one-shot: the admission loop must keep
