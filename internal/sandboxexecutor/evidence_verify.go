@@ -127,14 +127,10 @@ func expectedOutcome(state string) string {
 }
 
 // providerRunIdentity is the run identity receipts bind to: the
-// runtime-owned run id when the backend reported one, the backend's
-// handle otherwise. Both identify the same run — the run id is the
-// one the runtime itself can reconcile after a restart.
+// composed execution identity (run id, boot generation, policy digest)
+// when the row carries it, the backend's handle otherwise.
 func providerRunIdentity(job *LedgerJob) string {
-	if job.BackendJobID != "" {
-		return job.BackendJobID
-	}
-	return job.BackendHandle
+	return composedRunIdentity(job.BackendJobID, job.BackendBootID, job.PolicyDigest, job.BackendHandle)
 }
 
 func (r *VerifyReport) verifyReceipts(path string, byID map[string]*LedgerJob, refs []evidence.TerminalRef) {

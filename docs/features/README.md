@@ -55,6 +55,9 @@ live in the [Command Reference](../commands/README.md).
 
 ## Sync, execution, and evidence
 
+- [Sandbox executor](sandbox-executor.md): the isolated execution sidecar for
+  untrusted code — effective policy, runtime and execution identity, signed
+  evidence, deployment posture, and crash recovery.
 - [Sync](sync.md): Git file-list manifests, rsync, fingerprints, excludes, guardrails, and sanity checks.
 - [Jobs](jobs.md): named repo-local warmup, hydrate, run, and cleanup workflows.
 - [Hermetic agent evidence](hermetic-agent-evidence.md): repo-local pattern for

@@ -990,17 +990,39 @@ func (s *Server) settleObserved(job *LedgerJob, from []string, run RunIdentity, 
 		job.JobID, state, exitText, res.TimedOut, res.RuntimeState, res.RunID, res.OutputSHA256, cleanupPending)
 }
 
-// receiptRunIdentity is the runtime-owned run identity a receipt binds
-// to: the backend's run id when the result carries one, the row's when
-// it does not, the handle otherwise.
+// composedRunIdentity renders the run identity a signed receipt binds
+// to. When the full execution identity is known — the runtime-owned
+// run id, the VM boot generation and the effective-policy digest — the
+// receipt binds all three as one composite value, so the signed
+// evidence names the exact run, boot and policy rather than only the
+// run id; a row from before the identity existed (rc.5 era) binds its
+// bare run id, and a backend without one binds its handle.
+func composedRunIdentity(runID, bootID, policyDigest, handle string) string {
+	if runID == "" {
+		return handle
+	}
+	if bootID == "" || policyDigest == "" {
+		return runID
+	}
+	return runID + "@" + bootID + "@" + policyDigest
+}
+
+// receiptRunIdentity is the run identity a receipt for this job binds
+// to, preferring the result's own observation over the row's record.
 func receiptRunIdentity(job *LedgerJob, res *ExecResult) string {
-	if res != nil && res.RunID != "" {
-		return res.RunID
+	runID, bootID, policy := job.BackendJobID, job.BackendBootID, job.PolicyDigest
+	if res != nil {
+		if res.RunID != "" {
+			runID = res.RunID
+		}
+		if res.BootID != "" {
+			bootID = res.BootID
+		}
+		if res.PolicyDigest != "" {
+			policy = res.PolicyDigest
+		}
 	}
-	if job.BackendJobID != "" {
-		return job.BackendJobID
-	}
-	return job.BackendHandle
+	return composedRunIdentity(runID, bootID, policy, job.BackendHandle)
 }
 
 // applyRunIdentity persists one dispatch's full execution identity —

@@ -452,3 +452,73 @@ func readFile(t *testing.T, path string) string {
 	}
 	return string(data)
 }
+
+// TestReceiptBindsExecutionIdentity: the signed receipt binds the full
+// execution identity — runtime run id, VM boot generation and
+// effective-policy digest — so the evidence names the exact run, boot
+// and policy rather than only the run id, and the independent verifier
+// compares that composite against the durable row.
+func TestReceiptBindsExecutionIdentity(t *testing.T) {
+	dir := socketDir(t)
+	be := &stubBackend{handle: "vm-ident", wait: make(chan *ExecResult, 1)}
+	be.wait <- &ExecResult{ExitCode: 0, ExitVerified: true, FinishedAt: time.Now().UTC()}
+	srv, key := startEvidenceServer(t, dir, be)
+	submitSigned(t, srv, key, "job-ident")
+	lj := waitJob(t, srv.Ledger(), "job-ident", JobStateSucceeded)
+	srv.Stop()
+
+	want := lj.BackendJobID + "@" + lj.BackendBootID + "@" + lj.PolicyDigest
+	if lj.BackendJobID == "" || lj.BackendBootID == "" || lj.PolicyDigest == "" {
+		t.Fatalf("the row does not carry the execution identity: %+v", lj)
+	}
+	raw, err := os.ReadFile(filepath.Join(evidenceDirOf(dir), "receipts.jsonl"))
+	if err != nil {
+		t.Fatalf("read receipts: %v", err)
+	}
+	found := false
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		var rcpt struct {
+			ExecutionID   string `json:"execution_id"`
+			ProviderRunID string `json:"provider_run_id"`
+		}
+		if err := json.Unmarshal([]byte(line), &rcpt); err != nil {
+			t.Fatalf("parse receipt: %v", err)
+		}
+		if rcpt.ExecutionID == "job-ident" {
+			found = true
+			if rcpt.ProviderRunID != want {
+				t.Fatalf("receipt binds run identity %q, want the composed %q", rcpt.ProviderRunID, want)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("no receipt for the job")
+	}
+	rep := VerifyEvidenceDir(ledgerPathOf(dir), evidenceDirOf(dir), "", trustedSigner(t, dir))
+	if len(rep.Failures) != 0 {
+		t.Fatalf("verification failed: %v", rep.Failures)
+	}
+}
+
+// TestEvidenceDetectsIdentitySubstitution: a receipt whose signed run
+// identity does not name the ledger's execution is a finding — the
+// policy digest and boot generation are attested, not assumed.
+func TestEvidenceDetectsIdentitySubstitution(t *testing.T) {
+	ledger, evdir, dir := twoTerminalJobs(t)
+	// Rewrite the ledger's policy digest: the signed receipt still
+	// binds the original identity, so the two must disagree.
+	tamper(t, ledger, `UPDATE jobs SET policy_digest = ? WHERE job_id = 'job-a'`, strings.Repeat("cd", 32))
+	rep := VerifyEvidenceDir(ledger, evdir, "", trustedSigner(t, dir))
+	if len(rep.Failures) == 0 {
+		t.Fatal("an identity substitution went undetected")
+	}
+	found := false
+	for _, f := range rep.Failures {
+		if strings.Contains(f, "binding mismatch") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("failures %v do not name the binding mismatch", rep.Failures)
+	}
+}
