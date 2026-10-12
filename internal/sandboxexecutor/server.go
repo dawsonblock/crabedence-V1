@@ -395,20 +395,20 @@ func (s *Server) reconcileUnresolved() {
 			s.audit("reconcile: job %s (%s) stored contract is unreadable (%v) — leaving it unresolved", j.JobID, j.State, cerr)
 			continue
 		}
+		run := RunIdentity{Handle: j.BackendHandle, RunID: j.BackendJobID, BootID: j.BackendBootID, PolicyDigest: j.PolicyDigest}
 		ctx, cancel := context.WithTimeout(s.shutdown, s.cfg.ReconcileTimeout)
-		runID, res, rerr := s.cfg.Backend.Resume(ctx, contract, j.BackendHandle, j.BackendJobID)
+		adopted, res, rerr := s.cfg.Backend.Resume(ctx, contract, run)
 		cancel()
-		if runID != "" && runID != j.BackendJobID {
-			if aerr := s.ledger.AdoptBackendRun(j.JobID, runID); aerr != nil {
-				s.audit("reconcile: job %s recovered run %s but the ledger refused the adoption: %v", j.JobID, runID, aerr)
+		if adopted.RunID != run.RunID || adopted.BootID != run.BootID {
+			if aerr := s.ledger.AdoptBackendRun(j.JobID, adopted.RunID, adopted.BootID); aerr != nil {
+				s.audit("reconcile: job %s recovered run %s (boot %s) but the ledger refused the adoption: %v", j.JobID, adopted.RunID, adopted.BootID, aerr)
 				continue
 			}
-			s.audit("reconcile: job %s adopted runtime run %s (identity was lost with the crash)", j.JobID, runID)
-			j.BackendJobID = runID
+			s.audit("reconcile: job %s adopted runtime run %s boot generation %s (identity was lost with the crash)", j.JobID, adopted.RunID, adopted.BootID)
 		}
 		if rerr == nil && res != nil {
-			s.audit("reconcile: job %s (%s) resumed from run %s — settling the observed outcome", j.JobID, j.State, runID)
-			s.settleObserved(j, []string{JobStateDispatchAmbig, JobStateInterrupted}, j.BackendHandle, res, contract)
+			s.audit("reconcile: job %s (%s) resumed from run %s boot %s — settling the observed outcome", j.JobID, j.State, adopted.RunID, adopted.BootID)
+			s.settleObserved(j, []string{JobStateDispatchAmbig, JobStateInterrupted}, adopted, res, contract)
 			continue
 		}
 		// Not resumable: audit the handle's liveness so an orphaned
@@ -792,17 +792,17 @@ func (s *Server) serve(conn *net.UnixConn) {
 		case derr == nil:
 			err := s.ledger.Transition(jobID, JobStateRunning, []string{JobStateDispatching},
 				func(j *LedgerJob) error {
-					j.BackendID, j.BackendHandle, j.BackendJobID = s.backendName, disp.Handle, disp.RunID
+					applyRunIdentity(j, s.backendName, disp)
 					return nil
 				})
 			if err != nil {
 				fail(fmt.Sprintf("persist dispatch of %q: %v", jobID, err))
 				return
 			}
-			s.audit("accepted job %s from %s (principal=%s image=%s signed=%t handle=%s run_id=%s)",
-				jobID, submitter, principal, image, contract != nil, disp.Handle, disp.RunID)
+			s.audit("accepted job %s from %s (principal=%s image=%s signed=%t handle=%s run_id=%s boot_id=%s policy=%s)",
+				jobID, submitter, principal, image, contract != nil, disp.Handle, disp.RunID, disp.BootID, disp.PolicyDigest)
 			s.monitorWg.Add(1)
-			go s.monitor(jobID, disp.Handle, disp.RunID)
+			go s.monitor(jobID, disp)
 			if err := writeResponse(conn, &Response{OK: true, JobID: jobID, State: JobStateRunning}); err != nil {
 				return
 			}
@@ -812,7 +812,7 @@ func (s *Server) serve(conn *net.UnixConn) {
 			// reconciles against the backend, never a blind relaunch.
 			_ = s.ledger.Transition(jobID, JobStateDispatchAmbig, []string{JobStateDispatching},
 				func(j *LedgerJob) error {
-					j.BackendID, j.BackendHandle, j.BackendJobID = s.backendName, disp.Handle, disp.RunID
+					applyRunIdentity(j, s.backendName, disp)
 					j.Error = derr.Error()
 					return nil
 				})
@@ -850,7 +850,7 @@ func (s *Server) serve(conn *net.UnixConn) {
 // exit code. Context cancellation means the daemon is stopping — the
 // ledger row stays RUNNING and the next lifetime's reconcile marks it
 // ambiguous; it never reports a result it did not observe.
-func (s *Server) monitor(jobID, handle, runID string) {
+func (s *Server) monitor(jobID string, run RunIdentity) {
 	defer s.monitorWg.Done()
 
 	// The observation needs the row's bound identity — the stored
@@ -870,7 +870,7 @@ func (s *Server) monitor(jobID, handle, runID string) {
 		return
 	}
 
-	res, werr := s.cfg.Backend.Wait(s.shutdown, contract, handle, runID)
+	res, werr := s.cfg.Backend.Wait(s.shutdown, contract, run)
 	switch {
 	case werr == nil:
 		// A fully observed outcome — settled below.
@@ -895,7 +895,7 @@ func (s *Server) monitor(jobID, handle, runID string) {
 		s.markUnobserved(jobID, fmt.Sprintf("outcome unobserved: %v", werr))
 		return
 	}
-	s.settleObserved(job, []string{JobStateRunning}, handle, res, contract)
+	s.settleObserved(job, []string{JobStateRunning}, run, res, contract)
 }
 
 // classifyObserved maps one backend observation to the terminal
@@ -947,7 +947,7 @@ func classifyObserved(contract *JobContractV2, res *ExecResult) (state, outcome 
 // terminal row whose transition failed never destroys its VM,
 // because an unresolved row's workload is for an operator to
 // reconcile.
-func (s *Server) settleObserved(job *LedgerJob, from []string, handle string, res *ExecResult, contract *JobContractV2) {
+func (s *Server) settleObserved(job *LedgerJob, from []string, run RunIdentity, res *ExecResult, contract *JobContractV2) {
 	state, outcome, exit, errText, ok := classifyObserved(contract, res)
 	if !ok {
 		s.audit("job %s: backend returned an unverified outcome (%+v) — refusing the terminal claim", job.JobID, res)
@@ -961,7 +961,7 @@ func (s *Server) settleObserved(job *LedgerJob, from []string, handle string, re
 		return
 	}
 	resultJSON, _ := json.Marshal(res)
-	if err := s.finishTerminal(job, from, state, outcome, runIdentity(job, res), res.OutputSHA256,
+	if err := s.finishTerminal(job, from, state, outcome, receiptRunIdentity(job, res), res.OutputSHA256,
 		func(j *LedgerJob) error {
 			j.ExitCode = exit
 			j.Error = errText
@@ -973,7 +973,7 @@ func (s *Server) settleObserved(job *LedgerJob, from []string, handle string, re
 		return
 	}
 	cleanupPending := false
-	if err := s.cleanupBackend(handle); err != nil {
+	if err := s.cleanupBackend(run.Handle); err != nil {
 		cleanupPending = true
 		s.audit("job %s: cleanup pending — %v", job.JobID, err)
 		if merr := s.ledger.MarkCleanupPending(job.JobID, err.Error()); merr != nil {
@@ -990,9 +990,10 @@ func (s *Server) settleObserved(job *LedgerJob, from []string, handle string, re
 		job.JobID, state, exitText, res.TimedOut, res.RuntimeState, res.RunID, res.OutputSHA256, cleanupPending)
 }
 
-// runIdentity is the runtime-owned run identity evidence binds to:
-// the backend's run id when it reported one, its handle otherwise.
-func runIdentity(job *LedgerJob, res *ExecResult) string {
+// receiptRunIdentity is the runtime-owned run identity a receipt binds
+// to: the backend's run id when the result carries one, the row's when
+// it does not, the handle otherwise.
+func receiptRunIdentity(job *LedgerJob, res *ExecResult) string {
 	if res != nil && res.RunID != "" {
 		return res.RunID
 	}
@@ -1000,6 +1001,14 @@ func runIdentity(job *LedgerJob, res *ExecResult) string {
 		return job.BackendJobID
 	}
 	return job.BackendHandle
+}
+
+// applyRunIdentity persists one dispatch's full execution identity —
+// handle, runtime run id, VM boot generation and effective-policy
+// digest — on the ledger row.
+func applyRunIdentity(j *LedgerJob, backendName string, run RunIdentity) {
+	j.BackendID, j.BackendHandle = backendName, run.Handle
+	j.BackendJobID, j.BackendBootID, j.PolicyDigest = run.RunID, run.BootID, run.PolicyDigest
 }
 
 // cleanupBackend removes a finished job's backend resources under a

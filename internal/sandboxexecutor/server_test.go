@@ -387,56 +387,97 @@ type stubBackend struct {
 	cleaned    []string
 	resumeErr  error
 	adoptRunID string
+	adoptBoot  string
 	noRunID    bool
 }
 
-func (b *stubBackend) Dispatch(ctx context.Context, job *JobContractV2) (DispatchResult, error) {
+// stubIdentity is the execution identity a stub dispatch reports: a
+// fixed run id, boot generation and policy digest unless a test
+// overrides them.
+func (b *stubBackend) stubIdentity() RunIdentity {
+	return RunIdentity{
+		Handle:       b.handle,
+		RunID:        "job_" + strings.Repeat("1", 32),
+		BootID:       "boot_" + strings.Repeat("1", 32),
+		PolicyDigest: strings.Repeat("ab", 32),
+	}
+}
+
+func (b *stubBackend) Dispatch(ctx context.Context, job *JobContractV2) (RunIdentity, error) {
 	cpy := *job
 	b.got = &cpy
+	ident := b.stubIdentity()
 	if b.err != nil {
 		// Ambiguous dispatches return the handle too — the caller
 		// must record where the job may already be live.
-		return DispatchResult{Handle: b.handle, RunID: "job_" + strings.Repeat("0", 32)}, b.err
+		return ident, b.err
 	}
 	if b.handle == "" {
-		return DispatchResult{Handle: "stub-handle", RunID: "job_" + strings.Repeat("0", 32)}, nil
+		ident.Handle = "stub-handle"
+		return ident, nil
 	}
 	if b.noRunID {
 		// Models the crash window: the runtime admitted the job, but
 		// the ledger row never learned its identity.
-		return DispatchResult{Handle: b.handle}, nil
+		ident.RunID, ident.BootID = "", ""
 	}
-	return DispatchResult{Handle: b.handle, RunID: "job_" + strings.Repeat("1", 32)}, nil
+	return ident, nil
 }
 
-func (b *stubBackend) Wait(ctx context.Context, job *JobContractV2, handle, runID string) (*ExecResult, error) {
+func (b *stubBackend) Wait(ctx context.Context, job *JobContractV2, run RunIdentity) (*ExecResult, error) {
 	if b.wait != nil {
 		select {
 		case res := <-b.wait:
-			return res, b.werr
+			return withStubIdentity(res, run), b.werr
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
 	}
-	return &ExecResult{ExitCode: 0, ExitVerified: true, RunID: runID, FinishedAt: time.Now().UTC()}, b.werr
+	return &ExecResult{
+		ExitCode: 0, ExitVerified: true,
+		RunID: run.RunID, BootID: run.BootID, PolicyDigest: run.PolicyDigest,
+		FinishedAt: time.Now().UTC(),
+	}, b.werr
+}
+
+// withStubIdentity fills the execution identity the ledger compares
+// against when a fixture did not set it — the real backend always
+// carries it.
+func withStubIdentity(res *ExecResult, run RunIdentity) *ExecResult {
+	if res == nil {
+		return nil
+	}
+	if res.RunID == "" {
+		res.RunID = run.RunID
+	}
+	if res.BootID == "" {
+		res.BootID = run.BootID
+	}
+	if res.PolicyDigest == "" {
+		res.PolicyDigest = run.PolicyDigest
+	}
+	return res
 }
 
 func (b *stubBackend) Inspect(ctx context.Context, handle string) (bool, error) {
 	return b.live, nil
 }
 
-func (b *stubBackend) Resume(ctx context.Context, job *JobContractV2, handle, runID string) (string, *ExecResult, error) {
+func (b *stubBackend) Resume(ctx context.Context, job *JobContractV2, run RunIdentity) (RunIdentity, *ExecResult, error) {
 	if b.resumeErr != nil {
-		return runID, nil, b.resumeErr
+		return run, nil, b.resumeErr
 	}
-	if runID == "" {
+	if run.RunID == "" {
 		if b.adoptRunID == "" {
-			return "", nil, ErrExecutionUnobserved
+			return run, nil, ErrExecutionUnobserved
 		}
-		runID = b.adoptRunID
+		run.RunID = b.adoptRunID
+		if b.adoptBoot != "" {
+			run.BootID = b.adoptBoot
+		}
 	}
-	res, err := b.Wait(ctx, job, handle, runID)
-	return runID, res, err
+	res, err := b.Wait(ctx, job, run)
+	return run, res, err
 }
 
 func (b *stubBackend) Cleanup(ctx context.Context, handle string) error {
@@ -958,13 +999,16 @@ func TestReconcileAdoptsLostRunIdentity(t *testing.T) {
 	srv1.Stop()
 
 	adopted := "job_" + strings.Repeat("2", 32)
-	be2 := &stubBackend{handle: "vm-adopt", adoptRunID: adopted}
+	be2 := &stubBackend{handle: "vm-adopt", adoptRunID: adopted, adoptBoot: "boot_" + strings.Repeat("2", 32)}
 	srv2 := startServer(t, Config{SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys, Backend: be2})
 	defer srv2.Stop()
 
 	lj := waitLedgerState(t, srv2, "adopt-1", JobStateSucceeded)
 	if lj.BackendJobID != adopted {
 		t.Fatalf("adopted run identity = %q, want %q", lj.BackendJobID, adopted)
+	}
+	if lj.BackendBootID != "boot_"+strings.Repeat("2", 32) {
+		t.Fatalf("adopted boot generation = %q", lj.BackendBootID)
 	}
 	if lj.ReceiptSHA256 == "" {
 		t.Fatal("an adopted run reached a terminal state without a receipt")

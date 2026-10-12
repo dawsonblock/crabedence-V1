@@ -1,0 +1,482 @@
+package sandboxexecutor
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"time"
+)
+
+// EffectivePolicyVersion is the canonical policy shape this executor
+// compiles and verifies.
+const EffectivePolicyVersion = 1
+
+// bootIDPattern is the runtime's boot-generation identity shape, as
+// the runtime's own state file and job records spell it.
+var bootIDPattern = regexp.MustCompile(`^boot_[0-9a-f]{32}$`)
+
+// EffectivePolicyV1 is the canonical, immutable policy one job runs
+// under: the signed contract compiled together with every mandatory
+// operator restriction. It is the single source of truth for
+// verification — the booted VM must match it exactly, or no guest
+// code starts — and its digest identifies the policy a result was
+// produced under, so evidence names the authorization, not just the
+// job.
+//
+// Every field is normalized (sorted, deduplicated, canonicalized) so
+// two policies that mean the same thing hash the same, and a policy
+// that means anything different hashes differently.
+type EffectivePolicyV1 struct {
+	Version     int      `json:"version"`
+	JobID       string   `json:"job_id"`
+	Principal   string   `json:"principal"`
+	Image       string   `json:"image"`
+	ImageDigest string   `json:"image_digest"`
+	Argv        []string `json:"argv"`
+
+	// Env is the complete authorized guest environment: the contract's
+	// entries plus the pinned image's own config environment (fixed
+	// for the pinned digest). The booted environment must equal this
+	// set exactly — an entry nobody authorized refuses.
+	Env []string `json:"env"`
+
+	NetworkMode  string   `json:"network_mode"`
+	NetworkAllow []string `json:"network_allow,omitempty"`
+
+	SecurityProfile   string `json:"security_profile"`
+	DeploymentProfile string `json:"deployment_profile"`
+	// ExternalMountPolicy is the host-mount confinement the runtime
+	// must boot under; the executor requires the strictest profile.
+	ExternalMountPolicy string `json:"external_mount_policy"`
+
+	Workdir string  `json:"workdir,omitempty"`
+	Mounts  []Mount `json:"mounts,omitempty"`
+
+	CPUs            float64 `json:"cpus,omitempty"`
+	MemoryMB        uint64  `json:"memory_mb,omitempty"`
+	DiskMB          uint64  `json:"disk_mb,omitempty"`
+	Pids            uint32  `json:"pids,omitempty"`
+	TimeoutSeconds  uint32  `json:"timeout_seconds"`
+	MaxDurationSecs uint32  `json:"max_duration_secs"`
+	MaxOutputBytes  uint64  `json:"max_output_bytes,omitempty"`
+
+	SandboxName   string `json:"sandbox_name"`
+	DispatchNonce string `json:"dispatch_nonce"`
+	PullPolicy    string `json:"pull_policy"`
+
+	RuntimeVersion        string `json:"runtime_version"`
+	RuntimeMSBSHA256      string `json:"runtime_msb_sha256"`
+	RuntimeFirmwareSHA256 string `json:"runtime_firmware_sha256"`
+}
+
+// ExternalMountPolicyStrict is the host-mount confinement the runtime
+// must boot under: no implicit host paths.
+const ExternalMountPolicyStrict = "strict"
+
+// buildEffectivePolicy compiles the contract and the backend's
+// mandatory restrictions into the canonical policy for one dispatch.
+// imageEnv is the pinned image's own config environment; it is part of
+// the authorized set because the runtime injects it into every VM
+// booted from that digest.
+func (b *MSBBackend) buildEffectivePolicy(job *JobContractV2, name, nonce string, runtimeVersion string, imageEnv []string) (*EffectivePolicyV1, error) {
+	if job == nil {
+		return nil, fmt.Errorf("policy requires a signed job contract")
+	}
+	profile, err := deploymentProfileJSON(b.deploymentProfile())
+	if err != nil {
+		return nil, err
+	}
+	pull := b.PullPolicy
+	if pull == "" {
+		pull = PullNever
+	}
+	if pull != PullNever && pull != PullIfMissing {
+		return nil, fmt.Errorf("unknown image pull policy %q (want %q or %q)", pull, PullNever, PullIfMissing)
+	}
+	env := normalizeEnvSet(append(append([]string{}, job.Env...), imageEnv...))
+	mounts := append([]Mount{}, job.Filesystem.Mounts...)
+	sort.Slice(mounts, func(i, j int) bool {
+		if mounts[i].Dest != mounts[j].Dest {
+			return mounts[i].Dest < mounts[j].Dest
+		}
+		return mounts[i].Source < mounts[j].Source
+	})
+	allow := append([]string{}, job.Network.Allow...)
+	sort.Strings(allow)
+	manifest := b.runtimeManifest()
+	return &EffectivePolicyV1{
+		Version:               EffectivePolicyVersion,
+		JobID:                 job.JobID,
+		Principal:             job.Principal,
+		Image:                 job.Image,
+		ImageDigest:           job.ImageDigest,
+		Argv:                  append([]string{}, job.Argv...),
+		Env:                   env,
+		NetworkMode:           job.Network.Mode,
+		NetworkAllow:          allow,
+		SecurityProfile:       job.Security,
+		DeploymentProfile:     profile,
+		ExternalMountPolicy:   ExternalMountPolicyStrict,
+		Workdir:               job.Filesystem.Workdir,
+		Mounts:                mounts,
+		CPUs:                  job.Resources.CPUs,
+		MemoryMB:              job.Resources.MemoryMB,
+		DiskMB:                job.Resources.DiskMB,
+		Pids:                  job.Resources.Pids,
+		TimeoutSeconds:        job.Resources.TimeoutSeconds,
+		MaxDurationSecs:       uint32(vmMaxDuration(job) / time.Second),
+		MaxOutputBytes:        job.Resources.MaxOutputBytes,
+		SandboxName:           name,
+		DispatchNonce:         nonce,
+		PullPolicy:            pull,
+		RuntimeVersion:        runtimeVersion,
+		RuntimeMSBSHA256:      manifest.MSBSHA256,
+		RuntimeFirmwareSHA256: manifest.LibkrunfwSHA256,
+	}, nil
+}
+
+// CanonicalJSON renders the policy deterministically: Go marshals
+// struct fields in declaration order and every slice is normalized, so
+// the same policy always produces the same bytes.
+func (p *EffectivePolicyV1) CanonicalJSON() ([]byte, error) {
+	if p == nil {
+		return nil, fmt.Errorf("missing policy")
+	}
+	return json.Marshal(p)
+}
+
+// Digest is the policy's stable identity — what evidence binds and
+// what an operator compares across restarts.
+func (p *EffectivePolicyV1) Digest() (string, error) {
+	raw, err := p.CanonicalJSON()
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// normalizePolicyWord folds the spelling differences between a flag
+// value and the runtime's resolved rendering of it.
+func normalizePolicyWord(s string) string {
+	return strings.ToLower(strings.ReplaceAll(s, "-", ""))
+}
+
+// normalizeEnvSet canonicalizes a KEY=VALUE set: entries sorted by key,
+// duplicates refused (two values for one key is an ambiguous policy,
+// never a silently-last-wins one). An empty value is legal; a missing
+// '=' is not.
+func normalizeEnvSet(entries []string) []string {
+	seen := map[string]string{}
+	for _, kv := range entries {
+		key, value, found := strings.Cut(kv, "=")
+		if !found {
+			continue
+		}
+		if prior, ok := seen[key]; ok && prior != value {
+			// A conflicting duplicate cannot be normalized
+			// deterministically; keep both so verification refuses.
+			seen[key] = prior + "\x00" + value
+			continue
+		}
+		seen[key] = value
+	}
+	out := make([]string, 0, len(seen))
+	for k, v := range seen {
+		out = append(out, k+"="+v)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// envSetIndex indexes a normalized env set by key for exact
+// comparison.
+func envSetIndex(entries []string) map[string]string {
+	idx := map[string]string{}
+	for _, kv := range entries {
+		key, value, found := strings.Cut(kv, "=")
+		if found {
+			idx[key] = value
+		}
+	}
+	return idx
+}
+
+// ─── Booted-configuration verification ──────────────────────────────
+//
+// verifyBootedPolicy proves the VM that booted carries exactly the
+// canonical policy: both the persisted `config` (desired) and the
+// resolved `active_config` (what actually booted) must match, and
+// every security-sensitive setting is compared exactly — an
+// unauthorized environment entry, host channel, initialization hook,
+// mount, network rule or deployment setting is a refusal before any
+// guest command runs.
+
+func verifyBootedPolicy(p *EffectivePolicyV1, doc map[string]any) error {
+	cfg, ok := doc["config"].(map[string]any)
+	if !ok {
+		return fmt.Errorf("inspect document carries no config object")
+	}
+	if err := verifyBootedConfig(p, cfg); err != nil {
+		return err
+	}
+	active, ok := doc["active_config"].(map[string]any)
+	if !ok {
+		return fmt.Errorf("sandbox has no resolved active configuration — refusing to execute in a VM that is not running its authorized policy")
+	}
+	if err := verifyBootedConfig(p, active); err != nil {
+		return fmt.Errorf("booted configuration diverges from the authorized policy: %w", err)
+	}
+	// Sandbox-level state that is not part of either configuration but
+	// still decides what the guest sees: pending configuration changes
+	// mean the VM is not (yet) the authorized one, and a paused or
+	// recovery-required VM is not a fresh execution environment.
+	if pending, ok := doc["pending_changes"].([]any); ok && len(pending) != 0 {
+		return fmt.Errorf("sandbox carries %d pending configuration change(s) — refusing to execute before the authorized policy is actually applied", len(pending))
+	}
+	if pause, ok := doc["pause"].(map[string]any); ok {
+		if paused, _ := pause["paused"].(bool); paused {
+			return fmt.Errorf("sandbox is paused — refusing to execute in a suspended VM")
+		}
+		if recovery, _ := pause["recovery_required"].(bool); recovery {
+			return fmt.Errorf("sandbox requires recovery — refusing to execute in a VM whose state is uncertain")
+		}
+	}
+	return nil
+}
+
+func verifyBootedConfig(p *EffectivePolicyV1, cfg map[string]any) error {
+	if got := jsonString(cfg, "name"); got != p.SandboxName {
+		return fmt.Errorf("sandbox name %q does not match the authorized handle %q", got, p.SandboxName)
+	}
+	labels, _ := cfg["labels"].(map[string]any)
+	if got := jsonString(labels, "crabedence.job"); got != p.JobID {
+		return fmt.Errorf("sandbox label crabedence.job=%q does not match job %q", got, p.JobID)
+	}
+	if got := jsonString(labels, "crabedence.dispatch"); got != p.DispatchNonce {
+		return fmt.Errorf("sandbox dispatch label does not match this dispatch — the VM is not the one this policy created")
+	}
+	if got := jsonString(cfg, "manifest_digest"); got != p.ImageDigest {
+		return fmt.Errorf("sandbox image digest %q does not match the authorized %q", got, p.ImageDigest)
+	}
+	if got := jsonString(cfg, "security_profile"); got != p.SecurityProfile {
+		return fmt.Errorf("sandbox security profile %q does not match the authorized %q", got, p.SecurityProfile)
+	}
+	if got := jsonString(cfg, "deployment_profile"); got != p.DeploymentProfile {
+		return fmt.Errorf("sandbox deployment profile %q does not match the required %q — refusing to run under a downgraded host confinement", got, p.DeploymentProfile)
+	}
+	if got := jsonString(cfg, "external_mount_policy"); got != p.ExternalMountPolicy {
+		return fmt.Errorf("sandbox external mount policy %q does not match the required %q", got, p.ExternalMountPolicy)
+	}
+	// The runtime spells its resolved pull policy differently from the
+	// flag that requested it ("never" → "Never", "if-missing" →
+	// "IfMissing"): compare the normalized forms.
+	if got := jsonString(cfg, "pull_policy"); got != "" && normalizePolicyWord(got) != normalizePolicyWord(p.PullPolicy) {
+		return fmt.Errorf("sandbox pull policy %q does not match the required %q", got, p.PullPolicy)
+	}
+	// Initialization hooks and rootfs patches widen what runs before
+	// (or as) the authorized command; none is authorized.
+	if init := cfg["init"]; init != nil {
+		return fmt.Errorf("sandbox carries an initialization hook (%v) the policy did not authorize", init)
+	}
+	if patches, ok := cfg["patches"].([]any); ok && len(patches) != 0 {
+		return fmt.Errorf("sandbox carries %d rootfs patch(es) the policy did not authorize", len(patches))
+	}
+	rt, _ := cfg["runtime"].(map[string]any)
+	if scripts, ok := rt["scripts"].(map[string]any); ok && len(scripts) != 0 {
+		return fmt.Errorf("sandbox carries %d runtime script binding(s) the policy did not authorize", len(scripts))
+	}
+	if rlimits, ok := cfg["rlimits"].([]any); ok && len(rlimits) != 0 {
+		return fmt.Errorf("sandbox carries %d sandbox-level rlimit(s) the policy did not authorize", len(rlimits))
+	}
+	res, _ := cfg["resources"].(map[string]any)
+	if p.CPUs > 0 {
+		if got, ok := jsonNumber(res, "cpus"); !ok || got != p.CPUs {
+			return fmt.Errorf("sandbox cpus = %v, policy authorized %g", got, p.CPUs)
+		}
+	}
+	if p.MemoryMB > 0 {
+		if got, ok := jsonNumber(res, "memory_mib"); !ok || uint64(got) != p.MemoryMB {
+			return fmt.Errorf("sandbox memory_mib = %v, policy authorized %d", got, p.MemoryMB)
+		}
+	}
+	if p.DiskMB > 0 {
+		img, _ := cfg["image"].(map[string]any)
+		oci, _ := img["Oci"].(map[string]any)
+		rd, _ := oci["root_disk"].(map[string]any)
+		if got, ok := jsonNumber(rd, "size_mib"); !ok || uint64(got) != p.DiskMB {
+			return fmt.Errorf("sandbox root disk size_mib = %v, policy authorized %d", got, p.DiskMB)
+		}
+	}
+	lc, _ := cfg["lifecycle"].(map[string]any)
+	if got, ok := jsonNumber(lc, "max_duration_secs"); !ok || uint32(got) != p.MaxDurationSecs {
+		return fmt.Errorf("sandbox max_duration_secs = %v, policy authorized %d", got, p.MaxDurationSecs)
+	}
+	if p.Workdir != "" {
+		if got := jsonString(rt, "workdir"); got != p.Workdir {
+			return fmt.Errorf("sandbox workdir %q does not match the authorized %q", got, p.Workdir)
+		}
+	}
+	if err := verifyBootedNetwork(p, cfg); err != nil {
+		return err
+	}
+	if err := verifyBootedEnvironment(p, cfg); err != nil {
+		return err
+	}
+	return verifyBootedMounts(p, cfg)
+}
+
+// verifyBootedEnvironment is the exact environment comparison: the
+// booted set must equal the authorized set — the contract's entries
+// plus the pinned image's own config environment — with nothing extra
+// and nothing missing. An extra variable is a setting nobody
+// authorized, whatever its name.
+func verifyBootedEnvironment(p *EffectivePolicyV1, cfg map[string]any) error {
+	env, _ := cfg["env"].([]any)
+	booted := make([]string, 0, len(env))
+	for _, raw := range env {
+		e, _ := raw.(map[string]any)
+		booted = append(booted, jsonString(e, "key")+"="+jsonString(e, "value"))
+	}
+	want := envSetIndex(p.Env)
+	have := envSetIndex(booted)
+	for key, value := range want {
+		got, ok := have[key]
+		if !ok {
+			return fmt.Errorf("sandbox environment is missing the authorized %s entry", key)
+		}
+		if got != value {
+			return fmt.Errorf("sandbox environment %s=%q does not match the authorized value", key, got)
+		}
+	}
+	extra := []string{}
+	for key := range have {
+		if _, ok := want[key]; !ok {
+			extra = append(extra, key)
+		}
+	}
+	if len(extra) != 0 {
+		sort.Strings(extra)
+		return fmt.Errorf("sandbox environment carries %d unauthorized variable(s): %s", len(extra), strings.Join(extra, ", "))
+	}
+	return nil
+}
+
+func verifyBootedNetwork(p *EffectivePolicyV1, cfg map[string]any) error {
+	netw, _ := cfg["network"].(map[string]any)
+	policy, _ := netw["policy"].(map[string]any)
+	egress := jsonString(policy, "default_egress")
+	ingress := jsonString(policy, "default_ingress")
+	rules, _ := policy["rules"].([]any)
+	// Host channels (network interfaces attached to the VM) are never
+	// part of the authorized policy: a VM with an interface the policy
+	// did not request is reachability nobody authorized.
+	if iface, ok := netw["interface"].(map[string]any); ok && len(iface) != 0 {
+		return fmt.Errorf("sandbox carries %d network interface binding(s) the policy did not authorize", len(iface))
+	}
+	if ports, ok := netw["ports"].([]any); ok && len(ports) != 0 {
+		return fmt.Errorf("sandbox publishes %d port(s) the policy did not authorize", len(ports))
+	}
+	switch p.NetworkMode {
+	case NetworkNone:
+		if egress != "deny" || ingress != "deny" {
+			return fmt.Errorf("network mode none but the sandbox default policy is egress=%q ingress=%q", egress, ingress)
+		}
+		if len(rules) != 0 {
+			return fmt.Errorf("network mode none but the sandbox carries %d network rule(s)", len(rules))
+		}
+	case NetworkAllowlist:
+		if egress != "deny" || ingress != "deny" {
+			return fmt.Errorf("network allowlist but the sandbox default policy is egress=%q ingress=%q", egress, ingress)
+		}
+		if len(rules) != len(p.NetworkAllow) {
+			return fmt.Errorf("network allowlist has %d entries but the sandbox carries %d rule(s)", len(p.NetworkAllow), len(rules))
+		}
+		want := map[string]bool{}
+		for _, allow := range p.NetworkAllow {
+			kind, value := allowTarget(allow)
+			want[kind+":"+value] = true
+		}
+		for i, raw := range rules {
+			rule, _ := raw.(map[string]any)
+			if jsonString(rule, "action") != "allow" || jsonString(rule, "direction") != "egress" {
+				return fmt.Errorf("sandbox rule %d is not an egress allow", i)
+			}
+			dest, _ := rule["destination"].(map[string]any)
+			kind, value := ruleTarget(dest)
+			if !want[kind+":"+value] {
+				return fmt.Errorf("sandbox rule %d permits %s:%s, which the policy did not authorize", i, kind, value)
+			}
+			delete(want, kind+":"+value)
+		}
+		if len(want) != 0 {
+			return fmt.Errorf("the sandbox is missing %d authorized allow rule(s)", len(want))
+		}
+	case NetworkPublic:
+		if egress != "deny" {
+			return fmt.Errorf("network mode public but the sandbox default egress is %q", egress)
+		}
+		// `--net public` composes exactly two rules: the gateway DNS
+		// rule (group host) and the public egress allow. Any other
+		// rule is reachability the policy never authorized.
+		public := false
+		for i, raw := range rules {
+			rule, _ := raw.(map[string]any)
+			if jsonString(rule, "action") != "allow" || jsonString(rule, "direction") != "egress" {
+				return fmt.Errorf("sandbox rule %d is not an egress allow", i)
+			}
+			dest, _ := rule["destination"].(map[string]any)
+			kind, value := ruleTarget(dest)
+			switch {
+			case kind == "group" && value == "public":
+				public = true
+			case kind == "group" && value == "host":
+				// the sandbox's own DNS gateway
+			default:
+				return fmt.Errorf("sandbox rule %d permits %s:%s, which the policy did not authorize", i, kind, value)
+			}
+		}
+		if !public {
+			return fmt.Errorf("network mode public but the sandbox carries no public egress rule")
+		}
+	}
+	return nil
+}
+
+func verifyBootedMounts(p *EffectivePolicyV1, cfg map[string]any) error {
+	mounts, _ := cfg["mounts"].([]any)
+	if len(mounts) != len(p.Mounts) {
+		return fmt.Errorf("sandbox carries %d mount(s) but the policy authorized %d", len(mounts), len(p.Mounts))
+	}
+	authorized := map[string]*Mount{}
+	for i := range p.Mounts {
+		m := &p.Mounts[i]
+		authorized[filepath.Clean(m.Source)+"\x00"+m.Dest] = m
+	}
+	for i, raw := range mounts {
+		m, _ := raw.(map[string]any)
+		key := filepath.Clean(jsonString(m, "host")) + "\x00" + jsonString(m, "guest")
+		declared, ok := authorized[key]
+		if !ok {
+			return fmt.Errorf("sandbox mount %d (%s → %s) was not authorized",
+				i, jsonString(m, "host"), jsonString(m, "guest"))
+		}
+		// A host path the policy mounted read-only must not boot
+		// writable: the flag is part of the signed policy.
+		if want, ok := mountReadOnly(declared.Options); ok {
+			opts, _ := m["options"].(map[string]any)
+			got, _ := opts["readonly"].(bool)
+			if got != want {
+				return fmt.Errorf("sandbox mount %s is readonly=%t but the policy declared %q",
+					jsonString(m, "guest"), got, declared.Options)
+			}
+		}
+		delete(authorized, key)
+	}
+	return nil
+}

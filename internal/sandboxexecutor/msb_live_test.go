@@ -77,16 +77,38 @@ func liveImageDigest(t *testing.T, bin string) string {
 }
 
 // verifyLiveBackend proves the live runtime and host are the ones the
-// suite is qualified against: the pinned runtime version and a host
-// the runtime's own prerequisite check accepts.
+// suite is qualified against: the pinned runtime version, the exact
+// executable and firmware bytes (pinned from this machine's install —
+// the suite qualifies this runtime), and a host the runtime's own
+// prerequisite check accepts.
 func verifyLiveBackend(t *testing.T, backend *MSBBackend) {
 	t.Helper()
 	ctx := context.Background()
+	if backend.RuntimeManifest == nil {
+		backend.RuntimeManifest = liveRuntimeManifest(t, backend)
+	}
 	if _, err := backend.VerifyRuntime(ctx); err != nil {
 		t.Fatalf("live suite requires the pinned runtime: %v", err)
 	}
 	if _, err := backend.VerifyHost(ctx); err != nil {
 		t.Fatalf("live suite requires a supported host: %v", err)
+	}
+}
+
+// liveRuntimeManifest pins the installed runtime's actual bytes: the
+// live suite qualifies this machine's runtime, so the manifest is
+// derived from it (version, executable digest, firmware digest) and
+// the identity check exercises real hashing.
+func liveRuntimeManifest(t *testing.T, backend *MSBBackend) *RuntimeManifest {
+	t.Helper()
+	fwPath, err := backend.firmwarePath(context.Background())
+	if err != nil {
+		t.Fatalf("resolve the installed firmware: %v", err)
+	}
+	return &RuntimeManifest{
+		Version:         PinnedMSBVersion,
+		MSBSHA256:       sha256File(t, backend.Bin),
+		LibkrunfwSHA256: sha256File(t, fwPath),
 	}
 }
 
@@ -788,5 +810,93 @@ func TestMSBLiveRecoveryResumesInterruptedJob(t *testing.T) {
 	rep := VerifyEvidenceDir(ledgerPathOf(dir), evidenceDirOf(dir), "", trustedSigner(t, dir))
 	if len(rep.Failures) != 0 {
 		t.Fatalf("independent verification failed: %v", rep.Failures)
+	}
+}
+
+// TestMSBLiveSubstitutedVMIsNeverAdopted is the live execution-identity
+// qualification: after a job completes, the sandbox is removed and a
+// new one is created under the same deterministic name — a substituted
+// VM instance. Recovery must refuse to adopt it (its boot generation is
+// not the dispatch's), leave the row unresolved, and fabricate no
+// result.
+func TestMSBLiveSubstitutedVMIsNeverAdopted(t *testing.T) {
+	bin := msbOrSkip(t)
+	digest := liveImageDigest(t, bin)
+	key, keys := testAuthority(t)
+	dir := socketDir(t)
+	backend := &MSBBackend{
+		Bin: bin, StateDir: filepath.Join(dir, "artifacts"),
+		ObservationSlack: 3 * time.Second,
+	}
+	verifyLiveBackend(t, backend)
+	jobID := "msb-live-substitute"
+	name := "sx-" + jobID
+
+	// First lifetime: a job runs to completion and the daemon stops
+	// before it observes the result, so the row stays unresolved with
+	// its boot generation recorded.
+	srv1 := startServer(t, Config{
+		SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys, Backend: backend,
+	})
+	conn, reader := connect(t, srv1.SocketPath())
+	resp := sendJob(t, conn, reader, liveJob(t, key, digest, jobID, func(c *JobContractV2) {
+		c.Resources.TimeoutSeconds = 20
+		c.Argv = []string{"python3", "-c", "import time; time.sleep(6); print('original-vm')"}
+	}))
+	if !resp.OK {
+		t.Fatalf("live dispatch refused: %+v", resp)
+	}
+	// Stop watching while the job is still running: the row stays
+	// unresolved with its boot generation recorded.
+	time.Sleep(1500 * time.Millisecond)
+	srv1.Stop()
+	// Let the job finish in its VM (which outlives the daemon under its
+	// own contract bound) so only the substitution remains to test.
+	time.Sleep(7 * time.Second)
+
+	lj, err := InspectLedger(ledgerPathOf(dir))
+	if err != nil {
+		t.Fatalf("inspect ledger: %v", err)
+	}
+	row, gerr := lj.Get(jobID)
+	lj.Close()
+	if gerr != nil || row == nil {
+		t.Fatalf("ledger row: %v", gerr)
+	}
+	if row.BackendBootID == "" || !bootIDPattern.MatchString(row.BackendBootID) {
+		t.Fatalf("the dispatch did not record a boot generation: %+v", row)
+	}
+
+	// Substitute the VM: remove the sandbox and create a new one under
+	// the same name — a fresh boot generation with no job records.
+	if out, err := exec.Command(bin, "rm", "-f", name).CombinedOutput(); err != nil {
+		t.Fatalf("remove sandbox: %v: %s", err, out)
+	}
+	if out, err := exec.Command(bin, "create", "-q", "-n", name, "--net", "none", "--deployment-profile", "single-tenant", liveImage+"@"+digest).CombinedOutput(); err != nil {
+		t.Fatalf("re-create sandbox: %v: %s", err, out)
+	}
+	t.Cleanup(func() { _ = exec.Command(bin, "rm", "-f", name).Run() })
+
+	// Second lifetime: recovery must refuse the substituted instance.
+	srv2 := startServer(t, Config{
+		SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys, Backend: backend,
+	})
+	deadline := time.Now().Add(30 * time.Second)
+	var final *LedgerJob
+	for time.Now().Before(deadline) {
+		final, _ = srv2.Ledger().Get(jobID)
+		if final != nil && (final.State == JobStateDispatchAmbig || final.State == JobStateInterrupted) {
+			break
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	if final == nil || (final.State != JobStateDispatchAmbig && final.State != JobStateInterrupted) {
+		t.Fatalf("a substituted VM instance was not left unresolved: %+v", final)
+	}
+	if final.ResultJSON != "" || final.ReceiptSHA256 != "" {
+		t.Fatalf("a substituted VM instance produced a result: %+v", final)
+	}
+	if final.BackendBootID != row.BackendBootID {
+		t.Fatalf("the recorded boot generation changed: %q → %q", row.BackendBootID, final.BackendBootID)
 	}
 }

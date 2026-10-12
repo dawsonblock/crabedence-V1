@@ -72,7 +72,42 @@ func VerifyEvidenceDir(ledgerPath, evidenceDir, checkpointPath string, trusted m
 	r.verifyReceipts(filepath.Join(evidenceDir, "receipts.jsonl"), byID, refs)
 	r.verifyCheckpoint(evidenceDir, checkpointPath, refs)
 	r.verifyArtifacts(jobs)
+	r.verifyExecutionIdentity(jobs)
 	return r
+}
+
+// verifyExecutionIdentity checks that every result names the same
+// execution the ledger recorded — the runtime-owned run identity, the
+// VM boot generation and the effective-policy digest. The executor's
+// word is not enough: the verifier compares the signed-adjacent result
+// against the durable row, so a result produced under a different
+// policy, in a different VM, or from a different run is a finding.
+func (r *VerifyReport) verifyExecutionIdentity(jobs []*LedgerJob) {
+	for _, j := range jobs {
+		if j.ResultJSON == "" {
+			continue
+		}
+		var res ExecResult
+		if err := json.Unmarshal([]byte(j.ResultJSON), &res); err != nil {
+			r.fail("job %s: result_json unparseable: %v", j.JobID, err)
+			continue
+		}
+		for _, field := range []struct {
+			name           string
+			result, ledger string
+		}{
+			{"run identity", res.RunID, j.BackendJobID},
+			{"boot generation", res.BootID, j.BackendBootID},
+			{"policy digest", res.PolicyDigest, j.PolicyDigest},
+		} {
+			switch {
+			case field.result == "" && field.ledger == "":
+				// Both absent (a pre-binding row) — nothing to compare.
+			case field.result != field.ledger:
+				r.fail("job %s: result %s %q does not match the ledger's %q", j.JobID, field.name, field.result, field.ledger)
+			}
+		}
+	}
 }
 
 func (r *VerifyReport) fail(format string, args ...any) {

@@ -91,6 +91,13 @@ type LedgerJob struct {
 	// Microsandbox job id) the launch was observed through. Empty
 	// for backends without one.
 	BackendJobID string
+	// BackendBootID is the VM boot generation the run was verified
+	// in — the substituted-instance control the recovery pass
+	// enforces.
+	BackendBootID string
+	// PolicyDigest is the digest of the effective policy the run was
+	// authorized under.
+	PolicyDigest string
 	ReceivedAt   time.Time
 	UpdatedAt    time.Time
 	ExitCode     *int64
@@ -215,7 +222,7 @@ func (l *Ledger) Epoch() uint64 { return l.epoch }
 // ledgers (from the admission-only spike) get their new columns via
 // ALTER TABLE rather than a destructive rebuild, and v3 adds the
 // runtime run identity plus cleanup tracking.
-const ledgerSchemaVersion = 3
+const ledgerSchemaVersion = 4
 
 func (l *Ledger) migrate() error {
 	var version int
@@ -240,6 +247,8 @@ func (l *Ledger) migrate() error {
 			backend_id     TEXT NOT NULL DEFAULT '',
 			backend_handle TEXT NOT NULL DEFAULT '',
 			backend_job_id TEXT NOT NULL DEFAULT '',
+			backend_boot_id TEXT NOT NULL DEFAULT '',
+			policy_digest  TEXT NOT NULL DEFAULT '',
 			received_at    INTEGER NOT NULL,
 			updated_at     INTEGER NOT NULL,
 			exit_code      INTEGER,
@@ -282,6 +291,20 @@ func (l *Ledger) migrate() error {
 		} {
 			if _, err := l.db.Exec(ddl); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 				return fmt.Errorf("migrate ledger v%d→v3: %w", version, err)
+			}
+		}
+	}
+	if version < 4 {
+		// v3 → v4: the VM boot generation and the effective-policy
+		// digest the run was authorized under. Existing rows keep
+		// empty values — a pre-v4 executor recorded neither, which
+		// their unresolved or unverified state already says.
+		for _, ddl := range []string{
+			`ALTER TABLE jobs ADD COLUMN backend_boot_id TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE jobs ADD COLUMN policy_digest TEXT NOT NULL DEFAULT ''`,
+		} {
+			if _, err := l.db.Exec(ddl); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+				return fmt.Errorf("migrate ledger v%d→v4: %w", version, err)
 			}
 		}
 	}
@@ -444,7 +467,8 @@ func (l *Ledger) hashExistsTx(tx *sql.Tx, hash string) bool {
 
 // jobColumns is the canonical SELECT list for a full jobs row.
 const jobColumns = `job_id, contract_hash, seq, submitter, principal, image, contract_json,
-	state, fence_epoch, backend_id, backend_handle, backend_job_id, received_at, updated_at,
+	state, fence_epoch, backend_id, backend_handle, backend_job_id, backend_boot_id, policy_digest,
+	received_at, updated_at,
 	exit_code, error, result_json, terminal_seq, receipt_sha256, artifact_sha256,
 	cleanup_pending, cleanup_error`
 
@@ -465,7 +489,8 @@ func scanFields(j *LedgerJob) []any {
 	return []any{
 		&j.JobID, &j.ContractHash, &j.Seq, &j.Submitter, &j.Principal, &j.Image,
 		&j.ContractJSON, &j.State, &j.FenceEpoch, &j.BackendID, &j.BackendHandle,
-		&j.BackendJobID, &j.receivedAtRaw, &j.updatedAtRaw, &j.exitRaw, &j.Error, &j.ResultJSON,
+		&j.BackendJobID, &j.BackendBootID, &j.PolicyDigest,
+		&j.receivedAtRaw, &j.updatedAtRaw, &j.exitRaw, &j.Error, &j.ResultJSON,
 		&j.termSeqRaw, &j.ReceiptSHA256, &j.ArtifactSHA256,
 		&j.cleanupPendingRaw, &j.CleanupError,
 	}
@@ -533,18 +558,22 @@ func (l *Ledger) ReconcileCandidates(limit int) ([]*LedgerJob, error) {
 	return out, rows.Err()
 }
 
-// AdoptBackendRun records the runtime-owned run identity a reconcile
-// pass recovered for a non-terminal row — the crash window between
-// the runtime admitting a job and the ledger naming it. It is only
-// ever called on unresolved rows: a terminal row's identity is
-// already committed to by its receipt and checkpoint.
-func (l *Ledger) AdoptBackendRun(jobID, runID string) error {
+// AdoptBackendRun records the runtime-owned run identity and boot
+// generation a reconcile pass recovered for a non-terminal row — the
+// crash window between the runtime admitting a job and the ledger
+// naming it. It is only ever called on unresolved rows: a terminal
+// row's identity is already committed to by its receipt and
+// checkpoint.
+func (l *Ledger) AdoptBackendRun(jobID, runID, bootID string) error {
 	if runID == "" {
 		return fmt.Errorf("adopt run identity for %s: empty run id", jobID)
 	}
+	if bootID == "" {
+		return fmt.Errorf("adopt run identity for %s: empty boot generation", jobID)
+	}
 	res, err := l.db.Exec(
-		`UPDATE jobs SET backend_job_id = ? WHERE job_id = ? AND terminal_seq IS NULL`,
-		runID, jobID)
+		`UPDATE jobs SET backend_job_id = ?, backend_boot_id = ? WHERE job_id = ? AND terminal_seq IS NULL`,
+		runID, bootID, jobID)
 	if err != nil {
 		return fmt.Errorf("adopt run identity for %s: %w", jobID, err)
 	}
@@ -783,12 +812,14 @@ func (l *Ledger) Transition(jobID, to string, from []string, mutate func(*Ledger
 	}
 	res, err := tx.Exec(
 		`UPDATE jobs SET state = ?, fence_epoch = ?, backend_id = ?, backend_handle = ?,
-		 backend_job_id = ?, updated_at = ?, exit_code = ?, error = ?, result_json = ?,
+		 backend_job_id = ?, backend_boot_id = ?, policy_digest = ?,
+		 updated_at = ?, exit_code = ?, error = ?, result_json = ?,
 		 terminal_seq = ?, receipt_sha256 = ?, artifact_sha256 = ?,
 		 cleanup_pending = ?, cleanup_error = ?
 		 WHERE job_id = ? AND seq = ?`,
 		job.State, job.FenceEpoch, job.BackendID, job.BackendHandle,
-		job.BackendJobID, time.Now().UTC().UnixMilli(), exit, job.Error, job.ResultJSON,
+		job.BackendJobID, job.BackendBootID, job.PolicyDigest,
+		time.Now().UTC().UnixMilli(), exit, job.Error, job.ResultJSON,
 		termSeq, job.ReceiptSHA256, job.ArtifactSHA256,
 		cleanupPending, job.CleanupError,
 		jobID, job.Seq)

@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -185,6 +186,11 @@ type MSBBackend struct {
 	// against; empty means PinnedMSBVersion. VerifyRuntime refuses
 	// any other version.
 	RequiredVersion string
+	// RuntimeManifest pins the exact bytes of the runtime — the msb
+	// executable and the libkrunfw firmware. It is required: a runtime
+	// that reports the pinned version but hashes differently is a
+	// substituted runtime and refuses. Nil refuses verification.
+	RuntimeManifest *RuntimeManifest
 	// PollInterval paces Wait's observation polls; zero uses
 	// jobPollInterval.
 	PollInterval time.Duration
@@ -193,6 +199,53 @@ type MSBBackend struct {
 	// It exists so tests can exercise unobserved-outcome paths in
 	// bounded time — operators leave it at the default.
 	ObservationSlack time.Duration
+
+	// envMu guards the per-image environment baseline cache; the
+	// baseline is fixed for a pinned digest, so it is resolved once.
+	envMu       sync.Mutex
+	envBaseline map[string][]string
+}
+
+// imageEnvBaseline resolves the pinned image's own config environment
+// — the part of the guest environment the runtime injects at boot, and
+// therefore part of the authorized set. The result is cached per
+// digest: it cannot change while the digest is pinned.
+func (b *MSBBackend) imageEnvBaseline(ctx context.Context, job *JobContractV2) ([]string, error) {
+	b.envMu.Lock()
+	if env, ok := b.envBaseline[job.ImageDigest]; ok {
+		b.envMu.Unlock()
+		return append([]string{}, env...), nil
+	}
+	b.envMu.Unlock()
+	// The lookup is a cached read of a pinned artifact: it gets its own
+	// bounded context so a cold lookup can never consume the dispatch's
+	// launch budget (or be cancelled mid-flight by it).
+	lookupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	defer cancel()
+	out, err := b.runOnce(lookupCtx, "image", "inspect", "--format", "json", job.Image+"@"+job.ImageDigest)
+	if err != nil {
+		return nil, fmt.Errorf("inspect the pinned image %s: %v: %s", job.ImageDigest, err, strings.TrimSpace(string(out)))
+	}
+	var doc struct {
+		Digest string `json:"digest"`
+		Config struct {
+			Env []string `json:"env"`
+		} `json:"config"`
+	}
+	if err := json.Unmarshal(out, &doc); err != nil {
+		return nil, fmt.Errorf("inspect the pinned image %s: malformed json: %w", job.ImageDigest, err)
+	}
+	if doc.Digest != job.ImageDigest {
+		return nil, fmt.Errorf("image inspect reports digest %s, the contract authorized %s — refusing a substituted image", doc.Digest, job.ImageDigest)
+	}
+	env := normalizeEnvSet(doc.Config.Env)
+	b.envMu.Lock()
+	if b.envBaseline == nil {
+		b.envBaseline = map[string][]string{}
+	}
+	b.envBaseline[job.ImageDigest] = env
+	b.envMu.Unlock()
+	return append([]string{}, env...), nil
 }
 
 // requiredVersion is the effective runtime pin.
@@ -240,10 +293,11 @@ func (b *MSBBackend) VerifyHost(ctx context.Context) (string, error) {
 }
 
 // VerifyRuntime proves the configured msb binary is the pinned
-// version — the adapter's observation semantics are qualified against
-// one runtime's job protocol, and a silent version drift would
-// invalidate exactly the properties this backend exists to provide.
-// It returns the observed version for the startup report.
+// version AND the qualified bytes — the executable and the firmware it
+// boots guests with must hash to the runtime manifest. A binary that
+// reports the right version but differs in content is a substituted
+// runtime, and the version string alone would never catch it. It
+// returns the observed version for the startup report.
 func (b *MSBBackend) VerifyRuntime(ctx context.Context) (string, error) {
 	out, err := b.runOnce(ctx, "--version")
 	if err != nil {
@@ -256,6 +310,9 @@ func (b *MSBBackend) VerifyRuntime(ctx context.Context) (string, error) {
 	got := fields[1]
 	if got != b.requiredVersion() {
 		return got, fmt.Errorf("msb %s is not the pinned runtime %s — the adapter's job-protocol semantics are qualified against the pinned version; upgrade the runtime or pin the qualified version explicitly", got, b.requiredVersion())
+	}
+	if _, err := b.verifyRuntimeIdentity(ctx, got); err != nil {
+		return got, err
 	}
 	return got, nil
 }
@@ -484,23 +541,51 @@ func parseRunID(out string) (string, bool) {
 	return found, found != ""
 }
 
-// listJobs returns the runtime's job records for a sandbox. It is the
-// recovery probe: when a detached launch fails without naming its job,
-// the sandbox may still hold one — the launch may have been admitted
-// and its identity lost in transport, and a blind re-launch would
-// duplicate it.
+// listJobs returns the runtime's complete job records for a sandbox.
+// It is the recovery probe: when a detached launch fails without
+// naming its job, the sandbox may still hold one — the launch may have
+// been admitted and its identity lost in transport, and a blind
+// re-launch would duplicate it.
+//
+// Discovery is exhaustive: the runtime pages its job list, so every
+// page is followed until the runtime reports no continuation. A
+// cursor that repeats, or a list that exceeds the page bound, is an
+// error — incomplete discovery is never mistaken for absence of
+// execution.
 func (b *MSBBackend) listJobs(ctx context.Context, name string) ([]msbJobRecord, error) {
-	out, err := b.runOnce(ctx, "jobs", "--all", "--format", "json", name)
-	if err != nil {
-		return nil, fmt.Errorf("msb jobs %s: %v: %s", name, err, strings.TrimSpace(string(out)))
+	const pageLimit = 200
+	const maxPages = 25
+	var all []msbJobRecord
+	cursor := ""
+	seen := map[string]bool{}
+	for page := 0; page < maxPages; page++ {
+		args := []string{"jobs", "--all", "--format", "json", "--limit", fmt.Sprint(pageLimit)}
+		if cursor != "" {
+			args = append(args, "--cursor", cursor)
+		}
+		args = append(args, name)
+		out, err := b.runOnce(ctx, args...)
+		if err != nil {
+			return nil, fmt.Errorf("msb jobs %s: %v: %s", name, err, strings.TrimSpace(string(out)))
+		}
+		var doc struct {
+			Items      []msbJobRecord `json:"items"`
+			NextCursor *string        `json:"next_cursor"`
+		}
+		if err := json.Unmarshal(out, &doc); err != nil {
+			return nil, fmt.Errorf("msb jobs %s: malformed json: %w", name, err)
+		}
+		all = append(all, doc.Items...)
+		if doc.NextCursor == nil || *doc.NextCursor == "" {
+			return all, nil
+		}
+		if seen[*doc.NextCursor] {
+			return nil, fmt.Errorf("msb jobs %s: the runtime repeated page cursor %q — refusing to treat incomplete discovery as absence", name, *doc.NextCursor)
+		}
+		seen[*doc.NextCursor] = true
+		cursor = *doc.NextCursor
 	}
-	var page struct {
-		Items []msbJobRecord `json:"items"`
-	}
-	if err := json.Unmarshal(out, &page); err != nil {
-		return nil, fmt.Errorf("msb jobs %s: malformed json: %w", name, err)
-	}
-	return page.Items, nil
+	return nil, fmt.Errorf("msb jobs %s: job discovery exceeded %d pages — refusing to treat incomplete discovery as absence", name, maxPages)
 }
 
 // matchContractJobs returns the sandbox's jobs whose recorded command
@@ -550,19 +635,38 @@ func sameArgv(recorded, authorized []string) bool {
 // A dispatch deadline that expires mid-create is ambiguous by
 // construction — the VM may exist — so the handle is returned for
 // reconcile, never a blind retry.
-func (b *MSBBackend) Dispatch(ctx context.Context, job *JobContractV2) (DispatchResult, error) {
+func (b *MSBBackend) Dispatch(ctx context.Context, job *JobContractV2) (RunIdentity, error) {
 	if job == nil {
-		return DispatchResult{}, fmt.Errorf("dispatch requires a signed job contract")
+		return RunIdentity{}, fmt.Errorf("dispatch requires a signed job contract")
 	}
 	name := b.msbJobName(job.JobID)
 	nonce, err := dispatchNonce()
 	if err != nil {
-		return DispatchResult{}, err
+		return RunIdentity{}, err
 	}
 	createArgs, err := b.createArgs(job, name, nonce)
 	if err != nil {
-		return DispatchResult{}, err
+		return RunIdentity{}, err
 	}
+
+	// The canonical policy is compiled before anything boots: it is
+	// what the VM must match, and its digest is the authorization
+	// identity the result will carry. The pinned image's own config
+	// environment is part of the authorized set — the runtime injects
+	// it into every VM booted from that digest.
+	imageEnv, err := b.imageEnvBaseline(ctx, job)
+	if err != nil {
+		return RunIdentity{}, err
+	}
+	policy, err := b.buildEffectivePolicy(job, name, nonce, b.requiredVersion(), imageEnv)
+	if err != nil {
+		return RunIdentity{}, err
+	}
+	policyDigest, err := policy.Digest()
+	if err != nil {
+		return RunIdentity{}, err
+	}
+	identity := RunIdentity{Handle: name, PolicyDigest: policyDigest}
 
 	out, cerr := b.runOnce(ctx, createArgs...)
 	if cerr != nil {
@@ -570,65 +674,100 @@ func (b *MSBBackend) Dispatch(ctx context.Context, job *JobContractV2) (Dispatch
 			// The VM may exist; the dispatch never reached a
 			// verified launch, so the handle is returned for
 			// reconcile, never a blind retry.
-			return DispatchResult{Handle: name}, fmt.Errorf("%w: create deadline expired before the VM was proven: %v", ErrAmbiguousDispatch, ctx.Err())
+			return identity, fmt.Errorf("%w: create deadline expired before the VM was proven: %v", ErrAmbiguousDispatch, ctx.Err())
 		}
 		if strings.Contains(strings.ToLower(string(out)), "already exists") {
-			return DispatchResult{}, fmt.Errorf("sandbox %q already exists — refusing to reuse a VM this dispatch did not create", name)
+			return RunIdentity{}, fmt.Errorf("sandbox %q already exists — refusing to reuse a VM this dispatch did not create", name)
 		}
 		// A create can fail after the VM was already booted (a guest
 		// validation error, for instance). Destroy the leftover only
 		// when it carries this dispatch's identity label — proof it
 		// came from this create, not from someone else.
 		b.destroyIfOurs(name, nonce)
-		return DispatchResult{}, fmt.Errorf("msb create failed: %v: %s", cerr, strings.TrimSpace(string(out)))
+		return RunIdentity{}, fmt.Errorf("msb create failed: %v: %s", cerr, strings.TrimSpace(string(out)))
 	}
 
 	// Pre-execution policy verification: the VM that boots must be
-	// the VM the contract authorized, or it never runs the job.
+	// the VM the canonical policy describes, exactly, or it never
+	// runs the job. The boot generation is then bound to the
+	// dispatch, so a substituted VM under the same name cannot be
+	// adopted later.
 	doc, ierr := b.inspectRaw(ctx, name)
 	if ierr != nil {
 		b.destroy(name)
-		return DispatchResult{}, fmt.Errorf("verify sandbox %s before execution: %w", name, ierr)
+		return RunIdentity{}, fmt.Errorf("verify sandbox %s before execution: %w", name, ierr)
 	}
-	if verr := verifySandboxPolicy(job, name, nonce, b.deploymentProfile(), doc); verr != nil {
+	if verr := verifyBootedPolicy(policy, doc); verr != nil {
 		b.destroy(name)
-		return DispatchResult{}, fmt.Errorf("sandbox %s failed policy verification — destroyed before execution: %w", name, verr)
+		return RunIdentity{}, fmt.Errorf("sandbox %s failed policy verification — destroyed before execution: %w", name, verr)
 	}
+	bootID, berr := b.sandboxBootID(doc)
+	if berr != nil {
+		b.destroy(name)
+		return RunIdentity{}, fmt.Errorf("bind the VM boot generation of %s before execution: %w", name, berr)
+	}
+	identity.BootID = bootID
 
 	lout, lerr := b.runOnce(ctx, b.launchArgs(job, name)...)
 	if lerr == nil {
 		if runID, ok := parseRunID(string(lout)); ok {
-			return DispatchResult{Handle: name, RunID: runID}, nil
+			if aerr := b.verifyLaunchedRun(ctx, name, runID, bootID); aerr != nil {
+				b.destroy(name)
+				return identity, aerr
+			}
+			identity.RunID = runID
+			return identity, nil
 		}
 	}
 	// The launch did not name a job. It may still have been admitted:
 	// probe the sandbox before calling it a refusal, and adopt the
-	// job the runtime recorded rather than duplicating it.
+	// job the runtime recorded rather than duplicating it — provided
+	// it runs in the boot generation this dispatch verified.
 	probeCtx, cancel := context.WithTimeout(ctx, b.dispatchProbeTimeout())
 	defer cancel()
 	jobs, perr := b.listJobs(probeCtx, name)
 	switch {
 	case perr != nil:
 		// The probe failed too — the outcome is genuinely unknown.
-		return DispatchResult{Handle: name}, fmt.Errorf("%w: detached launch failed (%v: %s) and the job list could not be read: %v",
+		return identity, fmt.Errorf("%w: detached launch failed (%v: %s) and the job list could not be read: %v",
 			ErrAmbiguousDispatch, lerr, strings.TrimSpace(string(lout)), perr)
 	default:
 		matched := matchContractJobs(jobs, job)
 		switch len(matched) {
 		case 1:
 			// The launch was admitted; only its identity was lost.
-			return DispatchResult{Handle: name, RunID: matched[0].ID}, nil
+			if matched[0].RuntimeBoot != bootID {
+				b.destroy(name)
+				return identity, fmt.Errorf("the sandbox records job %s under boot generation %s, not the verified %s — refusing to adopt a substituted VM instance",
+					matched[0].ID, matched[0].RuntimeBoot, bootID)
+			}
+			identity.RunID = matched[0].ID
+			return identity, nil
 		case 0:
 			b.destroy(name)
 			if lerr != nil {
-				return DispatchResult{}, fmt.Errorf("msb exec -d failed: %v: %s", lerr, strings.TrimSpace(string(lout)))
+				return RunIdentity{}, fmt.Errorf("msb exec -d failed: %v: %s", lerr, strings.TrimSpace(string(lout)))
 			}
-			return DispatchResult{}, fmt.Errorf("msb exec -d named no job and the sandbox records none: %s", strings.TrimSpace(string(lout)))
+			return RunIdentity{}, fmt.Errorf("msb exec -d named no job and the sandbox records none: %s", strings.TrimSpace(string(lout)))
 		default:
-			return DispatchResult{Handle: name}, fmt.Errorf("%w: sandbox %s records %d jobs matching the authorized command — an operator must reconcile them",
+			return identity, fmt.Errorf("%w: sandbox %s records %d jobs matching the authorized command — an operator must reconcile them",
 				ErrAmbiguousDispatch, name, len(matched))
 		}
 	}
+}
+
+// verifyLaunchedRun proves the runtime-owned job the launch named is
+// running in the boot generation this dispatch verified — the
+// execution-identity binding between the VM and the job.
+func (b *MSBBackend) verifyLaunchedRun(ctx context.Context, name, runID, bootID string) error {
+	rec, err := b.inspectJob(ctx, name, runID)
+	if err != nil {
+		return fmt.Errorf("verify the launched job %s: %w", runID, err)
+	}
+	if rec.RuntimeBoot != bootID {
+		return fmt.Errorf("job %s reports boot generation %s but the verified VM is %s — refusing a substituted VM instance", runID, rec.RuntimeBoot, bootID)
+	}
+	return nil
 }
 
 // dispatchProbeTimeout bounds the post-failure job-list probe so a
@@ -722,31 +861,63 @@ func (b *MSBBackend) Inspect(ctx context.Context, handle string) (bool, error) {
 // window between the runtime admitting a job and the ledger naming it
 // — the runtime's own job list is the proof of what was admitted: a
 // single job matching the authorized argv is adopted; zero or several
-// are unobserved, never guessed at. The run is then observed exactly
-// as a live monitor would, so a recovered job reaches the same
-// terminal result and artifact it would have reached live.
-func (b *MSBBackend) Resume(ctx context.Context, job *JobContractV2, handle, runID string) (string, *ExecResult, error) {
+// are unobserved, never guessed at. A recovered job must run in the
+// boot generation the ledger recorded (when it recorded one): a
+// substituted VM under the same name is never adopted. The run is then
+// observed exactly as a live monitor would, so a recovered job reaches
+// the same terminal result and artifact it would have reached live.
+func (b *MSBBackend) Resume(ctx context.Context, job *JobContractV2, run RunIdentity) (RunIdentity, *ExecResult, error) {
 	if job == nil {
-		return runID, nil, fmt.Errorf("resume requires the job's signed contract")
+		return run, nil, fmt.Errorf("resume requires the job's signed contract")
 	}
-	if runID == "" {
-		jobs, err := b.listJobs(ctx, handle)
+	// The sandbox's *current* boot generation must be the one the
+	// ledger recorded: a VM re-created under the same name is a
+	// substituted instance, and nothing it records is this run.
+	doc, derr := b.inspectRaw(ctx, run.Handle)
+	if derr != nil {
+		return run, nil, fmt.Errorf("%w: cannot inspect the sandbox to bind its boot generation: %v", ErrExecutionUnobserved, derr)
+	}
+	currentBoot, berr := b.sandboxBootID(doc)
+	if berr != nil {
+		return run, nil, fmt.Errorf("%w: %v", ErrExecutionUnobserved, berr)
+	}
+	if run.BootID != "" && currentBoot != run.BootID {
+		return run, nil, fmt.Errorf("%w: sandbox %s is boot generation %s, not the dispatch's %s — refusing to adopt a substituted VM instance",
+			ErrExecutionUnobserved, run.Handle, currentBoot, run.BootID)
+	}
+	if run.RunID == "" {
+		jobs, err := b.listJobs(ctx, run.Handle)
 		if err != nil {
-			return "", nil, fmt.Errorf("%w: cannot read the sandbox's job list: %v", ErrExecutionUnobserved, err)
+			return run, nil, fmt.Errorf("%w: cannot read the sandbox's job list: %v", ErrExecutionUnobserved, err)
 		}
 		matched := matchContractJobs(jobs, job)
 		switch len(matched) {
 		case 0:
-			return "", nil, fmt.Errorf("%w: sandbox %s records no job matching the authorized command", ErrExecutionUnobserved, handle)
+			return run, nil, fmt.Errorf("%w: sandbox %s records no job matching the authorized command", ErrExecutionUnobserved, run.Handle)
 		case 1:
-			runID = matched[0].ID
+			// The recovered job must be the boot generation the
+			// ledger recorded; when the ledger recorded none (the
+			// crash window), the job's own generation is adopted —
+			// it is the runtime's record of what ran.
+			if run.BootID != "" && matched[0].RuntimeBoot != run.BootID {
+				return run, nil, fmt.Errorf("%w: sandbox %s records job %s under boot generation %s, not the dispatch's %s — refusing to adopt a substituted VM instance",
+					ErrExecutionUnobserved, run.Handle, matched[0].ID, matched[0].RuntimeBoot, run.BootID)
+			}
+			if matched[0].RuntimeBoot != currentBoot {
+				return run, nil, fmt.Errorf("%w: sandbox %s is boot generation %s but its job %s belongs to %s — refusing to adopt a substituted VM instance",
+					ErrExecutionUnobserved, run.Handle, currentBoot, matched[0].ID, matched[0].RuntimeBoot)
+			}
+			run.RunID = matched[0].ID
+			if run.BootID == "" {
+				run.BootID = matched[0].RuntimeBoot
+			}
 		default:
-			return "", nil, fmt.Errorf("%w: sandbox %s records %d jobs matching the authorized command — an operator must reconcile them",
-				ErrExecutionUnobserved, handle, len(matched))
+			return run, nil, fmt.Errorf("%w: sandbox %s records %d jobs matching the authorized command — an operator must reconcile them",
+				ErrExecutionUnobserved, run.Handle, len(matched))
 		}
 	}
-	res, err := b.Wait(ctx, job, handle, runID)
-	return runID, res, err
+	res, err := b.Wait(ctx, job, run)
+	return run, res, err
 }
 
 // Wait observes the job's runtime-owned record until it is terminal,
@@ -765,12 +936,15 @@ func (b *MSBBackend) Resume(ctx context.Context, job *JobContractV2, handle, run
 // the observation together with an error — the plan's "not fully
 // verified" — and anything unobservable returns
 // ErrExecutionUnobserved. Neither is ever a terminal claim.
-func (b *MSBBackend) Wait(ctx context.Context, job *JobContractV2, handle, runID string) (*ExecResult, error) {
+func (b *MSBBackend) Wait(ctx context.Context, job *JobContractV2, run RunIdentity) (*ExecResult, error) {
 	if job == nil {
 		return nil, fmt.Errorf("wait requires the job's signed contract")
 	}
-	if !jobIDPattern.MatchString(runID) {
-		return nil, fmt.Errorf("%w: run identity %q is not a runtime job id", ErrExecutionUnobserved, runID)
+	if !jobIDPattern.MatchString(run.RunID) {
+		return nil, fmt.Errorf("%w: run identity %q is not a runtime job id", ErrExecutionUnobserved, run.RunID)
+	}
+	if !bootIDPattern.MatchString(run.BootID) {
+		return nil, fmt.Errorf("%w: boot generation %q is not a runtime boot id — refusing to observe a run without its VM identity", ErrExecutionUnobserved, run.BootID)
 	}
 	slack := b.ObservationSlack
 	if slack <= 0 {
@@ -780,7 +954,7 @@ func (b *MSBBackend) Wait(ctx context.Context, job *JobContractV2, handle, runID
 	obsCtx, cancelObs := context.WithTimeout(ctx, window)
 	defer cancelObs()
 
-	res, err := b.observe(obsCtx, ctx, job, handle, runID)
+	res, err := b.observe(obsCtx, ctx, job, run)
 	if err != nil {
 		return nil, err
 	}
@@ -791,7 +965,7 @@ func (b *MSBBackend) Wait(ctx context.Context, job *JobContractV2, handle, runID
 	// deadline does not doom the artifact.
 	capCtx, cancelCap := context.WithTimeout(ctx, captureMargin)
 	defer cancelCap()
-	cap, cerr := b.capture(capCtx, job, handle, runID)
+	cap, cerr := b.capture(capCtx, job, run.Handle, run.RunID)
 	if cerr != nil {
 		return res, fmt.Errorf("artifact finalization failed for job %s: %w", job.JobID, cerr)
 	}
@@ -807,21 +981,25 @@ func (b *MSBBackend) Wait(ctx context.Context, job *JobContractV2, handle, runID
 // parent distinguishes a shutdown (its cancellation is returned as
 // such — the row stays RUNNING for reconcile) from the observation
 // deadline (an unobserved outcome).
-func (b *MSBBackend) observe(obsCtx, parent context.Context, job *JobContractV2, handle, runID string) (*ExecResult, error) {
+func (b *MSBBackend) observe(obsCtx, parent context.Context, job *JobContractV2, run RunIdentity) (*ExecResult, error) {
 	interval := b.PollInterval
 	if interval <= 0 {
 		interval = jobPollInterval
 	}
 	var lastErr error
 	for {
-		rec, err := b.inspectJob(obsCtx, handle, runID)
+		rec, err := b.inspectJob(obsCtx, run.Handle, run.RunID)
 		if err == nil {
 			if !sameArgv(rec.Command, job.Argv) {
-				return nil, fmt.Errorf("%w: job %s records a different command than the contract authorized", ErrExecutionUnobserved, runID)
+				return nil, fmt.Errorf("%w: job %s records a different command than the contract authorized", ErrExecutionUnobserved, run.RunID)
+			}
+			if rec.RuntimeBoot != run.BootID {
+				return nil, fmt.Errorf("%w: job %s reports boot generation %s, not the dispatch's %s — a substituted VM is never adopted",
+					ErrExecutionUnobserved, run.RunID, rec.RuntimeBoot, run.BootID)
 			}
 			switch rec.State {
 			case "exited":
-				res := &ExecResult{RuntimeState: rec.State, RunID: runID, FinishedAt: rec.finishedAt()}
+				res := &ExecResult{RuntimeState: rec.State, RunID: run.RunID, BootID: run.BootID, PolicyDigest: run.PolicyDigest, FinishedAt: rec.finishedAt()}
 				switch {
 				case rec.TimedOut:
 					// The runtime killed the command at the deadline:
@@ -831,7 +1009,7 @@ func (b *MSBBackend) observe(obsCtx, parent context.Context, job *JobContractV2,
 					res.ExitVerified = true
 					res.ExitCode = *rec.ExitCode
 				default:
-					return nil, fmt.Errorf("%w: job %s is exited without an exit code and without a timeout", ErrExecutionUnobserved, runID)
+					return nil, fmt.Errorf("%w: job %s is exited without an exit code and without a timeout", ErrExecutionUnobserved, run.RunID)
 				}
 				return res, nil
 			case "failed":
@@ -841,13 +1019,15 @@ func (b *MSBBackend) observe(obsCtx, parent context.Context, job *JobContractV2,
 				}
 				return &ExecResult{
 					RuntimeState:   rec.State,
-					RunID:          runID,
+					RunID:          run.RunID,
+					BootID:         run.BootID,
+					PolicyDigest:   run.PolicyDigest,
 					FailureKind:    kind,
 					FailureMessage: rec.Failure.text(),
 					FinishedAt:     rec.finishedAt(),
 				}, nil
 			case "lost":
-				return nil, fmt.Errorf("%w: the runtime lost job %s: %s", ErrExecutionUnobserved, runID, rec.errorText())
+				return nil, fmt.Errorf("%w: the runtime lost job %s: %s", ErrExecutionUnobserved, run.RunID, rec.errorText())
 			}
 		} else {
 			lastErr = err
@@ -858,9 +1038,9 @@ func (b *MSBBackend) observe(obsCtx, parent context.Context, job *JobContractV2,
 				return nil, parent.Err()
 			}
 			if lastErr != nil {
-				return nil, fmt.Errorf("%w: no terminal record for job %s within its observation window (last error: %v)", ErrExecutionUnobserved, runID, lastErr)
+				return nil, fmt.Errorf("%w: no terminal record for job %s within its observation window (last error: %v)", ErrExecutionUnobserved, run.RunID, lastErr)
 			}
-			return nil, fmt.Errorf("%w: job %s did not reach a terminal state within its observation window", ErrExecutionUnobserved, runID)
+			return nil, fmt.Errorf("%w: job %s did not reach a terminal state within its observation window", ErrExecutionUnobserved, run.RunID)
 		case <-time.After(interval):
 		}
 	}
@@ -933,9 +1113,12 @@ func (b *MSBBackend) capture(ctx context.Context, job *JobContractV2, name, runI
 		return nil, fmt.Errorf("publish artifact %s: %w", finalPath, err)
 	}
 	published = true
-	if dir, err := os.Open(b.StateDir); err == nil {
-		_ = dir.Sync()
-		_ = dir.Close()
+	// The rename's durability is part of the artifact's integrity: an
+	// unsynced directory can lose the published name in a crash while
+	// evidence already claims the digest. A sync failure is an
+	// unfinalized artifact — the result is not fully verified.
+	if err := syncDir(b.StateDir); err != nil {
+		return nil, fmt.Errorf("commit artifact directory %s: %w", b.StateDir, err)
 	}
 	// Read-back: the digest bound to evidence must be the digest of
 	// the published bytes, not of a stream that was written.
@@ -954,8 +1137,22 @@ func (b *MSBBackend) capture(ctx context.Context, job *JobContractV2, name, runI
 	return &captureResult{path: finalPath, sha256: readBack, nbytes: nbytes, truncated: truncated}, nil
 }
 
-// boundedArtifactWriter stores at most bound bytes of the runtime's
-// retained output and hashes exactly the stored bytes. Bytes past the
+// syncDir commits a directory entry (a rename's new name) to stable
+// storage — the durability half of atomic publication.
+func syncDir(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	serr := dir.Sync()
+	cerr := dir.Close()
+	if serr != nil {
+		return serr
+	}
+	return cerr
+}
+
+// boundedArtifactWriter stores at most bound bytes of the runtime's// retained output and hashes exactly the stored bytes. Bytes past the
 // bound are drained and discarded — never hashed — so the digest
 // always covers the artifact's content, and truncation is an explicit
 // observation rather than a silent cut.
@@ -1028,14 +1225,12 @@ func (b *MSBBackend) Close() error { return nil }
 // Name is the provider identity receipts and ledger rows attest.
 func (b *MSBBackend) Name() string { return "microsandbox" }
 
-// ─── Runtime policy verification ─────────────────────────────────────
+// ─── Policy inspection helpers ───────────────────────────────────────
 //
 // A signed contract is a claim about the VM that should run; the
-// inspect document is what actually booted. verifySandboxPolicy
-// compares the two and refuses on any difference — an unapproved
-// setting is a refusal, never a warning. This runs before the guest
-// command starts, so a VM that fails verification never executes the
-// job at all.
+// inspect document is what actually booted. The canonical policy and
+// its exact verification live in policy.go; these are the small
+// readers they share.
 
 func jsonString(m map[string]any, key string) string {
 	s, _ := m[key].(string)
@@ -1069,181 +1264,6 @@ func ruleTarget(dest map[string]any) (kind, value string) {
 	return "", ""
 }
 
-// verifySandboxPolicy proves the booted sandbox carries exactly the
-// policy the signed contract authorized. The persisted `config` is
-// the desired policy; `active_config` is what actually booted — both
-// must match, or a setting that was accepted but never applied (or is
-// pending a restart) would appear authorized while the guest runs
-// without it.
-func verifySandboxPolicy(job *JobContractV2, name, nonce, deploymentProfile string, doc map[string]any) error {
-	cfg, ok := doc["config"].(map[string]any)
-	if !ok {
-		return fmt.Errorf("inspect document carries no config object")
-	}
-	if err := verifySandboxConfig(job, name, nonce, deploymentProfile, cfg); err != nil {
-		return err
-	}
-	active, ok := doc["active_config"].(map[string]any)
-	if !ok {
-		return fmt.Errorf("sandbox has no resolved active configuration — refusing to execute in a VM that is not running its authorized policy")
-	}
-	if err := verifySandboxConfig(job, name, nonce, deploymentProfile, active); err != nil {
-		return fmt.Errorf("booted configuration diverges from the authorized policy: %w", err)
-	}
-	return nil
-}
-
-func verifySandboxConfig(job *JobContractV2, name, nonce, deploymentProfile string, cfg map[string]any) error {
-	if got := jsonString(cfg, "name"); got != name {
-		return fmt.Errorf("sandbox name %q does not match the authorized handle %q", got, name)
-	}
-	labels, _ := cfg["labels"].(map[string]any)
-	if got := jsonString(labels, "crabedence.job"); got != job.JobID {
-		return fmt.Errorf("sandbox label crabedence.job=%q does not match job %q", got, job.JobID)
-	}
-	if got := jsonString(labels, "crabedence.dispatch"); got != nonce {
-		return fmt.Errorf("sandbox dispatch label does not match this dispatch — the VM is not the one this contract created")
-	}
-	if got := jsonString(cfg, "manifest_digest"); got != job.ImageDigest {
-		return fmt.Errorf("sandbox image digest %q does not match the authorized %q", got, job.ImageDigest)
-	}
-	res, _ := cfg["resources"].(map[string]any)
-	if job.Resources.CPUs > 0 {
-		if got, ok := jsonNumber(res, "cpus"); !ok || got != job.Resources.CPUs {
-			return fmt.Errorf("sandbox cpus = %v, contract authorized %g", got, job.Resources.CPUs)
-		}
-	}
-	if job.Resources.MemoryMB > 0 {
-		if got, ok := jsonNumber(res, "memory_mib"); !ok || uint64(got) != job.Resources.MemoryMB {
-			return fmt.Errorf("sandbox memory_mib = %v, contract authorized %d", got, job.Resources.MemoryMB)
-		}
-	}
-	if job.Resources.DiskMB > 0 {
-		img, _ := cfg["image"].(map[string]any)
-		oci, _ := img["Oci"].(map[string]any)
-		rd, _ := oci["root_disk"].(map[string]any)
-		if got, ok := jsonNumber(rd, "size_mib"); !ok || uint64(got) != job.Resources.DiskMB {
-			return fmt.Errorf("sandbox root disk size_mib = %v, contract authorized %d", got, job.Resources.DiskMB)
-		}
-	}
-	lc, _ := cfg["lifecycle"].(map[string]any)
-	if got, ok := jsonNumber(lc, "max_duration_secs"); !ok || uint32(got) != uint32(vmMaxDuration(job)/time.Second) {
-		return fmt.Errorf("sandbox max_duration_secs = %v, contract authorized %d plus the %s observation grace",
-			got, job.Resources.TimeoutSeconds, maxDurationGrace)
-	}
-	if job.Filesystem.Workdir != "" {
-		rt, _ := cfg["runtime"].(map[string]any)
-		if got := jsonString(rt, "workdir"); got != job.Filesystem.Workdir {
-			return fmt.Errorf("sandbox workdir %q does not match the authorized %q", got, job.Filesystem.Workdir)
-		}
-	}
-	if got := jsonString(cfg, "security_profile"); got != job.Security {
-		return fmt.Errorf("sandbox security profile %q does not match the authorized %q", got, job.Security)
-	}
-	wantProfile, perr := deploymentProfileJSON(deploymentProfile)
-	if perr != nil {
-		return perr
-	}
-	if got := jsonString(cfg, "deployment_profile"); got != wantProfile {
-		return fmt.Errorf("sandbox deployment profile %q does not match the required %q — refusing to run under a downgraded host confinement", got, wantProfile)
-	}
-	if err := verifyNetworkPolicy(job, cfg); err != nil {
-		return err
-	}
-	if err := verifyEnvironment(job, cfg); err != nil {
-		return err
-	}
-	return verifyMounts(job, cfg)
-}
-
-func verifyNetworkPolicy(job *JobContractV2, cfg map[string]any) error {
-	netw, _ := cfg["network"].(map[string]any)
-	policy, _ := netw["policy"].(map[string]any)
-	egress := jsonString(policy, "default_egress")
-	ingress := jsonString(policy, "default_ingress")
-	rules, _ := policy["rules"].([]any)
-	switch job.Network.Mode {
-	case NetworkNone:
-		if egress != "deny" || ingress != "deny" {
-			return fmt.Errorf("network mode none but the sandbox default policy is egress=%q ingress=%q", egress, ingress)
-		}
-		if len(rules) != 0 {
-			return fmt.Errorf("network mode none but the sandbox carries %d network rule(s)", len(rules))
-		}
-	case NetworkAllowlist:
-		if egress != "deny" || ingress != "deny" {
-			return fmt.Errorf("network allowlist but the sandbox default policy is egress=%q ingress=%q", egress, ingress)
-		}
-		if len(rules) != len(job.Network.Allow) {
-			return fmt.Errorf("network allowlist has %d entries but the sandbox carries %d rule(s)", len(job.Network.Allow), len(rules))
-		}
-		want := map[string]bool{}
-		for _, allow := range job.Network.Allow {
-			kind, value := allowTarget(allow)
-			want[kind+":"+value] = true
-		}
-		for i, raw := range rules {
-			rule, _ := raw.(map[string]any)
-			if jsonString(rule, "action") != "allow" || jsonString(rule, "direction") != "egress" {
-				return fmt.Errorf("sandbox rule %d is not an egress allow", i)
-			}
-			dest, _ := rule["destination"].(map[string]any)
-			kind, value := ruleTarget(dest)
-			if !want[kind+":"+value] {
-				return fmt.Errorf("sandbox rule %d permits %s:%s, which the contract did not authorize", i, kind, value)
-			}
-			delete(want, kind+":"+value)
-		}
-		if len(want) != 0 {
-			return fmt.Errorf("the sandbox is missing %d authorized allow rule(s)", len(want))
-		}
-	case NetworkPublic:
-		if egress != "deny" {
-			return fmt.Errorf("network mode public but the sandbox default egress is %q", egress)
-		}
-		// `--net public` composes exactly two rules: the gateway DNS
-		// rule (group host) and the public egress allow. Any other
-		// rule is reachability the contract never authorized.
-		public := false
-		for i, raw := range rules {
-			rule, _ := raw.(map[string]any)
-			if jsonString(rule, "action") != "allow" || jsonString(rule, "direction") != "egress" {
-				return fmt.Errorf("sandbox rule %d is not an egress allow", i)
-			}
-			dest, _ := rule["destination"].(map[string]any)
-			kind, value := ruleTarget(dest)
-			switch {
-			case kind == "group" && value == "public":
-				public = true
-			case kind == "group" && value == "host":
-				// the sandbox's own DNS gateway
-			default:
-				return fmt.Errorf("sandbox rule %d permits %s:%s, which the contract did not authorize", i, kind, value)
-			}
-		}
-		if !public {
-			return fmt.Errorf("network mode public but the sandbox carries no public egress rule")
-		}
-	}
-	return nil
-}
-
-func verifyEnvironment(job *JobContractV2, cfg map[string]any) error {
-	env, _ := cfg["env"].([]any)
-	have := map[string]string{}
-	for _, raw := range env {
-		e, _ := raw.(map[string]any)
-		have[jsonString(e, "key")] = jsonString(e, "value")
-	}
-	for _, kv := range job.Env {
-		key, value, _ := strings.Cut(kv, "=")
-		if got, ok := have[key]; !ok || got != value {
-			return fmt.Errorf("sandbox environment is missing the authorized %s=… entry", key)
-		}
-	}
-	return nil
-}
-
 // mountReadOnly extracts the read-only intent from a contract mount's
 // option string — msb's `ro`/`rw` flags. Unrecognized tokens are not
 // interpreted here: the CLI refuses what it cannot honor, and the job
@@ -1258,39 +1278,6 @@ func mountReadOnly(options string) (value, declared bool) {
 		}
 	}
 	return false, false
-}
-
-func verifyMounts(job *JobContractV2, cfg map[string]any) error {
-	mounts, _ := cfg["mounts"].([]any)
-	if len(mounts) != len(job.Filesystem.Mounts) {
-		return fmt.Errorf("sandbox carries %d mount(s) but the contract authorized %d", len(mounts), len(job.Filesystem.Mounts))
-	}
-	authorized := map[string]*Mount{}
-	for i := range job.Filesystem.Mounts {
-		m := &job.Filesystem.Mounts[i]
-		authorized[filepath.Clean(m.Source)+"\x00"+m.Dest] = m
-	}
-	for i, raw := range mounts {
-		m, _ := raw.(map[string]any)
-		key := filepath.Clean(jsonString(m, "host")) + "\x00" + jsonString(m, "guest")
-		declared, ok := authorized[key]
-		if !ok {
-			return fmt.Errorf("sandbox mount %d (%s → %s) was not authorized",
-				i, jsonString(m, "host"), jsonString(m, "guest"))
-		}
-		// A host path the authority mounted read-only must not boot
-		// writable: the flag is part of the signed policy.
-		if want, ok := mountReadOnly(declared.Options); ok {
-			opts, _ := m["options"].(map[string]any)
-			got, _ := opts["readonly"].(bool)
-			if got != want {
-				return fmt.Errorf("sandbox mount %s is readonly=%t but the contract declared %q",
-					jsonString(m, "guest"), got, declared.Options)
-			}
-		}
-		delete(authorized, key)
-	}
-	return nil
 }
 
 var _ Backend = (*MSBBackend)(nil)

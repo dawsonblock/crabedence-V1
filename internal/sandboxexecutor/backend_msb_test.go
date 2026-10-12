@@ -40,26 +40,38 @@ func TestMain(m *testing.M) {
 }
 
 type fakeSandbox struct {
-	Name         string             `json:"name"`
-	Status       string             `json:"status"`
-	Config       fakeSandboxConfig  `json:"config"`
-	ActiveConfig *fakeSandboxConfig `json:"active_config"`
+	Name           string             `json:"name"`
+	Status         string             `json:"status"`
+	BootID         string             `json:"boot_id"`
+	Storage        fakeStorage        `json:"storage"`
+	PendingChanges []any              `json:"pending_changes"`
+	Pause          map[string]any     `json:"pause"`
+	Config         fakeSandboxConfig  `json:"config"`
+	ActiveConfig   *fakeSandboxConfig `json:"active_config"`
+}
+
+type fakeStorage struct {
+	Path string `json:"path"`
 }
 
 type fakeSandboxConfig struct {
-	Name              string            `json:"name"`
-	Labels            map[string]string `json:"labels"`
-	ManifestDigest    string            `json:"manifest_digest"`
-	PullPolicy        string            `json:"pull_policy"`
-	DeploymentProfile string            `json:"deployment_profile"`
-	Env               []fakeEnvVar      `json:"env"`
-	Resources         fakeResources     `json:"resources"`
-	Lifecycle         fakeLifecycle     `json:"lifecycle"`
-	Runtime           fakeRuntime       `json:"runtime"`
-	SecurityProfile   string            `json:"security_profile"`
-	Network           fakeNetwork       `json:"network"`
-	Mounts            []fakeMount       `json:"mounts"`
-	Image             fakeImage         `json:"image"`
+	Name                string            `json:"name"`
+	Labels              map[string]string `json:"labels"`
+	ManifestDigest      string            `json:"manifest_digest"`
+	PullPolicy          string            `json:"pull_policy"`
+	DeploymentProfile   string            `json:"deployment_profile"`
+	ExternalMountPolicy string            `json:"external_mount_policy"`
+	Init                any               `json:"init"`
+	Patches             []any             `json:"patches"`
+	Rlimits             []any             `json:"rlimits"`
+	Env                 []fakeEnvVar      `json:"env"`
+	Resources           fakeResources     `json:"resources"`
+	Lifecycle           fakeLifecycle     `json:"lifecycle"`
+	Runtime             fakeRuntime       `json:"runtime"`
+	SecurityProfile     string            `json:"security_profile"`
+	Network             fakeNetwork       `json:"network"`
+	Mounts              []fakeMount       `json:"mounts"`
+	Image               fakeImage         `json:"image"`
 }
 
 type fakeEnvVar struct {
@@ -80,13 +92,16 @@ type fakeLifecycle struct {
 }
 
 type fakeRuntime struct {
-	Workdir *string `json:"workdir"`
-	Shell   string  `json:"shell"`
+	Workdir *string        `json:"workdir"`
+	Shell   string         `json:"shell"`
+	Scripts map[string]any `json:"scripts"`
 }
 
 type fakeNetwork struct {
-	Enabled bool       `json:"enabled"`
-	Policy  fakePolicy `json:"policy"`
+	Enabled   bool           `json:"enabled"`
+	Interface map[string]any `json:"interface"`
+	Ports     []any          `json:"ports"`
+	Policy    fakePolicy     `json:"policy"`
 }
 
 type fakePolicy struct {
@@ -129,16 +144,17 @@ type fakeRootDisk struct {
 
 // fakeJobRecord mirrors the runtime's durable job metadata shape.
 type fakeJobRecord struct {
-	ID         string       `json:"id"`
-	Command    []string     `json:"command"`
-	State      string       `json:"state"`
-	ExitCode   *int         `json:"exit_code"`
-	Failure    *fakeFailure `json:"failure"`
-	Error      *string      `json:"error"`
-	TimedOut   bool         `json:"timed_out"`
-	CreatedAt  int64        `json:"created_at"`
-	StartedAt  *int64       `json:"started_at"`
-	FinishedAt *int64       `json:"finished_at"`
+	ID          string       `json:"id"`
+	RuntimeBoot string       `json:"runtime_boot_id"`
+	Command     []string     `json:"command"`
+	State       string       `json:"state"`
+	ExitCode    *int         `json:"exit_code"`
+	Failure     *fakeFailure `json:"failure"`
+	Error       *string      `json:"error"`
+	TimedOut    bool         `json:"timed_out"`
+	CreatedAt   int64        `json:"created_at"`
+	StartedAt   *int64       `json:"started_at"`
+	FinishedAt  *int64       `json:"finished_at"`
 }
 
 type fakeFailure struct {
@@ -146,15 +162,25 @@ type fakeFailure struct {
 	Message string `json:"message"`
 }
 
+// fakeDefaultImageEnv is the pinned image's own config environment the
+// fake runtime injects into every VM (and reports from image inspect).
+func fakeDefaultImageEnv() []string {
+	if v := os.Getenv("MSB_FAKE_IMAGE_ENV"); v != "" {
+		return strings.Split(v, ",")
+	}
+	return []string{"PATH=/usr/bin:/bin", "LANG=C.UTF-8"}
+}
+
 func fakeDefaultConfig() fakeSandboxConfig {
 	return fakeSandboxConfig{
-		Labels:            map[string]string{},
-		ManifestDigest:    testImageDigest,
-		DeploymentProfile: "single_tenant",
-		Resources:         fakeResources{CPUs: 1, MaxCPUs: 1, MemoryMiB: 512, MaxMemoryMiB: 512},
-		Lifecycle:         fakeLifecycle{},
-		Runtime:           fakeRuntime{Shell: "/bin/sh"},
-		SecurityProfile:   SecurityDefault,
+		Labels:              map[string]string{},
+		ManifestDigest:      testImageDigest,
+		DeploymentProfile:   "single_tenant",
+		ExternalMountPolicy: "strict",
+		Resources:           fakeResources{CPUs: 1, MaxCPUs: 1, MemoryMiB: 512, MaxMemoryMiB: 512},
+		Lifecycle:           fakeLifecycle{},
+		Runtime:             fakeRuntime{Shell: "/bin/sh", Scripts: map[string]any{}},
+		SecurityProfile:     SecurityDefault,
 		Network: fakeNetwork{Enabled: true, Policy: fakePolicy{
 			DefaultEgress: "deny", DefaultIngress: "deny",
 		}},
@@ -204,6 +230,9 @@ func fakeMSBMain() int {
 			fmt.Fprintln(os.Stderr, "error: host setup is not ready")
 			return 1
 		}
+		if fw := os.Getenv("MSB_FAKE_FIRMWARE"); fw != "" {
+			fmt.Fprintf(os.Stdout, "  ✓ libkrunfw           %s\n", fw)
+		}
 		fmt.Fprintln(os.Stdout, "  ✓ Host setup is ready.")
 		return 0
 	case "flood":
@@ -222,6 +251,8 @@ func fakeMSBMain() int {
 			return fakeInspectJob(dir, rest, jobID)
 		}
 		return fakeInspect(dir, rest)
+	case "image":
+		return fakeImageCmd(rest)
 	case "exec":
 		return fakeExec(dir, rest)
 	case "jobs":
@@ -268,6 +299,14 @@ func fakeName(args []string) string {
 }
 
 func fakeStatePath(dir, name string) string { return filepath.Join(dir, name+".json") }
+
+// fakeBootID derives a fresh boot generation for a create: the fake's
+// stand-in for the runtime's own boot identity. Re-creating a sandbox
+// (a substitution) produces a different one.
+func fakeBootID(name string) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%d", name, time.Now().UnixNano())))
+	return "boot_" + hex.EncodeToString(sum[:])[:32]
+}
 
 func fakeJobsPath(dir, name string) string { return filepath.Join(dir, name+".jobs.json") }
 
@@ -361,6 +400,17 @@ func fakeCreate(dir string, args []string) int {
 	}
 	conf.Name = name
 	conf.Image.Oci.Reference = image
+	// The runtime injects the pinned image's own config environment
+	// into every VM: the booted set is the image baseline plus the
+	// contract's entries.
+	imageEnv := fakeDefaultImageEnv()
+	merged := make([]fakeEnvVar, 0, len(imageEnv)+len(conf.Env))
+	for _, kv := range imageEnv {
+		key, value, _ := strings.Cut(kv, "=")
+		merged = append(merged, fakeEnvVar{Key: key, Value: value})
+	}
+	conf.Env = append(merged, conf.Env...)
+
 	if tamper := os.Getenv("MSB_FAKE_TAMPER"); tamper == "net_public" {
 		conf.Network.Policy = fakePublicPolicy()
 	} else if tamper == "ingress_allow" {
@@ -371,6 +421,22 @@ func fakeCreate(dir string, args []string) int {
 			fakeRule{Action: "allow", Direction: "egress", Destination: fakeTarget{Group: "private"}})
 	} else if tamper == "deployment_multi" {
 		conf.DeploymentProfile = "multi_tenant"
+	} else if tamper == "extra_env" {
+		conf.Env = append(conf.Env, fakeEnvVar{Key: "INJECTED", Value: "1"})
+	} else if tamper == "init_hook" {
+		conf.Init = map[string]any{"cmd": "/usr/bin/evil-init"}
+	} else if tamper == "patches" {
+		conf.Patches = []any{map[string]any{"path": "/etc/passwd"}}
+	} else if tamper == "scripts" {
+		conf.Runtime.Scripts = map[string]any{"evil": "/bin/evil"}
+	} else if tamper == "rlimits" {
+		conf.Rlimits = []any{map[string]any{"resource": "nofile", "value": 1 << 20}}
+	} else if tamper == "mount_policy_loose" {
+		conf.ExternalMountPolicy = "permissive"
+	} else if tamper == "extra_interface" {
+		conf.Network.Interface = map[string]any{"tap0": map[string]any{"ip": "10.0.0.2"}}
+	} else if tamper == "port_publish" {
+		conf.Network.Ports = []any{map[string]any{"host": 8080, "guest": 80}}
 	}
 	if os.Getenv("MSB_FAKE_CREATE_FAIL") != "" {
 		fmt.Fprintln(os.Stderr, "error: invalid config: sandbox refused before boot")
@@ -389,7 +455,37 @@ func fakeCreate(dir string, args []string) int {
 	if os.Getenv("MSB_FAKE_TAMPER") == "active_diverges" {
 		active.Network.Policy = fakePublicPolicy()
 	}
-	raw, _ := json.Marshal(fakeSandbox{Name: name, Status: "Running", Config: conf, ActiveConfig: &active})
+	// The runtime's boot generation lives in the sandbox's own state
+	// directory (the storage path the inspect document reports), and a
+	// fresh create is a fresh boot.
+	storagePath := filepath.Join(dir, name+".storage")
+	if err := os.MkdirAll(filepath.Join(storagePath, "runtime"), 0o700); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+	bootID := fakeBootID(name)
+	if os.Getenv("MSB_FAKE_BOOT_ID") != "" {
+		bootID = os.Getenv("MSB_FAKE_BOOT_ID")
+	}
+	if err := os.WriteFile(filepath.Join(storagePath, "runtime", "runtime-boot-id"), []byte(bootID), 0o600); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+	sandbox := fakeSandbox{
+		Name: name, Status: "Running", BootID: bootID,
+		Storage: fakeStorage{Path: storagePath},
+		Config:  conf, ActiveConfig: &active,
+	}
+	if os.Getenv("MSB_FAKE_TAMPER") == "pending_changes" {
+		sandbox.PendingChanges = []any{map[string]any{"field": "network"}}
+	}
+	if os.Getenv("MSB_FAKE_TAMPER") == "paused" {
+		sandbox.Pause = map[string]any{"paused": true, "recovery_required": false}
+	}
+	if os.Getenv("MSB_FAKE_TAMPER") == "recovery_required" {
+		sandbox.Pause = map[string]any{"paused": false, "recovery_required": true}
+	}
+	raw, _ := json.Marshal(sandbox)
 	_, _ = f.Write(raw)
 	if os.Getenv("MSB_FAKE_CREATE_FAIL_AFTER") != "" {
 		// Mirrors a create that booted the VM and then failed guest
@@ -429,6 +525,33 @@ func fakeRun(dir string, args []string) int {
 		}
 	}
 	_ = os.WriteFile(filepath.Join(dir, name+".exec"), []byte("executed"), 0o600)
+	return 0
+}
+
+// fakeImageCmd models `msb image inspect --format json <ref>`: the
+// pinned image's config environment, keyed by the digest the reference
+// names.
+func fakeImageCmd(args []string) int {
+	ref := ""
+	for _, a := range args {
+		if !strings.HasPrefix(a, "-") && a != "inspect" && a != "json" {
+			ref = a
+		}
+	}
+	_, digest, found := strings.Cut(ref, "@")
+	if !found || !strings.HasPrefix(digest, "sha256:") {
+		fmt.Fprintf(os.Stderr, "error: image %q is not digest-pinned\n", ref)
+		return 1
+	}
+	if os.Getenv("MSB_FAKE_IMAGE_DIGEST_MISMATCH") != "" {
+		digest = "sha256:" + strings.Repeat("f", 64)
+	}
+	raw, _ := json.Marshal(map[string]any{
+		"digest": digest,
+		"config": map[string]any{"env": fakeDefaultImageEnv()},
+	})
+	os.Stdout.Write(raw)
+	fmt.Fprintln(os.Stdout)
 	return 0
 }
 
@@ -507,11 +630,19 @@ func fakeWriteJob(dir, name string, command []string) error {
 	}
 	seq := len(recs) + 1
 	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%d|%s", name, seq, strings.Join(command, "\x00"))))
+	sb, serr := fakeReadSandbox(dir, name)
+	if serr != nil {
+		return serr
+	}
 	rec := fakeJobRecord{
-		ID:        "job_" + hex.EncodeToString(sum[:])[:32],
-		Command:   command,
-		State:     "exited",
-		CreatedAt: time.Now().UnixMilli(),
+		ID:          "job_" + hex.EncodeToString(sum[:])[:32],
+		RuntimeBoot: sb.BootID,
+		Command:     command,
+		State:       "exited",
+		CreatedAt:   time.Now().UnixMilli(),
+	}
+	if os.Getenv("MSB_FAKE_JOB_BOOT_MISMATCH") != "" {
+		rec.RuntimeBoot = "boot_" + strings.Repeat("9", 32)
 	}
 	switch {
 	case os.Getenv("MSB_FAKE_JOB_LOST") != "":
@@ -571,6 +702,19 @@ func fakeJobOutput() []byte {
 	default:
 		return []byte("hello\n")
 	}
+}
+
+// fakeReadSandbox reads the fake sandbox state file.
+func fakeReadSandbox(dir, name string) (fakeSandbox, error) {
+	raw, err := os.ReadFile(fakeStatePath(dir, name))
+	if err != nil {
+		return fakeSandbox{}, err
+	}
+	var sb fakeSandbox
+	if err := json.Unmarshal(raw, &sb); err != nil {
+		return fakeSandbox{}, err
+	}
+	return sb, nil
 }
 
 func fakeReadJobs(dir, name string) ([]fakeJobRecord, error) {
@@ -661,7 +805,35 @@ func fakeJobs(dir string, args []string) int {
 	if recs == nil {
 		recs = []fakeJobRecord{}
 	}
-	raw, _ := json.Marshal(map[string]any{"items": recs, "next_cursor": nil})
+	page := fakeEnvInt("MSB_FAKE_JOBS_PAGE", 0)
+	if page <= 0 {
+		raw, _ := json.Marshal(map[string]any{"items": recs, "next_cursor": nil})
+		os.Stdout.Write(raw)
+		fmt.Fprintln(os.Stdout)
+		return 0
+	}
+	offset := 0
+	if c := fakeFlagValue(args, "--cursor"); c != "" {
+		if n, cerr := strconv.Atoi(c); cerr == nil {
+			offset = n
+		}
+	}
+	if offset > len(recs) {
+		offset = len(recs)
+	}
+	end := offset + page
+	if end > len(recs) {
+		end = len(recs)
+	}
+	items := recs[offset:end]
+	var next any
+	if end < len(recs) {
+		next = strconv.Itoa(end)
+	}
+	if os.Getenv("MSB_FAKE_JOBS_CURSOR_LOOP") != "" {
+		next = "stuck"
+	}
+	raw, _ := json.Marshal(map[string]any{"items": items, "next_cursor": next})
 	os.Stdout.Write(raw)
 	fmt.Fprintln(os.Stdout)
 	return 0
@@ -768,14 +940,27 @@ func testContext(t *testing.T) context.Context {
 	return ctx
 }
 
-// testBackend builds an adapter with a fast observation window so the
-// unobserved-outcome paths are testable in bounded time.
-func testBackend(bin, stateDir string) *MSBBackend {
+// testBackend builds an adapter with a fast observation window and the
+// fake runtime's actual bytes pinned, so the runtime-identity check
+// exercises real hashing against the fake executable and a firmware
+// file the fake doctor names.
+func testBackend(t *testing.T, bin, stateDir string) *MSBBackend {
+	t.Helper()
+	fw := filepath.Join(t.TempDir(), "libkrunfw.dylib")
+	if err := os.WriteFile(fw, []byte("fake firmware bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MSB_FAKE_FIRMWARE", fw)
 	return &MSBBackend{
 		Bin:              bin,
 		StateDir:         stateDir,
 		PollInterval:     10 * time.Millisecond,
 		ObservationSlack: 500 * time.Millisecond,
+		RuntimeManifest: &RuntimeManifest{
+			Version:         PinnedMSBVersion,
+			MSBSHA256:       sha256File(t, bin),
+			LibkrunfwSHA256: sha256File(t, fw),
+		},
 	}
 }
 
@@ -857,7 +1042,7 @@ func TestBoundedArtifactWriterDigestMatchesStoredBytes(t *testing.T) {
 func TestMSBDispatchRefusesPreexistingSandbox(t *testing.T) {
 	key, _ := testAuthority(t)
 	bin, stateDir := fakeMSB(t, nil)
-	backend := testBackend(bin, filepath.Join(t.TempDir(), "artifacts"))
+	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "reuse-1"; c.Nonce = "n-reuse" })
 	name := backend.msbJobName(job.JobID)
 
@@ -891,7 +1076,7 @@ func TestMSBDispatchVerifiesPolicyBeforeExec(t *testing.T) {
 		t.Run(tamper, func(t *testing.T) {
 			key, _ := testAuthority(t)
 			bin, stateDir := fakeMSB(t, map[string]string{"MSB_FAKE_TAMPER": tamper})
-			backend := testBackend(bin, filepath.Join(t.TempDir(), "artifacts"))
+			backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 			job := testContract(t, key, func(c *JobContractV2) { c.JobID = "verify-1"; c.Nonce = "n-verify" })
 			name := backend.msbJobName(job.JobID)
 
@@ -920,7 +1105,7 @@ func TestMSBDispatchAmbiguousCreateLeaksNothing(t *testing.T) {
 	key, _ := testAuthority(t)
 	bin, _ := fakeMSB(t, map[string]string{"MSB_FAKE_CREATE_SLEEP": "5"})
 	dir := t.TempDir()
-	backend := testBackend(bin, filepath.Join(dir, "artifacts"))
+	backend := testBackend(t, bin, filepath.Join(dir, "artifacts"))
 	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "ambig-create"; c.Nonce = "n-ambig" })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
@@ -945,7 +1130,7 @@ func TestMSBDispatchRefusesUnauthorizedPublicRules(t *testing.T) {
 	t.Run("authorized public rules accepted", func(t *testing.T) {
 		key, _ := testAuthority(t)
 		bin, _ := fakeMSB(t, nil)
-		backend := testBackend(bin, filepath.Join(t.TempDir(), "artifacts"))
+		backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 		job := testContract(t, key, func(c *JobContractV2) {
 			c.JobID = "pub-ok"
 			c.Nonce = "n-pub-ok"
@@ -955,14 +1140,14 @@ func TestMSBDispatchRefusesUnauthorizedPublicRules(t *testing.T) {
 		if err != nil {
 			t.Fatalf("authorized public network refused: %v", err)
 		}
-		if _, err := backend.Wait(testContext(t), job, disp.Handle, disp.RunID); err != nil {
+		if _, err := backend.Wait(testContext(t), job, disp); err != nil {
 			t.Fatalf("wait: %v", err)
 		}
 	})
 	t.Run("extra private rule refused", func(t *testing.T) {
 		key, _ := testAuthority(t)
 		bin, stateDir := fakeMSB(t, map[string]string{"MSB_FAKE_TAMPER": "public_plus_private"})
-		backend := testBackend(bin, filepath.Join(t.TempDir(), "artifacts"))
+		backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 		job := testContract(t, key, func(c *JobContractV2) {
 			c.JobID = "pub-extra"
 			c.Nonce = "n-pub-extra"
@@ -985,7 +1170,7 @@ func TestMSBDispatchRefusesUnauthorizedPublicRules(t *testing.T) {
 func TestMSBDispatchVerifiesBootedConfiguration(t *testing.T) {
 	key, _ := testAuthority(t)
 	bin, stateDir := fakeMSB(t, map[string]string{"MSB_FAKE_TAMPER": "active_diverges"})
-	backend := testBackend(bin, filepath.Join(t.TempDir(), "artifacts"))
+	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "active-1"; c.Nonce = "n-active" })
 	name := backend.msbJobName(job.JobID)
 
@@ -1005,7 +1190,7 @@ func TestMSBDispatchVerifiesBootedConfiguration(t *testing.T) {
 func TestMSBDispatchFailedCreateRemovesItsOwnLeftover(t *testing.T) {
 	key, _ := testAuthority(t)
 	bin, stateDir := fakeMSB(t, map[string]string{"MSB_FAKE_CREATE_FAIL_AFTER": "1"})
-	backend := testBackend(bin, filepath.Join(t.TempDir(), "artifacts"))
+	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "orphan-own"; c.Nonce = "n-orphan" })
 	name := backend.msbJobName(job.JobID)
 
@@ -1023,7 +1208,7 @@ func TestMSBDispatchFailedCreateRemovesItsOwnLeftover(t *testing.T) {
 func TestMSBDispatchFailedCreateLeavesForeignSandboxAlone(t *testing.T) {
 	key, _ := testAuthority(t)
 	bin, stateDir := fakeMSB(t, map[string]string{"MSB_FAKE_CREATE_FAIL": "1"})
-	backend := testBackend(bin, filepath.Join(t.TempDir(), "artifacts"))
+	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "orphan-foreign"; c.Nonce = "n-foreign" })
 	name := backend.msbJobName(job.JobID)
 	writeFakeSandbox(t, stateDir, name, fakeDefaultConfig())
@@ -1043,7 +1228,7 @@ func TestMSBDispatchPullPolicy(t *testing.T) {
 	t.Run("if-missing is passed through when configured", func(t *testing.T) {
 		key, _ := testAuthority(t)
 		bin, stateDir := fakeMSB(t, nil)
-		backend := testBackend(bin, filepath.Join(t.TempDir(), "artifacts"))
+		backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 		backend.PullPolicy = PullIfMissing
 		job := testContract(t, key, func(c *JobContractV2) { c.JobID = "pull-1"; c.Nonce = "n-pull" })
 		disp, err := backend.Dispatch(testContext(t), job)
@@ -1053,14 +1238,14 @@ func TestMSBDispatchPullPolicy(t *testing.T) {
 		if got := readFakeSandbox(t, stateDir, disp.Handle).Config.PullPolicy; got != PullIfMissing {
 			t.Fatalf("pull policy = %q, want %q", got, PullIfMissing)
 		}
-		if _, err := backend.Wait(testContext(t), job, disp.Handle, disp.RunID); err != nil {
+		if _, err := backend.Wait(testContext(t), job, disp); err != nil {
 			t.Fatalf("wait: %v", err)
 		}
 	})
 	t.Run("unknown policy refuses", func(t *testing.T) {
 		key, _ := testAuthority(t)
 		bin, stateDir := fakeMSB(t, nil)
-		backend := testBackend(bin, filepath.Join(t.TempDir(), "artifacts"))
+		backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 		backend.PullPolicy = "yolo"
 		job := testContract(t, key, func(c *JobContractV2) { c.JobID = "pull-2"; c.Nonce = "n-pull-2" })
 		_, err := backend.Dispatch(testContext(t), job)
@@ -1077,7 +1262,7 @@ func TestMSBDispatchPullPolicy(t *testing.T) {
 func TestMSBDispatchMapsContractToSandbox(t *testing.T) {
 	key, _ := testAuthority(t)
 	bin, stateDir := fakeMSB(t, nil)
-	backend := testBackend(bin, filepath.Join(t.TempDir(), "artifacts"))
+	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 	job := testContract(t, key, func(c *JobContractV2) {
 		c.JobID = "mapped-1"
 		c.Nonce = "n-mapped"
@@ -1110,7 +1295,7 @@ func TestMSBDispatchMapsContractToSandbox(t *testing.T) {
 	if recs[0].ID != disp.RunID || !sameArgv(recs[0].Command, job.Argv) {
 		t.Fatalf("recorded job does not match the dispatch: %+v vs run id %s", recs[0], disp.RunID)
 	}
-	res, err := backend.Wait(testContext(t), job, disp.Handle, disp.RunID)
+	res, err := backend.Wait(testContext(t), job, disp)
 	if err != nil {
 		t.Fatalf("wait: %v", err)
 	}
@@ -1177,7 +1362,7 @@ func TestMSBDispatchMapsContractToSandbox(t *testing.T) {
 func TestMSBDispatchRefusalOnSpawnFailure(t *testing.T) {
 	key, _ := testAuthority(t)
 	bin, stateDir := fakeMSB(t, map[string]string{"MSB_FAKE_LAUNCH_FAIL": "1"})
-	backend := testBackend(bin, filepath.Join(t.TempDir(), "artifacts"))
+	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "spawn-fail"; c.Nonce = "n-spawn" })
 	name := backend.msbJobName(job.JobID)
 
@@ -1202,7 +1387,7 @@ func TestMSBDispatchRefusalOnSpawnFailure(t *testing.T) {
 func TestMSBDispatchAdoptsAdmittedUnnamedJob(t *testing.T) {
 	key, _ := testAuthority(t)
 	bin, stateDir := fakeMSB(t, map[string]string{"MSB_FAKE_LAUNCH_FAIL_ADMITTED": "1"})
-	backend := testBackend(bin, filepath.Join(t.TempDir(), "artifacts"))
+	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "adopt-1"; c.Nonce = "n-adopt" })
 
 	disp, err := backend.Dispatch(testContext(t), job)
@@ -1224,14 +1409,14 @@ func TestMSBWaitVerifiesGuestExit(t *testing.T) {
 		t.Run(fmt.Sprintf("exit-%d", code), func(t *testing.T) {
 			key, _ := testAuthority(t)
 			bin, _ := fakeMSB(t, map[string]string{"MSB_FAKE_EXIT": strconv.Itoa(code)})
-			backend := testBackend(bin, filepath.Join(t.TempDir(), "artifacts"))
+			backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 			job := testContract(t, key, func(c *JobContractV2) { c.JobID = fmt.Sprintf("exit-%d", code); c.Nonce = "n-exit" })
 
 			disp, err := backend.Dispatch(testContext(t), job)
 			if err != nil {
 				t.Fatalf("dispatch: %v", err)
 			}
-			res, err := backend.Wait(testContext(t), job, disp.Handle, disp.RunID)
+			res, err := backend.Wait(testContext(t), job, disp)
 			if err != nil {
 				t.Fatalf("wait: %v", err)
 			}
@@ -1257,14 +1442,14 @@ func TestMSBWaitVerifiesGuestExit(t *testing.T) {
 func TestMSBWaitTimeoutIsObservedNotInvented(t *testing.T) {
 	key, _ := testAuthority(t)
 	bin, _ := fakeMSB(t, map[string]string{"MSB_FAKE_JOB_TIMEDOUT": "1"})
-	backend := testBackend(bin, filepath.Join(t.TempDir(), "artifacts"))
+	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "timeout-1"; c.Nonce = "n-timeout" })
 
 	disp, err := backend.Dispatch(testContext(t), job)
 	if err != nil {
 		t.Fatalf("dispatch: %v", err)
 	}
-	res, err := backend.Wait(testContext(t), job, disp.Handle, disp.RunID)
+	res, err := backend.Wait(testContext(t), job, disp)
 	if err != nil {
 		t.Fatalf("wait: %v", err)
 	}
@@ -1282,14 +1467,14 @@ func TestMSBWaitTimeoutIsObservedNotInvented(t *testing.T) {
 func TestMSBWaitSpawnRejected(t *testing.T) {
 	key, _ := testAuthority(t)
 	bin, _ := fakeMSB(t, map[string]string{"MSB_FAKE_JOB_FAILURE": "not_found"})
-	backend := testBackend(bin, filepath.Join(t.TempDir(), "artifacts"))
+	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "spawn-rejected"; c.Nonce = "n-rej" })
 
 	disp, err := backend.Dispatch(testContext(t), job)
 	if err != nil {
 		t.Fatalf("dispatch: %v", err)
 	}
-	res, err := backend.Wait(testContext(t), job, disp.Handle, disp.RunID)
+	res, err := backend.Wait(testContext(t), job, disp)
 	if err != nil {
 		t.Fatalf("wait: %v", err)
 	}
@@ -1304,14 +1489,14 @@ func TestMSBWaitSpawnRejected(t *testing.T) {
 func TestMSBWaitLostRuntimeIsUnobserved(t *testing.T) {
 	key, _ := testAuthority(t)
 	bin, _ := fakeMSB(t, map[string]string{"MSB_FAKE_JOB_LOST": "1"})
-	backend := testBackend(bin, filepath.Join(t.TempDir(), "artifacts"))
+	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "lost-1"; c.Nonce = "n-lost" })
 
 	disp, err := backend.Dispatch(testContext(t), job)
 	if err != nil {
 		t.Fatalf("dispatch: %v", err)
 	}
-	res, err := backend.Wait(testContext(t), job, disp.Handle, disp.RunID)
+	res, err := backend.Wait(testContext(t), job, disp)
 	if err == nil {
 		t.Fatalf("a lost runtime produced a result: %+v", res)
 	}
@@ -1326,7 +1511,7 @@ func TestMSBWaitLostRuntimeIsUnobserved(t *testing.T) {
 func TestMSBWaitVanishedSandboxIsUnobserved(t *testing.T) {
 	key, _ := testAuthority(t)
 	bin, stateDir := fakeMSB(t, nil)
-	backend := testBackend(bin, filepath.Join(t.TempDir(), "artifacts"))
+	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 	backend.ObservationSlack = 300 * time.Millisecond
 	job := testContract(t, key, func(c *JobContractV2) {
 		c.JobID = "vanish-1"
@@ -1343,7 +1528,7 @@ func TestMSBWaitVanishedSandboxIsUnobserved(t *testing.T) {
 	if err := os.Remove(fakeStatePath(stateDir, disp.Handle)); err != nil {
 		t.Fatal(err)
 	}
-	res, err := backend.Wait(testContext(t), job, disp.Handle, disp.RunID)
+	res, err := backend.Wait(testContext(t), job, disp)
 	if err == nil {
 		t.Fatalf("a vanished sandbox produced a result: %+v", res)
 	}
@@ -1358,14 +1543,14 @@ func TestMSBWaitVanishedSandboxIsUnobserved(t *testing.T) {
 func TestMSBWaitCorrelatesTheAuthorizedCommand(t *testing.T) {
 	key, _ := testAuthority(t)
 	bin, _ := fakeMSB(t, map[string]string{"MSB_FAKE_JOB_COMMAND_TAMPER": "1"})
-	backend := testBackend(bin, filepath.Join(t.TempDir(), "artifacts"))
+	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "corr-1"; c.Nonce = "n-corr" })
 
 	disp, err := backend.Dispatch(testContext(t), job)
 	if err != nil {
 		t.Fatalf("dispatch: %v", err)
 	}
-	res, err := backend.Wait(testContext(t), job, disp.Handle, disp.RunID)
+	res, err := backend.Wait(testContext(t), job, disp)
 	if err == nil {
 		t.Fatalf("a foreign job record was accepted: %+v", res)
 	}
@@ -1379,14 +1564,14 @@ func TestMSBWaitCorrelatesTheAuthorizedCommand(t *testing.T) {
 func TestMSBWaitPollsUntilTerminal(t *testing.T) {
 	key, _ := testAuthority(t)
 	bin, _ := fakeMSB(t, map[string]string{"MSB_FAKE_JOB_RUNNING": "3", "MSB_FAKE_EXIT": "5"})
-	backend := testBackend(bin, filepath.Join(t.TempDir(), "artifacts"))
+	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "poll-1"; c.Nonce = "n-poll" })
 
 	disp, err := backend.Dispatch(testContext(t), job)
 	if err != nil {
 		t.Fatalf("dispatch: %v", err)
 	}
-	res, err := backend.Wait(testContext(t), job, disp.Handle, disp.RunID)
+	res, err := backend.Wait(testContext(t), job, disp)
 	if err != nil {
 		t.Fatalf("wait: %v", err)
 	}
@@ -1400,7 +1585,7 @@ func TestMSBWaitPollsUntilTerminal(t *testing.T) {
 func TestMSBCaptureBoundedAndTruncated(t *testing.T) {
 	key, _ := testAuthority(t)
 	bin, _ := fakeMSB(t, map[string]string{"MSB_FAKE_OUT": "burst", "MSB_FAKE_BYTES": "200000"})
-	backend := testBackend(bin, filepath.Join(t.TempDir(), "artifacts"))
+	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 	job := testContract(t, key, func(c *JobContractV2) {
 		c.JobID = "capture-1"
 		c.Nonce = "n-capture"
@@ -1411,7 +1596,7 @@ func TestMSBCaptureBoundedAndTruncated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dispatch: %v", err)
 	}
-	res, err := backend.Wait(testContext(t), job, disp.Handle, disp.RunID)
+	res, err := backend.Wait(testContext(t), job, disp)
 	if err != nil {
 		t.Fatalf("wait: %v", err)
 	}
@@ -1436,14 +1621,14 @@ func TestMSBCaptureBoundedAndTruncated(t *testing.T) {
 func TestMSBCaptureKeepsSmallOutputWhole(t *testing.T) {
 	key, _ := testAuthority(t)
 	bin, _ := fakeMSB(t, nil)
-	backend := testBackend(bin, filepath.Join(t.TempDir(), "artifacts"))
+	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "small-1"; c.Nonce = "n-small" })
 
 	disp, err := backend.Dispatch(testContext(t), job)
 	if err != nil {
 		t.Fatalf("dispatch: %v", err)
 	}
-	res, err := backend.Wait(testContext(t), job, disp.Handle, disp.RunID)
+	res, err := backend.Wait(testContext(t), job, disp)
 	if err != nil {
 		t.Fatalf("wait: %v", err)
 	}
@@ -1462,14 +1647,14 @@ func TestMSBCaptureKeepsSmallOutputWhole(t *testing.T) {
 func TestMSBCaptureFailureIsNotFullyVerified(t *testing.T) {
 	key, _ := testAuthority(t)
 	bin, _ := fakeMSB(t, map[string]string{"MSB_FAKE_LOGS_FAIL": "1"})
-	backend := testBackend(bin, filepath.Join(t.TempDir(), "artifacts"))
+	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "capfail-1"; c.Nonce = "n-capfail" })
 
 	disp, err := backend.Dispatch(testContext(t), job)
 	if err != nil {
 		t.Fatalf("dispatch: %v", err)
 	}
-	res, err := backend.Wait(testContext(t), job, disp.Handle, disp.RunID)
+	res, err := backend.Wait(testContext(t), job, disp)
 	if err == nil {
 		t.Fatalf("an unfinalized artifact produced a clean result: %+v", res)
 	}
@@ -1483,7 +1668,7 @@ func TestMSBCaptureFailureIsNotFullyVerified(t *testing.T) {
 func TestMSBCleanupRemovesSandbox(t *testing.T) {
 	key, _ := testAuthority(t)
 	bin, stateDir := fakeMSB(t, nil)
-	backend := testBackend(bin, filepath.Join(t.TempDir(), "artifacts"))
+	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "clean-1"; c.Nonce = "n-clean" })
 
 	disp, err := backend.Dispatch(testContext(t), job)
@@ -1506,7 +1691,7 @@ func TestMSBCleanupRemovesSandbox(t *testing.T) {
 func TestMSBCleanupFailureIsReported(t *testing.T) {
 	key, _ := testAuthority(t)
 	bin, stateDir := fakeMSB(t, map[string]string{"MSB_FAKE_RM_FAIL": "1"})
-	backend := testBackend(bin, filepath.Join(t.TempDir(), "artifacts"))
+	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "cleanfail-1"; c.Nonce = "n-cleanfail" })
 
 	disp, err := backend.Dispatch(testContext(t), job)
@@ -1524,7 +1709,7 @@ func TestMSBCleanupFailureIsReported(t *testing.T) {
 func TestMSBKeepSandboxesLeavesForensicVM(t *testing.T) {
 	key, _ := testAuthority(t)
 	bin, stateDir := fakeMSB(t, nil)
-	backend := testBackend(bin, filepath.Join(t.TempDir(), "artifacts"))
+	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 	backend.KeepSandboxes = true
 	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "keep-1"; c.Nonce = "n-keep" })
 
@@ -1532,7 +1717,7 @@ func TestMSBKeepSandboxesLeavesForensicVM(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dispatch: %v", err)
 	}
-	if _, err := backend.Wait(testContext(t), job, disp.Handle, disp.RunID); err != nil {
+	if _, err := backend.Wait(testContext(t), job, disp); err != nil {
 		t.Fatalf("wait: %v", err)
 	}
 	if err := backend.Cleanup(testContext(t), disp.Handle); err != nil {
@@ -1547,7 +1732,7 @@ func TestMSBKeepSandboxesLeavesForensicVM(t *testing.T) {
 
 func TestMSBVerifyRuntimeAcceptsPinnedVersion(t *testing.T) {
 	bin, _ := fakeMSB(t, nil)
-	backend := testBackend(bin, t.TempDir())
+	backend := testBackend(t, bin, t.TempDir())
 	got, err := backend.VerifyRuntime(testContext(t))
 	if err != nil {
 		t.Fatalf("pinned runtime refused: %v", err)
@@ -1559,7 +1744,7 @@ func TestMSBVerifyRuntimeAcceptsPinnedVersion(t *testing.T) {
 
 func TestMSBVerifyRuntimeRefusesDrift(t *testing.T) {
 	bin, _ := fakeMSB(t, map[string]string{"MSB_FAKE_VERSION": "0.7.7"})
-	backend := testBackend(bin, t.TempDir())
+	backend := testBackend(t, bin, t.TempDir())
 	if _, err := backend.VerifyRuntime(testContext(t)); err == nil {
 		t.Fatal("an unpinned runtime version was accepted")
 	} else if !strings.Contains(err.Error(), "pinned runtime") {
@@ -1571,8 +1756,9 @@ func TestMSBVerifyRuntimeRefusesDrift(t *testing.T) {
 // different version explicitly; the check is equality, not "at least".
 func TestMSBVerifyRuntimeHonorsExplicitPin(t *testing.T) {
 	bin, _ := fakeMSB(t, map[string]string{"MSB_FAKE_VERSION": "0.7.9"})
-	backend := testBackend(bin, t.TempDir())
+	backend := testBackend(t, bin, t.TempDir())
 	backend.RequiredVersion = "0.7.9"
+	backend.RuntimeManifest.Version = "0.7.9"
 	if _, err := backend.VerifyRuntime(testContext(t)); err != nil {
 		t.Fatalf("explicit pin refused: %v", err)
 	}
@@ -1588,7 +1774,7 @@ func TestMSBVerifyRuntimeHonorsExplicitPin(t *testing.T) {
 func TestMSBResumeAdoptsTheRuntimesOwnRecord(t *testing.T) {
 	key, _ := testAuthority(t)
 	bin, _ := fakeMSB(t, map[string]string{"MSB_FAKE_EXIT": "7"})
-	backend := testBackend(bin, filepath.Join(t.TempDir(), "artifacts"))
+	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "resume-1"; c.Nonce = "n-resume" })
 
 	disp, err := backend.Dispatch(testContext(t), job)
@@ -1596,12 +1782,15 @@ func TestMSBResumeAdoptsTheRuntimesOwnRecord(t *testing.T) {
 		t.Fatalf("dispatch: %v", err)
 	}
 	// The identity was lost with the crash: resume without one.
-	runID, res, err := backend.Resume(testContext(t), job, disp.Handle, "")
+	run, res, err := backend.Resume(testContext(t), job, RunIdentity{Handle: disp.Handle})
 	if err != nil {
 		t.Fatalf("resume: %v", err)
 	}
-	if runID != disp.RunID {
-		t.Fatalf("adopted run %q, want %q", runID, disp.RunID)
+	if run.RunID != disp.RunID {
+		t.Fatalf("adopted run %q, want %q", run.RunID, disp.RunID)
+	}
+	if run.BootID != disp.BootID {
+		t.Fatalf("adopted boot generation %q, want %q", run.BootID, disp.BootID)
 	}
 	if res == nil || !res.ExitVerified || res.ExitCode != 7 {
 		t.Fatalf("resumed result = %+v", res)
@@ -1616,11 +1805,11 @@ func TestMSBResumeAdoptsTheRuntimesOwnRecord(t *testing.T) {
 func TestMSBResumeRefusesAmbiguousAdoption(t *testing.T) {
 	key, _ := testAuthority(t)
 	bin, stateDir := fakeMSB(t, nil)
-	backend := testBackend(bin, filepath.Join(t.TempDir(), "artifacts"))
+	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "resume-2"; c.Nonce = "n-resume-2" })
 
 	t.Run("no sandbox at all", func(t *testing.T) {
-		if _, _, err := backend.Resume(testContext(t), job, "sx-resume-absent", ""); !errors.Is(err, ErrExecutionUnobserved) {
+		if _, _, err := backend.Resume(testContext(t), job, RunIdentity{Handle: "sx-resume-absent"}); !errors.Is(err, ErrExecutionUnobserved) {
 			t.Fatalf("resume without a sandbox = %v, want unobserved", err)
 		}
 	})
@@ -1631,7 +1820,7 @@ func TestMSBResumeRefusesAmbiguousAdoption(t *testing.T) {
 		if err := fakeWriteJob(stateDir, name, []string{"some-other-command"}); err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := backend.Resume(testContext(t), job, name, ""); !errors.Is(err, ErrExecutionUnobserved) {
+		if _, _, err := backend.Resume(testContext(t), job, RunIdentity{Handle: name}); !errors.Is(err, ErrExecutionUnobserved) {
 			t.Fatalf("resume with no match = %v, want unobserved", err)
 		}
 	})
@@ -1646,7 +1835,7 @@ func TestMSBResumeRefusesAmbiguousAdoption(t *testing.T) {
 		if err := fakeWriteJob(stateDir, disp.Handle, job.Argv); err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := backend.Resume(testContext(t), job, disp.Handle, ""); !errors.Is(err, ErrExecutionUnobserved) {
+		if _, _, err := backend.Resume(testContext(t), job, RunIdentity{Handle: disp.Handle}); !errors.Is(err, ErrExecutionUnobserved) {
 			t.Fatalf("resume with two matches = %v, want unobserved", err)
 		}
 	})
@@ -1662,7 +1851,7 @@ func TestMSBPinsDeploymentProfile(t *testing.T) {
 	t.Run("default single-tenant is pinned and verified", func(t *testing.T) {
 		key, _ := testAuthority(t)
 		bin, stateDir := fakeMSB(t, nil)
-		backend := testBackend(bin, filepath.Join(t.TempDir(), "artifacts"))
+		backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 		job := testContract(t, key, func(c *JobContractV2) { c.JobID = "prof-1"; c.Nonce = "n-prof" })
 		disp, err := backend.Dispatch(testContext(t), job)
 		if err != nil {
@@ -1671,14 +1860,14 @@ func TestMSBPinsDeploymentProfile(t *testing.T) {
 		if got := readFakeSandbox(t, stateDir, disp.Handle).Config.DeploymentProfile; got != "single_tenant" {
 			t.Fatalf("deployment profile = %q, want single_tenant", got)
 		}
-		if _, err := backend.Wait(testContext(t), job, disp.Handle, disp.RunID); err != nil {
+		if _, err := backend.Wait(testContext(t), job, disp); err != nil {
 			t.Fatalf("wait: %v", err)
 		}
 	})
 	t.Run("downgraded booted profile refuses", func(t *testing.T) {
 		key, _ := testAuthority(t)
 		bin, stateDir := fakeMSB(t, map[string]string{"MSB_FAKE_TAMPER": "deployment_multi"})
-		backend := testBackend(bin, filepath.Join(t.TempDir(), "artifacts"))
+		backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 		job := testContract(t, key, func(c *JobContractV2) { c.JobID = "prof-2"; c.Nonce = "n-prof-2" })
 		name := backend.msbJobName(job.JobID)
 		_, err := backend.Dispatch(testContext(t), job)
@@ -1692,7 +1881,7 @@ func TestMSBPinsDeploymentProfile(t *testing.T) {
 	t.Run("explicit multi-tenant pin is honored", func(t *testing.T) {
 		key, _ := testAuthority(t)
 		bin, stateDir := fakeMSB(t, nil)
-		backend := testBackend(bin, filepath.Join(t.TempDir(), "artifacts"))
+		backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 		backend.DeploymentProfile = DeploymentMultiTenant
 		job := testContract(t, key, func(c *JobContractV2) { c.JobID = "prof-3"; c.Nonce = "n-prof-3" })
 		disp, err := backend.Dispatch(testContext(t), job)
@@ -1706,7 +1895,7 @@ func TestMSBPinsDeploymentProfile(t *testing.T) {
 	t.Run("unknown profile refuses", func(t *testing.T) {
 		key, _ := testAuthority(t)
 		bin, _ := fakeMSB(t, nil)
-		backend := testBackend(bin, filepath.Join(t.TempDir(), "artifacts"))
+		backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 		backend.DeploymentProfile = "yolo-tenant"
 		job := testContract(t, key, func(c *JobContractV2) { c.JobID = "prof-4"; c.Nonce = "n-prof-4" })
 		if _, err := backend.Dispatch(testContext(t), job); err == nil || !strings.Contains(err.Error(), "unknown deployment profile") {
@@ -1720,7 +1909,7 @@ func TestMSBPinsDeploymentProfile(t *testing.T) {
 func TestMSBVerifyHost(t *testing.T) {
 	t.Run("ready host passes", func(t *testing.T) {
 		bin, _ := fakeMSB(t, nil)
-		backend := testBackend(bin, t.TempDir())
+		backend := testBackend(t, bin, t.TempDir())
 		out, err := backend.VerifyHost(testContext(t))
 		if err != nil {
 			t.Fatalf("ready host refused: %v", err)
@@ -1731,7 +1920,7 @@ func TestMSBVerifyHost(t *testing.T) {
 	})
 	t.Run("unsupported host refuses", func(t *testing.T) {
 		bin, _ := fakeMSB(t, map[string]string{"MSB_FAKE_DOCTOR_FAIL": "1"})
-		backend := testBackend(bin, t.TempDir())
+		backend := testBackend(t, bin, t.TempDir())
 		if _, err := backend.VerifyHost(testContext(t)); err == nil {
 			t.Fatal("an unsupported host was accepted")
 		} else if !strings.Contains(err.Error(), "host confinement check failed") {
@@ -1745,7 +1934,7 @@ func TestMSBVerifyHost(t *testing.T) {
 // accumulated without bound on the executor's behalf.
 func TestMSBBoundsUtilityCallOutput(t *testing.T) {
 	bin, _ := fakeMSB(t, nil)
-	backend := testBackend(bin, t.TempDir())
+	backend := testBackend(t, bin, t.TempDir())
 	out, err := backend.runOnce(testContext(t), "flood")
 	if err == nil {
 		t.Fatalf("a flooding call was accepted (%d bytes)", len(out))
@@ -1755,5 +1944,229 @@ func TestMSBBoundsUtilityCallOutput(t *testing.T) {
 	}
 	if len(out) > maxCLIOutputBytes {
 		t.Fatalf("captured %d bytes, over the %d-byte bound", len(out), maxCLIOutputBytes)
+	}
+}
+
+// ─── rc.6: runtime identity, effective policy, execution identity ───
+
+// TestMSBRuntimeIdentityRefusesSubstitutedBytes: a runtime that reports
+// the pinned version but hashes differently is a substituted runtime —
+// the version string is a claim, the digest is the identity.
+func TestMSBRuntimeIdentityRefusesSubstitutedBytes(t *testing.T) {
+	bin, _ := fakeMSB(t, nil)
+	t.Run("substituted executable", func(t *testing.T) {
+		backend := testBackend(t, bin, t.TempDir())
+		backend.RuntimeManifest.MSBSHA256 = strings.Repeat("0", 64)
+		if _, err := backend.VerifyRuntime(testContext(t)); err == nil {
+			t.Fatal("a substituted executable was accepted")
+		} else if !strings.Contains(err.Error(), "substituted executable") {
+			t.Fatalf("executable refusal = %v", err)
+		}
+	})
+	t.Run("substituted firmware", func(t *testing.T) {
+		backend := testBackend(t, bin, t.TempDir())
+		backend.RuntimeManifest.LibkrunfwSHA256 = strings.Repeat("0", 64)
+		if _, err := backend.VerifyRuntime(testContext(t)); err == nil {
+			t.Fatal("substituted firmware was accepted")
+		} else if !strings.Contains(err.Error(), "substituted virtualization component") {
+			t.Fatalf("firmware refusal = %v", err)
+		}
+	})
+	t.Run("missing manifest refuses", func(t *testing.T) {
+		backend := testBackend(t, bin, t.TempDir())
+		backend.RuntimeManifest = nil
+		if _, err := backend.VerifyRuntime(testContext(t)); err == nil {
+			t.Fatal("a runtime without a qualified manifest was accepted")
+		} else if !strings.Contains(err.Error(), "runtime manifest is required") {
+			t.Fatalf("manifest refusal = %v", err)
+		}
+	})
+}
+
+// TestMSBPolicyRefusesUnauthorizedSettings is the F-034 regression
+// table: every security-sensitive setting the policy did not authorize
+// refuses before any guest command runs.
+func TestMSBPolicyRefusesUnauthorizedSettings(t *testing.T) {
+	cases := []struct {
+		tamper string
+		want   string
+	}{
+		{"extra_env", "unauthorized variable"},
+		{"init_hook", "initialization hook"},
+		{"patches", "rootfs patch"},
+		{"scripts", "runtime script binding"},
+		{"rlimits", "sandbox-level rlimit"},
+		{"mount_policy_loose", "external mount policy"},
+		{"extra_interface", "network interface binding"},
+		{"port_publish", "port(s)"},
+		{"pending_changes", "pending configuration change"},
+		{"paused", "paused"},
+		{"recovery_required", "requires recovery"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.tamper, func(t *testing.T) {
+			key, _ := testAuthority(t)
+			bin, stateDir := fakeMSB(t, map[string]string{"MSB_FAKE_TAMPER": tc.tamper})
+			backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
+			job := testContract(t, key, func(c *JobContractV2) { c.JobID = "policy-" + tc.tamper; c.Nonce = "n-" + tc.tamper })
+			name := backend.msbJobName(job.JobID)
+			_, err := backend.Dispatch(testContext(t), job)
+			if err == nil {
+				t.Fatalf("%s was accepted", tc.tamper)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("refusal %q does not mention %q", err, tc.want)
+			}
+			if _, serr := os.Stat(fakeStatePath(stateDir, name)); serr == nil {
+				t.Fatal("the unauthorized VM was not destroyed")
+			}
+		})
+	}
+}
+
+// TestMSBDispatchBindsBootGeneration: the runtime-owned job must run in
+// the boot generation this dispatch verified — a job record naming a
+// different VM instance refuses, and the VM is destroyed (F-037).
+func TestMSBDispatchBindsBootGeneration(t *testing.T) {
+	key, _ := testAuthority(t)
+	bin, stateDir := fakeMSB(t, map[string]string{"MSB_FAKE_JOB_BOOT_MISMATCH": "1"})
+	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
+	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "boot-mismatch"; c.Nonce = "n-boot" })
+	name := backend.msbJobName(job.JobID)
+
+	_, err := backend.Dispatch(testContext(t), job)
+	if err == nil {
+		t.Fatal("a job in a substituted VM instance was accepted")
+	}
+	if !strings.Contains(err.Error(), "substituted VM instance") {
+		t.Fatalf("refusal = %v", err)
+	}
+	if _, serr := os.Stat(fakeStatePath(stateDir, name)); serr == nil {
+		t.Fatal("the substituted VM was not destroyed")
+	}
+}
+
+// TestMSBWaitRefusesSubstitutedBootGeneration: a job record whose boot
+// generation changes mid-observation is a different VM instance — the
+// outcome is unobserved, never adopted.
+func TestMSBWaitRefusesSubstitutedBootGeneration(t *testing.T) {
+	key, _ := testAuthority(t)
+	bin, stateDir := fakeMSB(t, nil)
+	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
+	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "wait-boot"; c.Nonce = "n-wait-boot" })
+
+	disp, err := backend.Dispatch(testContext(t), job)
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	// Substitute the VM the record belongs to: same job id, different
+	// boot generation.
+	recs, err := fakeReadJobs(stateDir, disp.Handle)
+	if err != nil || len(recs) != 1 {
+		t.Fatalf("job records = %+v (%v)", recs, err)
+	}
+	recs[0].RuntimeBoot = "boot_" + strings.Repeat("7", 32)
+	if err := fakeWriteJobs(stateDir, disp.Handle, recs); err != nil {
+		t.Fatal(err)
+	}
+	res, werr := backend.Wait(testContext(t), job, disp)
+	if werr == nil {
+		t.Fatalf("a substituted boot generation produced a result: %+v", res)
+	}
+	if !errors.Is(werr, ErrExecutionUnobserved) {
+		t.Fatalf("substitution error = %v, want unobserved", werr)
+	}
+}
+
+// TestMSBResumeRefusesSubstitutedBootGeneration: recovery adopts a job
+// only when it runs in the boot generation the ledger recorded — a
+// sandbox re-created under the same name is never adopted.
+func TestMSBResumeRefusesSubstitutedBootGeneration(t *testing.T) {
+	key, _ := testAuthority(t)
+	bin, stateDir := fakeMSB(t, nil)
+	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
+	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "resume-boot"; c.Nonce = "n-resume-boot" })
+
+	disp, err := backend.Dispatch(testContext(t), job)
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	// A new boot under the same name: the sandbox's boot identity file
+	// changes while the old job record remains.
+	newBoot := "boot_" + strings.Repeat("8", 32)
+	if err := os.WriteFile(filepath.Join(stateDir, disp.Handle+".storage", "runtime", "runtime-boot-id"), []byte(newBoot), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run, res, rerr := backend.Resume(testContext(t), job, RunIdentity{Handle: disp.Handle, RunID: "", BootID: disp.BootID})
+	if rerr == nil {
+		t.Fatalf("a substituted boot generation was adopted: %+v %+v", run, res)
+	}
+	if !errors.Is(rerr, ErrExecutionUnobserved) || !strings.Contains(rerr.Error(), "substituted VM instance") {
+		t.Fatalf("substitution error = %v", rerr)
+	}
+}
+
+// TestMSBListJobsIsExhaustive: discovery follows every page — a job on
+// a later page is found, so incomplete discovery is never mistaken for
+// absence of execution (F-038).
+func TestMSBListJobsIsExhaustive(t *testing.T) {
+	key, _ := testAuthority(t)
+	bin, stateDir := fakeMSB(t, map[string]string{"MSB_FAKE_JOBS_PAGE": "2"})
+	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
+	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "page-1"; c.Nonce = "n-page" })
+
+	disp, err := backend.Dispatch(testContext(t), job)
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	// Four more jobs on later pages; the authorized one is page 3.
+	for i := 0; i < 4; i++ {
+		if err := fakeWriteJob(stateDir, disp.Handle, []string{"other", fmt.Sprint(i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recs, err := backend.listJobs(testContext(t), disp.Handle)
+	if err != nil {
+		t.Fatalf("listJobs: %v", err)
+	}
+	if len(recs) != 5 {
+		t.Fatalf("discovered %d job(s), want all 5", len(recs))
+	}
+	found := false
+	for _, rec := range recs {
+		if rec.ID == disp.RunID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("the authorized job on a later page was not discovered")
+	}
+}
+
+// TestMSBListJobsRefusesStuckCursor: a cursor that repeats is an error —
+// discovery that cannot complete is never treated as absence.
+func TestMSBListJobsRefusesStuckCursor(t *testing.T) {
+	bin, stateDir := fakeMSB(t, map[string]string{"MSB_FAKE_JOBS_PAGE": "1", "MSB_FAKE_JOBS_CURSOR_LOOP": "1"})
+	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
+	name := "sx-stuck"
+	writeFakeSandbox(t, stateDir, name, fakeDefaultConfig())
+	for i := 0; i < 3; i++ {
+		if err := fakeWriteJob(stateDir, name, []string{"cmd", fmt.Sprint(i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := backend.listJobs(testContext(t), name); err == nil {
+		t.Fatal("a stuck cursor was treated as the end of discovery")
+	} else if !strings.Contains(err.Error(), "cursor") {
+		t.Fatalf("stuck cursor error = %v", err)
+	}
+}
+
+// TestSyncDirRefusesMissingDirectory: the artifact directory sync is a
+// checked durability operation — a sync that cannot run is an error, not
+// a silent success (F-036).
+func TestSyncDirRefusesMissingDirectory(t *testing.T) {
+	if err := syncDir(filepath.Join(t.TempDir(), "absent")); err == nil {
+		t.Fatal("syncing an absent directory reported success")
 	}
 }

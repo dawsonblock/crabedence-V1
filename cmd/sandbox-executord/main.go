@@ -31,6 +31,14 @@
 //	                 guest exit event observable independently of any
 //	                 CLI process exit code, and that semantics is
 //	                 version-qualified, never assumed
+//	-runtime-manifest
+//	                 qualified runtime manifest (JSON: version,
+//	                 msb_sha256, libkrunfw_sha256); required for the
+//	                 microsandbox backend. The installed executable
+//	                 and the firmware it boots guests with must hash
+//	                 to these digests — a binary reporting the right
+//	                 version but carrying different bytes is a
+//	                 substituted runtime and refuses startup
 //	-msb-deployment-profile
 //	                 host-runtime isolation profile every sandbox
 //	                 boots under (default single-tenant); the booted
@@ -120,6 +128,7 @@ func main() {
 	backendName := flag.String("backend", os.Getenv("SANDBOX_EXECUTOR_BACKEND"), "execution backend: \"\" or \"microsandbox\" (or SANDBOX_EXECUTOR_BACKEND)")
 	msbBin := flag.String("msb-bin", os.Getenv("SANDBOX_EXECUTOR_MSB_BIN"), "path to the msb binary (or SANDBOX_EXECUTOR_MSB_BIN)")
 	msbVersion := flag.String("msb-version", sandboxexecutor.PinnedMSBVersion, "pinned Microsandbox runtime version the adapter is qualified against")
+	runtimeManifest := flag.String("runtime-manifest", os.Getenv("SANDBOX_EXECUTOR_RUNTIME_MANIFEST"), "qualified runtime manifest (JSON) pinning the msb executable and libkrunfw firmware SHA-256 (or SANDBOX_EXECUTOR_RUNTIME_MANIFEST); required for the microsandbox backend")
 	msbProfile := flag.String("msb-deployment-profile", sandboxexecutor.DeploymentSingleTenant, "host-runtime isolation profile every sandbox boots under (single-tenant or multi-tenant)")
 	msbPull := flag.String("msb-pull", "never", "image fetch policy for the microsandbox backend: never (require the pinned image locally) or if-missing")
 	stateDir := flag.String("state-dir", os.Getenv("SANDBOX_EXECUTOR_STATE_DIR"), "artifact directory for captured output (or SANDBOX_EXECUTOR_STATE_DIR)")
@@ -190,18 +199,28 @@ func main() {
 			Bin: bin, StateDir: artifacts, PullPolicy: *msbPull,
 			RequiredVersion: *msbVersion, DeploymentProfile: *msbProfile,
 		}
+		// The qualified runtime manifest is mandatory: the version
+		// string is a claim, the digests are the identity. A runtime
+		// whose executable or firmware bytes differ from the qualified
+		// release refuses startup.
+		manifest, merr := sandboxexecutor.LoadRuntimeManifest(*runtimeManifest)
+		if merr != nil {
+			log.Fatalf("sandbox-executord: %v", merr)
+		}
+		mb.RuntimeManifest = manifest
 		// The pinned runtime is part of the execution policy: the
 		// adapter's structured-observation semantics are qualified
 		// against one runtime version, so a different one refuses
 		// startup instead of silently degrading how results are
 		// observed.
-		verifyCtx, verifyCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		verifyCtx, verifyCancel := context.WithTimeout(context.Background(), 60*time.Second)
 		got, verr := mb.VerifyRuntime(verifyCtx)
 		verifyCancel()
 		if verr != nil {
 			log.Fatalf("sandbox-executord: %v", verr)
 		}
-		log.Printf("sandbox-executord: microsandbox runtime %s verified at %s", got, bin)
+		log.Printf("sandbox-executord: microsandbox runtime %s identity verified at %s (msb sha256 %s…, firmware sha256 %s…)",
+			got, bin, manifest.MSBSHA256[:12], manifest.LibkrunfwSHA256[:12])
 		// The host confinement profile is the other half of the
 		// policy: an unsupported host refuses startup rather than
 		// running without the isolation the executor promises.

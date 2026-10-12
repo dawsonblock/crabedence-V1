@@ -20,14 +20,18 @@ var ErrAmbiguousDispatch = errors.New("dispatch outcome uncertain — the job ma
 // recorded as a guest exit.
 var ErrExecutionUnobserved = errors.New("execution outcome was never observed — reconciliation required")
 
-// DispatchResult identifies one launched job: the backend's handle for
-// the sandbox that runs it plus the runtime-owned run identity, when
-// the backend has one. The run identity is what makes a launch
-// observable after the daemon that started it is gone — a backend
-// that cannot name the run cannot reconcile it.
-type DispatchResult struct {
-	Handle string
-	RunID  string
+// RunIdentity is the complete execution identity of one dispatch: the
+// backend's handle for the sandbox, the runtime-owned run identity,
+// the VM boot generation the run was verified in, and the digest of
+// the effective policy it was authorized under. Every later
+// observation must carry the same identity — a run that names a
+// different boot generation is a substituted VM and is never adopted,
+// and a result that cannot name its policy is not evidence.
+type RunIdentity struct {
+	Handle       string
+	RunID        string
+	BootID       string
+	PolicyDigest string
 }
 
 // Backend is where an authorized, persisted job goes for execution.
@@ -45,19 +49,22 @@ type Backend interface {
 	// binds who ran the job, not just what ran.
 	Name() string
 
-	// Dispatch starts the job and returns the backend's handle for
-	// it (e.g. the sandbox name) plus its runtime-owned run identity
-	// when the backend has one. Returned errors classify as:
-	//   nil           — launched, handle valid
+	// Dispatch starts the job and returns the backend's execution
+	// identity for it: the handle, the runtime-owned run identity and
+	// boot generation when the backend has them, and the digest of
+	// the effective policy the launch was verified against. Returned
+	// errors classify as:
+	//   nil           — launched, identity valid
 	//   ErrAmbiguousDispatch (wrapped) — outcome unknown; the handle,
 	//                   if also returned, may be live
 	//   other error   — definitive refusal, nothing launched
-	Dispatch(ctx context.Context, job *JobContractV2) (DispatchResult, error)
+	Dispatch(ctx context.Context, job *JobContractV2) (RunIdentity, error)
 
 	// Wait observes the job until it demonstrably finished or ctx is
 	// canceled, then captures its bounded output artifact and reports
-	// the bound result. A ctx cancellation means the monitor stopped
-	// watching — it does not mean the job stopped running.
+	// the bound result. The observation must match the dispatch's
+	// execution identity exactly. A ctx cancellation means the monitor
+	// stopped watching — it does not mean the job stopped running.
 	//
 	// The result distinguishes observed outcomes: a verified guest
 	// termination (ExitVerified), a runtime-killed deadline
@@ -67,7 +74,7 @@ type Backend interface {
 	// artifact could not be finalized, a non-nil result with a
 	// non-nil error: the plan's "result not fully verified", never a
 	// terminal claim without its evidence.
-	Wait(ctx context.Context, job *JobContractV2, handle, runID string) (*ExecResult, error)
+	Wait(ctx context.Context, job *JobContractV2, run RunIdentity) (*ExecResult, error)
 
 	// Inspect reports whether handle still names a live workload —
 	// the reconcile aid after a daemon restart, never a re-dispatch
@@ -77,12 +84,14 @@ type Backend interface {
 	// Resume re-establishes observation of a run a previous daemon
 	// lifetime left unresolved: it recovers the runtime-owned run
 	// identity — adopting the runtime's own record when the identity
-	// was lost with the crash — and observes the run to a terminal
-	// result, exactly as Wait would. It never launches anything: a
-	// run it cannot find is unobserved, never duplicated. The
-	// returned run id is the identity the observation was made from,
-	// so the caller can persist an adopted one.
-	Resume(ctx context.Context, job *JobContractV2, handle, runID string) (string, *ExecResult, error)
+	// was lost with the crash — verifies the boot generation matches
+	// the one the ledger recorded, and observes the run to a terminal
+	// result, exactly as Wait would. It never launches anything: a run
+	// it cannot find, or one whose boot generation differs, is
+	// unobserved — never duplicated, never adopted. The returned
+	// identity carries any adopted fields so the caller can persist
+	// them.
+	Resume(ctx context.Context, job *JobContractV2, run RunIdentity) (RunIdentity, *ExecResult, error)
 
 	// Cleanup removes the backend resources a finished job leaves
 	// behind (e.g. its sandbox). A failure is recorded as cleanup
@@ -125,6 +134,13 @@ type ExecResult struct {
 	// RunID is the runtime-owned job identity the outcome was
 	// observed from.
 	RunID string `json:"run_id,omitempty"`
+	// BootID is the VM boot generation the run was verified in — the
+	// substituted-instance control.
+	BootID string `json:"boot_id,omitempty"`
+	// PolicyDigest is the digest of the effective policy the run was
+	// authorized under: the canonical identity an independent verifier
+	// compares against the ledger.
+	PolicyDigest string `json:"policy_digest,omitempty"`
 	// CaptureSource names where the artifact's bytes came from. The
 	// runtime's job store retains a bounded capture, so the artifact
 	// is exactly those stored bytes — a durable, hashed record, not
