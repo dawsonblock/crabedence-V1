@@ -22,6 +22,13 @@ import (
 
 func startServer(t *testing.T, cfg Config) *Server {
 	t.Helper()
+	// An execution backend requires a fully positive resource pool —
+	// aggregate bounds are mandatory for untrusted code. Tests that
+	// exercise the bounds set their own; the rest get a generous
+	// default so every suite runs under the mandated posture.
+	if cfg.Backend != nil && cfg.ResourcePool == nil {
+		cfg.ResourcePool = testPool()
+	}
 	srv, err := NewServer(cfg)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
@@ -31,6 +38,19 @@ func startServer(t *testing.T, cfg Config) *Server {
 	}
 	t.Cleanup(func() { _ = srv.Stop() })
 	return srv
+}
+
+// testPool is a fully positive aggregate pool — the posture every
+// execution backend must run under.
+func testPool() *ResourcePool {
+	return &ResourcePool{
+		MaxConcurrentVMs: 8,
+		MaxSubmitterVMs:  8,
+		TotalCPUs:        64,
+		TotalMemoryMB:    64 * 1024,
+		TotalDiskMB:      1 << 20,
+		TotalOutputBytes: 1 << 30,
+	}
 }
 
 // socketDir returns a short private directory — t.TempDir() paths
@@ -455,7 +475,7 @@ func signedJobReq(t *testing.T, key ed25519.PrivateKey, mutate func(*JobContract
 		Image:       "python:3.12",
 		ImageDigest: testImageDigest,
 		Argv:        []string{"python3", "-c", "print(1)"},
-		Resources:   ResourceBudget{TimeoutSeconds: 60},
+		Resources:   ResourceBudget{TimeoutSeconds: 60, CPUs: 1, MemoryMB: 256, DiskMB: 512, MaxOutputBytes: 4096},
 		Network:     NetworkPolicy{Mode: NetworkNone},
 		Security:    SecurityDefault,
 		IssuedAt:    now.Unix() - 5,
@@ -598,9 +618,11 @@ func TestResourcePoolBoundsAdmission(t *testing.T) {
 	// The stub holds every admitted job RUNNING, so the pool fills up.
 	be := &stubBackend{handle: "vm-pool", wait: make(chan *ExecResult)}
 	t.Cleanup(func() { close(be.wait) })
+	pool := testPool()
+	pool.MaxConcurrentVMs, pool.MaxSubmitterVMs = 2, 2
 	srv := startServer(t, Config{
 		SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys, Backend: be,
-		ResourcePool: &ResourcePool{MaxConcurrentVMs: 2, MaxSubmitterVMs: 2},
+		ResourcePool: pool,
 	})
 	admit := func(id string) Response {
 		conn, reader := connect(t, srv.SocketPath())
@@ -636,13 +658,19 @@ func TestResourcePoolRequiresDeclaredBudgets(t *testing.T) {
 	key, keys := testAuthority(t)
 	be := &stubBackend{handle: "vm-budget", wait: make(chan *ExecResult)}
 	t.Cleanup(func() { close(be.wait) })
+	pool := testPool()
+	pool.TotalMemoryMB = 1024
 	srv := startServer(t, Config{
 		SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys, Backend: be,
-		ResourcePool: &ResourcePool{TotalMemoryMB: 1024},
+		ResourcePool: pool,
 	})
 	conn, reader := connect(t, srv.SocketPath())
-	// The default test contract declares no memory.
-	resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV2) { c.JobID = "no-mem"; c.Nonce = "n-no-mem" }))
+	// The contract leaves memory undeclared under a pool that bounds it.
+	resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV2) {
+		c.JobID = "no-mem"
+		c.Nonce = "n-no-mem"
+		c.Resources.MemoryMB = 0
+	}))
 	if resp.OK || !strings.Contains(resp.Error, "declares none") {
 		t.Fatalf("undeclared budget admitted under a bounded pool: %+v", resp)
 	}
@@ -944,4 +972,35 @@ func TestReconcileAdoptsLostRunIdentity(t *testing.T) {
 	if be2.got != nil {
 		t.Fatalf("recovery re-dispatched the job: %+v", be2.got)
 	}
+}
+
+// TestBackendRequiresAggregateBounds: an execution backend runs
+// untrusted code, so zero-valued (disabled) aggregate bounds are not
+// an allowed posture — the executor refuses to start without them.
+func TestBackendRequiresAggregateBounds(t *testing.T) {
+	_, keys := testAuthority(t)
+	base := func() Config {
+		return Config{SocketDir: t.TempDir(), Peers: selfPeer(t), AuthorityKeys: keys, Backend: &stubBackend{}}
+	}
+	t.Run("no pool at all", func(t *testing.T) {
+		if _, err := NewServer(base()); err == nil || !strings.Contains(err.Error(), "requires a resource pool") {
+			t.Fatalf("backend without a pool = %v", err)
+		}
+	})
+	t.Run("a zero-valued dimension refuses", func(t *testing.T) {
+		cfg := base()
+		pool := testPool()
+		pool.TotalOutputBytes = 0
+		cfg.ResourcePool = pool
+		if _, err := NewServer(cfg); err == nil || !strings.Contains(err.Error(), "output") {
+			t.Fatalf("zero-valued output bound = %v", err)
+		}
+	})
+	t.Run("a fully positive pool is accepted", func(t *testing.T) {
+		cfg := base()
+		cfg.ResourcePool = testPool()
+		if _, err := NewServer(cfg); err != nil {
+			t.Fatalf("fully bounded backend refused: %v", err)
+		}
+	})
 }

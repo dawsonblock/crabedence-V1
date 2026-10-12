@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -190,6 +191,18 @@ func NewServer(cfg Config) (*Server, error) {
 	if p := cfg.ResourcePool; p != nil {
 		if p.MaxConcurrentVMs < 0 || p.MaxSubmitterVMs < 0 || p.TotalCPUs < 0 {
 			return nil, fmt.Errorf("resource pool bounds must not be negative")
+		}
+	}
+	// An execution backend runs untrusted code: the aggregate resource
+	// bounds are mandatory, and every dimension must be a positive
+	// bound. "Unbounded" is not a posture an untrusted-code executor
+	// may take, and a zero-valued dimension is a disabled bound.
+	if cfg.Backend != nil {
+		if cfg.ResourcePool == nil {
+			return nil, fmt.Errorf("an execution backend requires a resource pool — aggregate bounds (concurrent VMs, per-submitter VMs, cpus, memory, disk, output) are mandatory for untrusted code")
+		}
+		if err := cfg.ResourcePool.validate(); err != nil {
+			return nil, err
 		}
 	}
 	if cfg.LedgerPath == "" {
@@ -1116,6 +1129,37 @@ type ResourcePool struct {
 	TotalMemoryMB    uint64
 	TotalDiskMB      uint64
 	TotalOutputBytes uint64
+}
+
+// validate requires every dimension to be a positive bound. A
+// zero-valued dimension is a disabled bound, which an untrusted-code
+// backend may not run without — and a pool that bounds a dimension
+// also requires every admitted contract to declare it, so positive
+// aggregate bounds are what make the per-contract limits mandatory.
+func (p *ResourcePool) validate() error {
+	missing := []string{}
+	if p.MaxConcurrentVMs <= 0 {
+		missing = append(missing, "concurrent VMs (-pool-vms)")
+	}
+	if p.MaxSubmitterVMs <= 0 {
+		missing = append(missing, "per-submitter VMs (-pool-submitter-vms)")
+	}
+	if p.TotalCPUs <= 0 {
+		missing = append(missing, "cpus (-pool-cpus)")
+	}
+	if p.TotalMemoryMB == 0 {
+		missing = append(missing, "memory (-pool-memory-mb)")
+	}
+	if p.TotalDiskMB == 0 {
+		missing = append(missing, "disk (-pool-disk-mb)")
+	}
+	if p.TotalOutputBytes == 0 {
+		missing = append(missing, "output (-pool-output-bytes)")
+	}
+	if len(missing) != 0 {
+		return fmt.Errorf("an execution backend requires every aggregate bound to be positive; missing: %s", strings.Join(missing, ", "))
+	}
+	return nil
 }
 
 // check refuses one admission that would exceed the pool. Every

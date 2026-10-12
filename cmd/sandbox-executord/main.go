@@ -55,17 +55,27 @@
 //	-ceil-cpus/-ceil-memory-mb/-ceil-disk-mb/-ceil-output-bytes/-ceil-timeout-secs
 //	                 operator resource ceilings for contracts
 //	-pool-vms/-pool-submitter-vms/-pool-cpus/-pool-memory-mb/-pool-disk-mb/-pool-output-bytes
-//	                 aggregate bounds across all in-flight jobs; a
-//	                 configured dimension requires every contract to
-//	                 declare it (undeclared refuses rather than
-//	                 counting as free)
+//	                 aggregate bounds across all in-flight jobs. They
+//	                 are mandatory for a configured backend and every
+//	                 dimension must be a positive bound — "unbounded"
+//	                 is not a posture an untrusted-code executor may
+//	                 take. A bounded dimension also requires every
+//	                 contract to declare it (undeclared refuses
+//	                 rather than counting as free).
 //	-evidence-dir    execution-evidence chain directory: receipts,
 //	                 signed checkpoints and the evidence signer key
 //	                 (defaults to <socket-dir>/evidence). Every
 //	                 terminal job emits a signed receipt before its
 //	                 ledger transition; checkpoints commit to the
 //	                 durable terminal enumeration so deletion, rewrite
-//	                 or rollback is independently detectable.
+//	                 or rollback is independently detectable. Custody
+//	                 counts as independent only when the checkpoint
+//	                 files are retained outside this executor's
+//	                 administrative control too — sandbox-evidence-verify
+//	                 accepts any retained checkpoint path, so copy
+//	                 each published checkpoint to storage outside the
+//	                 executor's directory (and off this host) as it
+//	                 appears.
 //	-evidence-key    evidence signer PKCS8 PEM (defaults to
 //	                 <evidence-dir>/executor-evidence.pem, created
 //	                 durably if absent). It attests outcomes — it can

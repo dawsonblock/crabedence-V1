@@ -413,7 +413,7 @@ func TestExecutorRefusesToStartWithoutEvidence(t *testing.T) {
 	_, keys := testAuthority(t)
 	srv, err := NewServer(Config{
 		SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys,
-		Backend: &stubBackend{}, EvidenceDir: evidenceDirOf(dir),
+		Backend: &stubBackend{}, EvidenceDir: evidenceDirOf(dir), ResourcePool: testPool(),
 	})
 	if err != nil {
 		t.Fatal(err)
