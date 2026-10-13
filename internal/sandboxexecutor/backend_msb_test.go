@@ -93,9 +93,13 @@ type fakeLifecycle struct {
 }
 
 type fakeRuntime struct {
-	Workdir *string        `json:"workdir"`
-	Shell   string         `json:"shell"`
-	Scripts map[string]any `json:"scripts"`
+	Workdir    *string        `json:"workdir"`
+	Shell      string         `json:"shell"`
+	Cmd        []string       `json:"cmd"`
+	Entrypoint []string       `json:"entrypoint"`
+	User       string         `json:"user"`
+	Hostname   *string        `json:"hostname"`
+	Scripts    map[string]any `json:"scripts"`
 }
 
 type fakeNetwork struct {
@@ -161,6 +165,13 @@ type fakeJobRecord struct {
 type fakeFailure struct {
 	Kind    string `json:"kind"`
 	Message string `json:"message"`
+}
+
+// fakeImageConfig is the pinned image's own execution defaults — the
+// command, entrypoint and user the runtime boots guests with, and the
+// directory it starts them in. The fake models python:3.12's shape.
+func fakeImageConfig() (cmd, entrypoint []string, user, workingDir string) {
+	return []string{"python3"}, nil, "", ""
 }
 
 // fakeDefaultImageEnv is the pinned image's own config environment the
@@ -415,6 +426,8 @@ func fakeCreate(dir string, args []string) int {
 		merged = append(merged, fakeEnvVar{Key: key, Value: value})
 	}
 	conf.Env = append(merged, conf.Env...)
+	imgCmd, imgEntrypoint, imgUser, _ := fakeImageConfig()
+	conf.Runtime.Cmd, conf.Runtime.Entrypoint, conf.Runtime.User = imgCmd, imgEntrypoint, imgUser
 
 	if tamper := os.Getenv("MSB_FAKE_TAMPER"); tamper == "net_public" {
 		conf.Network.Policy = fakePublicPolicy()
@@ -454,6 +467,19 @@ func fakeCreate(dir string, args []string) int {
 	} else if tamper == "workdir" {
 		wd := "/tmp/unauthorized"
 		conf.Runtime.Workdir = &wd
+	} else if tamper == "shell" {
+		conf.Runtime.Shell = "/bin/bash"
+	} else if tamper == "runtime_cmd" {
+		conf.Runtime.Cmd = []string{"/usr/bin/evil"}
+	} else if tamper == "entrypoint" {
+		conf.Runtime.Entrypoint = []string{"/usr/bin/evil-init"}
+	} else if tamper == "runtime_user" {
+		conf.Runtime.User = "root"
+	} else if tamper == "hostname" {
+		host := "unauthorized-host"
+		conf.Runtime.Hostname = &host
+	} else if tamper == "duplicate_env" {
+		conf.Env = append(conf.Env, fakeEnvVar{Key: "PATH", Value: "/evil/bin"})
 	}
 	if os.Getenv("MSB_FAKE_CREATE_FAIL") != "" {
 		fmt.Fprintln(os.Stderr, "error: invalid config: sandbox refused before boot")
@@ -563,9 +589,16 @@ func fakeImageCmd(args []string) int {
 	if os.Getenv("MSB_FAKE_IMAGE_DIGEST_MISMATCH") != "" {
 		digest = "sha256:" + strings.Repeat("f", 64)
 	}
+	imgCmd, imgEntrypoint, imgUser, imgWorkdir := fakeImageConfig()
 	raw, _ := json.Marshal(map[string]any{
 		"digest": digest,
-		"config": map[string]any{"env": fakeDefaultImageEnv()},
+		"config": map[string]any{
+			"env":         fakeDefaultImageEnv(),
+			"cmd":         imgCmd,
+			"entrypoint":  imgEntrypoint,
+			"user":        imgUser,
+			"working_dir": imgWorkdir,
+		},
 	})
 	os.Stdout.Write(raw)
 	fmt.Fprintln(os.Stdout)
@@ -2021,6 +2054,12 @@ func TestMSBPolicyRefusesUnauthorizedSettings(t *testing.T) {
 		{"ephemeral", "ephemeral"},
 		{"idle_timeout", "idle timeout"},
 		{"workdir", "workdir"},
+		{"shell", "runtime shell"},
+		{"runtime_cmd", "runtime cmd"},
+		{"entrypoint", "runtime entrypoint"},
+		{"runtime_user", "runtime user"},
+		{"hostname", "hostname"},
+		{"duplicate_env", "duplicate entries"},
 		{"pending_changes", "pending configuration change"},
 		{"paused", "paused"},
 		{"recovery_required", "requires recovery"},

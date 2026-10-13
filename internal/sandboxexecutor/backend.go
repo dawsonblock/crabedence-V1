@@ -13,6 +13,44 @@ import (
 // stalled submission.
 var ErrAmbiguousDispatch = errors.New("dispatch outcome uncertain — the job may already be running")
 
+// DispatchClass is the explicit outcome class of a dispatch attempt —
+// the vocabulary the ledger records and the evidence rules key on. It
+// exists so no caller ever has to infer, from an error's shape,
+// whether an execution may have happened.
+type DispatchClass string
+
+const (
+	// DispatchNotAttempted: no launch was attempted at all (the job
+	// was refused before the backend was asked to do anything).
+	DispatchNotAttempted DispatchClass = "NOT_ATTEMPTED"
+	// DispatchProvenRejected: the backend proved nothing launched —
+	// the only class that may attest NO_EFFECT.
+	DispatchProvenRejected DispatchClass = "PROVEN_REJECTED"
+	// DispatchStarted: the launch was admitted and its identity
+	// verified.
+	DispatchStarted DispatchClass = "STARTED"
+	// DispatchUncertain: the workload may have started and its
+	// outcome is unknown. Never a no-effect claim, never retried
+	// blind.
+	DispatchUncertain DispatchClass = "UNCERTAIN"
+)
+
+// ClassifyDispatchError maps a dispatch error to its explicit class.
+// A nil error is STARTED; a proven pre-launch refusal is
+// PROVEN_REJECTED; everything else — including an unclassified error —
+// is UNCERTAIN, so a caller that cannot prove nothing executed never
+// claims it.
+func ClassifyDispatchError(err error) DispatchClass {
+	switch {
+	case err == nil:
+		return DispatchStarted
+	case errors.Is(err, ErrDispatchRefused):
+		return DispatchProvenRejected
+	default:
+		return DispatchUncertain
+	}
+}
+
 // ErrDispatchRefused marks a dispatch that definitively launched
 // nothing: the runtime refused before any workload started. Only this
 // class may produce a NO_EFFECT claim — a NO_EFFECT receipt asserts

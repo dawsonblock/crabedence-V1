@@ -200,21 +200,34 @@ type MSBBackend struct {
 	// bounded time — operators leave it at the default.
 	ObservationSlack time.Duration
 
-	// envMu guards the per-image environment baseline cache; the
-	// baseline is fixed for a pinned digest, so it is resolved once.
+	// envMu guards the per-image baseline cache; the baseline is fixed
+	// for a pinned digest, so it is resolved once.
 	envMu       sync.Mutex
-	envBaseline map[string][]string
+	envBaseline map[string]imageBaseline
+}
+
+// imageBaseline is the pinned image's own execution defaults — the
+// environment the runtime injects, the command and entrypoint it boots
+// with, the user it runs as and the directory it starts in. All of it
+// is fixed for the pinned digest, and all of it is part of the
+// authorized policy.
+type imageBaseline struct {
+	Env        []string
+	Cmd        []string
+	Entrypoint []string
+	User       string
+	WorkingDir string
 }
 
 // imageEnvBaseline resolves the pinned image's own config environment
 // — the part of the guest environment the runtime injects at boot, and
 // therefore part of the authorized set. The result is cached per
 // digest: it cannot change while the digest is pinned.
-func (b *MSBBackend) imageEnvBaseline(ctx context.Context, job *JobContractV2) ([]string, error) {
+func (b *MSBBackend) imageEnvBaseline(ctx context.Context, job *JobContractV2) (imageBaseline, error) {
 	b.envMu.Lock()
-	if env, ok := b.envBaseline[job.ImageDigest]; ok {
+	if base, ok := b.envBaseline[job.ImageDigest]; ok {
 		b.envMu.Unlock()
-		return append([]string{}, env...), nil
+		return base, nil
 	}
 	b.envMu.Unlock()
 	// The lookup is a cached read of a pinned artifact: it gets its own
@@ -224,28 +237,38 @@ func (b *MSBBackend) imageEnvBaseline(ctx context.Context, job *JobContractV2) (
 	defer cancel()
 	out, err := b.runOnce(lookupCtx, "image", "inspect", "--format", "json", job.Image+"@"+job.ImageDigest)
 	if err != nil {
-		return nil, fmt.Errorf("inspect the pinned image %s: %v: %s", job.ImageDigest, err, strings.TrimSpace(string(out)))
+		return imageBaseline{}, fmt.Errorf("inspect the pinned image %s: %v: %s", job.ImageDigest, err, strings.TrimSpace(string(out)))
 	}
 	var doc struct {
 		Digest string `json:"digest"`
 		Config struct {
-			Env []string `json:"env"`
+			Env        []string `json:"env"`
+			Cmd        []string `json:"cmd"`
+			Entrypoint []string `json:"entrypoint"`
+			User       string   `json:"user"`
+			WorkingDir string   `json:"working_dir"`
 		} `json:"config"`
 	}
 	if err := json.Unmarshal(out, &doc); err != nil {
-		return nil, fmt.Errorf("inspect the pinned image %s: malformed json: %w", job.ImageDigest, err)
+		return imageBaseline{}, fmt.Errorf("inspect the pinned image %s: malformed json: %w", job.ImageDigest, err)
 	}
 	if doc.Digest != job.ImageDigest {
-		return nil, fmt.Errorf("image inspect reports digest %s, the contract authorized %s — refusing a substituted image", doc.Digest, job.ImageDigest)
+		return imageBaseline{}, fmt.Errorf("image inspect reports digest %s, the contract authorized %s — refusing a substituted image", doc.Digest, job.ImageDigest)
 	}
-	env := normalizeEnvSet(doc.Config.Env)
+	base := imageBaseline{
+		Env:        normalizeEnvSet(doc.Config.Env),
+		Cmd:        doc.Config.Cmd,
+		Entrypoint: doc.Config.Entrypoint,
+		User:       doc.Config.User,
+		WorkingDir: doc.Config.WorkingDir,
+	}
 	b.envMu.Lock()
 	if b.envBaseline == nil {
-		b.envBaseline = map[string][]string{}
+		b.envBaseline = map[string]imageBaseline{}
 	}
-	b.envBaseline[job.ImageDigest] = env
+	b.envBaseline[job.ImageDigest] = base
 	b.envMu.Unlock()
-	return append([]string{}, env...), nil
+	return base, nil
 }
 
 // requiredVersion is the effective runtime pin.

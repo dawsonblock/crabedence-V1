@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/openclaw/crabbox/internal/evidence"
@@ -51,7 +52,12 @@ type EvidenceLog struct {
 	signer  *evidence.Signer
 	backend string // ProviderID attested in receipts
 	now     func() time.Time
-	f       *os.File
+	// mu serializes emissions: the live monitor, the refusal path and
+	// the reconcile pass all append receipts, and the chain's ordering
+	// and fsync guarantees only hold if one writer at a time owns the
+	// file.
+	mu sync.Mutex
+	f  *os.File
 	// appended counts receipts written this lifetime — informational
 	// for shutdown auditing.
 	appended int
@@ -113,6 +119,8 @@ var emptyEvidenceDigest = func() string {
 // between steps leaves an honest gap a verifier flags, never a false
 // attestation.
 func (e *EvidenceLog) EmitForJob(job *LedgerJob, outcome, artifactSHA, runID string) (string, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	if artifactSHA == "" {
 		artifactSHA = emptyEvidenceDigest
 	}
@@ -149,6 +157,15 @@ func (e *EvidenceLog) EmitForJob(job *LedgerJob, outcome, artifactSHA, runID str
 // checkpoint without rewriting history. Checkpoint N stays valid
 // even as N+k arrive: the prefix property is the point.
 func (e *EvidenceLog) Checkpoint(refs []evidence.TerminalRef) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.checkpointLocked(refs)
+}
+
+// checkpointLocked is Checkpoint's body for callers that already hold
+// the log's lock (Close emits its final checkpoint under the same
+// critical section).
+func (e *EvidenceLog) checkpointLocked(refs []evidence.TerminalRef) error {
 	cp := e.signer.SignCheckpoint(int64(len(refs)), refs)
 	raw, err := json.Marshal(cp)
 	if err != nil {
@@ -198,9 +215,11 @@ func (e *EvidenceLog) Checkpoint(refs []evidence.TerminalRef) error {
 // Close issues a final checkpoint (if refs are supplied), syncs and
 // closes the receipts file.
 func (e *EvidenceLog) Close(refs []evidence.TerminalRef) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	var err error
 	if refs != nil && e.appended > 0 {
-		if cerr := e.Checkpoint(refs); cerr != nil {
+		if cerr := e.checkpointLocked(refs); cerr != nil {
 			err = cerr
 		}
 	}

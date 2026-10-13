@@ -107,11 +107,14 @@ type LedgerJob struct {
 	// RuntimeIdentity is the qualified runtime identity (version and
 	// component digests) the dispatch was made under.
 	RuntimeIdentity string
-	ReceivedAt      time.Time
-	UpdatedAt       time.Time
-	ExitCode        *int64
-	Error           string
-	ResultJSON      string
+	// DispatchClass is the explicit outcome class of the dispatch
+	// attempt (NOT_ATTEMPTED, PROVEN_REJECTED, STARTED, UNCERTAIN).
+	DispatchClass string
+	ReceivedAt    time.Time
+	UpdatedAt     time.Time
+	ExitCode      *int64
+	Error         string
+	ResultJSON    string
 	// TerminalSeq is the job's position in the durable terminal
 	// enumeration — assigned transactionally with the terminal write
 	// so the enumeration checkpoints commit to is append-only by
@@ -231,7 +234,7 @@ func (l *Ledger) Epoch() uint64 { return l.epoch }
 // ledgers (from the admission-only spike) get their new columns via
 // ALTER TABLE rather than a destructive rebuild, and v3 adds the
 // runtime run identity plus cleanup tracking.
-const ledgerSchemaVersion = 5
+const ledgerSchemaVersion = 6
 
 func (l *Ledger) migrate() error {
 	var version int
@@ -261,6 +264,7 @@ func (l *Ledger) migrate() error {
 			dispatch_nonce TEXT NOT NULL DEFAULT '',
 			image_digest   TEXT NOT NULL DEFAULT '',
 			runtime_identity TEXT NOT NULL DEFAULT '',
+			dispatch_class TEXT NOT NULL DEFAULT '',
 			received_at    INTEGER NOT NULL,
 			updated_at     INTEGER NOT NULL,
 			exit_code      INTEGER,
@@ -333,6 +337,14 @@ func (l *Ledger) migrate() error {
 			if _, err := l.db.Exec(ddl); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 				return fmt.Errorf("migrate ledger v%d→v5: %w", version, err)
 			}
+		}
+	}
+	if version < 6 {
+		// v5 → v6: the explicit dispatch outcome class — recorded so
+		// evidence rules and operators read the classification rather
+		// than inferring it from an error's shape.
+		if _, err := l.db.Exec(`ALTER TABLE jobs ADD COLUMN dispatch_class TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			return fmt.Errorf("migrate ledger v%d→v6: %w", version, err)
 		}
 	}
 	if version < ledgerSchemaVersion {
@@ -495,7 +507,7 @@ func (l *Ledger) hashExistsTx(tx *sql.Tx, hash string) bool {
 // jobColumns is the canonical SELECT list for a full jobs row.
 const jobColumns = `job_id, contract_hash, seq, submitter, principal, image, contract_json,
 	state, fence_epoch, backend_id, backend_handle, backend_job_id, backend_boot_id, policy_digest,
-	dispatch_nonce, image_digest, runtime_identity,
+	dispatch_nonce, image_digest, runtime_identity, dispatch_class,
 	received_at, updated_at,
 	exit_code, error, result_json, terminal_seq, receipt_sha256, artifact_sha256,
 	cleanup_pending, cleanup_error`
@@ -518,7 +530,7 @@ func scanFields(j *LedgerJob) []any {
 		&j.JobID, &j.ContractHash, &j.Seq, &j.Submitter, &j.Principal, &j.Image,
 		&j.ContractJSON, &j.State, &j.FenceEpoch, &j.BackendID, &j.BackendHandle,
 		&j.BackendJobID, &j.BackendBootID, &j.PolicyDigest,
-		&j.DispatchNonce, &j.ImageDigest, &j.RuntimeIdentity,
+		&j.DispatchNonce, &j.ImageDigest, &j.RuntimeIdentity, &j.DispatchClass,
 		&j.receivedAtRaw, &j.updatedAtRaw, &j.exitRaw, &j.Error, &j.ResultJSON,
 		&j.termSeqRaw, &j.ReceiptSHA256, &j.ArtifactSHA256,
 		&j.cleanupPendingRaw, &j.CleanupError,
@@ -873,14 +885,14 @@ func (l *Ledger) Transition(jobID, to string, from []string, mutate func(*Ledger
 	res, err := tx.Exec(
 		`UPDATE jobs SET state = ?, fence_epoch = ?, backend_id = ?, backend_handle = ?,
 		 backend_job_id = ?, backend_boot_id = ?, policy_digest = ?,
-		 dispatch_nonce = ?, image_digest = ?, runtime_identity = ?,
+		 dispatch_nonce = ?, image_digest = ?, runtime_identity = ?, dispatch_class = ?,
 		 updated_at = ?, exit_code = ?, error = ?, result_json = ?,
 		 terminal_seq = ?, receipt_sha256 = ?, artifact_sha256 = ?,
 		 cleanup_pending = ?, cleanup_error = ?
 		 WHERE job_id = ? AND seq = ?`,
 		job.State, job.FenceEpoch, job.BackendID, job.BackendHandle,
 		job.BackendJobID, job.BackendBootID, job.PolicyDigest,
-		job.DispatchNonce, job.ImageDigest, job.RuntimeIdentity,
+		job.DispatchNonce, job.ImageDigest, job.RuntimeIdentity, job.DispatchClass,
 		time.Now().UTC().UnixMilli(), exit, job.Error, job.ResultJSON,
 		termSeq, job.ReceiptSHA256, job.ArtifactSHA256,
 		cleanupPending, job.CleanupError,

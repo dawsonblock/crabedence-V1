@@ -25,7 +25,10 @@ that policy exactly, in both the persisted `config` and the resolved
 - the image manifest digest, the security profile, the deployment profile and
   the strict external-mount policy;
 - the guest environment — the contract's entries plus the pinned image's own
-  config environment, with **nothing extra**;
+  config environment, with **nothing extra** and no duplicate keys;
+- the runtime's execution defaults — the command shell, and the pinned image's
+  own command, entrypoint, user and working directory — so nothing about how
+  the guest starts is left to a default nobody authorized;
 - resources, the VM's own `--max-duration` (contract timeout plus the fixed
   observation grace), the workdir and the authorized mounts (including
   read-only intent);
@@ -201,6 +204,10 @@ the backstop.
   The executor refuses a host its runtime's prerequisite check rejects, and the
   runtime manifest is built from the hashes of that qualified install, so the
   Linux lane pins exactly the bytes it proved.
+- The adversarial fault matrix measures the release targets instead of
+  asserting them: 33 scenarios across dispatch, policy and adoption boundaries
+  report zero false `NO_EFFECT` receipts, zero unauthorized adoptions, zero
+  duplicate dispatches and zero accepted forbidden policy changes.
 - The crash-consistency lane is qualified by SIGKILL rather than assertion:
   `TestDaemonCrashPreservesAcknowledgedJobs` kills the real daemon mid-job and
   requires the acknowledged job, its pre-persisted authorization and its single

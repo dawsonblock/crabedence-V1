@@ -814,6 +814,7 @@ func (s *Server) serve(conn *net.UnixConn) {
 			_ = s.ledger.Transition(jobID, JobStateDispatchFailed, []string{JobStateDispatching},
 				func(j *LedgerJob) error {
 					j.ReceiptSHA256 = receiptSHA
+					j.DispatchClass = string(DispatchNotAttempted)
 					j.Error = fmt.Sprintf("dispatch refused before launch: %v", perr)
 					return nil
 				})
@@ -833,6 +834,7 @@ func (s *Server) serve(conn *net.UnixConn) {
 			err := s.ledger.Transition(jobID, JobStateRunning, []string{JobStateDispatching},
 				func(j *LedgerJob) error {
 					applyRunIdentity(j, s.backendName, disp)
+					j.DispatchClass = string(DispatchStarted)
 					return nil
 				})
 			if err != nil {
@@ -853,6 +855,7 @@ func (s *Server) serve(conn *net.UnixConn) {
 			_ = s.ledger.Transition(jobID, JobStateDispatchAmbig, []string{JobStateDispatching},
 				func(j *LedgerJob) error {
 					applyRunIdentity(j, s.backendName, disp)
+					j.DispatchClass = string(DispatchUncertain)
 					j.Error = derr.Error()
 					return nil
 				})
@@ -875,6 +878,7 @@ func (s *Server) serve(conn *net.UnixConn) {
 				func(j *LedgerJob) error {
 					j.Error, j.BackendID, j.BackendHandle, j.ReceiptSHA256 =
 						derr.Error(), s.backendName, disp.Handle, receiptSHA
+					j.DispatchClass = string(DispatchProvenRejected)
 					return nil
 				})
 			s.checkpoint()
@@ -889,6 +893,7 @@ func (s *Server) serve(conn *net.UnixConn) {
 			_ = s.ledger.Transition(jobID, JobStateDispatchAmbig, []string{JobStateDispatching},
 				func(j *LedgerJob) error {
 					applyRunIdentity(j, s.backendName, disp)
+					j.DispatchClass = string(DispatchUncertain)
 					j.Error = fmt.Sprintf("dispatch error could not be classified as a pre-launch refusal — treating the outcome as uncertain: %v", derr)
 					return nil
 				})

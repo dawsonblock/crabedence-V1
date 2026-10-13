@@ -48,6 +48,19 @@ type EffectivePolicyV1 struct {
 	NetworkMode  string   `json:"network_mode"`
 	NetworkAllow []string `json:"network_allow,omitempty"`
 
+	// RuntimeShell is the pinned runtime's default command shell. An
+	// execution hook the policy did not authorize — a different shell
+	// the runtime would use for the guest command — is a refusal.
+	RuntimeShell string `json:"runtime_shell"`
+	// RuntimeCmd / RuntimeEntrypoint / RuntimeUser are the pinned
+	// image's own execution defaults (fixed for its digest): the VM
+	// must boot with exactly them, so nothing about how the guest
+	// starts is left to an image or a runtime default nobody
+	// authorized.
+	RuntimeCmd        []string `json:"runtime_cmd,omitempty"`
+	RuntimeEntrypoint []string `json:"runtime_entrypoint,omitempty"`
+	RuntimeUser       string   `json:"runtime_user,omitempty"`
+
 	SecurityProfile   string `json:"security_profile"`
 	DeploymentProfile string `json:"deployment_profile"`
 	// ExternalMountPolicy is the host-mount confinement the runtime
@@ -83,12 +96,17 @@ type EffectivePolicyV1 struct {
 // must boot under: no implicit host paths.
 const ExternalMountPolicyStrict = "strict"
 
+// defaultRuntimeShell is the pinned runtime's default command shell —
+// part of the effective policy, so a runtime that would run the guest
+// command through anything else refuses.
+const defaultRuntimeShell = "/bin/sh"
+
 // buildEffectivePolicy compiles the contract and the backend's
 // mandatory restrictions into the canonical policy for one dispatch.
 // imageEnv is the pinned image's own config environment; it is part of
 // the authorized set because the runtime injects it into every VM
 // booted from that digest.
-func (b *MSBBackend) buildEffectivePolicy(job *JobContractV2, name, nonce string, runtimeVersion string, imageEnv []string) (*EffectivePolicyV1, error) {
+func (b *MSBBackend) buildEffectivePolicy(job *JobContractV2, name, nonce string, runtimeVersion string, image imageBaseline) (*EffectivePolicyV1, error) {
 	if job == nil {
 		return nil, fmt.Errorf("policy requires a signed job contract")
 	}
@@ -103,7 +121,13 @@ func (b *MSBBackend) buildEffectivePolicy(job *JobContractV2, name, nonce string
 	if pull != PullNever && pull != PullIfMissing {
 		return nil, fmt.Errorf("unknown image pull policy %q (want %q or %q)", pull, PullNever, PullIfMissing)
 	}
-	env := normalizeEnvSet(append(append([]string{}, job.Env...), imageEnv...))
+	env := normalizeEnvSet(append(append([]string{}, job.Env...), image.Env...))
+	workdir := job.Filesystem.Workdir
+	if workdir == "" {
+		// The image's own working directory is the effective default
+		// when the contract does not override it.
+		workdir = image.WorkingDir
+	}
 	mounts := append([]Mount{}, job.Filesystem.Mounts...)
 	sort.Slice(mounts, func(i, j int) bool {
 		if mounts[i].Dest != mounts[j].Dest {
@@ -124,10 +148,14 @@ func (b *MSBBackend) buildEffectivePolicy(job *JobContractV2, name, nonce string
 		Env:                   env,
 		NetworkMode:           job.Network.Mode,
 		NetworkAllow:          allow,
+		RuntimeShell:          defaultRuntimeShell,
+		RuntimeCmd:            append([]string{}, image.Cmd...),
+		RuntimeEntrypoint:     append([]string{}, image.Entrypoint...),
+		RuntimeUser:           image.User,
 		SecurityProfile:       job.Security,
 		DeploymentProfile:     profile,
 		ExternalMountPolicy:   ExternalMountPolicyStrict,
-		Workdir:               job.Filesystem.Workdir,
+		Workdir:               workdir,
 		Mounts:                mounts,
 		CPUs:                  job.Resources.CPUs,
 		MemoryMB:              job.Resources.MemoryMB,
@@ -166,6 +194,40 @@ func (p *EffectivePolicyV1) Digest() (string, error) {
 	}
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:]), nil
+}
+
+// jsonStrings reads a JSON array of strings.
+func jsonStrings(m map[string]any, key string) []string {
+	raw, ok := m[key].([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(raw))
+	for _, v := range raw {
+		if s, ok := v.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// sameStringSet compares two string lists as sets: order is not
+// security-relevant, membership is.
+func sameStringSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	idx := map[string]int{}
+	for _, v := range a {
+		idx[v]++
+	}
+	for _, v := range b {
+		idx[v]--
+		if idx[v] < 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // normalizePolicyWord folds the spelling differences between a flag
@@ -298,6 +360,25 @@ func verifyBootedConfig(p *EffectivePolicyV1, cfg map[string]any) error {
 	if scripts, ok := rt["scripts"].(map[string]any); ok && len(scripts) != 0 {
 		return fmt.Errorf("sandbox carries %d runtime script binding(s) the policy did not authorize", len(scripts))
 	}
+	// Execution hooks: the shell the guest command runs through, the
+	// image's own command and entrypoint, the user it runs as and the
+	// hostname it boots with must all be exactly what the policy
+	// authorized — a runtime default nobody pinned is a refusal.
+	if got := jsonString(rt, "shell"); got != p.RuntimeShell {
+		return fmt.Errorf("sandbox runtime shell %q does not match the authorized %q", got, p.RuntimeShell)
+	}
+	if got := jsonStrings(rt, "cmd"); !sameStringSet(got, p.RuntimeCmd) {
+		return fmt.Errorf("sandbox runtime cmd %v does not match the image's authorized %v", got, p.RuntimeCmd)
+	}
+	if got := jsonStrings(rt, "entrypoint"); !sameStringSet(got, p.RuntimeEntrypoint) {
+		return fmt.Errorf("sandbox runtime entrypoint %v does not match the image's authorized %v", got, p.RuntimeEntrypoint)
+	}
+	if got := jsonString(rt, "user"); got != p.RuntimeUser {
+		return fmt.Errorf("sandbox runtime user %q does not match the authorized %q", got, p.RuntimeUser)
+	}
+	if got := jsonString(rt, "hostname"); got != "" {
+		return fmt.Errorf("sandbox boots with hostname %q, which the policy did not authorize", got)
+	}
 	if rlimits, ok := cfg["rlimits"].([]any); ok && len(rlimits) != 0 {
 		return fmt.Errorf("sandbox carries %d sandbox-level rlimit(s) the policy did not authorize", len(rlimits))
 	}
@@ -367,6 +448,17 @@ func verifyBootedEnvironment(p *EffectivePolicyV1, cfg map[string]any) error {
 	for _, raw := range env {
 		e, _ := raw.(map[string]any)
 		booted = append(booted, jsonString(e, "key")+"="+jsonString(e, "value"))
+	}
+	// A booted environment with two entries for one key is not a set
+	// the policy can authorize: the guest's view depends on resolution
+	// order nobody approved.
+	seen := map[string]bool{}
+	for _, kv := range booted {
+		key, _, _ := strings.Cut(kv, "=")
+		if seen[key] {
+			return fmt.Errorf("sandbox environment carries duplicate entries for %s", key)
+		}
+		seen[key] = true
 	}
 	want := envSetIndex(p.Env)
 	have := envSetIndex(booted)
@@ -445,6 +537,12 @@ func verifyBootedNetwork(p *EffectivePolicyV1, cfg map[string]any) error {
 	case NetworkPublic:
 		if egress != "deny" {
 			return fmt.Errorf("network mode public but the sandbox default egress is %q", egress)
+		}
+		// Public networking composes the runtime's own ingress default
+		// with the public egress group; the policy pins that exact
+		// shape rather than leaving it unverified.
+		if ingress != "allow" {
+			return fmt.Errorf("network mode public but the sandbox default ingress is %q, not the public mode's %q", ingress, "allow")
 		}
 		// `--net public` composes exactly two rules: the gateway DNS
 		// rule (group host) and the public egress allow. Any other
