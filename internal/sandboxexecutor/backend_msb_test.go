@@ -14,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/openclaw/crabbox/internal/evidence"
 )
 
 // ─── Fake msb helper process ─────────────────────────────────────────
@@ -72,6 +74,21 @@ type fakeSandboxConfig struct {
 	Network             fakeNetwork       `json:"network"`
 	Mounts              []fakeMount       `json:"mounts"`
 	Image               fakeImage         `json:"image"`
+	Vsock               *fakeVsock        `json:"vsock,omitempty"`
+	DevicePassthrough   any               `json:"device_passthrough,omitempty"`
+}
+
+// fakeVsock models the pinned runtime's guest-to-host channel binding
+// — the key the real runtime omits entirely unless a channel was
+// requested.
+type fakeVsock struct {
+	Routes []fakeVsockRoute `json:"routes"`
+}
+
+type fakeVsockRoute struct {
+	HostSocket string `json:"host_socket"`
+	Port       uint32 `json:"port"`
+	SocketType string `json:"socket_type"`
 }
 
 type fakeEnvVar struct {
@@ -171,7 +188,25 @@ type fakeFailure struct {
 // command, entrypoint and user the runtime boots guests with, and the
 // directory it starts them in. The fake models python:3.12's shape.
 func fakeImageConfig() (cmd, entrypoint []string, user, workingDir string) {
-	return []string{"python3"}, nil, "", ""
+	cmd = []string{"python3"}
+	if v := os.Getenv("MSB_FAKE_IMAGE_CMD"); v != "" {
+		cmd = strings.Split(v, ",")
+	}
+	if v := os.Getenv("MSB_FAKE_IMAGE_ENTRYPOINT"); v != "" {
+		entrypoint = strings.Split(v, ",")
+	}
+	return cmd, entrypoint, "", ""
+}
+
+// fakeReversed returns the same words in the opposite order — the
+// mutation a set comparison cannot tell apart from the authorized
+// value, and therefore the one an ordered comparison must refuse.
+func fakeReversed(in []string) []string {
+	out := make([]string, len(in))
+	for i, v := range in {
+		out[len(in)-1-i] = v
+	}
+	return out
 }
 
 // fakeDefaultImageEnv is the pinned image's own config environment the
@@ -471,8 +506,12 @@ func fakeCreate(dir string, args []string) int {
 		conf.Runtime.Shell = "/bin/bash"
 	} else if tamper == "runtime_cmd" {
 		conf.Runtime.Cmd = []string{"/usr/bin/evil"}
+	} else if tamper == "cmd_reordered" {
+		conf.Runtime.Cmd = fakeReversed(conf.Runtime.Cmd)
 	} else if tamper == "entrypoint" {
 		conf.Runtime.Entrypoint = []string{"/usr/bin/evil-init"}
+	} else if tamper == "entrypoint_reordered" {
+		conf.Runtime.Entrypoint = fakeReversed(conf.Runtime.Entrypoint)
 	} else if tamper == "runtime_user" {
 		conf.Runtime.User = "root"
 	} else if tamper == "hostname" {
@@ -480,6 +519,12 @@ func fakeCreate(dir string, args []string) int {
 		conf.Runtime.Hostname = &host
 	} else if tamper == "duplicate_env" {
 		conf.Env = append(conf.Env, fakeEnvVar{Key: "PATH", Value: "/evil/bin"})
+	} else if tamper == "vsock_route" {
+		conf.Vsock = &fakeVsock{Routes: []fakeVsockRoute{
+			{HostSocket: "/tmp/unauthorized.sock", Port: 1234, SocketType: "stream"},
+		}}
+	} else if tamper == "unknown_field" {
+		conf.DevicePassthrough = map[string]any{"host_device": "/dev/kvm"}
 	}
 	if os.Getenv("MSB_FAKE_CREATE_FAIL") != "" {
 		fmt.Fprintln(os.Stderr, "error: invalid config: sandbox refused before boot")
@@ -648,16 +693,31 @@ func fakeExec(dir string, args []string) int {
 		fmt.Fprintf(os.Stderr, "error: sandbox not found: %s\n", name)
 		return 1
 	}
+	if os.Getenv("MSB_FAKE_LAUNCH_NO_ADMIT_FAIL") != "" {
+		// The launch failed before the runtime admitted anything, so
+		// its durable job store holds no record of it — the shape an
+		// absence of evidence really has.
+		fmt.Fprintln(os.Stderr, "error: sandbox not found")
+		return 1
+	}
+	if os.Getenv("MSB_FAKE_LAUNCH_FAIL") != "" {
+		// The real runtime records a spawn it rejected as a durable
+		// typed failure before the CLI reports the launch as failed.
+		// The record — not the CLI's exit status, and not an absent
+		// record — is the evidence that the workload produced no
+		// effect.
+		_ = os.Setenv("MSB_FAKE_JOB_FAILURE", "not_found")
+	}
+	if err := fakeWriteJob(dir, name, command); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
 	if os.Getenv("MSB_FAKE_LAUNCH_FAIL") != "" {
 		target := "command"
 		if len(command) > 0 {
 			target = command[0]
 		}
 		fmt.Fprintf(os.Stderr, "error: exec_failed: spawn %q: No such file or directory (os error 2)\n", target)
-		return 1
-	}
-	if err := fakeWriteJob(dir, name, command); err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
 	if os.Getenv("MSB_FAKE_LAUNCH_FAIL_ADMITTED") != "" {
@@ -1406,28 +1466,74 @@ func TestMSBDispatchMapsContractToSandbox(t *testing.T) {
 	}
 }
 
-// TestMSBDispatchRefusalOnSpawnFailure: a command the guest rejects
-// before it starts is a definitive dispatch refusal — nothing ran,
-// no job exists, and the VM is removed.
-func TestMSBDispatchRefusalOnSpawnFailure(t *testing.T) {
+// TestMSBDispatchAdoptsARejectedSpawn (F-050): the runtime records a
+// spawn it rejected as a durable typed failure, so the launch is
+// adopted from that record and reaches its definitive no-effect
+// outcome through observation — never through the CLI's exit status,
+// and never through an absent record.
+func TestMSBDispatchAdoptsARejectedSpawn(t *testing.T) {
 	key, _ := testAuthority(t)
 	bin, stateDir := fakeMSB(t, map[string]string{"MSB_FAKE_LAUNCH_FAIL": "1"})
 	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "spawn-fail"; c.Nonce = "n-spawn" })
-	name := backend.msbJobName(job.JobID)
 
-	_, err := backend.Dispatch(testContext(t), job, nil)
+	disp, err := backend.Dispatch(testContext(t), job, nil)
+	if err != nil {
+		t.Fatalf("a launch the runtime recorded must be adopted, not refused: %v", err)
+	}
+	if !jobIDPattern.MatchString(disp.RunID) {
+		t.Fatalf("adopted run id %q is not a runtime job id", disp.RunID)
+	}
+	recs, _ := fakeReadJobs(stateDir, disp.Handle)
+	if len(recs) != 1 {
+		t.Fatalf("the rejected spawn is not exactly one durable record: %d", len(recs))
+	}
+	if recs[0].State != "failed" || recs[0].Failure == nil {
+		t.Fatalf("the record does not carry the typed rejection: %+v", recs[0])
+	}
+
+	res, werr := backend.Wait(testContext(t), job, disp)
+	if werr != nil {
+		t.Fatalf("observe the rejected spawn: %v", werr)
+	}
+	if res.ExitVerified || res.FailureKind != "not_found" {
+		t.Fatalf("the rejected spawn was not observed as a typed rejection: %+v", res)
+	}
+	state, outcome, _, _, ok := classifyObserved(job, res)
+	if !ok || state != JobStateDispatchFailed || outcome != evidence.OutcomeNoEffect {
+		t.Fatalf("the rejected spawn reached %s/%s (ok=%t), want a definitive no-effect", state, outcome, ok)
+	}
+}
+
+// TestMSBDispatchFailureWithoutARecordIsUncertain (F-050): a launch
+// that failed before the runtime admitted anything leaves no record,
+// and an absent record is not proof that nothing executed. The job
+// stays uncertain, and the VM is left for reconciliation rather than
+// destroyed under a workload that may be running.
+func TestMSBDispatchFailureWithoutARecordIsUncertain(t *testing.T) {
+	key, _ := testAuthority(t)
+	bin, stateDir := fakeMSB(t, map[string]string{"MSB_FAKE_LAUNCH_NO_ADMIT_FAIL": "1"})
+	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
+	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "no-record"; c.Nonce = "n-no-record" })
+
+	disp, err := backend.Dispatch(testContext(t), job, nil)
 	if err == nil {
-		t.Fatal("a spawn failure was accepted as a launch")
+		t.Fatal("a launch with no record was accepted as a verified start")
 	}
-	if errors.Is(err, ErrAmbiguousDispatch) {
-		t.Fatalf("a definitive spawn refusal was classified ambiguous: %v", err)
+	if !errors.Is(err, ErrAmbiguousDispatch) {
+		t.Fatalf("an absent record was treated as proof that nothing executed: %v", err)
 	}
-	if _, serr := os.Stat(fakeStatePath(stateDir, name)); serr == nil {
-		t.Fatal("the refused VM was not destroyed")
+	if !strings.Contains(err.Error(), "cannot prove that nothing executed") {
+		t.Fatalf("refusal %q does not state the missing evidence", err)
 	}
-	if recs, _ := fakeReadJobs(stateDir, name); len(recs) != 0 {
-		t.Fatal("a refused launch recorded a job")
+	if disp.Handle == "" {
+		t.Fatal("the uncertain dispatch did not return its handle for reconciliation")
+	}
+	if _, serr := os.Stat(fakeStatePath(stateDir, disp.Handle)); serr != nil {
+		t.Fatal("the VM of a possibly-running workload was destroyed instead of left for reconciliation")
+	}
+	if recs, _ := fakeReadJobs(stateDir, disp.Handle); len(recs) != 0 {
+		t.Fatalf("the fake admitted a job it should not have: %d", len(recs))
 	}
 }
 
@@ -1831,8 +1937,15 @@ func TestMSBResumeAdoptsTheRuntimesOwnRecord(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dispatch: %v", err)
 	}
-	// The identity was lost with the crash: resume without one.
-	run, res, err := backend.Resume(testContext(t), job, RunIdentity{Handle: disp.Handle})
+	// The run identity was lost with the crash. The authorization was
+	// not: it is persisted before the VM exists, so recovery proves
+	// the discovered VM against it instead of reconstructing authority
+	// from the command.
+	run, res, err := backend.Resume(testContext(t), job, RunIdentity{
+		Handle:       disp.Handle,
+		PolicyDigest: disp.PolicyDigest,
+		Nonce:        disp.Nonce,
+	})
 	if err != nil {
 		t.Fatalf("resume: %v", err)
 	}
@@ -1859,33 +1972,43 @@ func TestMSBResumeRefusesAmbiguousAdoption(t *testing.T) {
 	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "resume-2"; c.Nonce = "n-resume-2" })
 
 	t.Run("no sandbox at all", func(t *testing.T) {
-		if _, _, err := backend.Resume(testContext(t), job, RunIdentity{Handle: "sx-resume-absent"}); !errors.Is(err, ErrExecutionUnobserved) {
+		if _, _, err := backend.Resume(testContext(t), job, RunIdentity{
+			Handle: "sx-resume-absent", PolicyDigest: strings.Repeat("ab", 32), Nonce: "n-absent",
+		}); !errors.Is(err, ErrExecutionUnobserved) {
 			t.Fatalf("resume without a sandbox = %v, want unobserved", err)
 		}
 	})
 
 	t.Run("no matching job record", func(t *testing.T) {
-		name := "sx-resume-empty"
-		writeFakeSandbox(t, stateDir, name, fakeDefaultConfig())
-		if err := fakeWriteJob(stateDir, name, []string{"some-other-command"}); err != nil {
+		j := testContract(t, key, func(c *JobContractV2) { c.JobID = "resume-2a"; c.Nonce = "n-resume-2a" })
+		disp, derr := backend.Dispatch(testContext(t), j, nil)
+		if derr != nil {
+			t.Fatalf("dispatch: %v", derr)
+		}
+		// The sandbox and its authorization are intact; the runtime
+		// records no job whose command matches the authorized one.
+		if err := fakeWriteJobs(stateDir, disp.Handle, nil); err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := backend.Resume(testContext(t), job, RunIdentity{Handle: name}); !errors.Is(err, ErrExecutionUnobserved) {
+		run := RunIdentity{Handle: disp.Handle, RunID: "", PolicyDigest: disp.PolicyDigest, Nonce: disp.Nonce}
+		if _, _, err := backend.Resume(testContext(t), j, run); !errors.Is(err, ErrExecutionUnobserved) {
 			t.Fatalf("resume with no match = %v, want unobserved", err)
 		}
 	})
 
 	t.Run("several matching job records", func(t *testing.T) {
-		disp, err := backend.Dispatch(testContext(t), job, nil)
+		j := testContract(t, key, func(c *JobContractV2) { c.JobID = "resume-2b"; c.Nonce = "n-resume-2b" })
+		disp, err := backend.Dispatch(testContext(t), j, nil)
 		if err != nil {
 			t.Fatalf("dispatch: %v", err)
 		}
 		// A second identical launch on the same sandbox: two records
 		// matching the authorized argv are ambiguous, never adopted.
-		if err := fakeWriteJob(stateDir, disp.Handle, job.Argv); err != nil {
+		if err := fakeWriteJob(stateDir, disp.Handle, j.Argv); err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := backend.Resume(testContext(t), job, RunIdentity{Handle: disp.Handle}); !errors.Is(err, ErrExecutionUnobserved) {
+		run := RunIdentity{Handle: disp.Handle, RunID: "", PolicyDigest: disp.PolicyDigest, Nonce: disp.Nonce}
+		if _, _, err := backend.Resume(testContext(t), j, run); !errors.Is(err, ErrExecutionUnobserved) {
 			t.Fatalf("resume with two matches = %v, want unobserved", err)
 		}
 	})
@@ -2085,6 +2208,158 @@ func TestMSBPolicyRefusesUnauthorizedSettings(t *testing.T) {
 	}
 }
 
+// TestMSBPolicyRefusesReorderedExecutionHooks (F-045): a command and
+// an entrypoint are ordered programs, not sets. A VM that boots the
+// authorized words in a different order is running something the
+// policy never authorized — ["/bin/sh","-c"] and ["-c","/bin/sh"] are
+// different programs — so it refuses before any guest command runs.
+func TestMSBPolicyRefusesReorderedExecutionHooks(t *testing.T) {
+	cases := []struct {
+		tamper string
+		want   string
+	}{
+		{"cmd_reordered", "runtime cmd"},
+		{"entrypoint_reordered", "runtime entrypoint"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.tamper, func(t *testing.T) {
+			key, _ := testAuthority(t)
+			bin, stateDir := fakeMSB(t, map[string]string{
+				"MSB_FAKE_TAMPER":           tc.tamper,
+				"MSB_FAKE_IMAGE_CMD":        "/bin/sh,-c",
+				"MSB_FAKE_IMAGE_ENTRYPOINT": "/usr/bin/env,python3",
+			})
+			backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
+			job := testContract(t, key, func(c *JobContractV2) { c.JobID = "order-" + tc.tamper; c.Nonce = "n-" + tc.tamper })
+			name := backend.msbJobName(job.JobID)
+
+			_, err := backend.Dispatch(testContext(t), job, nil)
+			if err == nil {
+				t.Fatalf("a reordered %s was accepted", tc.tamper)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("refusal %q does not mention %q", err, tc.want)
+			}
+			if _, serr := os.Stat(fakeStatePath(stateDir, name)); serr == nil {
+				t.Fatal("the reordered VM was not destroyed")
+			}
+		})
+	}
+}
+
+// TestSameStringSequenceIsOrderSensitive pins the comparison itself:
+// the same words in a different order are a different sequence, and a
+// reordered list is never accepted as the authorized one.
+func TestSameStringSequenceIsOrderSensitive(t *testing.T) {
+	cases := []struct {
+		name string
+		a, b []string
+		want bool
+	}{
+		{"identical", []string{"/bin/sh", "-c"}, []string{"/bin/sh", "-c"}, true},
+		{"both empty", nil, nil, true},
+		{"reordered", []string{"-c", "/bin/sh"}, []string{"/bin/sh", "-c"}, false},
+		{"different length", []string{"/bin/sh"}, []string{"/bin/sh", "-c"}, false},
+		{"different word", []string{"/bin/bash", "-c"}, []string{"/bin/sh", "-c"}, false},
+		{"reordered suffix", []string{"a", "b", "c"}, []string{"a", "c", "b"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sameStringSequence(tc.a, tc.b); got != tc.want {
+				t.Fatalf("sameStringSequence(%v, %v) = %t, want %t", tc.a, tc.b, got, tc.want)
+			}
+			if got := sameStringSequence(tc.b, tc.a); got != tc.want {
+				t.Fatalf("sameStringSequence is not symmetric for %v, %v", tc.a, tc.b)
+			}
+		})
+	}
+}
+
+// TestMSBPolicyRefusesHostChannelsAndUnknownFields (F-046): a vsock
+// route is a guest-to-host channel — and a host local-IPC endpoint —
+// the policy never authorizes, and the configuration schema is
+// closed. Either refuses even though every other field still matches
+// the authorized policy exactly, and the VM is destroyed before any
+// guest command runs.
+func TestMSBPolicyRefusesHostChannelsAndUnknownFields(t *testing.T) {
+	cases := []struct {
+		tamper string
+		want   string
+	}{
+		{"vsock_route", "host channel"},
+		{"unknown_field", "does not define"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.tamper, func(t *testing.T) {
+			key, _ := testAuthority(t)
+			bin, stateDir := fakeMSB(t, map[string]string{"MSB_FAKE_TAMPER": tc.tamper})
+			backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
+			job := testContract(t, key, func(c *JobContractV2) { c.JobID = "closed-" + tc.tamper; c.Nonce = "n-" + tc.tamper })
+			name := backend.msbJobName(job.JobID)
+
+			_, err := backend.Dispatch(testContext(t), job, nil)
+			if err == nil {
+				t.Fatalf("a VM carrying %s was accepted", tc.tamper)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("refusal %q does not mention %q", err, tc.want)
+			}
+			if !errors.Is(err, ErrDispatchRefused) {
+				t.Fatalf("%s was not a proven pre-launch refusal: %v", tc.tamper, err)
+			}
+			if _, serr := os.Stat(fakeStatePath(stateDir, name)); serr == nil {
+				t.Fatal("the unauthorized VM was not destroyed before execution")
+			}
+		})
+	}
+}
+
+// TestBootedConfigClosureNamesEveryUnknownField pins the closure
+// itself: every field the qualified schema does not define is named,
+// and a configuration carrying only known fields passes.
+func TestBootedConfigClosureNamesEveryUnknownField(t *testing.T) {
+	known := map[string]any{}
+	for key := range bootedConfigFields {
+		known[key] = "x"
+	}
+	if err := verifyClosedConfig(known); err != nil {
+		t.Fatalf("a configuration of only defined fields refused: %v", err)
+	}
+
+	known["vsock"] = map[string]any{"routes": []any{}}
+	known["device_passthrough"] = map[string]any{"host_device": "/dev/kvm"}
+	err := verifyClosedConfig(known)
+	if err == nil {
+		t.Fatal("unknown fields were accepted")
+	}
+	for _, want := range []string{"vsock", "device_passthrough"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("refusal %q does not name %q", err, want)
+		}
+	}
+}
+
+// TestVerifyNoHostChannelsRefusesEveryRoute pins the host-channel
+// check: an empty or absent binding passes, any route refuses and is
+// named.
+func TestVerifyNoHostChannelsRefusesEveryRoute(t *testing.T) {
+	if err := verifyNoHostChannels(map[string]any{}); err != nil {
+		t.Fatalf("an absent binding refused: %v", err)
+	}
+	if err := verifyNoHostChannels(map[string]any{"vsock": map[string]any{"routes": []any{}}}); err != nil {
+		t.Fatalf("an empty binding refused: %v", err)
+	}
+	err := verifyNoHostChannels(map[string]any{"vsock": map[string]any{"routes": []any{
+		map[string]any{"host_socket": "/tmp/unauthorized.sock", "port": float64(1234), "socket_type": "stream"},
+	}}})
+	if err == nil {
+		t.Fatal("a vsock route was accepted")
+	}
+	if !strings.Contains(err.Error(), "/tmp/unauthorized.sock") {
+		t.Fatalf("refusal %q does not name the host endpoint", err)
+	}
+}
+
 // TestMSBDispatchBindsBootGeneration: the runtime-owned job must run in
 // the boot generation this dispatch verified — a job record naming a
 // different VM instance refuses, and the VM is destroyed (F-037).
@@ -2161,7 +2436,10 @@ func TestMSBResumeRefusesSubstitutedBootGeneration(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(stateDir, disp.Handle+".storage", "runtime", "runtime-boot-id"), []byte(newBoot), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	run, res, rerr := backend.Resume(testContext(t), job, RunIdentity{Handle: disp.Handle, RunID: "", BootID: disp.BootID})
+	run, res, rerr := backend.Resume(testContext(t), job, RunIdentity{
+		Handle: disp.Handle, RunID: "", BootID: disp.BootID,
+		PolicyDigest: disp.PolicyDigest, Nonce: disp.Nonce,
+	})
 	if rerr == nil {
 		t.Fatalf("a substituted boot generation was adopted: %+v %+v", run, res)
 	}
@@ -2267,7 +2545,10 @@ func TestMSBDispatchPostLaunchFailureIsUncertain(t *testing.T) {
 }
 
 // TestMSBDispatchRefusalsAreProven: the only errors that may produce a
-// NO_EFFECT claim are the proven pre-launch refusals.
+// NO_EFFECT claim are the proven pre-launch refusals — an error the
+// backend can positively attribute to a refusal before anything was
+// admitted. A launch that merely failed, with no record proving what
+// happened, is uncertain instead (F-050).
 func TestMSBDispatchRefusalsAreProven(t *testing.T) {
 	key, _ := testAuthority(t)
 	cases := []struct {
@@ -2275,7 +2556,7 @@ func TestMSBDispatchRefusalsAreProven(t *testing.T) {
 		env    map[string]string
 		reason string
 	}{
-		{"synchronous launch refusal", map[string]string{"MSB_FAKE_LAUNCH_FAIL": "1"}, "exec -d failed"},
+		{"create refused before boot", map[string]string{"MSB_FAKE_CREATE_FAIL": "1"}, "msb create failed"},
 		{"pre-exec policy refusal", map[string]string{"MSB_FAKE_TAMPER": "extra_env"}, "policy verification"},
 	}
 	for _, tc := range cases {
@@ -2388,6 +2669,61 @@ func TestMSBResumeRefusesRewrittenAuthorization(t *testing.T) {
 			t.Fatalf("resume changed the policy digest: %q → %q", disp.PolicyDigest, run.PolicyDigest)
 		}
 	})
+}
+
+// TestMSBResumeRequiresTheFullAuthorization (F-047): the dispatch
+// authorization is persisted before the backend may create anything,
+// so a row that carries no policy digest or no nonce cannot be
+// authorized after the fact. Matching command arguments, or finding a
+// sandbox under the expected name, is not authority — the job stays
+// unresolved for an operator instead of being adopted.
+func TestMSBResumeRequiresTheFullAuthorization(t *testing.T) {
+	key, _ := testAuthority(t)
+	bin, _ := fakeMSB(t, nil)
+	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
+	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "noauth-1"; c.Nonce = "n-noauth" })
+
+	disp, err := backend.Dispatch(testContext(t), job, nil)
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		run  func(*RunIdentity)
+	}{
+		{"missing policy digest", func(r *RunIdentity) { r.PolicyDigest = "" }},
+		{"missing nonce", func(r *RunIdentity) { r.Nonce = "" }},
+		{"missing both", func(r *RunIdentity) { r.PolicyDigest = ""; r.Nonce = "" }},
+		// The strongest form: the run identity is lost too, so the
+		// runtime's job list holds exactly one job whose command
+		// matches the contract. Authority must still not be
+		// reconstructed from it.
+		{"missing authorization with a matching command", func(r *RunIdentity) {
+			r.PolicyDigest = ""
+			r.Nonce = ""
+			r.RunID = ""
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			run := disp
+			tc.run(&run)
+			adopted, res, rerr := backend.Resume(testContext(t), job, run)
+			if !errors.Is(rerr, ErrExecutionUnobserved) {
+				t.Fatalf("a dispatch without persisted authorization was adopted: %v", rerr)
+			}
+			if !strings.Contains(rerr.Error(), "no persisted authorization") {
+				t.Fatalf("refusal %q does not name the missing authorization", rerr)
+			}
+			if res != nil {
+				t.Fatalf("an unauthorized recovery produced a result: %+v", res)
+			}
+			if adopted != run {
+				t.Fatalf("an unauthorized recovery rewrote the run identity: %+v → %+v", run, adopted)
+			}
+		})
+	}
 }
 
 // TestMSBRuntimeIdentityCoversTheComponentChain (F-042): every shared

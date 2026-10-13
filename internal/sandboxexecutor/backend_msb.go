@@ -629,15 +629,7 @@ func matchContractJobs(jobs []msbJobRecord, job *JobContractV2) []msbJobRecord {
 // contract's argv element-wise — the correlation that proves an
 // observed job is the authorized command, not a lookalike.
 func sameArgv(recorded, authorized []string) bool {
-	if len(recorded) != len(authorized) {
-		return false
-	}
-	for i := range recorded {
-		if recorded[i] != authorized[i] {
-			return false
-		}
-	}
-	return true
+	return sameStringSequence(recorded, authorized)
 }
 
 // Dispatch boots the job's microVM and starts its authorized command
@@ -817,11 +809,19 @@ func (b *MSBBackend) Dispatch(ctx context.Context, job *JobContractV2, plan *Dis
 			identity.RunID = matched[0].ID
 			return identity, nil
 		case 0:
-			b.destroy(name)
-			if lerr != nil {
-				return RunIdentity{}, fmt.Errorf("%w: msb exec -d failed: %v: %s", ErrDispatchRefused, lerr, strings.TrimSpace(string(lout)))
+			// The launch may have been admitted. The runtime records
+			// every job it admits — including one whose spawn it
+			// rejected — so an empty list is not evidence that nothing
+			// executed, and the CLI's own exit status is not either.
+			// The VM is left for reconciliation rather than destroyed
+			// under a workload that may be running, and no no-effect
+			// claim is ever made about it.
+			detail := fmt.Sprintf("msb exec -d failed: %v: %s", lerr, strings.TrimSpace(string(lout)))
+			if lerr == nil {
+				detail = fmt.Sprintf("msb exec -d named no job: %s", strings.TrimSpace(string(lout)))
 			}
-			return RunIdentity{}, fmt.Errorf("%w: msb exec -d named no job and the sandbox records none: %s", ErrDispatchRefused, strings.TrimSpace(string(lout)))
+			return identity, fmt.Errorf("%w: %s, and the sandbox records no job for the authorized command — the runtime's record cannot prove that nothing executed",
+				ErrAmbiguousDispatch, detail)
 		default:
 			return identity, fmt.Errorf("%w: sandbox %s records %d jobs matching the authorized command — an operator must reconcile them",
 				ErrAmbiguousDispatch, name, len(matched))
@@ -930,7 +930,10 @@ func (b *MSBBackend) Inspect(ctx context.Context, handle string) (bool, error) {
 }
 
 // Resume re-establishes observation of a run a previous lifetime left
-// unresolved. When the run identity was lost with the crash — the
+// unresolved. Recovery requires the persisted dispatch authorization:
+// a row carrying no policy digest or nonce is never adopted — a
+// matching command is not authority — and stays unresolved for an
+// operator. When the run identity was lost with the crash — the
 // window between the runtime admitting a job and the ledger naming it
 // — the runtime's own job list is the proof of what was admitted: a
 // single job matching the authorized argv is adopted; zero or several
@@ -964,18 +967,27 @@ func (b *MSBBackend) Resume(ctx context.Context, job *JobContractV2, run RunIden
 	// booted configuration must still equal that policy. A VM whose
 	// policy cannot be proven is never adopted, whatever its name or
 	// command says.
-	if run.PolicyDigest != "" {
-		policy, digest, perr := b.policyFor(ctx, job, run.Handle, run.Nonce)
-		if perr != nil {
-			return run, nil, fmt.Errorf("%w: cannot recompute the dispatch's policy to authorize recovery: %v", ErrExecutionUnobserved, perr)
-		}
-		if digest != run.PolicyDigest {
-			return run, nil, fmt.Errorf("%w: sandbox %s would run under policy %s, not the dispatch's approved %s — refusing to adopt it (the operator configuration changed, or the authorization was rewritten)",
-				ErrExecutionUnobserved, run.Handle, digest, run.PolicyDigest)
-		}
-		if verr := verifyBootedPolicy(policy, doc); verr != nil {
-			return run, nil, fmt.Errorf("%w: sandbox %s no longer matches its approved policy: %v", ErrExecutionUnobserved, run.Handle, verr)
-		}
+	//
+	// The proof is mandatory. The dispatch authorization is persisted
+	// before the backend may create anything, so a row carrying no
+	// policy digest or no nonce cannot be authorized from the runtime's
+	// record: matching command arguments, or finding a sandbox under
+	// the expected name, is not authority. Such a row stays unresolved
+	// for an operator instead of being adopted.
+	if run.PolicyDigest == "" || run.Nonce == "" {
+		return run, nil, fmt.Errorf("%w: the dispatch carries no persisted authorization (policy digest %q, nonce %q) — refusing to reconstruct authority from the runtime's record; the job stays unresolved",
+			ErrExecutionUnobserved, run.PolicyDigest, run.Nonce)
+	}
+	policy, digest, perr := b.policyFor(ctx, job, run.Handle, run.Nonce)
+	if perr != nil {
+		return run, nil, fmt.Errorf("%w: cannot recompute the dispatch's policy to authorize recovery: %v", ErrExecutionUnobserved, perr)
+	}
+	if digest != run.PolicyDigest {
+		return run, nil, fmt.Errorf("%w: sandbox %s would run under policy %s, not the dispatch's approved %s — refusing to adopt it (the operator configuration changed, or the authorization was rewritten)",
+			ErrExecutionUnobserved, run.Handle, digest, run.PolicyDigest)
+	}
+	if verr := verifyBootedPolicy(policy, doc); verr != nil {
+		return run, nil, fmt.Errorf("%w: sandbox %s no longer matches its approved policy: %v", ErrExecutionUnobserved, run.Handle, verr)
 	}
 	if run.RunID == "" {
 		jobs, err := b.listJobs(ctx, run.Handle)

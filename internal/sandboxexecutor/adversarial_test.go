@@ -33,6 +33,27 @@ func (a adversarialTargets) assertZero(t *testing.T) {
 // targets across all of them — zero false NO_EFFECT receipts, zero
 // unauthorized adoptions, zero duplicate dispatches and zero accepted
 // forbidden policy changes.
+// waitForLedgerState polls one row until it reaches want, so a case
+// whose outcome is decided by the asynchronous monitor can be measured
+// at its terminal state rather than at the dispatch response.
+func waitForLedgerState(t *testing.T, l *Ledger, jobID, want string) *LedgerJob {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		lj, err := l.Get(jobID)
+		if err != nil {
+			t.Fatalf("ledger row: %v", err)
+		}
+		if lj != nil && lj.State == want {
+			return lj
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("job %s never reached %s: %+v", jobID, want, lj)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestAdversarialFaultMatrix(t *testing.T) {
 	targets := adversarialTargets{}
 
@@ -45,22 +66,28 @@ func TestAdversarialFaultMatrix(t *testing.T) {
 		wantClass   string
 		wantReceipt bool
 		wantJobs    int
+		// wantSettled is the terminal state the monitor reaches
+		// asynchronously, for cases that outlive the dispatch call.
+		// Empty means the dispatch call itself decides the outcome.
+		wantSettled string
 	}
 	cases := []dispatchCase{
 		{"create refused before boot", map[string]string{"MSB_FAKE_CREATE_FAIL": "1"}, 0,
-			JobStateDispatchFailed, string(DispatchProvenRejected), true, 0},
+			JobStateDispatchFailed, string(DispatchProvenRejected), true, 0, ""},
 		{"create failed after boot", map[string]string{"MSB_FAKE_CREATE_FAIL_AFTER": "1"}, 0,
-			JobStateDispatchFailed, string(DispatchProvenRejected), true, 0},
+			JobStateDispatchFailed, string(DispatchProvenRejected), true, 0, ""},
 		{"create deadline mid-boot", map[string]string{"MSB_FAKE_CREATE_SLEEP": "5"}, 500 * time.Millisecond,
-			JobStateDispatchAmbig, string(DispatchUncertain), false, 0},
+			JobStateDispatchAmbig, string(DispatchUncertain), false, 0, ""},
 		{"post-launch identity unprovable", map[string]string{"MSB_FAKE_JOB_INSPECT_FAIL": "1"}, 0,
-			JobStateDispatchAmbig, string(DispatchUncertain), false, 1},
-		{"synchronous launch refusal", map[string]string{"MSB_FAKE_LAUNCH_FAIL": "1"}, 0,
-			JobStateDispatchFailed, string(DispatchProvenRejected), true, 0},
+			JobStateDispatchAmbig, string(DispatchUncertain), false, 1, ""},
+		{"spawn rejected by the guest", map[string]string{"MSB_FAKE_LAUNCH_FAIL": "1"}, 0,
+			JobStateRunning, string(DispatchStarted), true, 1, JobStateDispatchFailed},
+		{"launch failed before admission", map[string]string{"MSB_FAKE_LAUNCH_NO_ADMIT_FAIL": "1"}, 0,
+			JobStateDispatchAmbig, string(DispatchUncertain), false, 0, ""},
 		{"launch admitted but unnamed", map[string]string{"MSB_FAKE_LAUNCH_FAIL_ADMITTED": "1"}, 0,
-			JobStateRunning, string(DispatchStarted), false, 1},
+			JobStateRunning, string(DispatchStarted), false, 1, ""},
 		{"launched job in a substituted VM", map[string]string{"MSB_FAKE_JOB_BOOT_MISMATCH": "1"}, 0,
-			JobStateDispatchAmbig, string(DispatchUncertain), false, 1},
+			JobStateDispatchAmbig, string(DispatchUncertain), false, 1, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -86,6 +113,9 @@ func TestAdversarialFaultMatrix(t *testing.T) {
 			if err != nil || lj == nil {
 				t.Fatalf("ledger row: %v", err)
 			}
+			if tc.wantSettled != "" {
+				lj = waitForLedgerState(t, srv.Ledger(), jobID, tc.wantSettled)
+			}
 			if lj.DispatchClass != tc.wantClass {
 				t.Fatalf("dispatch class = %q, want %q", lj.DispatchClass, tc.wantClass)
 			}
@@ -93,9 +123,14 @@ func TestAdversarialFaultMatrix(t *testing.T) {
 			if hasReceipt != tc.wantReceipt {
 				t.Fatalf("receipt present = %t, want %t", hasReceipt, tc.wantReceipt)
 			}
-			// A NO_EFFECT receipt is only sound for a proven refusal:
-			// any receipt on a non-refusal is a false no-effect claim.
-			if hasReceipt && lj.DispatchClass != string(DispatchProvenRejected) {
+			// A NO_EFFECT receipt is sound only when the executor
+			// proved nothing executed: a proven pre-launch refusal, or
+			// a typed spawn rejection the runtime itself recorded. A
+			// receipt on anything else is a false no-effect claim —
+			// and an empty job list is never proof of either.
+			sound := lj.DispatchClass == string(DispatchProvenRejected) ||
+				strings.Contains(lj.Error, "command rejected before start")
+			if hasReceipt && !sound {
 				targets.falseNoEffect++
 			}
 			// Duplicate dispatch: at most one runtime job record, ever.
