@@ -1,3 +1,22 @@
 blacksmith:
   workflow: .github/workflows/blacksmith-testbox.yml
   job: go
+
+jobs:
+  live-microvm:
+    # Real-microVM qualification. It needs a host that can boot microVMs:
+    # Apple Silicon, or Linux with KVM exposed (bare metal, or an instance
+    # family with nested virtualization enabled). The blacksmith testbox is
+    # a GitHub Actions runner and cannot boot microVMs, so select a capable
+    # provider explicitly, for example:
+    #   crabbox job run live-microvm --provider ssh --static-host <kvm-host>
+    # The pinned runtime must already be installed on that host; the command
+    # fails closed when it is missing instead of letting the suite skip.
+    shell: true
+    command: >
+      test -x "$HOME/.microsandbox/bin/msb" ||
+      { echo "missing the pinned microsandbox runtime at ~/.microsandbox/bin/msb"; exit 1; };
+      "$HOME/.microsandbox/bin/msb" --version;
+      CRABBOX_MSB_LIVE=1 go test -race -timeout=900s
+      -run 'TestMSBLive' ./internal/sandboxexecutor/
+    stop: always

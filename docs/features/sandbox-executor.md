@@ -168,8 +168,30 @@ the backstop.
 - `CRABBOX_MSB_LIVE=1 go test -race -timeout=900s -run 'TestMSBLive' ./internal/sandboxexecutor/`
   qualifies real microVMs (policy enforcement, isolation, artifact integrity,
   monitor interruption, substituted-VM refusal, recovery). It runs on Apple
-  Silicon and on Linux with KVM; the Linux KVM lane must be run on a KVM-capable
-  host — a skipped live test is not a pass.
+  Silicon and on Linux with KVM; a skipped live test is not a pass.
+- The repo-local job `live-microvm` (`.crabbox.yaml`) wraps that lane for a
+  remote host and fails closed when the pinned runtime is absent:
+
+  ```sh
+  crabbox job run --dry-run live-microvm
+  crabbox job run live-microvm --provider ssh --static-host <kvm-host>
+  ```
+
+- **Linux KVM lane.** Nested KVM is not a managed-provider feature, so the lane
+  needs an operator-prepared host: bare metal, or an instance family with nested
+  virtualization enabled and `/dev/kvm` exposed. Install the pinned runtime
+  (the `msb-linux-<arch>` and `libkrunfw-linux-<arch>.so` assets of the pinned
+  microsandbox release, or `msb update` on the host), then prove the host with
+  the runtime's own check before qualifying:
+
+  ```sh
+  "$HOME/.microsandbox/bin/msb" --version      # must be the pinned version
+  "$HOME/.microsandbox/bin/msb" self doctor    # must report host setup ready
+  ```
+
+  The executor refuses a host its runtime's prerequisite check rejects, and the
+  runtime manifest is built from the hashes of that qualified install, so the
+  Linux lane pins exactly the bytes it proved.
 - The executor's macOS artifacts follow this fork's declared unsigned contract;
   the rc lane publishes source bundles, SBOM and release evidence, not compiled
   binaries.
