@@ -52,8 +52,10 @@
 //	                 image must be present locally, and a missing one
 //	                 refuses fast instead of fetching mid-dispatch) or
 //	                 if-missing
-//	-state-dir       artifact directory for captured output (defaults
-//	                 to <socket-dir>/artifacts)
+//	-state-dir       artifact directory for captured output; required
+//	                 for the microsandbox backend — without it every
+//	                 capture would fail at runtime and no job could
+//	                 reach a verified result
 //	-ledger          durable job ledger path (defaults to
 //	                 <socket-dir>/executor-ledger.db)
 //	-max-conns       simultaneous connection bound (default 64)
@@ -141,12 +143,12 @@ func main() {
 	ceilDiskMB := flag.Uint64("ceil-disk-mb", 0, "contract disk_mb ceiling (0 = no operator ceiling)")
 	ceilOutput := flag.Uint64("ceil-output-bytes", 0, "contract max_output_bytes ceiling (0 = no operator ceiling)")
 	ceilTimeout := flag.Uint("ceil-timeout-secs", 0, "contract timeout_seconds ceiling (0 = no operator ceiling)")
-	poolVMs := flag.Int("pool-vms", 0, "aggregate bound on concurrent VMs (0 = unbounded)")
-	poolSubmitterVMs := flag.Int("pool-submitter-vms", 0, "aggregate bound on concurrent VMs per submitter (0 = unbounded)")
-	poolCPUs := flag.Float64("pool-cpus", 0, "aggregate bound on declared cpus (0 = unbounded)")
-	poolMemMB := flag.Uint64("pool-memory-mb", 0, "aggregate bound on declared memory in MiB (0 = unbounded)")
-	poolDiskMB := flag.Uint64("pool-disk-mb", 0, "aggregate bound on declared disk in MiB (0 = unbounded)")
-	poolOutput := flag.Uint64("pool-output-bytes", 0, "aggregate bound on declared output in bytes (0 = unbounded)")
+	poolVMs := flag.Int("pool-vms", 0, "aggregate bound on concurrent VMs (required: a positive bound for a configured backend)")
+	poolSubmitterVMs := flag.Int("pool-submitter-vms", 0, "aggregate bound on concurrent VMs per submitter (required: a positive bound for a configured backend)")
+	poolCPUs := flag.Float64("pool-cpus", 0, "aggregate bound on declared cpus (required: a positive bound for a configured backend)")
+	poolMemMB := flag.Uint64("pool-memory-mb", 0, "aggregate bound on declared memory in MiB (required: a positive bound for a configured backend)")
+	poolDiskMB := flag.Uint64("pool-disk-mb", 0, "aggregate bound on declared disk in MiB (required: a positive bound for a configured backend)")
+	poolOutput := flag.Uint64("pool-output-bytes", 0, "aggregate bound on declared output in bytes (required: a positive bound for a configured backend)")
 	evidenceDir := flag.String("evidence-dir", os.Getenv("SANDBOX_EXECUTOR_EVIDENCE_DIR"), "execution-evidence chain directory (or SANDBOX_EXECUTOR_EVIDENCE_DIR)")
 	evidenceKey := flag.String("evidence-key", os.Getenv("SANDBOX_EXECUTOR_EVIDENCE_KEY"), "evidence signer PKCS8 PEM path (or SANDBOX_EXECUTOR_EVIDENCE_KEY)")
 	flag.Parse()
@@ -179,6 +181,12 @@ func main() {
 	case "microsandbox":
 		if len(keys) == 0 {
 			log.Fatalf("sandbox-executord: -backend=microsandbox requires -job-pubkey-file — unsigned jobs must never reach execution")
+		}
+		if *stateDir == "" {
+			// Without an artifact directory every capture fails at
+			// runtime and no job could ever reach a verified result:
+			// refuse at startup instead of failing every artifact.
+			log.Fatalf("sandbox-executord: -backend=microsandbox requires -state-dir — captured output must land somewhere durable")
 		}
 		bin := *msbBin
 		if bin == "" {

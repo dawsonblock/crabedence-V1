@@ -219,11 +219,11 @@ type imageBaseline struct {
 	WorkingDir string
 }
 
-// imageEnvBaseline resolves the pinned image's own config environment
+// imageDefaults resolves the pinned image's own config environment
 // — the part of the guest environment the runtime injects at boot, and
 // therefore part of the authorized set. The result is cached per
 // digest: it cannot change while the digest is pinned.
-func (b *MSBBackend) imageEnvBaseline(ctx context.Context, job *JobContractV2) (imageBaseline, error) {
+func (b *MSBBackend) imageDefaults(ctx context.Context, job *JobContractV2) (imageBaseline, error) {
 	b.envMu.Lock()
 	if base, ok := b.envBaseline[job.ImageDigest]; ok {
 		b.envMu.Unlock()
@@ -664,7 +664,7 @@ func sameArgv(recorded, authorized []string) bool {
 // authorized set: the runtime injects it into every VM booted from
 // that digest.
 func (b *MSBBackend) policyFor(ctx context.Context, job *JobContractV2, handle, nonce string) (*EffectivePolicyV1, string, error) {
-	imageEnv, err := b.imageEnvBaseline(ctx, job)
+	imageEnv, err := b.imageDefaults(ctx, job)
 	if err != nil {
 		return nil, "", err
 	}

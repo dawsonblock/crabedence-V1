@@ -105,12 +105,6 @@ type DispatchPlan struct {
 	RuntimeFirmwareSHA256 string
 }
 
-// Identity renders the plan's execution identity (without a run id or
-// boot generation — those exist only after the launch).
-func (p *DispatchPlan) Identity() RunIdentity {
-	return RunIdentity{Handle: p.Handle, PolicyDigest: p.PolicyDigest, Nonce: p.Nonce}
-}
-
 // Backend is where an authorized, persisted job goes for execution.
 // The contract it receives has already been signature-verified,
 // window-checked, and durably recorded — the backend enforces the

@@ -524,3 +524,40 @@ func TestEvidenceDetectsIdentitySubstitution(t *testing.T) {
 		t.Fatalf("failures %v do not name the binding mismatch", rep.Failures)
 	}
 }
+
+// TestCleanupBookkeepingPreservesTheCheckpointChain: cleanup tracking is
+// post-terminal bookkeeping, and a checkpoint commits to the terminal
+// enumeration as it was — so marking and clearing cleanup pending must
+// leave an earlier checkpoint's chain verifiable. This pins the
+// invariant that only the terminal write may touch a checkpoint-covered
+// field.
+func TestCleanupBookkeepingPreservesTheCheckpointChain(t *testing.T) {
+	ledger, evdir, dir := twoTerminalJobs(t)
+	before := VerifyEvidenceDir(ledger, evdir, "", trustedSigner(t, dir))
+	if len(before.Failures) != 0 {
+		t.Fatalf("baseline: %v", before.Failures)
+	}
+	checkpoints, err := os.ReadDir(filepath.Join(evdir, "checkpoints"))
+	if err != nil || len(checkpoints) == 0 {
+		t.Fatalf("no checkpoints published: %v", err)
+	}
+
+	// Mark and clear cleanup pending on a terminal row — the two
+	// post-terminal writes that exist.
+	tamper(t, ledger, `UPDATE jobs SET cleanup_pending = 1, cleanup_error = 'retry' WHERE job_id = 'job-a'`)
+	tamper(t, ledger, `UPDATE jobs SET cleanup_pending = 0, cleanup_error = '' WHERE job_id = 'job-a'`)
+
+	after := VerifyEvidenceDir(ledger, evdir, "", trustedSigner(t, dir))
+	if len(after.Failures) != 0 {
+		t.Fatalf("cleanup bookkeeping invalidated the chain: %v", after.Failures)
+	}
+	// Every checkpoint published before the bookkeeping still verifies:
+	// the chain commits to what the terminal write recorded.
+	for _, entry := range checkpoints {
+		path := filepath.Join(evdir, "checkpoints", entry.Name())
+		rep := VerifyEvidenceDir(ledger, evdir, path, trustedSigner(t, dir))
+		if len(rep.Failures) != 0 {
+			t.Fatalf("checkpoint %s no longer verifies after cleanup bookkeeping: %v", entry.Name(), rep.Failures)
+		}
+	}
+}

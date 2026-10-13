@@ -30,12 +30,7 @@ func TestDaemonCrashPreservesAcknowledgedJobs(t *testing.T) {
 		t.Skip("builds and SIGKILLs the daemon")
 	}
 	dir := socketDir(t)
-	daemon := filepath.Join(dir, "sandbox-executord")
-	build := exec.Command("go", "build", "-o", daemon, "github.com/openclaw/crabbox/cmd/sandbox-executord")
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Skipf("cannot build the daemon (%v): %s", err, out)
-	}
-
+	daemon := buildDaemon(t, dir)
 	// The fake runtime the daemon will qualify and use: this test
 	// binary acting as msb, a firmware file, and the manifest that pins
 	// both. The job it launches stays "running" for a very long time —
@@ -45,33 +40,10 @@ func TestDaemonCrashPreservesAcknowledgedJobs(t *testing.T) {
 	if err := os.MkdirAll(fakeState, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	firmware := filepath.Join(dir, "lib", "libkrunfw.dylib")
-	if err := os.MkdirAll(filepath.Dir(firmware), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(firmware, []byte("fake firmware bytes"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	manifestPath := filepath.Join(dir, "runtime-manifest.json")
-	manifest := RuntimeManifest{
-		Version:         PinnedMSBVersion,
-		MSBSHA256:       sha256File(t, bin),
-		LibkrunfwSHA256: sha256File(t, firmware),
-	}
-	rawManifest, _ := json.Marshal(manifest)
-	if err := os.WriteFile(manifestPath, rawManifest, 0o600); err != nil {
-		t.Fatal(err)
-	}
-
+	firmware := writeFakeFirmware(t, dir)
+	manifestPath := writeRuntimeManifest(t, dir, bin, firmware)
 	key, keys := testAuthority(t)
-	keyFile := filepath.Join(dir, "authority.pubkeys")
-	lines := make([]string, 0, len(keys))
-	for fp, pub := range keys {
-		lines = append(lines, fp+":"+base64.StdEncoding.EncodeToString(pub))
-	}
-	if err := os.WriteFile(keyFile, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	keyFile := writeAuthorityKeyFile(t, dir, keys)
 
 	logFile, err := os.Create(filepath.Join(dir, "daemon.log"))
 	if err != nil {
@@ -225,6 +197,59 @@ func TestDaemonCrashPreservesAcknowledgedJobs(t *testing.T) {
 	}
 }
 
+// buildDaemon compiles the daemon under test into dir.
+func buildDaemon(t *testing.T, dir string) string {
+	t.Helper()
+	daemon := filepath.Join(dir, "sandbox-executord")
+	build := exec.Command("go", "build", "-o", daemon, "github.com/openclaw/crabbox/cmd/sandbox-executord")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Skipf("cannot build the daemon (%v): %s", err, out)
+	}
+	return daemon
+}
+
+// writeFakeFirmware lays down the firmware file the fake doctor names.
+func writeFakeFirmware(t *testing.T, dir string) string {
+	t.Helper()
+	firmware := filepath.Join(dir, "lib", "libkrunfw.dylib")
+	if err := os.MkdirAll(filepath.Dir(firmware), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(firmware, []byte("fake firmware bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return firmware
+}
+
+// writeRuntimeManifest pins the fake runtime's actual bytes.
+func writeRuntimeManifest(t *testing.T, dir, bin, firmware string) string {
+	t.Helper()
+	manifestPath := filepath.Join(dir, "runtime-manifest.json")
+	raw, _ := json.Marshal(RuntimeManifest{
+		Version:         PinnedMSBVersion,
+		MSBSHA256:       sha256File(t, bin),
+		LibkrunfwSHA256: sha256File(t, firmware),
+	})
+	if err := os.WriteFile(manifestPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return manifestPath
+}
+
+// writeAuthorityKeyFile renders the daemon's trust file.
+func writeAuthorityKeyFile(t *testing.T, dir string, keys AuthorityKeys) string {
+	t.Helper()
+	keyFile := filepath.Join(dir, "authority.pubkeys")
+	lines := make([]string, 0, len(keys))
+	for fp, pub := range keys {
+		lines = append(lines, fp+":"+base64.StdEncoding.EncodeToString(pub))
+	}
+	if err := os.WriteFile(keyFile, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return keyFile
+}
+
 // waitForPath waits until the daemon's socket answers a dial.
 func waitForPath(path string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
@@ -236,4 +261,43 @@ func waitForPath(path string, timeout time.Duration) error {
 		time.Sleep(100 * time.Millisecond)
 	}
 	return fmt.Errorf("daemon socket %s did not appear", path)
+}
+
+// TestDaemonRefusesWithoutAnArtifactDirectory: a configured backend
+// without -state-dir would fail every artifact capture at runtime and
+// no job could ever reach a verified result — so the daemon refuses at
+// startup instead of failing silently per job.
+func TestDaemonRefusesWithoutAnArtifactDirectory(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds the daemon")
+	}
+	dir := socketDir(t)
+	daemon := buildDaemon(t, dir)
+	bin := os.Args[0]
+	firmware := writeFakeFirmware(t, dir)
+	manifest := writeRuntimeManifest(t, dir, bin, firmware)
+	_, keys := testAuthority(t)
+	keyFile := writeAuthorityKeyFile(t, dir, keys)
+
+	cmd := exec.Command(daemon,
+		"-socket-dir", dir,
+		"-peer-uids", fmt.Sprintf("%d:crash-test", os.Getuid()),
+		"-job-pubkey-file", keyFile,
+		"-backend", "microsandbox",
+		"-msb-bin", bin,
+		"-runtime-manifest", manifest,
+		// -state-dir deliberately omitted.
+	)
+	cmd.Env = append(os.Environ(),
+		"MSB_FAKE_HELPER=1",
+		"MSB_FAKE_DIR="+filepath.Join(dir, "fake-msb"),
+		"MSB_FAKE_FIRMWARE="+firmware,
+	)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("the daemon started without an artifact directory: %s", out)
+	}
+	if !strings.Contains(string(out), "requires -state-dir") {
+		t.Fatalf("refusal = %s", out)
+	}
 }

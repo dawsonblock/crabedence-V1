@@ -29,9 +29,12 @@ that policy exactly, in both the persisted `config` and the resolved
 - the runtime's execution defaults — the command shell, and the pinned image's
   own command, entrypoint, user and working directory — so nothing about how
   the guest starts is left to a default nobody authorized;
-- resources, the VM's own `--max-duration` (contract timeout plus the fixed
-  observation grace), the workdir and the authorized mounts (including
-  read-only intent);
+- resources and their **ceilings** — the runtime must boot with exactly the
+  authorized cpus, memory and disk, and no headroom above the budget the
+  contract and the aggregate pool accounted for — plus the VM's own
+  `--max-duration` (contract timeout plus the fixed observation grace), a
+  lifecycle that is neither ephemeral nor idle-reaped, the workdir and the
+  authorized mounts (including read-only intent);
 - the network policy rule-for-rule, with no interface bindings or published
   ports;
 - the absence of initialization hooks, rootfs patches, runtime script bindings
@@ -54,10 +57,11 @@ result was produced on.
 **Execution identity.** Every dispatch records the runtime-owned job id, the VM
 boot generation (read from the pinned runtime's state and cross-checked against
 the runtime's own job record), the dispatch nonce and the effective-policy
-digest. The generation is persisted (ledger schema v4) and every later
-observation must carry it — a job record naming a different generation refuses
-at launch, in the monitor, and in recovery. A sandbox re-created under the same
-name is a substituted VM instance and is never adopted.
+digest. All of it is persisted in the ledger's dispatch-authorization columns
+before any VM exists, and every later observation must carry the same identity
+— a job record naming a different generation refuses at launch, in the monitor,
+and in recovery. A sandbox re-created under the same name is a substituted VM
+instance and is never adopted.
 
 **Result authenticity.** Guest outcomes are observed from the runtime's own
 durable job record, never from a CLI process exit code: `exited` with the
@@ -95,6 +99,7 @@ sandbox-executord \
   -msb-pull never \
   -pool-vms 4 -pool-submitter-vms 2 \
   -pool-cpus 8 -pool-memory-mb 8192 -pool-disk-mb 40960 -pool-output-bytes 67108864 \
+  -state-dir /var/lib/crabedence/executor-artifacts \
   -evidence-dir /var/lib/crabedence/executor-evidence \
   -ledger /var/lib/crabedence/executor-ledger.db
 ```

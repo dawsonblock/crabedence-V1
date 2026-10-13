@@ -93,11 +93,9 @@ func TestAdversarialFaultMatrix(t *testing.T) {
 			if hasReceipt != tc.wantReceipt {
 				t.Fatalf("receipt present = %t, want %t", hasReceipt, tc.wantReceipt)
 			}
-			// A NO_EFFECT receipt is only sound for a proven refusal.
+			// A NO_EFFECT receipt is only sound for a proven refusal:
+			// any receipt on a non-refusal is a false no-effect claim.
 			if hasReceipt && lj.DispatchClass != string(DispatchProvenRejected) {
-				targets.falseNoEffect++
-			}
-			if lj.DispatchClass == string(DispatchUncertain) && hasReceipt {
 				targets.falseNoEffect++
 			}
 			// Duplicate dispatch: at most one runtime job record, ever.
