@@ -2350,3 +2350,73 @@ func TestMSBResumeRefusesRewrittenAuthorization(t *testing.T) {
 		}
 	})
 }
+
+// TestMSBRuntimeIdentityCoversTheComponentChain (F-042): every shared
+// component the pinned runtime version ships must be the qualified
+// bytes — an unpinned component, a substituted component or a pinned
+// component that is missing all refuse.
+func TestMSBRuntimeIdentityCoversTheComponentChain(t *testing.T) {
+	bin, _ := fakeMSB(t, nil)
+	newBackend := func(t *testing.T) (*MSBBackend, string) {
+		t.Helper()
+		backend := testBackend(t, bin, t.TempDir())
+		fwPath, err := backend.firmwarePath(testContext(t))
+		if err != nil {
+			t.Fatalf("resolve firmware: %v", err)
+		}
+		componentDir := filepath.Join(filepath.Dir(fwPath), "v"+PinnedMSBVersion)
+		if err := os.MkdirAll(componentDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		return backend, componentDir
+	}
+
+	t.Run("unpinned component refuses", func(t *testing.T) {
+		backend, componentDir := newBackend(t)
+		if err := os.WriteFile(filepath.Join(componentDir, "injected.dylib"), []byte("injected bytes"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := backend.VerifyRuntime(testContext(t)); err == nil {
+			t.Fatal("an unpinned runtime component was accepted")
+		} else if !strings.Contains(err.Error(), "unpinned dependency") {
+			t.Fatalf("refusal = %v", err)
+		}
+	})
+
+	t.Run("pinned component with the wrong bytes refuses", func(t *testing.T) {
+		backend, componentDir := newBackend(t)
+		path := filepath.Join(componentDir, "helper.dylib")
+		if err := os.WriteFile(path, []byte("qualified bytes"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		backend.RuntimeManifest.Components = map[string]string{"helper.dylib": strings.Repeat("0", 64)}
+		if _, err := backend.VerifyRuntime(testContext(t)); err == nil {
+			t.Fatal("a substituted runtime component was accepted")
+		} else if !strings.Contains(err.Error(), "substituted dependency") {
+			t.Fatalf("refusal = %v", err)
+		}
+	})
+
+	t.Run("pinned component that is missing refuses", func(t *testing.T) {
+		backend, _ := newBackend(t)
+		backend.RuntimeManifest.Components = map[string]string{"absent.dylib": strings.Repeat("1", 64)}
+		if _, err := backend.VerifyRuntime(testContext(t)); err == nil {
+			t.Fatal("a missing pinned component was accepted")
+		} else if !strings.Contains(err.Error(), "incomplete install") {
+			t.Fatalf("refusal = %v", err)
+		}
+	})
+
+	t.Run("the qualified chain is accepted", func(t *testing.T) {
+		backend, componentDir := newBackend(t)
+		path := filepath.Join(componentDir, "helper.dylib")
+		if err := os.WriteFile(path, []byte("qualified bytes"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		sum := sha256File(t, path)
+		backend.RuntimeManifest.Components = map[string]string{"helper.dylib": sum}
+		if _, err := backend.VerifyRuntime(testContext(t)); err != nil {
+			t.Fatalf("the qualified component chain was refused: %v", err)
+		}
+	})
+}

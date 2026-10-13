@@ -39,11 +39,14 @@ that policy exactly, in both the persisted `config` and the resolved
 A mismatch destroys the VM before the guest command runs.
 
 **Runtime identity.** A qualified runtime manifest (JSON with `version`,
-`msb_sha256`, `libkrunfw_sha256`) is required. Startup verifies the version and
-hashes both the executable and the firmware the runtime's own prerequisite
-report names: a binary that reports the right version but carries different
-bytes refuses. The effective policy binds the same digests, so the signed
-evidence names the runtime the result was produced on.
+`msb_sha256`, `libkrunfw_sha256` and an optional `components` map) is required.
+Startup verifies the version, hashes the executable and the firmware the
+runtime's own prerequisite report names, and verifies every shared component
+the pinned version ships under `<install>/lib/v<version>/` against the
+manifest — an unpinned, substituted or missing component refuses. A binary that
+reports the right version but carries different bytes refuses. The effective
+policy binds the same digests, so the signed evidence names the runtime the
+result was produced on.
 
 **Execution identity.** Every dispatch records the runtime-owned job id, the VM
 boot generation (read from the pinned runtime's state and cross-checked against
@@ -198,6 +201,11 @@ the backstop.
   The executor refuses a host its runtime's prerequisite check rejects, and the
   runtime manifest is built from the hashes of that qualified install, so the
   Linux lane pins exactly the bytes it proved.
+- The crash-consistency lane is qualified by SIGKILL rather than assertion:
+  `TestDaemonCrashPreservesAcknowledgedJobs` kills the real daemon mid-job and
+  requires the acknowledged job, its pre-persisted authorization and its single
+  runtime record to survive, with recovery settling the run from the runtime's
+  own record afterwards.
 - The executor's macOS artifacts follow this fork's declared unsigned contract;
   the rc lane publishes source bundles, SBOM and release evidence, not compiled
   binaries.

@@ -28,6 +28,13 @@ type RuntimeManifest struct {
 	// LibkrunfwSHA256 is the lowercase hex SHA-256 of the firmware
 	// shared library the runtime boots guests with.
 	LibkrunfwSHA256 string `json:"libkrunfw_sha256"`
+	// Components pins every additional shared component the pinned
+	// runtime version ships in its install tree
+	// (<install>/lib/v<version>/…), keyed by path relative to that
+	// directory. A component present on disk but unpinned refuses, and
+	// a pinned component that is missing or differs refuses: the chain
+	// the runtime loads is exactly the chain the operator qualified.
+	Components map[string]string `json:"components,omitempty"`
 }
 
 // LoadRuntimeManifest reads and validates a runtime manifest file.
@@ -82,6 +89,69 @@ func (m *RuntimeManifest) Validate() error {
 	}
 	if !isSHA256Digest("sha256:" + m.LibkrunfwSHA256) {
 		return fmt.Errorf("libkrunfw_sha256 must be a lowercase 64-hex digest")
+	}
+	for name, digest := range m.Components {
+		if name == "" || filepath.IsAbs(name) || strings.Contains(name, "..") {
+			return fmt.Errorf("component %q must be a relative path inside the runtime's version directory", name)
+		}
+		if !isSHA256Digest("sha256:" + digest) {
+			return fmt.Errorf("component %q must carry a lowercase 64-hex digest", name)
+		}
+	}
+	return nil
+}
+
+// verifyComponents proves every shared component the pinned runtime
+// version ships is exactly the qualified bytes: each file under
+// <install>/lib/v<version>/ must be pinned in the manifest with a
+// matching digest, and every pinned component must exist. An unpinned
+// component — a substituted or injected library the runtime could load
+// — refuses.
+func verifyComponents(componentDir string, pinned map[string]string) error {
+	present := map[string]string{}
+	err := filepath.WalkDir(componentDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		rel, rerr := filepath.Rel(componentDir, path)
+		if rerr != nil {
+			return rerr
+		}
+		sum, herr := hashFileSHA256(path)
+		if herr != nil {
+			return fmt.Errorf("hash component %s: %w", rel, herr)
+		}
+		present[filepath.ToSlash(rel)] = sum
+		return nil
+	})
+	if err != nil {
+		if os.IsNotExist(err) {
+			// The pinned runtime ships no component directory: the
+			// chain is the executable and the firmware, and any pinned
+			// component would be missing.
+			if len(pinned) != 0 {
+				return fmt.Errorf("the runtime manifest pins %d component(s) but the runtime ships no version directory", len(pinned))
+			}
+			return nil
+		}
+		return fmt.Errorf("inspect the runtime's component directory %s: %w", componentDir, err)
+	}
+	for name, sum := range present {
+		want, ok := pinned[name]
+		if !ok {
+			return fmt.Errorf("the runtime ships component %s (digest %s) that the qualified manifest does not pin — refusing an unpinned dependency", name, sum)
+		}
+		if want != sum {
+			return fmt.Errorf("component %s digest %s does not match the qualified manifest %s — refusing a substituted dependency", name, sum, want)
+		}
+	}
+	for name := range pinned {
+		if _, ok := present[name]; !ok {
+			return fmt.Errorf("the qualified manifest pins component %s, which the runtime does not ship — refusing an incomplete install", name)
+		}
 	}
 	return nil
 }
@@ -162,6 +232,13 @@ func (b *MSBBackend) verifyRuntimeIdentity(ctx context.Context, version string) 
 	if fwSum != b.RuntimeManifest.LibkrunfwSHA256 {
 		return "", fmt.Errorf("firmware library digest %s does not match the qualified manifest %s — refusing a substituted virtualization component",
 			fwSum, b.RuntimeManifest.LibkrunfwSHA256)
+	}
+	// The rest of the pinned version's install tree: every shared
+	// component the runtime ships must be the qualified bytes, and
+	// nothing unpinned may sit in a place the runtime loads from.
+	componentDir := filepath.Join(filepath.Dir(fwPath), "v"+version)
+	if err := verifyComponents(componentDir, b.RuntimeManifest.Components); err != nil {
+		return "", err
 	}
 	return fwPath, nil
 }
