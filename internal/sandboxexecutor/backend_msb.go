@@ -158,9 +158,6 @@ type MSBBackend struct {
 	// file per job, mode 0600; the ledger row binds the file's
 	// SHA-256, so the artifact is evidence, not just logs.
 	StateDir string
-	// ExtraArgs are additional operator-pinned msb create flags,
-	// appended verbatim before the image (e.g. ["--root-disk","tmpfs:2G"]).
-	ExtraArgs []string
 	// NamePrefix namespaces every sandbox this backend creates —
 	// Inspect refuses handles that lack it, so the backend can never
 	// be pointed at sandboxes it did not launch.
@@ -527,7 +524,6 @@ func (b *MSBBackend) createArgs(job *JobContractV2, name, nonce string) ([]strin
 		return nil, fmt.Errorf("unknown image pull policy %q (want %q or %q)", policy, PullNever, PullIfMissing)
 	}
 	args = append(args, "--pull", policy)
-	args = append(args, b.ExtraArgs...)
 	args = append(args, pinnedImage(job))
 	return args, nil
 }

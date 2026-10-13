@@ -2360,6 +2360,42 @@ func TestVerifyNoHostChannelsRefusesEveryRoute(t *testing.T) {
 	}
 }
 
+// TestMSBCreateArgsArePolicyDerived (F-046): every flag the adapter
+// passes to `msb create` comes from the compiled policy, so a VM can
+// never boot with a setting nobody authorized. A flag added here
+// without a matching policy dimension is exactly the widening this
+// guards against — the create command is the policy, not a policy
+// plus operator extras.
+func TestMSBCreateArgsArePolicyDerived(t *testing.T) {
+	key, _ := testAuthority(t)
+	bin, _ := fakeMSB(t, nil)
+	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
+	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "args-1"; c.Nonce = "n-args" })
+
+	args, err := backend.createArgs(job, backend.msbJobName(job.JobID), job.Nonce)
+	if err != nil {
+		t.Fatalf("createArgs: %v", err)
+	}
+	allowed := map[string]bool{
+		"-q": true, "-n": true, "--deployment-profile": true, "--cpus": true,
+		"--memory": true, "--root-disk": true, "--max-duration": true,
+		"--net": true, "--net-default": true, "--net-rule": true, "-e": true,
+		"-v": true, "-w": true, "--security": true, "--label": true,
+		"--pull": true,
+	}
+	for _, a := range args {
+		if !strings.HasPrefix(a, "-") {
+			continue
+		}
+		if !allowed[a] {
+			t.Fatalf("`msb create` receives %q, which the policy does not compile", a)
+		}
+	}
+	if last := args[len(args)-1]; last != job.Image+"@"+job.ImageDigest {
+		t.Fatalf("create ends with %q, not the authority-pinned image", last)
+	}
+}
+
 // TestMSBDispatchBindsBootGeneration: the runtime-owned job must run in
 // the boot generation this dispatch verified — a job record naming a
 // different VM instance refuses, and the VM is destroyed (F-037).
