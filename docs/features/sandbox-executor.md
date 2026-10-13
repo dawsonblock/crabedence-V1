@@ -152,10 +152,16 @@ On startup the executor reconciles what the runtime can still prove: unresolved
 rows are **resumed** through the runtime's own job record — a terminal run
 reaches the same receipt, artifact and terminal state a live monitor would have
 produced, and a run whose identity was lost with the crash is adopted from the
-runtime's job list only when exactly one record matches the authorized argv and
-it runs in the recorded boot generation. Zero matches, several matches, a
-changed boot generation or an unreadable runtime all stay unresolved with a
-liveness audit. Nothing is ever re-dispatched and nothing is auto-destroyed.
+runtime's job list only when exactly one record matches the authorized argv.
+Recovery is authorization, not command matching: before adopting anything the
+executor re-inspects the discovered VM, recomputes the policy the dispatch was
+approved under (from the stored contract and the current operator
+configuration), requires the VM's booted configuration to still equal it, and
+requires the VM to present the dispatch's own nonce label and boot generation.
+A substituted instance, a rewritten nonce, a rewritten policy digest or a
+changed operator configuration all refuse; zero matches or several matches stay
+unresolved with a liveness audit. Nothing is ever re-dispatched and nothing is
+auto-destroyed — an uncertain launch leaves its VM for reconciliation.
 
 Cleanup is tracked separately from the result: the terminal write records
 cleanup intent, the sandbox removal runs after, and a failure is recorded as

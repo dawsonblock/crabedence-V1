@@ -46,6 +46,12 @@ const (
 	// defaultDispatchTimeout bounds the synchronous launch call —
 	// a wedged backend cannot pin an admission slot forever.
 	defaultDispatchTimeout = 45 * time.Second
+	// prepareTimeout bounds the dispatch-plan computation. It is
+	// separate from DispatchTimeout because the plan resolves at most
+	// one cached, idempotent lookup (the pinned image's config
+	// environment) — a cold lookup must not consume the budget that
+	// governs creating and launching the VM.
+	prepareTimeout = 30 * time.Second
 	// defaultReconcileTimeout bounds one startup recovery attempt —
 	// a run that is still live is left unresolved rather than
 	// blocking reconciliation indefinitely.
@@ -395,7 +401,7 @@ func (s *Server) reconcileUnresolved() {
 			s.audit("reconcile: job %s (%s) stored contract is unreadable (%v) — leaving it unresolved", j.JobID, j.State, cerr)
 			continue
 		}
-		run := RunIdentity{Handle: j.BackendHandle, RunID: j.BackendJobID, BootID: j.BackendBootID, PolicyDigest: j.PolicyDigest}
+		run := RunIdentity{Handle: j.BackendHandle, RunID: j.BackendJobID, BootID: j.BackendBootID, PolicyDigest: j.PolicyDigest, Nonce: j.DispatchNonce}
 		ctx, cancel := context.WithTimeout(s.shutdown, s.cfg.ReconcileTimeout)
 		adopted, res, rerr := s.cfg.Backend.Resume(ctx, contract, run)
 		cancel()
@@ -785,8 +791,42 @@ func (s *Server) serve(conn *net.UnixConn) {
 			continue
 		}
 
+		// The dispatch identity is computed without creating anything
+		// and persisted before the backend may create a VM: a crash can
+		// then never leave a VM whose authorization is not on disk, and
+		// recovery validates a discovered VM against this stored
+		// identity rather than reconstructing authority from a
+		// matching command.
+		prepareCtx, cancelPrepare := context.WithTimeout(s.shutdown, prepareTimeout)
+		plan, perr := s.cfg.Backend.Prepare(prepareCtx, contract)
+		cancelPrepare()
+		if perr != nil {
+			// Nothing was created: a pre-launch refusal, the only kind
+			// that may attest NO_EFFECT.
+			receiptSHA, rerr := s.emitReceipt(&LedgerJob{
+				JobID: jobID, Principal: principal, ContractHash: contractHash,
+			}, evidence.OutcomeNoEffect, "", "")
+			if rerr != nil {
+				s.audit("job %s: evidence emission failed (%v) — refusing the terminal claim too", jobID, rerr)
+				fail(fmt.Sprintf("backend refused and evidence emission failed for %q: %v", jobID, rerr))
+				return
+			}
+			_ = s.ledger.Transition(jobID, JobStateDispatchFailed, []string{JobStateDispatching},
+				func(j *LedgerJob) error {
+					j.ReceiptSHA256 = receiptSHA
+					j.Error = fmt.Sprintf("dispatch refused before launch: %v", perr)
+					return nil
+				})
+			failJob(jobID, JobStateDispatchFailed, fmt.Sprintf("backend refused job: %v", perr))
+			return
+		}
+		if err := s.ledger.RecordDispatchPlan(jobID, s.backendName, plan); err != nil {
+			fail(fmt.Sprintf("persist dispatch identity of %q: %v", jobID, err))
+			return
+		}
+
 		dispatchCtx, cancel := context.WithTimeout(s.shutdown, s.cfg.DispatchTimeout)
-		disp, derr := s.cfg.Backend.Dispatch(dispatchCtx, contract)
+		disp, derr := s.cfg.Backend.Dispatch(dispatchCtx, contract, plan)
 		cancel()
 		switch {
 		case derr == nil:
@@ -818,11 +858,11 @@ func (s *Server) serve(conn *net.UnixConn) {
 				})
 			failJob(jobID, JobStateDispatchAmbig, fmt.Sprintf("dispatch outcome uncertain — reconciling manually; the job will NOT be retried: %v", derr))
 			return
-		default:
-			// Definitive refusal: nothing launched, but the job
-			// identity stays recorded — a backend error must never
-			// erase an acknowledged job. The NO_EFFECT receipt
-			// attests the refusal itself.
+		case errors.Is(derr, ErrDispatchRefused):
+			// Definitive refusal: the backend proved nothing launched,
+			// but the job identity stays recorded — a backend error
+			// must never erase an acknowledged job. The NO_EFFECT
+			// receipt attests the refusal itself.
 			receiptSHA, rerr := s.emitReceipt(&LedgerJob{
 				JobID: jobID, Principal: principal, ContractHash: contractHash,
 			}, evidence.OutcomeNoEffect, "", disp.Handle)
@@ -839,6 +879,21 @@ func (s *Server) serve(conn *net.UnixConn) {
 				})
 			s.checkpoint()
 			failJob(jobID, JobStateDispatchFailed, fmt.Sprintf("backend refused job: %v", derr))
+			return
+		default:
+			// Unclassified dispatch error: the executor cannot prove
+			// nothing executed, so it must not claim it. Record the
+			// uncertainty exactly as an ambiguous dispatch — the job
+			// is never retried blind and never receives a NO_EFFECT
+			// receipt it cannot support.
+			_ = s.ledger.Transition(jobID, JobStateDispatchAmbig, []string{JobStateDispatching},
+				func(j *LedgerJob) error {
+					applyRunIdentity(j, s.backendName, disp)
+					j.Error = fmt.Sprintf("dispatch error could not be classified as a pre-launch refusal — treating the outcome as uncertain: %v", derr)
+					return nil
+				})
+			s.audit("job %s: unclassified dispatch error treated as uncertain (never a no-effect claim): %v", jobID, derr)
+			failJob(jobID, JobStateDispatchAmbig, fmt.Sprintf("dispatch outcome uncertain — reconciling manually; the job will NOT be retried: %v", derr))
 			return
 		}
 	}
@@ -1031,6 +1086,9 @@ func receiptRunIdentity(job *LedgerJob, res *ExecResult) string {
 func applyRunIdentity(j *LedgerJob, backendName string, run RunIdentity) {
 	j.BackendID, j.BackendHandle = backendName, run.Handle
 	j.BackendJobID, j.BackendBootID, j.PolicyDigest = run.RunID, run.BootID, run.PolicyDigest
+	if run.Nonce != "" {
+		j.DispatchNonce = run.Nonce
+	}
 }
 
 // cleanupBackend removes a finished job's backend resources under a

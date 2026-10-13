@@ -389,21 +389,42 @@ type stubBackend struct {
 	adoptRunID string
 	adoptBoot  string
 	noRunID    bool
+	prepareErr error
 }
 
 // stubIdentity is the execution identity a stub dispatch reports: a
-// fixed run id, boot generation and policy digest unless a test
-// overrides them.
+// fixed run id, boot generation, policy digest and dispatch nonce
+// unless a test overrides them.
 func (b *stubBackend) stubIdentity() RunIdentity {
 	return RunIdentity{
 		Handle:       b.handle,
 		RunID:        "job_" + strings.Repeat("1", 32),
 		BootID:       "boot_" + strings.Repeat("1", 32),
 		PolicyDigest: strings.Repeat("ab", 32),
+		Nonce:        "nonce_" + strings.Repeat("1", 32),
 	}
 }
 
-func (b *stubBackend) Dispatch(ctx context.Context, job *JobContractV2) (RunIdentity, error) {
+// Prepare renders the stub's dispatch plan — the identity the server
+// persists before any VM exists.
+func (b *stubBackend) Prepare(ctx context.Context, job *JobContractV2) (*DispatchPlan, error) {
+	if b.prepareErr != nil {
+		return nil, b.prepareErr
+	}
+	ident := b.stubIdentity()
+	if ident.Handle == "" {
+		ident.Handle = "stub-handle"
+	}
+	return &DispatchPlan{
+		Handle:         ident.Handle,
+		Nonce:          ident.Nonce,
+		PolicyDigest:   ident.PolicyDigest,
+		ImageDigest:    job.ImageDigest,
+		RuntimeVersion: "0.7.8",
+	}, nil
+}
+
+func (b *stubBackend) Dispatch(ctx context.Context, job *JobContractV2, plan *DispatchPlan) (RunIdentity, error) {
 	cpy := *job
 	b.got = &cpy
 	ident := b.stubIdentity()
@@ -572,7 +593,7 @@ func TestBackendHandoff(t *testing.T) {
 	})
 
 	t.Run("backend refusal keeps the job recorded", func(t *testing.T) {
-		be := &stubBackend{err: fmt.Errorf("no sandbox available")}
+		be := &stubBackend{err: fmt.Errorf("%w: no sandbox available", ErrDispatchRefused)}
 		srv := startServer(t, Config{SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys, Backend: be})
 		conn, reader := connect(t, srv.SocketPath())
 		resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV2) { c.JobID = "job-fail"; c.Nonce = "n-fail" }))
@@ -587,6 +608,26 @@ func TestBackendHandoff(t *testing.T) {
 		}
 		if lj.State != JobStateDispatchFailed {
 			t.Fatalf("job state = %q", lj.State)
+		}
+	})
+
+	t.Run("unclassified backend error stays uncertain", func(t *testing.T) {
+		// An error the backend did not classify as a proven refusal is
+		// never recorded as one: the executor cannot prove nothing
+		// executed, so it does not claim it (F-040).
+		be := &stubBackend{err: fmt.Errorf("no sandbox available")}
+		srv := startServer(t, Config{SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys, Backend: be})
+		conn, reader := connect(t, srv.SocketPath())
+		resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV2) { c.JobID = "job-unclassified"; c.Nonce = "n-unclassified" }))
+		if resp.OK || resp.State != JobStateDispatchAmbig {
+			t.Fatalf("unclassified error = %+v, want an uncertain outcome", resp)
+		}
+		lj, err := srv.Ledger().Get("job-unclassified")
+		if err != nil || lj == nil {
+			t.Fatalf("ledger row: %v", err)
+		}
+		if lj.State != JobStateDispatchAmbig || lj.ReceiptSHA256 != "" {
+			t.Fatalf("unclassified error produced %+v — a no-effect claim it cannot support", lj)
 		}
 	})
 
@@ -1047,4 +1088,75 @@ func TestBackendRequiresAggregateBounds(t *testing.T) {
 			t.Fatalf("fully bounded backend refused: %v", err)
 		}
 	})
+}
+
+// TestServerNeverClaimsNoEffectForALaunchedJob (F-040): when the launch
+// was admitted but its identity cannot be verified, the executor records
+// an uncertain outcome and emits no NO_EFFECT receipt — it never asserts
+// that nothing executed.
+func TestServerNeverClaimsNoEffectForALaunchedJob(t *testing.T) {
+	bin, _ := fakeMSB(t, map[string]string{"MSB_FAKE_JOB_INSPECT_FAIL": "1"})
+	dir := socketDir(t)
+	key, keys := testAuthority(t)
+	backend := testBackend(t, bin, filepath.Join(dir, "artifacts"))
+	srv := startServer(t, Config{
+		SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys, Backend: backend,
+	})
+	conn, reader := connect(t, srv.SocketPath())
+	resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV2) {
+		c.JobID = "post-launch-srv"
+		c.Nonce = "n-post-srv"
+	}))
+	if resp.OK {
+		t.Fatalf("an unverifiable launch was admitted as running: %+v", resp)
+	}
+	if resp.State != JobStateDispatchAmbig {
+		t.Fatalf("state = %s, want %s — a launched job is never a refusal", resp.State, JobStateDispatchAmbig)
+	}
+	lj, err := srv.Ledger().Get("post-launch-srv")
+	if err != nil || lj == nil {
+		t.Fatalf("ledger row: %v", err)
+	}
+	if lj.State != JobStateDispatchAmbig {
+		t.Fatalf("row state = %s, want %s", lj.State, JobStateDispatchAmbig)
+	}
+	if lj.ReceiptSHA256 != "" {
+		t.Fatal("a NO_EFFECT receipt was emitted for a job that may have executed")
+	}
+	raw, rerr := os.ReadFile(filepath.Join(evidenceDirOf(dir), "receipts.jsonl"))
+	if rerr == nil && strings.Contains(string(raw), "post-launch-srv") {
+		t.Fatal("the evidence chain carries a receipt for an uncertain execution")
+	}
+}
+
+// TestServerPersistsDispatchIdentityBeforeTheVM (F-041): the dispatch
+// authorization is on the ledger before the backend creates anything —
+// an ambiguous create still leaves the exact identity recovery needs.
+func TestServerPersistsDispatchIdentityBeforeTheVM(t *testing.T) {
+	bin, _ := fakeMSB(t, map[string]string{"MSB_FAKE_CREATE_SLEEP": "5"})
+	dir := socketDir(t)
+	key, keys := testAuthority(t)
+	backend := testBackend(t, bin, filepath.Join(dir, "artifacts"))
+	srv := startServer(t, Config{
+		SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys, Backend: backend,
+		DispatchTimeout: 500 * time.Millisecond,
+	})
+	conn, reader := connect(t, srv.SocketPath())
+	resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV2) {
+		c.JobID = "plan-first"
+		c.Nonce = "n-plan-first"
+	}))
+	if resp.OK || resp.State != JobStateDispatchAmbig {
+		t.Fatalf("ambiguous create = %+v", resp)
+	}
+	lj, err := srv.Ledger().Get("plan-first")
+	if err != nil || lj == nil {
+		t.Fatalf("ledger row: %v", err)
+	}
+	if lj.DispatchNonce == "" || lj.PolicyDigest == "" || lj.ImageDigest == "" || lj.RuntimeIdentity == "" {
+		t.Fatalf("the dispatch authorization was not persisted before the create: %+v", lj)
+	}
+	if lj.BackendHandle == "" {
+		t.Fatal("the deterministic handle was not persisted")
+	}
 }

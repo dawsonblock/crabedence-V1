@@ -98,7 +98,9 @@ func TestEvidenceLifecycle(t *testing.T) {
 
 func TestEvidenceNOEFFECT(t *testing.T) {
 	dir := socketDir(t)
-	srv, key := startEvidenceServer(t, dir, &stubBackend{err: fmt.Errorf("no capacity")})
+	// Only a proven pre-launch refusal may attest NO_EFFECT: the stub
+	// wraps the refusal sentinel the backend contract defines.
+	srv, key := startEvidenceServer(t, dir, &stubBackend{err: fmt.Errorf("%w: no capacity", ErrDispatchRefused)})
 	if state := submitSigned(t, srv, key, "job-nofx"); state != JobStateDispatchFailed {
 		t.Fatalf("dispatch state = %s", state)
 	}

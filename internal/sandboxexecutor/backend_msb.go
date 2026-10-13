@@ -635,38 +635,82 @@ func sameArgv(recorded, authorized []string) bool {
 // A dispatch deadline that expires mid-create is ambiguous by
 // construction — the VM may exist — so the handle is returned for
 // reconcile, never a blind retry.
-func (b *MSBBackend) Dispatch(ctx context.Context, job *JobContractV2) (RunIdentity, error) {
+// policyFor compiles the canonical policy for one dispatch identity —
+// the handle and nonce the VM will carry — and returns it with its
+// digest. The pinned image's own config environment is part of the
+// authorized set: the runtime injects it into every VM booted from
+// that digest.
+func (b *MSBBackend) policyFor(ctx context.Context, job *JobContractV2, handle, nonce string) (*EffectivePolicyV1, string, error) {
+	imageEnv, err := b.imageEnvBaseline(ctx, job)
+	if err != nil {
+		return nil, "", err
+	}
+	policy, err := b.buildEffectivePolicy(job, handle, nonce, b.requiredVersion(), imageEnv)
+	if err != nil {
+		return nil, "", err
+	}
+	digest, err := policy.Digest()
+	if err != nil {
+		return nil, "", err
+	}
+	return policy, digest, nil
+}
+
+// Prepare computes the dispatch identity without creating anything: the
+// deterministic handle, a fresh nonce, the canonical policy and digest,
+// the authorized image digest and the qualified runtime identity. The
+// caller persists it before Dispatch, so the authorization on disk
+// always precedes the VM it authorizes.
+func (b *MSBBackend) Prepare(ctx context.Context, job *JobContractV2) (*DispatchPlan, error) {
+	if job == nil {
+		return nil, fmt.Errorf("prepare requires a signed job contract")
+	}
+	handle := b.msbJobName(job.JobID)
+	nonce, err := dispatchNonce()
+	if err != nil {
+		return nil, err
+	}
+	policy, digest, err := b.policyFor(ctx, job, handle, nonce)
+	if err != nil {
+		return nil, err
+	}
+	m := b.runtimeManifest()
+	return &DispatchPlan{
+		Handle:                handle,
+		Nonce:                 nonce,
+		Policy:                policy,
+		PolicyDigest:          digest,
+		ImageDigest:           job.ImageDigest,
+		RuntimeVersion:        m.Version,
+		RuntimeMSBSHA256:      m.MSBSHA256,
+		RuntimeFirmwareSHA256: m.LibkrunfwSHA256,
+	}, nil
+}
+
+func (b *MSBBackend) Dispatch(ctx context.Context, job *JobContractV2, plan *DispatchPlan) (RunIdentity, error) {
 	if job == nil {
 		return RunIdentity{}, fmt.Errorf("dispatch requires a signed job contract")
 	}
-	name := b.msbJobName(job.JobID)
-	nonce, err := dispatchNonce()
-	if err != nil {
-		return RunIdentity{}, err
+	if plan == nil {
+		// The caller did not pre-persist a plan (a direct/test call):
+		// prepare one now so the launch still runs under a canonical
+		// identity. A prepare failure is a pre-launch refusal —
+		// nothing has been created.
+		prepared, perr := b.Prepare(ctx, job)
+		if perr != nil {
+			return RunIdentity{}, fmt.Errorf("%w: %v", ErrDispatchRefused, perr)
+		}
+		plan = prepared
 	}
+	if plan.Handle == "" || plan.Nonce == "" || plan.Policy == nil || plan.PolicyDigest == "" {
+		return RunIdentity{}, fmt.Errorf("%w: the dispatch plan is incomplete (handle, nonce, policy and digest are required)", ErrDispatchRefused)
+	}
+	name, nonce, policy, policyDigest := plan.Handle, plan.Nonce, plan.Policy, plan.PolicyDigest
 	createArgs, err := b.createArgs(job, name, nonce)
 	if err != nil {
-		return RunIdentity{}, err
+		return RunIdentity{}, fmt.Errorf("%w: %v", ErrDispatchRefused, err)
 	}
-
-	// The canonical policy is compiled before anything boots: it is
-	// what the VM must match, and its digest is the authorization
-	// identity the result will carry. The pinned image's own config
-	// environment is part of the authorized set — the runtime injects
-	// it into every VM booted from that digest.
-	imageEnv, err := b.imageEnvBaseline(ctx, job)
-	if err != nil {
-		return RunIdentity{}, err
-	}
-	policy, err := b.buildEffectivePolicy(job, name, nonce, b.requiredVersion(), imageEnv)
-	if err != nil {
-		return RunIdentity{}, err
-	}
-	policyDigest, err := policy.Digest()
-	if err != nil {
-		return RunIdentity{}, err
-	}
-	identity := RunIdentity{Handle: name, PolicyDigest: policyDigest}
+	identity := RunIdentity{Handle: name, PolicyDigest: policyDigest, Nonce: nonce}
 
 	out, cerr := b.runOnce(ctx, createArgs...)
 	if cerr != nil {
@@ -677,14 +721,14 @@ func (b *MSBBackend) Dispatch(ctx context.Context, job *JobContractV2) (RunIdent
 			return identity, fmt.Errorf("%w: create deadline expired before the VM was proven: %v", ErrAmbiguousDispatch, ctx.Err())
 		}
 		if strings.Contains(strings.ToLower(string(out)), "already exists") {
-			return RunIdentity{}, fmt.Errorf("sandbox %q already exists — refusing to reuse a VM this dispatch did not create", name)
+			return RunIdentity{}, fmt.Errorf("%w: sandbox %q already exists — refusing to reuse a VM this dispatch did not create", ErrDispatchRefused, name)
 		}
 		// A create can fail after the VM was already booted (a guest
 		// validation error, for instance). Destroy the leftover only
 		// when it carries this dispatch's identity label — proof it
 		// came from this create, not from someone else.
 		b.destroyIfOurs(name, nonce)
-		return RunIdentity{}, fmt.Errorf("msb create failed: %v: %s", cerr, strings.TrimSpace(string(out)))
+		return RunIdentity{}, fmt.Errorf("%w: msb create failed: %v: %s", ErrDispatchRefused, cerr, strings.TrimSpace(string(out)))
 	}
 
 	// Pre-execution policy verification: the VM that boots must be
@@ -695,25 +739,31 @@ func (b *MSBBackend) Dispatch(ctx context.Context, job *JobContractV2) (RunIdent
 	doc, ierr := b.inspectRaw(ctx, name)
 	if ierr != nil {
 		b.destroy(name)
-		return RunIdentity{}, fmt.Errorf("verify sandbox %s before execution: %w", name, ierr)
+		return RunIdentity{}, fmt.Errorf("%w: verify sandbox %s before execution: %v", ErrDispatchRefused, name, ierr)
 	}
 	if verr := verifyBootedPolicy(policy, doc); verr != nil {
 		b.destroy(name)
-		return RunIdentity{}, fmt.Errorf("sandbox %s failed policy verification — destroyed before execution: %w", name, verr)
+		return RunIdentity{}, fmt.Errorf("%w: sandbox %s failed policy verification — destroyed before execution: %v", ErrDispatchRefused, name, verr)
 	}
 	bootID, berr := b.sandboxBootID(doc)
 	if berr != nil {
 		b.destroy(name)
-		return RunIdentity{}, fmt.Errorf("bind the VM boot generation of %s before execution: %w", name, berr)
+		return RunIdentity{}, fmt.Errorf("%w: bind the VM boot generation of %s before execution: %v", ErrDispatchRefused, name, berr)
 	}
 	identity.BootID = bootID
 
 	lout, lerr := b.runOnce(ctx, b.launchArgs(job, name)...)
 	if lerr == nil {
 		if runID, ok := parseRunID(string(lout)); ok {
+			// The launch named a job: the workload started. It is
+			// this dispatch's only if the runtime's record proves it
+			// runs in the VM this dispatch verified; if that proof
+			// cannot be made, the outcome is uncertain — the VM and
+			// its workload are left for reconciliation, and no
+			// no-effect claim is ever made about them.
 			if aerr := b.verifyLaunchedRun(ctx, name, runID, bootID); aerr != nil {
-				b.destroy(name)
-				return identity, aerr
+				identity.RunID = runID
+				return identity, fmt.Errorf("%w: %v", ErrAmbiguousDispatch, aerr)
 			}
 			identity.RunID = runID
 			return identity, nil
@@ -746,9 +796,9 @@ func (b *MSBBackend) Dispatch(ctx context.Context, job *JobContractV2) (RunIdent
 		case 0:
 			b.destroy(name)
 			if lerr != nil {
-				return RunIdentity{}, fmt.Errorf("msb exec -d failed: %v: %s", lerr, strings.TrimSpace(string(lout)))
+				return RunIdentity{}, fmt.Errorf("%w: msb exec -d failed: %v: %s", ErrDispatchRefused, lerr, strings.TrimSpace(string(lout)))
 			}
-			return RunIdentity{}, fmt.Errorf("msb exec -d named no job and the sandbox records none: %s", strings.TrimSpace(string(lout)))
+			return RunIdentity{}, fmt.Errorf("%w: msb exec -d named no job and the sandbox records none: %s", ErrDispatchRefused, strings.TrimSpace(string(lout)))
 		default:
 			return identity, fmt.Errorf("%w: sandbox %s records %d jobs matching the authorized command — an operator must reconcile them",
 				ErrAmbiguousDispatch, name, len(matched))
@@ -884,6 +934,25 @@ func (b *MSBBackend) Resume(ctx context.Context, job *JobContractV2, run RunIden
 	if run.BootID != "" && currentBoot != run.BootID {
 		return run, nil, fmt.Errorf("%w: sandbox %s is boot generation %s, not the dispatch's %s — refusing to adopt a substituted VM instance",
 			ErrExecutionUnobserved, run.Handle, currentBoot, run.BootID)
+	}
+	// Authorization, not command matching: the VM must still match the
+	// policy the dispatch was authorized under — the same handle, the
+	// same dispatch nonce, the same operator configuration — and its
+	// booted configuration must still equal that policy. A VM whose
+	// policy cannot be proven is never adopted, whatever its name or
+	// command says.
+	if run.PolicyDigest != "" {
+		policy, digest, perr := b.policyFor(ctx, job, run.Handle, run.Nonce)
+		if perr != nil {
+			return run, nil, fmt.Errorf("%w: cannot recompute the dispatch's policy to authorize recovery: %v", ErrExecutionUnobserved, perr)
+		}
+		if digest != run.PolicyDigest {
+			return run, nil, fmt.Errorf("%w: sandbox %s would run under policy %s, not the dispatch's approved %s — refusing to adopt it (the operator configuration changed, or the authorization was rewritten)",
+				ErrExecutionUnobserved, run.Handle, digest, run.PolicyDigest)
+		}
+		if verr := verifyBootedPolicy(policy, doc); verr != nil {
+			return run, nil, fmt.Errorf("%w: sandbox %s no longer matches its approved policy: %v", ErrExecutionUnobserved, run.Handle, verr)
+		}
 	}
 	if run.RunID == "" {
 		jobs, err := b.listJobs(ctx, run.Handle)

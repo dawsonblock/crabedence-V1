@@ -57,9 +57,14 @@ type EffectivePolicyV1 struct {
 	Workdir string  `json:"workdir,omitempty"`
 	Mounts  []Mount `json:"mounts,omitempty"`
 
-	CPUs            float64 `json:"cpus,omitempty"`
-	MemoryMB        uint64  `json:"memory_mb,omitempty"`
-	DiskMB          uint64  `json:"disk_mb,omitempty"`
+	CPUs     float64 `json:"cpus,omitempty"`
+	MemoryMB uint64  `json:"memory_mb,omitempty"`
+	DiskMB   uint64  `json:"disk_mb,omitempty"`
+	// MaxCPUs / MaxMemoryMB are the ceilings the runtime must boot
+	// with: no headroom beyond the authorized budget, so a VM cannot
+	// burst past what the contract and the pool accounted for.
+	MaxCPUs         float64 `json:"max_cpus,omitempty"`
+	MaxMemoryMB     uint64  `json:"max_memory_mb,omitempty"`
 	Pids            uint32  `json:"pids,omitempty"`
 	TimeoutSeconds  uint32  `json:"timeout_seconds"`
 	MaxDurationSecs uint32  `json:"max_duration_secs"`
@@ -126,6 +131,8 @@ func (b *MSBBackend) buildEffectivePolicy(job *JobContractV2, name, nonce string
 		Mounts:                mounts,
 		CPUs:                  job.Resources.CPUs,
 		MemoryMB:              job.Resources.MemoryMB,
+		MaxCPUs:               job.Resources.CPUs,
+		MaxMemoryMB:           job.Resources.MemoryMB,
 		DiskMB:                job.Resources.DiskMB,
 		Pids:                  job.Resources.Pids,
 		TimeoutSeconds:        job.Resources.TimeoutSeconds,
@@ -299,10 +306,19 @@ func verifyBootedConfig(p *EffectivePolicyV1, cfg map[string]any) error {
 		if got, ok := jsonNumber(res, "cpus"); !ok || got != p.CPUs {
 			return fmt.Errorf("sandbox cpus = %v, policy authorized %g", got, p.CPUs)
 		}
+		// The ceiling must equal the authorized budget: headroom above
+		// it would let the guest consume more than the policy (and the
+		// aggregate pool) accounted for.
+		if got, ok := jsonNumber(res, "max_cpus"); !ok || got != p.MaxCPUs {
+			return fmt.Errorf("sandbox max_cpus = %v, policy authorized %g", got, p.MaxCPUs)
+		}
 	}
 	if p.MemoryMB > 0 {
 		if got, ok := jsonNumber(res, "memory_mib"); !ok || uint64(got) != p.MemoryMB {
 			return fmt.Errorf("sandbox memory_mib = %v, policy authorized %d", got, p.MemoryMB)
+		}
+		if got, ok := jsonNumber(res, "max_memory_mib"); !ok || uint64(got) != p.MaxMemoryMB {
+			return fmt.Errorf("sandbox max_memory_mib = %v, policy authorized %d", got, p.MaxMemoryMB)
 		}
 	}
 	if p.DiskMB > 0 {
@@ -317,10 +333,19 @@ func verifyBootedConfig(p *EffectivePolicyV1, cfg map[string]any) error {
 	if got, ok := jsonNumber(lc, "max_duration_secs"); !ok || uint32(got) != p.MaxDurationSecs {
 		return fmt.Errorf("sandbox max_duration_secs = %v, policy authorized %d", got, p.MaxDurationSecs)
 	}
-	if p.Workdir != "" {
-		if got := jsonString(rt, "workdir"); got != p.Workdir {
-			return fmt.Errorf("sandbox workdir %q does not match the authorized %q", got, p.Workdir)
-		}
+	// Lifecycle completeness: an ephemeral or idle-reaped sandbox is a
+	// lifecycle the policy did not authorize (an idle reaper can
+	// destroy the VM mid-job).
+	if ephemeral, _ := lc["ephemeral"].(bool); ephemeral {
+		return fmt.Errorf("sandbox lifecycle is ephemeral, which the policy did not authorize")
+	}
+	if idle, present := lc["idle_timeout_secs"]; present && idle != nil {
+		return fmt.Errorf("sandbox carries an idle timeout (%v) the policy did not authorize", idle)
+	}
+	// The workdir is compared exactly, including the unset case: a VM
+	// that boots into a directory nobody authorized is a refusal.
+	if got := jsonString(rt, "workdir"); got != p.Workdir {
+		return fmt.Errorf("sandbox workdir %q does not match the authorized %q", got, p.Workdir)
 	}
 	if err := verifyBootedNetwork(p, cfg); err != nil {
 		return err

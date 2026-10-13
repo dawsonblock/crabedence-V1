@@ -13,6 +13,14 @@ import (
 // stalled submission.
 var ErrAmbiguousDispatch = errors.New("dispatch outcome uncertain — the job may already be running")
 
+// ErrDispatchRefused marks a dispatch that definitively launched
+// nothing: the runtime refused before any workload started. Only this
+// class may produce a NO_EFFECT claim — a NO_EFFECT receipt asserts
+// that nothing executed, and the executor may only assert that when it
+// can prove it. Every other dispatch error is uncertain by default, so
+// a post-launch failure can never be recorded as a refusal.
+var ErrDispatchRefused = errors.New("dispatch refused before launch — nothing executed")
+
 // ErrExecutionUnobserved is returned when the backend cannot
 // demonstrate how the workload ended — a lost runtime, a vanished
 // sandbox, or an observation deadline that expired. The job stays
@@ -32,6 +40,37 @@ type RunIdentity struct {
 	RunID        string
 	BootID       string
 	PolicyDigest string
+	// Nonce is the per-dispatch authorization nonce the VM carries as
+	// its dispatch label. Recovery admits a discovered VM only when it
+	// presents this exact nonce — a matching command or sandbox name
+	// alone never authorizes adoption.
+	Nonce string
+}
+
+// DispatchPlan is the dispatch identity computed BEFORE any VM exists:
+// the deterministic handle, the per-dispatch nonce, the canonical
+// policy and its digest, the authorized image digest, and the
+// qualified runtime identity the launch will be made under.
+//
+// The caller persists the plan before the backend creates anything, so
+// a crash can never leave a VM whose authorization is not on disk, and
+// recovery validates a discovered VM against the stored plan instead of
+// reconstructing authority from a matching command.
+type DispatchPlan struct {
+	Handle                string
+	Nonce                 string
+	Policy                *EffectivePolicyV1
+	PolicyDigest          string
+	ImageDigest           string
+	RuntimeVersion        string
+	RuntimeMSBSHA256      string
+	RuntimeFirmwareSHA256 string
+}
+
+// Identity renders the plan's execution identity (without a run id or
+// boot generation — those exist only after the launch).
+func (p *DispatchPlan) Identity() RunIdentity {
+	return RunIdentity{Handle: p.Handle, PolicyDigest: p.PolicyDigest, Nonce: p.Nonce}
 }
 
 // Backend is where an authorized, persisted job goes for execution.
@@ -49,16 +88,25 @@ type Backend interface {
 	// binds who ran the job, not just what ran.
 	Name() string
 
-	// Dispatch starts the job and returns the backend's execution
-	// identity for it: the handle, the runtime-owned run identity and
-	// boot generation when the backend has them, and the digest of
-	// the effective policy the launch was verified against. Returned
-	// errors classify as:
+	// Prepare computes the dispatch identity — handle, nonce, canonical
+	// policy and digest, image digest, runtime identity — without
+	// creating anything. The caller persists it before Dispatch, so the
+	// authorization on disk always precedes the VM it authorizes.
+	Prepare(ctx context.Context, job *JobContractV2) (*DispatchPlan, error)
+
+	// Dispatch starts the job under the plan's identity and returns the
+	// backend's execution identity for it. A nil plan means the caller
+	// did not pre-persist one (tests, record-only flows); the backend
+	// then prepares internally. Returned errors classify as:
 	//   nil           — launched, identity valid
-	//   ErrAmbiguousDispatch (wrapped) — outcome unknown; the handle,
-	//                   if also returned, may be live
-	//   other error   — definitive refusal, nothing launched
-	Dispatch(ctx context.Context, job *JobContractV2) (RunIdentity, error)
+	//   ErrDispatchRefused (wrapped) — definitively nothing launched;
+	//                   the only class that may produce a NO_EFFECT
+	//                   claim
+	//   ErrAmbiguousDispatch (wrapped) — the workload may have started;
+	//                   never a no-effect claim, never retried blind
+	//   other error   — unclassified; callers must treat it as
+	//                   uncertain (fail closed), never as a refusal
+	Dispatch(ctx context.Context, job *JobContractV2, plan *DispatchPlan) (RunIdentity, error)
 
 	// Wait observes the job until it demonstrably finished or ctx is
 	// canceled, then captures its bounded output artifact and reports

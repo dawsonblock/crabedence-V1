@@ -98,11 +98,20 @@ type LedgerJob struct {
 	// PolicyDigest is the digest of the effective policy the run was
 	// authorized under.
 	PolicyDigest string
-	ReceivedAt   time.Time
-	UpdatedAt    time.Time
-	ExitCode     *int64
-	Error        string
-	ResultJSON   string
+	// DispatchNonce is the per-dispatch authorization nonce, carried on
+	// the VM as its dispatch label: recovery admits a discovered VM
+	// only when it presents this exact nonce.
+	DispatchNonce string
+	// ImageDigest is the image manifest digest the dispatch authorized.
+	ImageDigest string
+	// RuntimeIdentity is the qualified runtime identity (version and
+	// component digests) the dispatch was made under.
+	RuntimeIdentity string
+	ReceivedAt      time.Time
+	UpdatedAt       time.Time
+	ExitCode        *int64
+	Error           string
+	ResultJSON      string
 	// TerminalSeq is the job's position in the durable terminal
 	// enumeration — assigned transactionally with the terminal write
 	// so the enumeration checkpoints commit to is append-only by
@@ -222,7 +231,7 @@ func (l *Ledger) Epoch() uint64 { return l.epoch }
 // ledgers (from the admission-only spike) get their new columns via
 // ALTER TABLE rather than a destructive rebuild, and v3 adds the
 // runtime run identity plus cleanup tracking.
-const ledgerSchemaVersion = 4
+const ledgerSchemaVersion = 5
 
 func (l *Ledger) migrate() error {
 	var version int
@@ -249,6 +258,9 @@ func (l *Ledger) migrate() error {
 			backend_job_id TEXT NOT NULL DEFAULT '',
 			backend_boot_id TEXT NOT NULL DEFAULT '',
 			policy_digest  TEXT NOT NULL DEFAULT '',
+			dispatch_nonce TEXT NOT NULL DEFAULT '',
+			image_digest   TEXT NOT NULL DEFAULT '',
+			runtime_identity TEXT NOT NULL DEFAULT '',
 			received_at    INTEGER NOT NULL,
 			updated_at     INTEGER NOT NULL,
 			exit_code      INTEGER,
@@ -305,6 +317,21 @@ func (l *Ledger) migrate() error {
 		} {
 			if _, err := l.db.Exec(ddl); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 				return fmt.Errorf("migrate ledger v%d→v4: %w", version, err)
+			}
+		}
+	}
+	if version < 5 {
+		// v4 → v5: the dispatch authorization — the nonce, image digest
+		// and qualified runtime identity persisted before any VM exists.
+		// Existing rows keep empty values; their unresolved state
+		// already says their authorization was not recorded.
+		for _, ddl := range []string{
+			`ALTER TABLE jobs ADD COLUMN dispatch_nonce TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE jobs ADD COLUMN image_digest TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE jobs ADD COLUMN runtime_identity TEXT NOT NULL DEFAULT ''`,
+		} {
+			if _, err := l.db.Exec(ddl); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+				return fmt.Errorf("migrate ledger v%d→v5: %w", version, err)
 			}
 		}
 	}
@@ -468,6 +495,7 @@ func (l *Ledger) hashExistsTx(tx *sql.Tx, hash string) bool {
 // jobColumns is the canonical SELECT list for a full jobs row.
 const jobColumns = `job_id, contract_hash, seq, submitter, principal, image, contract_json,
 	state, fence_epoch, backend_id, backend_handle, backend_job_id, backend_boot_id, policy_digest,
+	dispatch_nonce, image_digest, runtime_identity,
 	received_at, updated_at,
 	exit_code, error, result_json, terminal_seq, receipt_sha256, artifact_sha256,
 	cleanup_pending, cleanup_error`
@@ -490,6 +518,7 @@ func scanFields(j *LedgerJob) []any {
 		&j.JobID, &j.ContractHash, &j.Seq, &j.Submitter, &j.Principal, &j.Image,
 		&j.ContractJSON, &j.State, &j.FenceEpoch, &j.BackendID, &j.BackendHandle,
 		&j.BackendJobID, &j.BackendBootID, &j.PolicyDigest,
+		&j.DispatchNonce, &j.ImageDigest, &j.RuntimeIdentity,
 		&j.receivedAtRaw, &j.updatedAtRaw, &j.exitRaw, &j.Error, &j.ResultJSON,
 		&j.termSeqRaw, &j.ReceiptSHA256, &j.ArtifactSHA256,
 		&j.cleanupPendingRaw, &j.CleanupError,
@@ -556,6 +585,37 @@ func (l *Ledger) ReconcileCandidates(limit int) ([]*LedgerJob, error) {
 		out = append(out, j)
 	}
 	return out, rows.Err()
+}
+
+// RecordDispatchPlan writes the dispatch authorization — the nonce,
+// the effective-policy digest, the image digest and the qualified
+// runtime identity — onto a non-terminal row. It is called before the
+// backend creates anything, so a crash can never leave a VM whose
+// authorization is not on disk. It never touches a terminal row.
+func (l *Ledger) RecordDispatchPlan(jobID, backendName string, plan *DispatchPlan) error {
+	if plan == nil {
+		return fmt.Errorf("record dispatch plan for %s: no plan", jobID)
+	}
+	if plan.Handle == "" || plan.Nonce == "" || plan.PolicyDigest == "" {
+		return fmt.Errorf("record dispatch plan for %s: incomplete plan", jobID)
+	}
+	runtimeIdentity := plan.RuntimeVersion
+	if plan.RuntimeMSBSHA256 != "" || plan.RuntimeFirmwareSHA256 != "" {
+		runtimeIdentity = fmt.Sprintf("%s msb=%s firmware=%s",
+			plan.RuntimeVersion, plan.RuntimeMSBSHA256, plan.RuntimeFirmwareSHA256)
+	}
+	res, err := l.db.Exec(
+		`UPDATE jobs SET backend_id = ?, backend_handle = ?, dispatch_nonce = ?, policy_digest = ?,
+		 image_digest = ?, runtime_identity = ? WHERE job_id = ? AND terminal_seq IS NULL`,
+		backendName, plan.Handle, plan.Nonce, plan.PolicyDigest,
+		plan.ImageDigest, runtimeIdentity, jobID)
+	if err != nil {
+		return fmt.Errorf("record dispatch plan for %s: %w", jobID, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("record dispatch plan for %s: no non-terminal row", jobID)
+	}
+	return nil
 }
 
 // AdoptBackendRun records the runtime-owned run identity and boot
@@ -813,12 +873,14 @@ func (l *Ledger) Transition(jobID, to string, from []string, mutate func(*Ledger
 	res, err := tx.Exec(
 		`UPDATE jobs SET state = ?, fence_epoch = ?, backend_id = ?, backend_handle = ?,
 		 backend_job_id = ?, backend_boot_id = ?, policy_digest = ?,
+		 dispatch_nonce = ?, image_digest = ?, runtime_identity = ?,
 		 updated_at = ?, exit_code = ?, error = ?, result_json = ?,
 		 terminal_seq = ?, receipt_sha256 = ?, artifact_sha256 = ?,
 		 cleanup_pending = ?, cleanup_error = ?
 		 WHERE job_id = ? AND seq = ?`,
 		job.State, job.FenceEpoch, job.BackendID, job.BackendHandle,
 		job.BackendJobID, job.BackendBootID, job.PolicyDigest,
+		job.DispatchNonce, job.ImageDigest, job.RuntimeIdentity,
 		time.Now().UTC().UnixMilli(), exit, job.Error, job.ResultJSON,
 		termSeq, job.ReceiptSHA256, job.ArtifactSHA256,
 		cleanupPending, job.CleanupError,
