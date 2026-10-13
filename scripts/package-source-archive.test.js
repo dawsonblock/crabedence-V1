@@ -81,9 +81,9 @@ function makeRepo(t, { runtime = false } = {}) {
   return { root, git };
 }
 
-function pack(root, args) {
+function pack(root, args, overlay = {}) {
   const packager = path.join(root, "scripts", "package-source-archive.sh");
-  const env = { ...process.env };
+  const env = { ...process.env, ...overlay };
   const bin = digestTool();
   if (bin) env.NEMO_RUNTIME_DIGEST_BIN = bin;
   return spawnSync("bash", [packager, ...args], { cwd: root, encoding: "utf8", env });
@@ -117,6 +117,40 @@ test("the packager preserves symlinks, exec bits, and smudged worktree bytes", {
     "the packaged bytes are the CRLF worktree bytes, not the normalized blob",
   );
   assert.ok(fs.existsSync(`${archive}.sha256`), "the archive carries a sha256 sidecar");
+});
+
+// The packager must select the GNU tar format explicitly, spelled the way
+// the system tar accepts: GNU tar calls it `gnu`, libarchive `gnutar`.
+// pax writers normalize non-ASCII names (NFC -> NFD), which would make an
+// archived path differ from its tracked name and fail manifest
+// verification — so the selection is asserted through a logging tar shim
+// rather than assumed.
+test("tar packaging selects the implementation's GNU format", { skip: !prerequisites && skipReason }, (t) => {
+  const { root } = makeRepo(t);
+  const out = outDir(t);
+  const wrapperDir = path.join(out, "bin");
+  const tarLog = path.join(out, "tar-args.log");
+  fs.mkdirSync(wrapperDir);
+  const systemTar = execFileSync("which", ["tar"], { encoding: "utf8" }).trim();
+  const wrapper = path.join(wrapperDir, "tar");
+  fs.writeFileSync(
+    wrapper,
+    `#!/bin/sh\nprintf '%s\\n' "$*" >> "$TAR_ARGS_LOG"\nexec ${JSON.stringify(systemTar)} "$@"\n`,
+  );
+  fs.chmodSync(wrapper, 0o755);
+
+  const archive = path.join(out, "fixture.tar.gz");
+  const r = pack(root, ["--format", "tar.gz", "--prefix", "fixture", "-o", archive], {
+    PATH: `${wrapperDir}${path.delimiter}${process.env.PATH}`,
+    TAR_ARGS_LOG: tarLog,
+  });
+  assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+
+  const gnuTar = execFileSync(systemTar, ["--version"], { encoding: "utf8" }).includes("GNU tar");
+  const expected = gnuTar ? "--format=gnu" : "--format=gnutar";
+  const calls = fs.readFileSync(tarLog, "utf8").trim().split("\n");
+  assert.ok(calls.some((args) => args.includes(expected)), `the tar stream explicitly selects ${expected}`);
+  execFileSync(systemTar, ["-tzf", archive]);
 });
 
 test("a modified tracked file refuses packaging unless --allow-dirty", { skip: !prerequisites && skipReason }, (t) => {
