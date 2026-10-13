@@ -307,6 +307,19 @@ run_gate go-race-evidence TEST go test -v -race -count=1 -timeout=120s \
 run_gate go-race-providers TEST go test -v -race -count=1 -timeout=120s \
   ./internal/providers/tart/ ./internal/providers/lume/ ./internal/providers/shared/
 
+# The sandbox executor is its own lane. It is the component that boots
+# untrusted code, and its race suite is the only thing that exercises the
+# policy, dispatch and recovery paths under concurrency — including the
+# hard-crash qualification that SIGKILLs the daemon mid-job. Folding it
+# into a general Go gate would hide a regression in the one package whose
+# failure mode is executing something nobody authorized. The live
+# microVM lane is deliberately NOT here: it needs a host that can boot
+# microVMs, so it runs as its own env-gated lane
+# (`crabbox job run live-microvm`), never as a gate that would skip on a
+# runner without virtualization and be recorded as a pass.
+run_gate go-race-sandboxexecutor TEST go test -v -race -count=1 -timeout=1200s \
+  ./internal/sandboxexecutor/
+
 # ─── Effect Fabric contract gates ────────────────────────────────────────────
 # Dedicated gates for the durable execution contract. These are NOT
 # hidden inside the general Go test gates — they are first-class
@@ -905,7 +918,7 @@ extract_tests_executed() {
       f=$(grep -oE '^tests_failed=[0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$' || true)
       count=$((${p:-0} + ${f:-0}))
       ;;
-    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-cli|effect-fabric-contract|effect-fabric-reconciliation|effect-fabric-evidence|effect-fabric-race|authority-postgres|provider-github-real-api|critical-external|critical-faults|effect-fabric-post-dispatch-timeout)
+    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-sandboxexecutor|go-race-cli|effect-fabric-contract|effect-fabric-reconciliation|effect-fabric-evidence|effect-fabric-race|authority-postgres|provider-github-real-api|critical-external|critical-faults|effect-fabric-post-dispatch-timeout)
       # Go test with -v prints one line per test:
       #   --- PASS: TestName (0.00s)
       #   --- FAIL: TestName (0.00s)
@@ -988,7 +1001,7 @@ extract_tests_skipped() {
       count=$(grep -oE '^tests_skipped=[0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$' || true)
       count=${count:-0}
       ;;
-    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-cli|effect-fabric-contract|effect-fabric-reconciliation|effect-fabric-evidence|effect-fabric-race|authority-postgres|provider-github-real-api|critical-external|critical-faults|cross-language-conformance|effect-fabric-post-dispatch-timeout)
+    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-sandboxexecutor|go-race-cli|effect-fabric-contract|effect-fabric-reconciliation|effect-fabric-evidence|effect-fabric-race|authority-postgres|provider-github-real-api|critical-external|critical-faults|cross-language-conformance|effect-fabric-post-dispatch-timeout)
       count=$(grep -cE '^\s*--- SKIP:' "$log" 2>/dev/null || true)
       ;;
     worker-tests|nemo-tests)
@@ -1051,7 +1064,7 @@ extract_tests_failed() {
         count=$(jq '[.testResults[].assertionResults[] | select(.status == "failed")] | length' "$json_summary" 2>/dev/null || true)
       fi
       ;;
-    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-cli|effect-fabric-contract|effect-fabric-reconciliation|effect-fabric-evidence|effect-fabric-race|authority-postgres|provider-github-real-api|critical-external|critical-faults|cross-language-conformance|effect-fabric-post-dispatch-timeout)
+    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-sandboxexecutor|go-race-cli|effect-fabric-contract|effect-fabric-reconciliation|effect-fabric-evidence|effect-fabric-race|authority-postgres|provider-github-real-api|critical-external|critical-faults|cross-language-conformance|effect-fabric-post-dispatch-timeout)
       count=$(grep -cE '^\s*--- FAIL:' "$log" 2>/dev/null || true)
       ;;
     worker-tests|nemo-tests)
