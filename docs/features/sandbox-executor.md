@@ -180,6 +180,31 @@ cleanup intent, the sandbox removal runs after, and a failure is recorded as
 failure never rewrites the observed result, and the VM's own contract bound is
 the backstop.
 
+## Platform qualification
+
+Microsandbox runs on two independent virtualization implementations, and
+evidence from one never qualifies the other:
+
+| Lane | Host | Prerequisite | Proves |
+| --- | --- | --- | --- |
+| `apple-hypervisor-framework` | Apple Silicon (`darwin/arm64`) | `sysctl -n kern.hv_support` is `1` | policy enforcement, isolation, artifacts and recovery on HVF |
+| `linux-kvm` | Linux (`arm64` or `x86-64`) | `/dev/kvm` present | the same properties on KVM |
+
+- `TestMSBLivePlatformIdentity` names the lane a host provides and is
+  deliberately ungated: the lane belongs in every qualification record.
+- `TestMSBLiveLinuxKVM` is the Linux lane's entry point — it runs the real
+  microVM suite on a Linux host with KVM and skips as **unsupported**
+  everywhere else. A release that claims Linux support requires this lane's
+  own passing evidence; a macOS HVF pass is not Linux evidence, and a Linux
+  KVM lane is never "failed" because it ran on a Mac.
+- The executor refuses an unsupported host on its own: startup runs the
+  runtime's prerequisite check (`msb doctor`), so a host with neither HVF nor
+  KVM cannot execute anything.
+- **Two runners**: keep the Mac as the primary development and HVF
+  qualification machine, and add a dedicated Linux KVM runner. The repo-local
+  job takes the host explicitly, e.g.
+  `crabbox job run live-microvm --provider ssh --static-host <kvm-host>`.
+
 ## Qualification and boundaries
 
 - `CRABBOX_MSB_LIVE=1 go test -race -timeout=900s -run 'TestMSBLive' ./internal/sandboxexecutor/`

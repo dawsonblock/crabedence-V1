@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -84,6 +85,11 @@ func liveImageDigest(t *testing.T, bin string) string {
 func verifyLiveBackend(t *testing.T, backend *MSBBackend) {
 	t.Helper()
 	ctx := context.Background()
+	if osName, arch, lane, supported := liveLane(t); supported {
+		t.Logf("qualifying the %s lane on %s/%s", lane, osName, arch)
+	} else {
+		t.Fatalf("no supported virtualization lane on %s/%s", osName, arch)
+	}
 	if backend.RuntimeManifest == nil {
 		backend.RuntimeManifest = liveRuntimeManifest(t, backend)
 	}
@@ -899,4 +905,69 @@ func TestMSBLiveSubstitutedVMIsNeverAdopted(t *testing.T) {
 	if final.BackendBootID != row.BackendBootID {
 		t.Fatalf("the recorded boot generation changed: %q → %q", row.BackendBootID, final.BackendBootID)
 	}
+}
+
+// liveLane names the virtualization lane a host provides. Microsandbox
+// runs on Apple's Hypervisor Framework under macOS and on Linux KVM
+// under Linux: the two are independent implementations, and evidence
+// from one never qualifies the other. laneSupported is false when the
+// host's prerequisite is absent — that is an *unsupported* host for
+// this lane, never a failed test.
+func liveLane(t *testing.T) (osName, arch, lane string, laneSupported bool) {
+	t.Helper()
+	osName, arch = runtime.GOOS, runtime.GOARCH
+	switch osName {
+	case "darwin":
+		lane = "apple-hypervisor-framework"
+		out, err := exec.Command("sysctl", "-n", "kern.hv_support").Output()
+		if err != nil {
+			return osName, arch, lane, false
+		}
+		return osName, arch, lane, strings.TrimSpace(string(out)) == "1"
+	case "linux":
+		lane = "linux-kvm"
+		if _, err := os.Stat("/dev/kvm"); err != nil {
+			return osName, arch, lane, false
+		}
+		return osName, arch, lane, true
+	default:
+		return osName, arch, "unsupported", false
+	}
+}
+
+// TestMSBLivePlatformIdentity pins which virtualization lane this host
+// qualifies. It is deliberately ungated by CRABBOX_MSB_LIVE: the lane
+// identity belongs in every qualification record, and a host whose lane
+// prerequisite is missing skips as unsupported rather than failing —
+// a Linux KVM lane is not "failed" because it ran on a Mac, and passing
+// Apple Hypervisor Framework tests never qualifies the KVM
+// implementation.
+func TestMSBLivePlatformIdentity(t *testing.T) {
+	osName, arch, lane, supported := liveLane(t)
+	if !supported {
+		t.Skipf("unsupported host for microVM qualification: %s/%s provides no %s lane", osName, arch, lane)
+	}
+	t.Logf("microVM qualification lane: %s (%s/%s)", lane, osName, arch)
+	// The runtime's own prerequisite check is the authority for the
+	// lane being usable at all; the executor refuses a host it rejects.
+	bin := msbOrSkip(t)
+	backend := &MSBBackend{Bin: bin, StateDir: t.TempDir()}
+	if _, err := backend.VerifyHost(context.Background()); err != nil {
+		t.Fatalf("%s lane is present but the runtime rejects the host: %v", lane, err)
+	}
+}
+
+// TestMSBLiveLinuxKVM is the Linux-lane qualification entry point: it
+// runs the real microVM suite on a Linux host with KVM and skips as
+// unsupported everywhere else. A release that claims Linux support
+// requires this lane's own evidence.
+func TestMSBLiveLinuxKVM(t *testing.T) {
+	osName, arch, lane, supported := liveLane(t)
+	if osName != "linux" || !supported {
+		t.Skipf("Linux KVM qualification requires a Linux host with KVM: this is %s/%s (lane %s)", osName, arch, lane)
+	}
+	bin := msbOrSkip(t)
+	backend := &MSBBackend{Bin: bin, StateDir: t.TempDir()}
+	verifyLiveBackend(t, backend)
+	t.Logf("Linux KVM lane qualified on %s/%s", osName, arch)
 }

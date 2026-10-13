@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Sandbox executor platform qualification (rc.7): the live suite now names and records the virtualization lane it ran in — `apple-hypervisor-framework` on Apple Silicon, `linux-kvm` on Linux. `TestMSBLivePlatformIdentity` is deliberately ungated so every qualification record carries the lane, and `TestMSBLiveLinuxKVM` is the Linux lane's entry point, skipping as *unsupported* (never failed) off Linux. HVF evidence never qualifies the KVM implementation and vice versa: a release claiming Linux support requires the Linux lane's own passing evidence, and the executor refuses a host its runtime's prerequisite check rejects.
+
 - Sandbox executor typed dispatch outcomes (rc.7, F-040): the classification is now a first-class vocabulary — `DispatchClass` with `NOT_ATTEMPTED`, `PROVEN_REJECTED`, `STARTED` and `UNCERTAIN` — recorded on the ledger row (schema v6) so evidence rules and operators read the outcome class rather than inferring it from an error's shape. `ClassifyDispatchError` fails closed: only a proven pre-launch refusal is `PROVEN_REJECTED`, and anything unclassified is `UNCERTAIN`. A job that may have started cannot produce a NO_EFFECT receipt.
 
 - Sandbox executor closed-policy verification (rc.7, F-039 completion): the effective policy now pins the runtime's execution defaults — the command shell, and the pinned image's own command, entrypoint, user and working directory — and verification requires the booted VM to match them exactly, so nothing about how the guest starts is left to a runtime or image default nobody authorized. Public networking pins its exact ingress default, and a booted environment carrying duplicate keys for one variable refuses.
