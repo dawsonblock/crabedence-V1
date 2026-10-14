@@ -35,8 +35,13 @@ that policy exactly, in both the persisted `config` and the resolved
   authorized cpus, memory and disk, and no headroom above the budget the
   contract and the aggregate pool accounted for — plus the VM's own
   `--max-duration` (contract timeout plus the fixed observation grace), a
-  lifecycle that is neither ephemeral nor idle-reaped, the workdir and the
-  authorized mounts (including read-only intent);
+  lifecycle that is neither ephemeral nor idle-reaped, and the workdir;
+- the authorized mounts, including read-only intent in both directions, every
+  **hardening option the contract declared** (`nodev`, `nosuid`, `noexec` — a
+  silently dropped one boots a mount nobody authorized), and the renderings that
+  decide what the guest can observe about the host: **host permissions** and
+  **file-stat virtualization** must be the confined values, and a mount must not
+  follow host root symlinks;
 - the network policy rule-for-rule, with no interface bindings or published
   ports;
 - the absence of initialization hooks, rootfs patches, runtime script bindings
@@ -63,6 +68,14 @@ host channel is reachability, and a host local-IPC endpoint, that the policy
 never authorizes. The `msb create` command is derived from the compiled policy
 alone, so no operator-supplied flag can add a setting the verification does not
 cover.
+
+Every field the schema admits has a stated disposition, so "not checked" is a
+decision a reviewer can challenge rather than a gap: a field is either verified
+against the policy, or recorded as deliberately unpinned with the reason it is
+not a policy dimension (a field that only reports on something already verified,
+or one that narrows rather than widens). Fields whose reason stops holding
+belong in verification instead — the mount hardening options and the
+host-identity renderings were exactly that, and moved.
 
 **Runtime identity.** A qualified runtime manifest (JSON with `version`,
 `msb_sha256`, `libkrunfw_sha256` and an optional `components` map) is required.

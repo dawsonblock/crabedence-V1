@@ -451,6 +451,47 @@ var openFields = map[string]bool{
 	"network.ports":     true,
 }
 
+// bootedInertFields are schema fields the closure admits but
+// verification deliberately does not pin, each with the reason it is
+// not a policy dimension.
+//
+// The map exists so that "not checked" is always a decision someone
+// made and a reviewer can challenge, never a field that quietly fell
+// through the gap between the closure and the checks. Every field the
+// pinned runtime emits is therefore either verified against the policy
+// or recorded here; adding a field to the schema means choosing one.
+// The reasons are the argument for the choice, not a substitute for it,
+// and a field whose reason stops holding belongs in verification
+// instead.
+var bootedInertFields = map[string]string{
+	// Fields that only report on, or harden, something already
+	// verified.
+	"image.Oci.reference":                 "the reference the runtime resolved; the booted digest is verified against the authorized manifest_digest, which is the identity that matters",
+	"mounts[].quota_mib":                  "a host-side size cap on the mount, which narrows it rather than widening it",
+	"mounts[].options.nodev":              "a mount hardening flag: set, it narrows what the mount can do",
+	"mounts[].options.noexec":             "a mount hardening flag: set, it narrows what the mount can do",
+	"mounts[].options.nosuid":             "a mount hardening flag: set, it narrows what the mount can do",
+	"network.enabled":                     "whether the runtime's network stack is up; the guest's reachability is decided rule-for-rule by the policy, which verification checks",
+	"network.max_connections":             "a host-side concurrency bound on the runtime's own connection tracking, not a guest capability",
+	"network.nat64_prefixes":              "the translation prefix the host assigns; reachability is still decided by the rules",
+	"network.dns.query_timeout_ms":        "a timeout on the runtime's own resolver; the nameserver override is verified separately and refuses",
+	"network.dns.rebind_protection":       "the runtime's resolver hardening, which narrows resolution rather than widening it",
+	"network.http.deny_response":          "renders the response the runtime returns for a request the rules already deny; it changes no reachability",
+	"network.secrets.violation_action":    "the action taken for a secret violation; the secrets themselves are verified and must be empty",
+	"runtime.log_level":                   "the guest runtime's own log verbosity; it grants no capability and the record is carried verbatim in evidence",
+	"runtime.metrics_sample_interval_ms":  "the runtime's own metrics cadence; it grants no capability",
+	"runtime.disable_metrics_sample":      "the runtime's own metrics toggle; it grants no capability",
+	"network.tls.block_quic_on_intercept": "only meaningful when interception is enabled, and enabling interception refuses",
+	"network.tls.bypass":                  "an interception bypass list, only meaningful when interception is enabled",
+	"network.tls.cache":                   "the interception cache, only meaningful when interception is enabled",
+	"network.tls.cache.capacity":          "the interception cache's size, only meaningful when interception is enabled",
+	"network.tls.cache.validity_hours":    "the interception cache's lifetime, only meaningful when interception is enabled",
+	"network.tls.intercepted_ports":       "the interception port set, only meaningful when interception is enabled",
+	"network.tls.verify_upstream":         "upstream certificate verification, only meaningful when interception is enabled",
+	"network.tls.scoped_upstream_ca_cert": "a scoped upstream trust anchor, only meaningful when interception is enabled",
+	"network.tls.scoped_verify_upstream":  "a scoped upstream verification toggle, only meaningful when interception is enabled",
+}
+
 // verifyNoHostChannels refuses a VM carrying any guest-to-host vsock
 // route. A host channel is reachability — and a host local-IPC
 // endpoint — the policy never authorized, so its presence refuses
@@ -858,6 +899,29 @@ func verifyBootedMounts(p *EffectivePolicyV1, cfg map[string]any) error {
 		if follow, _ := m["follow_root_symlinks"].(bool); follow {
 			return fmt.Errorf("sandbox mount %s follows host root symlinks, which the policy did not authorize",
 				jsonString(m, "guest"))
+		}
+		// Every hardening option the contract declared must be in
+		// force. An option that is silently dropped boots a mount
+		// nobody authorized — a setuid binary that was supposed to be
+		// neutered, or a device node that was supposed to be absent.
+		opts, _ := m["options"].(map[string]any)
+		for _, name := range declaredMountHardening(declared.Options) {
+			if on, _ := opts[name].(bool); !on {
+				return fmt.Errorf("sandbox mount %s is missing the declared %s option",
+					jsonString(m, "guest"), name)
+			}
+		}
+		// The mount must render host identity the confined way: the
+		// guest sees its own permission bits and its own file stats,
+		// never the host's. A mount rendered any other way lets the
+		// guest observe the host it is confined to.
+		if got := jsonString(m, "host_permissions"); got != mountHostPermissionsConfined {
+			return fmt.Errorf("sandbox mount %s renders host permissions as %q, not the confined %q",
+				jsonString(m, "guest"), got, mountHostPermissionsConfined)
+		}
+		if got := jsonString(m, "stat_virtualization"); got != mountStatVirtualizationStrict {
+			return fmt.Errorf("sandbox mount %s renders host file stats as %q, not the confined %q",
+				jsonString(m, "guest"), got, mountStatVirtualizationStrict)
 		}
 		delete(authorized, key)
 	}

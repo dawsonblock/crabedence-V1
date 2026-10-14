@@ -1431,4 +1431,31 @@ func mountReadOnly(options string) (value, declared bool) {
 	return false, false
 }
 
+// mountHostPermissionsConfined and mountStatVirtualizationStrict are
+// the renderings that keep host identity out of the guest: the guest
+// sees its own permission bits and its own file stats, never the
+// host's. They are qualified against the pinned runtime, and a mount
+// rendered any other way refuses rather than being assumed harmless.
+const (
+	mountHostPermissionsConfined  = "private"
+	mountStatVirtualizationStrict = "strict"
+)
+
+// declaredMountHardening lists the hardening options a contract's mount
+// declared, in msb's option spelling. Read-only intent is handled
+// separately — it is compared exactly, in both directions — so it is
+// not repeated here. Tokens the executor does not recognize are left
+// alone: the CLI refuses what it cannot honor, and the job refuses with
+// it.
+func declaredMountHardening(options string) []string {
+	out := []string{}
+	for _, tok := range strings.Split(options, ",") {
+		switch strings.TrimSpace(tok) {
+		case "nodev", "nosuid", "noexec":
+			out = append(out, strings.TrimSpace(tok))
+		}
+	}
+	return out
+}
+
 var _ Backend = (*MSBBackend)(nil)
