@@ -27,8 +27,10 @@ that policy exactly, in both the persisted `config` and the resolved
 - the guest environment — the contract's entries plus the pinned image's own
   config environment, with **nothing extra** and no duplicate keys;
 - the runtime's execution defaults — the command shell, and the pinned image's
-  own command, entrypoint, user and working directory — so nothing about how
-  the guest starts is left to a default nobody authorized;
+  own command, entrypoint, user and working directory — compared as **ordered
+  sequences**, because for a program the order *is* the meaning: `["/bin/sh",
+  "-c"]` and `["-c","/bin/sh"]` run different things, so a reordered hook
+  refuses rather than passing as an equivalent spelling;
 - resources and their **ceilings** — the runtime must boot with exactly the
   authorized cpus, memory and disk, and no headroom above the budget the
   contract and the aggregate pool accounted for — plus the VM's own
@@ -43,6 +45,16 @@ that policy exactly, in both the persisted `config` and the resolved
 - the dispatch identity labels that bind this VM to this contract.
 
 A mismatch destroys the VM before the guest command runs.
+
+The comparison is a **closure, not a checklist**. Every field the pinned
+runtime's resolved configuration carries must be one the policy was qualified
+against; a field the schema does not define refuses by name, so a capability the
+pinned runtime grows, or one a substituted runtime invents, can never ride along
+unverified. A **guest-to-host `vsock` route** refuses in its own right even when
+every other field matches exactly — a host channel is reachability, and a host
+local-IPC endpoint, that the policy never authorizes. The `msb create` command
+is derived from the compiled policy alone, so no operator-supplied flag can add
+a setting the verification does not cover.
 
 **Runtime identity.** A qualified runtime manifest (JSON with `version`,
 `msb_sha256`, `libkrunfw_sha256` and an optional `components` map) is required.
@@ -70,6 +82,14 @@ guest's code (0 = verified success, any other code = verified failure),
 code is invented), `failed` (the guest rejected the command before it started),
 `lost` or unreachable (unobserved). An unobserved outcome becomes
 `DISPATCH_AMBIGUOUS` with no receipt, and is never retried blind.
+
+A no-effect claim is only ever made from evidence, never from absence. The
+runtime durably records a spawn it rejected as a typed failure, so that is what
+proves the workload produced no effect; a launch that failed before the runtime
+admitted anything leaves no record at all, and an absent record is not proof
+that nothing executed — that outcome stays `DISPATCH_AMBIGUOUS`, its VM is left
+for reconciliation rather than destroyed under a workload that may be running,
+and no receipt is emitted.
 
 **Artifacts.** Captured output is read from the runtime's retained job log,
 bounded by the contract's `max_output_bytes`, and published durably: a private
@@ -169,16 +189,25 @@ executor re-inspects the discovered VM, recomputes the policy the dispatch was
 approved under (from the stored contract and the current operator
 configuration), requires the VM's booted configuration to still equal it, and
 requires the VM to present the dispatch's own nonce label and boot generation.
-A substituted instance, a rewritten nonce, a rewritten policy digest or a
-changed operator configuration all refuse; zero matches or several matches stay
-unresolved with a liveness audit. Nothing is ever re-dispatched and nothing is
-auto-destroyed — an uncertain launch leaves its VM for reconciliation.
+That proof is **mandatory**: a row carrying no persisted policy digest or nonce
+— a legacy row, or one whose authorization never reached disk — is never adopted
+from the runtime's record, because a matching command, or a sandbox found under
+the expected name, is not authority. Such a row stays unresolved for an
+operator. A substituted instance, a rewritten nonce, a rewritten policy digest
+or a changed operator configuration all refuse; zero matches or several matches
+stay unresolved with a liveness audit. The startup pass walks **every**
+unresolved row and every pending cleanup through a keyset cursor, so a candidate
+is never omitted for having fallen outside the newest page. Nothing is ever
+re-dispatched and nothing is auto-destroyed — an uncertain launch leaves its VM
+for reconciliation.
 
 Cleanup is tracked separately from the result: the terminal write records
 cleanup intent, the sandbox removal runs after, and a failure is recorded as
 `cleanup_pending` (with the reason) and retried at the next startup. A cleanup
 failure never rewrites the observed result, and the VM's own contract bound is
-the backstop.
+the backstop. Until that removal is verified the job **keeps its pool
+reservation**: the guest process finishing is not the microVM ceasing to exist,
+so capacity is released on verified cleanup rather than on workload completion.
 
 ## Platform qualification
 

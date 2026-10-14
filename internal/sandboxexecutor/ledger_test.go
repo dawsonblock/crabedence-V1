@@ -1,8 +1,10 @@
 package sandboxexecutor
 
 import (
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -294,6 +296,196 @@ func TestActiveUsageReleasesProvablyDeadVMs(t *testing.T) {
 		time.Now().Add(-time.Second).UnixMilli(), c.JobID)
 	if usage, _ := l.ActiveUsage(time.Hour); usage.VMs != 1 {
 		t.Fatalf("a VM inside the grace window was released: %+v", usage)
+	}
+}
+
+// TestActiveUsageHoldsCleanupPendingVMs: a completed workload may
+// still have a live microVM. The guest process finishing is not the VM
+// ceasing to exist, so a terminal row whose VM could not be removed
+// keeps its reservation until cleanup is verified — capacity is never
+// freed merely because the workload completed.
+func TestActiveUsageHoldsCleanupPendingVMs(t *testing.T) {
+	l, path := openLedger(t)
+	key, _ := testAuthority(t)
+	c := testContract(t, key, func(c *JobContractV2) {
+		c.JobID = "usage-cleanup"
+		c.Resources = ResourceBudget{TimeoutSeconds: 60, CPUs: 2, MemoryMB: 512, DiskMB: 1024, MaxOutputBytes: 4096}
+	})
+	raw, _ := json.Marshal(c)
+	if _, err := l.InsertJob(c.JobID, ContractHash(c), "s", "alice", c.Image, string(raw)); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Transition(c.JobID, JobStateDispatching, []string{JobStateRecorded}, nil); err != nil {
+		t.Fatalf("transition to dispatching: %v", err)
+	}
+	if err := l.Transition(c.JobID, JobStateRunning, []string{JobStateDispatching}, nil); err != nil {
+		t.Fatalf("transition to running: %v", err)
+	}
+
+	t.Run("terminal with cleanup verified releases", func(t *testing.T) {
+		if err := l.Transition(c.JobID, JobStateSucceeded, []string{JobStateRunning},
+			func(j *LedgerJob) error { j.ResultJSON = "{}"; return nil }); err != nil {
+			t.Fatal(err)
+		}
+		if usage, _ := l.ActiveUsage(time.Minute); usage.VMs != 0 || usage.CPUs != 0 {
+			t.Fatalf("a cleaned-up terminal job still reserves: %+v", usage)
+		}
+	})
+
+	t.Run("terminal with cleanup pending holds", func(t *testing.T) {
+		if err := l.MarkCleanupPending(c.JobID, "msb rm failed"); err != nil {
+			t.Fatal(err)
+		}
+		usage, err := l.ActiveUsage(time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if usage.VMs != 1 || usage.CPUs != 2 || usage.MemoryMB != 512 || usage.DiskMB != 1024 || usage.OutputBytes != 4096 {
+			t.Fatalf("a live microVM behind a terminal job lost its reservation: %+v", usage)
+		}
+		if usage.PerSubmitter["s"] != 1 {
+			t.Fatalf("per-submitter usage = %+v", usage.PerSubmitter)
+		}
+	})
+
+	t.Run("verified cleanup releases", func(t *testing.T) {
+		if err := l.ClearCleanupPending(c.JobID); err != nil {
+			t.Fatal(err)
+		}
+		if usage, _ := l.ActiveUsage(time.Minute); usage.VMs != 0 {
+			t.Fatalf("capacity was not released after verified cleanup: %+v", usage)
+		}
+	})
+
+	t.Run("a provably dead VM releases even while cleanup is pending", func(t *testing.T) {
+		if err := l.MarkCleanupPending(c.JobID, "msb rm failed"); err != nil {
+			t.Fatal(err)
+		}
+		if usage, _ := l.ActiveUsage(time.Minute); usage.VMs != 1 {
+			t.Fatalf("a pending cleanup was not reserved: %+v", usage)
+		}
+		// The VM cannot outlive its own contract timeout plus the
+		// grace, so once that has certainly elapsed the reservation
+		// stops consuming budget forever.
+		tamper(t, path, `UPDATE jobs SET updated_at = ? WHERE job_id = ?`,
+			time.Now().Add(-time.Hour).UnixMilli(), c.JobID)
+		if usage, _ := l.ActiveUsage(time.Minute); usage.VMs != 0 {
+			t.Fatalf("a provably dead VM still holds a reservation: %+v", usage)
+		}
+	})
+}
+
+// insertWalkJob records one job and moves it into `to` carrying a
+// backend handle, so it is a candidate for the startup recovery walk.
+func insertWalkJob(t *testing.T, l *Ledger, key ed25519.PrivateKey, id, to string) {
+	t.Helper()
+	c := testContract(t, key, func(c *JobContractV2) { c.JobID = id; c.Nonce = "n-" + id })
+	raw, err := json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.InsertJob(c.JobID, ContractHash(c), "s", "alice", c.Image, string(raw)); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Transition(c.JobID, to, []string{JobStateRecorded},
+		func(j *LedgerJob) error { j.BackendHandle = "sx-" + c.JobID; return nil }); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// walkCandidates follows a candidate query's keyset cursor to
+// exhaustion and reports how many times each row was returned.
+func walkCandidates(t *testing.T, page func(uint64) ([]*LedgerJob, error)) map[string]int {
+	t.Helper()
+	seen := map[string]int{}
+	var cursor uint64
+	for {
+		rows, err := page(cursor)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) == 0 {
+			return seen
+		}
+		for _, j := range rows {
+			seen[j.JobID]++
+		}
+		cursor = rows[len(rows)-1].Seq
+	}
+}
+
+// TestReconcileCandidatesWalkEveryRow (F-049): the startup recovery
+// walk sees every unresolved candidate, not only the newest page. A
+// single bounded query cannot, and the keyset cursor returns each row
+// exactly once before stopping.
+func TestReconcileCandidatesWalkEveryRow(t *testing.T) {
+	l, _ := openLedger(t)
+	key, _ := testAuthority(t)
+
+	total := recoveryPageSize*2 + 7
+	for i := 0; i < total; i++ {
+		insertWalkJob(t, l, key, fmt.Sprintf("walk-%03d", i), JobStateDispatchAmbig)
+	}
+
+	first, err := l.ReconcileCandidates(recoveryPageSize, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != recoveryPageSize {
+		t.Fatalf("first page holds %d rows, want a full page of %d", len(first), recoveryPageSize)
+	}
+
+	seen := walkCandidates(t, func(cursor uint64) ([]*LedgerJob, error) {
+		return l.ReconcileCandidates(recoveryPageSize, cursor)
+	})
+	if len(seen) != total {
+		t.Fatalf("the walk saw %d of %d unresolved candidates — the rest were omitted", len(seen), total)
+	}
+	for id, n := range seen {
+		if n != 1 {
+			t.Fatalf("candidate %s was returned %d times", id, n)
+		}
+	}
+}
+
+// TestCleanupCandidatesWalkEveryRow (F-049): pending removals are
+// retried for every candidate too — a microVM that outlived its job
+// is never abandoned because it fell outside the newest page.
+func TestCleanupCandidatesWalkEveryRow(t *testing.T) {
+	l, _ := openLedger(t)
+	key, _ := testAuthority(t)
+
+	total := recoveryPageSize*2 + 5
+	for i := 0; i < total; i++ {
+		id := fmt.Sprintf("cleanup-%03d", i)
+		insertWalkJob(t, l, key, id, JobStateRunning)
+		if err := l.Transition(id, JobStateSucceeded, []string{JobStateRunning},
+			func(j *LedgerJob) error { j.ResultJSON = "{}"; return nil }); err != nil {
+			t.Fatal(err)
+		}
+		if err := l.MarkCleanupPending(id, "msb rm failed"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	first, err := l.CleanupCandidates(recoveryPageSize, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != recoveryPageSize {
+		t.Fatalf("first page holds %d rows, want a full page of %d", len(first), recoveryPageSize)
+	}
+
+	seen := walkCandidates(t, func(cursor uint64) ([]*LedgerJob, error) {
+		return l.CleanupCandidates(recoveryPageSize, cursor)
+	})
+	if len(seen) != total {
+		t.Fatalf("the walk saw %d of %d pending cleanups — the rest were omitted", len(seen), total)
+	}
+	for id, n := range seen {
+		if n != 1 {
+			t.Fatalf("cleanup candidate %s was returned %d times", id, n)
+		}
 	}
 }
 

@@ -56,6 +56,10 @@ const (
 	// a run that is still live is left unresolved rather than
 	// blocking reconciliation indefinitely.
 	defaultReconcileTimeout = 30 * time.Second
+	// recoveryPageSize bounds one page of the startup recovery walk.
+	// The walk follows its keyset cursor to exhaustion, so the bound
+	// is on memory, never on which candidates are seen.
+	recoveryPageSize = 64
 	// defaultMaxContractTTL bounds how far past issued_at a contract
 	// may remain valid — long-lived contracts are long-lived forgery
 	// windows.
@@ -387,49 +391,65 @@ func (s *Server) reconcileUnresolved() {
 	if s.cfg.Backend == nil {
 		return
 	}
-	jobs, err := s.ledger.ReconcileCandidates(64)
-	if err != nil {
-		s.audit("reconcile failed: cannot enumerate unresolved jobs: %v", err)
-		return
-	}
-	for _, j := range jobs {
-		if s.isStopped() {
+	// Exhaustive, not one page: every unresolved row is a candidate.
+	// The keyset cursor walks the whole registry newest-first, so a
+	// row is never omitted for having fallen outside the first page.
+	var cursor uint64
+	for {
+		jobs, err := s.ledger.ReconcileCandidates(recoveryPageSize, cursor)
+		if err != nil {
+			s.audit("reconcile failed: cannot enumerate unresolved jobs: %v", err)
 			return
 		}
-		contract, cerr := ParseContract(json.RawMessage(j.ContractJSON))
-		if cerr != nil {
-			s.audit("reconcile: job %s (%s) stored contract is unreadable (%v) — leaving it unresolved", j.JobID, j.State, cerr)
-			continue
+		if len(jobs) == 0 {
+			return
 		}
-		run := RunIdentity{Handle: j.BackendHandle, RunID: j.BackendJobID, BootID: j.BackendBootID, PolicyDigest: j.PolicyDigest, Nonce: j.DispatchNonce}
-		ctx, cancel := context.WithTimeout(s.shutdown, s.cfg.ReconcileTimeout)
-		adopted, res, rerr := s.cfg.Backend.Resume(ctx, contract, run)
-		cancel()
-		if adopted.RunID != run.RunID || adopted.BootID != run.BootID {
-			if aerr := s.ledger.AdoptBackendRun(j.JobID, adopted.RunID, adopted.BootID); aerr != nil {
-				s.audit("reconcile: job %s recovered run %s (boot %s) but the ledger refused the adoption: %v", j.JobID, adopted.RunID, adopted.BootID, aerr)
-				continue
+		for _, j := range jobs {
+			if s.isStopped() {
+				return
 			}
-			s.audit("reconcile: job %s adopted runtime run %s boot generation %s (identity was lost with the crash)", j.JobID, adopted.RunID, adopted.BootID)
+			s.reconcileOne(j)
 		}
-		if rerr == nil && res != nil {
-			s.audit("reconcile: job %s (%s) resumed from run %s boot %s — settling the observed outcome", j.JobID, j.State, adopted.RunID, adopted.BootID)
-			s.settleObserved(j, []string{JobStateDispatchAmbig, JobStateInterrupted}, adopted, res, contract)
-			continue
+		cursor = jobs[len(jobs)-1].Seq
+	}
+}
+
+// reconcileOne re-establishes observation of one unresolved row, or
+// audits why it cannot be resumed.
+func (s *Server) reconcileOne(j *LedgerJob) {
+	contract, cerr := ParseContract(json.RawMessage(j.ContractJSON))
+	if cerr != nil {
+		s.audit("reconcile: job %s (%s) stored contract is unreadable (%v) — leaving it unresolved", j.JobID, j.State, cerr)
+		return
+	}
+	run := RunIdentity{Handle: j.BackendHandle, RunID: j.BackendJobID, BootID: j.BackendBootID, PolicyDigest: j.PolicyDigest, Nonce: j.DispatchNonce}
+	ctx, cancel := context.WithTimeout(s.shutdown, s.cfg.ReconcileTimeout)
+	adopted, res, rerr := s.cfg.Backend.Resume(ctx, contract, run)
+	cancel()
+	if adopted.RunID != run.RunID || adopted.BootID != run.BootID {
+		if aerr := s.ledger.AdoptBackendRun(j.JobID, adopted.RunID, adopted.BootID); aerr != nil {
+			s.audit("reconcile: job %s recovered run %s (boot %s) but the ledger refused the adoption: %v", j.JobID, adopted.RunID, adopted.BootID, aerr)
+			return
 		}
-		// Not resumable: audit the handle's liveness so an orphaned
-		// workload is visible rather than remembered.
-		lctx, lcancel := context.WithTimeout(s.shutdown, 10*time.Second)
-		live, ierr := s.cfg.Backend.Inspect(lctx, j.BackendHandle)
-		lcancel()
-		switch {
-		case ierr != nil:
-			s.audit("reconcile: job %s (%s) handle %s — not resumable (%v); inspect failed: %v", j.JobID, j.State, j.BackendHandle, rerr, ierr)
-		case live:
-			s.audit("reconcile: job %s (%s) backend %s handle %s is STILL RUNNING — operator must inspect/remove it (evidence preserved, never auto-destroyed)", j.JobID, j.State, j.BackendID, j.BackendHandle)
-		default:
-			s.audit("reconcile: job %s (%s) backend %s handle %s is gone", j.JobID, j.State, j.BackendID, j.BackendHandle)
-		}
+		s.audit("reconcile: job %s adopted runtime run %s boot generation %s (identity was lost with the crash)", j.JobID, adopted.RunID, adopted.BootID)
+	}
+	if rerr == nil && res != nil {
+		s.audit("reconcile: job %s (%s) resumed from run %s boot %s — settling the observed outcome", j.JobID, j.State, adopted.RunID, adopted.BootID)
+		s.settleObserved(j, []string{JobStateDispatchAmbig, JobStateInterrupted}, adopted, res, contract)
+		return
+	}
+	// Not resumable: audit the handle's liveness so an orphaned
+	// workload is visible rather than remembered.
+	lctx, lcancel := context.WithTimeout(s.shutdown, 10*time.Second)
+	live, ierr := s.cfg.Backend.Inspect(lctx, j.BackendHandle)
+	lcancel()
+	switch {
+	case ierr != nil:
+		s.audit("reconcile: job %s (%s) handle %s — not resumable (%v); inspect failed: %v", j.JobID, j.State, j.BackendHandle, rerr, ierr)
+	case live:
+		s.audit("reconcile: job %s (%s) backend %s handle %s is STILL RUNNING — operator must inspect/remove it (evidence preserved, never auto-destroyed)", j.JobID, j.State, j.BackendID, j.BackendHandle)
+	default:
+		s.audit("reconcile: job %s (%s) backend %s handle %s is gone", j.JobID, j.State, j.BackendID, j.BackendHandle)
 	}
 }
 
@@ -439,30 +459,40 @@ func (s *Server) reconcileUnresolved() {
 // outlived its job is reconciled rather than forgotten. It never
 // touches a job whose outcome is unresolved: those VMs may still be
 // running the workload and are for an operator to inspect.
+//
+// Like reconcileUnresolved it walks every candidate, so a pending
+// removal is never abandoned for having fallen outside the first page.
 func (s *Server) retryCleanups() {
 	defer s.acceptWg.Done()
 	if s.cfg.Backend == nil {
 		return
 	}
-	jobs, err := s.ledger.CleanupCandidates(64)
-	if err != nil {
-		s.audit("cleanup retry failed: cannot enumerate pending cleanups: %v", err)
-		return
-	}
-	for _, j := range jobs {
-		ctx, cancel := context.WithTimeout(s.shutdown, 15*time.Second)
-		cerr := s.cfg.Backend.Cleanup(ctx, j.BackendHandle)
-		cancel()
-		if cerr != nil {
-			s.audit("cleanup retry: job %s handle %s still pending: %v", j.JobID, j.BackendHandle, cerr)
-		} else if err := s.ledger.ClearCleanupPending(j.JobID); err != nil {
-			s.audit("cleanup retry: job %s removed but the ledger refused the clear: %v", j.JobID, err)
-		} else {
-			s.audit("cleanup retry: job %s handle %s removed", j.JobID, j.BackendHandle)
-		}
-		if s.isStopped() {
+	var cursor uint64
+	for {
+		jobs, err := s.ledger.CleanupCandidates(recoveryPageSize, cursor)
+		if err != nil {
+			s.audit("cleanup retry failed: cannot enumerate pending cleanups: %v", err)
 			return
 		}
+		if len(jobs) == 0 {
+			return
+		}
+		for _, j := range jobs {
+			if s.isStopped() {
+				return
+			}
+			ctx, cancel := context.WithTimeout(s.shutdown, 15*time.Second)
+			cerr := s.cfg.Backend.Cleanup(ctx, j.BackendHandle)
+			cancel()
+			if cerr != nil {
+				s.audit("cleanup retry: job %s handle %s still pending: %v", j.JobID, j.BackendHandle, cerr)
+			} else if err := s.ledger.ClearCleanupPending(j.JobID); err != nil {
+				s.audit("cleanup retry: job %s removed but the ledger refused the clear: %v", j.JobID, err)
+			} else {
+				s.audit("cleanup retry: job %s handle %s removed", j.JobID, j.BackendHandle)
+			}
+		}
+		cursor = jobs[len(jobs)-1].Seq
 	}
 }
 

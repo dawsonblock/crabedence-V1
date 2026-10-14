@@ -566,21 +566,26 @@ func (l *Ledger) Get(jobID string) (*LedgerJob, error) {
 	return j, finishScan(j)
 }
 
-// ReconcileCandidates returns jobs whose backend outcome is
-// unresolved — DISPATCH_AMBIGUOUS (may or may not have launched) and
-// INTERRUPTED (definitely launched, result unknown) — newest first,
-// capped at limit. The startup pass inspects their handles against
-// the live backend so an orphaned workload surfaces in the audit log
-// instead of being discovered manually.
-func (l *Ledger) ReconcileCandidates(limit int) ([]*LedgerJob, error) {
+// ReconcileCandidates returns one page of jobs whose backend outcome
+// is unresolved — DISPATCH_AMBIGUOUS (may or may not have launched)
+// and INTERRUPTED (definitely launched, result unknown) — newest
+// first, capped at limit. beforeSeq is the keyset cursor: zero starts
+// at the newest row, and the last row's Seq continues after it.
+//
+// The startup pass follows the cursor to exhaustion, so an unresolved
+// row is never omitted for having fallen outside the newest page. The
+// cursor is stable while rows change state: a row's Seq never moves,
+// so no row can be skipped, and a row that leaves the result set is
+// simply never returned again.
+func (l *Ledger) ReconcileCandidates(limit int, beforeSeq uint64) ([]*LedgerJob, error) {
 	if limit <= 0 {
 		limit = 64
 	}
 	rows, err := l.db.Query(
 		`SELECT `+jobColumns+` FROM jobs
-		 WHERE state IN (?, ?) AND backend_handle != ''
+		 WHERE state IN (?, ?) AND backend_handle != '' AND (? = 0 OR seq < ?)
 		 ORDER BY seq DESC LIMIT ?`,
-		JobStateDispatchAmbig, JobStateInterrupted, limit)
+		JobStateDispatchAmbig, JobStateInterrupted, beforeSeq, beforeSeq, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -693,19 +698,20 @@ func (l *Ledger) ClearCleanupPending(jobID string) error {
 	return nil
 }
 
-// CleanupCandidates returns terminal jobs whose backend resources are
-// recorded as still present, newest first, capped at limit. The
-// startup pass retries their removal — tracked separately from the
-// result, so a VM that outlived its job is reconciled rather than
-// forgotten.
-func (l *Ledger) CleanupCandidates(limit int) ([]*LedgerJob, error) {
+// CleanupCandidates returns one page of terminal jobs whose backend
+// resources are recorded as still present, newest first, capped at
+// limit. beforeSeq is the keyset cursor, exactly as
+// ReconcileCandidates uses it. The startup pass follows it to
+// exhaustion — a VM that outlived its job is reconciled rather than
+// forgotten for having fallen outside the newest page.
+func (l *Ledger) CleanupCandidates(limit int, beforeSeq uint64) ([]*LedgerJob, error) {
 	if limit <= 0 {
 		limit = 64
 	}
 	rows, err := l.db.Query(
 		`SELECT `+jobColumns+` FROM jobs
-		 WHERE cleanup_pending = 1 AND backend_handle != ''
-		 ORDER BY seq DESC LIMIT ?`, limit)
+		 WHERE cleanup_pending = 1 AND backend_handle != '' AND (? = 0 OR seq < ?)
+		 ORDER BY seq DESC LIMIT ?`, beforeSeq, beforeSeq, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -743,6 +749,12 @@ type PoolUsage struct {
 // their reservation is held until an operator reconciles the row or
 // the bound below proves the VM gone.
 //
+// A terminal row whose VM could not be removed (cleanup_pending)
+// holds its reservation too. The guest process finishing is not the
+// VM ceasing to exist: the microVM still occupies host capacity until
+// its removal is verified, so capacity is released on verified
+// cleanup, never merely because the workload completed.
+//
 // grace is the longest interval between a row's last transition and
 // the creation of the VM it may represent — the caller's dispatch
 // timeout plus a margin. A VM cannot outlive its contract (the
@@ -754,7 +766,8 @@ type PoolUsage struct {
 // silently free.
 func (l *Ledger) ActiveUsage(grace time.Duration) (*PoolUsage, error) {
 	rows, err := l.db.Query(
-		`SELECT submitter, contract_json, updated_at FROM jobs WHERE state IN (?, ?, ?, ?)`,
+		`SELECT submitter, contract_json, updated_at FROM jobs
+		 WHERE state IN (?, ?, ?, ?) OR cleanup_pending = 1`,
 		JobStateDispatching, JobStateRunning, JobStateDispatchAmbig, JobStateInterrupted)
 	if err != nil {
 		return nil, err

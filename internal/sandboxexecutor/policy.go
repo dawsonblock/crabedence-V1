@@ -211,19 +211,17 @@ func jsonStrings(m map[string]any, key string) []string {
 	return out
 }
 
-// sameStringSet compares two string lists as sets: order is not
-// security-relevant, membership is.
-func sameStringSet(a, b []string) bool {
+// sameStringSequence compares two string lists element-wise. For a
+// command and an entrypoint the order *is* the meaning — ["/bin/sh",
+// "-c"] and ["-c", "/bin/sh"] are different programs — so a reordered
+// hook is a refusal, never an equivalent spelling of the authorized
+// one.
+func sameStringSequence(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
 	}
-	idx := map[string]int{}
-	for _, v := range a {
-		idx[v]++
-	}
-	for _, v := range b {
-		idx[v]--
-		if idx[v] < 0 {
+	for i := range a {
+		if a[i] != b[i] {
 			return false
 		}
 	}
@@ -319,7 +317,86 @@ func verifyBootedPolicy(p *EffectivePolicyV1, doc map[string]any) error {
 	return nil
 }
 
+// bootedConfigFields is the closed set of keys the pinned runtime's
+// resolved configuration may carry — the schema the policy was
+// qualified against. Verification is a closure, not a checklist: a
+// field nobody authorized refuses by name, so a capability the pinned
+// runtime grows, or one a substituted runtime invents, can never ride
+// along unverified.
+//
+// `vsock` is deliberately absent. A route is a guest-to-host channel
+// and the policy never authorizes one, so it is refused in its own
+// right (verifyNoHostChannels) before the closure is consulted.
+var bootedConfigFields = map[string]bool{
+	"deployment_profile":    true,
+	"env":                   true,
+	"external_mount_policy": true,
+	"image":                 true,
+	"init":                  true,
+	"labels":                true,
+	"lifecycle":             true,
+	"manifest_digest":       true,
+	"mounts":                true,
+	"name":                  true,
+	"network":               true,
+	"patches":               true,
+	"pull_policy":           true,
+	"resources":             true,
+	"rlimits":               true,
+	"runtime":               true,
+	"security_profile":      true,
+}
+
+// verifyNoHostChannels refuses a VM carrying any guest-to-host vsock
+// route. A host channel is reachability — and a host local-IPC
+// endpoint — the policy never authorized, so its presence refuses
+// even when every other configuration field matches exactly.
+func verifyNoHostChannels(cfg map[string]any) error {
+	vsock, ok := cfg["vsock"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	routes, _ := vsock["routes"].([]any)
+	if len(routes) == 0 {
+		return nil
+	}
+	targets := make([]string, 0, len(routes))
+	for _, raw := range routes {
+		r, _ := raw.(map[string]any)
+		targets = append(targets, fmt.Sprintf("%s:%v/%s",
+			jsonString(r, "host_socket"), r["port"], jsonString(r, "socket_type")))
+	}
+	sort.Strings(targets)
+	return fmt.Errorf("sandbox carries %d host channel(s) the policy did not authorize: %s",
+		len(routes), strings.Join(targets, ", "))
+}
+
+// verifyClosedConfig refuses any field the qualified configuration
+// schema does not define. The comparison is closed: an unknown key is
+// an unauthorized setting whatever its name, and the policy cannot
+// verify what it does not understand.
+func verifyClosedConfig(cfg map[string]any) error {
+	unknown := make([]string, 0, len(cfg))
+	for key := range cfg {
+		if !bootedConfigFields[key] {
+			unknown = append(unknown, key)
+		}
+	}
+	if len(unknown) == 0 {
+		return nil
+	}
+	sort.Strings(unknown)
+	return fmt.Errorf("sandbox configuration carries %d field(s) the policy does not define: %s",
+		len(unknown), strings.Join(unknown, ", "))
+}
+
 func verifyBootedConfig(p *EffectivePolicyV1, cfg map[string]any) error {
+	if err := verifyNoHostChannels(cfg); err != nil {
+		return err
+	}
+	if err := verifyClosedConfig(cfg); err != nil {
+		return err
+	}
 	if got := jsonString(cfg, "name"); got != p.SandboxName {
 		return fmt.Errorf("sandbox name %q does not match the authorized handle %q", got, p.SandboxName)
 	}
@@ -367,10 +444,10 @@ func verifyBootedConfig(p *EffectivePolicyV1, cfg map[string]any) error {
 	if got := jsonString(rt, "shell"); got != p.RuntimeShell {
 		return fmt.Errorf("sandbox runtime shell %q does not match the authorized %q", got, p.RuntimeShell)
 	}
-	if got := jsonStrings(rt, "cmd"); !sameStringSet(got, p.RuntimeCmd) {
+	if got := jsonStrings(rt, "cmd"); !sameStringSequence(got, p.RuntimeCmd) {
 		return fmt.Errorf("sandbox runtime cmd %v does not match the image's authorized %v", got, p.RuntimeCmd)
 	}
-	if got := jsonStrings(rt, "entrypoint"); !sameStringSet(got, p.RuntimeEntrypoint) {
+	if got := jsonStrings(rt, "entrypoint"); !sameStringSequence(got, p.RuntimeEntrypoint) {
 		return fmt.Errorf("sandbox runtime entrypoint %v does not match the image's authorized %v", got, p.RuntimeEntrypoint)
 	}
 	if got := jsonString(rt, "user"); got != p.RuntimeUser {
