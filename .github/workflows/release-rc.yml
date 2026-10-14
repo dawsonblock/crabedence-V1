@@ -105,7 +105,7 @@ jobs:
         run: go vet ./...
 
       - name: Go tests (uncached)
-        run: go test -count=1 -timeout=15m ./internal/cli/ ./internal/capability/ ./internal/execution/ ./internal/idempotency/ ./internal/providers/shared/ ./internal/providers/tart/ ./internal/providers/lume/
+        run: go test -count=1 -timeout=15m ./internal/cli/ ./internal/capability/ ./internal/execution/ ./internal/idempotency/ ./internal/providers/shared/ ./internal/providers/tart/ ./internal/providers/lume/ ./internal/sandboxexecutor/
 
   # ─── Go race tests (parallel matrix) ─────────────────────────────────
   go-race:
@@ -125,6 +125,15 @@ jobs:
             pattern: ""
           - name: providers
             packages: ./internal/providers/tart/ ./internal/providers/lume/ ./internal/providers/shared/
+            pattern: ""
+          # The executor is its own group: it boots untrusted code, and
+          # its race suite is the only thing that exercises the policy,
+          # dispatch and recovery paths under concurrency — including the
+          # hard-crash qualification that SIGKILLs the daemon mid-job. It
+          # is not folded into another group, so a regression is
+          # attributed to the lane that failed.
+          - name: sandboxexecutor
+            packages: ./internal/sandboxexecutor/
             pattern: ""
     steps:
       - name: Check out
