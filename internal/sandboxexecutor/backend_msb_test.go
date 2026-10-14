@@ -144,10 +144,16 @@ type fakeTarget struct {
 	Group        string `json:"group,omitempty"`
 }
 
+// fakeMount mirrors the runtime's resolved mount, including the
+// renderings that decide what the guest can observe about the host.
 type fakeMount struct {
-	Host  string `json:"host,omitempty"`
-	Guest string `json:"guest"`
-	Type  string `json:"type"`
+	Host               string         `json:"host,omitempty"`
+	Guest              string         `json:"guest"`
+	Type               string         `json:"type"`
+	HostPermissions    string         `json:"host_permissions,omitempty"`
+	StatVirtualization string         `json:"stat_virtualization,omitempty"`
+	FollowRootSymlinks *bool          `json:"follow_root_symlinks,omitempty"`
+	Options            map[string]any `json:"options,omitempty"`
 }
 
 type fakeImage struct {
@@ -421,7 +427,12 @@ func fakeCreate(dir string, args []string) int {
 			i++
 			parts := strings.SplitN(args[i], ":", 3)
 			if len(parts) >= 2 {
-				conf.Mounts = append(conf.Mounts, fakeMount{Host: parts[0], Guest: parts[1], Type: "Bind"})
+				// The real runtime renders host identity the confined
+				// way on every mount it resolves.
+				conf.Mounts = append(conf.Mounts, fakeMount{
+					Host: parts[0], Guest: parts[1], Type: "Bind",
+					HostPermissions: "private", StatVirtualization: "strict",
+				})
 			}
 		case "-w", "--workdir":
 			i++
@@ -2575,19 +2586,95 @@ func TestBootedNetworkRefusesUnverifiedSurfaces(t *testing.T) {
 // so the flag is part of what the mount must prove.
 func TestBootedMountsRefusesHostRootSymlinkFollowing(t *testing.T) {
 	policy := &EffectivePolicyV1{Mounts: []Mount{{Source: "/host/src", Dest: "/guest/src"}}}
-	clean := map[string]any{"mounts": []any{map[string]any{"host": "/host/src", "guest": "/guest/src"}}}
-	if err := verifyBootedMounts(policy, clean); err != nil {
+	build := func(follow bool) map[string]any {
+		return map[string]any{"mounts": []any{map[string]any{
+			"host": "/host/src", "guest": "/guest/src",
+			"host_permissions": "private", "stat_virtualization": "strict",
+			"follow_root_symlinks": follow,
+		}}}
+	}
+	if err := verifyBootedMounts(policy, build(false)); err != nil {
 		t.Fatalf("an authorized mount refused: %v", err)
 	}
-	following := map[string]any{"mounts": []any{map[string]any{
-		"host": "/host/src", "guest": "/guest/src", "follow_root_symlinks": true,
-	}}}
-	err := verifyBootedMounts(policy, following)
+	err := verifyBootedMounts(policy, build(true))
 	if err == nil {
 		t.Fatal("a mount following host root symlinks was accepted")
 	}
 	if !strings.Contains(err.Error(), "follows host root symlinks") {
 		t.Fatalf("refusal %q does not name the flag", err)
+	}
+}
+
+// TestBootedMountsRequireDeclaredHardening: an option the contract
+// declared must be in force. Silently dropping one boots a mount nobody
+// authorized — a setuid binary that was supposed to be neutered, or a
+// device node that was supposed to be absent.
+func TestBootedMountsRequireDeclaredHardening(t *testing.T) {
+	policy := &EffectivePolicyV1{Mounts: []Mount{
+		{Source: "/host/src", Dest: "/guest/src", Options: "nosuid,nodev"},
+	}}
+	build := func(options map[string]any) map[string]any {
+		return map[string]any{"mounts": []any{map[string]any{
+			"host": "/host/src", "guest": "/guest/src",
+			"host_permissions": "private", "stat_virtualization": "strict",
+			"options": options,
+		}}}
+	}
+	if err := verifyBootedMounts(policy, build(map[string]any{"nosuid": true, "nodev": true})); err != nil {
+		t.Fatalf("a fully hardened mount refused: %v", err)
+	}
+	err := verifyBootedMounts(policy, build(map[string]any{"nosuid": true, "nodev": false}))
+	if err == nil {
+		t.Fatal("a mount missing a declared hardening option was accepted")
+	}
+	if !strings.Contains(err.Error(), "missing the declared nodev option") {
+		t.Fatalf("refusal %q does not name the dropped option", err)
+	}
+}
+
+// TestBootedMountsRequireConfinedHostRendering: the mount must render
+// host identity the confined way, so the guest cannot observe the host
+// it is confined to.
+func TestBootedMountsRequireConfinedHostRendering(t *testing.T) {
+	policy := &EffectivePolicyV1{Mounts: []Mount{{Source: "/host/src", Dest: "/guest/src"}}}
+	build := func(permissions, stat string) map[string]any {
+		return map[string]any{"mounts": []any{map[string]any{
+			"host": "/host/src", "guest": "/guest/src",
+			"host_permissions": permissions, "stat_virtualization": stat,
+		}}}
+	}
+	if err := verifyBootedMounts(policy, build("private", "strict")); err != nil {
+		t.Fatalf("a confined mount refused: %v", err)
+	}
+	cases := []struct{ name, permissions, stat, want string }{
+		{"host permissions shared", "shared", "strict", "host permissions"},
+		{"host file stats exposed", "private", "host", "host file stats"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := verifyBootedMounts(policy, build(tc.permissions, tc.stat))
+			if err == nil {
+				t.Fatalf("%s was accepted", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("refusal %q does not mention %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// TestBootedInertFieldsAreSchemaFields keeps the disposition map
+// honest: every field recorded as deliberately unpinned must be a field
+// the schema actually admits, with a reason stated, so the map cannot
+// rot into a list of names nothing emits.
+func TestBootedInertFieldsAreSchemaFields(t *testing.T) {
+	for field, reason := range bootedInertFields {
+		if !bootedConfigFields[field] {
+			t.Fatalf("inert field %q is not in the qualified schema", field)
+		}
+		if strings.TrimSpace(reason) == "" {
+			t.Fatalf("inert field %q has no reason recorded", field)
+		}
 	}
 }
 
