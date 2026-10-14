@@ -317,34 +317,138 @@ func verifyBootedPolicy(p *EffectivePolicyV1, doc map[string]any) error {
 	return nil
 }
 
-// bootedConfigFields is the closed set of keys the pinned runtime's
-// resolved configuration may carry — the schema the policy was
-// qualified against. Verification is a closure, not a checklist: a
-// field nobody authorized refuses by name, so a capability the pinned
-// runtime grows, or one a substituted runtime invents, can never ride
-// along unverified.
+// bootedConfigFields is the qualified shape of the pinned runtime's
+// resolved configuration, as dotted paths — `[]` marks an array's
+// elements. It is the schema the policy was qualified against, taken
+// from the pinned runtime's own output.
+//
+// Verification is a closure at every level, not only at the top. A
+// field the schema does not define refuses by name wherever it appears,
+// so a capability the pinned runtime grows, or one a substituted
+// runtime invents, can never ride along unverified inside a nested
+// object. Closing only the top level left a whole surface invisible
+// while the policy claimed to check the booted VM exactly — TLS
+// interception, injected secrets, DNS overrides, host CA trust and the
+// mount flags all lived below the keys that were checked.
 //
 // `vsock` is deliberately absent. A route is a guest-to-host channel
 // and the policy never authorizes one, so it is refused in its own
 // right (verifyNoHostChannels) before the closure is consulted.
 var bootedConfigFields = map[string]bool{
-	"deployment_profile":    true,
-	"env":                   true,
-	"external_mount_policy": true,
-	"image":                 true,
-	"init":                  true,
-	"labels":                true,
-	"lifecycle":             true,
-	"manifest_digest":       true,
-	"mounts":                true,
-	"name":                  true,
-	"network":               true,
-	"patches":               true,
-	"pull_policy":           true,
-	"resources":             true,
-	"rlimits":               true,
-	"runtime":               true,
-	"security_profile":      true,
+	"deployment_profile":                        true,
+	"env":                                       true,
+	"env[]":                                     true,
+	"env[].key":                                 true,
+	"env[].value":                               true,
+	"external_mount_policy":                     true,
+	"image":                                     true,
+	"image.Oci":                                 true,
+	"image.Oci.reference":                       true,
+	"image.Oci.root_disk":                       true,
+	"image.Oci.root_disk.kind":                  true,
+	"image.Oci.root_disk.size_mib":              true,
+	"init":                                      true,
+	"labels":                                    true,
+	"lifecycle":                                 true,
+	"lifecycle.ephemeral":                       true,
+	"lifecycle.idle_timeout_secs":               true,
+	"lifecycle.max_duration_secs":               true,
+	"manifest_digest":                           true,
+	"mounts":                                    true,
+	"mounts[]":                                  true,
+	"mounts[].follow_root_symlinks":             true,
+	"mounts[].guest":                            true,
+	"mounts[].host":                             true,
+	"mounts[].host_permissions":                 true,
+	"mounts[].options":                          true,
+	"mounts[].options.nodev":                    true,
+	"mounts[].options.noexec":                   true,
+	"mounts[].options.nosuid":                   true,
+	"mounts[].options.readonly":                 true,
+	"mounts[].quota_mib":                        true,
+	"mounts[].stat_virtualization":              true,
+	"mounts[].type":                             true,
+	"name":                                      true,
+	"network":                                   true,
+	"network.dns":                               true,
+	"network.dns.nameservers":                   true,
+	"network.dns.query_timeout_ms":              true,
+	"network.dns.rebind_protection":             true,
+	"network.enabled":                           true,
+	"network.http":                              true,
+	"network.http.deny_response":                true,
+	"network.interface":                         true,
+	"network.max_connections":                   true,
+	"network.nat64_prefixes":                    true,
+	"network.policy":                            true,
+	"network.policy.default_egress":             true,
+	"network.policy.default_ingress":            true,
+	"network.policy.rules":                      true,
+	"network.policy.rules[]":                    true,
+	"network.policy.rules[].action":             true,
+	"network.policy.rules[].destination":        true,
+	"network.policy.rules[].destination.domain": true,
+	"network.policy.rules[].destination.domain_suffix": true,
+	"network.policy.rules[].destination.group":         true,
+	"network.policy.rules[].direction":                 true,
+	"network.policy.rules[].ports":                     true,
+	"network.policy.rules[].protocols":                 true,
+	"network.ports":                                    true,
+	"network.secrets":                                  true,
+	"network.secrets.secrets":                          true,
+	"network.secrets.violation_action":                 true,
+	"network.strict":                                   true,
+	"network.tls":                                      true,
+	"network.tls.block_quic_on_intercept":              true,
+	"network.tls.bypass":                               true,
+	"network.tls.cache":                                true,
+	"network.tls.cache.capacity":                       true,
+	"network.tls.cache.validity_hours":                 true,
+	"network.tls.enabled":                              true,
+	"network.tls.intercept_ca":                         true,
+	"network.tls.intercept_ca.cert_path":               true,
+	"network.tls.intercept_ca.key_path":                true,
+	"network.tls.intercepted_ports":                    true,
+	"network.tls.scoped_upstream_ca_cert":              true,
+	"network.tls.scoped_verify_upstream":               true,
+	"network.tls.upstream_ca_cert":                     true,
+	"network.tls.verify_upstream":                      true,
+	"network.trust_host_cas":                           true,
+	"patches":                                          true,
+	"pull_policy":                                      true,
+	"resources":                                        true,
+	"resources.cpus":                                   true,
+	"resources.max_cpus":                               true,
+	"resources.max_memory_mib":                         true,
+	"resources.memory_mib":                             true,
+	"rlimits":                                          true,
+	"runtime":                                          true,
+	"runtime.cmd":                                      true,
+	"runtime.disable_metrics_sample":                   true,
+	"runtime.entrypoint":                               true,
+	"runtime.hostname":                                 true,
+	"runtime.log_level":                                true,
+	"runtime.metrics_sample_interval_ms":               true,
+	"runtime.scripts":                                  true,
+	"runtime.shell":                                    true,
+	"runtime.user":                                     true,
+	"runtime.workdir":                                  true,
+	"security_profile":                                 true,
+}
+
+// openFields are containers whose contents the policy cannot enumerate,
+// because the runtime owns them (labels) or because a dedicated check
+// refuses them outright (init, patches, rlimits, script bindings,
+// interface bindings, published ports). Their keys are not closed here;
+// their values are still verified by that check.
+var openFields = map[string]bool{
+	"labels":            true,
+	"init":              true,
+	"patches":           true,
+	"rlimits":           true,
+	"runtime.scripts":   true,
+	"network.interface": true,
+	"network.ports":     true,
 }
 
 // verifyNoHostChannels refuses a VM carrying any guest-to-host vsock
@@ -371,23 +475,62 @@ func verifyNoHostChannels(cfg map[string]any) error {
 		len(routes), strings.Join(targets, ", "))
 }
 
-// verifyClosedConfig refuses any field the qualified configuration
-// schema does not define. The comparison is closed: an unknown key is
-// an unauthorized setting whatever its name, and the policy cannot
-// verify what it does not understand.
+// verifyClosedConfig refuses any field the qualified schema does not
+// define, at every level of the configuration. The comparison is
+// closed: an unknown key is an unauthorized setting whatever its name
+// and wherever it sits, and the policy cannot verify what it does not
+// understand.
 func verifyClosedConfig(cfg map[string]any) error {
-	unknown := make([]string, 0, len(cfg))
-	for key := range cfg {
-		if !bootedConfigFields[key] {
-			unknown = append(unknown, key)
-		}
-	}
-	if len(unknown) == 0 {
+	return verifyClosedValue(cfg, "")
+}
+
+func verifyClosedValue(value any, path string) error {
+	if openFields[path] {
 		return nil
 	}
-	sort.Strings(unknown)
-	return fmt.Errorf("sandbox configuration carries %d field(s) the policy does not define: %s",
-		len(unknown), strings.Join(unknown, ", "))
+	switch v := value.(type) {
+	case map[string]any:
+		unknown := make([]string, 0, len(v))
+		for key := range v {
+			if !bootedConfigFields[childPath(path, key)] {
+				unknown = append(unknown, key)
+			}
+		}
+		if len(unknown) != 0 {
+			sort.Strings(unknown)
+			return fmt.Errorf("sandbox configuration carries %d field(s) the policy does not define%s: %s",
+				len(unknown), atPath(path), strings.Join(unknown, ", "))
+		}
+		for key, child := range v {
+			if err := verifyClosedValue(child, childPath(path, key)); err != nil {
+				return err
+			}
+		}
+	case []any:
+		for _, item := range v {
+			if err := verifyClosedValue(item, path+"[]"); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// childPath joins a schema path with one key.
+func childPath(path, key string) string {
+	if path == "" {
+		return key
+	}
+	return path + "." + key
+}
+
+// atPath names where in the configuration a refusal was found, so an
+// operator does not have to search for it.
+func atPath(path string) string {
+	if path == "" {
+		return ""
+	}
+	return " at " + path
 }
 
 func verifyBootedConfig(p *EffectivePolicyV1, cfg map[string]any) error {
@@ -645,6 +788,39 @@ func verifyBootedNetwork(p *EffectivePolicyV1, cfg map[string]any) error {
 			return fmt.Errorf("network mode public but the sandbox carries no public egress rule")
 		}
 	}
+	// The runtime's network object carries an interception, secret and
+	// resolution surface the policy never authorizes. Verification
+	// reads it now: a guest whose TLS the host can intercept, whose
+	// DNS is redirected, or whose environment can be seeded with host
+	// secrets is not the VM the policy described, whatever the rest of
+	// the configuration says.
+	secrets, _ := netw["secrets"].(map[string]any)
+	if injected, ok := secrets["secrets"].([]any); ok && len(injected) != 0 {
+		return fmt.Errorf("sandbox carries %d injected secret(s) the policy did not authorize", len(injected))
+	}
+	tls, _ := netw["tls"].(map[string]any)
+	if enabled, _ := tls["enabled"].(bool); enabled {
+		return fmt.Errorf("sandbox enables TLS interception, which the policy did not authorize")
+	}
+	ca, _ := tls["intercept_ca"].(map[string]any)
+	if jsonString(ca, "cert_path") != "" || jsonString(ca, "key_path") != "" {
+		return fmt.Errorf("sandbox carries a TLS interception certificate authority the policy did not authorize")
+	}
+	for _, key := range []string{"bypass", "upstream_ca_cert", "scoped_upstream_ca_cert", "scoped_verify_upstream"} {
+		if entries, ok := tls[key].([]any); ok && len(entries) != 0 {
+			return fmt.Errorf("sandbox carries %d %s entr(ies) the policy did not authorize", len(entries), key)
+		}
+	}
+	if trust, _ := netw["trust_host_cas"].(bool); trust {
+		return fmt.Errorf("sandbox trusts the host's certificate authorities, which the policy did not authorize")
+	}
+	if strict, present := netw["strict"].(bool); present && !strict {
+		return fmt.Errorf("sandbox network is not strict, which the policy requires")
+	}
+	dns, _ := netw["dns"].(map[string]any)
+	if ns, ok := dns["nameservers"].([]any); ok && len(ns) != 0 {
+		return fmt.Errorf("sandbox carries %d DNS nameserver override(s) the policy did not authorize", len(ns))
+	}
 	return nil
 }
 
@@ -675,6 +851,13 @@ func verifyBootedMounts(p *EffectivePolicyV1, cfg map[string]any) error {
 				return fmt.Errorf("sandbox mount %s is readonly=%t but the policy declared %q",
 					jsonString(m, "guest"), got, declared.Options)
 			}
+		}
+		// Following host root symlinks would let the mounted path
+		// resolve somewhere the policy never authorized, so the flag is
+		// part of what the mount must prove.
+		if follow, _ := m["follow_root_symlinks"].(bool); follow {
+			return fmt.Errorf("sandbox mount %s follows host root symlinks, which the policy did not authorize",
+				jsonString(m, "guest"))
 		}
 		delete(authorized, key)
 	}

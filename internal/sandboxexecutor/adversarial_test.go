@@ -1,6 +1,7 @@
 package sandboxexecutor
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -125,11 +126,18 @@ func TestAdversarialFaultMatrix(t *testing.T) {
 			}
 			// A NO_EFFECT receipt is sound only when the executor
 			// proved nothing executed: a proven pre-launch refusal, or
-			// a typed spawn rejection the runtime itself recorded. A
-			// receipt on anything else is a false no-effect claim —
-			// and an empty job list is never proof of either.
-			sound := lj.DispatchClass == string(DispatchProvenRejected) ||
-				strings.Contains(lj.Error, "command rejected before start")
+			// a typed rejection the runtime itself recorded at a
+			// pre-execution stage. The check reads the recorded
+			// evidence, not the message — a receipt whose result does
+			// not carry a pre-execution stage is a false no-effect
+			// claim, and an empty job list is never proof of either.
+			sound := lj.DispatchClass == string(DispatchProvenRejected)
+			if !sound && lj.ResultJSON != "" {
+				var res ExecResult
+				if jerr := json.Unmarshal([]byte(lj.ResultJSON), &res); jerr == nil {
+					sound = preExecutionStages[res.FailureStage]
+				}
+			}
 			if hasReceipt && !sound {
 				targets.falseNoEffect++
 			}

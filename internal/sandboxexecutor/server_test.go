@@ -848,9 +848,21 @@ func TestMonitorClassifiesObservedOutcomes(t *testing.T) {
 			wantState: JobStateFailed, wantErrSub: "contract timeout",
 		},
 		{
-			name:      "spawn rejected",
-			result:    &ExecResult{FailureKind: "not_found", FailureMessage: "no such binary", RuntimeState: "failed"},
+			name: "spawn rejected",
+			result: &ExecResult{
+				FailureKind: "not_found", FailureStage: "Command::spawn",
+				FailureMessage: "no such binary", RuntimeState: "failed",
+			},
 			wantState: JobStateDispatchFailed, wantErrSub: "not_found",
+		},
+		{
+			// A typed rejection the executor cannot read as
+			// pre-execution has demonstrated nothing about whether the
+			// workload ran: it is refused, never recorded as a
+			// no-effect claim.
+			name:      "rejection without a pre-execution stage refused",
+			result:    &ExecResult{FailureKind: "not_found", RuntimeState: "failed"},
+			wantState: JobStateDispatchAmbig, wantErrSub: "unverified",
 		},
 		{
 			name:      "unverified outcome refused",

@@ -170,6 +170,7 @@ type fakeJobRecord struct {
 	RuntimeBoot string       `json:"runtime_boot_id"`
 	Command     []string     `json:"command"`
 	State       string       `json:"state"`
+	PID         *uint32      `json:"pid"`
 	ExitCode    *int         `json:"exit_code"`
 	Failure     *fakeFailure `json:"failure"`
 	Error       *string      `json:"error"`
@@ -179,9 +180,13 @@ type fakeJobRecord struct {
 	FinishedAt  *int64       `json:"finished_at"`
 }
 
+// fakeFailure mirrors the runtime's typed failure. Stage is the
+// runtime's own statement of where it failed — the field that
+// distinguishes a rejected spawn from a process that ran and failed.
 type fakeFailure struct {
 	Kind    string `json:"kind"`
 	Message string `json:"message"`
+	Stage   string `json:"stage"`
 }
 
 // fakeImageConfig is the pinned image's own execution defaults — the
@@ -754,14 +759,48 @@ func fakeWriteJob(dir, name string, command []string) error {
 	if os.Getenv("MSB_FAKE_JOB_BOOT_MISMATCH") != "" {
 		rec.RuntimeBoot = "boot_" + strings.Repeat("9", 32)
 	}
+	// started records whether the runtime's record shows a process was
+	// created. A pre-execution failure must not: the record is the
+	// proof that nothing ran.
+	started := true
 	switch {
 	case os.Getenv("MSB_FAKE_JOB_LOST") != "":
 		rec.State = "lost"
 		msg := "owning runtime is no longer available; exit status is unknown"
 		rec.Error = &msg
 	case os.Getenv("MSB_FAKE_JOB_FAILURE") != "":
+		// The real runtime records a rejected spawn as a typed failure
+		// at a pre-execution stage, with no pid and no start
+		// timestamp.
 		rec.State = "failed"
-		rec.Failure = &fakeFailure{Kind: os.Getenv("MSB_FAKE_JOB_FAILURE"), Message: "spawn failed"}
+		rec.Failure = &fakeFailure{
+			Kind:    os.Getenv("MSB_FAKE_JOB_FAILURE"),
+			Message: "spawn failed",
+			Stage:   "Command::spawn",
+		}
+		started = false
+	case os.Getenv("MSB_FAKE_JOB_FAILURE_UNTYPED") != "":
+		// A bare `failed` state with no typed failure: the runtime
+		// said it failed, but nothing in the record proves the
+		// command never ran.
+		rec.State = "failed"
+	case os.Getenv("MSB_FAKE_JOB_FAILURE_STAGE") != "":
+		// A typed failure at a stage that is not pre-execution.
+		rec.State = "failed"
+		rec.Failure = &fakeFailure{
+			Kind:    "unrecognized",
+			Message: "failed at a later stage",
+			Stage:   os.Getenv("MSB_FAKE_JOB_FAILURE_STAGE"),
+		}
+	case os.Getenv("MSB_FAKE_JOB_FAILURE_STARTED") != "":
+		// A pre-execution failure whose record nevertheless shows a
+		// started process: the signals disagree, so nothing is proven.
+		rec.State = "failed"
+		rec.Failure = &fakeFailure{
+			Kind:    "not_found",
+			Message: "spawn failed",
+			Stage:   "Command::spawn",
+		}
 	case os.Getenv("MSB_FAKE_JOB_RUNNING") != "":
 		// Stays running until enough polls have observed it.
 		rec.State = "running"
@@ -780,7 +819,12 @@ func fakeWriteJob(dir, name string, command []string) error {
 		rec.Command = append([]string{"tampered"}, rec.Command[1:]...)
 	}
 	now := time.Now().UnixMilli()
-	rec.StartedAt, rec.FinishedAt = &now, &now
+	rec.FinishedAt = &now
+	if started {
+		rec.StartedAt = &now
+		pid := uint32(4242)
+		rec.PID = &pid
+	}
 	if err := os.WriteFile(fakeJobOutputPath(dir, name, rec.ID), fakeJobOutput(), 0o600); err != nil {
 		return err
 	}
@@ -1639,6 +1683,83 @@ func TestMSBWaitSpawnRejected(t *testing.T) {
 	}
 }
 
+// TestMSBWaitRefusesUnprovenSpawnRejection (RC7.2, F-050): a no-effect
+// claim needs positive evidence that no process was created. A bare
+// `failed` state, a failure the runtime did not type as pre-execution,
+// or a record whose signals disagree about whether the command started
+// all prove nothing about whether the workload ran — so the outcome is
+// unobserved, never a no-effect claim.
+func TestMSBWaitRefusesUnprovenSpawnRejection(t *testing.T) {
+	cases := []struct {
+		name string
+		env  map[string]string
+	}{
+		{"bare failed state", map[string]string{"MSB_FAKE_JOB_FAILURE_UNTYPED": "1"}},
+		{"unrecognized failure stage", map[string]string{"MSB_FAKE_JOB_FAILURE_STAGE": "Command::post_start"}},
+		{"signals disagree about starting", map[string]string{"MSB_FAKE_JOB_FAILURE_STARTED": "1"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			key, _ := testAuthority(t)
+			bin, _ := fakeMSB(t, tc.env)
+			backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
+			job := testContract(t, key, func(c *JobContractV2) { c.JobID = "unproven"; c.Nonce = "n-unproven" })
+
+			disp, err := backend.Dispatch(testContext(t), job, nil)
+			if err != nil {
+				t.Fatalf("dispatch: %v", err)
+			}
+			res, werr := backend.Wait(testContext(t), job, disp)
+			if werr == nil {
+				t.Fatalf("an unproven rejection produced an observation: %+v", res)
+			}
+			if !errors.Is(werr, ErrExecutionUnobserved) {
+				t.Fatalf("unproven rejection = %v, want unobserved", werr)
+			}
+			if !strings.Contains(werr.Error(), "without proof that the command never started") {
+				t.Fatalf("refusal %q does not state the missing proof", werr)
+			}
+			if res != nil {
+				t.Fatalf("an unobserved outcome carried a result: %+v", res)
+			}
+		})
+	}
+}
+
+// TestPreExecutionFailureRequiresEverySignal pins the predicate the
+// no-effect claim rests on: a typed failure at a recognized
+// pre-execution stage, with no pid and no start timestamp. Any single
+// signal showing a started process refuses the claim.
+func TestPreExecutionFailureRequiresEverySignal(t *testing.T) {
+	started := int64(1)
+	pid := uint32(4242)
+	cases := []struct {
+		name string
+		rec  msbJobRecord
+		want bool
+	}{
+		{"proven pre-execution failure", msbJobRecord{
+			Failure: &msbJobFailure{Kind: "not_found", Stage: "Command::spawn"},
+		}, true},
+		{"no failure object", msbJobRecord{}, false},
+		{"failure without a stage", msbJobRecord{Failure: &msbJobFailure{Kind: "not_found"}}, false},
+		{"unrecognized stage", msbJobRecord{Failure: &msbJobFailure{Kind: "x", Stage: "Command::post_start"}}, false},
+		{"record shows a pid", msbJobRecord{
+			Failure: &msbJobFailure{Kind: "not_found", Stage: "Command::spawn"}, PID: &pid,
+		}, false},
+		{"record shows a start timestamp", msbJobRecord{
+			Failure: &msbJobFailure{Kind: "not_found", Stage: "Command::spawn"}, StartedAt: &started,
+		}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := preExecutionFailure(&tc.rec); got != tc.want {
+				t.Fatalf("preExecutionFailure = %t, want %t (%s)", got, tc.want, tc.rec.failureShape())
+			}
+		})
+	}
+}
+
 // TestMSBWaitLostRuntimeIsUnobserved: the runtime lost the job
 // without a confirmed exit. That is exactly the outcome the plan
 // forbids inventing a result for — it must come back unobserved.
@@ -2393,6 +2514,128 @@ func TestMSBCreateArgsArePolicyDerived(t *testing.T) {
 	}
 	if last := args[len(args)-1]; last != job.Image+"@"+job.ImageDigest {
 		t.Fatalf("create ends with %q, not the authority-pinned image", last)
+	}
+}
+
+// TestBootedNetworkRefusesUnverifiedSurfaces (RC7.2, F-046): the
+// runtime's network object carries interception, secret and resolution
+// fields the policy never authorizes. Each refuses on its own, whatever
+// the rest of the network configuration says.
+func TestBootedNetworkRefusesUnverifiedSurfaces(t *testing.T) {
+	policy := &EffectivePolicyV1{NetworkMode: NetworkNone}
+	base := func() map[string]any {
+		return map[string]any{"network": map[string]any{
+			"policy": map[string]any{"default_egress": "deny", "default_ingress": "deny", "rules": []any{}},
+		}}
+	}
+	if err := verifyBootedNetwork(policy, base()); err != nil {
+		t.Fatalf("a clean network refused: %v", err)
+	}
+	cases := []struct {
+		name string
+		net  map[string]any
+		want string
+	}{
+		{"injected secrets", map[string]any{"secrets": map[string]any{
+			"secrets": []any{map[string]any{"name": "HOST_TOKEN"}},
+		}}, "injected secret"},
+		{"TLS interception", map[string]any{"tls": map[string]any{"enabled": true}}, "TLS interception"},
+		{"interception CA", map[string]any{"tls": map[string]any{
+			"intercept_ca": map[string]any{"cert_path": "/tmp/ca.pem"},
+		}}, "interception certificate authority"},
+		{"upstream CA pinning", map[string]any{"tls": map[string]any{
+			"upstream_ca_cert": []any{"PEM"},
+		}}, "upstream_ca_cert"},
+		{"host CA trust", map[string]any{"trust_host_cas": true}, "trusts the host"},
+		{"non-strict network", map[string]any{"strict": false}, "not strict"},
+		{"DNS override", map[string]any{"dns": map[string]any{
+			"nameservers": []any{"10.0.0.1"},
+		}}, "DNS nameserver override"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := base()
+			netw := cfg["network"].(map[string]any)
+			for k, v := range tc.net {
+				netw[k] = v
+			}
+			err := verifyBootedNetwork(policy, cfg)
+			if err == nil {
+				t.Fatalf("%s was accepted", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("refusal %q does not mention %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// TestBootedMountsRefusesHostRootSymlinkFollowing: a mount that follows
+// host root symlinks can resolve to a path the policy never authorized,
+// so the flag is part of what the mount must prove.
+func TestBootedMountsRefusesHostRootSymlinkFollowing(t *testing.T) {
+	policy := &EffectivePolicyV1{Mounts: []Mount{{Source: "/host/src", Dest: "/guest/src"}}}
+	clean := map[string]any{"mounts": []any{map[string]any{"host": "/host/src", "guest": "/guest/src"}}}
+	if err := verifyBootedMounts(policy, clean); err != nil {
+		t.Fatalf("an authorized mount refused: %v", err)
+	}
+	following := map[string]any{"mounts": []any{map[string]any{
+		"host": "/host/src", "guest": "/guest/src", "follow_root_symlinks": true,
+	}}}
+	err := verifyBootedMounts(policy, following)
+	if err == nil {
+		t.Fatal("a mount following host root symlinks was accepted")
+	}
+	if !strings.Contains(err.Error(), "follows host root symlinks") {
+		t.Fatalf("refusal %q does not name the flag", err)
+	}
+}
+
+// TestBootedConfigClosureIsDeep (RC7.2, F-046): the closure holds at
+// every level, not only at the top. A field the schema does not define
+// refuses wherever it sits, and the refusal names where.
+func TestBootedConfigClosureIsDeep(t *testing.T) {
+	known := map[string]any{}
+	for path := range bootedConfigFields {
+		if strings.ContainsAny(path, ".[") {
+			continue
+		}
+		known[path] = "x"
+	}
+	if err := verifyClosedConfig(known); err != nil {
+		t.Fatalf("a configuration of only defined top-level fields refused: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		cfg  map[string]any
+		want string
+	}{
+		{"unknown inside network", map[string]any{
+			"network": map[string]any{"proxy": "x"},
+		}, "at network"},
+		{"unknown inside runtime", map[string]any{
+			"runtime": map[string]any{"capabilities": []any{}},
+		}, "at runtime"},
+		{"unknown inside a mount", map[string]any{
+			"mounts": []any{map[string]any{"host_permissions": "private", "device": "y"}},
+		}, "at mounts[]"},
+		{"unknown inside a network rule destination", map[string]any{
+			"network": map[string]any{"policy": map[string]any{"rules": []any{
+				map[string]any{"destination": map[string]any{"domain": "a", "port_range": "1-2"}},
+			}}},
+		}, "at network.policy.rules[].destination"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := verifyClosedConfig(tc.cfg)
+			if err == nil {
+				t.Fatalf("%s was accepted", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("refusal %q does not name %q", err, tc.want)
+			}
+		})
 	}
 }
 

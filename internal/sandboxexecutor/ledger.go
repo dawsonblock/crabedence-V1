@@ -782,12 +782,8 @@ func (l *Ledger) ActiveUsage(grace time.Duration) (*PoolUsage, error) {
 			return nil, err
 		}
 		c, cerr := ParseContract(json.RawMessage(raw))
-		if cerr == nil && c.Resources.TimeoutSeconds > 0 {
-			deadline := time.UnixMilli(updatedAt).
-				Add(time.Duration(c.Resources.TimeoutSeconds)*time.Second + grace)
-			if now.After(deadline) {
-				continue
-			}
+		if vmProvablyDead(time.UnixMilli(updatedAt), c, grace, now) {
+			continue
 		}
 		usage.VMs++
 		usage.PerSubmitter[submitter]++
@@ -799,6 +795,34 @@ func (l *Ledger) ActiveUsage(grace time.Duration) (*PoolUsage, error) {
 		}
 	}
 	return usage, rows.Err()
+}
+
+// vmProvablyDead reports whether the VM a row may represent can no
+// longer exist.
+//
+// There are exactly two ways a reservation ends. The first is verified
+// cleanup: the removal succeeded and the ledger cleared
+// cleanup_pending, so the row stops being a candidate here at all. The
+// second is this one — a time bound — and it is not verification of
+// anything. A VM cannot outlive its own runtime-enforced --max-duration,
+// which the backend pins to the contract timeout plus the observation
+// grace, so once that bound plus the caller's grace has certainly
+// elapsed the reservation is released even though the row stays
+// unresolved for the operator's audit.
+//
+// The bound therefore rests on the pinned runtime honouring
+// --max-duration, which is part of what the runtime identity is pinned
+// by digest to guarantee. It is deliberately conservative — the caller's
+// grace is larger than the VM's own, and a terminal row's last
+// transition is always later than the VM's creation — so the release
+// never outruns the VM. A row whose contract cannot be parsed, or that
+// declares no timeout, is never released this way: the bound cannot be
+// established, so the reservation is held rather than guessed away.
+func vmProvablyDead(updatedAt time.Time, contract *JobContractV2, grace time.Duration, now time.Time) bool {
+	if contract == nil || contract.Resources.TimeoutSeconds == 0 {
+		return false
+	}
+	return now.After(updatedAt.Add(time.Duration(contract.Resources.TimeoutSeconds)*time.Second + grace))
 }
 
 // Count reports the durable registry size.
