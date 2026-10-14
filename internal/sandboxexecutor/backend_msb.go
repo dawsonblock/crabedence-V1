@@ -365,6 +365,46 @@ type msbJobFailure struct {
 	Stage     string `json:"stage"`
 }
 
+// preExecutionStages are the failure stages the pinned runtime reports
+// when it rejected a command before creating a process. The set is
+// qualified against the pinned runtime — the stage is the runtime's own
+// statement of where it failed — and an unrecognized stage fails
+// closed: if the executor cannot read the stage as pre-execution, it
+// cannot prove the workload never ran, and that is an unresolved
+// outcome rather than a no-effect claim.
+var preExecutionStages = map[string]bool{
+	"Command::spawn": true,
+}
+
+// preExecutionFailure reports whether the runtime's record positively
+// evidences that no process was ever created: a typed failure at a
+// recognized pre-execution stage, with no pid and no start timestamp.
+// Every signal must agree — one that shows a started process refuses
+// the claim outright.
+func preExecutionFailure(rec *msbJobRecord) bool {
+	if rec.Failure == nil || rec.PID != nil || rec.StartedAt != nil {
+		return false
+	}
+	return preExecutionStages[rec.Failure.Stage]
+}
+
+// failureShape renders what a failed record actually shows, so an
+// operator reading the audit log can see which signal was missing
+// rather than only that the claim was refused.
+func (r *msbJobRecord) failureShape() string {
+	kind, stage := "-", "-"
+	if r.Failure != nil {
+		if r.Failure.Kind != "" {
+			kind = r.Failure.Kind
+		}
+		if r.Failure.Stage != "" {
+			stage = r.Failure.Stage
+		}
+	}
+	return fmt.Sprintf("failure=%t kind=%s stage=%s pid=%t started=%t",
+		r.Failure != nil, kind, stage, r.PID != nil, r.StartedAt != nil)
+}
+
 // finishedAt converts the runtime's finish timestamp, falling back to
 // observation time when the record carries none.
 func (r *msbJobRecord) finishedAt() time.Time {
@@ -1113,16 +1153,27 @@ func (b *MSBBackend) observe(obsCtx, parent context.Context, job *JobContractV2,
 				}
 				return res, nil
 			case "failed":
-				kind := "unknown"
-				if rec.Failure != nil && rec.Failure.Kind != "" {
-					kind = rec.Failure.Kind
+				// A no-effect claim needs positive evidence that no
+				// process was ever created, and the runtime's own
+				// record is where that lives: a typed failure, at a
+				// pre-execution stage, with no pid and no start
+				// timestamp. A bare `failed` state proves nothing about
+				// whether the workload ran — defaulting the kind to
+				// "unknown" made every failure a no-effect claim — so
+				// an untyped failure, an unrecognized stage, or a
+				// record showing a started process is unobserved
+				// instead.
+				if !preExecutionFailure(rec) {
+					return nil, fmt.Errorf("%w: job %s is failed without proof that the command never started (%s)",
+						ErrExecutionUnobserved, run.RunID, rec.failureShape())
 				}
 				return &ExecResult{
 					RuntimeState:   rec.State,
 					RunID:          run.RunID,
 					BootID:         run.BootID,
 					PolicyDigest:   run.PolicyDigest,
-					FailureKind:    kind,
+					FailureKind:    rec.Failure.Kind,
+					FailureStage:   rec.Failure.Stage,
 					FailureMessage: rec.Failure.text(),
 					FinishedAt:     rec.finishedAt(),
 				}, nil

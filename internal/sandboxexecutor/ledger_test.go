@@ -489,6 +489,45 @@ func TestCleanupCandidatesWalkEveryRow(t *testing.T) {
 	}
 }
 
+// TestReservationBoundOutlastsTheVMsOwnLifetime (RC7.2, F-048): there
+// are two ways a reservation ends — verified cleanup, and the time
+// bound — and the bound is not verification of anything, so it must not
+// release a reservation while the VM could still exist. It has to
+// outlast the runtime's own --max-duration, which the backend pins to
+// the contract timeout plus the observation grace.
+func TestReservationBoundOutlastsTheVMsOwnLifetime(t *testing.T) {
+	key, _ := testAuthority(t)
+	contract := testContract(t, key, func(c *JobContractV2) { c.Resources.TimeoutSeconds = 60 })
+	grace := defaultDispatchTimeout + time.Minute
+	updated := time.Now().UTC()
+	lifetime := time.Duration(contract.Resources.TimeoutSeconds) * time.Second
+
+	if grace <= maxDurationGrace {
+		t.Fatalf("the caller's grace %s does not exceed the VM's own %s", grace, maxDurationGrace)
+	}
+	vmDeath := updated.Add(lifetime + maxDurationGrace)
+	if vmProvablyDead(updated, contract, grace, vmDeath) {
+		t.Fatal("the bound released a reservation while the VM could still be alive")
+	}
+	if !vmProvablyDead(updated, contract, grace, updated.Add(lifetime+grace+time.Second)) {
+		t.Fatal("a provably dead VM still held its reservation")
+	}
+}
+
+// TestReservationBoundHoldsWhenItCannotBeEstablished: the bound is only
+// usable when the VM's lifetime is known. A row whose contract cannot
+// be parsed, or that declares no timeout, is held rather than guessed
+// away.
+func TestReservationBoundHoldsWhenItCannotBeEstablished(t *testing.T) {
+	far := time.Now().UTC().Add(1000 * time.Hour)
+	if vmProvablyDead(time.Now().UTC(), nil, time.Minute, far) {
+		t.Fatal("an unparseable contract was released by the bound")
+	}
+	if vmProvablyDead(time.Now().UTC(), &JobContractV2{}, time.Minute, far) {
+		t.Fatal("a contract declaring no timeout was released by the bound")
+	}
+}
+
 func TestLedgerRefusesSymlink(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "real.db")

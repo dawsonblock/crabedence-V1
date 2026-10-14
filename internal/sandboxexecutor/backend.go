@@ -204,6 +204,12 @@ type ExecResult struct {
 	// the guest rejected the command before it started; the workload
 	// provably produced no effect.
 	FailureKind string `json:"failure_kind,omitempty"`
+	// FailureStage is the runtime's own statement of where that
+	// failure occurred. It is what makes the no-effect claim auditable
+	// rather than asserted: a receipt carrying a pre-execution stage
+	// names the proof that nothing ran, and a stage that is not
+	// pre-execution never reaches a receipt at all.
+	FailureStage string `json:"failure_stage,omitempty"`
 	// FailureMessage is the runtime's own explanation of that
 	// rejection, recorded for the operator.
 	FailureMessage string `json:"failure_message,omitempty"`

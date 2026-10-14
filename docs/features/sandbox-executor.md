@@ -46,15 +46,23 @@ that policy exactly, in both the persisted `config` and the resolved
 
 A mismatch destroys the VM before the guest command runs.
 
-The comparison is a **closure, not a checklist**. Every field the pinned
-runtime's resolved configuration carries must be one the policy was qualified
-against; a field the schema does not define refuses by name, so a capability the
+The comparison is a **closure at every level, not only at the top**. Every field
+the pinned runtime's resolved configuration carries must be one the policy was
+qualified against, and the schema is taken from the pinned runtime's own output;
+a field it does not define refuses by name and by path, so a capability the
 pinned runtime grows, or one a substituted runtime invents, can never ride along
-unverified. A **guest-to-host `vsock` route** refuses in its own right even when
-every other field matches exactly — a host channel is reachability, and a host
-local-IPC endpoint, that the policy never authorizes. The `msb create` command
-is derived from the compiled policy alone, so no operator-supplied flag can add
-a setting the verification does not cover.
+unverified inside a nested object. Closing only the top level left a whole
+surface invisible while the policy claimed to check the booted VM exactly, so
+the security-relevant nested fields are verified on their own terms as well:
+**injected secrets**, **TLS interception** and an **interception certificate
+authority**, upstream CA pinning, **host CA trust**, a non-strict network, a
+**DNS nameserver override**, and **host-root-symlink following** on a mount each
+refuse, whatever the rest of the configuration says. A **guest-to-host `vsock`
+route** refuses in its own right even when every other field matches exactly — a
+host channel is reachability, and a host local-IPC endpoint, that the policy
+never authorizes. The `msb create` command is derived from the compiled policy
+alone, so no operator-supplied flag can add a setting the verification does not
+cover.
 
 **Runtime identity.** A qualified runtime manifest (JSON with `version`,
 `msb_sha256`, `libkrunfw_sha256` and an optional `components` map) is required.
@@ -83,9 +91,15 @@ code is invented), `failed` (the guest rejected the command before it started),
 `lost` or unreachable (unobserved). An unobserved outcome becomes
 `DISPATCH_AMBIGUOUS` with no receipt, and is never retried blind.
 
-A no-effect claim is only ever made from evidence, never from absence. The
-runtime durably records a spawn it rejected as a typed failure, so that is what
-proves the workload produced no effect; a launch that failed before the runtime
+A no-effect claim is only ever made from positive evidence, never from absence
+and never from a generic failure. What proves the workload produced no effect is
+the runtime's own record of a typed failure at a **pre-execution stage**
+(`Command::spawn`), with no pid and no start timestamp — every signal must
+agree, and the stage is bound into the result and re-checked when the outcome is
+classified, so the receipt names the proof rather than asserting it. A bare
+`failed` state, a failure the runtime did not type as pre-execution, or a record
+showing a started process demonstrates nothing about whether the workload ran
+and is left unresolved instead. Likewise a launch that failed before the runtime
 admitted anything leaves no record at all, and an absent record is not proof
 that nothing executed — that outcome stays `DISPATCH_AMBIGUOUS`, its VM is left
 for reconciliation rather than destroyed under a workload that may be running,
@@ -205,9 +219,24 @@ Cleanup is tracked separately from the result: the terminal write records
 cleanup intent, the sandbox removal runs after, and a failure is recorded as
 `cleanup_pending` (with the reason) and retried at the next startup. A cleanup
 failure never rewrites the observed result, and the VM's own contract bound is
-the backstop. Until that removal is verified the job **keeps its pool
+the backstop. Until the removal is verified the job **keeps its pool
 reservation**: the guest process finishing is not the microVM ceasing to exist,
-so capacity is released on verified cleanup rather than on workload completion.
+so capacity is not released because the workload completed.
+
+A reservation ends in exactly two ways, and only the first is verification.
+**Verified cleanup** — the removal succeeded and the ledger cleared
+`cleanup_pending` — ends it outright. The second is the VM's own
+runtime-enforced `--max-duration`, which the backend pins to the contract
+timeout plus the observation grace: once that bound plus the caller's grace has
+certainly elapsed the VM cannot exist, and the reservation is released even
+though the row stays unresolved for the operator's audit. That bound is not
+verification of anything — it rests on the pinned runtime honouring
+`--max-duration`, which is part of what the runtime identity is pinned by digest
+to guarantee. It is deliberately conservative (the caller's grace exceeds the
+VM's own, and a terminal row's last transition is always later than the VM's
+creation), and a row whose contract cannot be parsed or that declares no timeout
+is never released this way: the bound cannot be established, so the reservation
+is held rather than guessed away.
 
 ## Platform qualification
 

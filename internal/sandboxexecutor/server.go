@@ -1000,11 +1000,18 @@ func classifyObserved(contract *JobContractV2, res *ExecResult) (state, outcome 
 	state, outcome = JobStateSucceeded, evidence.OutcomeCompleted
 	switch {
 	case res.FailureKind != "":
-		// The guest rejected the command before it started: the
-		// workload provably produced no effect, and the job identity
-		// persists for the audit.
+		// A no-effect claim rests on the runtime's own statement that
+		// it failed before creating a process. The stage is the proof,
+		// so it is re-checked here rather than trusted from the
+		// backend: a rejection the executor cannot read as
+		// pre-execution has demonstrated nothing about whether the
+		// workload ran, and claiming NO_EFFECT for it would be a false
+		// receipt.
+		if !preExecutionStages[res.FailureStage] {
+			return "", "", nil, "", false
+		}
 		state, outcome = JobStateDispatchFailed, evidence.OutcomeNoEffect
-		errText = fmt.Sprintf("command rejected before start (%s): %s", res.FailureKind, res.FailureMessage)
+		errText = fmt.Sprintf("command rejected before start (%s at %s): %s", res.FailureKind, res.FailureStage, res.FailureMessage)
 	case res.TimedOut:
 		// The runtime killed the command at the contract deadline: an
 		// observed outcome, but not a guest exit — no exit code is
