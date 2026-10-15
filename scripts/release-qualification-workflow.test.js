@@ -50,6 +50,7 @@ test("permissions are read-only except the attesting evidence job", () => {
     "postgres",
     "nemo",
     "cross-language",
+    "live-microvm",
   ]) {
     assert.doesNotMatch(job(name), /contents: write|id-token: write|attestations: write/, `${name} is read-only`);
   }
@@ -83,7 +84,7 @@ test("evidence is verified before it is attested", () => {
   }
   assert.match(evidence, /subject-path: dist\/release-evidence\/evidence-manifest\.json/);
   assert.match(evidence, /"evidence_sha256": "\$\{\{ steps\.qual_summary\.outputs\.evidence_sha256 \}\}"/);
-  assert.match(evidence, /needs: \[provenance, go-tests, go-race, worker, postgres, nemo, cross-language\]/);
+  assert.match(evidence, /needs: \[provenance, go-tests, go-race, worker, postgres, nemo, cross-language, live-microvm\]/);
 });
 
 test("the evidence job runs the full release-script gate inputs", () => {

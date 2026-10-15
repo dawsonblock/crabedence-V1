@@ -31,9 +31,19 @@ import (
 
 const liveImage = "python:3.12"
 
+// msbQualifying reports release-qualification mode: under it the suite's
+// prerequisites fail rather than skip. A claimed lane whose runtime,
+// image, or host capability is missing is a failed gate — never a
+// silently-passed one. Ordinary development runs keep skipping so
+// portable unit tests stay portable.
+func msbQualifying() bool { return os.Getenv("CRABBOX_MSB_QUALIFY") == "1" }
+
 func msbOrSkip(t *testing.T) string {
 	t.Helper()
 	if os.Getenv("CRABBOX_MSB_LIVE") != "1" {
+		if msbQualifying() {
+			t.Fatal("CRABBOX_MSB_LIVE=1 not set — a qualification run must enable live mode explicitly")
+		}
 		t.Skip("CRABBOX_MSB_LIVE=1 not set — skipping live microsandbox test")
 	}
 	candidates := []string{}
@@ -48,6 +58,9 @@ func msbOrSkip(t *testing.T) string {
 			return c
 		}
 	}
+	if msbQualifying() {
+		t.Fatal("no msb binary found — a claimed lane cannot qualify without the pinned runtime")
+	}
 	t.Skip("no msb binary found")
 	return ""
 }
@@ -59,6 +72,9 @@ func liveImageDigest(t *testing.T, bin string) string {
 	t.Helper()
 	out, err := exec.Command(bin, "image", "list", "--format", "json").Output()
 	if err != nil {
+		if msbQualifying() {
+			t.Fatalf("msb image list failed on a claimed lane: %v", err)
+		}
 		t.Skipf("msb image list failed: %v", err)
 	}
 	var images []struct {
@@ -72,6 +88,9 @@ func liveImageDigest(t *testing.T, bin string) string {
 		if img.Reference == liveImage || strings.HasPrefix(img.Reference, liveImage+"@") {
 			return img.Digest
 		}
+	}
+	if msbQualifying() {
+		t.Fatalf("image %s is not cached on a claimed lane — the qualification environment must provide it", liveImage)
 	}
 	t.Skipf("image %s is not cached locally — pull it first", liveImage)
 	return ""
@@ -945,6 +964,9 @@ func liveLane(t *testing.T) (osName, arch, lane string, laneSupported bool) {
 func TestMSBLivePlatformIdentity(t *testing.T) {
 	osName, arch, lane, supported := liveLane(t)
 	if !supported {
+		if msbQualifying() {
+			t.Fatalf("unsupported host for microVM qualification: %s/%s provides no %s lane — a claimed lane cannot qualify here", osName, arch, lane)
+		}
 		t.Skipf("unsupported host for microVM qualification: %s/%s provides no %s lane", osName, arch, lane)
 	}
 	t.Logf("microVM qualification lane: %s (%s/%s)", lane, osName, arch)

@@ -173,6 +173,38 @@ if [ -f "$ARTIFACT_JSON" ]; then
   fi
 fi
 
+# ─── Lane claims and release identity binding ──────────────────────────
+# The record's claimed_lanes are the lanes the release asserts support
+# for — the shared validator already requires each to be backed by a
+# passing mandatory lane gate, which is reported above. Here we bind the
+# release identity and restrict the support claim: release-manifest.json
+# may only advertise lanes the record actually qualified.
+CLAIMED_LANES="$(jq -r '.claimed_lanes // [] | join(" ")' "$QUAL_FILE" 2>/dev/null || echo "")"
+QUALIFIED_LANES="$(jq -r '.qualified_lanes // [] | join(" ")' "$QUAL_FILE" 2>/dev/null || echo "")"
+QUAL_RELEASE="$(jq -r '.release // empty' "$QUAL_FILE" 2>/dev/null || echo "")"
+if [ -n "$CLAIMED_LANES" ]; then
+  echo "  Claimed lanes: $CLAIMED_LANES"
+  echo "  Qualified lanes: ${QUALIFIED_LANES:-<none>}"
+fi
+MANIFEST_JSON="$EVIDENCE_DIR/release-manifest.json"
+if [ -f "$MANIFEST_JSON" ]; then
+  manifest_version="$(jq -r '.release_version // empty' "$MANIFEST_JSON" 2>/dev/null || echo "")"
+  if [ -n "$QUAL_RELEASE" ] && [ "$manifest_version" != "$QUAL_RELEASE" ]; then
+    echo "  INCONSISTENCY: release-manifest.json version $manifest_version does not equal the qualified release $QUAL_RELEASE" >&2
+    CONSISTENT=false
+  fi
+  # Every lane the manifest claims support for must be qualified by the
+  # record — a manifest cannot widen the support claim beyond evidence.
+  while IFS= read -r sl; do
+    [ -z "$sl" ] && continue
+    case " $QUALIFIED_LANES " in
+      *" $sl "*) ;;
+      *) echo "  INCONSISTENCY: release-manifest.json claims supported lane $sl with no qualified lane evidence" >&2
+         CONSISTENT=false ;;
+    esac
+  done < <(jq -r '.supported_lanes // [] | .[]' "$MANIFEST_JSON" 2>/dev/null)
+fi
+
 # ─── Admission decision ────────────────────────────────────────────────
 echo ""
 

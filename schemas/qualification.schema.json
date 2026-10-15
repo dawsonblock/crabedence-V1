@@ -6,6 +6,7 @@
   "type": "object",
   "required": [
     "schema_version",
+    "release",
     "release_status",
     "artifact_promotable",
     "gate_summary",
@@ -15,10 +16,26 @@
     "toolchains",
     "environment"
   ],
+  "definitions": {
+    "boundFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file", "sha256"],
+      "properties": {
+        "file": { "type": "string", "minLength": 1 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    }
+  },
   "properties": {
     "schema_version": {
       "type": "integer",
       "enum": [2]
+    },
+    "release": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Canonical release version this record qualifies; must equal the VERSION file and the release manifest."
     },
     "release_status": {
       "type": "string",
@@ -26,6 +43,16 @@
     },
     "artifact_promotable": {
       "type": "boolean"
+    },
+    "claimed_lanes": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "description": "Virtualization lanes the release claims support for. Every claimed lane must be backed by a passing mandatory gate carrying test_suite evidence for that lane."
+    },
+    "qualified_lanes": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "description": "Lanes with passing per-test evidence in this record. supported_lanes in the release manifest derives from this."
     },
     "gate_summary": {
       "type": "object",
@@ -72,6 +99,19 @@
             "properties": {
               "file": { "type": "string", "minLength": 1 },
               "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+            }
+          },
+          "test_suite": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["suite", "lane", "inventory", "results", "raw"],
+            "description": "Per-test evidence binding: the digest-bound results file must satisfy the bundled required-test inventory for the lane — every required case exactly once, status pass, identity matching the record.",
+            "properties": {
+              "suite": { "type": "string", "minLength": 1 },
+              "lane": { "type": "string", "minLength": 1 },
+              "inventory": { "$ref": "#/definitions/boundFile" },
+              "results": { "$ref": "#/definitions/boundFile" },
+              "raw": { "$ref": "#/definitions/boundFile" }
             }
           }
         }

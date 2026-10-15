@@ -36,6 +36,21 @@
 #       PASS requires tests_executed > 0 and tests_failed == 0
 #   - non-test-bearing gate must not report nonzero test counts
 #   - evidence.sha256 must be a 64-character lowercase hex digest
+#
+# Optional extensions (fail closed when present, absent when unused):
+#   - gate.test_suite: a per-test evidence binding
+#       {"suite","lane","inventory":{file,sha256},
+#        "results":{file,sha256},"raw":{file,sha256}}
+#     The results file is validated case-by-case against the bundled
+#     required-test inventory: every required case for the lane must
+#     appear exactly once with status "pass"; absent, skipped,
+#     duplicated, failed, or foreign-lane cases are findings; so are
+#     identity drift (commit, toolchain, runner os), aggregate
+#     inconsistency, and results that disagree with the raw stream.
+#   - qualification.claimed_lanes: the virtualization lanes this
+#     release claims support for. Every claimed lane must be backed by
+#     a passing mandatory gate carrying test_suite evidence for that
+#     lane — a lane claim without lane evidence cannot admit.
 
 # shellcheck disable=SC2034
 QUALIFICATION_SCHEMA_VERSION=2
@@ -96,12 +111,34 @@ qualification_gate_structure_findings() {
       elif ($o[$k] | is_int | not) then "\($p).\($k) is not an integer"
       elif ($o[$k] < 0) then "\($p).\($k) is negative"
       else empty end;
+    def opt_suite($g; $p):
+      if ($g | has("test_suite") | not) then empty
+      elif ($g.test_suite | type) != "object" then "\($p).test_suite is not an object"
+      else
+        req_str($g.test_suite; "suite"; "\($p).test_suite"),
+        req_str($g.test_suite; "lane"; "\($p).test_suite"),
+        (["inventory", "results", "raw"][] | . as $k |
+          if ($g.test_suite | has($k) | not) then "\($p).test_suite.\($k) is missing"
+          elif ($g.test_suite[$k] | type) != "object" then "\($p).test_suite.\($k) is not an object"
+          else req_str($g.test_suite[$k]; "file"; "\($p).test_suite.\($k)"),
+               req_str($g.test_suite[$k]; "sha256"; "\($p).test_suite.\($k)")
+          end)
+      end;
     if (type != "object") then "qualification record is not a JSON object"
     elif (has("gates") | not) then "gates is missing"
     elif (.gates | type) != "array" then "gates is not an array"
     elif (.gates | length) == 0 then "gates is empty (a qualification record must carry at least one gate)"
     else
-      .gates | to_entries[] |
+      (if (has("release") | not) then "release is missing (the record must carry the release identity it evaluated)"
+       elif (.release | type) != "string" then "release is not a string"
+       elif (.release | length) == 0 then "release is empty"
+       else empty end),
+      (if (has("claimed_lanes") | not) then empty
+       elif (.claimed_lanes | type) != "array" then "claimed_lanes is not an array"
+       elif (.claimed_lanes | map(type == "string" and length > 0) | all | not)
+            then "claimed_lanes must contain only non-empty strings"
+       else empty end),
+      (.gates | to_entries[] |
       .key as $i | .value as $g | "gates[\($i)]" as $p |
       if ($g | type) != "object" then "\($p) is not an object"
       else
@@ -117,10 +154,167 @@ qualification_gate_structure_findings() {
          end),
         opt_uint($g; "tests_executed"; $p),
         opt_uint($g; "tests_failed"; $p),
-        opt_uint($g; "duration_ms"; $p)
-      end
+        opt_uint($g; "duration_ms"; $p),
+        opt_suite($g; $p)
+      end)
     end
   ' "$1" 2>/dev/null
+}
+
+# required_tests_case_findings <cases.json> <inventory.json> <lane>
+#
+# Prints one finding per violation of the required-test inventory for
+# the given lane. A lane's required set is the common cases plus that
+# lane's platform-specific cases; each must appear exactly once with
+# status "pass". Absent, skipped, failed, duplicated, multi-event, or
+# foreign-lane executions are all findings. Empty output is the pass.
+required_tests_case_findings() {
+  jq -n --slurpfile cases "$1" --slurpfile inv "$2" --arg lane "$3" '
+    ($inv[0]) as $inv | ($cases[0].tests // []) as $tests |
+    ((($inv.common_required_tests // []) +
+      (($inv.platform_specific_tests // {})[$lane] // [])) | unique) as $required |
+    ($tests | map(.name)) as $names |
+    (
+      $required[] | . as $t |
+      ([ $names[] | select(. == $t) ] | length) as $n |
+      if $n == 0 then "required test \($t) absent from results"
+      elif $n > 1 then "required test \($t) recorded \($n) times"
+      else empty end
+    ),
+    (
+      $tests[] | . as $tc |
+      if ($required | index($tc.name)) == null then empty
+      else
+        (if ($tc.status != "pass")
+         then "required test \($tc.name) status=\($tc.status) (want pass)" else empty end),
+        (if (($tc.terminal_events // 1) != 1)
+         then "required test \($tc.name) recorded \($tc.terminal_events) terminal events"
+         else empty end)
+      end
+    ),
+    (
+      $names | group_by(.)[] | select(length > 1) | .[0] |
+      "test \(.) recorded more than once"
+    ),
+    (
+      # An executed case the inventory does not require means the bound
+      # inventory does not describe this run — either the inventory was
+      # swapped to drop required cases or the suite outgrew it. The
+      # record may not claim coverage it cannot account for.
+      $tests[] | select(.status == "pass" or .status == "fail") | .name | split("/")[0] |
+      select(. as $n | $required | index($n) == null) |
+      "test \(.) executed but is not in the required inventory for lane \($lane)"
+    ),
+    (
+      (($inv.platform_specific_tests // {}) | to_entries
+        | map(select(.key != $lane) | .value[])) as $foreign |
+      $tests[] | select(.status != "skip") | .name | split("/")[0] |
+      select(. as $n | $foreign | index($n) != null) |
+      "test \(.) is platform-specific to another lane and must not execute here"
+    )
+  '
+}
+
+# validate_test_suite_binding <qualification.json> <gate_index> <evidence_dir>
+#
+# Validates one gate's test_suite evidence binding: the bound files must
+# exist inside the bundle, their digests must match the record, and the
+# results must satisfy the inventory for the gate's lane with identity
+# (commit, toolchain, runner os) matching the qualification record.
+validate_test_suite_binding() {
+  local qual="$1" idx="$2" dir="$3"
+  local gid suite lane inv_file inv_sha res_file res_sha raw_file raw_sha
+  gid="$(jq -r ".gates[$idx].gate_id" "$qual")"
+  IFS=$'\t' read -r suite lane inv_file inv_sha res_file res_sha raw_file raw_sha \
+    <<<"$(jq -r '.gates['"$idx"'].test_suite |
+        [.suite, .lane,
+         .inventory.file, .inventory.sha256,
+         .results.file, .results.sha256,
+         .raw.file, .raw.sha256] | @tsv' "$qual")"
+
+  # Bundle confinement and existence: bound paths must stay inside the
+  # evidence tree and exist.
+  local defects=0 f
+  for f in "$inv_file" "$res_file" "$raw_file"; do
+    case "$f" in
+      /*|*..*)
+        echo "gate $gid: test_suite evidence path escapes the bundle: $f"
+        defects=$((defects + 1)) ;;
+      *)
+        if [ ! -f "$dir/$f" ]; then
+          echo "gate $gid: test_suite evidence file missing: $f"
+          defects=$((defects + 1))
+        fi ;;
+    esac
+  done
+  [ "$defects" -gt 0 ] && return 0
+
+  # Digest binding: every bound file must hash to the recorded digest.
+  local actual
+  actual="$(shasum -a 256 "$dir/$inv_file" | awk '{print $1}')"
+  if [ "$actual" != "$inv_sha" ]; then
+    echo "gate $gid: test_suite inventory digest $actual does not match the recorded $inv_sha"
+    defects=$((defects + 1))
+  fi
+  actual="$(shasum -a 256 "$dir/$res_file" | awk '{print $1}')"
+  if [ "$actual" != "$res_sha" ]; then
+    echo "gate $gid: test_suite results digest $actual does not match the recorded $res_sha"
+    defects=$((defects + 1))
+  fi
+  actual="$(shasum -a 256 "$dir/$raw_file" | awk '{print $1}')"
+  if [ "$actual" != "$raw_sha" ]; then
+    echo "gate $gid: test_suite raw digest $actual does not match the recorded $raw_sha"
+    defects=$((defects + 1))
+  fi
+  [ "$defects" -gt 0 ] && return 0
+
+  # Identity and aggregate consistency between the record, the results,
+  # and the inventory.
+  local commit go te tf
+  commit="$(jq -r '.provenance.commit // empty' "$qual")"
+  go="$(jq -r '.toolchains.go // empty' "$qual")"
+  te="$(jq -r ".gates[$idx].tests_executed // 0" "$qual")"
+  tf="$(jq -r ".gates[$idx].tests_failed // 0" "$qual")"
+  jq -n --arg gid "$gid" --arg suite "$suite" --arg lane "$lane" \
+    --arg commit "$commit" --arg go "$go" \
+    --argjson te "$te" --argjson tf "$tf" \
+    --slurpfile inv "$dir/$inv_file" --slurpfile res "$dir/$res_file" '
+    ($inv[0]) as $i | ($res[0]) as $r |
+    (if ($i.schema_version != 1) then "gate \($gid): inventory schema_version \($i.schema_version // "missing") (want 1)" else empty end),
+    (if ($i.suite != $suite) then "gate \($gid): inventory suite \($i.suite) != \($suite)" else empty end),
+    (if (($i.lanes // {}) | has($lane) | not) then "gate \($gid): inventory has no lane \($lane)" else empty end),
+    (if ($r.schema_version != 1) then "gate \($gid): results schema_version \($r.schema_version // "missing") (want 1)" else empty end),
+    (if ($r.suite != $suite) then "gate \($gid): results suite \($r.suite) != \($suite)" else empty end),
+    (if ($r.lane != $lane) then "gate \($gid): results lane \($r.lane) != \($lane)" else empty end),
+    (if ($r.source_commit != $commit) then "gate \($gid): results commit \($r.source_commit) does not match the qualified commit \($commit)" else empty end),
+    (if ($r.toolchain_go != $go) then "gate \($gid): results toolchain \($r.toolchain_go) does not match the qualified toolchain \($go)" else empty end),
+    (if (($i.lanes[$lane].goos // "") != ($r.runner.os // "")) then "gate \($gid): results runner os \($r.runner.os) is not the \($lane) lane os \($i.lanes[$lane].goos)" else empty end),
+    (if (($r.tests // []) | map(select(.status == "pass" or .status == "fail")) | length) != $te
+     then "gate \($gid): tests_executed=\($te) inconsistent with case results" else empty end),
+    (if (($r.tests // []) | map(select(.status == "fail")) | length) != $tf
+     then "gate \($gid): tests_failed=\($tf) inconsistent with case results" else empty end)
+  '
+
+  # Per-case coverage against the inventory.
+  required_tests_case_findings "$dir/$res_file" "$dir/$inv_file" "$lane" \
+    | sed "s/^/gate $gid: /"
+
+  # The normalized results must agree with the raw go test -json stream:
+  # a results file asserting outcomes the raw stream does not support
+  # is fabricated evidence.
+  if ! jq -n -e \
+    --slurpfile res "$dir/$res_file" --slurpfile raw "$dir/$raw_file" '
+    (($raw | map(select(.Test != null and
+        (.Action == "pass" or .Action == "fail" or .Action == "skip")))
+      | group_by(.Test) | map({key: .[0].Test, value: .[-1].Action})
+      | from_entries)
+    ==
+    (($res[0].tests // []) | map({key: .name, value: .status})
+      | from_entries))
+  ' >/dev/null 2>&1; then
+    echo "gate $gid: case results are inconsistent with the raw go test -json stream"
+  fi
+  return 0
 }
 
 # validate_qualification_gates <qualification.json>
@@ -238,6 +432,35 @@ validate_qualification_gates() {
       findings=$((findings + 1))
     fi
   done <<< "$rows"
+
+  # ─── Per-test suite bindings ─────────────────────────────────────────
+  # A gate carrying test_suite claims per-test evidence; the bound files
+  # live in the same evidence directory as the record and must satisfy
+  # the required-test inventory for the gate's lane.
+  local evidence_dir
+  evidence_dir="$(dirname "$qual")"
+  local idx finding
+  for idx in $(jq -r '.gates | to_entries[] | select(.value.test_suite != null) | .key' "$qual" 2>/dev/null); do
+    while IFS= read -r finding; do
+      [ -z "$finding" ] && continue
+      echo "$finding"
+      findings=$((findings + 1))
+    done < <(validate_test_suite_binding "$qual" "$idx" "$evidence_dir")
+  done
+
+  # ─── Claimed lanes ───────────────────────────────────────────────────
+  # Every lane the release claims support for must be backed by a
+  # passing mandatory gate carrying test_suite evidence for that lane.
+  local lane
+  while IFS= read -r lane; do
+    [ -z "$lane" ] && continue
+    if ! jq -e --arg lane "$lane" \
+      '[.gates[] | select(.test_suite.lane == $lane and .status == "PASS" and .mandatory == true)] | length > 0' \
+      "$qual" >/dev/null 2>&1; then
+      echo "claimed lane $lane has no passing mandatory lane gate"
+      findings=$((findings + 1))
+    fi
+  done < <(jq -r '.claimed_lanes // [] | .[]' "$qual" 2>/dev/null)
 
   [ "$findings" -eq 0 ]
 }

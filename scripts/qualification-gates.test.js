@@ -48,6 +48,7 @@ function record(t, mutate = () => {}) {
   ];
   const qualification = {
     schema_version: 2,
+    release: "9.9.9-test",
     release_status: "PASS",
     artifact_promotable: true,
     gate_summary: { total: gates.length, passed: gates.length, failed: 0, skipped: 0 },
@@ -209,6 +210,7 @@ test("the admission script and the verifier share one validator", () => {
 // summary from gates.
 function rawRecord(t, qualification) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cbx-gates-")));
+  qualification.release ??= "9.9.9-test";
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   fs.writeFileSync(path.join(root, "qualification.json"), JSON.stringify(qualification, null, 2));
   return root;

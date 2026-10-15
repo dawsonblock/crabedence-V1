@@ -28,6 +28,24 @@ source "$REPO_ROOT/scripts/lib/live-gate.sh"
 source "$REPO_ROOT/scripts/lib/redact.sh"
 source "$REPO_ROOT/scripts/lib/evidence-inventory.sh"
 
+# ─── Release identity (Phase 02) ────────────────────────────────────────
+# The canonical release identity is declared once, up front: the record's
+# embedded version is the VERSION file's, and only that value may label
+# the manifest. A mismatch is a provenance defect — fail before any gate
+# runs rather than producing an inconsistently-named bundle.
+if [ -z "${RELEASE_VERSION:-}" ]; then
+  echo "ERROR: RELEASE_VERSION must be set (e.g., 1.0.0-rc.7)" >&2
+  echo "       Refusing to use a hardcoded default." >&2
+  exit 1
+fi
+VERSION_FILE="$(tr -d '[:space:]' < "$REPO_ROOT/VERSION")"
+if [ "$RELEASE_VERSION" != "$VERSION_FILE" ]; then
+  echo "ERROR: RELEASE_VERSION=$RELEASE_VERSION does not equal VERSION ($VERSION_FILE)" >&2
+  echo "       The embedded release version must equal the canonical version source." >&2
+  exit 1
+fi
+RELEASE_NAME="${RELEASE_NAME:-crabedence-v${RELEASE_VERSION}}"
+
 # Clean previous generated artifacts.
 rm -f "$EVIDENCE_DIR"/*.json "$EVIDENCE_DIR"/SHA256SUMS \
   "$EVIDENCE_DIR"/source-tree-sha256.txt "$EVIDENCE_DIR"/source-tree-git-blobs.txt \
@@ -47,6 +65,10 @@ declare -a GATE_EXIT=()
 declare -a GATE_LOG=()
 declare -a GATE_TESTS=()
 declare -a GATE_DURATION=()
+# Per-gate test_suite evidence binding (JSON object, empty when the gate
+# carries none). Live virtualization lanes bind their per-test results
+# here so the shared validator can check the required-test inventory.
+declare -a GATE_SUITE=()
 
 # now_ms prints the current epoch time in milliseconds. perl is already a
 # release dependency (shasum is perl); the date fallback is
@@ -61,7 +83,7 @@ now_ms() {
 GATE_START_MS=""
 
 record_gate() {
-  local name="$1" type="$2" status="$3" exit_code="$4" log="$5" tests="${6:-}"
+  local name="$1" type="$2" status="$3" exit_code="$4" log="$5" tests="${6:-}" suite_json="${7:-}"
   local duration=0
   if [ -n "${GATE_START_MS:-}" ]; then
     duration=$(( $(now_ms) - GATE_START_MS ))
@@ -74,6 +96,7 @@ record_gate() {
   GATE_LOG+=("$log")
   GATE_TESTS+=("$tests")
   GATE_DURATION+=("$duration")
+  GATE_SUITE+=("$suite_json")
 }
 
 # ─── run_and_log (Phase 2) ──────────────────────────────────────────────────
@@ -316,33 +339,275 @@ run_gate go-race-providers TEST go test -v -race -count=1 -timeout=120s \
 run_gate go-race-sandboxexecutor TEST go test -v -race -count=1 -timeout=1200s \
   ./internal/sandboxexecutor/
 
-# ─── Live microVM lane ───────────────────────────────────────────────────────
-# The real-microVM qualification: a signed contract in, a booted microVM
-# executing it, a bound result out. It proves the isolation properties no
-# source-level fake can — a real VM booting under the authorized policy,
-# refusing a substituted instance, unable to reach the network or host
-# credentials, producing an artifact whose digest survives independent
-# verification.
+# ─── Live microVM lanes ──────────────────────────────────────────────────────
+# The real-microVM qualification, per virtualization lane. A lane gate
+# proves what no source-level fake can: a real VM booting under the
+# authorized policy, refusing a substituted instance, unable to reach the
+# network or host credentials, producing an artifact whose digest
+# survives independent verification — on exactly one backend.
 #
-# It is registered ONLY when this host can actually run it. That is the
-# whole point: the lane is not portable, and a gate that "skips" on a
-# runner without virtualization is recorded as a pass that proves
-# nothing. On a capable host it is a first-class gate with honest test
-# counts; on a host that cannot boot microVMs it is not registered at
-# all, so the bundle makes no claim about the lane rather than a claim
-# that reads like one. The lane it ran in (Apple Hypervisor Framework or
-# Linux KVM) is recorded by TestMSBLivePlatformIdentity, which is
-# deliberately ungated so every record carries it.
+# Lane separation is load-bearing: Apple Hypervisor Framework evidence
+# never qualifies Linux KVM and vice versa. Gate ids come from the
+# authoritative inventory (qualification/required-tests.json), which is
+# copied into the bundle and digest-bound to each lane gate so the
+# required-case set cannot be forged or swapped.
+#
+# A lane gate is registered when:
+#   (a) the release claims it via CRABBOX_QUALIFY_LANES, or
+#   (b) this host provides it with a usable pinned runtime.
+# A claimed lane that cannot produce passing per-test evidence records
+# FAIL — a claim never skips. Imported lane evidence (a sibling run's
+# raw stream + case results under CRABBOX_LANE_EVIDENCE_DIR/<lane>/)
+# is accepted only when it passes the same inventory check and binds to
+# this exact source commit — borrowed evidence from another build fails.
+
+REQUIRED_TESTS_REL="required-tests.json"
+REQUIRED_TESTS_SRC="$REPO_ROOT/qualification/$REQUIRED_TESTS_REL"
+REQUIRED_TESTS_SHA=""
+if [ -f "$REQUIRED_TESTS_SRC" ]; then
+  cp "$REQUIRED_TESTS_SRC" "$EVIDENCE_DIR/$REQUIRED_TESTS_REL"
+  REQUIRED_TESTS_SHA="$(shasum -a 256 "$EVIDENCE_DIR/$REQUIRED_TESTS_REL" | awk '{print $1}')"
+fi
+
+# Normalize claimed lane names: accept the short aliases "apple" and
+# "kvm" as well as the canonical inventory lane ids.
+normalize_claimed_lanes() {
+  local out="" l
+  for l in $1; do
+    case "$l" in
+      apple|apple-hypervisor|apple-hypervisor-framework) out="$out apple-hypervisor-framework" ;;
+      kvm|linux|linux-kvm) out="$out linux-kvm" ;;
+      *) out="$out $l" ;;
+    esac
+  done
+  echo "${out# }"
+}
+CLAIMED_LANES="$(normalize_claimed_lanes "${CRABBOX_QUALIFY_LANES:-}")"
+LANE_IMPORT_DIR="${CRABBOX_LANE_EVIDENCE_DIR:-}"
+
+# The lane this host can provide.
+HOST_LANE=""
+case "$(uname -s)" in
+  Darwin) [ "$(sysctl -n kern.hv_support 2>/dev/null)" = "1" ] && HOST_LANE="apple-hypervisor-framework" ;;
+  Linux)  [ -c /dev/kvm ] && HOST_LANE="linux-kvm" ;;
+esac
+
 MSB_BIN="${CRABBOX_MSB_BIN:-$HOME/.microsandbox/bin/msb}"
 if [ ! -x "$MSB_BIN" ]; then
   MSB_BIN="$(command -v msb 2>/dev/null || true)"
 fi
+MSB_USABLE=false
 if [ -n "$MSB_BIN" ] && [ -x "$MSB_BIN" ] && "$MSB_BIN" doctor >/dev/null 2>&1; then
-  echo "  LIVE  live-microvm (host is microVM-capable: $("$MSB_BIN" doctor 2>&1 | sed -n 's/.*Architecture *//p' | head -1))"
-  run_gate live-microvm TEST env CRABBOX_MSB_LIVE=1 \
-    go test -v -race -count=1 -timeout=1200s -run 'TestMSBLive' ./internal/sandboxexecutor/
+  MSB_USABLE=true
+fi
+
+# build_test_suite_json <lane> <cases-file> <raw-file>
+# Emits the test_suite binding object for a lane gate whose evidence
+# files exist in the bundle.
+build_test_suite_json() {
+  local lane="$1" cases="$2" raw="$3"
+  jq -cn --arg lane "$lane" \
+    --arg inv_file "$REQUIRED_TESTS_REL" --arg inv_sha "$REQUIRED_TESTS_SHA" \
+    --arg res_file "gate-results/$(basename "$cases")" \
+    --arg res_sha "$(shasum -a 256 "$cases" | awk '{print $1}')" \
+    --arg raw_file "gate-results/$(basename "$raw")" \
+    --arg raw_sha "$(shasum -a 256 "$raw" | awk '{print $1}')" \
+    '{suite:"live-microvm", lane:$lane,
+      inventory:{file:$inv_file, sha256:$inv_sha},
+      results:{file:$res_file, sha256:$res_sha},
+      raw:{file:$raw_file, sha256:$raw_sha}}'
+}
+
+# register_lane_fail <gate-id> <reason>
+# A claimed lane that cannot produce passing per-test evidence records
+# an honest FAIL — never an absent gate on a claimed lane.
+register_lane_fail() {
+  local gid="$1" reason="$2"
+  local log="$EVIDENCE_DIR/gate-results/${gid}.log"
+  GATE_START_MS="$(now_ms)"
+  {
+    echo "command=live microVM qualification lane $gid"
+    echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "---"
+    echo "FAIL: $reason"
+    echo "tests_discovered=0"
+    echo "tests_passed=0"
+    echo "tests_failed=1"
+    echo "tests_skipped=0"
+    echo "---"
+    echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "exit=1"
+  } > "$log"
+  record_gate "$gid" TEST FAIL 1 "$log"
+  echo "  FAIL  $gid ($reason)"
+}
+
+# register_lane_import <lane> <gate-id>
+# Accept per-test evidence produced for this lane on another host —
+# only when the case results satisfy the inventory AND are bound to
+# this exact source commit. Evidence for a different build is refused.
+# lane_import_source <lane>
+# Finds imported evidence for a lane under CRABBOX_LANE_EVIDENCE_DIR.
+# Each import directory holds cases.json + test.json; the lane is read
+# from the cases record itself (a directory named for a lane proves
+# nothing — the record's own lane field is authoritative).
+lane_import_source() {
+  local lane="$1" d
+  [ -d "$LANE_IMPORT_DIR" ] || return 1
+  for d in "$LANE_IMPORT_DIR"/*/; do
+    [ -f "$d/cases.json" ] && [ -f "$d/test.json" ] || continue
+    if [ "$(jq -r '.lane // empty' "$d/cases.json" 2>/dev/null)" = "$lane" ]; then
+      echo "$d"
+      return 0
+    fi
+  done
+  return 1
+}
+
+register_lane_import() {
+  local lane="$1" gid="$2"
+  local srcdir="$3"
+  local log="$EVIDENCE_DIR/gate-results/${gid}.log"
+  local cases="$EVIDENCE_DIR/gate-results/${gid}.cases.json"
+  local raw="$EVIDENCE_DIR/gate-results/${gid}.test.json"
+  GATE_START_MS="$(now_ms)"
+  cp "$srcdir/cases.json" "$cases"
+  cp "$srcdir/test.json" "$raw"
+  {
+    echo "command=imported live microVM lane evidence ($lane) from $srcdir"
+    echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "---"
+  } > "$log"
+  local imported_commit findings=""
+  imported_commit="$(jq -r '.source_commit // empty' "$cases" 2>/dev/null)"
+  if [ "$imported_commit" != "$COMMIT" ]; then
+    findings="imported results commit ${imported_commit:-<missing>} does not match the qualified commit $COMMIT"
+  else
+    findings="$(required_tests_case_findings "$cases" "$EVIDENCE_DIR/$REQUIRED_TESTS_REL" "$lane" || true)"
+  fi
+  local passed failed
+  passed="$(jq '.counts.passed // 0' "$cases" 2>/dev/null || echo 0)"
+  failed="$(jq '.counts.failed // 0' "$cases" 2>/dev/null || echo 0)"
+  {
+    echo "imported_from=$srcdir"
+    echo "imported_commit=$imported_commit"
+    [ -n "$findings" ] && echo "$findings"
+    echo "tests_passed=$passed"
+    echo "tests_failed=$failed"
+    echo "---"
+    echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } >> "$log"
+  if [ -n "$findings" ] || [ "$failed" -gt 0 ] || [ "$passed" -le 0 ]; then
+    echo "exit=1" >> "$log"
+    record_gate "$gid" TEST FAIL 1 "$log"
+    echo "  FAIL  $gid (imported $lane evidence does not satisfy the required-test inventory)"
+    return
+  fi
+  echo "exit=0" >> "$log"
+  record_gate "$gid" TEST PASS 0 "$log" "" \
+    "$(build_test_suite_json "$lane" "$cases" "$raw")"
+  echo "  PASS  $gid ($passed cases, imported $lane evidence)"
+}
+
+# register_lane_live <lane> <gate-id>
+# Run the live suite on this host under `go test -json`, then normalize
+# the stream into per-case evidence bound to this commit and toolchain.
+# The shared validator re-checks it against the bundled inventory, so a
+# "passing" run that skipped an isolation case cannot produce an
+# admissible record.
+register_lane_live() {
+  local lane="$1" gid="$2"
+  local log="$EVIDENCE_DIR/gate-results/${gid}.log"
+  local raw="$EVIDENCE_DIR/gate-results/${gid}.test.json"
+  local cases="$EVIDENCE_DIR/gate-results/${gid}.cases.json"
+  GATE_START_MS="$(now_ms)"
+  {
+    echo "command=env CRABBOX_MSB_LIVE=1 CRABBOX_MSB_QUALIFY=1 go test -json -race -count=1 -timeout=1200s -run '^TestMSBLive' ./internal/sandboxexecutor/"
+    echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "---"
+  } > "$log"
+  set +e
+  env CRABBOX_MSB_LIVE=1 CRABBOX_MSB_QUALIFY=1 \
+    go test -json -race -count=1 -timeout=1200s -run '^TestMSBLive' \
+    ./internal/sandboxexecutor/ > "$raw" 2>>"$log"
+  local rc=$?
+  set -e
+  {
+    echo "---"
+    echo "go_test_exit=$rc"
+    echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } >> "$log"
+  # Normalize the raw stream into per-case evidence; also verify the
+  # inventory still covers every suite test in source.
+  set +e
+  python3 "$REPO_ROOT/scripts/go-test-case-evidence.py" \
+    --stream "$raw" --out "$cases" \
+    --suite live-microvm --lane "$lane" \
+    --commit "$COMMIT" --toolchain-go "$GO_VERSION" \
+    --inventory "$EVIDENCE_DIR/$REQUIRED_TESTS_REL" \
+    --source-root "$REPO_ROOT" >>"$log" 2>&1
+  local norm_rc=$?
+  set -e
+  local passed failed skipped findings=""
+  passed="$(jq '.counts.passed // 0' "$cases" 2>/dev/null || echo 0)"
+  failed="$(jq '.counts.failed // 0' "$cases" 2>/dev/null || echo 0)"
+  skipped="$(jq '.counts.skipped // 0' "$cases" 2>/dev/null || echo 0)"
+  {
+    echo "tests_passed=$passed"
+    echo "tests_failed=$failed"
+    echo "tests_skipped=$skipped"
+  } >> "$log"
+  if [ "$norm_rc" -eq 0 ]; then
+    findings="$(required_tests_case_findings "$cases" "$EVIDENCE_DIR/$REQUIRED_TESTS_REL" "$lane" || true)"
+    [ -n "$findings" ] && echo "$findings" >> "$log"
+  fi
+  # A skip of a lane-foreign case (the other lane's platform-specific
+  # test) is honest evidence — required-case skips are already findings
+  # from the inventory check above, so a blanket skipped>0 check would
+  # fail a correct lane for its foreign cases.
+  if [ "$rc" -ne 0 ] || [ "$norm_rc" -ne 0 ] || [ -n "$findings" ] \
+    || [ "$failed" -gt 0 ] || [ "$passed" -le 0 ]; then
+    echo "exit=1" >> "$log"
+    record_gate "$gid" TEST FAIL 1 "$log"
+    echo "  FAIL  $gid (rc=$rc normalize=$norm_rc passed=$passed failed=$failed skipped=$skipped)"
+    return
+  fi
+  echo "exit=0" >> "$log"
+  record_gate "$gid" TEST PASS 0 "$log" "" \
+    "$(build_test_suite_json "$lane" "$cases" "$raw")"
+  echo "  PASS  $gid ($passed cases, lane $lane)"
+}
+
+lane_is_claimed() {
+  case " $CLAIMED_LANES " in
+    *" $1 "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+if [ -n "$CLAIMED_LANES" ] && [ -z "$REQUIRED_TESTS_SHA" ]; then
+  echo "  ERROR  claimed lanes ($CLAIMED_LANES) require qualification/required-tests.json — refusing to qualify lane claims without the authoritative inventory" >&2
+  register_lane_fail "live-microvm-uninventoried" "claimed lanes without required-tests.json"
+elif [ -n "$REQUIRED_TESTS_SHA" ]; then
+  for LANE in $(jq -r '.lanes | keys[]' "$EVIDENCE_DIR/$REQUIRED_TESTS_REL"); do
+    GATE_ID="$(jq -r --arg l "$LANE" '.lanes[$l].gate_id' "$EVIDENCE_DIR/$REQUIRED_TESTS_REL")"
+    if [ "$LANE" = "$HOST_LANE" ] && [ "$MSB_USABLE" = true ]; then
+      register_lane_live "$LANE" "$GATE_ID"
+    elif lane_is_claimed "$LANE"; then
+      IMPORT_SRC="$(lane_import_source "$LANE" || true)"
+      if [ -n "$IMPORT_SRC" ]; then
+        register_lane_import "$LANE" "$GATE_ID" "$IMPORT_SRC"
+      elif [ "$LANE" = "$HOST_LANE" ]; then
+        register_lane_fail "$GATE_ID" "claimed lane $LANE but the pinned runtime is unusable on this host (msb missing or doctor failed)"
+      else
+        register_lane_fail "$GATE_ID" "claimed lane $LANE on a host that provides ${HOST_LANE:-no lane}, and no imported evidence under CRABBOX_LANE_EVIDENCE_DIR"
+      fi
+    else
+      echo "  --    $GATE_ID (lane not claimed and this host provides ${HOST_LANE:-no lane} — no evidence recorded)"
+    fi
+  done
 else
-  echo "  SKIP  live-microvm (this host cannot boot microVMs: the pinned runtime is absent or its prerequisite check fails — gate not applicable, and not recorded)"
+  echo "  --    live-microvm (no required-test inventory — lane gates not registered)"
 fi
 
 # ─── Effect Fabric contract gates ────────────────────────────────────────────
@@ -555,6 +820,12 @@ run_live_postgres_gate() {
   record_gate "$name" "INTEGRATION" "PASS" 0 "$log"
   echo "  PASS  $name ($executed_tests tests executed)"
 }
+
+# The Vitest live gates run the worker package's locked Vitest — install
+# it before the first gate that can need it, not only before the worker
+# section far below. CI installs worker deps before invoking this script;
+# a standalone run must satisfy the same precondition itself.
+npm ci --prefix worker
 
 run_live_postgres_gate postgres-fencing test/postgres-authority-fencing.live.test.ts
 run_live_postgres_gate postgres-parity test/coordinator-parity.live.test.ts
@@ -853,8 +1124,7 @@ run_gate cross-language-conformance TEST \
 # ─── Phase 15: Worker gates ────────────────────────────────────────────────
 echo ""
 echo "=== Worker gates ==="
-# Ensure Worker dependencies are installed.
-npm ci --prefix worker
+# Worker dependencies were installed before the live postgres gates above.
 run_gate worker-typecheck STATIC_ANALYSIS npm run check --prefix worker
 run_gate worker-tests TEST npm test --prefix worker
 run_gate worker-format STATIC_ANALYSIS npm run format:check --prefix worker
@@ -934,7 +1204,7 @@ extract_tests_executed() {
   local count=0
 
   case "$gate_name" in
-    effect-fabric-postgres|provider-github-faults)
+    effect-fabric-postgres|provider-github-faults|live-microvm-*)
       # -json gates write structured accounting lines into the log:
       #   tests_discovered=N / tests_passed=N / tests_failed=N / tests_skipped=N
       # (the -json event stream has no "--- PASS:" lines to grep).
@@ -943,7 +1213,7 @@ extract_tests_executed() {
       f=$(grep -oE '^tests_failed=[0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$' || true)
       count=$((${p:-0} + ${f:-0}))
       ;;
-    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-sandboxexecutor|live-microvm|go-race-cli|effect-fabric-contract|effect-fabric-reconciliation|effect-fabric-evidence|effect-fabric-race|authority-postgres|provider-github-real-api|critical-external|critical-faults|effect-fabric-post-dispatch-timeout)
+    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-sandboxexecutor|go-race-cli|effect-fabric-contract|effect-fabric-reconciliation|effect-fabric-evidence|effect-fabric-race|authority-postgres|provider-github-real-api|critical-external|critical-faults|effect-fabric-post-dispatch-timeout)
       # Go test with -v prints one line per test:
       #   --- PASS: TestName (0.00s)
       #   --- FAIL: TestName (0.00s)
@@ -1021,12 +1291,12 @@ extract_tests_skipped() {
   local count=0
 
   case "$gate_name" in
-    effect-fabric-postgres|provider-github-faults)
+    effect-fabric-postgres|provider-github-faults|live-microvm-*)
       # -json gates write structured accounting lines into the log.
       count=$(grep -oE '^tests_skipped=[0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$' || true)
       count=${count:-0}
       ;;
-    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-sandboxexecutor|live-microvm|go-race-cli|effect-fabric-contract|effect-fabric-reconciliation|effect-fabric-evidence|effect-fabric-race|authority-postgres|provider-github-real-api|critical-external|critical-faults|cross-language-conformance|effect-fabric-post-dispatch-timeout)
+    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-sandboxexecutor|go-race-cli|effect-fabric-contract|effect-fabric-reconciliation|effect-fabric-evidence|effect-fabric-race|authority-postgres|provider-github-real-api|critical-external|critical-faults|cross-language-conformance|effect-fabric-post-dispatch-timeout)
       count=$(grep -cE '^\s*--- SKIP:' "$log" 2>/dev/null || true)
       ;;
     worker-tests|nemo-tests)
@@ -1071,7 +1341,7 @@ extract_tests_failed() {
   local count=0
 
   case "$gate_name" in
-    effect-fabric-postgres|provider-github-faults)
+    effect-fabric-postgres|provider-github-faults|live-microvm-*)
       # -json gates write structured accounting lines into the log.
       count=$(grep -oE '^tests_failed=[0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$' || true)
       count=${count:-0}
@@ -1089,7 +1359,7 @@ extract_tests_failed() {
         count=$(jq '[.testResults[].assertionResults[] | select(.status == "failed")] | length' "$json_summary" 2>/dev/null || true)
       fi
       ;;
-    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-sandboxexecutor|live-microvm|go-race-cli|effect-fabric-contract|effect-fabric-reconciliation|effect-fabric-evidence|effect-fabric-race|authority-postgres|provider-github-real-api|critical-external|critical-faults|cross-language-conformance|effect-fabric-post-dispatch-timeout)
+    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-sandboxexecutor|go-race-cli|effect-fabric-contract|effect-fabric-reconciliation|effect-fabric-evidence|effect-fabric-race|authority-postgres|provider-github-real-api|critical-external|critical-faults|cross-language-conformance|effect-fabric-post-dispatch-timeout)
       count=$(grep -cE '^\s*--- FAIL:' "$log" 2>/dev/null || true)
       ;;
     worker-tests|nemo-tests)
@@ -1135,9 +1405,29 @@ for i in "${!GATE_NAMES[@]}"; do
   tests_executed="$(extract_tests_executed "$gate_name" "$gate_log")"
   tests_failed="$(extract_tests_failed "$gate_name" "$gate_log")"
   evidence_sha="$(shasum -a 256 "$gate_log" | awk '{print $1}')"
-  GATES_JSON+="{\"gate_id\":\"${gate_name}\",\"gate_type\":\"${GATE_TYPES[$i]}\",\"mandatory\":true,\"status\":\"${GATE_STATUS[$i]}\",\"exit_code\":${GATE_EXIT[$i]},\"tests_executed\":${tests_executed},\"tests_failed\":${tests_failed},\"duration_ms\":${GATE_DURATION[$i]},\"evidence\":{\"file\":\"${gate_rel}\",\"sha256\":\"${evidence_sha}\"}}"
+  GATES_JSON+="{\"gate_id\":\"${gate_name}\",\"gate_type\":\"${GATE_TYPES[$i]}\",\"mandatory\":true,\"status\":\"${GATE_STATUS[$i]}\",\"exit_code\":${GATE_EXIT[$i]},\"tests_executed\":${tests_executed},\"tests_failed\":${tests_failed},\"duration_ms\":${GATE_DURATION[$i]},\"evidence\":{\"file\":\"${gate_rel}\",\"sha256\":\"${evidence_sha}\"}"
+  if [ -n "${GATE_SUITE[$i]}" ]; then
+    GATES_JSON+=",\"test_suite\":${GATE_SUITE[$i]}"
+  fi
+  GATES_JSON+="}"
 done
 GATES_JSON+="]"
+
+# Derived lane identities: qualified lanes are those with a passing lane
+# gate carrying test_suite evidence; claimed lanes were declared up front
+# by the release (CRABBOX_QUALIFY_LANES).
+QUALIFIED_LANES=""
+for i in "${!GATE_NAMES[@]}"; do
+  if [ "${GATE_STATUS[$i]}" = "PASS" ] && [ -n "${GATE_SUITE[$i]}" ]; then
+    lane="$(jq -r '.lane' <<<"${GATE_SUITE[$i]}")"
+    case " $QUALIFIED_LANES " in
+      *" $lane "*) ;;
+      *) QUALIFIED_LANES="${QUALIFIED_LANES:+$QUALIFIED_LANES }$lane" ;;
+    esac
+  fi
+done
+CLAIMED_LANES_JSON="[$(for l in $CLAIMED_LANES; do printf '"%s",' "$l"; done | sed 's/,$//')]"
+QUALIFIED_LANES_JSON="[$(for l in $QUALIFIED_LANES; do printf '"%s",' "$l"; done | sed 's/,$//')]"
 
 # Determine overall release status.
 ALL_PASS=true
@@ -1171,8 +1461,11 @@ done
 cat > "$EVIDENCE_DIR/qualification.json" << EOF
 {
   "schema_version": 2,
+  "release": "$RELEASE_VERSION",
   "release_status": "$RELEASE_STATUS",
   "artifact_promotable": $ARTIFACT_PROMOTABLE,
+  "claimed_lanes": $CLAIMED_LANES_JSON,
+  "qualified_lanes": $QUALIFIED_LANES_JSON,
   "gate_summary": {
     "total": $TOTAL_GATES,
     "passed": $PASSED_GATES,
@@ -1270,15 +1563,9 @@ cp "$REPO_ROOT/schemas/qualification.schema.json" "$EVIDENCE_DIR/schemas/qualifi
 # binds the release name/version to the source commit, artifact digest,
 # evidence file list, and qualification summary.
 #
-# RELEASE_NAME / RELEASE_VERSION come from the environment (set by CI)
-# so that the same script works for any RC version without code changes.
-# Require explicit RELEASE_VERSION — fail closed if not set.
-if [ -z "${RELEASE_VERSION:-}" ]; then
-  echo "ERROR: RELEASE_VERSION must be set (e.g., 1.0.0-rc.7)" >&2
-  echo "       Refusing to use a hardcoded default." >&2
-  exit 1
-fi
-RELEASE_NAME="${RELEASE_NAME:-crabedence-v${RELEASE_VERSION}}"
+# RELEASE_NAME / RELEASE_VERSION are validated up front: the version must
+# equal the VERSION file so the embedded identity can never diverge from
+# the canonical source.
 
 # Aggregate tests_executed and tests_skipped across the test-bearing
 # gates for the release manifest. Test accounting follows the DECLARED
@@ -1301,6 +1588,13 @@ cat > "$EVIDENCE_DIR/release-manifest.json" << EOF
   "release_type": "release-candidate",
   "status": "$RELEASE_STATUS",
   "artifact_promotable": $ARTIFACT_PROMOTABLE,
+  "claimed_lanes": $CLAIMED_LANES_JSON,
+  "supported_lanes": $QUALIFIED_LANES_JSON,
+  "components": {
+    "authority_registry_sha256": "$REGISTRY_SHA256",
+    "qualification_registry_sha256": "$QUALIFICATION_REGISTRY_SHA256",
+    "nemo_runtime_sha256": "$NEMO_RUNTIME_SHA256"
+  },
   "provenance": {
     "commit": "$COMMIT",
     "tree": "$TREE",

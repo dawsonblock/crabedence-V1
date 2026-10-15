@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "suite": "live-microvm",
+  "package": "internal/sandboxexecutor",
+  "run_pattern": "TestMSBLive",
+  "description": "Authoritative inventory of the mandatory live-microVM qualification cases. A lane gate is qualified only when every common case plus the lane's platform-specific cases executed exactly once and passed. A case that is absent, skipped, duplicated, or failed fails the gate; evidence from another source commit, toolchain, or virtualization lane is rejected.",
+  "lanes": {
+    "apple-hypervisor-framework": {
+      "goos": "darwin",
+      "goarch": "arm64",
+      "gate_id": "live-microvm-apple",
+      "host_prerequisite": "kern.hv_support == 1 (Apple Silicon)"
+    },
+    "linux-kvm": {
+      "goos": "linux",
+      "gate_id": "live-microvm-linux-kvm",
+      "host_prerequisite": "/dev/kvm present"
+    }
+  },
+  "common_required_tests": [
+    "TestMSBLiveArtifactIntegrityUnderConcurrency",
+    "TestMSBLiveContractTimeoutIsObserved",
+    "TestMSBLiveCredentialIsolation",
+    "TestMSBLiveJobLifecycle",
+    "TestMSBLiveMonitorInterruptedLeavesJobUncertain",
+    "TestMSBLiveMountIsReadOnly",
+    "TestMSBLiveNetworkIsolation",
+    "TestMSBLivePlatformIdentity",
+    "TestMSBLiveRecoveryResumesInterruptedJob",
+    "TestMSBLiveRefusalsAndCleanup",
+    "TestMSBLiveRefusesPreexistingSandbox",
+    "TestMSBLiveSubstitutedVMIsNeverAdopted",
+    "TestMSBLiveTransportFailureLeavesJobUncertain"
+  ],
+  "platform_specific_tests": {
+    "apple-hypervisor-framework": [],
+    "linux-kvm": [
+      "TestMSBLiveLinuxKVM"
+    ]
+  }
+}

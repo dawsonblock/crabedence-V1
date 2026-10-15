@@ -83,3 +83,35 @@ test("the generator and the live-gate helper parse", () => {
     execFileSync("bash", ["-n", file]);
   }
 });
+
+test("lane gates consume the authoritative required-test inventory", () => {
+  const source = fs.readFileSync(GENERATOR, "utf8");
+  const inventory = JSON.parse(
+    fs.readFileSync(path.join(scripts, "..", "qualification", "required-tests.json"), "utf8"),
+  );
+  // The inventory is copied into the bundle and digest-bound to each lane
+  // gate — a forged or missing inventory on a claimed lane fails.
+  assert.match(source, /qualification\/\$REQUIRED_TESTS_REL|qualification\/required-tests\.json/);
+  assert.match(source, /required-tests\.json/);
+  assert.match(source, /claimed lanes .* require qualification\/required-tests\.json/);
+  // Every lane gate id comes from the inventory, never hardcoded here.
+  for (const lane of Object.values(inventory.lanes)) {
+    assert.ok(lane.gate_id.startsWith("live-microvm-"), `lane gate_id ${lane.gate_id} names a lane gate`);
+  }
+  // The lane suite runs under machine-readable output and qualifying mode.
+  assert.match(source, /go test -json -race -count=1 -timeout=1200s -run '\^TestMSBLive'/);
+  assert.match(source, /CRABBOX_MSB_QUALIFY=1/);
+  assert.match(source, /go-test-case-evidence\.py/);
+  // Claimed lanes and qualified lanes are recorded, not implied.
+  assert.match(source, /claimed_lanes/);
+  assert.match(source, /qualified_lanes/);
+  // The generator derives the inventory lane set from the manifest itself.
+  assert.match(source, /\.lanes \| keys/);
+  // The release version may not drift from VERSION.
+  assert.match(source, /RELEASE_VERSION.*does not equal VERSION/);
+});
+
+test("lane evidence normalizer and installer parse", () => {
+  execFileSync("python3", ["-m", "py_compile", path.join(scripts, "go-test-case-evidence.py")]);
+  execFileSync("bash", ["-n", path.join(scripts, "install-msb-runtime.sh")]);
+});

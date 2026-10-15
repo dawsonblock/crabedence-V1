@@ -8,6 +8,8 @@
 //   - worker/package-lock.json (root "version" and packages[""].version)
 //   - nemo/package.json
 //   - the latest versioned section in CHANGELOG.md
+//   - the release-qualification workflow's RELEASE_VERSION (the embedded
+//     release identity the CI pipeline stamps on every produced record)
 //   - the signed release tag (checked when --tag is passed)
 //
 // The release pipeline's toolchain declarations must also agree with
@@ -129,6 +131,29 @@ export async function verifyVersionConsistency({ root, tag } = {}) {
     if (provenanceGo && provenanceGo !== moduleToolchain) {
       findings.push(
         `release-provenance.mjs Go toolchain ${provenanceGo} does not equal the go.mod toolchain ${moduleToolchain}`,
+      );
+    }
+  }
+
+  // The qualification workflow embeds the release identity it stamps on
+  // produced records; it must equal VERSION, not merely look plausible —
+  // a stale embedded version labels a record as a release it is not. A
+  // missing workflow means the identity cannot be verified: fail closed.
+  let qualWorkflow = null;
+  try {
+    qualWorkflow = await read(".github/workflows/release-qualification.yml");
+  } catch {
+    findings.push(".github/workflows/release-qualification.yml is missing — cannot verify embedded RELEASE_VERSION");
+  }
+  if (qualWorkflow !== null) {
+    const workflowVersion = /RELEASE_VERSION:\s*([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)/.exec(
+      qualWorkflow,
+    )?.[1];
+    if (!workflowVersion) {
+      findings.push("release-qualification.yml does not declare RELEASE_VERSION");
+    } else if (workflowVersion !== version) {
+      findings.push(
+        `release-qualification.yml RELEASE_VERSION ${workflowVersion} does not equal VERSION ${version}`,
       );
     }
   }

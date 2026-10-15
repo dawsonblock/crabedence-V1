@@ -14,6 +14,15 @@ on:
         description: "Git ref to qualify (defaults to HEAD)"
         required: false
         default: ""
+      claimed_lanes:
+        description: >-
+          Virtualization lanes the release claims support for
+          (space-separated: apple-hypervisor-framework linux-kvm).
+          Every claimed lane must run its own lane job and its evidence
+          must satisfy the required-test inventory — a claim without
+          passing lane evidence fails release admission.
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -334,12 +343,112 @@ jobs:
       - name: Cross-language conformance
         run: go test -count=1 -timeout=60s -run "TestRunEvidenceConformanceCorpus|TestReceiptContractConformance" ./internal/cli/
 
+  # ─── Live microVM lanes ──────────────────────────────────────────────
+  # One job per virtualization lane the release claims. Each runs the
+  # real-microVM suite under `go test -json` with CRABBOX_MSB_QUALIFY=1 —
+  # on a claimed lane, missing runtime, image, or host capability is a
+  # failed gate, never a skipped one. The normalized per-case evidence
+  # (raw stream + case results) is uploaded for the evidence job to bind
+  # into the lane's gate record; the evidence job's validator re-checks
+  # it against the required-test inventory, so a "pass" that skipped an
+  # isolation case cannot produce an admissible record.
+  #
+  # Lane jobs only run for lanes the dispatch claims — an unclaimed lane
+  # matrix entry is skipped, and a skipped lane never fabricates
+  # evidence for that lane.
+  live-microvm:
+    name: Live microVM (${{ matrix.lane }})
+    timeout-minutes: 45
+    needs: provenance
+    runs-on: ${{ matrix.runner }}
+    if: contains(inputs.claimed_lanes || '', matrix.short)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: apple-hypervisor-framework
+            short: apple
+            runner: macos-15
+          - lane: linux-kvm
+            short: linux-kvm
+            runner: blacksmith-2vcpu-ubuntu-2404
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.provenance.outputs.commit }}
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: ${{ env.GO_EXACT_VERSION }}
+          cache: false
+
+      - name: Assert the exact Go toolchain
+        shell: bash
+        run: |
+          actual="$(go env GOVERSION)"
+          if [ "$actual" != "go${GO_EXACT_VERSION}" ]; then
+            echo "Expected go${GO_EXACT_VERSION}, got $actual" >&2
+            exit 1
+          fi
+          go version
+          go env GOVERSION GOTOOLCHAIN
+
+      - name: Install the pinned Microsandbox runtime
+        shell: bash
+        run: bash scripts/install-msb-runtime.sh
+
+      # The suite binds a contract to a concrete image digest; the lane
+      # image must be cached before the run or the claimed lane fails.
+      - name: Cache the qualification image
+        shell: bash
+        run: |
+          MSB="$HOME/.microsandbox/bin/msb"
+          "$MSB" pull python:3.12 || "$MSB" image pull python:3.12
+          "$MSB" image list
+
+      - name: Run the live lane suite
+        shell: bash
+        run: |
+          mkdir -p lane-evidence
+          set +e
+          env CRABBOX_MSB_LIVE=1 CRABBOX_MSB_QUALIFY=1 \
+            go test -json -race -count=1 -timeout=1200s -run '^TestMSBLive' \
+            ./internal/sandboxexecutor/ > lane-evidence/test.json
+          rc=$?
+          set -e
+          python3 scripts/go-test-case-evidence.py \
+            --stream lane-evidence/test.json \
+            --out lane-evidence/cases.json \
+            --suite live-microvm --lane '${{ matrix.lane }}' \
+            --commit "$(git rev-parse HEAD)" \
+            --toolchain-go "$(go version)" \
+            --inventory qualification/required-tests.json \
+            --source-root .
+          echo "go_test_exit=$rc"
+          exit $rc
+
+      - name: Upload lane evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: lane-evidence-${{ matrix.lane }}
+          path: lane-evidence/
+          if-no-files-found: error
+
   # ─── Evidence aggregation ────────────────────────────────────────────
   evidence:
     name: Release evidence + admission
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: [provenance, go-tests, go-race, worker, postgres, nemo, cross-language]
+    needs: [provenance, go-tests, go-race, worker, postgres, nemo, cross-language, live-microvm]
+    # Run when every need succeeded OR a claimed lane job did not run at
+    # all (no lanes claimed → matrix skips). A failed lane — like any
+    # failed need — still blocks evidence generation: the record cannot
+    # pass with a failed mandatory gate and there is nothing to admit.
+    if: ${{ !cancelled() && !failure() }}
     permissions:
       contents: read
       attestations: write
@@ -362,8 +471,8 @@ jobs:
           --health-retries 10
     env:
       CRABBOX_TEST_DATABASE_URL: postgres://crabbox@localhost:5432/crabbox_test
-      RELEASE_NAME: crabedence-v0.54.0-rc.7.2
-      RELEASE_VERSION: 0.54.0-rc.7.2
+      RELEASE_NAME: crabedence-v0.54.0-rc.7.3
+      RELEASE_VERSION: 0.54.0-rc.7.3
     steps:
       - name: Check out
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -431,7 +540,24 @@ jobs:
       - name: Install NeMo dependencies
         run: npm ci --prefix nemo
 
+      # Lane evidence produced by the per-lane live jobs: each artifact
+      # is one lane's raw `go test -json` stream plus its normalized
+      # per-case results. The generator binds them into the claimed
+      # lane's gate record only if they satisfy the required-test
+      # inventory and carry this exact commit — borrowed or incomplete
+      # lane evidence is a FAIL, never a skipped claim.
+      - name: Download lane evidence
+        if: ${{ inputs.claimed_lanes != '' }}
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          pattern: lane-evidence-*
+          path: dist/lane-evidence
+          merge-multiple: false
+
       - name: Generate release evidence
+        env:
+          CRABBOX_QUALIFY_LANES: ${{ inputs.claimed_lanes || '' }}
+          CRABBOX_LANE_EVIDENCE_DIR: dist/lane-evidence
         run: bash scripts/generate-release-evidence.sh
 
       - name: Check release admission

@@ -57,8 +57,8 @@ normalized tar ↔ ZIP tree equivalence
 Each release includes `.sha256` files alongside the archives:
 
 ```bash
-# The release you are verifying (current candidate: 0.54.0-rc.7.2)
-VERSION=0.54.0-rc.7.2
+# The release you are verifying (current candidate: 0.54.0-rc.7.3)
+VERSION=0.54.0-rc.7.3
 
 sha256sum -c "crabedence-${VERSION}.tar.gz.sha256"
 sha256sum -c "crabedence-${VERSION}.zip.sha256"
@@ -94,7 +94,7 @@ object this artifact was qualified against:
 ```json
 {
   "schema_version": 2,
-  "release": "0.54.0-rc.7.2",
+  "release": "0.54.0-rc.7.3",
   "source": { "commit": "...", "tree": "...", "manifest_sha256": "..." },
   "artifact": { "filename": "...tar.gz", "sha256": "...", "size": 12345,
                 "zip_filename": "...zip", "zip_sha256": "...", "zip_size": 12345 },
@@ -188,6 +188,30 @@ grep '^toolchain' "tar-source/crabedence-${VERSION}/go.mod"
 
 All three must agree on `go1.26.5`; the standalone verifier fails closed
 if they do not.
+
+### Live microVM lane claims
+
+A release may claim live-virtualization support per lane
+(`apple-hypervisor-framework`, `linux-kvm`). Each claimed lane must be
+backed by a `live-microvm-*` gate carrying `test_suite` evidence — the
+digest-bound per-test results, rendered from the raw `go test -json`
+stream, that satisfy the bundled `required-tests.json` inventory:
+
+```bash
+# Lanes the release claims vs lanes it actually qualified
+jq -r '.claimed_lanes, .qualified_lanes' evidence/qualification.json
+
+# Every claimed lane must appear in qualified_lanes, backed by a
+# passing mandatory lane gate whose test_suite binds this exact lane,
+# commit, toolchain and runner OS.
+jq -r '.gates[] | select(.test_suite) |
+  "\(.gate_id): lane=\(.test_suite.lane) \(.status)"' \
+  evidence/qualification.json
+```
+
+A claimed lane absent from `qualified_lanes`, a lane gate that skipped
+required cases, or evidence bound to another commit fails admission —
+lane evidence can never substitute for a lane that did not run.
 
 ## Step 6: Verify the source manifest (both archives)
 

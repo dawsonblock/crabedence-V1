@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "baseline": "0.54.0-rc.7.2",
+  "target": "0.54.0-rc.7.3",
+  "generated_at": "2026-10-15T07:24:42Z",
+  "source": {
+    "commit": "10d51d2e59729ba6990f05b2601b20ced7979d12",
+    "tree": "13ffd33f2ee648aac2fbd9a2880f56a5d1e25b3d",
+    "branch": "fix/rc7.1-closed-policy-and-recovery",
+    "canonical_worktree": "crabedence-V1-fix-integration-integrity/",
+    "inventory": {
+      "file": "source-inventory.txt",
+      "entries": 4159
+    },
+    "git_blob_inventory": {
+      "file": "source-git-blobs.txt",
+      "entries": 4159
+    }
+  },
+  "frozen_nemo_reference": {
+    "path": "../NEMO-feat-native-plugin-isolation",
+    "note": "transfer manifest verified by nemo-transfer-provenance gate"
+  },
+  "immutable_rc72_archives": [
+    {
+      "path": "../NEMO-CONTROL-exp-microsandbox-executord-2d1f0e99.zip",
+      "sha256": "5d78998ac97891bee47f6d846f0221529f4a8e012b3f3457629cc6b73ea13378",
+      "bytes": 17801446
+    },
+    {
+      "path": "../NEMO-CONTROL-exp-microsandbox-executord-c9eda649.zip",
+      "sha256": "a014eda674ec8cf1adc3bee47d4301cb89570e46f5be9a02767c49adfde881f3",
+      "bytes": 17341391
+    }
+  ],
+  "toolchain": {
+    "go": "go version go1.26.5 darwin/arm64",
+    "goversion": "go1.26.5",
+    "gotoolchain": "auto",
+    "node": "v24.16.0",
+    "npm": "11.13.0",
+    "msb": "msb 0.7.8",
+    "host_lane": "apple-hypervisor-framework"
+  },
+  "notes": "Baseline = the HEAD commit the RC7.3 work tree diverges from. All RC7.3 modifications diff against source-inventory.txt (mode+sha256 per tracked file) and source-git-blobs.txt (git blob ids)."
+}

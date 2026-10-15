@@ -35,6 +35,7 @@ function admissionFixture(t, mutate = () => {}) {
 
   const qualification = {
     schema_version: 2,
+    release: "1.0.0-rc.7",
     release_status: "PASS",
     artifact_promotable: true,
     gate_summary: { total: 1, passed: 1, failed: 0, skipped: 0 },
@@ -161,6 +162,7 @@ function verifierFixture(t, mutate = () => {}) {
   const gateLogSha = sha256(fs.readFileSync(path.join(root, "gate-results", "exact-toolchain.log")));
   const qualification = {
     schema_version: 2,
+    release: "1.0.0-rc.7",
     release_status: "PASS",
     artifact_promotable: true,
     gate_summary: { total: 1, passed: 1, failed: 0, skipped: 0 },

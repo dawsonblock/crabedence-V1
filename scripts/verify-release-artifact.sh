@@ -266,6 +266,19 @@ if [ -f "$ARTIFACT_JSON" ]; then
       check "artifact.json binds the qualification record" "FAIL"
       echo "  ERROR: qualification digest/schema $ACTUAL_QUAL_SHA/$ACTUAL_QUAL_SCHEMA does not match artifact.json $ARTIFACT_QUAL_SHA/$ARTIFACT_QUAL_SCHEMA" >&2
     fi
+    # The artifact's declared release must equal the release identity the
+    # qualification record evaluated — an artifact may not pose as a
+    # different release than the one that was qualified.
+    QUAL_RELEASE="$(jq -r '.release // empty' "$EVIDENCE_DIR/qualification.json" 2>/dev/null || true)"
+    if [ -n "$QUAL_RELEASE" ] && [ "$ARTIFACT_RELEASE" = "$QUAL_RELEASE" ]; then
+      check "artifact.json binds the release identity" "PASS"
+    elif [ -z "$QUAL_RELEASE" ]; then
+      check "artifact.json binds the release identity" "FAIL"
+      echo "  ERROR: qualification.json carries no release identity — cannot bind the artifact's declared release" >&2
+    else
+      check "artifact.json binds the release identity" "FAIL"
+      echo "  ERROR: artifact.json declares release $ARTIFACT_RELEASE but qualification evaluated $QUAL_RELEASE" >&2
+    fi
   fi
   if [ -n "$SBOM_PATH" ]; then
     if [ ! -f "$SBOM_PATH" ]; then

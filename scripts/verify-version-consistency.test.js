@@ -32,6 +32,9 @@ function makeTree(overrides = {}) {
     "scripts/release-provenance.mjs": 'const GO_VERSION = "go1.26.4";\n',
     ...overrides,
   };
+  // The workflow's embedded release identity follows the effective VERSION
+  // unless a test overrides the workflow file itself.
+  files[".github/workflows/release-qualification.yml"] ??= `env:\n  RELEASE_VERSION: ${(files.VERSION ?? "0.50.0\n").trim()}\n`;
   for (const [relative, content] of Object.entries(files)) {
     const file = path.join(root, relative);
     fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -186,6 +189,22 @@ test("malformed VERSION is rejected", async (t) => {
   const findings = await verifyVersionConsistency({ root });
   assert.equal(findings.length, 1);
   assert.match(findings[0], /VERSION must be X\.Y\.Z/);
+});
+
+test("a stale workflow RELEASE_VERSION is rejected", async (t) => {
+  const root = withTree(t, {
+    ".github/workflows/release-qualification.yml": "env:\n  RELEASE_VERSION: 0.49.0\n",
+  });
+  const findings = await verifyVersionConsistency({ root });
+  assert.equal(findings.length, 1);
+  assert.match(findings[0], /RELEASE_VERSION 0\.49\.0 does not equal VERSION 0\.50\.0/);
+});
+
+test("a missing workflow fails closed", async (t) => {
+  const root = withTree(t);
+  fs.rmSync(path.join(root, ".github"), { recursive: true, force: true });
+  const findings = await verifyVersionConsistency({ root });
+  assert.ok(findings.some((finding) => /release-qualification\.yml is missing/.test(finding)));
 });
 
 test("version comparison helpers", () => {
