@@ -312,13 +312,38 @@ run_gate go-race-providers TEST go test -v -race -count=1 -timeout=120s \
 # policy, dispatch and recovery paths under concurrency — including the
 # hard-crash qualification that SIGKILLs the daemon mid-job. Folding it
 # into a general Go gate would hide a regression in the one package whose
-# failure mode is executing something nobody authorized. The live
-# microVM lane is deliberately NOT here: it needs a host that can boot
-# microVMs, so it runs as its own env-gated lane
-# (`crabbox job run live-microvm`), never as a gate that would skip on a
-# runner without virtualization and be recorded as a pass.
+# failure mode is executing something nobody authorized.
 run_gate go-race-sandboxexecutor TEST go test -v -race -count=1 -timeout=1200s \
   ./internal/sandboxexecutor/
+
+# ─── Live microVM lane ───────────────────────────────────────────────────────
+# The real-microVM qualification: a signed contract in, a booted microVM
+# executing it, a bound result out. It proves the isolation properties no
+# source-level fake can — a real VM booting under the authorized policy,
+# refusing a substituted instance, unable to reach the network or host
+# credentials, producing an artifact whose digest survives independent
+# verification.
+#
+# It is registered ONLY when this host can actually run it. That is the
+# whole point: the lane is not portable, and a gate that "skips" on a
+# runner without virtualization is recorded as a pass that proves
+# nothing. On a capable host it is a first-class gate with honest test
+# counts; on a host that cannot boot microVMs it is not registered at
+# all, so the bundle makes no claim about the lane rather than a claim
+# that reads like one. The lane it ran in (Apple Hypervisor Framework or
+# Linux KVM) is recorded by TestMSBLivePlatformIdentity, which is
+# deliberately ungated so every record carries it.
+MSB_BIN="${CRABBOX_MSB_BIN:-$HOME/.microsandbox/bin/msb}"
+if [ ! -x "$MSB_BIN" ]; then
+  MSB_BIN="$(command -v msb 2>/dev/null || true)"
+fi
+if [ -n "$MSB_BIN" ] && [ -x "$MSB_BIN" ] && "$MSB_BIN" doctor >/dev/null 2>&1; then
+  echo "  LIVE  live-microvm (host is microVM-capable: $("$MSB_BIN" doctor 2>&1 | sed -n 's/.*Architecture *//p' | head -1))"
+  run_gate live-microvm TEST env CRABBOX_MSB_LIVE=1 \
+    go test -v -race -count=1 -timeout=1200s -run 'TestMSBLive' ./internal/sandboxexecutor/
+else
+  echo "  SKIP  live-microvm (this host cannot boot microVMs: the pinned runtime is absent or its prerequisite check fails — gate not applicable, and not recorded)"
+fi
 
 # ─── Effect Fabric contract gates ────────────────────────────────────────────
 # Dedicated gates for the durable execution contract. These are NOT
@@ -918,7 +943,7 @@ extract_tests_executed() {
       f=$(grep -oE '^tests_failed=[0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$' || true)
       count=$((${p:-0} + ${f:-0}))
       ;;
-    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-sandboxexecutor|go-race-cli|effect-fabric-contract|effect-fabric-reconciliation|effect-fabric-evidence|effect-fabric-race|authority-postgres|provider-github-real-api|critical-external|critical-faults|effect-fabric-post-dispatch-timeout)
+    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-sandboxexecutor|live-microvm|go-race-cli|effect-fabric-contract|effect-fabric-reconciliation|effect-fabric-evidence|effect-fabric-race|authority-postgres|provider-github-real-api|critical-external|critical-faults|effect-fabric-post-dispatch-timeout)
       # Go test with -v prints one line per test:
       #   --- PASS: TestName (0.00s)
       #   --- FAIL: TestName (0.00s)
@@ -1001,7 +1026,7 @@ extract_tests_skipped() {
       count=$(grep -oE '^tests_skipped=[0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$' || true)
       count=${count:-0}
       ;;
-    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-sandboxexecutor|go-race-cli|effect-fabric-contract|effect-fabric-reconciliation|effect-fabric-evidence|effect-fabric-race|authority-postgres|provider-github-real-api|critical-external|critical-faults|cross-language-conformance|effect-fabric-post-dispatch-timeout)
+    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-sandboxexecutor|live-microvm|go-race-cli|effect-fabric-contract|effect-fabric-reconciliation|effect-fabric-evidence|effect-fabric-race|authority-postgres|provider-github-real-api|critical-external|critical-faults|cross-language-conformance|effect-fabric-post-dispatch-timeout)
       count=$(grep -cE '^\s*--- SKIP:' "$log" 2>/dev/null || true)
       ;;
     worker-tests|nemo-tests)
@@ -1064,7 +1089,7 @@ extract_tests_failed() {
         count=$(jq '[.testResults[].assertionResults[] | select(.status == "failed")] | length' "$json_summary" 2>/dev/null || true)
       fi
       ;;
-    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-sandboxexecutor|go-race-cli|effect-fabric-contract|effect-fabric-reconciliation|effect-fabric-evidence|effect-fabric-race|authority-postgres|provider-github-real-api|critical-external|critical-faults|cross-language-conformance|effect-fabric-post-dispatch-timeout)
+    go-evidence-tests|go-tart-tests|go-lume-tests|go-shared-tests|go-race-evidence|go-race-providers|go-race-sandboxexecutor|live-microvm|go-race-cli|effect-fabric-contract|effect-fabric-reconciliation|effect-fabric-evidence|effect-fabric-race|authority-postgres|provider-github-real-api|critical-external|critical-faults|cross-language-conformance|effect-fabric-post-dispatch-timeout)
       count=$(grep -cE '^\s*--- FAIL:' "$log" 2>/dev/null || true)
       ;;
     worker-tests|nemo-tests)

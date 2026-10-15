@@ -282,6 +282,11 @@ evidence from one never qualifies the other:
   qualifies real microVMs (policy enforcement, isolation, artifact integrity,
   monitor interruption, substituted-VM refusal, recovery). It runs on Apple
   Silicon and on Linux with KVM; a skipped live test is not a pass.
+- That lane is also a release gate: `live-microvm` is registered in
+  `dist/release-evidence` only on a host that can boot microVMs (the pinned
+  runtime present, `msb doctor` green). On a host that cannot, the gate is
+  not registered at all — the portable gate set makes no lane claim rather
+  than recording a skip that reads like a pass.
 - The repo-local job `live-microvm` (`.crabbox.yaml`) wraps that lane for a
   remote host and fails closed when the pinned runtime is absent:
 
