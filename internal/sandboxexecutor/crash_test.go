@@ -150,7 +150,8 @@ func TestDaemonCrashPreservesAcknowledgedJobs(t *testing.T) {
 			LibkrunfwSHA256: sha256File(t, firmware),
 		},
 	}
-	srv := startServer(t, Config{SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys, Backend: backend})
+	audit := func(f string, a ...any) { t.Logf("srv: "+f, a...) }
+	srv := startServer(t, Config{SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys, Backend: backend, ResumeBackoff: 200 * time.Millisecond, Audit: audit})
 	deadline := time.Now().Add(20 * time.Second)
 	var recovered *LedgerJob
 	for time.Now().Before(deadline) {
@@ -176,7 +177,12 @@ func TestDaemonCrashPreservesAcknowledgedJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 	srv.Stop()
-	srv2 := startServer(t, Config{SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys, Backend: backend})
+	// A previous lifetime may stamp a resume attempt just before
+	// stopping; the next lifetime's paced walk then waits out the
+	// (durable) backoff — declare a short backoff plus a short
+	// maintenance cadence so the re-observation lands well inside the
+	// assertion window instead of the default 60s tick.
+	srv2 := startServer(t, Config{SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys, Backend: backend, ResumeBackoff: 50 * time.Millisecond, MaintenanceInterval: 25 * time.Millisecond, Audit: func(f string, a ...any) { t.Logf("srv2: "+f, a...) }})
 	deadline = time.Now().Add(20 * time.Second)
 	var settled *LedgerJob
 	for time.Now().Before(deadline) {

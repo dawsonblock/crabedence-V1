@@ -3,6 +3,7 @@ package sandboxexecutor
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -12,8 +13,11 @@ import (
 // SocketCustodian is the ArchiveCustodian that hands archive segments
 // to an external custody witness over its unix socket. The executor
 // releases the operational rows only when the witness has stored the
-// payload and signed its acknowledgement — custody of the archive's
-// contents then lives outside the executor's own storage.
+// payload and its acknowledgement independently verifies: bound to
+// this exact segment and request, signed under the witness's key, and
+// issued by a witness the configured trust root approves — custody of
+// the archive's contents then lives outside the executor's own
+// storage and outside the witness's say-so.
 type SocketCustodian struct {
 	// Socket is the custody daemon's socket path.
 	Socket string
@@ -21,19 +25,44 @@ type SocketCustodian struct {
 	Timeout time.Duration
 	// Token is the optional shared secret the daemon requires.
 	Token string
+	// Trust is the approved-witness root — public keys the operator
+	// explicitly configured through controlled configuration. When
+	// set it is the authority on which witness may vouch.
+	Trust *sandboxcustody.TrustRoot
 	// ExpectedSigner pins the custody daemon's witness fingerprint —
-	// a response signed under a different key is not the custody the
-	// operator configured. Empty accepts any signer (the chain is
-	// still verifiable, but the witness's identity is unpinned).
+	// a response signed under a key with a different fingerprint is
+	// not the custody the operator configured. It is a trust input,
+	// never a substitute for signature verification: the ack's
+	// embedded public key and signature must still verify.
 	ExpectedSigner string
 }
 
-// WitnessArchive hands the segment to the custody daemon and insists
-// the acknowledgement names this segment's digest — a response that
-// attests a different digest is not custody of this archive.
-func (c *SocketCustodian) WitnessArchive(seg *ArchiveSegment, payload []byte) error {
+// trust resolves the effective witness trust root. A fingerprint pin
+// becomes a fingerprint-scoped root; an explicitly configured root is
+// used as-is. No configured trust is no trust — every acknowledgement
+// then fails closed as self-declared custody.
+func (c *SocketCustodian) trust() *sandboxcustody.TrustRoot {
+	if c.Trust != nil && !c.Trust.Empty() {
+		return c.Trust
+	}
+	if c.ExpectedSigner != "" {
+		return sandboxcustody.NewFingerprintTrust(c.ExpectedSigner)
+	}
+	return nil
+}
+
+// WitnessArchive hands the segment to the custody daemon and
+// independently verifies the signed acknowledgement — digest and
+// fingerprint comparisons are not custody evidence. A verified
+// acknowledgement is returned for the ledger to persist before the
+// operational rows may release.
+func (c *SocketCustodian) WitnessArchive(seg *ArchiveSegment, payload []byte) (*CustodyAck, error) {
+	trust := c.trust()
+	if trust.Empty() {
+		return nil, fmt.Errorf("custody witness trust not configured — refusing self-declared custody")
+	}
 	cli := &sandboxcustody.Client{Socket: c.Socket, Timeout: c.Timeout, Token: c.Token}
-	resp, err := cli.Witness(context.Background(), &sandboxcustody.WitnessRequest{
+	req := &sandboxcustody.WitnessRequest{
 		Op:               sandboxcustody.OpWitnessArchive,
 		SegmentSeq:       seg.Seq,
 		FirstTerminalSeq: seg.FirstTerminalSeq,
@@ -42,18 +71,25 @@ func (c *SocketCustodian) WitnessArchive(seg *ArchiveSegment, payload []byte) er
 		SHA256:           seg.SHA256,
 		CreatedAt:        seg.CreatedAt.UnixMilli(),
 		PayloadB64:       base64.StdEncoding.EncodeToString(payload),
-	})
+	}
+	resp, err := cli.Witness(context.Background(), req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if !resp.OK {
-		return fmt.Errorf("custody witness refused segment %d: %s", seg.Seq, resp.Error)
+		return nil, fmt.Errorf("custody witness refused segment %d: %s", seg.Seq, resp.Error)
 	}
-	if resp.WitnessedSHA256 != seg.SHA256 {
-		return fmt.Errorf("custody witness acknowledged %s, not the segment's %s", resp.WitnessedSHA256, seg.SHA256)
+	if err := sandboxcustody.VerifyWitnessAck(resp.Ack, sandboxcustody.BindingFor(req), trust); err != nil {
+		return nil, fmt.Errorf("custody acknowledgement for segment %d failed verification: %w", seg.Seq, err)
 	}
-	if c.ExpectedSigner != "" && resp.Signer != c.ExpectedSigner {
-		return fmt.Errorf("custody acknowledged by signer %s, not the pinned witness %s", resp.Signer, c.ExpectedSigner)
+	ackJSON, err := json.Marshal(resp.Ack)
+	if err != nil {
+		return nil, fmt.Errorf("marshal verified custody ack: %w", err)
 	}
-	return nil
+	return &CustodyAck{
+		AckSeq:        resp.Ack.AckSeq,
+		Signer:        resp.Ack.Signer,
+		PayloadSHA256: resp.Ack.PayloadSHA256,
+		AckJSON:       string(ackJSON),
+	}, nil
 }

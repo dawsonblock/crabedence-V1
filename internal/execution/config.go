@@ -28,6 +28,17 @@ type ServiceConfig struct {
 	GitHubAPIURL    string
 	QualProviderURL string
 
+	// HistoryDB, when set, wires the governed memory adapter: the
+	// history.* reads plus the grant-gated mutations (append,
+	// checkpoint, record_decision) run against the store at this path.
+	// HistoryWitnessKey enables history.checkpoint — the witness is a
+	// signer outside the store's administrative control, configured by
+	// the deployment and never named by a request. HistoryContentDir
+	// overrides the content store's default sibling location.
+	HistoryDB         string
+	HistoryWitnessKey string
+	HistoryContentDir string
+
 	// Evidence trust root.
 	EvidenceKeyPath        string
 	EvidenceTrustedSigners []string
@@ -158,6 +169,17 @@ func LoadServiceConfig(opts ServeOptions) (*ServiceConfig, error) {
 	// the adapter enforces the loopback-only contract when it is
 	// constructed.
 	cfg.QualProviderURL = strings.TrimSpace(os.Getenv("CRABEDENCE_QUAL_PROVIDER_URL"))
+
+	// The governed memory adapter: CRABEDENCE_HISTORY_DB names the
+	// history store the history.*/research.* capabilities run against.
+	// Unset, the capabilities stay registered (static policy) and fail
+	// CAPABILITY_UNAVAILABLE at dispatch — a deployment decision, never
+	// a registry change. The witness key is optional: without it
+	// history.checkpoint refuses rather than minting witnessed state
+	// under an unnamed identity.
+	cfg.HistoryDB = strings.TrimSpace(os.Getenv("CRABEDENCE_HISTORY_DB"))
+	cfg.HistoryWitnessKey = strings.TrimSpace(os.Getenv("CRABEDENCE_HISTORY_WITNESS_KEY"))
+	cfg.HistoryContentDir = strings.TrimSpace(os.Getenv("CRABEDENCE_HISTORY_CONTENT"))
 
 	cfg.EvidenceKeyPath = os.Getenv("CRABBOX_EVIDENCE_KEY")
 	trusted, err := parseTrustedEvidenceSigners(os.Getenv("CRABBOX_EVIDENCE_TRUSTED_SIGNERS"))

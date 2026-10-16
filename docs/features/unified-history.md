@@ -59,9 +59,12 @@ idempotent — re-running it appends only what is new. Kinds:
   read-only through `InspectLedger`, no flock contention) as
   `execution` events: state, dispatch class, outcome, and the
   contract's resource/network/security shape parsed from the durable
-  contract JSON. Active and archived rows alike; re-ingesting a row
-  that settled records the new state — the observation is the
-  history.
+  contract JSON. Active and archived rows alike. The job's identity
+  (subject, contract-hash correlation) is stored apart from each
+  observation: dedupe commits to the observation's content, so an
+  unchanged re-ingest is idempotent while every material update —
+  state transition, receipt binding, archive flip, exit code —
+  persists as its own individually identifiable observation.
 - `ingest-evidence DIR` — `receipts.jsonl` and `checkpoints/` as
   records that carry what the ingester could verify: intrinsic
   signature validity, trusted-signer membership (from
@@ -85,6 +88,87 @@ idempotent — re-running it appends only what is new. Kinds:
 - `append` — ad-hoc records: experiments, failed attempts,
   observations. Dedupes on the content digest unless `-dedupe` is
   given.
+- `ingest-conversations PATH` — development transcripts (Claude Code
+  JSONL, generic `role`/`content` rows, JSON arrays) as per-message
+  `conversation` events: speaker attribution verbatim, session
+  identity, timestamps, tool calls, and touched file paths. Dedupe
+  commits to message position + content, so a live transcript's
+  appended tail re-ingests incrementally; a line that is not valid
+  JSON refuses the ingest.
+- `ingest-traces PATH` — agent action traces (JSONL tool-call
+  records) as `trace` events: tool, input/output digests, duration,
+  run identity. A record naming no tool is refused — it cannot say
+  what was done.
+- `ingest-archive FILE` — one source archive (zip, tar, tar.gz) as an
+  `archive` event: member manifest digest plus detected-vs-supplied
+  identity. The project version is detected from `VERSION`,
+  `package.json`, or `Cargo.toml` inside the bytes — never the
+  filename — and a filename that disagrees with the content records
+  `version_conflict`, keeping both claims.
+- `ingest-experiments PATH` — JSON experiment records
+  (`experiment_id`, `hypothesis`, `arm`, `outcome`, `metrics`) as
+  `experiment` events keyed on content; a corrected record is a new
+  observation beside the original.
+- `ingest-recovery LEDGER.db` — the executor's durable
+  `recovery_events` trail (claims, ambiguity markings, expirations,
+  escalations) as `recovery` events.
+
+The transcript/trace/archive/experiment ingesters commit source bytes
+to a content-addressed `ContentStore` (`<db>.content/objects/<sha256>`,
+overridable via `-content-dir`): atomic writes, digest-verified reads,
+and `Verify()` reporting objects that fail their own address. Every
+event links to the held bytes through `source_sha256`.
+
+## Trust: observations vs. verdicts
+
+The event chain proves its contents were not tampered with. It
+cannot by itself prove that its tail is still there, or that a
+record in it deserves trust. Two separate mechanisms cover that.
+
+**Witnessed checkpoints.** `sandbox-history -db history.db
+checkpoint DIR -witness-key KEY.pem` asks an independent witness —
+an Ed25519 key held outside the store — to sign a checkpoint
+record: the store's stable `store_id`, the chain's sequence and
+head digest, the digest of the applicable source inventory, the
+hash of the previous checkpoint (the witnessed series is itself
+append-only), and the witness identity. `verify-checkpoint` fetches
+the latest checkpoint from outside the database and fails on:
+
+- rollback — events the witness saw are missing below its sequence;
+- prefix rewrite — the event at the witnessed sequence no longer
+  digests to the witnessed head;
+- store replacement — a different (however internally valid)
+  database does not inherit the witnessed `store_id`;
+- witnessed-series tampering — edited, reordered, or truncated
+  checkpoint files break the `previous_checkpoint_hash` links.
+
+A store with more events than the witness saw is progress, not a
+finding — checkpoints are historical commitments, and witnessing
+proves what was committed, never what was never committed and never
+witnessed. Checkpoint files are written atomically (temp, fsync,
+rename, directory fsync), so a crash mid-witness leaves the last
+committed checkpoint, never a torn one.
+
+**Assessments.** Verdicts about evidence live in a versioned
+`assessments` table, apart from the immutable observations they
+describe. Each assessment names the observation's dedupe key, the
+verifier identity, the verification rules version, a digest of the
+trusted-signer set in force, the input digest, and a result:
+`VERIFIED`, `REJECTED`, `UNVERIFIED`, `CONFLICTED`, `STALE`.
+Ingest emits one per observed receipt, checkpoint, and custody ack;
+`EffectiveAssessment` derives the current state for a subject under
+a caller-chosen policy:
+
+- no applicable verdict → `UNVERIFIED`;
+- latest verdict minted under a different trust set → `STALE` (the
+  old verdict stays for audit and never silently upgrades);
+- disagreeing verifiers → `CONFLICTED`;
+- otherwise the latest applicable verdict.
+
+So re-ingesting a receipt with a newly trusted signer mints a new
+`VERIFIED` assessment — the observation is untouched — while a
+previously rejected record can never become trusted without a new
+assessment explicitly saying so.
 
 ## The model
 
@@ -121,6 +205,12 @@ sandbox-history -db history.db -trusted-signer <witness-fp> \
     ingest-custody custody/
 sandbox-history -db history.db verify
 
+# Anchor the chain to an independent witness, then check it later
+sandbox-history -db history.db checkpoint custody-witnessed/ \
+    -witness-key witness-key.pem
+sandbox-history -db history.db verify-checkpoint custody-witnessed/ \
+    -trusted-signer <witness-fp>
+
 # Learn and propose
 sandbox-dream -db history.db -envelope arms.json report
 sandbox-dream -db history.db -envelope arms.json \
@@ -142,3 +232,42 @@ authority, pick a security profile or network mode, rewrite a
 verification rule, or promote a release. It selects resource
 parameters inside an operator-declared envelope, records why, and
 nothing it emits carries execution authority.
+
+## Governed surface (capability registry)
+
+The memory and research operations are registered capabilities, not a
+private back channel. The execution service's release registry now
+carries eight governed entries, all bound to the `history` adapter:
+
+| Capability | Class | Route | Authority |
+|---|---|---|---|
+| `history.query` | READ | DIRECT | none |
+| `history.verify` | READ | DIRECT | none |
+| `history.explain` | READ | DIRECT | none |
+| `research.diagnose` | READ | DIRECT | none |
+| `research.propose` | READ | DIRECT | none |
+| `history.append` | MUTATION | CRABEDENCE | grant required |
+| `history.checkpoint` | MUTATION | CRABEDENCE | grant required |
+| `research.record_decision` | MUTATION | CRABEDENCE | grant required |
+
+Reads stay observational: they resolve DIRECT and carry no
+grant requirement because remembering is not an effect. Writes are
+governed effects: appending a record, minting a witness-signed
+checkpoint, and recording an explorer decision each route through the
+durable execution fabric under an explicit grant, so a memory write is
+idempotent, audited, and attributable like any other mutation.
+
+Deployment wiring is `CRABEDENCE_HISTORY_DB` (the store the adapter
+serves). Unset, the capabilities stay registered — release policy does
+not vary by deployment — and calls fail `CAPABILITY_UNAVAILABLE`, never
+`CAPABILITY_NOT_FOUND` and never a silent reroute. The adapter
+additionally refuses `history.checkpoint` without
+`CRABEDENCE_HISTORY_WITNESS_KEY`: witnessed state is never minted
+under an unnamed identity, and the witness lives in deployment
+configuration, not in a request an agent could influence.
+
+The advisory boundary is unchanged at the governed layer:
+`research.propose` returns interventions inside the caller-declared
+envelope — it emits a proposal, not an execution request, and no
+capability in this surface can sign a contract, dispatch a job, or
+mint evidence.

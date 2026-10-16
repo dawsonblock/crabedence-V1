@@ -1,7 +1,9 @@
 package history
 
 import (
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"sync"
@@ -12,7 +14,13 @@ import (
 // schemaVersion is bumped only by a migration that knows how to carry
 // every existing row forward — the store's history is itself history,
 // never silently rebuilt.
-const schemaVersion = 1
+//
+// v2 adds the trust layer: store_meta carries the store's stable
+// identity (bound into witnessed checkpoints so a replaced database
+// cannot inherit witnessed history), and assessments carries
+// versioned verification verdicts kept apart from the immutable
+// observations they describe.
+const schemaVersion = 2
 
 // Store is the append-only event chain. One process owns the writer
 // at a time (the writer mutex serializes appends; the chain's seq
@@ -69,14 +77,43 @@ func OpenReadOnly(path string) (*Store, error) {
 func (s *Store) migrate() error {
 	var v int
 	err := s.db.QueryRow(`SELECT version FROM schema_version`).Scan(&v)
-	if err == nil {
-		if v != schemaVersion {
-			return fmt.Errorf("history schema version %d, expected %d", v, schemaVersion)
+	switch {
+	case err == nil && v == schemaVersion:
+		return nil
+	case err == nil && v == 1:
+		// v1 → v2: add the trust layer without touching the chain —
+		// the events table is carried forward byte-for-byte; the
+		// store gains the identity checkpoints bind to.
+		if _, err := s.db.Exec(`
+			CREATE TABLE IF NOT EXISTS store_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+			CREATE TABLE IF NOT EXISTS assessments(
+				seq INTEGER PRIMARY KEY AUTOINCREMENT,
+				subject_key TEXT NOT NULL,
+				verifier TEXT NOT NULL,
+				rules_version TEXT NOT NULL,
+				trust_set_sha TEXT NOT NULL,
+				input_sha TEXT NOT NULL,
+				result TEXT NOT NULL,
+				detail TEXT NOT NULL DEFAULT '',
+				assessed_at_ms INTEGER NOT NULL,
+				UNIQUE(subject_key, verifier, rules_version, trust_set_sha, input_sha, result)
+			);
+			CREATE INDEX IF NOT EXISTS idx_assessments_subject ON assessments(subject_key)`); err != nil {
+			return fmt.Errorf("history migration v2: %w", err)
+		}
+		if err := s.ensureStoreID(); err != nil {
+			return err
+		}
+		if _, err := s.db.Exec(`UPDATE schema_version SET version = ?`, schemaVersion); err != nil {
+			return fmt.Errorf("history migration v2: %w", err)
 		}
 		return nil
+	case err == nil:
+		return fmt.Errorf("history schema version %d, expected %d", v, schemaVersion)
 	}
 	if _, err := s.db.Exec(`
 		CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL);
+		CREATE TABLE IF NOT EXISTS store_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 		CREATE TABLE IF NOT EXISTS events(
 			seq INTEGER PRIMARY KEY AUTOINCREMENT,
 			dedupe_key TEXT NOT NULL UNIQUE,
@@ -89,13 +126,52 @@ func (s *Store) migrate() error {
 			sha256 TEXT NOT NULL,
 			prev_sha256 TEXT NOT NULL
 		);
+		CREATE TABLE IF NOT EXISTS assessments(
+			seq INTEGER PRIMARY KEY AUTOINCREMENT,
+			subject_key TEXT NOT NULL,
+			verifier TEXT NOT NULL,
+			rules_version TEXT NOT NULL,
+			trust_set_sha TEXT NOT NULL,
+			input_sha TEXT NOT NULL,
+			result TEXT NOT NULL,
+			detail TEXT NOT NULL DEFAULT '',
+			assessed_at_ms INTEGER NOT NULL,
+			UNIQUE(subject_key, verifier, rules_version, trust_set_sha, input_sha, result)
+		);
 		CREATE INDEX IF NOT EXISTS idx_events_kind_time ON events(kind, occurred_at);
 		CREATE INDEX IF NOT EXISTS idx_events_correlation ON events(correlation);
-		CREATE INDEX IF NOT EXISTS idx_events_subject ON events(subject)`); err != nil {
+		CREATE INDEX IF NOT EXISTS idx_events_subject ON events(subject);
+		CREATE INDEX IF NOT EXISTS idx_assessments_subject ON assessments(subject_key)`); err != nil {
 		return fmt.Errorf("history migration: %w", err)
+	}
+	if err := s.ensureStoreID(); err != nil {
+		return err
 	}
 	if _, err := s.db.Exec(`INSERT INTO schema_version(version) VALUES (?)`, schemaVersion); err != nil {
 		return fmt.Errorf("history migration: %w", err)
+	}
+	return nil
+}
+
+// ensureStoreID assigns the store's stable identity exactly once —
+// a randomly generated value no operator chooses, written at creation
+// (or v1→v2 migration) and bound into every checkpoint thereafter.
+func (s *Store) ensureStoreID() error {
+	var existing string
+	err := s.db.QueryRow(`SELECT value FROM store_meta WHERE key = 'store_id'`).Scan(&existing)
+	if err == nil && existing != "" {
+		return nil
+	}
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("history store identity: %w", err)
+	}
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Errorf("history store identity: %w", err)
+	}
+	id := "hist-" + hex.EncodeToString(b[:])
+	if _, err := s.db.Exec(`INSERT INTO store_meta(key, value) VALUES ('store_id', ?)`, id); err != nil {
+		return fmt.Errorf("history store identity: %w", err)
 	}
 	return nil
 }

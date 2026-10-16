@@ -10,10 +10,23 @@
 //	sandbox-history -db /path/history.db ingest-custody /path/custody [-trusted-signer fp,...]
 //	sandbox-history -db /path/history.db ingest-doc FILE...
 //	sandbox-history -db /path/history.db ingest-teststream FILE [-label NAME]
+//	sandbox-history -db /path/history.db ingest-conversations PATH
+//	sandbox-history -db /path/history.db ingest-traces PATH
+//	sandbox-history -db /path/history.db ingest-archive FILE
+//	sandbox-history -db /path/history.db ingest-experiments PATH
+//	sandbox-history -db /path/history.db ingest-recovery /path/ledger.db
 //	sandbox-history -db /path/history.db query [-kind K] [-correlation C] [-limit N]
 //	sandbox-history -db /path/history.db stats
 //	sandbox-history -db /path/history.db verify
+//	sandbox-history -db /path/history.db checkpoint DIR -witness-key KEY.pem
+//	sandbox-history -db /path/history.db verify-checkpoint DIR [-trusted-signer fp,...]
 //
+// checkpoint asks an independent witness (its own key, held outside
+// this store) to sign the current chain head into DIR; verify-checkpoint
+// fetches the latest checkpoint from outside the database and fails
+// when the store has rolled back below — or diverged from — the
+// witnessed head. Witnessing proves what was committed; it cannot
+// prove records nobody witnessed.
 // Ingest commands are idempotent: every record carries a dedupe key
 // derived from its source identity, so re-running an ingest appends
 // only what is new. verify re-derives the entire event chain; a
@@ -39,6 +52,8 @@ func main() {
 	dbPath := flag.String("db", "", "history store path (required)")
 	trusted := flag.String("trusted-signer", "", "comma-separated signer fingerprints to trust (ingest-evidence, ingest-custody)")
 	ledger := flag.String("ledger", "", "ingest-evidence: executor ledger for full checkpoint verification")
+	witnessKey := flag.String("witness-key", "", "checkpoint: witness signer key file (created if absent)")
+	contentDir := flag.String("content-dir", "", "content-addressed object dir for source bytes (default <db>.content)")
 	label := flag.String("label", "", "label for ingest-teststream")
 	kind := flag.String("kind", "", "query/append: event kind filter")
 	subject := flag.String("subject", "", "append: event subject")
@@ -64,7 +79,8 @@ func main() {
 	rest := args[1:]
 	var s *history.Store
 	var err error
-	if op == "verify" || op == "query" || op == "stats" {
+	if op == "verify" || op == "query" || op == "stats" ||
+		op == "verify-checkpoint" || op == "checkpoint" {
 		s, err = history.OpenReadOnly(*dbPath)
 	} else {
 		s, err = history.OpenStore(*dbPath)
@@ -148,6 +164,41 @@ func main() {
 		n, err := s.IngestTestStream(f, *label)
 		done(n, err, "test records")
 
+	case "ingest-conversations", "ingest-traces", "ingest-experiments", "ingest-archive":
+		if len(rest) != 1 {
+			usage(op + " PATH")
+		}
+		cs, err := openContentStore(*dbPath, *contentDir)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "content store:", err)
+			os.Exit(1)
+		}
+		var n int
+		switch op {
+		case "ingest-conversations":
+			n, err = s.IngestConversations(rest[0], cs)
+		case "ingest-traces":
+			n, err = s.IngestTraces(rest[0], cs)
+		case "ingest-experiments":
+			n, err = s.IngestExperiments(rest[0], cs)
+		case "ingest-archive":
+			n, err = s.IngestArchive(rest[0], cs)
+		}
+		done(n, err, "records")
+
+	case "ingest-recovery":
+		if len(rest) != 1 {
+			usage("ingest-recovery LEDGER.db")
+		}
+		l, err := sx.InspectLedger(rest[0])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "open ledger:", err)
+			os.Exit(1)
+		}
+		defer l.Close()
+		n, err := s.IngestRecovery(l, rest[0])
+		done(n, err, "recovery events")
+
 	case "append":
 		// Ad-hoc records: experiments, failed attempts, observations —
 		// anything an operator wants in memory that no dedicated
@@ -215,10 +266,77 @@ func main() {
 		fmt.Fprintf(os.Stderr, "FAILED: %d chain problem(s)\n", len(findings))
 		os.Exit(1)
 
+	case "checkpoint":
+		if len(rest) != 1 {
+			usage("checkpoint CHECKPOINT_DIR -witness-key KEY.pem")
+		}
+		if *witnessKey == "" {
+			fmt.Fprintln(os.Stderr, "checkpoint requires -witness-key — the witness is an independent key, not the store's own")
+			os.Exit(2)
+		}
+		witness, err := evidence.LoadOrCreateSigner(*witnessKey)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "witness key:", err)
+			os.Exit(1)
+		}
+		cp, err := s.WriteCheckpoint(rest[0], witness)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "checkpoint:", err)
+			os.Exit(1)
+		}
+		fmt.Printf("checkpoint %d: store %s head %s witnessed by %s\n",
+			cp.Sequence, cp.StoreID, cp.ChainHead[:16], cp.Signer)
+
+	case "verify-checkpoint":
+		if len(rest) != 1 {
+			usage("verify-checkpoint CHECKPOINT_DIR [-trusted-signer fp,...]")
+		}
+		cps, err := history.LoadCheckpoints(rest[0])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "load checkpoints:", err)
+			os.Exit(1)
+		}
+		if len(cps) == 0 {
+			fmt.Fprintln(os.Stderr, "no checkpoints in", rest[0], "— nothing witnessed; the store is unanchored")
+			os.Exit(1)
+		}
+		var failed bool
+		for _, f := range history.VerifyCheckpointChain(cps) {
+			fmt.Fprintln(os.Stderr, "  FAIL", f)
+			failed = true
+		}
+		latest := cps[len(cps)-1].Checkpoint()
+		if err := history.VerifyCheckpointFile(latest, trustedSet); err != nil {
+			fmt.Fprintln(os.Stderr, "  FAIL", err)
+			failed = true
+		}
+		if !failed {
+			for _, f := range s.VerifyAgainstCheckpoint(latest) {
+				fmt.Fprintln(os.Stderr, "  FAIL", f)
+				failed = true
+			}
+		}
+		if failed {
+			fmt.Fprintln(os.Stderr, "FAILED: store disagrees with the witnessed record")
+			os.Exit(1)
+		}
+		fmt.Printf("OK: witnessed seq %d head %s holds (witness %s)\n",
+			latest.Sequence, latest.ChainHead[:16], latest.Signer)
+
 	default:
 		fmt.Fprintln(os.Stderr, "unknown op:", op)
 		os.Exit(2)
 	}
+}
+
+// openContentStore resolves the object dir: explicit -content-dir,
+// else a sibling of the database so memory and its held evidence
+// travel together.
+func openContentStore(dbPath, dir string) (*history.ContentStore, error) {
+	if dir == "" {
+		dir = dbPath + ".content"
+	}
+	return history.OpenContentStore(dir)
 }
 
 func usage(s string) {

@@ -299,19 +299,24 @@ type stubCustodian struct {
 	seen     []string
 }
 
-func (c *stubCustodian) WitnessArchive(seg *ArchiveSegment, payload []byte) error {
+func (c *stubCustodian) WitnessArchive(seg *ArchiveSegment, payload []byte) (*CustodyAck, error) {
 	if c.failNext > 0 {
 		c.failNext--
-		return fmt.Errorf("custodian offline")
+		return nil, fmt.Errorf("custodian offline")
 	}
 	// A real custodian holds the bytes: the stub enforces the same
 	// binding so a payload mismatch can never be attested.
 	sum := sha256.Sum256(payload)
 	if hex.EncodeToString(sum[:]) != seg.SHA256 {
-		return fmt.Errorf("payload digest does not match segment %s", seg.SHA256)
+		return nil, fmt.Errorf("payload digest does not match segment %s", seg.SHA256)
 	}
 	c.seen = append(c.seen, seg.SHA256)
-	return nil
+	return &CustodyAck{
+		AckSeq:        int64(len(c.seen)),
+		Signer:        "stub-witness",
+		PayloadSHA256: seg.SHA256,
+		AckJSON:       `{"record_type":"stub","payload_sha256":"` + seg.SHA256 + `"}`,
+	}, nil
 }
 
 func TestCustodialArchiveHoldsRowsUntilWitnessed(t *testing.T) {
@@ -580,7 +585,10 @@ func TestArchiveCustodyOverSocket(t *testing.T) {
 // rows — the registry keeps them for the retry.
 func TestArchiveCustodyOfflineHoldsRows(t *testing.T) {
 	l, _ := openLedger(t)
-	custodian := &SocketCustodian{Socket: filepath.Join(t.TempDir(), "custody.sock")}
+	custodian := &SocketCustodian{
+		Socket:         filepath.Join(t.TempDir(), "custody.sock"),
+		ExpectedSigner: strings.Repeat("0", 64),
+	}
 	if err := l.SetArchiveCustodian(custodian); err != nil {
 		t.Fatal(err)
 	}

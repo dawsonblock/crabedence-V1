@@ -48,8 +48,25 @@ type ArchiveCustodian interface {
 	// idempotent on the same segment digest. The payload is the
 	// canonical segment bytes — sha256(payload) == seg.SHA256 — so the
 	// custodian holds the archived content itself, not just a promise
-	// that it existed.
-	WitnessArchive(seg *ArchiveSegment, payload []byte) error
+	// that it existed. The returned acknowledgement is the verified
+	// custody reference the ledger persists with the segment before
+	// any row may leave.
+	WitnessArchive(seg *ArchiveSegment, payload []byte) (*CustodyAck, error)
+}
+
+// CustodyAck is the verified custody acknowledgement reference the
+// ledger stores with its segment — the durable link between "the rows
+// were released" and "an independent witness provably holds them".
+type CustodyAck struct {
+	// AckSeq is the acknowledgement's position in the witness's chain.
+	AckSeq int64 `json:"ack_seq"`
+	// Signer is the witness key that signed it.
+	Signer string `json:"signer"`
+	// PayloadSHA256 is the segment digest the ack commits to.
+	PayloadSHA256 string `json:"payload_sha256"`
+	// AckJSON is the canonical signed acknowledgement record — the
+	// complete evidence an auditor re-verifies, not a summary.
+	AckJSON string `json:"ack_json"`
 }
 
 // ArchiveSegment is the immutable record of one archival transition:
@@ -292,13 +309,14 @@ func (l *Ledger) ArchiveCompleted(limit int) (*ArchiveSegment, error) {
 	}
 
 	if custodian != nil {
-		if err := custodian.WitnessArchive(seg, segBytes); err != nil {
+		ack, err := custodian.WitnessArchive(seg, segBytes)
+		if err != nil {
 			// The archive rows and the pending segment are durable; the
 			// operational rows were never released. A later pass retries
 			// the handoff — nothing is lost and nothing was claimed.
 			return nil, fmt.Errorf("archive custody witness refused: %w", err)
 		}
-		if err := l.completeCustodial(seg); err != nil {
+		if err := l.completeCustodial(seg, ack); err != nil {
 			return nil, err
 		}
 		seg.Custody = "witnessed"
@@ -329,20 +347,30 @@ func (l *Ledger) releaseArchivedTx(tx *sql.Tx, rows []*LedgerJob) error {
 }
 
 // completeCustodial finishes a witnessed archive: custody flips to
-// 'witnessed' and the operational rows release — one transaction, so a
-// crash rolls back to the pending shape a custody retry can resume.
-// Only the pass that actually flips custody releases rows; a retry
-// that finds the segment already witnessed leaves the release to the
-// finalize pass, which makes the whole handoff idempotent.
-func (l *Ledger) completeCustodial(seg *ArchiveSegment) error {
+// 'witnessed', the verified acknowledgement reference persists, and
+// the operational rows release — one transaction, so a crash rolls
+// back to the pending shape a custody retry can resume. Only the pass
+// that actually flips custody releases rows; a retry that finds the
+// segment already witnessed leaves the release to the finalize pass,
+// which makes the whole handoff idempotent.
+func (l *Ledger) completeCustodial(seg *ArchiveSegment, ack *CustodyAck) error {
+	ackJSON := ""
+	if ack != nil {
+		raw, err := json.Marshal(ack)
+		if err != nil {
+			return fmt.Errorf("marshal custody ack reference: %w", err)
+		}
+		ackJSON = string(raw)
+	}
 	tx, err := l.db.BeginTx(context.Background(), nil)
 	if err != nil {
 		return fmt.Errorf("custodial finalize begin: %w", err)
 	}
 	defer tx.Rollback()
 	res, err := tx.Exec(
-		`UPDATE archive_segments SET custody = 'witnessed' WHERE segment_seq = ? AND custody = 'pending'`,
-		seg.Seq)
+		`UPDATE archive_segments SET custody = 'witnessed', custody_ack = ?
+		 WHERE segment_seq = ? AND custody = 'pending'`,
+		ackJSON, seg.Seq)
 	if err != nil {
 		return fmt.Errorf("mark segment witnessed: %w", err)
 	}
@@ -377,10 +405,11 @@ func (l *Ledger) retryPendingCustody(c ArchiveCustodian) error {
 		if err != nil {
 			return fmt.Errorf("archive custody retry for segment %d cannot rebuild payload: %w", seg.Seq, err)
 		}
-		if err := c.WitnessArchive(seg, payload); err != nil {
+		ack, err := c.WitnessArchive(seg, payload)
+		if err != nil {
 			return fmt.Errorf("archive custody witness refused segment %d: %w", seg.Seq, err)
 		}
-		if err := l.completeCustodial(seg); err != nil {
+		if err := l.completeCustodial(seg, ack); err != nil {
 			return err
 		}
 	}

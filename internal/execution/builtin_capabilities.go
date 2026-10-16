@@ -32,6 +32,7 @@ func RegisterBuiltinCapabilities(registry *capability.Registry) error {
 		{"github.issue.update", RegisterGitHubIssueUpdateCapability},
 		{"github.pr.create", RegisterGitHubPullCreateCapability},
 		{"github.pr.merge", RegisterGitHubPullMergeCapability},
+		{"history.*+research.*", RegisterHistoryCapabilities},
 	}
 	for _, registration := range registrations {
 		if err := registration.register(registry); err != nil {

@@ -3,6 +3,8 @@ package sandboxexecutor
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/openclaw/crabbox/internal/evidence"
@@ -18,10 +20,14 @@ import (
 // claims and fence epoch the live path uses, never creating work —
 // only moving durable intents toward their recorded conclusion.
 //
-// Per-attempt pacing lives in small in-memory backoff maps: a restart
-// re-tries everything once immediately (correct — state may have
-// changed while the daemon was down), then each row backs off, so a
-// permanently failing cleanup audits rather than spams.
+// Per-attempt pacing is durable (recovery_attempts): a claim stays
+// claimed across restarts, so a daemon reopened inside a backoff
+// window keeps waiting instead of re-attempting every row — while
+// downtime longer than the backoff still makes the next pass due
+// immediately, because the world may have changed while down. What
+// the loop did is itself evidence: claims, markings, terminations
+// and escalations land in recovery_events, the durable trail a log
+// line never was.
 
 const (
 	// defaultMaintenanceInterval paces the recovery scheduler.
@@ -77,32 +83,55 @@ func (s *Server) maintenancePass() {
 	s.escalateResidue()
 }
 
-// maintMu guards the retry-pacing and escalation bookkeeping — maps
-// of last-attempt times and the last-audited residue shape.
-// The maps are per-lifetime by design: a restart re-attempts every
-// candidate once, because the world may have changed while down.
-
-// claimAttempt reports whether a row is due for another attempt — the
-// first sighting is always due, then once per backoff. The map is
-// stamped on every true return, so a row attempted once per pass is
-// attempted at most once per backoff window.
-func (s *Server) claimAttempt(m map[string]time.Time, jobID string, backoff time.Duration) bool {
-	s.maintMu.Lock()
-	defer s.maintMu.Unlock()
-	now := s.now()
-	if last, ok := m[jobID]; ok && now.Sub(last) < backoff {
-		return false
+// resumeBackoff/cleanupBackoff resolve the configured pacing windows,
+// falling back to the defaults. The values are validated at startup,
+// so a configured window is never negative here.
+func (s *Server) resumeBackoff() time.Duration {
+	if s.cfg.ResumeBackoff > 0 {
+		return s.cfg.ResumeBackoff
 	}
-	m[jobID] = now
-	return true
+	return resumeRetryBackoff
 }
 
-// forgetAttempt drops pacing state for a job that resolved — the map
-// must not grow on history the ledger no longer holds.
-func (s *Server) forgetAttempt(m map[string]time.Time, jobID string) {
-	s.maintMu.Lock()
-	defer s.maintMu.Unlock()
-	delete(m, jobID)
+func (s *Server) cleanupBackoff() time.Duration {
+	if s.cfg.CleanupBackoff > 0 {
+		return s.cfg.CleanupBackoff
+	}
+	return cleanupRetryBackoff
+}
+
+// claimRecovery reports whether a row is due for another attempt —
+// the first sighting is always due, then once per backoff, with the
+// schedule itself durable in the ledger so a restart inside the
+// backoff does not re-attempt. Ledger failures are reported and the
+// row skipped: an unpaceable retry is never run unpaced.
+func (s *Server) claimRecovery(jobID, action string, backoff time.Duration) bool {
+	due, attempts, err := s.ledger.ClaimRecoveryAttempt(jobID, action, backoff, s.now())
+	if err != nil {
+		s.audit("maintenance: cannot pace %s attempt for %s: %v", action, jobID, err)
+		return false
+	}
+	if due && attempts > 1 {
+		s.recordRecovery("claim", jobID, fmt.Sprintf("%s attempt %d", action, attempts))
+	}
+	return due
+}
+
+// forgetRecovery drops pacing state for a job that resolved — the
+// table must not grow on history the ledger no longer holds.
+func (s *Server) forgetRecovery(jobID, action string) {
+	if err := s.ledger.ForgetRecoveryAttempt(jobID, action); err != nil {
+		s.audit("maintenance: cannot drop %s pacing for %s: %v", action, jobID, err)
+	}
+}
+
+// recordRecovery appends to the durable recovery trail. A write
+// failure is audited but never blocks the pass — the trail is a
+// record of work done, not a gate on doing it.
+func (s *Server) recordRecovery(kind, subject, detail string) {
+	if err := s.ledger.RecordRecoveryEvent(kind, subject, detail, s.now()); err != nil {
+		s.audit("maintenance: cannot record %s for %s: %v", kind, subject, err)
+	}
 }
 
 // dispatchRecorded sweeps jobs whose durable intent never reached a
@@ -176,6 +205,7 @@ func (s *Server) dispatchRecordedOne(j *LedgerJob) {
 		return
 	}
 	s.audit("maintenance: claiming stranded dispatch of %s", j.JobID)
+	s.recordRecovery("claim", j.JobID, "stranded dispatch intent claimed by maintenance")
 	state, reason := s.driveDispatch(j, contract)
 	if state != JobStateRunning {
 		s.audit("maintenance: deferred dispatch of %s -> %s: %v", j.JobID, state, reason)
@@ -212,6 +242,7 @@ func (s *Server) markStaleDispatching() {
 			continue
 		}
 		s.audit("maintenance: dispatching job %s has no live driver — marked outcome uncertain", j.JobID)
+		s.recordRecovery("mark_ambiguous", j.JobID, "dispatching row had no live driver")
 	}
 }
 
@@ -236,13 +267,21 @@ func (s *Server) expireRecorded(j *LedgerJob, reason string) {
 		return
 	}
 	s.audit("maintenance: job %s terminated without dispatch: %s", j.JobID, reason)
+	s.recordRecovery("expire", j.JobID, reason)
 	s.checkpoint()
 }
 
+// residueStateKey is the durable throttle state: the last-audited
+// residue shape and when. Kept in the ledger so a daemon reopened
+// mid-throttle does not re-escalate an unchanged shape.
+const residueStateKey = "residue_escalation"
+
 // escalateResidue audits what maintenance could not resolve. The line
 // fires immediately when the residue shape changes, then repeats on a
-// throttle so a permanently unresolved workload stays visible without
-// drowning the log.
+// throttle — with the throttle state durable, so a crash-looping
+// daemon escalates an unchanged shape once, not once per restart.
+// Every escalation also lands in recovery_events: the trail survives
+// the log it was printed to.
 func (s *Server) escalateResidue() {
 	r, err := s.ledger.PendingResidue()
 	if err != nil {
@@ -255,16 +294,34 @@ func (s *Server) escalateResidue() {
 	now := s.now()
 	sig := fmt.Sprintf("%d/%d/%d/%d", r.Unresolved, r.CleanupPending,
 		r.OldestUnresolved.Unix(), r.OldestCleanup.Unix())
-	s.maintMu.Lock()
-	if sig == s.lastResidueSig && now.Sub(s.lastResidueAudit) < residueEscalationRepeat {
-		s.maintMu.Unlock()
+	prev, found, err := s.ledger.RecoveryState(residueStateKey)
+	if err != nil {
+		s.audit("maintenance: cannot read residue throttle state: %v", err)
 		return
 	}
-	s.lastResidueSig, s.lastResidueAudit = sig, now
-	s.maintMu.Unlock()
+	var lastAudit time.Time
+	if found {
+		if at := strings.LastIndex(prev, "@"); at >= 0 && prev[:at] == sig {
+			if ms, perr := strconv.ParseInt(prev[at+1:], 10, 64); perr == nil {
+				lastAudit = time.UnixMilli(ms)
+			}
+		}
+	}
+	if !lastAudit.IsZero() && now.Sub(lastAudit) < residueEscalationRepeat {
+		return
+	}
+	if err := s.ledger.SetRecoveryState(residueStateKey,
+		fmt.Sprintf("%s@%d", sig, now.UnixMilli())); err != nil {
+		s.audit("maintenance: cannot persist residue throttle state: %v", err)
+		return
+	}
 	s.audit("ESCALATION: registry residue persists — %d unresolved job(s) (oldest %s ago), %d cleanup pending (oldest %s ago) — operator reconciliation required; these are never auto-retried blind or auto-destroyed",
 		r.Unresolved, now.Sub(r.OldestUnresolved).Round(time.Second),
 		r.CleanupPending, now.Sub(r.OldestCleanup).Round(time.Second))
+	s.recordRecovery("escalation", "registry",
+		fmt.Sprintf("residue persists: %d unresolved (oldest %s ago), %d cleanup pending (oldest %s ago)",
+			r.Unresolved, now.Sub(r.OldestUnresolved).Round(time.Second),
+			r.CleanupPending, now.Sub(r.OldestCleanup).Round(time.Second)))
 }
 
 // reconcileWalk re-attempts observation of unresolved rows: a run the
@@ -287,12 +344,12 @@ func (s *Server) reconcileWalk() {
 			if s.isStopped() {
 				return
 			}
-			if !s.claimAttempt(s.lastResumeAttempt, j.JobID, resumeRetryBackoff) {
+			if !s.claimRecovery(j.JobID, RecoveryActionResume, s.resumeBackoff()) {
 				continue
 			}
 			s.reconcileOne(j)
 			if done, _ := s.ledger.Get(j.JobID); done == nil || done.State != JobStateDispatchAmbig && done.State != JobStateInterrupted {
-				s.forgetAttempt(s.lastResumeAttempt, j.JobID)
+				s.forgetRecovery(j.JobID, RecoveryActionResume)
 			}
 		}
 		cursor = jobs[len(jobs)-1].Seq
@@ -315,7 +372,7 @@ func (s *Server) cleanupWalk() {
 			if s.isStopped() {
 				return
 			}
-			if !s.claimAttempt(s.lastCleanupAttempt, j.JobID, cleanupRetryBackoff) {
+			if !s.claimRecovery(j.JobID, RecoveryActionCleanup, s.cleanupBackoff()) {
 				continue
 			}
 			s.cleanupOne(j)

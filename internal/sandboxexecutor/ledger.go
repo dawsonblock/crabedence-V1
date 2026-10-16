@@ -254,10 +254,16 @@ func (l *Ledger) Epoch() uint64 { return l.epoch }
 // ledgerSchemaVersion bumps when the schema gains columns; pre-v2
 // ledgers (from the admission-only spike) get their new columns via
 // ALTER TABLE rather than a destructive rebuild, v3 adds the runtime
-// run identity plus cleanup tracking, and v7 adds the archive set —
+// run identity plus cleanup tracking, v7 adds the archive set —
 // job_identities, jobs_archive, archive_segments — separating settled
-// history from operational state without surrendering replay identity.
-const ledgerSchemaVersion = 7
+// history from operational state without surrendering replay identity,
+// and v8 records the verified custody acknowledgement on each
+// witnessed segment. v9 makes the recovery scheduler durable:
+// recovery_attempts paces retries across restarts so a crash-looping
+// daemon cannot re-attempt every row on every open, and
+// recovery_events is the durable escalation trail the audit line
+// previously left only in logs.
+const ledgerSchemaVersion = 9
 
 func (l *Ledger) migrate() error {
 	var version int
@@ -426,6 +432,7 @@ func (l *Ledger) migrate() error {
 				row_count          INTEGER NOT NULL,
 				sha256             TEXT NOT NULL,
 				custody            TEXT NOT NULL DEFAULT 'local',
+				custody_ack        TEXT NOT NULL DEFAULT '',
 				created_at         INTEGER NOT NULL
 			);
 			INSERT INTO job_identities (job_id, contract_hash, seq, terminal_seq)
@@ -434,6 +441,42 @@ func (l *Ledger) migrate() error {
 		`)
 		if err != nil {
 			return fmt.Errorf("migrate ledger v%d→v7: %w", version, err)
+		}
+	}
+	if version < 8 {
+		// v7 → v8: the verified custody acknowledgement reference on
+		// each archive segment. Segments witnessed before the
+		// acknowledgement became evidence-carrying keep an empty
+		// reference — the custody chain still attests them.
+		if _, err := l.db.Exec(`ALTER TABLE archive_segments ADD COLUMN custody_ack TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			return fmt.Errorf("migrate ledger v%d→v8: %w", version, err)
+		}
+	}
+	if version < 9 {
+		// v8 → v9: durable recovery scheduling. Attempt pacing used
+		// to live in per-lifetime maps, so every restart re-attempted
+		// every unresolved row once — tolerable on a planned restart,
+		// a spin on a crash loop. Durable pacing makes the schedule
+		// itself survive: a reopen inside the backoff keeps waiting.
+		_, err := l.db.Exec(`
+			CREATE TABLE IF NOT EXISTS recovery_attempts (
+				job_id          TEXT NOT NULL,
+				action          TEXT NOT NULL,
+				last_attempt_ms INTEGER NOT NULL,
+				attempts        INTEGER NOT NULL,
+				PRIMARY KEY (job_id, action)
+			);
+			CREATE TABLE IF NOT EXISTS recovery_events (
+				seq      INTEGER PRIMARY KEY AUTOINCREMENT,
+				at_ms    INTEGER NOT NULL,
+				kind     TEXT NOT NULL,
+				subject  TEXT NOT NULL,
+				detail   TEXT NOT NULL DEFAULT ''
+			);
+			CREATE INDEX IF NOT EXISTS idx_recovery_events_kind ON recovery_events(kind, at_ms);
+		`)
+		if err != nil {
+			return fmt.Errorf("migrate ledger v%d→v9: %w", version, err)
 		}
 	}
 	if version < ledgerSchemaVersion {

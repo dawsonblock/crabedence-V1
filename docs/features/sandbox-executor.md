@@ -288,10 +288,38 @@ release. The witness is an independent attestor with its own key and store:
 - Custody is idempotent on the digest: a retried handoff re-verifies the held
   bytes and returns the original acknowledgement, so the crash window between
   the executor's archive commit and the operational release resumes without
-  double-witnessing.
+  double-witnessing. A retry whose declared identity disagrees with the
+  recorded acknowledgement is a conflicting custody claim, not a retry.
 - `sandbox-custodyd -verify -custody-dir <dir>` re-derives the whole store
   independently — chain links, signatures, payload digests, and orphaned
-  payloads — from the durable bytes alone.
+  payloads — from the durable bytes alone; `-trust-file` additionally flags
+  acknowledgements by witnesses the operator never approved.
+
+The response carries the complete signed acknowledgement (record type
+`archive-custody-ack/v2`), and the executor independently verifies it before
+any row may leave: the record must bind this exact segment (sequence,
+terminal range, row count, payload digest, and the request's own
+`created_at`), carry a signer identity consistent with its embedded public
+key, hold a valid Ed25519 signature over the versioned custody domain — and
+the signer must be an approved witness. Witness trust is explicit
+configuration, never learned from a response: `-archive-custody-trust-file`
+loads a trust root of approved witness public keys (owner-only file;
+rotations require the incumbent's signed key-transition record), and
+`-archive-custody-signer` pins a single witness fingerprint. A configured
+custody socket without an approved witness refuses startup — an unpinned
+witness is a self-declared identity, not custody. The verified
+acknowledgement reference is persisted on the segment
+(`archive_segments.custody_ack`) in the same transaction that releases the
+operational rows.
+
+Payload files and the ack chain are committed at durability boundaries: file
+sync plus directory sync at every rename and acknowledgement append, so a
+power loss cannot lose the name under which the acknowledgement or payload
+was committed. The custody socket obeys the same discipline as the
+executor's: the directory is owner-only on a local filesystem, an existing
+occupant is cleared only when it is a stale socket (a live listener refuses
+startup rather than losing its socket), and shutdown unlinks only the exact
+object the daemon bound.
 
 If the custodian cannot be reached or refuses, the archive rows and the
 pending segment are durable but the operational rows are never released; the
@@ -322,8 +350,10 @@ negative disables the periodic passes):
   uncertain, never retried, never claimed dead — where the reconcile walk and
   the escalation see it.
 - **Unresolved re-observation.** `DISPATCH_AMBIGUOUS`/`INTERRUPTED` rows are
-  re-resumed through the backend on a per-row backoff, exactly as at startup.
-- **Cleanup retries.** `cleanup_pending` removals retry on their own backoff.
+  re-resumed through the backend on a per-row backoff (`ResumeBackoff`, default
+  2m), exactly as at startup.
+- **Cleanup retries.** `cleanup_pending` removals retry on their own backoff
+  (`CleanupBackoff`, default 5m).
 - **Archival.** Settled rows move to the archive each pass; capacity relief
   does not wait for the registry to fill.
 - **Residue escalation.** Rows that persist unresolved or cleanup-pending are
@@ -331,6 +361,19 @@ negative disables the periodic passes):
   then on a throttle — so an operator learns the residue exists rather than
   discovering it at the next restart. Nothing is re-dispatched blind and
   nothing is auto-destroyed.
+
+The scheduler's pacing is itself durable (ledger `recovery_attempts`, schema
+v9): a retry claimed recently stays claimed across a restart, so a daemon
+reopened inside a backoff window keeps waiting instead of re-attempting every
+unresolved row on every open — a crash loop cannot hammer a wedged backend with
+its own recovery — while downtime longer than the backoff still makes the next
+pass due immediately, because the world may have changed while the daemon was
+down. The same durability covers the escalation throttle, and every claim,
+marking, termination, and escalation lands in `recovery_events`: the durable
+recovery trail `InspectLedger` can read back after the audit log is gone.
+Because the pacing is durable, a backoff configured long also delays the first
+post-restart attempt — `ResumeBackoff` and `CleanupBackoff` tune both windows
+for deployments whose backends recover slower or faster than the defaults.
 
 ## Platform qualification
 

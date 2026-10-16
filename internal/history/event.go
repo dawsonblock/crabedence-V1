@@ -62,6 +62,21 @@ const (
 	// task: the adaptive controller's own learning record, so its
 	// proposals are themselves part of history.
 	KindDecision = "decision"
+	// KindConversation is one message in a development transcript —
+	// the reasoning record: what was tried, what failed, what was
+	// decided and why. Speaker attribution is preserved verbatim;
+	// the store never rewrites who said what.
+	KindConversation = "conversation"
+	// KindArchive is one source archive (zip/tar): its supplied name
+	// and its detected identity are recorded separately — a filename
+	// is a claim, never authoritative identity.
+	KindArchive = "archive"
+	// KindTrace is one agent action record: a tool call, its inputs,
+	// and its outcome — how the work was actually done.
+	KindTrace = "trace"
+	// KindRecovery is one executor recovery_events record: what the
+	// maintenance loop claimed, marked, terminated, or escalated.
+	KindRecovery = "recovery"
 )
 
 // Event is one appended record. The identity fields live in columns;

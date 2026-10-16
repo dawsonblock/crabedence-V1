@@ -23,6 +23,18 @@ import (
 // A custody dir with no acks is empty but consistent — nothing was
 // ever witnessed there.
 func VerifyCustodyDir(dir string) []string {
+	return verifyCustodyDir(dir, nil)
+}
+
+// VerifyCustodyDirTrusted audits the custody dir the same way and
+// additionally flags every acknowledgement whose signer is not an
+// approved witness — a well-formed chain signed by the wrong key is
+// integrity without custody.
+func VerifyCustodyDirTrusted(dir string, trust *TrustRoot) []string {
+	return verifyCustodyDir(dir, trust)
+}
+
+func verifyCustodyDir(dir string, trust *TrustRoot) []string {
 	var findings []string
 	chainPath := filepath.Join(dir, "acks.jsonl")
 	f, err := os.Open(chainPath)
@@ -48,8 +60,11 @@ func VerifyCustodyDir(dir string) []string {
 			prevRaw = nil
 			continue
 		}
-		if rec.RecordType != "archive-custody-ack/v1" {
+		if rec.RecordType != AckRecordTypeV1 && rec.RecordType != AckRecordTypeV2 {
 			findings = append(findings, fmt.Sprintf("ack %d record_type %q", lineNo, rec.RecordType))
+		}
+		if rec.RecordType == AckRecordTypeV2 && rec.RequestCreatedAt <= 0 {
+			findings = append(findings, fmt.Sprintf("ack %d v2 record carries no request identity", lineNo))
 		}
 		if rec.AckSeq != wantSeq {
 			findings = append(findings, fmt.Sprintf("ack %d seq %d — expected %d (gap or reorder)", lineNo, rec.AckSeq, wantSeq))
@@ -66,10 +81,15 @@ func VerifyCustodyDir(dir string) []string {
 		if perr != nil || len(pub) != ed25519.PublicKeySize {
 			findings = append(findings, fmt.Sprintf("ack %d carries an unusable public key", lineNo))
 		} else {
+			if trust != nil && !trust.Approve(rec.Signer, ed25519.PublicKey(pub)) {
+				findings = append(findings, fmt.Sprintf("ack %d signer %s is not an approved witness", lineNo, rec.Signer))
+			}
 			if rec.Signer != evidence.Fingerprint(ed25519.PublicKey(pub)) {
 				findings = append(findings, fmt.Sprintf("ack %d signer %s does not match its public key", lineNo, rec.Signer))
 			}
-			if err := evidence.VerifyRecordSignature(ed25519.PublicKey(pub), WitnessDomain, rec.Signature, rec.ackFields()...); err != nil {
+			if fields, ferr := rec.SigningFields(); ferr != nil {
+				findings = append(findings, fmt.Sprintf("ack %d %v", lineNo, ferr))
+			} else if err := evidence.VerifyRecordSignature(ed25519.PublicKey(pub), WitnessDomain, rec.Signature, fields...); err != nil {
 				findings = append(findings, fmt.Sprintf("ack %d signature invalid: %v", lineNo, err))
 			}
 		}

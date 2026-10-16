@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/openclaw/crabbox/internal/evidence"
+	"github.com/openclaw/crabbox/internal/sockfile"
 )
 
 // JobStateRecorded marks a job the executor accepted into its durable
@@ -120,6 +121,13 @@ type Config struct {
 	// default; negative disables the periodic passes (the startup
 	// recovery walks still run).
 	MaintenanceInterval time.Duration
+	// ResumeBackoff and CleanupBackoff set the per-job durable pacing
+	// windows for re-observing unresolved runs and retrying pending
+	// removals — durable across restarts, so a longer backoff also
+	// delays the first post-restart attempt. Zero uses the defaults;
+	// negative refuses startup.
+	ResumeBackoff  time.Duration
+	CleanupBackoff time.Duration
 	// ArchiveCustodian witnesses archive segments to external custody
 	// before the operational rows release — nil keeps custody local
 	// (the archive is its own custody).
@@ -169,7 +177,7 @@ type Server struct {
 
 	mu       sync.Mutex
 	listener *net.UnixListener
-	ident    *socketIdentity
+	ident    *sockfile.SocketIdentity
 	started  bool
 	stopped  bool
 	acceptWg sync.WaitGroup
@@ -180,14 +188,6 @@ type Server struct {
 	// intent, so two concurrent admissions can never both pass the
 	// same budget. Released before the backend is asked to launch.
 	admitMu sync.Mutex
-
-	// maintMu guards the maintenance loop's pacing state: per-job
-	// last-attempt stamps and the last-audited residue shape.
-	maintMu            sync.Mutex
-	lastResumeAttempt  map[string]time.Time
-	lastCleanupAttempt map[string]time.Time
-	lastResidueSig     string
-	lastResidueAudit   time.Time
 
 	ledger     *Ledger
 	monitorWg  sync.WaitGroup
@@ -221,6 +221,9 @@ func NewServer(cfg Config) (*Server, error) {
 	}
 	if cfg.ReconcileTimeout < 0 {
 		return nil, fmt.Errorf("reconcile timeout must not be negative")
+	}
+	if cfg.ResumeBackoff < 0 || cfg.CleanupBackoff < 0 {
+		return nil, fmt.Errorf("recovery backoffs must not be negative")
 	}
 	if p := cfg.ResourcePool; p != nil {
 		if p.MaxConcurrentVMs < 0 || p.MaxSubmitterVMs < 0 || p.TotalCPUs < 0 {
@@ -280,9 +283,6 @@ func NewServer(cfg Config) (*Server, error) {
 		shutdown:   shutdown,
 		shutdownFn: cancel,
 		closed:     make(chan struct{}),
-
-		lastResumeAttempt:  map[string]time.Time{},
-		lastCleanupAttempt: map[string]time.Time{},
 	}, nil
 }
 
@@ -306,7 +306,7 @@ func (s *Server) Start() error {
 	if s.stopped {
 		return fmt.Errorf("server already stopped")
 	}
-	if err := ensureSocketDir(s.cfg.SocketDir); err != nil {
+	if err := sockfile.EnsureDir(s.cfg.SocketDir); err != nil {
 		return err
 	}
 	// The ledger opens first: an executor that cannot persist an
@@ -363,7 +363,7 @@ func (s *Server) Start() error {
 		s.evidence = nil
 		return failLedger(err)
 	}
-	if err := clearStaleSocket(s.socket); err != nil {
+	if err := sockfile.ClearStale(s.socket, sockfile.ProbeAlive); err != nil {
 		return failStart(err)
 	}
 	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: s.socket, Net: "unix"})
@@ -379,7 +379,7 @@ func (s *Server) Start() error {
 		_ = listener.Close()
 		return failStart(fmt.Errorf("secure executor socket %s: %w", s.socket, err))
 	}
-	ident, err := socketIdentityFor(s.socket)
+	ident, err := sockfile.IdentityFor(s.socket)
 	if err != nil {
 		_ = listener.Close()
 		return failStart(err)
@@ -508,7 +508,7 @@ func (s *Server) cleanupOne(j *LedgerJob) {
 		return
 	}
 	s.audit("cleanup retry: job %s handle %s removed", j.JobID, j.BackendHandle)
-	s.forgetAttempt(s.lastCleanupAttempt, j.JobID)
+	s.forgetRecovery(j.JobID, RecoveryActionCleanup)
 }
 
 // Stop shuts the server down in drain order: cancel monitors'
@@ -559,7 +559,7 @@ func (s *Server) Stop() error {
 			ledgerErr = cerr
 		}
 	}
-	if rmErr := removeOwnedSocket(s.socket, ident); rmErr != nil && err == nil {
+	if rmErr := sockfile.RemoveOwned(s.socket, ident); rmErr != nil && err == nil {
 		err = rmErr
 	}
 	if ledgerErr != nil && err == nil {

@@ -107,6 +107,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/openclaw/crabbox/internal/sandboxcustody"
 	"github.com/openclaw/crabbox/internal/sandboxexecutor"
 )
 
@@ -138,6 +139,8 @@ func main() {
 	maxConns := flag.Int("max-conns", 0, "simultaneous connection bound (default 64)")
 	dispatchTimeout := flag.Duration("dispatch-timeout", 0, "bound on one backend launch call (default 45s)")
 	maintenanceInterval := flag.Duration("maintenance-interval", 0, "continuous-recovery cadence: stranded dispatch claims, cleanup retries, re-observation, archival (default 60s; negative disables)")
+	resumeBackoff := flag.Duration("resume-backoff", 0, "durable per-job backoff between unresolved-run re-observations (default 2m; applies across restarts)")
+	cleanupBackoff := flag.Duration("cleanup-backoff", 0, "durable per-job backoff between pending-cleanup retries (default 5m; applies across restarts)")
 	contractMaxTTL := flag.Duration("contract-max-ttl", 0, "bound on contract validity window (default 1h; negative disables)")
 	ceilCPUs := flag.Float64("ceil-cpus", 0, "contract cpus ceiling (0 = no operator ceiling)")
 	ceilMemMB := flag.Uint64("ceil-memory-mb", 0, "contract memory_mb ceiling (0 = no operator ceiling)")
@@ -155,6 +158,7 @@ func main() {
 	custodySocket := flag.String("archive-custody-socket", os.Getenv("SANDBOX_EXECUTOR_CUSTODY_SOCKET"), "sandbox-custodyd socket — witnessed external custody for archive segments (or SANDBOX_EXECUTOR_CUSTODY_SOCKET)")
 	custodyTokenFile := flag.String("archive-custody-token-file", os.Getenv("SANDBOX_EXECUTOR_CUSTODY_TOKEN_FILE"), "shared-secret file the custody daemon requires (or SANDBOX_EXECUTOR_CUSTODY_TOKEN_FILE)")
 	custodySigner := flag.String("archive-custody-signer", os.Getenv("SANDBOX_EXECUTOR_CUSTODY_SIGNER"), "pinned custody-witness signer fingerprint — acknowledgements under a different key are refused (or SANDBOX_EXECUTOR_CUSTODY_SIGNER)")
+	custodyTrustFile := flag.String("archive-custody-trust-file", os.Getenv("SANDBOX_EXECUTOR_CUSTODY_TRUST_FILE"), "0600 owner-only custody trust root (JSON): approved witness public keys with signed key transitions — the strongest custody identity pin (or SANDBOX_EXECUTOR_CUSTODY_TRUST_FILE)")
 	flag.Parse()
 
 	peers, err := sandboxexecutor.ParsePeerAllowlist(*peerUIDs)
@@ -294,6 +298,8 @@ func main() {
 		MaxConns:            *maxConns,
 		DispatchTimeout:     *dispatchTimeout,
 		MaintenanceInterval: *maintenanceInterval,
+		ResumeBackoff:       *resumeBackoff,
+		CleanupBackoff:      *cleanupBackoff,
 		MaxContractTTL:      *contractMaxTTL,
 		ResourceCeiling:     ceiling,
 		ResourcePool:        pool,
@@ -302,13 +308,31 @@ func main() {
 		Audit:               func(format string, args ...any) { log.Printf(format, args...) },
 	}
 	// External custody: archive segments are witnessed to the custody
-	// daemon before their operational rows release.
+	// daemon before their operational rows release. The witness's
+	// identity must be pinned — an acknowledgement is verified
+	// evidence, and an unpinned witness is a self-declared identity.
+	// A configured custody socket therefore refuses to run without an
+	// explicitly approved witness (trust file preferred, signer
+	// fingerprint accepted).
 	if *custodySocket != "" {
-		cfg.ArchiveCustodian = &sandboxexecutor.SocketCustodian{
+		custodian := &sandboxexecutor.SocketCustodian{
 			Socket:         *custodySocket,
 			Token:          custodyToken,
 			ExpectedSigner: *custodySigner,
 		}
+		if *custodyTrustFile != "" {
+			trust, terr := sandboxcustody.LoadTrustRoot(*custodyTrustFile)
+			if terr != nil {
+				log.Fatalf("sandbox-executord: %v", terr)
+			}
+			custodian.Trust = trust
+		}
+		if custodian.Trust == nil && *custodySigner == "" {
+			log.Fatalf("sandbox-executord: -archive-custody-socket requires an approved witness — pass -archive-custody-trust-file or -archive-custody-signer")
+		}
+		cfg.ArchiveCustodian = custodian
+	} else if *custodyTrustFile != "" || *custodySigner != "" || *custodyTokenFile != "" {
+		log.Fatalf("sandbox-executord: custody trust/token configured without -archive-custody-socket — a witness the executor never calls is not custody")
 	}
 	srv, err := sandboxexecutor.NewServer(cfg)
 	if err != nil {

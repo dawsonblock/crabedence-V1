@@ -1,6 +1,8 @@
 package history
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 
 	"github.com/openclaw/crabbox/internal/sandboxexecutor"
@@ -35,14 +37,14 @@ type jobRecord struct {
 	RuntimeIdentity string                         `json:"runtime_identity,omitempty"`
 }
 
-// IngestJobs records executor jobs as execution events — active
+// IngestJobs records executor jobs as execution observations — active
 // registry rows and archived terminal history alike, since Ledger.List
-// already unions them. Dedupe is permanent by contract hash: a job is
-// one historical fact, and re-ingesting sees it once. A job's record
-// is re-ingestable on change (its dedupe key includes the contract
-// hash AND the terminal state, so a row observed mid-flight is
-// refreshed when it settles — the durable record replaces the
-// in-flight note, never duplicates it).
+// already unions them. The job identity (subject + contract-hash
+// correlation) is recorded separately from each observation: dedupe
+// keys commit to the observation's content, so a re-ingest of an
+// unchanged ledger row is idempotent while every material update —
+// state transition, receipt binding, archive flip, exit code — is
+// preserved as its own individually identifiable observation.
 //
 // Jobs are a memory subject, not evidence in themselves: the receipt
 // chain they reference is ingested by IngestEvidenceDir.
@@ -89,8 +91,9 @@ func (s *Store) IngestJobs(ledger *sandboxexecutor.Ledger) (int, error) {
 		if j.TerminalSeq != 0 {
 			at = j.UpdatedAt.UnixMilli()
 		}
+		sum := sha256.Sum256(payload)
 		events = append(events, &Event{
-			DedupeKey:   "job:" + j.ContractHash + ":" + j.State,
+			DedupeKey:   "job:" + j.ContractHash + ":" + hex.EncodeToString(sum[:]),
 			Kind:        KindExecution,
 			Subject:     j.JobID,
 			Correlation: j.ContractHash,

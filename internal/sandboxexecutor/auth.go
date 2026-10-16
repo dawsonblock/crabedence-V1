@@ -6,6 +6,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/openclaw/crabbox/internal/sockfile"
 )
 
 // PeerAllowlist binds permitted kernel UIDs to submitter identities.
@@ -89,7 +91,7 @@ func LoadSubmissionToken(path string) (*SubmissionToken, error) {
 	if !info.Mode().IsRegular() {
 		return nil, fmt.Errorf("submission token %s is not a regular file", path)
 	}
-	if err := verifyOwnership(path, info, "submission token"); err != nil {
+	if err := sockfile.VerifyOwnership(path, info, "submission token"); err != nil {
 		return nil, err
 	}
 	if perm := info.Mode().Perm(); perm&0o077 != 0 {
@@ -120,16 +122,6 @@ func (t *SubmissionToken) Verify(presented string) bool {
 	return subtle.ConstantTimeCompare([]byte(presented), t.secret) == 1
 }
 
-// verifyOwnership checks the file is owned by the current user. Shared
-// with the socket-path checks — a file another user can replace is not
-// a credential. Inability to determine the owner fails closed.
-func verifyOwnership(path string, info os.FileInfo, what string) error {
-	uid, ok := fileOwnerUID(info)
-	if !ok {
-		return fmt.Errorf("%s %s: cannot determine owner", what, path)
-	}
-	if uid != uint32(os.Getuid()) {
-		return fmt.Errorf("%s %s is owned by uid %d, not the process uid %d", what, path, uid, os.Getuid())
-	}
-	return nil
-}
+// Ownership verification is shared with the socket-path checks in
+// internal/sockfile — a file another user can replace is not a
+// credential, and inability to determine the owner fails closed.

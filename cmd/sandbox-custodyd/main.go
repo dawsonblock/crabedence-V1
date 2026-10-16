@@ -33,6 +33,7 @@ func main() {
 	custodyDir := flag.String("custody-dir", os.Getenv("SANDBOX_CUSTODY_DIR"), "custody store directory (or SANDBOX_CUSTODY_DIR)")
 	keyPath := flag.String("key", os.Getenv("SANDBOX_CUSTODY_KEY"), "witness signer PKCS8 PEM path (or SANDBOX_CUSTODY_KEY)")
 	tokenFile := flag.String("token-file", os.Getenv("SANDBOX_CUSTODY_TOKEN_FILE"), "optional shared-secret file (or SANDBOX_CUSTODY_TOKEN_FILE)")
+	trustFile := flag.String("trust-file", os.Getenv("SANDBOX_CUSTODY_TRUST_FILE"), "with -verify: custody trust root (JSON) — acknowledgements by unapproved witnesses are findings (or SANDBOX_CUSTODY_TRUST_FILE)")
 	verify := flag.Bool("verify", false, "audit the custody dir and exit instead of running the daemon")
 	flag.Parse()
 
@@ -40,7 +41,16 @@ func main() {
 		if *custodyDir == "" {
 			log.Fatalf("sandbox-custodyd: -verify requires -custody-dir")
 		}
-		findings := sandboxcustody.VerifyCustodyDir(*custodyDir)
+		var findings []string
+		if *trustFile != "" {
+			trust, terr := sandboxcustody.LoadTrustRoot(*trustFile)
+			if terr != nil {
+				log.Fatalf("sandbox-custodyd: %v", terr)
+			}
+			findings = sandboxcustody.VerifyCustodyDirTrusted(*custodyDir, trust)
+		} else {
+			findings = sandboxcustody.VerifyCustodyDir(*custodyDir)
+		}
 		if len(findings) > 0 {
 			for _, f := range findings {
 				fmt.Fprintf(os.Stderr, "custody finding: %s\n", f)

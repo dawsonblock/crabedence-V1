@@ -235,6 +235,21 @@ func Fit(env *Envelope, records []Record) (*model, error) {
 // than extrapolating a near-miss.
 const minEvidence = 1.0
 
+// Estimate exposes the fitted estimate for callers that compare
+// arms rather than follow a policy — the research controller's
+// intervention selection. It is a read on the model, not a decision.
+func (m *model) Estimate(t Task, arm int) float64 {
+	if arm < 0 || arm >= len(m.env.Arms) {
+		return -1e18
+	}
+	return m.estimate(t, arm)
+}
+
+// Digest exposes the model's content identity — the digest a
+// Decision already names — for callers that pin proposals to the
+// exact fitted state that produced them.
+func (m *model) Digest() string { return m.digest() }
+
 // estimate is the arm's expected reward for this task: the
 // similarity-weighted mean over the arm's logged outcomes when
 // similar history carries enough weight, else the arm's global mean.

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"strings"
+
+	"github.com/openclaw/crabbox/internal/sockfile"
 )
 
 // AuthorityKeys is the executor's trust set for signed job contracts:
@@ -39,7 +41,7 @@ func LoadAuthorityKeys(path string) (AuthorityKeys, error) {
 	if !info.Mode().IsRegular() {
 		return nil, fmt.Errorf("authority keys %s is not a regular file", path)
 	}
-	if err := verifyOwnership(path, info, "authority keys"); err != nil {
+	if err := sockfile.VerifyOwnership(path, info, "authority keys"); err != nil {
 		return nil, err
 	}
 	if perm := info.Mode().Perm(); perm&0o077 != 0 {

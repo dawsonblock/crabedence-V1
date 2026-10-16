@@ -60,8 +60,15 @@ type checkpointRecord struct {
 // not decide). refs, when non-nil, is the ledger's terminal
 // enumeration and enables full checkpoint verification; nil records
 // checkpoints as unverified-by-ingestion.
+//
+// Every observed record also produces an Assessment — the verifier's
+// verdict under this exact trust set — recorded apart from the
+// immutable observation, so re-ingesting under a changed trust set
+// mints a fresh verdict instead of silently rewriting the old one.
 func (s *Store) IngestEvidenceDir(dir string, trustedSigners map[string]bool, refs []evidence.TerminalRef) (int, error) {
 	var events []*Event
+	var verdicts []*Assessment
+	trustSHA := TrustSetSHA256(trustedSigners)
 
 	// ── receipts.jsonl ───────────────────────────────────────────
 	rf, err := os.Open(filepath.Join(dir, "receipts.jsonl"))
@@ -103,14 +110,30 @@ func (s *Store) IngestEvidenceDir(dir string, trustedSigners map[string]bool, re
 				return 0, err
 			}
 			at := receiptTime(r.IssuedAt)
+			key := "receipt:" + rec.ReceiptSHA256
 			events = append(events, &Event{
-				DedupeKey:   "receipt:" + rec.ReceiptSHA256,
+				DedupeKey:   key,
 				Kind:        KindReceipt,
 				Subject:     r.ExecutionID,
 				Correlation: r.RequestDigest,
 				Source:      "evidence:" + dir,
 				OccurredAt:  at,
 				Payload:     payload,
+			})
+			result := AssessmentUnverified
+			switch {
+			case !rec.SignatureValid:
+				result = AssessmentRejected
+			case rec.Trusted:
+				result = AssessmentVerified
+			}
+			verdicts = append(verdicts, &Assessment{
+				SubjectKey:   key,
+				Verifier:     "history-ingest",
+				RulesVersion: "receipt-v1",
+				TrustSetSHA:  trustSHA,
+				InputSHA:     rec.ReceiptSHA256,
+				Result:       result,
 			})
 		}
 		rf.Close()
@@ -155,19 +178,38 @@ func (s *Store) IngestEvidenceDir(dir string, trustedSigners map[string]bool, re
 			return 0, err
 		}
 		sum := sha256.Sum256(raw)
+		key := "checkpoint:" + hex.EncodeToString(sum[:])
 		events = append(events, &Event{
-			DedupeKey:  "checkpoint:" + hex.EncodeToString(sum[:]),
+			DedupeKey:  key,
 			Kind:       KindCheckpoint,
 			Subject:    fmt.Sprintf("checkpoint-%08d", cp.Sequence),
 			Source:     "evidence:" + dir,
 			OccurredAt: receiptTime(cp.IssuedAt),
 			Payload:    payload,
 		})
+		result := AssessmentUnverified
+		switch {
+		case rec.Verified != nil && !*rec.Verified:
+			result = AssessmentRejected
+		case rec.Verified != nil && rec.Trusted:
+			result = AssessmentVerified
+		}
+		verdicts = append(verdicts, &Assessment{
+			SubjectKey:   key,
+			Verifier:     "history-ingest",
+			RulesVersion: "checkpoint-v1",
+			TrustSetSHA:  trustSHA,
+			InputSHA:     key[len("checkpoint:"):],
+			Result:       result,
+		})
 	}
 
 	appended, err := s.Append(events...)
 	if err != nil {
 		return 0, err
+	}
+	if err := s.RecordAssessment(verdicts...); err != nil {
+		return 0, fmt.Errorf("record assessments: %w", err)
 	}
 	return len(appended), nil
 }
@@ -206,6 +248,8 @@ func (s *Store) IngestCustodyDir(dir string, trustedSigners map[string]bool) (in
 	defer f.Close()
 
 	var events []*Event
+	var verdicts []*Assessment
+	trustSHA := TrustSetSHA256(trustedSigners)
 	var prevRaw []byte
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 1<<20), 16<<20)
@@ -238,20 +282,12 @@ func (s *Store) IngestCustodyDir(dir string, trustedSigners map[string]bool) (in
 			Trusted:          trustedSigners[rec.Signer],
 		}
 		if pub, err := base64.StdEncoding.DecodeString(rec.PublicKey); err == nil && len(pub) == ed25519.PublicKeySize {
-			out.SignatureValid = evidence.VerifyRecordSignature(
-				ed25519.PublicKey(pub), sandboxcustody.WitnessDomain, rec.Signature,
-				rec.RecordType,
-				fmt.Sprint(rec.AckSeq),
-				fmt.Sprint(rec.SegmentSeq),
-				fmt.Sprint(rec.FirstTerminalSeq),
-				fmt.Sprint(rec.LastTerminalSeq),
-				fmt.Sprint(rec.RowCount),
-				rec.PayloadSHA256,
-				rec.PrevAckSHA256,
-				rec.WitnessedAt,
-				rec.PublicKey,
-				rec.Signer,
-			) == nil && rec.Signer == evidence.Fingerprint(ed25519.PublicKey(pub))
+			if fields, ferr := rec.SigningFields(); ferr == nil {
+				out.SignatureValid = evidence.VerifyRecordSignature(
+					ed25519.PublicKey(pub), sandboxcustody.WitnessDomain, rec.Signature,
+					fields...,
+				) == nil && rec.Signer == evidence.Fingerprint(ed25519.PublicKey(pub))
+			}
 		}
 		if seg, err := os.ReadFile(filepath.Join(dir, "segments", rec.PayloadSHA256)); err == nil {
 			sum := sha256.Sum256(seg)
@@ -262,14 +298,30 @@ func (s *Store) IngestCustodyDir(dir string, trustedSigners map[string]bool) (in
 			return 0, err
 		}
 		sum := sha256.Sum256(raw)
+		key := "custody:" + hex.EncodeToString(sum[:])
 		events = append(events, &Event{
-			DedupeKey:   "custody:" + hex.EncodeToString(sum[:]),
+			DedupeKey:   key,
 			Kind:        KindCustodyAck,
 			Subject:     fmt.Sprintf("segment-%d", rec.SegmentSeq),
 			Correlation: rec.PayloadSHA256,
 			Source:      "custody:" + dir,
 			OccurredAt:  receiptTime(rec.WitnessedAt),
 			Payload:     payload,
+		})
+		result := AssessmentUnverified
+		switch {
+		case !out.ChainLinkValid || !out.SignatureValid || !out.SegmentHeld:
+			result = AssessmentRejected
+		case out.Trusted:
+			result = AssessmentVerified
+		}
+		verdicts = append(verdicts, &Assessment{
+			SubjectKey:   key,
+			Verifier:     "history-ingest",
+			RulesVersion: "custody-v1",
+			TrustSetSHA:  trustSHA,
+			InputSHA:     hex.EncodeToString(sum[:]),
+			Result:       result,
 		})
 		prevRaw = raw
 	}
@@ -279,6 +331,9 @@ func (s *Store) IngestCustodyDir(dir string, trustedSigners map[string]bool) (in
 	appended, err := s.Append(events...)
 	if err != nil {
 		return 0, err
+	}
+	if err := s.RecordAssessment(verdicts...); err != nil {
+		return 0, fmt.Errorf("record assessments: %w", err)
 	}
 	return len(appended), nil
 }

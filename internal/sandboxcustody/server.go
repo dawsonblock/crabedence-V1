@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/openclaw/crabbox/internal/evidence"
+	"github.com/openclaw/crabbox/internal/sockfile"
 )
 
 // The custody daemon is the witness the executor's archive custodian
@@ -57,6 +58,7 @@ type Server struct {
 	stopped    bool
 	started    bool
 	listener   *net.UnixListener
+	ident      *sockfile.SocketIdentity
 	closed     chan struct{}
 	acceptWg   sync.WaitGroup
 	shutdown   context.Context
@@ -102,35 +104,45 @@ func (s *Server) audit(format string, args ...any) {
 	}
 }
 
-// Start binds the custody socket and begins accepting witnesses.
+// Start binds the custody socket and begins accepting witnesses. The
+// socket path must be free or provably stale: a live listener there —
+// another custody daemon, or anything answering at all — refuses
+// startup rather than letting this daemon unlink a socket it does not
+// own, and a recovered path is bound only after ownership, socket
+// type, and filesystem locality all check out.
 func (s *Server) Start() error {
 	if s.started {
 		return fmt.Errorf("custody server already started")
 	}
-	if err := os.MkdirAll(s.cfg.SocketDir, 0o700); err != nil {
+	if err := sockfile.EnsureDir(s.cfg.SocketDir); err != nil {
 		return fmt.Errorf("custody socket dir: %w", err)
 	}
-	if err := os.MkdirAll(s.cfg.CustodyDir, 0o700); err != nil {
+	if err := sockfile.EnsureDir(s.cfg.CustodyDir); err != nil {
 		return fmt.Errorf("custody dir: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Join(s.cfg.CustodyDir, "segments"), 0o700); err != nil {
+	if err := sockfile.EnsureDir(filepath.Join(s.cfg.CustodyDir, "segments")); err != nil {
 		return fmt.Errorf("custody segments dir: %w", err)
 	}
-	if _, err := os.Lstat(s.socket); err == nil {
-		if rmErr := os.Remove(s.socket); rmErr != nil {
-			return fmt.Errorf("remove stale custody socket: %w", rmErr)
-		}
+	if err := sockfile.ClearStale(s.socket, sockfile.ProbeAlive); err != nil {
+		return err
 	}
 	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: s.socket, Net: "unix"})
 	if err != nil {
 		return fmt.Errorf("bind custody socket %s: %w", s.socket, err)
 	}
+	// The finalizer owns unlinking — never let the listener itself
+	// remove a path that might no longer be this daemon's.
 	listener.SetUnlinkOnClose(false)
 	if err := os.Chmod(s.socket, 0o600); err != nil {
 		_ = listener.Close()
 		return fmt.Errorf("secure custody socket %s: %w", s.socket, err)
 	}
-	s.listener, s.started = listener, true
+	ident, err := sockfile.IdentityFor(s.socket)
+	if err != nil {
+		_ = listener.Close()
+		return err
+	}
+	s.listener, s.ident, s.started = listener, ident, true
 	s.acceptWg.Add(1)
 	go s.acceptLoop()
 	s.audit("sandbox-custodyd listening on %s (custody=%s signer=%s)",
@@ -152,7 +164,11 @@ func (s *Server) Stop() error {
 	s.shutdownFn()
 	err := listener.Close()
 	s.acceptWg.Wait()
-	_ = os.Remove(s.socket)
+	// Unlink only the object this server bound: a path replaced by a
+	// successor or a foreign file is not this daemon's to remove.
+	if rmErr := sockfile.RemoveOwned(s.socket, s.ident); rmErr != nil && err == nil {
+		err = rmErr
+	}
 	close(s.closed)
 	return err
 }
@@ -276,7 +292,25 @@ func (s *Server) witness(req *WitnessRequest) (*WitnessResponse, error) {
 		if ack == nil {
 			return nil, fmt.Errorf("segment %s held but no acknowledgement is on the chain — custody store inconsistent", req.SHA256)
 		}
-		return ack, nil
+		// The stored acknowledgement must name this exact segment —
+		// a request whose declared identity disagrees with what was
+		// witnessed is a conflicting custody claim, not a retry.
+		if ack.SegmentSeq != req.SegmentSeq ||
+			ack.FirstTerminalSeq != req.FirstTerminalSeq ||
+			ack.LastTerminalSeq != req.LastTerminalSeq ||
+			ack.RowCount != req.RowCount ||
+			(ack.RecordType == AckRecordTypeV2 && ack.RequestCreatedAt != req.CreatedAt) {
+			return nil, fmt.Errorf("segment %s held under a different identity (ack segment %d, terminal %d..%d, %d rows) — refusing conflicting custody claim",
+				req.SHA256, ack.SegmentSeq, ack.FirstTerminalSeq, ack.LastTerminalSeq, ack.RowCount)
+		}
+		return &WitnessResponse{
+			OK:              true,
+			AckSeq:          ack.AckSeq,
+			WitnessedSHA256: ack.PayloadSHA256,
+			Signer:          ack.Signer,
+			Signature:       ack.Signature,
+			Ack:             ack,
+		}, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("custody stat %s: %w", req.SHA256, err)
 	}
@@ -293,6 +327,14 @@ func (s *Server) witness(req *WitnessRequest) (*WitnessResponse, error) {
 	return ack, nil
 }
 
+// Acknowledgement record types. v2 binds the exact request instance
+// (its created-at timestamp) into the signature so an acknowledgement
+// is evidence for one specific witness request, not just a digest.
+const (
+	AckRecordTypeV1 = "archive-custody-ack/v1"
+	AckRecordTypeV2 = "archive-custody-ack/v2"
+)
+
 // AckRecord is one link of the custody chain — the signed
 // acknowledgement that a segment's bytes are durably held.
 type AckRecord struct {
@@ -303,6 +345,10 @@ type AckRecord struct {
 	LastTerminalSeq  int64  `json:"last_terminal_seq"`
 	RowCount         int    `json:"row_count"`
 	PayloadSHA256    string `json:"payload_sha256"`
+	// RequestCreatedAt is the witness request's own timestamp —
+	// bound into v2 signatures so the acknowledgement identifies
+	// this request, not any request naming the same digest.
+	RequestCreatedAt int64  `json:"request_created_at,omitempty"`
 	PrevAckSHA256    string `json:"prev_ack_sha256"`
 	WitnessedAt      string `json:"witnessed_at"`
 	PublicKey        string `json:"public_key"`
@@ -310,10 +356,12 @@ type AckRecord struct {
 	Signature        string `json:"signature"`
 }
 
-// ackFields is the signing vector — every field the signature commits
-// to, in declared order.
-func (a *AckRecord) ackFields() []string {
-	return []string{
+// SigningFields is the versioned signing vector — every field the
+// signature commits to, in declared order. Each record type signs a
+// distinct vector, so a signature minted under one version never
+// verifies as another.
+func (a *AckRecord) SigningFields() ([]string, error) {
+	fields := []string{
 		a.RecordType,
 		fmt.Sprint(a.AckSeq),
 		fmt.Sprint(a.SegmentSeq),
@@ -321,11 +369,21 @@ func (a *AckRecord) ackFields() []string {
 		fmt.Sprint(a.LastTerminalSeq),
 		fmt.Sprint(a.RowCount),
 		a.PayloadSHA256,
+	}
+	switch a.RecordType {
+	case AckRecordTypeV1:
+		// Legacy records predate request-instance binding.
+	case AckRecordTypeV2:
+		fields = append(fields, fmt.Sprint(a.RequestCreatedAt))
+	default:
+		return nil, fmt.Errorf("unknown custody ack record_type %q", a.RecordType)
+	}
+	return append(fields,
 		a.PrevAckSHA256,
 		a.WitnessedAt,
 		a.PublicKey,
 		a.Signer,
-	}
+	), nil
 }
 
 // appendAck signs and appends the acknowledgement — the caller holds
@@ -338,19 +396,24 @@ func (s *Server) appendAck(req *WitnessRequest) (*WitnessResponse, error) {
 	}
 	pub := s.signer.PublicKey()
 	ack := &AckRecord{
-		RecordType:       "archive-custody-ack/v1",
+		RecordType:       AckRecordTypeV2,
 		AckSeq:           nextSeq,
 		SegmentSeq:       req.SegmentSeq,
 		FirstTerminalSeq: req.FirstTerminalSeq,
 		LastTerminalSeq:  req.LastTerminalSeq,
 		RowCount:         req.RowCount,
 		PayloadSHA256:    req.SHA256,
+		RequestCreatedAt: req.CreatedAt,
 		PrevAckSHA256:    prevSHA,
 		WitnessedAt:      time.Now().UTC().Format(time.RFC3339Nano),
 		PublicKey:        base64.StdEncoding.EncodeToString(pub),
 		Signer:           evidence.Fingerprint(pub),
 	}
-	sig, err := s.signer.SignRecord(WitnessDomain, ack.ackFields()...)
+	fields, err := ack.SigningFields()
+	if err != nil {
+		return nil, err
+	}
+	sig, err := s.signer.SignRecord(WitnessDomain, fields...)
 	if err != nil {
 		return nil, fmt.Errorf("sign custody ack: %w", err)
 	}
@@ -374,19 +437,28 @@ func (s *Server) appendAck(req *WitnessRequest) (*WitnessResponse, error) {
 	if err := f.Close(); err != nil {
 		return nil, fmt.Errorf("close custody chain: %w", err)
 	}
+	// The chain append is not durable until the directory entry is —
+	// a power loss between file sync and directory sync can lose the
+	// link the acknowledgement lives at.
+	if err := sockfile.FsyncDir(s.cfg.CustodyDir); err != nil {
+		return nil, fmt.Errorf("commit custody chain: %w", err)
+	}
 	return &WitnessResponse{
 		OK:              true,
 		AckSeq:          ack.AckSeq,
 		WitnessedSHA256: req.SHA256,
 		Signer:          ack.Signer,
 		Signature:       ack.Signature,
+		Ack:             ack,
 	}, nil
 }
 
 // findAck locates the prior acknowledgement for a digest — the
 // idempotent-custody lookup. The chain is the source of truth: an ack
-// that never made the chain does not count as custody.
-func (s *Server) findAck(sha string) (*WitnessResponse, error) {
+// that never made the chain does not count as custody. The stored
+// record is returned whole so the response carries everything an
+// independent verifier needs.
+func (s *Server) findAck(sha string) (*AckRecord, error) {
 	chainPath := filepath.Join(s.cfg.CustodyDir, "acks.jsonl")
 	f, err := os.Open(chainPath)
 	if errors.Is(err, os.ErrNotExist) {
@@ -404,13 +476,7 @@ func (s *Server) findAck(sha string) (*WitnessResponse, error) {
 			return nil, fmt.Errorf("custody chain malformed: %w", err)
 		}
 		if rec.PayloadSHA256 == sha {
-			return &WitnessResponse{
-				OK:              true,
-				AckSeq:          rec.AckSeq,
-				WitnessedSHA256: rec.PayloadSHA256,
-				Signer:          rec.Signer,
-				Signature:       rec.Signature,
-			}, nil
+			return rec, nil
 		}
 	}
 	if err := sc.Err(); err != nil {
@@ -450,8 +516,10 @@ func chainTail(chainPath string) (prevSHA string, nextSeq int64, err error) {
 	return hex.EncodeToString(sum[:]), prev.AckSeq + 1, nil
 }
 
-// writeFileAtomic writes a custody file: temp file, sync, rename —
-// a crash leaves the pre-image or the post-image, never a torn file.
+// writeFileAtomic writes a custody file: temp file, sync, rename,
+// directory sync — a crash leaves the pre-image or the post-image,
+// never a torn file, and never a post-image whose name was not
+// committed.
 func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	tmp := path + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
@@ -476,7 +544,10 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 		_ = os.Remove(tmp)
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	return sockfile.FsyncDir(filepath.Dir(path))
 }
 
 // isHex reports whether s is a lowercase hex string.

@@ -58,6 +58,13 @@ func testPayload(t *testing.T, seqs ...int64) ([]byte, string) {
 }
 
 func witnessReq(seq int64, first, last int64, payload []byte, sha string) *WitnessRequest {
+	return witnessReqAt(seq, first, last, payload, sha, time.Now().UTC().UnixMilli())
+}
+
+// witnessReqAt builds a request with a fixed request identity — the
+// shape production sends, where created_at is the durable segment's
+// own timestamp, stable across every retry of the same handoff.
+func witnessReqAt(seq int64, first, last int64, payload []byte, sha string, createdAt int64) *WitnessRequest {
 	return &WitnessRequest{
 		Op:               OpWitnessArchive,
 		SegmentSeq:       seq,
@@ -65,7 +72,7 @@ func witnessReq(seq int64, first, last int64, payload []byte, sha string) *Witne
 		LastTerminalSeq:  last,
 		RowCount:         len(mustRows(payload)),
 		SHA256:           sha,
-		CreatedAt:        time.Now().UTC().UnixMilli(),
+		CreatedAt:        createdAt,
 		PayloadB64:       base64.StdEncoding.EncodeToString(payload),
 	}
 }
@@ -153,11 +160,12 @@ func TestCustodyIdempotentRetry(t *testing.T) {
 	srv := startCustody(t, dir)
 	payload, sha := testPayload(t, 1)
 	cli := &Client{Socket: srv.SocketPath()}
-	r1, err := cli.Witness(context.Background(), witnessReq(1, 1, 1, payload, sha))
+	created := time.Now().UTC().UnixMilli()
+	r1, err := cli.Witness(context.Background(), witnessReqAt(1, 1, 1, payload, sha, created))
 	if err != nil || !r1.OK {
 		t.Fatalf("first witness: %v %+v", err, r1)
 	}
-	r2, err := cli.Witness(context.Background(), witnessReq(1, 1, 1, payload, sha))
+	r2, err := cli.Witness(context.Background(), witnessReqAt(1, 1, 1, payload, sha, created))
 	if err != nil || !r2.OK {
 		t.Fatalf("retry witness: %v %+v", err, r2)
 	}

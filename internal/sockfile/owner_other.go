@@ -1,6 +1,6 @@
 //go:build !unix
 
-package sandboxexecutor
+package sockfile
 
 import "os"
 
@@ -10,9 +10,9 @@ func fileOwnerUID(info os.FileInfo) (uint32, bool) {
 	return 0, false
 }
 
-// socketFileIdentity reports no identity on platforms without inode
+// fileIdentity reports no identity on platforms without inode
 // semantics. Callers treat nil as "cannot compare" and skip the
 // identity check rather than assuming a match.
-func socketFileIdentity(info os.FileInfo) *socketFileID {
+func fileIdentity(info os.FileInfo) *FileID {
 	return nil
 }

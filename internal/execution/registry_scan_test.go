@@ -24,6 +24,7 @@ func TestBuiltInRegistryPassesStartupScan(t *testing.T) {
 		"test-counter": {Status: capability.AvailabilityAvailable},
 		"system-info":  {Status: capability.AvailabilityAvailable},
 		"github":       {Status: capability.AvailabilityAvailable},
+		"history":      {Status: capability.AvailabilityAvailable},
 	}
 	if report := registry.CheckAdapterAvailability(availability); len(report.Unavailable) != 0 {
 		t.Fatalf("built-in adapters must be wired: %+v", report.Unavailable)
@@ -33,8 +34,8 @@ func TestBuiltInRegistryPassesStartupScan(t *testing.T) {
 	if err != nil {
 		t.Fatalf("report: %v", err)
 	}
-	if report.Total != 11 {
-		t.Fatalf("built-in registry total = %d, want 11", report.Total)
+	if report.Total != 19 {
+		t.Fatalf("built-in registry total = %d, want 19", report.Total)
 	}
 	if report.Digest == "" {
 		t.Fatal("registry digest must be non-empty")

@@ -46,14 +46,18 @@ type WitnessRequest struct {
 
 // WitnessResponse is the custody acknowledgement: ok means the bytes
 // are durably held under their digest and the acknowledgement is
-// chained and signed.
+// chained and signed. Ack carries the complete signed record — the
+// only form of the acknowledgement an independent verifier can check:
+// the flat fields above it are a convenience echo of what Ack commits
+// to, never evidence in their own right.
 type WitnessResponse struct {
-	OK              bool   `json:"ok"`
-	AckSeq          int64  `json:"ack_seq,omitempty"`
-	WitnessedSHA256 string `json:"witnessed_sha256,omitempty"`
-	Signer          string `json:"signer,omitempty"`
-	Signature       string `json:"signature,omitempty"`
-	Error           string `json:"error,omitempty"`
+	OK              bool       `json:"ok"`
+	AckSeq          int64      `json:"ack_seq,omitempty"`
+	WitnessedSHA256 string     `json:"witnessed_sha256,omitempty"`
+	Signer          string     `json:"signer,omitempty"`
+	Signature       string     `json:"signature,omitempty"`
+	Ack             *AckRecord `json:"ack,omitempty"`
+	Error           string     `json:"error,omitempty"`
 }
 
 // Client speaks to the witness over its unix socket — one request, one

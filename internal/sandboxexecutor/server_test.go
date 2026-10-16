@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/openclaw/crabbox/internal/sockfile"
 )
 
 // The PR-03 gate: an independent client without valid identity cannot
@@ -367,8 +369,8 @@ func TestStopKeepsForeignOccupant(t *testing.T) {
 	if err := os.WriteFile(socket, []byte("not ours"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	ident, _ := socketIdentityFor(socket)
-	if err := removeOwnedSocket(socket, ident); err == nil {
+	ident, _ := sockfile.IdentityFor(socket)
+	if err := sockfile.RemoveOwned(socket, ident); err == nil {
 		t.Fatal("a non-socket occupant must not be unlinked")
 	}
 	if _, err := os.Lstat(socket); err != nil {

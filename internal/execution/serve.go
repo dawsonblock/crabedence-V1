@@ -291,6 +291,21 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	if qualAdapter != nil {
 		handlers[QualificationAdapterID] = qualAdapter
 	}
+
+	// Governed memory adapter: CRABEDENCE_HISTORY_DB wires the
+	// history.* reads and grant-gated mutations plus the research.*
+	// advisory computations against one store. The capabilities are
+	// registered unconditionally (release policy); an unset path is a
+	// deployment choice that fails CAPABILITY_UNAVAILABLE at dispatch.
+	var historyAdapter *HistoryAdapter
+	if cfg.HistoryDB != "" {
+		historyAdapter, err = NewHistoryAdapter(cfg.HistoryDB, cfg.HistoryWitnessKey, cfg.HistoryContentDir)
+		if err != nil {
+			return fmt.Errorf("history adapter: %w", err)
+		}
+		defer historyAdapter.Close()
+		handlers[historyAdapterID] = historyAdapter
+	}
 	multiHandler := NewMultiHandler(handlers)
 
 	// Registry invariant scan and startup report. The registry fails
@@ -354,6 +369,11 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	if githubReads != nil {
 		if err := RegisterGitHubReads(directReads, githubReads); err != nil {
 			return fmt.Errorf("failed to register github.issue.get direct read: %w", err)
+		}
+	}
+	if historyAdapter != nil {
+		if err := RegisterHistoryReads(directReads, historyAdapter); err != nil {
+			return fmt.Errorf("failed to register history direct reads: %w", err)
 		}
 	}
 	dispatcher := NewRouteDispatcher(durable)
