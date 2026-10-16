@@ -549,6 +549,19 @@ func (l *Ledger) nextSeq(tx *sql.Tx) (uint64, error) {
 // never precedes persistence. Duplicate job_id and replayed contract
 // hashes are refused distinctly.
 func (l *Ledger) InsertJob(jobID, contractHash, submitter, principal, image, contractJSON string) (*LedgerJob, error) {
+	return l.insertJob(jobID, contractHash, submitter, principal, image, contractJSON, JobStateRecorded)
+}
+
+// AdmitJob is InsertJob with the dispatch intent claimed atomically:
+// a backend executor writes the row already DISPATCHING, so a crash
+// cannot strand a durable RECORDED row no driver will ever pick up.
+func (l *Ledger) AdmitJob(jobID, contractHash, submitter, principal, image, contractJSON string) (*LedgerJob, error) {
+	return l.insertJob(jobID, contractHash, submitter, principal, image, contractJSON, JobStateDispatching)
+}
+
+// insertJob is the shared admission write — identity, sequence and the
+// operational row commit or roll back together.
+func (l *Ledger) insertJob(jobID, contractHash, submitter, principal, image, contractJSON, state string) (*LedgerJob, error) {
 	now := time.Now().UTC().UnixMilli()
 	tx, err := l.db.BeginTx(context.Background(), nil)
 	if err != nil {
@@ -576,7 +589,7 @@ func (l *Ledger) InsertJob(jobID, contractHash, submitter, principal, image, con
 		 contract_json, state, fence_epoch, received_at, updated_at)
 		 VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
 		jobID, contractHash, seq, submitter, principal, image, contractJSON,
-		JobStateRecorded, l.epoch, now, now)
+		state, l.epoch, now, now)
 	if err != nil {
 		if isUniqueViolation(err) {
 			if existing, gerr := l.getTx(tx, jobID); gerr == nil && existing != nil {
@@ -728,6 +741,111 @@ func (l *Ledger) ReconcileCandidates(limit int, beforeSeq uint64) ([]*LedgerJob,
 		out = append(out, j)
 	}
 	return out, rows.Err()
+}
+
+// RecordedCandidates returns one page of jobs still in RECORDED —
+// admitted and persisted but with no dispatch intent claimed. Only a
+// previous lifetime interrupted mid-admission, or a ledger migrated
+// from a record-only deployment, can produce these; the maintenance
+// scheduler sweeps them under the same CAS claim the live path uses.
+// Keyset-paginated like the other walks: seq never moves, so no row
+// is skipped while rows leave the set.
+func (l *Ledger) RecordedCandidates(limit int, beforeSeq uint64) ([]*LedgerJob, error) {
+	if limit <= 0 {
+		limit = 64
+	}
+	rows, err := l.db.Query(
+		`SELECT `+jobColumns+` FROM jobs
+		 WHERE state = ? AND (? = 0 OR seq > ?)
+		 ORDER BY seq ASC LIMIT ?`,
+		JobStateRecorded, beforeSeq, beforeSeq, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*LedgerJob
+	for rows.Next() {
+		j := &LedgerJob{}
+		if err := rows.Scan(scanFields(j)...); err != nil {
+			return nil, err
+		}
+		if err := finishScan(j); err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
+// DispatchingStragglers returns DISPATCHING rows last written before
+// the cutoff. Every context on the dispatch drive is bounded, so a
+// row older than prepare+dispatch has no live driver — the lifetime
+// that claimed it is gone, or the drive returned without recording a
+// claim outcome. Either way the job's execution is genuinely
+// uncertain: the backend may have launched it.
+func (l *Ledger) DispatchingStragglers(limit int, cutoff time.Time) ([]*LedgerJob, error) {
+	if limit <= 0 {
+		limit = 64
+	}
+	rows, err := l.db.Query(
+		`SELECT `+jobColumns+` FROM jobs
+		 WHERE state = ? AND updated_at < ?
+		 ORDER BY seq ASC LIMIT ?`,
+		JobStateDispatching, cutoff.UTC().UnixMilli(), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*LedgerJob
+	for rows.Next() {
+		j := &LedgerJob{}
+		if err := rows.Scan(scanFields(j)...); err != nil {
+			return nil, err
+		}
+		if err := finishScan(j); err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
+// RegistryResidue is the operational remainder the maintenance loop
+// escalates on: rows still waiting on something — an unresolved
+// backend outcome or an unverified cleanup — and the age of the
+// oldest of each. Archived history is deliberately excluded: it is
+// settled, not residue.
+type RegistryResidue struct {
+	Unresolved       int
+	CleanupPending   int
+	OldestUnresolved time.Time
+	OldestCleanup    time.Time
+}
+
+// PendingResidue counts the residue without loading rows — the
+// escalation summary needs counts and ages, not payloads.
+func (l *Ledger) PendingResidue() (*RegistryResidue, error) {
+	r := &RegistryResidue{}
+	var oldestU, oldestC sql.NullInt64
+	err := l.db.QueryRow(
+		`SELECT
+			(SELECT COUNT(1) FROM jobs WHERE state IN (?, ?)),
+			(SELECT MIN(updated_at) FROM jobs WHERE state IN (?, ?)),
+			(SELECT COUNT(1) FROM jobs WHERE cleanup_pending = 1),
+			(SELECT MIN(updated_at) FROM jobs WHERE cleanup_pending = 1)`,
+		JobStateDispatchAmbig, JobStateInterrupted,
+		JobStateDispatchAmbig, JobStateInterrupted).
+		Scan(&r.Unresolved, &oldestU, &r.CleanupPending, &oldestC)
+	if err != nil {
+		return nil, err
+	}
+	if oldestU.Valid {
+		r.OldestUnresolved = time.UnixMilli(oldestU.Int64).UTC()
+	}
+	if oldestC.Valid {
+		r.OldestCleanup = time.UnixMilli(oldestC.Int64).UTC()
+	}
+	return r, nil
 }
 
 // RecordDispatchPlan writes the dispatch authorization — the nonce,

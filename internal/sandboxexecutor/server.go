@@ -114,6 +114,12 @@ type Config struct {
 	// resumed run gets before it is left unresolved again. Zero uses
 	// the default; negative refuses startup.
 	ReconcileTimeout time.Duration
+	// MaintenanceInterval paces the continuous-recovery scheduler:
+	// stranded dispatch claims, cleanup retries, unresolved
+	// re-observation, archival and residue escalation. Zero uses the
+	// default; negative disables the periodic passes (the startup
+	// recovery walks still run).
+	MaintenanceInterval time.Duration
 	// MaxContractTTL bounds contract validity windows. Zero uses the
 	// default; negative disables the bound.
 	MaxContractTTL time.Duration
@@ -170,6 +176,14 @@ type Server struct {
 	// intent, so two concurrent admissions can never both pass the
 	// same budget. Released before the backend is asked to launch.
 	admitMu sync.Mutex
+
+	// maintMu guards the maintenance loop's pacing state: per-job
+	// last-attempt stamps and the last-audited residue shape.
+	maintMu            sync.Mutex
+	lastResumeAttempt  map[string]time.Time
+	lastCleanupAttempt map[string]time.Time
+	lastResidueSig     string
+	lastResidueAudit   time.Time
 
 	ledger     *Ledger
 	monitorWg  sync.WaitGroup
@@ -262,6 +276,9 @@ func NewServer(cfg Config) (*Server, error) {
 		shutdown:   shutdown,
 		shutdownFn: cancel,
 		closed:     make(chan struct{}),
+
+		lastResumeAttempt:  map[string]time.Time{},
+		lastCleanupAttempt: map[string]time.Time{},
 	}, nil
 }
 
@@ -377,6 +394,11 @@ func (s *Server) Start() error {
 	// already has a terminal result is cleaned up, never forgotten.
 	s.acceptWg.Add(1)
 	go s.retryCleanups()
+	// And keep draining forever: the maintenance loop is the startup
+	// walks' continuation — stranded dispatches, re-observation,
+	// cleanup retries, archival and residue escalation.
+	s.acceptWg.Add(1)
+	go s.maintenanceLoop()
 	return nil
 }
 
@@ -397,27 +419,7 @@ func (s *Server) reconcileUnresolved() {
 	if s.cfg.Backend == nil {
 		return
 	}
-	// Exhaustive, not one page: every unresolved row is a candidate.
-	// The keyset cursor walks the whole registry newest-first, so a
-	// row is never omitted for having fallen outside the first page.
-	var cursor uint64
-	for {
-		jobs, err := s.ledger.ReconcileCandidates(recoveryPageSize, cursor)
-		if err != nil {
-			s.audit("reconcile failed: cannot enumerate unresolved jobs: %v", err)
-			return
-		}
-		if len(jobs) == 0 {
-			return
-		}
-		for _, j := range jobs {
-			if s.isStopped() {
-				return
-			}
-			s.reconcileOne(j)
-		}
-		cursor = jobs[len(jobs)-1].Seq
-	}
+	s.reconcileWalk()
 }
 
 // reconcileOne re-establishes observation of one unresolved row, or
@@ -473,33 +475,26 @@ func (s *Server) retryCleanups() {
 	if s.cfg.Backend == nil {
 		return
 	}
-	var cursor uint64
-	for {
-		jobs, err := s.ledger.CleanupCandidates(recoveryPageSize, cursor)
-		if err != nil {
-			s.audit("cleanup retry failed: cannot enumerate pending cleanups: %v", err)
-			return
-		}
-		if len(jobs) == 0 {
-			return
-		}
-		for _, j := range jobs {
-			if s.isStopped() {
-				return
-			}
-			ctx, cancel := context.WithTimeout(s.shutdown, 15*time.Second)
-			cerr := s.cfg.Backend.Cleanup(ctx, j.BackendHandle)
-			cancel()
-			if cerr != nil {
-				s.audit("cleanup retry: job %s handle %s still pending: %v", j.JobID, j.BackendHandle, cerr)
-			} else if err := s.ledger.ClearCleanupPending(j.JobID); err != nil {
-				s.audit("cleanup retry: job %s removed but the ledger refused the clear: %v", j.JobID, err)
-			} else {
-				s.audit("cleanup retry: job %s handle %s removed", j.JobID, j.BackendHandle)
-			}
-		}
-		cursor = jobs[len(jobs)-1].Seq
+	s.cleanupWalk()
+}
+
+// cleanupOne retries the pending removal of one terminal job's
+// backend resources — the row's outcome is already recorded, so a
+// failure audits rather than rewriting it.
+func (s *Server) cleanupOne(j *LedgerJob) {
+	ctx, cancel := context.WithTimeout(s.shutdown, 15*time.Second)
+	cerr := s.cfg.Backend.Cleanup(ctx, j.BackendHandle)
+	cancel()
+	if cerr != nil {
+		s.audit("cleanup retry: job %s handle %s still pending: %v", j.JobID, j.BackendHandle, cerr)
+		return
 	}
+	if err := s.ledger.ClearCleanupPending(j.JobID); err != nil {
+		s.audit("cleanup retry: job %s removed but the ledger refused the clear: %v", j.JobID, err)
+		return
+	}
+	s.audit("cleanup retry: job %s handle %s removed", j.JobID, j.BackendHandle)
+	s.forgetAttempt(s.lastCleanupAttempt, j.JobID)
 }
 
 // Stop shuts the server down in drain order: cancel monitors'
@@ -803,7 +798,8 @@ func (s *Server) serve(conn *net.UnixConn) {
 		// Persist before dispatch, under the pool reservation: if the
 		// process dies after this commit, the job identity survives —
 		// that is the point of the ledger.
-		if err := s.admitJob(jobID, contractHash, submitter, principal, image, contractJSON, contractBudget(contract)); err != nil {
+		lj, err := s.admitJob(jobID, contractHash, submitter, principal, image, contractJSON, contractBudget(contract))
+		if err != nil {
 			switch {
 			case errors.Is(err, ErrDuplicateJobID):
 				fail(fmt.Sprintf("job_id %q already submitted", jobID))
@@ -827,116 +823,135 @@ func (s *Server) serve(conn *net.UnixConn) {
 			continue
 		}
 
-		// The dispatch identity is computed without creating anything
-		// and persisted before the backend may create a VM: a crash can
-		// then never leave a VM whose authorization is not on disk, and
-		// recovery validates a discovered VM against this stored
-		// identity rather than reconstructing authority from a
-		// matching command.
-		prepareCtx, cancelPrepare := context.WithTimeout(s.shutdown, prepareTimeout)
-		plan, perr := s.cfg.Backend.Prepare(prepareCtx, contract)
-		cancelPrepare()
-		if perr != nil {
-			// Nothing was created: a pre-launch refusal, the only kind
-			// that may attest NO_EFFECT.
-			receiptSHA, rerr := s.emitReceipt(&LedgerJob{
-				JobID: jobID, Principal: principal, ContractHash: contractHash,
-			}, evidence.OutcomeNoEffect, "", "")
-			if rerr != nil {
-				s.audit("job %s: evidence emission failed (%v) — refusing the terminal claim too", jobID, rerr)
-				fail(fmt.Sprintf("backend refused and evidence emission failed for %q: %v", jobID, rerr))
-				return
-			}
-			_ = s.ledger.Transition(jobID, JobStateDispatchFailed, []string{JobStateDispatching},
-				func(j *LedgerJob) error {
-					j.ReceiptSHA256 = receiptSHA
-					j.DispatchClass = string(DispatchNotAttempted)
-					j.Error = fmt.Sprintf("dispatch refused before launch: %v", perr)
-					return nil
-				})
-			failJob(jobID, JobStateDispatchFailed, fmt.Sprintf("backend refused job: %v", perr))
-			return
-		}
-		if err := s.ledger.RecordDispatchPlan(jobID, s.backendName, plan); err != nil {
-			fail(fmt.Sprintf("persist dispatch identity of %q: %v", jobID, err))
-			return
-		}
-
-		dispatchCtx, cancel := context.WithTimeout(s.shutdown, s.cfg.DispatchTimeout)
-		disp, derr := s.cfg.Backend.Dispatch(dispatchCtx, contract, plan)
-		cancel()
-		switch {
-		case derr == nil:
-			err := s.ledger.Transition(jobID, JobStateRunning, []string{JobStateDispatching},
-				func(j *LedgerJob) error {
-					applyRunIdentity(j, s.backendName, disp)
-					j.DispatchClass = string(DispatchStarted)
-					return nil
-				})
-			if err != nil {
-				fail(fmt.Sprintf("persist dispatch of %q: %v", jobID, err))
-				return
-			}
-			s.audit("accepted job %s from %s (principal=%s image=%s signed=%t handle=%s run_id=%s boot_id=%s policy=%s)",
-				jobID, submitter, principal, image, contract != nil, disp.Handle, disp.RunID, disp.BootID, disp.PolicyDigest)
-			s.monitorWg.Add(1)
-			go s.monitor(jobID, disp)
+		// The row is already claimed DISPATCHING — admitJob wrote the
+		// intent atomically with the record. The shared pipeline takes
+		// it from here; the response reports the durable outcome.
+		s.audit("accepted job %s from %s (principal=%s image=%s signed=%t)",
+			jobID, submitter, principal, image, contract != nil)
+		state, reason := s.driveDispatch(lj, contract)
+		if state == JobStateRunning {
 			if err := writeResponse(conn, &Response{OK: true, JobID: jobID, State: JobStateRunning}); err != nil {
 				return
 			}
-		case errors.Is(derr, ErrAmbiguousDispatch):
-			// The job may already be running. Record everything we
-			// know and refuse the retry path outright — an operator
-			// reconciles against the backend, never a blind relaunch.
-			_ = s.ledger.Transition(jobID, JobStateDispatchAmbig, []string{JobStateDispatching},
-				func(j *LedgerJob) error {
-					applyRunIdentity(j, s.backendName, disp)
-					j.DispatchClass = string(DispatchUncertain)
-					j.Error = derr.Error()
-					return nil
-				})
-			failJob(jobID, JobStateDispatchAmbig, fmt.Sprintf("dispatch outcome uncertain — reconciling manually; the job will NOT be retried: %v", derr))
-			return
-		case errors.Is(derr, ErrDispatchRefused):
-			// Definitive refusal: the backend proved nothing launched,
-			// but the job identity stays recorded — a backend error
-			// must never erase an acknowledged job. The NO_EFFECT
-			// receipt attests the refusal itself.
-			receiptSHA, rerr := s.emitReceipt(&LedgerJob{
-				JobID: jobID, Principal: principal, ContractHash: contractHash,
-			}, evidence.OutcomeNoEffect, "", disp.Handle)
-			if rerr != nil {
-				s.audit("job %s: evidence emission failed (%v) — refusing the terminal claim too", jobID, rerr)
-				fail(fmt.Sprintf("backend refused and evidence emission failed for %q: %v", jobID, rerr))
-				return
-			}
-			_ = s.ledger.Transition(jobID, JobStateDispatchFailed, []string{JobStateDispatching},
-				func(j *LedgerJob) error {
-					j.Error, j.BackendID, j.BackendHandle, j.ReceiptSHA256 =
-						derr.Error(), s.backendName, disp.Handle, receiptSHA
-					j.DispatchClass = string(DispatchProvenRejected)
-					return nil
-				})
-			s.checkpoint()
-			failJob(jobID, JobStateDispatchFailed, fmt.Sprintf("backend refused job: %v", derr))
-			return
-		default:
-			// Unclassified dispatch error: the executor cannot prove
-			// nothing executed, so it must not claim it. Record the
-			// uncertainty exactly as an ambiguous dispatch — the job
-			// is never retried blind and never receives a NO_EFFECT
-			// receipt it cannot support.
-			_ = s.ledger.Transition(jobID, JobStateDispatchAmbig, []string{JobStateDispatching},
-				func(j *LedgerJob) error {
-					applyRunIdentity(j, s.backendName, disp)
-					j.DispatchClass = string(DispatchUncertain)
-					j.Error = fmt.Sprintf("dispatch error could not be classified as a pre-launch refusal — treating the outcome as uncertain: %v", derr)
-					return nil
-				})
-			s.audit("job %s: unclassified dispatch error treated as uncertain (never a no-effect claim): %v", jobID, derr)
-			failJob(jobID, JobStateDispatchAmbig, fmt.Sprintf("dispatch outcome uncertain — reconciling manually; the job will NOT be retried: %v", derr))
+			continue
+		}
+		if state == "" {
+			fail(reason.Error())
 			return
 		}
+		failJob(jobID, state, reason.Error())
+		return
+	}
+}
+
+// driveDispatch runs one claimed DISPATCHING row through the backend
+// pipeline: prepare, persist the dispatch authorization, dispatch,
+// monitor. It returns the durable state the row now holds and, for a
+// non-running outcome, the operator-facing reason; an empty state
+// means the drive itself failed before any claim could be recorded,
+// and the row is left DISPATCHING for reconcile to mark ambiguous.
+// The socket handler and the maintenance scheduler share this — one
+// definition of dispatch truth, never a silent retry.
+func (s *Server) driveDispatch(j *LedgerJob, contract *JobContractV2) (string, error) {
+	// The dispatch identity is computed without creating anything
+	// and persisted before the backend may create a VM: a crash can
+	// then never leave a VM whose authorization is not on disk, and
+	// recovery validates a discovered VM against this stored
+	// identity rather than reconstructing authority from a
+	// matching command.
+	prepareCtx, cancelPrepare := context.WithTimeout(s.shutdown, prepareTimeout)
+	plan, perr := s.cfg.Backend.Prepare(prepareCtx, contract)
+	cancelPrepare()
+	if perr != nil {
+		// Nothing was created: a pre-launch refusal, the only kind
+		// that may attest NO_EFFECT.
+		receiptSHA, rerr := s.emitReceipt(&LedgerJob{
+			JobID: j.JobID, Principal: j.Principal, ContractHash: j.ContractHash,
+		}, evidence.OutcomeNoEffect, "", "")
+		if rerr != nil {
+			s.audit("job %s: evidence emission failed (%v) — refusing the terminal claim too", j.JobID, rerr)
+			return "", fmt.Errorf("backend refused and evidence emission failed for %q: %v", j.JobID, rerr)
+		}
+		_ = s.ledger.Transition(j.JobID, JobStateDispatchFailed, []string{JobStateDispatching},
+			func(lj *LedgerJob) error {
+				lj.ReceiptSHA256 = receiptSHA
+				lj.DispatchClass = string(DispatchNotAttempted)
+				lj.Error = fmt.Sprintf("dispatch refused before launch: %v", perr)
+				return nil
+			})
+		return JobStateDispatchFailed, fmt.Errorf("backend refused job: %v", perr)
+	}
+	if err := s.ledger.RecordDispatchPlan(j.JobID, s.backendName, plan); err != nil {
+		return "", fmt.Errorf("persist dispatch identity of %q: %v", j.JobID, err)
+	}
+
+	dispatchCtx, cancel := context.WithTimeout(s.shutdown, s.cfg.DispatchTimeout)
+	disp, derr := s.cfg.Backend.Dispatch(dispatchCtx, contract, plan)
+	cancel()
+	switch {
+	case derr == nil:
+		err := s.ledger.Transition(j.JobID, JobStateRunning, []string{JobStateDispatching},
+			func(lj *LedgerJob) error {
+				applyRunIdentity(lj, s.backendName, disp)
+				lj.DispatchClass = string(DispatchStarted)
+				return nil
+			})
+		if err != nil {
+			return "", fmt.Errorf("persist dispatch of %q: %v", j.JobID, err)
+		}
+		s.audit("dispatched job %s (handle=%s run_id=%s boot_id=%s policy=%s)",
+			j.JobID, disp.Handle, disp.RunID, disp.BootID, disp.PolicyDigest)
+		s.monitorWg.Add(1)
+		go s.monitor(j.JobID, disp)
+		return JobStateRunning, nil
+	case errors.Is(derr, ErrAmbiguousDispatch):
+		// The job may already be running. Record everything we
+		// know and refuse the retry path outright — an operator
+		// reconciles against the backend, never a blind relaunch.
+		_ = s.ledger.Transition(j.JobID, JobStateDispatchAmbig, []string{JobStateDispatching},
+			func(lj *LedgerJob) error {
+				applyRunIdentity(lj, s.backendName, disp)
+				lj.DispatchClass = string(DispatchUncertain)
+				lj.Error = derr.Error()
+				return nil
+			})
+		return JobStateDispatchAmbig, fmt.Errorf("dispatch outcome uncertain — reconciling manually; the job will NOT be retried: %v", derr)
+	case errors.Is(derr, ErrDispatchRefused):
+		// Definitive refusal: the backend proved nothing launched,
+		// but the job identity stays recorded — a backend error
+		// must never erase an acknowledged job. The NO_EFFECT
+		// receipt attests the refusal itself.
+		receiptSHA, rerr := s.emitReceipt(&LedgerJob{
+			JobID: j.JobID, Principal: j.Principal, ContractHash: j.ContractHash,
+		}, evidence.OutcomeNoEffect, "", disp.Handle)
+		if rerr != nil {
+			s.audit("job %s: evidence emission failed (%v) — refusing the terminal claim too", j.JobID, rerr)
+			return "", fmt.Errorf("backend refused and evidence emission failed for %q: %v", j.JobID, rerr)
+		}
+		_ = s.ledger.Transition(j.JobID, JobStateDispatchFailed, []string{JobStateDispatching},
+			func(lj *LedgerJob) error {
+				lj.Error, lj.BackendID, lj.BackendHandle, lj.ReceiptSHA256 =
+					derr.Error(), s.backendName, disp.Handle, receiptSHA
+				lj.DispatchClass = string(DispatchProvenRejected)
+				return nil
+			})
+		s.checkpoint()
+		return JobStateDispatchFailed, fmt.Errorf("backend refused job: %v", derr)
+	default:
+		// Unclassified dispatch error: the executor cannot prove
+		// nothing executed, so it must not claim it. Record the
+		// uncertainty exactly as an ambiguous dispatch — the job
+		// is never retried blind and never receives a NO_EFFECT
+		// receipt it cannot support.
+		_ = s.ledger.Transition(j.JobID, JobStateDispatchAmbig, []string{JobStateDispatching},
+			func(lj *LedgerJob) error {
+				applyRunIdentity(lj, s.backendName, disp)
+				lj.DispatchClass = string(DispatchUncertain)
+				lj.Error = fmt.Sprintf("dispatch error could not be classified as a pre-launch refusal — treating the outcome as uncertain: %v", derr)
+				return nil
+			})
+		s.audit("job %s: unclassified dispatch error treated as uncertain (never a no-effect claim): %v", j.JobID, derr)
+		return JobStateDispatchAmbig, fmt.Errorf("dispatch outcome uncertain — reconciling manually; the job will NOT be retried: %v", derr)
 	}
 }
 
@@ -1371,7 +1386,7 @@ func contractBudget(c *JobContractV2) *ResourceBudget {
 // insert → dispatch intent. A concurrent admission's check observes
 // this job's durable DISPATCHING row, so two jobs can never both pass
 // the same budget. The lock is released before any backend launch.
-func (s *Server) admitJob(jobID, contractHash, submitter, principal, image, contractJSON string, budget *ResourceBudget) error {
+func (s *Server) admitJob(jobID, contractHash, submitter, principal, image, contractJSON string, budget *ResourceBudget) (*LedgerJob, error) {
 	s.admitMu.Lock()
 	defer s.admitMu.Unlock()
 	// The registry bound is checked against durable ACTIVE state —
@@ -1379,16 +1394,16 @@ func (s *Server) admitJob(jobID, contractHash, submitter, principal, image, cont
 	// active table is full, archive its settled rows first and recount:
 	// only a registry still full of live or unresolved work refuses.
 	if count, err := s.ledger.Count(); err != nil {
-		return fmt.Errorf("registry unavailable: %w", err)
+		return nil, fmt.Errorf("registry unavailable: %w", err)
 	} else if count >= maxJobs {
 		if _, aerr := s.ledger.ArchiveCompleted(maxArchiveBatch); aerr != nil {
-			return fmt.Errorf("registry full and archival failed: %w", aerr)
+			return nil, fmt.Errorf("registry full and archival failed: %w", aerr)
 		}
 		if count, err = s.ledger.Count(); err != nil {
-			return fmt.Errorf("registry unavailable: %w", err)
+			return nil, fmt.Errorf("registry unavailable: %w", err)
 		}
 		if count >= maxJobs {
-			return fmt.Errorf("job registry full (%d active records)", maxJobs)
+			return nil, fmt.Errorf("job registry full (%d active records)", maxJobs)
 		}
 	}
 	// The pool bounds execution, so it applies only when a backend can
@@ -1397,20 +1412,20 @@ func (s *Server) admitJob(jobID, contractHash, submitter, principal, image, cont
 	if s.cfg.Backend != nil && s.cfg.ResourcePool != nil {
 		usage, err := s.ledger.ActiveUsage(s.cfg.DispatchTimeout + time.Minute)
 		if err != nil {
-			return fmt.Errorf("read pool usage: %w", err)
+			return nil, fmt.Errorf("read pool usage: %w", err)
 		}
 		if err := s.cfg.ResourcePool.check(usage, submitter, budget); err != nil {
-			return fmt.Errorf("%w: %v", ErrPoolExhausted, err)
+			return nil, fmt.Errorf("%w: %v", ErrPoolExhausted, err)
 		}
 	}
-	if _, err := s.ledger.InsertJob(jobID, contractHash, submitter, principal, image, contractJSON); err != nil {
-		return err
-	}
+	// The row and the dispatch intent commit together when a backend
+	// exists — there is no durable RECORDED state to strand in. A
+	// record-only executor still writes RECORDED and stops.
 	if s.cfg.Backend == nil {
-		return nil
+		return s.ledger.InsertJob(jobID, contractHash, submitter, principal, image, contractJSON)
 	}
 	// Persisted intent to dispatch before the backend sees anything —
 	// a crash between dispatch and result leaves a DISPATCHING row,
 	// which reconcile marks ambiguous rather than guessing.
-	return s.ledger.Transition(jobID, JobStateDispatching, []string{JobStateRecorded}, nil)
+	return s.ledger.AdmitJob(jobID, contractHash, submitter, principal, image, contractJSON)
 }

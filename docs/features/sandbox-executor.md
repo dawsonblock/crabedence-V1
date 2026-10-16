@@ -230,7 +230,8 @@ for reconciliation.
 
 Cleanup is tracked separately from the result: the terminal write records
 cleanup intent, the sandbox removal runs after, and a failure is recorded as
-`cleanup_pending` (with the reason) and retried at the next startup. A cleanup
+`cleanup_pending` (with the reason) and retried at the next startup and on the
+maintenance cadence below. A cleanup
 failure never rewrites the observed result, and the VM's own contract bound is
 the backstop. Until the removal is verified the job **keeps its pool
 reservation**: the guest process finishing is not the microVM ceasing to exist,
@@ -268,6 +269,40 @@ settled rows and recounts rather than refusing on stale history; only a registry
 still full of live or unresolved work refuses. `VerifyArchiveSegments`
 re-derives each segment's digest from the archive contents, so a rewrite of
 archived bytes is detectable tampering.
+
+## Continuous recovery
+
+Startup reconciliation fixes what a previous lifetime left, but a daemon that
+runs forever also leaves residue mid-lifetime — a driver that dies between
+recording a job and claiming its dispatch intent, a cleanup that keeps failing,
+an unresolved run whose backend settles an hour later. A maintenance scheduler
+re-drives each category on a bounded cadence (`MaintenanceInterval`, default 60s,
+negative disables the periodic passes):
+
+- **Stranded `RECORDED` rows.** An admission crash or a record-only deployment
+  can leave a durable row with no dispatch intent. The scheduler re-checks the
+  contract — an expired or unreadable one terminates as `DISPATCH_FAILED` with a
+  `NO_EFFECT` receipt, which is sound precisely because `RECORDED` proves no
+  backend was ever asked — re-checks the pool under the admission lock, claims
+  the row through the same `RECORDED`→`DISPATCHING` CAS the live path uses, and
+  drives it through the shared dispatch pipeline. Live admission itself is
+  atomic (`AdmitJob` writes the row already `DISPATCHING`), so the stranded set
+  only ever contains pre-existing residue.
+- **Stale `DISPATCHING` rows.** Every context on the dispatch drive is bounded
+  (prepare plus the dispatch timeout), so a `DISPATCHING` row older than both
+  bounds has no live driver. The sweep marks it `DISPATCH_AMBIGUOUS` —
+  uncertain, never retried, never claimed dead — where the reconcile walk and
+  the escalation see it.
+- **Unresolved re-observation.** `DISPATCH_AMBIGUOUS`/`INTERRUPTED` rows are
+  re-resumed through the backend on a per-row backoff, exactly as at startup.
+- **Cleanup retries.** `cleanup_pending` removals retry on their own backoff.
+- **Archival.** Settled rows move to the archive each pass; capacity relief
+  does not wait for the registry to fill.
+- **Residue escalation.** Rows that persist unresolved or cleanup-pending are
+  audited as an `ESCALATION` line — immediately when the residue shape changes,
+  then on a throttle — so an operator learns the residue exists rather than
+  discovering it at the next restart. Nothing is re-dispatched blind and
+  nothing is auto-destroyed.
 
 ## Platform qualification
 
