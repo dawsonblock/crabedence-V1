@@ -117,9 +117,14 @@ jobs:
           # claim it schedules.
           matrix='{"include":[]}'
           for lane in $resolved; do
+            # Runner selection is workflow configuration: every claimed
+            # lane must map to a runner that actually provisions on this
+            # repository. The blacksmith label does not resolve here —
+            # jobs queue without a runner — so the KVM lane uses the
+            # GitHub-hosted Linux image, which exposes /dev/kvm.
             case "$lane" in
               apple-hypervisor-framework) runner=macos-15 ;;
-              linux-kvm) runner=blacksmith-2vcpu-ubuntu-2404 ;;
+              linux-kvm) runner=ubuntu-latest ;;
             esac
             matrix="$(jq -c --arg l "$lane" --arg r "$runner" \
               '.include += [{lane: $l, runner: $r}]' <<<"$matrix")"
@@ -439,6 +444,16 @@ jobs:
           fi
           go version
           go env GOVERSION GOTOOLCHAIN
+
+      # GitHub-hosted Linux runners expose /dev/kvm but the job user is
+      # not in the kvm group; the lane's msb doctor fails closed without
+      # it. An ACL grants access without group changes taking effect.
+      - name: Grant /dev/kvm access
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo setfacl -m "u:$(id -un):rw" /dev/kvm
+          test -r /dev/kvm && test -w /dev/kvm
 
       - name: Install the pinned Microsandbox runtime
         shell: bash

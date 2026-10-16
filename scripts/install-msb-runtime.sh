@@ -109,8 +109,16 @@ case "$os" in
   darwin) lib_asset="libkrunfw-${os}-${arch}.dylib" ;;
   linux)  lib_asset="libkrunfw-${os}-${arch}.so" ;;
 esac
-curl -fsSL --retry 3 -o "$DEST_LIB/$lib_asset" "${base}/${lib_asset}"
-verify_asset "$DEST_LIB/$lib_asset" "$lib_asset"
+# msb resolves libkrunfw by the versioned soname the release tarball
+# ships (libkrunfw.5.dylib, libkrunfw.so.5.6.1), never by the asset
+# name — that canonical filename is pinned beside the digests.
+lib_install="$(jq -r --arg n "$lib_asset" '.install_names[$n] // empty' "$PINS_FILE")"
+if [ -z "$lib_install" ]; then
+  echo "ERROR: $PINS_FILE carries no install name for $lib_asset" >&2
+  exit 1
+fi
+curl -fsSL --retry 3 -o "$DEST_LIB/$lib_install" "${base}/${lib_asset}"
+verify_asset "$DEST_LIB/$lib_install" "$lib_asset"
 
 actual="$("$DEST_BIN/msb" --version 2>/dev/null || true)"
 echo "installed: $actual"

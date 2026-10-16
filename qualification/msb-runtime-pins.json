@@ -12,5 +12,10 @@
     "libkrunfw-darwin-aarch64.dylib": "723f7cd73be9bab21c0abf6a9b07b45a07d4cd178f1690250e392d55dfb236b4",
     "libkrunfw-linux-aarch64.so": "bc854ef198a257204636e9895153931bf1a0a3dcb5069afd83e0ff03f9f60d66",
     "libkrunfw-linux-x86_64.so": "ce0a915daa6aff403e9a388e161671fbac9b85b0c200a99d7a9fdf0e1c03d668"
+  },
+  "install_names": {
+    "libkrunfw-darwin-aarch64.dylib": "libkrunfw.5.dylib",
+    "libkrunfw-linux-aarch64.so": "libkrunfw.so.5.6.1",
+    "libkrunfw-linux-x86_64.so": "libkrunfw.so.5.6.1"
   }
 }
