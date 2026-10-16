@@ -111,7 +111,24 @@ test("lane gates consume the authoritative required-test inventory", () => {
   assert.match(source, /RELEASE_VERSION.*does not equal VERSION/);
 });
 
-test("lane evidence normalizer and installer parse", () => {
+test("a live lane may only run on the repository-pinned runtime", () => {
+  const source = fs.readFileSync(GENERATOR, "utf8");
+  // Whatever msb the host happens to carry is verified against the
+  // trusted pins before a live lane runs on it — a substituted or
+  // unanchored runtime marks the lane unusable, never silently usable.
+  assert.match(source, /verify-msb-runtime-pins\.sh/);
+  const pins = JSON.parse(
+    fs.readFileSync(path.join(scripts, "..", "qualification", "msb-runtime-pins.json"), "utf8"),
+  );
+  assert.equal(pins.schema_version, 1);
+  assert.match(pins.version, /^\d+\.\d+\.\d+$/);
+  for (const [asset, digest] of Object.entries(pins.assets)) {
+    assert.match(digest, /^[0-9a-f]{64}$/, `${asset} digest is a sha256`);
+  }
+});
+
+test("lane evidence normalizer and installers parse", () => {
   execFileSync("python3", ["-m", "py_compile", path.join(scripts, "go-test-case-evidence.py")]);
   execFileSync("bash", ["-n", path.join(scripts, "install-msb-runtime.sh")]);
+  execFileSync("bash", ["-n", path.join(scripts, "verify-msb-runtime-pins.sh")]);
 });

@@ -18,9 +18,13 @@ on:
         description: >-
           Virtualization lanes the release claims support for
           (space-separated: apple-hypervisor-framework linux-kvm).
-          Every claimed lane must run its own lane job and its evidence
-          must satisfy the required-test inventory — a claim without
-          passing lane evidence fails release admission.
+          Empty claims every lane the required-test inventory ships —
+          the distribution enables those backends, so the default must
+          qualify them all. The token "none" marks a deliberately
+          restricted release that claims no microVM support. Every
+          claimed lane must run its own lane job and its evidence must
+          satisfy the required-test inventory — a claim without passing
+          lane evidence fails release admission.
         required: false
         default: ""
 
@@ -45,6 +49,7 @@ jobs:
       commit: ${{ steps.record.outputs.commit }}
       tree: ${{ steps.record.outputs.tree }}
       branch: ${{ steps.record.outputs.branch }}
+      claimed_lanes: ${{ steps.lanes.outputs.claimed_lanes }}
     steps:
       - name: Check out
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -75,6 +80,35 @@ jobs:
           echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "tree=$(git rev-parse HEAD^{tree})" >> "$GITHUB_OUTPUT"
           echo "branch=$(git rev-parse --abbrev-ref HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Lane claims are authoritative, not advisory: the distribution
+      # enables every backend the required-test inventory declares, so an
+      # empty input claims them all — a release cannot silently omit live
+      # qualification for a shipping execution backend. Only the explicit
+      # token "none" marks a deliberately restricted release, and a claim
+      # naming a lane the inventory does not declare fails here, before
+      # any runner is scheduled.
+      - name: Resolve claimed virtualization lanes
+        id: lanes
+        shell: bash
+        env:
+          CLAIMED_LANES_INPUT: ${{ inputs.claimed_lanes }}
+        run: |
+          inventory="$(jq -r '.lanes | keys | sort | join(" ")' qualification/required-tests.json)"
+          input="$CLAIMED_LANES_INPUT"
+          case "$input" in
+            "") resolved="$inventory" ;;
+            none) resolved="" ;;
+            *) resolved="$input" ;;
+          esac
+          for lane in $resolved; do
+            case " $inventory " in
+              *" $lane "*) ;;
+              *) echo "ERROR: claimed lane $lane is not declared in the required-test inventory" >&2; exit 1 ;;
+            esac
+          done
+          echo "resolved lane claims: ${resolved:-<none — restricted release>}"
+          echo "claimed_lanes=$resolved" >> "$GITHUB_OUTPUT"
 
       - name: Verify version consistency
         shell: bash
@@ -353,24 +387,24 @@ jobs:
   # it against the required-test inventory, so a "pass" that skipped an
   # isolation case cannot produce an admissible record.
   #
-  # Lane jobs only run for lanes the dispatch claims — an unclaimed lane
-  # matrix entry is skipped, and a skipped lane never fabricates
-  # evidence for that lane.
+  # Lane jobs run for exactly the lanes the resolved claim covers — an
+  # unclaimed lane matrix entry is skipped, and a skipped lane never
+  # fabricates evidence for that lane. The claim itself is resolved by
+  # the provenance job: the shipping default is every inventoried lane,
+  # not none of them.
   live-microvm:
     name: Live microVM (${{ matrix.lane }})
     timeout-minutes: 45
     needs: provenance
     runs-on: ${{ matrix.runner }}
-    if: contains(inputs.claimed_lanes || '', matrix.short)
+    if: contains(needs.provenance.outputs.claimed_lanes, matrix.lane)
     strategy:
       fail-fast: false
       matrix:
         include:
           - lane: apple-hypervisor-framework
-            short: apple
             runner: macos-15
           - lane: linux-kvm
-            short: linux-kvm
             runner: blacksmith-2vcpu-ubuntu-2404
     steps:
       - name: Check out
@@ -547,7 +581,7 @@ jobs:
       # inventory and carry this exact commit — borrowed or incomplete
       # lane evidence is a FAIL, never a skipped claim.
       - name: Download lane evidence
-        if: ${{ inputs.claimed_lanes != '' }}
+        if: ${{ needs.provenance.outputs.claimed_lanes != '' }}
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           pattern: lane-evidence-*
@@ -556,7 +590,7 @@ jobs:
 
       - name: Generate release evidence
         env:
-          CRABBOX_QUALIFY_LANES: ${{ inputs.claimed_lanes || '' }}
+          CRABBOX_QUALIFY_LANES: ${{ needs.provenance.outputs.claimed_lanes }}
           CRABBOX_LANE_EVIDENCE_DIR: dist/lane-evidence
         run: bash scripts/generate-release-evidence.sh
 

@@ -22,6 +22,9 @@ const LANE = "apple-hypervisor-framework";
 const GATE_ID = "live-microvm-apple";
 const COMMIT = "a".repeat(40);
 const GO = "go version go1.26.5 darwin/arm64";
+// go test -json events name the full import path; the suite package is
+// the inventory's `package` under this module root.
+const PKG = "github.com/example/module/internal/sandboxexecutor";
 
 const INVENTORY = {
   schema_version: 1,
@@ -29,7 +32,9 @@ const INVENTORY = {
   package: "internal/sandboxexecutor",
   run_pattern: "TestMSBLive",
   lanes: {
-    "apple-hypervisor-framework": { goos: "darwin", gate_id: GATE_ID },
+    // Matches qualification/required-tests.json: the apple lane pins
+    // goarch, the linux lane accepts either KVM-capable arch.
+    "apple-hypervisor-framework": { goos: "darwin", goarch: "arm64", gate_id: GATE_ID },
     "linux-kvm": { goos: "linux", gate_id: "live-microvm-linux-kvm" },
   },
   common_required_tests: ["TestMSBLiveA", "TestMSBLiveB", "TestMSBLiveC"],
@@ -39,6 +44,11 @@ const INVENTORY = {
   },
 };
 
+// The output bytes the stream attributes to a test; the case's claimed
+// digest is the sha256 of exactly these bytes — the verifier re-derives
+// the digest from the stream, so the two must agree byte-for-byte.
+const caseOutput = (name) => `${name} log\n`;
+
 // A "case" in the normalized results file: the terminal outcome the raw
 // go test -json stream is claimed to show.
 function caseEntry(name, status = "pass", extra = {}) {
@@ -47,20 +57,24 @@ function caseEntry(name, status = "pass", extra = {}) {
     status,
     elapsed_seconds: 0.01,
     terminal_events: 1,
-    output_sha256: sha256(name),
+    output_sha256: sha256(caseOutput(name)),
     ...extra,
   };
 }
 
-// The raw go test -json stream matching a set of cases (the validator
-// cross-checks terminal outcomes between the two).
+// The raw go test -json stream matching a set of cases: per-test
+// run/output/terminal events followed by the package's own terminal
+// event — the canonical verifier requires both halves of a real run.
 function rawStream(cases) {
   const events = [];
   for (const c of cases) {
-    events.push({ Time: "2026-01-01T00:00:00Z", Action: "run", Package: "internal/sandboxexecutor", Test: c.name });
-    events.push({ Time: "2026-01-01T00:00:01Z", Action: "output", Package: "internal/sandboxexecutor", Test: c.name, Output: `${c.name} log\n` });
-    events.push({ Time: "2026-01-01T00:00:02Z", Action: c.status, Package: "internal/sandboxexecutor", Test: c.name, Elapsed: 0.01 });
+    events.push({ Time: "2026-01-01T00:00:00Z", Action: "run", Package: PKG, Test: c.name });
+    events.push({ Time: "2026-01-01T00:00:01Z", Action: "output", Package: PKG, Test: c.name, Output: caseOutput(c.name) });
+    events.push({ Time: "2026-01-01T00:00:02Z", Action: c.status, Package: PKG, Test: c.name, Elapsed: 0.01 });
   }
+  const failed = cases.some((c) => c.status === "fail" || c.status === "incomplete");
+  events.push({ Time: "2026-01-01T00:00:03Z", Action: "output", Package: PKG, Output: `${failed ? "FAIL" : "ok"}  \t${PKG}\t0.03s\n` });
+  events.push({ Time: "2026-01-01T00:00:03Z", Action: failed ? "fail" : "pass", Package: PKG, Elapsed: 0.03 });
   return events.map((e) => JSON.stringify(e)).join("\n") + "\n";
 }
 
@@ -72,7 +86,7 @@ function resultsRecord(cases, overrides = {}) {
     source_commit: COMMIT,
     toolchain_go: GO,
     runner: { os: "darwin", arch: "arm64" },
-    packages: ["github.com/example/internal/sandboxexecutor"],
+    packages: [PKG],
     tests: cases,
     counts: {
       passed: cases.filter((c) => c.status === "pass").length,
@@ -343,7 +357,7 @@ test("results from another source commit are rejected", (t) => {
   assert.match(findings, /results commit f+ does not match the qualified commit/);
 });
 
-test("results from another toolchain are rejected", (t) => {
+test("results from another toolchain version are rejected", (t) => {
   const root = laneBundle(t, {
     cases: ALL_PASS(),
     mutate: (q, root, results) => {
@@ -353,7 +367,21 @@ test("results from another toolchain are rejected", (t) => {
   });
   const { status, findings } = validate(root);
   assert.notEqual(status, 0);
-  assert.match(findings, /results toolchain .* does not match the qualified toolchain/);
+  assert.match(findings, /results toolchain .* does not run the qualified toolchain version/);
+});
+
+// A lane legitimately runs on a different platform than the evidence
+// host — the toolchain's os/arch tail is the LANE's identity, not the
+// record host's. Only the version must match the qualified toolchain.
+test("results with the same toolchain version on the lane platform are accepted", (t) => {
+  const root = laneBundle(t, {
+    cases: ALL_PASS(),
+    mutate: (q, root, results) => {
+      results.toolchain_go = "go version go1.26.5 darwin/arm64";
+      rewrite(root, `gate-results/${GATE_ID}.cases.json`, () => JSON.stringify(results, null, 2));
+    },
+  });
+  assert.equal(validate(root).status, 0, validate(root).findings);
 });
 
 // ─── Forged and inconsistent evidence ─────────────────────────────────
@@ -416,7 +444,7 @@ test("case results disagreeing with the raw stream are rejected", (t) => {
   });
   const { status, findings } = validate(root);
   assert.notEqual(status, 0);
-  assert.match(findings, /case results are inconsistent with the raw go test -json stream/);
+  assert.match(findings, /TestMSBLiveB status='pass' does not match the stream-derived 'fail'/);
 });
 
 test("aggregate counts inconsistent with the case results are rejected", (t) => {
@@ -467,6 +495,132 @@ test("a malformed test_suite binding fails structurally", (t) => {
   assert.match(findings, /test_suite\.raw is missing/);
 });
 
+// ─── Reproduced validator escapes (permanent regression) ──────────────
+// These are the three evidence shapes an earlier validator accepted:
+// the raw stream is rewritten while the digest-bound results record
+// stays consistent — only canonical re-derivation catches each one.
+
+test("a duplicate terminal event in the raw stream is rejected", (t) => {
+  const root = laneBundle(t, {
+    cases: ALL_PASS(),
+    mutate: (q, root) => {
+      // The record still claims terminal_events:1 — the extra pass in
+      // the stream must be caught by re-derivation, not by comparing
+      // final outcomes. It lands before the package terminal, exactly
+      // where a real event stream would place a second outcome for B.
+      rewrite(root, `gate-results/${GATE_ID}.test.json`, (raw) => {
+        const lines = raw.trimEnd().split("\n");
+        const extra = JSON.stringify({ Time: "2026-01-01T00:00:02Z", Action: "pass", Package: PKG, Test: "TestMSBLiveB", Elapsed: 0.02 });
+        lines.splice(lines.length - 2, 0, extra);
+        return lines.join("\n") + "\n";
+      });
+    },
+  });
+  const { status, findings } = validate(root);
+  assert.notEqual(status, 0);
+  assert.match(findings, /TestMSBLiveB.*(after its terminal outcome|2 terminal events|terminal_events=1 .* '2')/);
+});
+
+test("an output-digest mismatch between stream and results is rejected", (t) => {
+  const root = laneBundle(t, {
+    cases: ALL_PASS(),
+    mutate: (q, root) => {
+      // Change the bytes the stream attributes to B without updating
+      // the claimed output digest — the binding stays honest.
+      rewrite(root, `gate-results/${GATE_ID}.test.json`, (raw) =>
+        raw.replace("TestMSBLiveB log\\n", "TestMSBLiveB tampered\\n"),
+      );
+    },
+  });
+  const { status, findings } = validate(root);
+  assert.notEqual(status, 0);
+  assert.match(findings, /TestMSBLiveB output_sha256=.*does not match the stream-derived/);
+});
+
+test("a runner CPU architecture other than the lane's is rejected", (t) => {
+  const root = laneBundle(t, {
+    cases: ALL_PASS(),
+    mutate: (q, root, results) => {
+      results.runner.arch = "x86_64";
+      rewrite(root, `gate-results/${GATE_ID}.cases.json`, () => JSON.stringify(results, null, 2));
+    },
+  });
+  const { status, findings } = validate(root);
+  assert.notEqual(status, 0);
+  assert.match(findings, /runner arch x86_64 is not the apple-hypervisor-framework lane arch arm64/);
+});
+
+test("a raw stream the run never completed is rejected", (t) => {
+  const root = laneBundle(t, {
+    cases: ALL_PASS(),
+    mutate: (q, root) => {
+      // Drop the package terminal: the stream shows tests passing but
+      // the package itself never reported an outcome — an interrupted
+      // or truncated run must not qualify.
+      rewrite(root, `gate-results/${GATE_ID}.test.json`, (raw) =>
+        raw.split("\n").filter((l) => !l.includes(`"Package":"${PKG}","Output"`) && !l.includes(`"Package":"${PKG}","Elapsed"`)).join("\n"),
+      );
+    },
+  });
+  const { status, findings } = validate(root);
+  assert.notEqual(status, 0);
+  assert.match(findings, /has no terminal outcome|records .* cases; the raw stream derives|do not match the stream-derived/);
+});
+
+test("a stream containing a foreign package is rejected", (t) => {
+  const root = laneBundle(t, {
+    cases: ALL_PASS(),
+    mutate: (q, root) => {
+      rewrite(root, `gate-results/${GATE_ID}.test.json`, (raw) =>
+        raw + JSON.stringify({ Time: "2026-01-01T00:00:04Z", Action: "pass", Package: "github.com/example/other", Elapsed: 0.01 }) + "\n",
+      );
+    },
+  });
+  const { status, findings } = validate(root);
+  assert.notEqual(status, 0);
+  assert.match(findings, /package github\.com\/example\/other is not the declared suite package|packages .* do not match the stream-derived/);
+});
+
+test("a malformed event line in the raw stream is rejected", (t) => {
+  const root = laneBundle(t, {
+    cases: ALL_PASS(),
+    mutate: (q, root) => {
+      rewrite(root, `gate-results/${GATE_ID}.test.json`, (raw) => "this is decorated output\n" + raw);
+    },
+  });
+  const { status, findings } = validate(root);
+  assert.notEqual(status, 0);
+  assert.match(findings, /not a go test -json event line/);
+});
+
+test("results whose packages identity is foreign are rejected", (t) => {
+  const root = laneBundle(t, {
+    cases: ALL_PASS(),
+    mutate: (q, root, results) => {
+      results.packages = ["github.com/example/other/package"];
+      rewrite(root, `gate-results/${GATE_ID}.cases.json`, () => JSON.stringify(results, null, 2));
+    },
+  });
+  const { status, findings } = validate(root);
+  assert.notEqual(status, 0);
+  assert.match(findings, /packages.*(not the suite package|do not match the stream-derived)/);
+});
+
+test("a toolchain naming a foreign platform is rejected", (t) => {
+  const root = laneBundle(t, {
+    cases: ALL_PASS(),
+    mutate: (q, root, results) => {
+      // Same Go version but the wrong lane platform — version equality
+      // alone must not launder a platform substitution.
+      results.toolchain_go = "go version go1.26.5 linux/amd64";
+      rewrite(root, `gate-results/${GATE_ID}.cases.json`, () => JSON.stringify(results, null, 2));
+    },
+  });
+  const { status, findings } = validate(root);
+  assert.notEqual(status, 0);
+  assert.match(findings, /toolchain os linux is not the apple-hypervisor-framework lane os darwin/);
+});
+
 // ─── Lane claims ──────────────────────────────────────────────────────
 
 test("a claimed lane with no lane gate is rejected", (t) => {
@@ -500,10 +654,14 @@ test("a claimed lane satisfied only by another lane's gate is rejected", (t) => 
   const root = laneBundle(t, {
     cases: ALL_PASS(),
     mutate: (q, root, results) => {
-      // The binding claims linux-kvm evidence for the apple claim.
+      // The binding claims linux-kvm evidence for the apple claim. The
+      // toolchain and runner identities stay internally consistent so
+      // only the lane substitution is exercised.
       q.gates[0].test_suite.lane = "linux-kvm";
       results.lane = "linux-kvm";
       results.runner.os = "linux";
+      results.runner.arch = "x86_64";
+      results.toolchain_go = "go version go1.26.5 linux/amd64";
       results.tests = results.tests.filter((c) => c.name !== "TestMSBLiveLinuxKVM");
       results.tests.push(caseEntry("TestMSBLiveLinuxKVM"));
       rewrite(root, `gate-results/${GATE_ID}.cases.json`, () => JSON.stringify(results, null, 2));

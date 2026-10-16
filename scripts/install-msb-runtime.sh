@@ -9,9 +9,14 @@
 # the binary reports the pinned version and that `msb doctor` passes —
 # a wrong or unhealthy runtime fails the lane before any test runs.
 #
-# Every downloaded artifact is verified against the release's
-# checksums.sha256 — a lane cannot qualify on bits that were substituted
-# in transit.
+# Every downloaded artifact is verified twice: against the repository's
+# independent trusted pins (qualification/msb-runtime-pins.json) AND the
+# release's own checksums.sha256. The checksum file verifies transit
+# integrity from the release; the repository pins are the trust anchor —
+# a substituted release serving forged assets alongside a forged
+# checksum file still fails, because the bytes cannot match the digests
+# the qualification repository pins. An asset with no repository pin
+# refuses: a lane never qualifies on unanchored bytes.
 #
 # Layout (matches the executor's discovery):
 #   $HOME/.microsandbox/bin/msb
@@ -22,10 +27,28 @@
 #   MSB_VERSION=0.7.8 bash scripts/install-msb-runtime.sh
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
 MSB_VERSION="${MSB_VERSION:-0.7.8}"
 DEST_BIN="$HOME/.microsandbox/bin"
 DEST_LIB="$HOME/.microsandbox/lib"
 REPO="superradcompany/microsandbox"
+PINS_FILE="${MSB_PINS_FILE:-$REPO_ROOT/qualification/msb-runtime-pins.json}"
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "ERROR: jq is required to verify the trusted runtime pins" >&2
+  exit 1
+fi
+if [ ! -f "$PINS_FILE" ]; then
+  echo "ERROR: trusted runtime pins not found: $PINS_FILE" >&2
+  exit 1
+fi
+pinned_version="$(jq -r '.version // empty' "$PINS_FILE")"
+if [ "$pinned_version" != "$MSB_VERSION" ]; then
+  echo "ERROR: $PINS_FILE pins msb '$pinned_version' — refusing to install unanchored version $MSB_VERSION" >&2
+  exit 1
+fi
 
 case "$(uname -s)" in
   Darwin) os="darwin" ;;
@@ -46,19 +69,30 @@ trap 'rm -f "$sums"' EXIT
 curl -fsSL --retry 3 -o "$sums" "${base}/checksums.sha256"
 
 # verify_asset <downloaded-file> <asset-name>
-# Asserts the release's checksums.sha256 carries exactly this asset and
-# the downloaded bytes match — the checksum file is fetched from the
-# same pinned tag, so a substituted artifact fails the lane here.
+# Asserts the downloaded bytes match the repository's trusted pin AND
+# the release's checksums.sha256. The pin is checked first — it is the
+# independent anchor; the checksum entry is consistency with upstream's
+# own manifest, so drift between the pinned bytes and a recut release is
+# surfaced rather than silently adopted.
 verify_asset() {
-  local file="$1" name="$2" want actual
+  local file="$1" name="$2" want pin actual
+  pin="$(jq -r --arg n "$name" '.assets[$n] // empty' "$PINS_FILE")"
+  if [ -z "$pin" ]; then
+    echo "ERROR: $PINS_FILE carries no trusted digest for $name — refusing to install unanchored bytes" >&2
+    exit 1
+  fi
   want="$(awk -v n="$name" '$NF == n {print $1}' "$sums")"
   if [ -z "$want" ]; then
     echo "ERROR: checksums.sha256 for v${MSB_VERSION} has no entry for $name" >&2
     exit 1
   fi
   actual="$(shasum -a 256 "$file" | awk '{print $1}')"
+  if [ "$actual" != "$pin" ]; then
+    echo "ERROR: $name digest $actual does not match the repository-pinned trusted digest $pin — refusing a substituted runtime" >&2
+    exit 1
+  fi
   if [ "$actual" != "$want" ]; then
-    echo "ERROR: $name digest $actual does not match the pinned release digest $want" >&2
+    echo "ERROR: $name digest $actual does not match the pinned release checksum $want — the upstream asset drifted from the qualified pin" >&2
     exit 1
   fi
 }
@@ -86,3 +120,9 @@ if ! printf '%s' "$actual" | grep -q "$MSB_VERSION"; then
 fi
 
 "$DEST_BIN/msb" doctor
+
+# Final as-installed assertion: the runtime msb actually resolves —
+# binary AND the firmware doctor reports — must be byte-identical to
+# the repository's trusted pins, so a lane can never qualify on bytes
+# that merely downloaded cleanly once.
+bash "$REPO_ROOT/scripts/verify-msb-runtime-pins.sh" "$DEST_BIN/msb"

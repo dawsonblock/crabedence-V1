@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "runtime": "microsandbox",
+  "version": "0.7.8",
+  "repository": "superradcompany/microsandbox",
+  "release_tag": "v0.7.8",
+  "description": "Independently pinned SHA-256 digests of the exact release assets scripts/install-msb-runtime.sh downloads for the pinned Microsandbox runtime (internal/sandboxexecutor/backend_msb.go PinnedMSBVersion). The upstream checksums.sha256 verifies transit integrity from the release; this file is the trust anchor — a release whose assets AND checksums were substituted together still fails because the downloaded bytes cannot match these repository-pinned digests. Every digest was established by hashing the actual downloaded asset bytes, not copied from the checksum manifest. A pinned version change requires updating this file AND the executor's PinnedMSBVersion in the same change.",
+  "assets": {
+    "msb-darwin-aarch64": "0995a03d0eaf46c7fadb28ea419be800def10f9152a12f0c03216bf4c8a0f06f",
+    "msb-linux-aarch64": "1e272a1bbb25c39f730493b22f28eb6356e25ed8411d7df6d820a3d8bbbc2466",
+    "msb-linux-x86_64": "c33a2e7458040d889c3ce1fabee25e3cb91c2189681c2bd0d42fa82e9972cfe8",
+    "libkrunfw-darwin-aarch64.dylib": "723f7cd73be9bab21c0abf6a9b07b45a07d4cd178f1690250e392d55dfb236b4",
+    "libkrunfw-linux-aarch64.so": "bc854ef198a257204636e9895153931bf1a0a3dcb5069afd83e0ff03f9f60d66",
+    "libkrunfw-linux-x86_64.so": "ce0a915daa6aff403e9a388e161671fbac9b85b0c200a99d7a9fdf0e1c03d668"
+  }
+}

@@ -369,6 +369,14 @@ if [ -f "$REQUIRED_TESTS_SRC" ]; then
   REQUIRED_TESTS_SHA="$(shasum -a 256 "$EVIDENCE_DIR/$REQUIRED_TESTS_REL" | awk '{print $1}')"
 fi
 
+# The trusted runtime pins in force for this qualification ride in the
+# bundle too — a verifier can check which digests the live lane was
+# required to match, not just what the lane claims ran.
+MSB_PINS_SRC="$REPO_ROOT/qualification/msb-runtime-pins.json"
+if [ -f "$MSB_PINS_SRC" ]; then
+  cp "$MSB_PINS_SRC" "$EVIDENCE_DIR/msb-runtime-pins.json"
+fi
+
 # Normalize claimed lane names: accept the short aliases "apple" and
 # "kvm" as well as the canonical inventory lane ids.
 normalize_claimed_lanes() {
@@ -397,8 +405,17 @@ if [ ! -x "$MSB_BIN" ]; then
   MSB_BIN="$(command -v msb 2>/dev/null || true)"
 fi
 MSB_USABLE=false
+MSB_UNUSABLE_REASON="msb missing or doctor failed"
 if [ -n "$MSB_BIN" ] && [ -x "$MSB_BIN" ] && "$MSB_BIN" doctor >/dev/null 2>&1; then
-  MSB_USABLE=true
+  # A healthy msb is necessary but not sufficient: a qualification lane
+  # must run on byte-identical trusted runtime + firmware, so whatever
+  # is installed is verified against qualification/msb-runtime-pins.json
+  # before a live lane may run on it.
+  if pin_err="$(bash "$REPO_ROOT/scripts/verify-msb-runtime-pins.sh" "$MSB_BIN" 2>&1)"; then
+    MSB_USABLE=true
+  else
+    MSB_UNUSABLE_REASON="$(printf '%s\n' "$pin_err" | sed 's/^ERROR: //' | tr '\n' ' ')"
+  fi
 fi
 
 # build_test_suite_json <lane> <cases-file> <raw-file>
@@ -598,7 +615,7 @@ elif [ -n "$REQUIRED_TESTS_SHA" ]; then
       if [ -n "$IMPORT_SRC" ]; then
         register_lane_import "$LANE" "$GATE_ID" "$IMPORT_SRC"
       elif [ "$LANE" = "$HOST_LANE" ]; then
-        register_lane_fail "$GATE_ID" "claimed lane $LANE but the pinned runtime is unusable on this host (msb missing or doctor failed)"
+        register_lane_fail "$GATE_ID" "claimed lane $LANE but the pinned runtime is unusable on this host ($MSB_UNUSABLE_REASON)"
       else
         register_lane_fail "$GATE_ID" "claimed lane $LANE on a host that provides ${HOST_LANE:-no lane}, and no imported evidence under CRABBOX_LANE_EVIDENCE_DIR"
       fi

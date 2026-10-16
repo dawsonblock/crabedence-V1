@@ -45,8 +45,13 @@
 #     required-test inventory: every required case for the lane must
 #     appear exactly once with status "pass"; absent, skipped,
 #     duplicated, failed, or foreign-lane cases are findings; so are
-#     identity drift (commit, toolchain, runner os), aggregate
-#     inconsistency, and results that disagree with the raw stream.
+#     identity drift (commit, toolchain, runner os/arch, lane, package),
+#     aggregate inconsistency, and a results record that is not the exact
+#     canonical re-derivation of the bound raw go test -json stream —
+#     outcomes, terminal-event counts, durations, output digests,
+#     package identity, and run completion are all recomputed from the
+#     stream by the shared evidence parser, never trusted from the
+#     record.
 #   - qualification.claimed_lanes: the virtualization lanes this
 #     release claims support for. Every claimed lane must be backed by
 #     a passing mandatory gate carrying test_suite evidence for that
@@ -54,6 +59,12 @@
 
 # shellcheck disable=SC2034
 QUALIFICATION_SCHEMA_VERSION=2
+
+# The canonical case-evidence parser ships beside this library; the raw
+# stream revalidation resolves it relative to the library's own path so
+# admission, standalone verification, and the producer's self-check share
+# exactly one parser — never a per-consumer approximation of it.
+GATE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Closed enum. Adding a type is a deliberate schema change.
 QUALIFICATION_GATE_TYPES="TEST BUILD STATIC_ANALYSIS INTEGRATION SECURITY FAULT_INJECTION REPRODUCIBILITY PROVENANCE CLEAN_ROOM"
@@ -269,7 +280,10 @@ validate_test_suite_binding() {
   [ "$defects" -gt 0 ] && return 0
 
   # Identity and aggregate consistency between the record, the results,
-  # and the inventory.
+  # and the inventory. The lane's declared platform, the runner's
+  # reported platform, and the toolchain's own os/arch tail are checked
+  # as ONE identity — evidence naming a different CPU architecture or a
+  # package outside the suite is rejected, not merely recorded.
   local commit go te tf
   commit="$(jq -r '.provenance.commit // empty' "$qual")"
   go="$(jq -r '.toolchains.go // empty' "$qual")"
@@ -279,7 +293,14 @@ validate_test_suite_binding() {
     --arg commit "$commit" --arg go "$go" \
     --argjson te "$te" --argjson tf "$tf" \
     --slurpfile inv "$dir/$inv_file" --slurpfile res "$dir/$res_file" '
+    def canon_arch:
+      if . == "x86_64" or . == "amd64" then "amd64"
+      elif . == "aarch64" or . == "arm64" then "arm64"
+      else . end;
     ($inv[0]) as $i | ($res[0]) as $r |
+    (($r.toolchain_go // "") | split(" ") | last) as $ttail |
+    (($r.toolchain_go // "") | split(" ") | .[2] // "") as $rver |
+    (($go // "") | split(" ") | .[2] // "") as $qver |
     (if ($i.schema_version != 1) then "gate \($gid): inventory schema_version \($i.schema_version // "missing") (want 1)" else empty end),
     (if ($i.suite != $suite) then "gate \($gid): inventory suite \($i.suite) != \($suite)" else empty end),
     (if (($i.lanes // {}) | has($lane) | not) then "gate \($gid): inventory has no lane \($lane)" else empty end),
@@ -287,8 +308,27 @@ validate_test_suite_binding() {
     (if ($r.suite != $suite) then "gate \($gid): results suite \($r.suite) != \($suite)" else empty end),
     (if ($r.lane != $lane) then "gate \($gid): results lane \($r.lane) != \($lane)" else empty end),
     (if ($r.source_commit != $commit) then "gate \($gid): results commit \($r.source_commit) does not match the qualified commit \($commit)" else empty end),
-    (if ($r.toolchain_go != $go) then "gate \($gid): results toolchain \($r.toolchain_go) does not match the qualified toolchain \($go)" else empty end),
+    # The lane must run the qualified toolchain VERSION; the os/arch
+    # tail legitimately differs — it is the lane identity itself, checked
+    # below against the lane goos and the runner arch. Comparing the
+    # whole string would reject any lane qualified on another platform.
+    (if (($rver == "") or ($rver | startswith("go") | not) or ($rver != $qver))
+     then "gate \($gid): results toolchain \($r.toolchain_go // "missing") does not run the qualified toolchain version \($go)" else empty end),
     (if (($i.lanes[$lane].goos // "") != ($r.runner.os // "")) then "gate \($gid): results runner os \($r.runner.os) is not the \($lane) lane os \($i.lanes[$lane].goos)" else empty end),
+    (if (($r.runner.arch // "") == "") then "gate \($gid): results runner arch is missing" else empty end),
+    (if ((($i.lanes[$lane].goarch // "") != "") and
+         ((($r.runner.arch // "") | canon_arch) != ($i.lanes[$lane].goarch | canon_arch)))
+     then "gate \($gid): results runner arch \($r.runner.arch // "missing") is not the \($lane) lane arch \($i.lanes[$lane].goarch)" else empty end),
+    (if ($ttail | test("/") | not) then "gate \($gid): results toolchain \($r.toolchain_go // "missing") carries no os/arch identity" else empty end),
+    (if (($ttail | test("/")) and (($ttail | split("/")[0]) != ($i.lanes[$lane].goos // "")))
+     then "gate \($gid): toolchain os \($ttail | split("/")[0]) is not the \($lane) lane os \($i.lanes[$lane].goos)" else empty end),
+    (if (($ttail | test("/")) and (($ttail | split("/")[1] | canon_arch) != (($r.runner.arch // "") | canon_arch)))
+     then "gate \($gid): toolchain arch \($ttail | split("/")[1]) does not match the results runner arch \($r.runner.arch // "missing")" else empty end),
+    (if (($i.package // "") == "") then "gate \($gid): inventory carries no suite package identity"
+     elif (($r.packages | type) != "array" or ($r.packages | length) == 0) then "gate \($gid): results record no package identity"
+     elif (($r.packages | map(type == "string" and (. == $i.package or endswith("/" + $i.package))) | all) | not)
+     then "gate \($gid): results packages \($r.packages) are not the suite package \($i.package)"
+     else empty end),
     (if (($r.tests // []) | map(select(.status == "pass" or .status == "fail")) | length) != $te
      then "gate \($gid): tests_executed=\($te) inconsistent with case results" else empty end),
     (if (($r.tests // []) | map(select(.status == "fail")) | length) != $tf
@@ -299,20 +339,30 @@ validate_test_suite_binding() {
   required_tests_case_findings "$dir/$res_file" "$dir/$inv_file" "$lane" \
     | sed "s/^/gate $gid: /"
 
-  # The normalized results must agree with the raw go test -json stream:
-  # a results file asserting outcomes the raw stream does not support
-  # is fabricated evidence.
-  if ! jq -n -e \
-    --slurpfile res "$dir/$res_file" --slurpfile raw "$dir/$raw_file" '
-    (($raw | map(select(.Test != null and
-        (.Action == "pass" or .Action == "fail" or .Action == "skip")))
-      | group_by(.Test) | map({key: .[0].Test, value: .[-1].Action})
-      | from_entries)
-    ==
-    (($res[0].tests // []) | map({key: .name, value: .status})
-      | from_entries))
-  ' >/dev/null 2>&1; then
-    echo "gate $gid: case results are inconsistent with the raw go test -json stream"
+  # The normalized results must be the canonical re-derivation of the
+  # bound raw stream: the shared evidence parser recomputes every case
+  # outcome, terminal-event count, duration, output digest, the
+  # aggregate counts, the package identities, and the run's own terminal
+  # completeness — and reports every point the record disagrees with the
+  # stream and every way the stream itself is malformed. A digest-bound
+  # results file whose precomputed fields were supplied rather than
+  # derived is fabricated evidence; only re-derivation proves the record
+  # describes the run.
+  local normalizer="$GATE_LIB_DIR/../go-test-case-evidence.py"
+  local expected_pkg stream_findings rc=0
+  expected_pkg="$(jq -r '.package // empty' "$dir/$inv_file")"
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "gate $gid: python3 is required to re-derive case evidence from the raw go test -json stream"
+  elif [ ! -f "$normalizer" ]; then
+    echo "gate $gid: canonical evidence parser not found: $normalizer"
+  else
+    stream_findings="$(python3 "$normalizer" --verify \
+      --stream "$dir/$raw_file" --results "$dir/$res_file" \
+      --expect-package "$expected_pkg" 2>&1)" || rc=$?
+    if [ -z "$stream_findings" ] && [ "$rc" -ne 0 ]; then
+      stream_findings="raw stream re-derivation could not run (exit $rc)"
+    fi
+    printf '%s\n' "$stream_findings" | sed '/^$/d; '"s/^/gate $gid: /"
   fi
   return 0
 }

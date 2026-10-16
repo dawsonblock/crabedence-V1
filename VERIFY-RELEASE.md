@@ -203,7 +203,7 @@ jq -r '.claimed_lanes, .qualified_lanes' evidence/qualification.json
 
 # Every claimed lane must appear in qualified_lanes, backed by a
 # passing mandatory lane gate whose test_suite binds this exact lane,
-# commit, toolchain and runner OS.
+# commit, toolchain version, runner OS and architecture.
 jq -r '.gates[] | select(.test_suite) |
   "\(.gate_id): lane=\(.test_suite.lane) \(.status)"' \
   evidence/qualification.json
@@ -212,6 +212,31 @@ jq -r '.gates[] | select(.test_suite) |
 A claimed lane absent from `qualified_lanes`, a lane gate that skipped
 required cases, or evidence bound to another commit fails admission —
 lane evidence can never substitute for a lane that did not run.
+
+The results record is never trusted for what the raw stream must prove:
+the shared validator re-derives every case outcome, terminal-event
+count, duration, output digest, aggregate count, package identity and
+the run's package-terminal completeness from the bound `go test -json`
+stream itself and rejects every discrepancy — a second terminal event
+for one test, output bytes other than the claimed digest, a package
+that never completed, or a lane ran on a different CPU architecture
+than its inventory `goarch` all fail. You can replay that
+re-derivation directly:
+
+```bash
+python3 scripts/go-test-case-evidence.py --verify \
+  --stream evidence/gate-results/<gate>.test.json \
+  --results evidence/gate-results/<gate>.cases.json \
+  --expect-package internal/sandboxexecutor
+```
+
+The runtime the lane qualified on is likewise anchored:
+`qualification/msb-runtime-pins.json` pins the SHA-256 of every
+Microsandbox `v0.7.8` asset (executable and `libkrunfw` firmware per
+platform), and a live lane may only run on a host whose installed
+executable and doctor-resolved firmware are byte-identical to those
+pins — `scripts/verify-msb-runtime-pins.sh` checks an install against
+them on demand.
 
 ## Step 6: Verify the source manifest (both archives)
 
