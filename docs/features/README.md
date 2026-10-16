@@ -58,6 +58,10 @@ live in the [Command Reference](../commands/README.md).
 - [Sandbox executor](sandbox-executor.md): the isolated execution sidecar for
   untrusted code — effective policy, runtime and execution identity, signed
   evidence, deployment posture, and crash recovery.
+- [Unified history and adaptive exploration](unified-history.md): the
+  hash-chained memory of the system's development record, and the
+  envelope-bounded explorer that learns execution parameters from it
+  without ever holding execution authority.
 - [Sync](sync.md): Git file-list manifests, rsync, fingerprints, excludes, guardrails, and sanity checks.
 - [Jobs](jobs.md): named repo-local warmup, hydrate, run, and cleanup workflows.
 - [Hermetic agent evidence](hermetic-agent-evidence.md): repo-local pattern for
