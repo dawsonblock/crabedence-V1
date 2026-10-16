@@ -357,9 +357,10 @@ run_gate go-race-sandboxexecutor TEST go test -v -race -count=1 -timeout=1200s \
 #   (b) this host provides it with a usable pinned runtime.
 # A claimed lane that cannot produce passing per-test evidence records
 # FAIL — a claim never skips. Imported lane evidence (a sibling run's
-# raw stream + case results under CRABBOX_LANE_EVIDENCE_DIR/<lane>/)
-# is accepted only when it passes the same inventory check and binds to
-# this exact source commit — borrowed evidence from another build fails.
+# raw stream + case results under CRABBOX_LANE_EVIDENCE_DIR, at the
+# root or in a per-artifact subdirectory) is accepted only when it
+# passes the same inventory check and binds to this exact source
+# commit — borrowed evidence from another build fails.
 
 REQUIRED_TESTS_REL="required-tests.json"
 REQUIRED_TESTS_SRC="$REPO_ROOT/qualification/$REQUIRED_TESTS_REL"
@@ -464,14 +465,19 @@ register_lane_fail() {
 # only when the case results satisfy the inventory AND are bound to
 # this exact source commit. Evidence for a different build is refused.
 # lane_import_source <lane>
-# Finds imported evidence for a lane under CRABBOX_LANE_EVIDENCE_DIR.
-# Each import directory holds cases.json + test.json; the lane is read
-# from the cases record itself (a directory named for a lane proves
-# nothing — the record's own lane field is authoritative).
+# Finds imported evidence for a lane under CRABBOX_LANE_EVIDENCE_DIR —
+# flat at the root or one directory level down, matching the layouts
+# actions/download-artifact produces for one versus several matched
+# artifacts. Each import directory holds cases.json + test.json; the
+# lane is read from the cases record itself (a directory named for a
+# lane proves nothing — the record's own lane field is authoritative).
 lane_import_source() {
   local lane="$1" d
   [ -d "$LANE_IMPORT_DIR" ] || return 1
-  for d in "$LANE_IMPORT_DIR"/*/; do
+  # download-artifact extracts a single matching artifact flat into the
+  # path and several artifacts into per-name subdirectories — accept
+  # both layouts. Explicit per-lane directories win over a flat root.
+  for d in "$LANE_IMPORT_DIR"/*/ "$LANE_IMPORT_DIR"; do
     [ -f "$d/cases.json" ] && [ -f "$d/test.json" ] || continue
     if [ "$(jq -r '.lane // empty' "$d/cases.json" 2>/dev/null)" = "$lane" ]; then
       echo "$d"

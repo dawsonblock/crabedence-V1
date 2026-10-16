@@ -111,6 +111,18 @@ test("lane gates consume the authoritative required-test inventory", () => {
   assert.match(source, /RELEASE_VERSION.*does not equal VERSION/);
 });
 
+test("imported lane evidence is found flat or in a per-artifact directory", () => {
+  const source = fs.readFileSync(GENERATOR, "utf8");
+  // actions/download-artifact extracts a single matching artifact flat
+  // into the download path and several artifacts into per-name
+  // subdirectories — lane_import_source must accept both layouts or a
+  // claimed lane's real evidence is never imported.
+  assert.match(
+    source,
+    /for d in "\$LANE_IMPORT_DIR"\/\*\/ "\$LANE_IMPORT_DIR"/
+  );
+});
+
 test("a live lane may only run on the repository-pinned runtime", () => {
   const source = fs.readFileSync(GENERATOR, "utf8");
   // Whatever msb the host happens to carry is verified against the
