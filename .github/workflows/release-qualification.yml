@@ -447,12 +447,16 @@ jobs:
 
       # GitHub-hosted Linux runners expose /dev/kvm but the job user is
       # not in the kvm group; the lane's msb doctor fails closed without
-      # it. An ACL grants access without group changes taking effect.
+      # it. The node is root:kvm 0660 and udev can re-assert those bits
+      # on device events later in the job, so a one-shot ACL is not
+      # enough — install a persistent mode rule and apply it now.
       - name: Grant /dev/kvm access
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          sudo setfacl -m "u:$(id -un):rw" /dev/kvm
+          echo 'KERNEL=="kvm", MODE="0666"' | sudo tee /etc/udev/rules.d/99-kvm-ci.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm --action=change || sudo chmod 0666 /dev/kvm
           test -r /dev/kvm && test -w /dev/kvm
 
       - name: Install the pinned Microsandbox runtime
@@ -461,11 +465,22 @@ jobs:
 
       # The suite binds a contract to a concrete image digest; the lane
       # image must be cached before the run or the claimed lane fails.
+      # msb indexes images by the exact pulled reference, so a tag pull
+      # alone leaves no digest-qualified entry and inspecting
+      # python:3.12@sha256:<d> reports "image not found" — pull the
+      # resolved digest too.
       - name: Cache the qualification image
         shell: bash
         run: |
           MSB="$HOME/.microsandbox/bin/msb"
           "$MSB" pull python:3.12 || "$MSB" image pull python:3.12
+          digest="$("$MSB" image list --format json \
+            | jq -r '.[] | select(.reference == "python:3.12") | .digest')"
+          if [ -z "$digest" ]; then
+            echo "python:3.12 is not cached after pull" >&2
+            exit 1
+          fi
+          "$MSB" pull "python:3.12@$digest" || "$MSB" image pull "python:3.12@$digest"
           "$MSB" image list
 
       - name: Run the live lane suite
