@@ -172,6 +172,130 @@ qualification_gate_structure_findings() {
   ' "$1" 2>/dev/null
 }
 
+# qualification_evidence_path_findings <evidence_root> <relpath>
+#
+# The confinement rule every digest-bound evidence path must satisfy —
+# a lexical check is not enough because a syntactically clean relative
+# path can still escape through a symlinked directory component or a
+# symlinked file. Prints one "<code>\t<detail>" finding per defect and
+# returns 1; empty output and exit 0 mean the path is admissible:
+#
+#   escape        absolute path, dot segment, or parent traversal
+#   canonical     resolved directory leaves the evidence root
+#   missing       the file does not exist
+#   symlink_dir   an intermediate component is a symlink
+#   symlink_file  the evidence file itself is a symlink
+#   not_regular   not a regular file
+#   unreadable    cannot be opened for reading
+qualification_evidence_path_findings() {
+  local root="$1" rel="$2"
+  local defect=0
+  case "$rel" in
+    ""|/*|*..*)
+      printf 'escape\t%s\n' "$rel"
+      return 1 ;;
+  esac
+  local parts=() i
+  IFS='/' read -r -a parts <<< "$rel"
+  for i in "${!parts[@]}"; do
+    case "${parts[i]}" in
+      ""|.) printf 'escape\t%s\n' "$rel"; return 1 ;;
+    esac
+  done
+  local cur="$root"
+  local last=$(( ${#parts[@]} - 1 ))
+  for ((i = 0; i < last; i++)); do
+    cur="$cur/${parts[i]}"
+    if [ -L "$cur" ]; then
+      printf 'symlink_dir\t%s\n' "$cur"
+      defect=1
+    elif [ ! -d "$cur" ]; then
+      printf 'missing\t%s\n' "$rel"
+      return 1
+    fi
+  done
+  local file="$cur/${parts[$last]}"
+  if [ -L "$file" ]; then
+    printf 'symlink_file\t%s\n' "$rel"
+    return 1
+  fi
+  if [ ! -e "$file" ]; then
+    printf 'missing\t%s\n' "$rel"
+    return 1
+  fi
+  if [ ! -f "$file" ]; then
+    printf 'not_regular\t%s\n' "$rel"
+    return 1
+  fi
+  # Canonical containment: even with no symlinked component, the root
+  # itself must be the physical directory the relative path resolved
+  # against — compare the file's physical parent to the physical root.
+  local canon_root dir_real
+  canon_root="$(cd "$root" 2>/dev/null && pwd -P)" || {
+    printf 'escape\t%s\n' "$rel"
+    return 1
+  }
+  dir_real="$(cd "$(dirname "$file")" 2>/dev/null && pwd -P)" || {
+    printf 'canonical\t%s\n' "$rel"
+    return 1
+  }
+  case "$dir_real" in
+    "$canon_root"|"$canon_root"/*) ;;
+    *) printf 'canonical\t%s\n' "$rel"; return 1 ;;
+  esac
+  if [ ! -r "$file" ]; then
+    printf 'unreadable\t%s\n' "$rel"
+    return 1
+  fi
+  return "$defect"
+}
+
+# qualification_evidence_snapshot <evidence_root> <relpath> <dest>
+#
+# Admits <relpath> through qualification_evidence_path_findings, then
+# copies its bytes to <dest> in a single read. Every later consumer —
+# digest, inventory match, stream re-derivation — reads the snapshot,
+# never the live path, so a path swapped after validation cannot smuggle
+# different content past the digest binding: the snapshot digests to the
+# recorded value only if it holds the attested bytes, whatever the live
+# path now names. As best-effort detection the file's inode is compared
+# across the copy — a rename/swap racing validation is reported, never
+# silently accepted. Prints the snapshot path; returns 1 on any defect.
+qualification_evidence_snapshot() {
+  local root="$1" rel="$2" dest="$3"
+  qualification_evidence_path_findings "$root" "$rel" >/dev/null 2>&1 || return 1
+  local file="$root/$rel"
+  local ino_before ino_after
+  ino_before="$(ls -id "$file" 2>/dev/null | awk '{print $1}')"
+  if ! cat "$file" > "$dest" 2>/dev/null; then return 1; fi
+  ino_after="$(ls -id "$file" 2>/dev/null | awk '{print $1}')"
+  if [ -n "$ino_before" ] && [ -n "$ino_after" ] && [ "$ino_before" != "$ino_after" ]; then
+    printf 'replaced\t%s\n' "$rel" >&2
+    return 1
+  fi
+  printf '%s\n' "$dest"
+}
+
+# qualification_evidence_finding <gate-id> <rel> <code>
+#
+# Formats a path-confinement finding for a test_suite bound path. The
+# messages are the contract the adversarial tests pin.
+qualification_evidence_finding() {
+  local gid="$1" rel="$2" code="$3"
+  case "$code" in
+    escape|canonical|symlink_dir)
+      echo "gate $gid: test_suite evidence path escapes the bundle: $rel" ;;
+    symlink_file)
+      echo "gate $gid: test_suite evidence file is a symlink: $rel" ;;
+    missing)
+      echo "gate $gid: test_suite evidence file missing: $rel" ;;
+    not_regular)
+      echo "gate $gid: test_suite evidence is not a regular file: $rel" ;;
+    *)
+      echo "gate $gid: test_suite evidence path $rel is inadmissible ($code)" ;;
+  esac
+}
+
 # required_tests_case_findings <cases.json> <inventory.json> <lane>
 #
 # Prints one finding per violation of the required-test inventory for
@@ -244,55 +368,79 @@ validate_test_suite_binding() {
          .raw.file, .raw.sha256] | @tsv' "$qual")"
 
   # Bundle confinement and existence: bound paths must stay inside the
-  # evidence tree and exist.
-  local defects=0 f
+  # evidence tree, follow no symlink, and name a regular file. Each
+  # admitted file is then read ONCE into a private snapshot so the
+  # digest check and every downstream consumer act on the same bytes —
+  # a path replaced between validation and use cannot smuggle content
+  # past the digest binding.
+  local defects=0 f finding
+  local snapdir
+  snapdir="$(mktemp -d "${TMPDIR:-/tmp}/cbx-suite-evidence.XXXXXX")" || {
+    echo "gate $gid: cannot create a scratch dir for evidence snapshots"
+    return 0
+  }
+  local inv_snap="$snapdir/inventory.json" res_snap="$snapdir/results.json" raw_snap="$snapdir/raw.json"
   for f in "$inv_file" "$res_file" "$raw_file"; do
-    case "$f" in
-      /*|*..*)
-        echo "gate $gid: test_suite evidence path escapes the bundle: $f"
-        defects=$((defects + 1)) ;;
-      *)
-        if [ ! -f "$dir/$f" ]; then
-          echo "gate $gid: test_suite evidence file missing: $f"
-          defects=$((defects + 1))
-        fi ;;
-    esac
+    while IFS= read -r finding; do
+      [ -z "$finding" ] && continue
+      qualification_evidence_finding "$gid" "$f" "${finding%%$'\t'*}"
+      defects=$((defects + 1))
+    done < <(qualification_evidence_path_findings "$dir" "$f")
   done
-  [ "$defects" -gt 0 ] && return 0
+  if [ "$defects" -gt 0 ]; then rm -rf "$snapdir"; return 0; fi
+  if ! qualification_evidence_snapshot "$dir" "$inv_file" "$inv_snap" >/dev/null; then
+    echo "gate $gid: test_suite inventory $inv_file could not be pinned open"
+    defects=$((defects + 1))
+  fi
+  if ! qualification_evidence_snapshot "$dir" "$res_file" "$res_snap" >/dev/null; then
+    echo "gate $gid: test_suite results $res_file could not be pinned open"
+    defects=$((defects + 1))
+  fi
+  if ! qualification_evidence_snapshot "$dir" "$raw_file" "$raw_snap" >/dev/null; then
+    echo "gate $gid: test_suite raw stream $raw_file could not be pinned open"
+    defects=$((defects + 1))
+  fi
+  if [ "$defects" -gt 0 ]; then rm -rf "$snapdir"; return 0; fi
 
   # Digest binding: every bound file must hash to the recorded digest.
   local actual
-  actual="$(shasum -a 256 "$dir/$inv_file" | awk '{print $1}')"
+  actual="$(shasum -a 256 "$inv_snap" | awk '{print $1}')"
   if [ "$actual" != "$inv_sha" ]; then
     echo "gate $gid: test_suite inventory digest $actual does not match the recorded $inv_sha"
     defects=$((defects + 1))
   fi
-  actual="$(shasum -a 256 "$dir/$res_file" | awk '{print $1}')"
+  actual="$(shasum -a 256 "$res_snap" | awk '{print $1}')"
   if [ "$actual" != "$res_sha" ]; then
     echo "gate $gid: test_suite results digest $actual does not match the recorded $res_sha"
     defects=$((defects + 1))
   fi
-  actual="$(shasum -a 256 "$dir/$raw_file" | awk '{print $1}')"
+  actual="$(shasum -a 256 "$raw_snap" | awk '{print $1}')"
   if [ "$actual" != "$raw_sha" ]; then
     echo "gate $gid: test_suite raw digest $actual does not match the recorded $raw_sha"
     defects=$((defects + 1))
   fi
-  [ "$defects" -gt 0 ] && return 0
+  if [ "$defects" -gt 0 ]; then rm -rf "$snapdir"; return 0; fi
 
   # Identity and aggregate consistency between the record, the results,
   # and the inventory. The lane's declared platform, the runner's
   # reported platform, and the toolchain's own os/arch tail are checked
   # as ONE identity — evidence naming a different CPU architecture or a
   # package outside the suite is rejected, not merely recorded.
-  local commit go te tf
+  local commit go te tf qci
   commit="$(jq -r '.provenance.commit // empty' "$qual")"
   go="$(jq -r '.toolchains.go // empty' "$qual")"
   te="$(jq -r ".gates[$idx].tests_executed // 0" "$qual")"
   tf="$(jq -r ".gates[$idx].tests_failed // 0" "$qual")"
+  # CI-runner provenance: when the qualification record declares the
+  # authenticated run it was produced under, the lane evidence must bind
+  # that same run — a well-formed synthetic stream produced anywhere
+  # else cannot impersonate a trusted live qualification run.
+  qci="$(jq -c '.provenance.ci // empty' "$qual")"
   jq -n --arg gid "$gid" --arg suite "$suite" --arg lane "$lane" \
     --arg commit "$commit" --arg go "$go" \
     --argjson te "$te" --argjson tf "$tf" \
-    --slurpfile inv "$dir/$inv_file" --slurpfile res "$dir/$res_file" '
+    --argjson qci "${qci:-null}" \
+    --slurpfile inv "$inv_snap" --slurpfile res "$res_snap" '
     def canon_arch:
       if . == "x86_64" or . == "amd64" then "amd64"
       elif . == "aarch64" or . == "arm64" then "arm64"
@@ -332,11 +480,42 @@ validate_test_suite_binding() {
     (if (($r.tests // []) | map(select(.status == "pass" or .status == "fail")) | length) != $te
      then "gate \($gid): tests_executed=\($te) inconsistent with case results" else empty end),
     (if (($r.tests // []) | map(select(.status == "fail")) | length) != $tf
-     then "gate \($gid): tests_failed=\($tf) inconsistent with case results" else empty end)
+     then "gate \($gid): tests_failed=\($tf) inconsistent with case results" else empty end),
+    # ─── CI-runner provenance binding ─────────────────────────────────
+    # A record that claims CI qualification binds the lane evidence to
+    # the authenticated workflow run that produced it. A results file
+    # asserting CI provenance the record does not carry — or carrying a
+    # different run, repository, ref, or commit — is injected evidence.
+    (if $qci == null then
+       (if ($r.ci // null) != null
+        then "gate \($gid): results claim CI provenance but the qualification record carries none — unauthenticated evidence" else empty end)
+     else
+       (if (($r.ci // null) | type) != "object"
+        then "gate \($gid): results carry no CI provenance — a CI-qualified lane must bind the authenticated run that produced it"
+        else
+          (if ($r.ci.run_id // "") != ($qci.run_id // "")
+           then "gate \($gid): results ci.run_id \($r.ci.run_id // "missing") is not the qualification run \($qci.run_id // "missing")" else empty end),
+          (if ($r.ci.repository // "") != ($qci.repository // "")
+           then "gate \($gid): results ci.repository \($r.ci.repository // "missing") is not the qualification repository \($qci.repository // "missing")" else empty end),
+          (if (($qci.sha // "") != "") and (($r.ci.sha // "") != $commit)
+           then "gate \($gid): results ci.sha \($r.ci.sha // "missing") does not match the qualified commit \($commit)" else empty end),
+          (if (($r.ci.workflow_ref // "") != "") and (($qci.workflow_ref // "") != "") and
+              (($r.ci.workflow_ref) != ($qci.workflow_ref))
+           then "gate \($gid): results workflow_ref \($r.ci.workflow_ref) is not the qualification workflow \($qci.workflow_ref)" else empty end),
+          (if (($r.ci.runner_os // "") != "") and
+              (({"macOS":"darwin","Linux":"linux","Windows":"windows"}[$r.ci.runner_os] // $r.ci.runner_os)
+               != ($i.lanes[$lane].goos // ""))
+           then "gate \($gid): CI runner os \($r.ci.runner_os) is not the \($lane) lane os \($i.lanes[$lane].goos)" else empty end),
+          (if (($i.lanes[$lane].goarch // "") != "") and (($r.ci.runner_arch // "") != "") and
+              (({"X64":"amd64","ARM64":"arm64","ARM":"arm"}[$r.ci.runner_arch] // $r.ci.runner_arch | canon_arch)
+               != ($i.lanes[$lane].goarch | canon_arch))
+           then "gate \($gid): CI runner arch \($r.ci.runner_arch) is not the \($lane) lane arch \($i.lanes[$lane].goarch)" else empty end)
+       end)
+     end)
   '
 
   # Per-case coverage against the inventory.
-  required_tests_case_findings "$dir/$res_file" "$dir/$inv_file" "$lane" \
+  required_tests_case_findings "$res_snap" "$inv_snap" "$lane" \
     | sed "s/^/gate $gid: /"
 
   # The normalized results must be the canonical re-derivation of the
@@ -350,20 +529,21 @@ validate_test_suite_binding() {
   # describes the run.
   local normalizer="$GATE_LIB_DIR/../go-test-case-evidence.py"
   local expected_pkg stream_findings rc=0
-  expected_pkg="$(jq -r '.package // empty' "$dir/$inv_file")"
+  expected_pkg="$(jq -r '.package // empty' "$inv_snap")"
   if ! command -v python3 >/dev/null 2>&1; then
     echo "gate $gid: python3 is required to re-derive case evidence from the raw go test -json stream"
   elif [ ! -f "$normalizer" ]; then
     echo "gate $gid: canonical evidence parser not found: $normalizer"
   else
     stream_findings="$(python3 "$normalizer" --verify \
-      --stream "$dir/$raw_file" --results "$dir/$res_file" \
+      --stream "$raw_snap" --results "$res_snap" \
       --expect-package "$expected_pkg" 2>&1)" || rc=$?
     if [ -z "$stream_findings" ] && [ "$rc" -ne 0 ]; then
       stream_findings="raw stream re-derivation could not run (exit $rc)"
     fi
     printf '%s\n' "$stream_findings" | sed '/^$/d; '"s/^/gate $gid: /"
   fi
+  rm -rf "$snapdir"
   return 0
 }
 

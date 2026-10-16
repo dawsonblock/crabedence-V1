@@ -34,7 +34,24 @@ MSB_VERSION="${MSB_VERSION:-0.7.8}"
 DEST_BIN="$HOME/.microsandbox/bin"
 DEST_LIB="$HOME/.microsandbox/lib"
 REPO="superradcompany/microsandbox"
-PINS_FILE="${MSB_PINS_FILE:-$REPO_ROOT/qualification/msb-runtime-pins.json}"
+
+# A qualifying install anchors to the repository's trusted manifest and
+# nothing else — MSB_PINS_FILE is a substitution vector for forged
+# digests. It survives only beside MSB_PINS_NONQUALIFYING=1, an explicit
+# declaration that this install is development-only and can never stand
+# behind release qualification.
+TRUSTED_PINS="$REPO_ROOT/qualification/msb-runtime-pins.json"
+case "${MSB_PINS_NONQUALIFYING:-}" in
+  1|true|yes)
+    PINS_FILE="${MSB_PINS_FILE:-$TRUSTED_PINS}"
+    echo "WARNING: NON-QUALIFYING install — pins read from $PINS_FILE" >&2 ;;
+  *)
+    if [ -n "${MSB_PINS_FILE:-}" ] && [ "$MSB_PINS_FILE" != "$TRUSTED_PINS" ]; then
+      echo "ERROR: MSB_PINS_FILE=$MSB_PINS_FILE attempts to substitute the trusted pin manifest — a qualifying install always uses $TRUSTED_PINS (set MSB_PINS_NONQUALIFYING=1 for an explicitly non-qualifying install)" >&2
+      exit 1
+    fi
+    PINS_FILE="$TRUSTED_PINS" ;;
+esac
 
 if ! command -v jq >/dev/null 2>&1; then
   echo "ERROR: jq is required to verify the trusted runtime pins" >&2

@@ -109,11 +109,24 @@ function gateLog(root, id, content = "gate ran\n") {
 // inventory, and a lane gate whose test_suite binds digest-pinned
 // results + raw stream. `cases` is the normalized case list; `mutate`
 // can edit the record before digests and summaries are (re)derived.
-function laneBundle(t, { cases, mutate = () => {}, claimLane = true, rebind = true }) {
+// `pins` controls the bound runtime-pin manifest: "trusted" copies the
+// repository's real qualification/msb-runtime-pins.json (what the
+// evidence generator ships), "forged" ships an attacker manifest, and
+// false omits the file entirely.
+const PINS_TRUSTED = path.join(scripts, "..", "qualification", "msb-runtime-pins.json");
+
+function laneBundle(t, { cases, mutate = () => {}, claimLane = true, rebind = true, pins = "trusted" }) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cbx-lane-")));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
 
   fs.writeFileSync(path.join(root, "required-tests.json"), JSON.stringify(INVENTORY, null, 2));
+  if (pins === "trusted") {
+    fs.copyFileSync(PINS_TRUSTED, path.join(root, "msb-runtime-pins.json"));
+  } else if (pins === "forged") {
+    const forged = JSON.parse(fs.readFileSync(PINS_TRUSTED, "utf8"));
+    forged.comment = "attacker-controlled manifest";
+    fs.writeFileSync(path.join(root, "msb-runtime-pins.json"), JSON.stringify(forged, null, 2));
+  }
   fs.mkdirSync(path.join(root, "gate-results"), { recursive: true });
   const results = resultsRecord(cases);
   fs.writeFileSync(path.join(root, `gate-results/${GATE_ID}.cases.json`), JSON.stringify(results, null, 2));
@@ -593,6 +606,103 @@ test("a malformed event line in the raw stream is rejected", (t) => {
   assert.match(findings, /not a go test -json event line/);
 });
 
+test("a terminal outcome with no preceding run event is rejected", (t) => {
+  const root = laneBundle(t, {
+    cases: ALL_PASS(),
+    mutate: (q, root) => {
+      // The record claims B passed and the stream shows a pass — but no
+      // run event ever started it. Outcomes a run never produced are
+      // fabrication, not evidence.
+      rewrite(root, `gate-results/${GATE_ID}.test.json`, (raw) =>
+        raw
+          .split("\n")
+          .filter((l) => !(l.includes('"Action":"run"') && l.includes('"TestMSBLiveB"')))
+          .join("\n"),
+      );
+    },
+  });
+  const { status, findings } = validate(root);
+  assert.notEqual(status, 0);
+  assert.match(findings, /TestMSBLiveB records (pass )?without a preceding run event/);
+});
+
+test("a duplicate run event in the raw stream is rejected", (t) => {
+  const root = laneBundle(t, {
+    cases: ALL_PASS(),
+    mutate: (q, root) => {
+      rewrite(root, `gate-results/${GATE_ID}.test.json`, (raw) => {
+        const lines = raw.trimEnd().split("\n");
+        const dup = JSON.stringify({ Time: "2026-01-01T00:00:01Z", Action: "run", Package: PKG, Test: "TestMSBLiveB" });
+        // Insert while B is still running — a second run for a test
+        // already in flight, before its terminal outcome.
+        const bRun = lines.findIndex((l) => l.includes('"Action":"run"') && l.includes('"TestMSBLiveB"'));
+        lines.splice(bRun + 1, 0, dup);
+        return lines.join("\n") + "\n";
+      });
+    },
+  });
+  const { status, findings } = validate(root);
+  assert.notEqual(status, 0);
+  assert.match(findings, /TestMSBLiveB records a duplicate run event/);
+});
+
+test("an unknown go test action in the raw stream is rejected", (t) => {
+  const root = laneBundle(t, {
+    cases: ALL_PASS(),
+    mutate: (q, root) => {
+      rewrite(root, `gate-results/${GATE_ID}.test.json`, (raw) => {
+        const lines = raw.trimEnd().split("\n");
+        lines.splice(lines.length - 2, 0, JSON.stringify({ Action: "teleport", Package: PKG, Test: "TestMSBLiveB" }));
+        return lines.join("\n") + "\n";
+      });
+    },
+  });
+  const { status, findings } = validate(root);
+  assert.notEqual(status, 0);
+  assert.match(findings, /unknown go test action 'teleport'/);
+});
+
+test("a bound evidence file that is a symlink out of the bundle is rejected", (t) => {
+  const outside = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cbx-outside-")));
+  t.after(() => fs.rmSync(outside, { recursive: true, force: true }));
+  const root = laneBundle(t, {
+    cases: ALL_PASS(),
+    mutate: (q, root) => {
+      // A syntactically valid relative path whose leaf is a symlink to
+      // content outside the qualification directory. The digest even
+      // matches — readFileSync follows the link — so only the
+      // confinement rule, not the digest binding, can catch this.
+      const payload = path.join(outside, "smuggled.cases.json");
+      fs.copyFileSync(path.join(root, `gate-results/${GATE_ID}.cases.json`), payload);
+      fs.symlinkSync(payload, path.join(root, "gate-results/evil.cases.json"));
+      q.gates[0].test_suite.results.file = "gate-results/evil.cases.json";
+    },
+  });
+  const { status, findings } = validate(root);
+  assert.notEqual(status, 0);
+  assert.match(findings, /test_suite evidence file is a symlink/);
+});
+
+test("a bound evidence path through a symlinked directory is rejected", (t) => {
+  const outside = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cbx-outside-dir-")));
+  t.after(() => fs.rmSync(outside, { recursive: true, force: true }));
+  const root = laneBundle(t, {
+    cases: ALL_PASS(),
+    mutate: (q, root) => {
+      // gate-results/linked is a symlinked DIRECTORY component pointing
+      // outside the bundle; the file beneath it reads valid relative
+      // syntax but resolves outside the evidence root.
+      fs.mkdirSync(path.join(outside, "linked"), { recursive: true });
+      fs.copyFileSync(path.join(root, `gate-results/${GATE_ID}.cases.json`), path.join(outside, "linked", "cases.json"));
+      fs.symlinkSync(path.join(outside, "linked"), path.join(root, "gate-results/linked"));
+      q.gates[0].test_suite.results.file = "gate-results/linked/cases.json";
+    },
+  });
+  const { status, findings } = validate(root);
+  assert.notEqual(status, 0);
+  assert.match(findings, /test_suite evidence path escapes the bundle/);
+});
+
 test("results whose packages identity is foreign are rejected", (t) => {
   const root = laneBundle(t, {
     cases: ALL_PASS(),
@@ -694,6 +804,107 @@ test("a malformed claimed_lanes declaration fails structurally", (t) => {
   const { status, findings } = validate(root);
   assert.notEqual(status, 0);
   assert.match(findings, /claimed_lanes is not an array/);
+});
+
+// ─── Trusted runtime-pin binding ──────────────────────────────────────
+// The lane evidence may be perfectly formed; admission still requires
+// the bundle to carry the repository-trusted pin manifest so the
+// qualified runtime identity is anchored to this checkout — a lane
+// qualified against attacker-chosen pins proves nothing.
+
+test("a claimed lane whose bundle omits the trusted pins manifest is rejected", (t) => {
+  const root = laneBundle(t, { cases: ALL_PASS(), pins: false });
+  assert.equal(validate(root).status, 0, validate(root).findings);
+  const { status, output } = admit(root);
+  assert.notEqual(status, 0);
+  assert.match(output, /no bound msb-runtime-pins\.json/);
+});
+
+test("a bundle carrying a substituted pins manifest is rejected", (t) => {
+  const root = laneBundle(t, { cases: ALL_PASS(), pins: "forged" });
+  assert.equal(validate(root).status, 0, validate(root).findings);
+  const { status, output } = admit(root);
+  assert.notEqual(status, 0);
+  assert.match(output, /does not match the repository's trusted pins/);
+});
+
+// ─── CI-runner provenance ─────────────────────────────────────────────
+// A well-formed synthetic stream is never enough: when the qualification
+// record names the authenticated workflow run that produced it, the lane
+// evidence must bind that same run — and evidence asserting CI
+// provenance a non-CI record never claimed is injected, not imported.
+
+const CI = {
+  server_url: "https://github.com",
+  repository: "example/module",
+  run_id: "424242",
+  run_attempt: "1",
+  job: "qualify",
+  workflow: "release-qualification",
+  workflow_ref: "example/module/.github/workflows/release-qualification.yml@refs/heads/main",
+  sha: COMMIT,
+  event_name: "push",
+};
+
+test("lane evidence asserting CI provenance the record lacks is rejected", (t) => {
+  const root = laneBundle(t, {
+    cases: ALL_PASS(),
+    mutate: (q, root, results) => {
+      results.ci = CI;
+      rewrite(root, `gate-results/${GATE_ID}.cases.json`, () => JSON.stringify(results, null, 2));
+    },
+  });
+  const { status, findings } = validate(root);
+  assert.notEqual(status, 0);
+  assert.match(findings, /results claim CI provenance but the qualification record carries none/);
+});
+
+test("lane evidence from a different CI run than the record's is rejected", (t) => {
+  const root = laneBundle(t, {
+    cases: ALL_PASS(),
+    mutate: (q, root, results) => {
+      q.provenance.ci = CI;
+      results.ci = { ...CI, run_id: "999999" };
+      rewrite(root, `gate-results/${GATE_ID}.cases.json`, () => JSON.stringify(results, null, 2));
+    },
+  });
+  const { status, findings } = validate(root);
+  assert.notEqual(status, 0);
+  assert.match(findings, /ci\.run_id 999999 is not the qualification run 424242/);
+});
+
+test("lane evidence bound to the record's CI run is accepted", (t) => {
+  const root = laneBundle(t, {
+    cases: ALL_PASS(),
+    mutate: (q, root, results) => {
+      q.provenance.ci = CI;
+      results.ci = CI;
+      rewrite(root, `gate-results/${GATE_ID}.cases.json`, () => JSON.stringify(results, null, 2));
+    },
+  });
+  const { status, findings } = validate(root);
+  assert.equal(status, 0, findings);
+});
+
+// ─── Enabled-backend qualification ────────────────────────────────────
+// A release manifest may only advertise lanes the record qualified — an
+// enabled backend that skipped live qualification cannot ship.
+
+test("a manifest advertising an unqualified lane is rejected", (t) => {
+  const root = laneBundle(t, {
+    cases: ALL_PASS(),
+    mutate: (q, root) => {
+      // The record qualified no lanes (field absent) but the manifest
+      // claims the lane is supported — an enabled, unqualified backend.
+      fs.writeFileSync(
+        path.join(root, "release-manifest.json"),
+        JSON.stringify({ release_version: "0.54.0-rc.7.3", supported_lanes: [LANE] }, null, 2),
+      );
+    },
+  });
+  const { status, output } = admit(root);
+  assert.notEqual(status, 0);
+  assert.match(output, /claims supported lane apple-hypervisor-framework with no qualified lane evidence/);
 });
 
 // ─── The normalizer ───────────────────────────────────────────────────

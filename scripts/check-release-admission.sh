@@ -37,6 +37,19 @@ if [ "$GATE_COUNT" -eq 0 ]; then
   exit 1
 fi
 
+# Gate evidence is only admissible bundle-confined content: relative
+# paths, no parent traversal, no symlinked component or file, regular
+# files only. Each admitted file is pinned open once into a scratch
+# snapshot so the digest check reads the bytes that were validated.
+EVIDENCE_SNAP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/cbx-admission-evidence.XXXXXX")"
+trap 'rm -rf "$EVIDENCE_SNAP_DIR"' EXIT
+EVIDENCE_SNAP_N=0
+evidence_snapshot() {
+  EVIDENCE_SNAP_N=$((EVIDENCE_SNAP_N + 1))
+  qualification_evidence_snapshot "$EVIDENCE_DIR" "$1" \
+    "$EVIDENCE_SNAP_DIR/$EVIDENCE_SNAP_N" 2>/dev/null
+}
+
 # ─── Gate semantics: the shared validator ────────────────────────────────
 # mandatory && status != PASS, unknown gate_type, duplicate gate_id,
 # test-bearing gates without honest counts, non-test gates claiming test
@@ -74,16 +87,32 @@ for i in $(seq 0 $((GATE_COUNT - 1))); do
   fi
 
   # A gate claiming PASS without intact proof is not admissible: the
-  # evidence file must exist and match the digest the record binds.
+  # evidence file must exist, stay confined to the bundle without
+  # following a symlink, and match the digest the record binds.
   if [ -n "$evidence_file" ]; then
-    if [ ! -f "$EVIDENCE_DIR/$evidence_file" ]; then
-      echo "  INCONSISTENCY: $gate_id references missing evidence: $evidence_file" >&2
-      SEMANTIC_FAILURES=$((SEMANTIC_FAILURES + 1))
-    elif [ -n "$evidence_sha" ]; then
-      actual_sha="$(shasum -a 256 "$EVIDENCE_DIR/$evidence_file" | awk '{print $1}')"
-      if [ "$actual_sha" != "$evidence_sha" ]; then
-        echo "  INCONSISTENCY: $gate_id evidence digest $actual_sha does not match the recorded $evidence_sha" >&2
+    path_defects="$(qualification_evidence_path_findings "$EVIDENCE_DIR" "$evidence_file" || true)"
+    if [ -n "$path_defects" ]; then
+      while IFS= read -r defect; do
+        [ -z "$defect" ] && continue
+        case "${defect%%$'\t'*}" in
+          missing)
+            echo "  INCONSISTENCY: $gate_id references missing evidence: $evidence_file" >&2 ;;
+          *)
+            echo "  INCONSISTENCY: $gate_id references inadmissible evidence ($evidence_file: ${defect%%$'\t'*})" >&2 ;;
+        esac
         SEMANTIC_FAILURES=$((SEMANTIC_FAILURES + 1))
+      done <<< "$path_defects"
+    elif [ -n "$evidence_sha" ]; then
+      snap="$(evidence_snapshot "$evidence_file")" || snap=""
+      if [ -z "$snap" ]; then
+        echo "  INCONSISTENCY: $gate_id evidence $evidence_file could not be pinned open" >&2
+        SEMANTIC_FAILURES=$((SEMANTIC_FAILURES + 1))
+      else
+        actual_sha="$(shasum -a 256 "$snap" | awk '{print $1}')"
+        if [ "$actual_sha" != "$evidence_sha" ]; then
+          echo "  INCONSISTENCY: $gate_id evidence digest $actual_sha does not match the recorded $evidence_sha" >&2
+          SEMANTIC_FAILURES=$((SEMANTIC_FAILURES + 1))
+        fi
       fi
     fi
   fi
@@ -203,6 +232,36 @@ if [ -f "$MANIFEST_JSON" ]; then
          CONSISTENT=false ;;
     esac
   done < <(jq -r '.supported_lanes // [] | .[]' "$MANIFEST_JSON" 2>/dev/null)
+fi
+
+# ─── Trusted runtime pins binding ──────────────────────────────────────
+# The pin manifest the live lanes were required to match is part of the
+# qualified source. A bundle carrying runtime evidence must bind the
+# EXACT repository-trusted manifest — byte-identical to this checkout's
+# qualification/msb-runtime-pins.json — so a substituted manifest that
+# makes a forged runtime "match" cannot qualify. A claimed lane without
+# bound pins is a claim the runtime identity was never anchored for.
+PINS_REPO="$REPO_ROOT/qualification/msb-runtime-pins.json"
+PINS_BUNDLED="$EVIDENCE_DIR/msb-runtime-pins.json"
+if [ -f "$PINS_BUNDLED" ] || [ -n "$CLAIMED_LANES" ]; then
+  if [ -n "$CLAIMED_LANES" ] && [ ! -f "$PINS_BUNDLED" ]; then
+    echo "  INCONSISTENCY: lanes claimed ($CLAIMED_LANES) but the bundle carries no bound msb-runtime-pins.json — the qualified runtime identity is not anchored" >&2
+    CONSISTENT=false
+  elif [ -f "$PINS_BUNDLED" ]; then
+    if [ ! -f "$PINS_REPO" ]; then
+      echo "  INCONSISTENCY: bundle carries msb-runtime-pins.json but the trusted manifest $PINS_REPO is absent" >&2
+      CONSISTENT=false
+    else
+      bundled_pins_sha="$(shasum -a 256 "$PINS_BUNDLED" | awk '{print $1}')"
+      trusted_pins_sha="$(shasum -a 256 "$PINS_REPO" | awk '{print $1}')"
+      if [ "$bundled_pins_sha" != "$trusted_pins_sha" ]; then
+        echo "  INCONSISTENCY: bundled msb-runtime-pins.json ($bundled_pins_sha) does not match the repository's trusted pins ($trusted_pins_sha)" >&2
+        CONSISTENT=false
+      else
+        echo "  Trusted runtime pins: bound ($trusted_pins_sha)"
+      fi
+    fi
+  fi
 fi
 
 # ─── Admission decision ────────────────────────────────────────────────

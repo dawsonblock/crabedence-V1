@@ -35,16 +35,35 @@ counts, package identity, and the run's own terminal completeness — and
 reports every point on which the supplied results file disagrees with
 the stream, plus every way the stream itself is malformed. Findings are
 printed one per line; a clean run prints nothing.
+
+Both modes enforce the canonical per-test lifecycle a real `go test
+-json` run produces:
+
+    run -> (output | pause | cont)* -> exactly one terminal outcome
+                                       (pass | fail | skip | bench)
+
+A terminal outcome without a preceding run, a duplicate run, a pause
+while not running, a cont while not paused, any event after the terminal
+outcome, or a test that appears under two package identities is
+malformed evidence — generation refuses to normalize it and verification
+reports it.
 """
 
 import argparse
 import hashlib
 import json
+import os
 import platform
 import re
 import sys
 
 TERMINAL_ACTIONS = ("pass", "fail", "skip")
+
+# `bench` terminates a benchmark's lifecycle the way the terminal trio
+# terminates a test's: a benchmark emits run -> output* -> bench. Its
+# derived status is "bench" — never "pass" — so a benchmark can never
+# satisfy a required-test slot.
+BENCH_ACTION = "bench"
 
 # The closed set of actions a real `go test -json` stream emits. Anything
 # outside it is a fabricated or corrupted event, never a forward
@@ -52,6 +71,18 @@ TERMINAL_ACTIONS = ("pass", "fail", "skip")
 GO_ACTIONS = frozenset(
     ("start", "run", "pause", "cont", "pass", "bench", "fail", "output", "skip")
 )
+
+# Per-test lifecycle states. Events are only legal in the states named
+# by TEST_TRANSITIONS below.
+TEST_STATE_NEW = "new"
+TEST_STATE_RUNNING = "running"
+TEST_STATE_PAUSED = "paused"
+TEST_STATE_DONE = "done"
+
+# Actions legal at package scope (no Test field): a package starts,
+# emits output, and reports exactly one terminal outcome. run/pause/
+# cont/bench are per-test states a package can never hold.
+PACKAGE_ACTIONS = frozenset(("start", "output") + TERMINAL_ACTIONS)
 
 
 def new_case():
@@ -73,7 +104,7 @@ def accumulate(rec, event):
     what the stream means lands here — never in one caller alone.
     """
     action = event.get("Action")
-    if action in TERMINAL_ACTIONS:
+    if action in TERMINAL_ACTIONS or action == BENCH_ACTION:
         rec["status"] = action
         rec["terminal_events"] += 1
         if event.get("Elapsed") is not None:
@@ -82,67 +113,56 @@ def accumulate(rec, event):
         rec["out"].update(event.get("Output", "").encode("utf-8"))
 
 
-def parse_stream(path):
-    """Parse a go test -json stream into {name: {status, elapsed, out_sha, terminal_events}}.
+class _Scan:
+    """The state one canonical stream walk produces.
 
-    Returns (cases, packages) where cases maps test name -> record and
-    packages is the set of Go packages the events belonged to.
+    Shared by generation (parse_stream) and verification (verify_stream)
+    so the normalized record and the re-derived record can never diverge
+    in what the stream means.
     """
-    cases = {}
-    order = []
-    packages = set()
-    with open(path, "r", encoding="utf-8") as handle:
-        for lineno, line in enumerate(handle, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                # The stream is pure JSON by construction; a non-JSON line
-                # means the producer wrote decorated output into the raw
-                # file — reject rather than silently skip it.
-                sys.exit(f"error: {path}:{lineno}: not a go test -json event line")
-            test = event.get("Test")
-            if event.get("Package"):
-                packages.add(event["Package"])
-            if not test:
-                continue
-            if test not in cases:
-                cases[test] = new_case()
-                order.append(test)
-            accumulate(cases[test], event)
-    for rec in cases.values():
-        rec["output_sha256"] = rec["out"].hexdigest()
-        del rec["out"]
-    return ([dict(name=n, **cases[n]) for n in order], sorted(p for p in packages if p))
+
+    def __init__(self):
+        self.findings = []
+        self.cases = {}
+        self.order = []
+        self.packages = set()
+        self.test_pkg = {}
+        self.pkg_terminal = {}
+        self.pkg_outcome = {}
+        self.pkg_started = set()
+        self.done_pkgs = set()
+        self.state = {}
+        self.pkg_conflicts = set()
 
 
-def verify_stream(path, expect_package=""):
-    """Strictly re-derive the normalized record from a raw stream.
+def _scan_stream(path):
+    """Walk one raw go test -json stream under the canonical lifecycle.
 
-    Returns (findings, derived_tests, derived_counts, derived_packages).
-    A finding is emitted for every malformed event, every impossible
-    sequence (events after a test's or a package's terminal outcome,
-    duplicate terminal outcomes, a package the run never completed), and
-    every package identity that is not the suite package. Derivation uses
-    the same `accumulate` rule as generation, so the derived record is by
-    construction the record the stream actually supports.
+    Returns a _Scan. A finding is emitted for every malformed event and
+    every impossible sequence: a test-scoped event before its run, a
+    duplicate run, an invalid pause/cont transition, a terminal outcome
+    from a non-running state, any event after a test's or a package's
+    terminal outcome, a test-scoped start, a package-scoped per-test
+    action, a test straddling two package identities, or a duplicate
+    package start. Findings never stop the walk — the derived record must
+    describe all the bytes the bundle binds.
     """
-    findings = []
-    cases = {}
-    order = []
-    packages = set()
-    test_pkg = {}
-    pkg_terminal = {}
-    pkg_outcome = {}
-    done_tests = set()
-    done_pkgs = set()
+    scan = _Scan()
+    findings = scan.findings
+    cases = scan.cases
+    order = scan.order
+    packages = scan.packages
+    test_pkg = scan.test_pkg
+    state = scan.state
+    pkg_terminal = scan.pkg_terminal
+    pkg_outcome = scan.pkg_outcome
+    done_pkgs = scan.done_pkgs
 
     try:
         handle = open(path, "r", encoding="utf-8")
     except OSError as exc:
-        return ([f"raw stream {path} cannot be read: {exc}"], [], {}, [])
+        findings.append(f"raw stream {path} cannot be read: {exc}")
+        return scan
     with handle:
         for lineno, line in enumerate(handle, 1):
             line = line.strip()
@@ -187,25 +207,126 @@ def verify_stream(path, expect_package=""):
             if pkg:
                 packages.add(pkg)
             if test is None:
-                if action in TERMINAL_ACTIONS:
+                if action == "start":
+                    if pkg in scan.pkg_started:
+                        findings.append(
+                            f"{path}:{lineno}: package {pkg} records a second start event"
+                        )
+                    else:
+                        scan.pkg_started.add(pkg)
+                elif action in TERMINAL_ACTIONS:
                     pkg_terminal[pkg] = pkg_terminal.get(pkg, 0) + 1
                     pkg_outcome[pkg] = action
                     done_pkgs.add(pkg)
+                elif action not in PACKAGE_ACTIONS:
+                    findings.append(
+                        f"{path}:{lineno}: package {pkg} records test-scoped "
+                        f"action {action} with no test name"
+                    )
                 continue
-            if test in done_tests:
+            if test not in cases:
+                cases[test] = new_case()
+                order.append(test)
+                state[test] = TEST_STATE_NEW
+                test_pkg[test] = pkg
+            elif test_pkg[test] != pkg:
+                if test not in scan.pkg_conflicts:
+                    scan.pkg_conflicts.add(test)
+                    findings.append(
+                        f"{path}:{lineno}: test {test} records events under both "
+                        f"{test_pkg[test]} and {pkg} — conflicting package identity"
+                    )
+            st = state[test]
+            if st == TEST_STATE_DONE:
                 findings.append(
                     f"{path}:{lineno}: test {test} records an event "
                     f"(action={action}) after its terminal outcome"
                 )
-                # The event is still folded into the record: the derived
-                # record must describe all the bytes the bundle binds.
-            if test not in cases:
-                cases[test] = new_case()
-                order.append(test)
-            test_pkg[test] = pkg
+            elif st == TEST_STATE_NEW and action != "run":
+                findings.append(
+                    f"{path}:{lineno}: test {test} records {action} without a "
+                    "preceding run event — an outcome the run never started "
+                    "is not evidence it executed"
+                )
+            elif action == "run" and st != TEST_STATE_NEW:
+                findings.append(
+                    f"{path}:{lineno}: test {test} records a duplicate run event"
+                )
+            elif action == "pause" and st != TEST_STATE_RUNNING:
+                findings.append(
+                    f"{path}:{lineno}: test {test} pauses while not running"
+                )
+            elif action == "cont" and st != TEST_STATE_PAUSED:
+                findings.append(
+                    f"{path}:{lineno}: test {test} continues while not paused"
+                )
+            elif action == "start":
+                findings.append(
+                    f"{path}:{lineno}: test {test} records a test-scoped start event"
+                )
+            elif action in TERMINAL_ACTIONS and st == TEST_STATE_PAUSED:
+                findings.append(
+                    f"{path}:{lineno}: test {test} records terminal outcome "
+                    f"{action} while paused"
+                )
+            # Transition. Even a malformed event lands the state machine
+            # where the action claims to take it, so one defect cannot
+            # cascade into a fabricated history of the stream.
+            if action == "run":
+                if st == TEST_STATE_NEW:
+                    state[test] = TEST_STATE_RUNNING
+            elif action == "pause":
+                state[test] = TEST_STATE_PAUSED
+            elif action == "cont":
+                state[test] = TEST_STATE_RUNNING
+            elif action in TERMINAL_ACTIONS or action == BENCH_ACTION:
+                state[test] = TEST_STATE_DONE
             accumulate(cases[test], event)
-            if action in TERMINAL_ACTIONS:
-                done_tests.add(test)
+    return scan
+
+
+def parse_stream(path):
+    """Parse a go test -json stream into {name: {status, elapsed, out_sha, terminal_events}}.
+
+    Generation enforces the same canonical lifecycle verification does:
+    a stream that cannot be a real `go test -json` run is refused, never
+    normalized into plausible-looking evidence. Returns (cases, packages)
+    where cases maps test name -> record and packages is the set of Go
+    packages the events belonged to.
+    """
+    scan = _scan_stream(path)
+    if scan.findings:
+        for finding in scan.findings:
+            print(f"error: {finding}", file=sys.stderr)
+        sys.exit(1)
+    for rec in scan.cases.values():
+        rec["output_sha256"] = rec["out"].hexdigest()
+        del rec["out"]
+    return (
+        [dict(name=n, **scan.cases[n]) for n in scan.order],
+        sorted(p for p in scan.packages if p),
+    )
+
+
+def verify_stream(path, expect_package=""):
+    """Strictly re-derive the normalized record from a raw stream.
+
+    Returns (findings, derived_tests, derived_counts, derived_packages).
+    A finding is emitted for every malformed event, every impossible
+    sequence (events after a test's or a package's terminal outcome,
+    duplicate terminal outcomes, a package the run never completed), and
+    every package identity that is not the suite package. Derivation uses
+    the same `accumulate` rule as generation, so the derived record is by
+    construction the record the stream actually supports.
+    """
+    scan = _scan_stream(path)
+    findings = scan.findings
+    cases = scan.cases
+    order = scan.order
+    packages = scan.packages
+    test_pkg = scan.test_pkg
+    pkg_terminal = scan.pkg_terminal
+    pkg_outcome = scan.pkg_outcome
 
     for name in order:
         n = cases[name]["terminal_events"]
@@ -216,27 +337,30 @@ def verify_stream(path, expect_package=""):
             )
     for pkg in sorted(p for p in packages if p):
         n = pkg_terminal.get(pkg, 0)
+        pkg_tests = [t for t, p in test_pkg.items() if p == pkg]
         if n == 0:
             findings.append(
                 f"package {pkg} has no terminal outcome — the run did not complete"
             )
         elif n > 1:
             findings.append(f"package {pkg} recorded {n} terminal outcomes")
-        else:
-            expected = (
-                "fail"
-                if any(
-                    (cases[t]["status"] or "incomplete") in ("fail", "incomplete")
-                    for t, p in test_pkg.items()
-                    if p == pkg
-                )
-                else "pass"
+        elif pkg_outcome[pkg] != "pass":
+            # A package that failed or skipped is honest evidence of a
+            # failed run, never of a qualified one — a build break, a
+            # TestMain panic, or a skipped suite must not launder the
+            # per-test cases into a passing record.
+            findings.append(
+                f"package {pkg} finished with outcome {pkg_outcome[pkg]} — "
+                "a failed or skipped package run is not passing evidence"
             )
-            if pkg_outcome[pkg] != expected:
-                findings.append(
-                    f"package {pkg} terminal outcome {pkg_outcome[pkg]} does not "
-                    f"match the derived test outcomes (want {expected})"
-                )
+        elif any(
+            (cases[t]["status"] or "incomplete") in ("fail", "incomplete")
+            for t in pkg_tests
+        ):
+            findings.append(
+                f"package {pkg} reports pass while the derived test outcomes "
+                "contain a failed or incomplete case"
+            )
     if expect_package:
         for pkg in sorted(p for p in packages if p):
             if pkg != expect_package and not pkg.endswith("/" + expect_package):
@@ -351,6 +475,40 @@ def verify_results(stream_path, results_path, expect_package=""):
     return findings
 
 
+def ci_provenance():
+    """Capture the CI-runner identity this evidence was produced under.
+
+    Lane evidence is only trustworthy as a qualification input when it is
+    bound to an authenticated run — a well-formed synthetic event stream
+    produced off-CI must not impersonate a trusted live qualification
+    run. Under GitHub Actions the runner environment carries the run's
+    identity; the release pipeline binds these fields into the lane
+    gate's evidence and the admission validator cross-checks them against
+    the qualification record's own CI provenance. Outside CI the record
+    carries no ci block — local lane evidence is still verifiable, but a
+    release claiming CI provenance cannot admit it.
+    """
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return None
+    keys = {
+        "server_url": "GITHUB_SERVER_URL",
+        "repository": "GITHUB_REPOSITORY",
+        "run_id": "GITHUB_RUN_ID",
+        "run_attempt": "GITHUB_RUN_ATTEMPT",
+        "job": "GITHUB_JOB",
+        "workflow": "GITHUB_WORKFLOW",
+        "workflow_ref": "GITHUB_WORKFLOW_REF",
+        "sha": "GITHUB_SHA",
+        "event_name": "GITHUB_EVENT_NAME",
+        "runner_os": "RUNNER_OS",
+        "runner_arch": "RUNNER_ARCH",
+        "runner_environment": "RUNNER_ENVIRONMENT",
+        "image_os": "ImageOS",
+        "image_version": "ImageVersion",
+    }
+    return {k: os.environ[v] for k, v in keys.items() if os.environ.get(v)}
+
+
 def inventory_coverage(inventory, source_root):
     """Return suite test names present in source but absent from the inventory."""
     covered = set(inventory.get("common_required_tests", []))
@@ -416,8 +574,17 @@ def main():
         "toolchain_go": args.toolchain_go,
         "runner": {
             "os": platform.system().lower(),
-            "arch": platform.machine().lower(),
+            # Canonical goarch spelling: the lane inventory pins goos/
+            # goarch identities, so emit amd64/arm64 rather than the
+            # platform.machine() aliases (x86_64, aarch64).
+            "arch": {
+                "x86_64": "amd64",
+                "amd64": "amd64",
+                "aarch64": "arm64",
+                "arm64": "arm64",
+            }.get(platform.machine().lower(), platform.machine().lower()),
         },
+        "ci": ci_provenance(),
         "packages": packages,
         "tests": [
             {

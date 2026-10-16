@@ -789,22 +789,46 @@ if [ -f "$EVIDENCE_DIR/qualification.json" ]; then
   fi
 
   # 4f. Every gate's evidence file must exist and match the digest the
-  # record binds. A gate claiming PASS without intact proof is not
+  # record binds — and the path itself must be admissible bundle
+  # evidence: relative, no traversal, no symlinked component or file,
+  # and regular. A gate claiming PASS without intact proof is not
   # admissible evidence.
   GATE_EVIDENCE_FAILED=false
+  VERIFY_SNAP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/cbx-verify-evidence.XXXXXX")"
+  VERIFY_SNAP_N=0
   while IFS=$'\t' read -r gate_id evidence_file evidence_sha; do
     [ -z "$gate_id" ] && continue
-    if [ -z "$evidence_file" ] || [ ! -f "$EVIDENCE_DIR/$evidence_file" ]; then
+    path_defects=""
+    if [ -n "$evidence_file" ]; then
+      path_defects="$(qualification_evidence_path_findings "$EVIDENCE_DIR" "$evidence_file" || true)"
+    fi
+    if [ -z "$evidence_file" ] || [ -n "$path_defects" ]; then
       GATE_EVIDENCE_FAILED=true
-      echo "  Missing evidence file for gate $gate_id: ${evidence_file:-<none>}" >&2
+      if [ -z "$path_defects" ]; then
+        echo "  Missing evidence file for gate $gate_id: ${evidence_file:-<none>}" >&2
+      else
+        printf '%s\n' "$path_defects" | while IFS= read -r d; do
+          [ -z "$d" ] && continue
+          echo "  Inadmissible evidence path for gate $gate_id ($evidence_file: ${d%%$'\t'*})" >&2
+        done
+      fi
       continue
     fi
-    actual_sha="$(shasum -a 256 "$EVIDENCE_DIR/$evidence_file" | awk '{print $1}')"
+    VERIFY_SNAP_N=$((VERIFY_SNAP_N + 1))
+    snap="$(qualification_evidence_snapshot "$EVIDENCE_DIR" "$evidence_file" \
+      "$VERIFY_SNAP_DIR/$VERIFY_SNAP_N" 2>/dev/null || true)"
+    if [ -z "$snap" ]; then
+      GATE_EVIDENCE_FAILED=true
+      echo "  Evidence file for gate $gate_id could not be pinned open: $evidence_file" >&2
+      continue
+    fi
+    actual_sha="$(shasum -a 256 "$snap" | awk '{print $1}')"
     if [ "$actual_sha" != "$evidence_sha" ]; then
       GATE_EVIDENCE_FAILED=true
       echo "  Gate $gate_id evidence digest $actual_sha does not match the recorded $evidence_sha" >&2
     fi
   done < <(jq -r '.gates[]? | [(.gate_id // ""), (.evidence.file // ""), (.evidence.sha256 // "")] | @tsv' "$EVIDENCE_DIR/qualification.json" 2>/dev/null || true)
+  rm -rf "$VERIFY_SNAP_DIR"
   if [ "$GATE_EVIDENCE_FAILED" = false ]; then
     check "Gate evidence bound (file + digest)" "PASS"
   else

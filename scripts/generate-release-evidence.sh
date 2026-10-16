@@ -164,6 +164,32 @@ COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 TREE="$(git -C "$REPO_ROOT" rev-parse HEAD^{tree})"
 BRANCH="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD)"
 
+# CI-runner provenance: under GitHub Actions the record carries the
+# authenticated workflow-run identity it was produced by, and every lane
+# evidence bundle is cross-checked against it at admission — a lane's
+# case evidence cannot be a well-formed synthetic stream produced
+# elsewhere. Outside CI the record carries no ci block and lane evidence
+# carrying one is itself a finding.
+CI_PROVENANCE_JSON="null"
+if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+  CI_PROVENANCE_JSON="$(jq -cn '{
+    server_url: env.GITHUB_SERVER_URL,
+    repository: env.GITHUB_REPOSITORY,
+    run_id: env.GITHUB_RUN_ID,
+    run_attempt: env.GITHUB_RUN_ATTEMPT,
+    job: env.GITHUB_JOB,
+    workflow: env.GITHUB_WORKFLOW,
+    workflow_ref: env.GITHUB_WORKFLOW_REF,
+    sha: env.GITHUB_SHA,
+    event_name: env.GITHUB_EVENT_NAME,
+    runner_os: env.RUNNER_OS,
+    runner_arch: env.RUNNER_ARCH,
+    runner_environment: env.RUNNER_ENVIRONMENT,
+    image_os: env.ImageOS,
+    image_version: env.ImageVersion
+  } | with_entries(select(.value != null and .value != ""))')"
+fi
+
 # One timestamp for the whole qualification run. Every derived artifact
 # (qualification provenance, evidence manifest, evidence root, report)
 # binds THIS value — downstream regeneration reads it back from the
@@ -505,6 +531,28 @@ register_lane_import() {
   imported_commit="$(jq -r '.source_commit // empty' "$cases" 2>/dev/null)"
   if [ "$imported_commit" != "$COMMIT" ]; then
     findings="imported results commit ${imported_commit:-<missing>} does not match the qualified commit $COMMIT"
+  elif [ "$CI_PROVENANCE_JSON" != "null" ]; then
+    # Under CI the lane evidence must have been produced by THIS
+    # authenticated workflow run — a borrowed stream whose cases describe
+    # the right tests but the wrong run is injected evidence.
+    local imported_run imported_repo imported_sha
+    imported_run="$(jq -r '.ci.run_id // empty' "$cases" 2>/dev/null)"
+    imported_repo="$(jq -r '.ci.repository // empty' "$cases" 2>/dev/null)"
+    imported_sha="$(jq -r '.ci.sha // empty' "$cases" 2>/dev/null)"
+    local want_run want_repo
+    want_run="$(jq -r '.run_id // empty' <<<"$CI_PROVENANCE_JSON")"
+    want_repo="$(jq -r '.repository // empty' <<<"$CI_PROVENANCE_JSON")"
+    if [ -z "$imported_run" ]; then
+      findings="imported lane evidence carries no CI provenance — a claimed lane must bind the authenticated run that produced it"
+    elif [ "$imported_run" != "$want_run" ]; then
+      findings="imported lane evidence run_id $imported_run is not this qualification run $want_run — evidence from another run is borrowed, not produced"
+    elif [ "$imported_repo" != "$want_repo" ]; then
+      findings="imported lane evidence repository $imported_repo is not $want_repo"
+    elif [ -n "$imported_sha" ] && [ "$imported_sha" != "$COMMIT" ]; then
+      findings="imported lane evidence ci.sha $imported_sha does not match the qualified commit $COMMIT"
+    else
+      findings="$(required_tests_case_findings "$cases" "$EVIDENCE_DIR/$REQUIRED_TESTS_REL" "$lane" || true)"
+    fi
   else
     findings="$(required_tests_case_findings "$cases" "$EVIDENCE_DIR/$REQUIRED_TESTS_REL" "$lane" || true)"
   fi
@@ -1524,7 +1572,8 @@ cat > "$EVIDENCE_DIR/qualification.json" << EOF
     "commit": "$COMMIT",
     "tree": "$TREE",
     "branch": "$BRANCH",
-    "timestamp": "$EVIDENCE_TIMESTAMP"
+    "timestamp": "$EVIDENCE_TIMESTAMP",
+    "ci": $CI_PROVENANCE_JSON
   },
   "toolchains": {
     "go": "$GO_VERSION",
