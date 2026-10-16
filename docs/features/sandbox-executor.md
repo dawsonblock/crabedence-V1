@@ -251,6 +251,24 @@ creation), and a row whose contract cannot be parsed or that declares no timeout
 is never released this way: the bound cannot be established, so the reservation
 is held rather than guessed away.
 
+## Registry archival
+
+The registry bound counts **active** work — jobs whose outcome or cleanup could
+still change — not history. A settled row (terminal sequence assigned, signed
+receipt bound, cleanup verified) may move to the ledger's immutable archive:
+the full payload is copied into `jobs_archive` inside one transaction under a
+content-addressed `archive_segments` record, and the operational row is deleted.
+The job's identity never archives — `job_identities` keeps every admitted
+`job_id`/`contract_hash`/`seq` for the registry's whole life, so replay
+protection survives the row's operational deletion. `Get`, `List`, the terminal
+enumeration that checkpoints commit to, and the read-only verifier all span the
+active table plus the archive, so evidence coverage is complete whether or not a
+row has moved. When the active registry reaches the bound, admission archives
+settled rows and recounts rather than refusing on stale history; only a registry
+still full of live or unresolved work refuses. `VerifyArchiveSegments`
+re-derives each segment's digest from the archive contents, so a rewrite of
+archived bytes is detectable tampering.
+
 ## Platform qualification
 
 Microsandbox runs on two independent virtualization implementations, and

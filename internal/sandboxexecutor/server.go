@@ -24,10 +24,16 @@ import (
 // execution — the ledger entry exists before any backend is asked.
 const JobStateRecorded = "RECORDED"
 
-// maxJobs bounds the registry. Refusal is louder than silent growth —
-// a permitted peer cannot turn the executor's bookkeeping into a
-// memory or disk exhaustion vector.
+// maxJobs bounds the ACTIVE registry — jobs whose outcome or cleanup
+// could still change, plus rows admitted but not yet settled. Settled
+// terminal history lives in the archive, not here, so the bound now
+// means "how much live work this executor tracks", not "how much work
+// it ever did". Refusal is still louder than silent growth.
 const maxJobs = 4096
+
+// maxArchiveBatch bounds one admission-time archival pass so a full
+// registry's relief is bounded work, not an unbounded pause.
+const maxArchiveBatch = 1024
 
 // Default bounds. Every executor resource is bounded; these are the
 // values an operator gets without asking.
@@ -1368,12 +1374,22 @@ func contractBudget(c *JobContractV2) *ResourceBudget {
 func (s *Server) admitJob(jobID, contractHash, submitter, principal, image, contractJSON string, budget *ResourceBudget) error {
 	s.admitMu.Lock()
 	defer s.admitMu.Unlock()
-	// The registry bound is checked against durable state — the
-	// ledger is the registry, not a cache of it.
+	// The registry bound is checked against durable ACTIVE state —
+	// settled terminal history no longer counts against it. When the
+	// active table is full, archive its settled rows first and recount:
+	// only a registry still full of live or unresolved work refuses.
 	if count, err := s.ledger.Count(); err != nil {
 		return fmt.Errorf("registry unavailable: %w", err)
 	} else if count >= maxJobs {
-		return fmt.Errorf("job registry full (%d records)", maxJobs)
+		if _, aerr := s.ledger.ArchiveCompleted(maxArchiveBatch); aerr != nil {
+			return fmt.Errorf("registry full and archival failed: %w", aerr)
+		}
+		if count, err = s.ledger.Count(); err != nil {
+			return fmt.Errorf("registry unavailable: %w", err)
+		}
+		if count >= maxJobs {
+			return fmt.Errorf("job registry full (%d active records)", maxJobs)
+		}
 	}
 	// The pool bounds execution, so it applies only when a backend can
 	// execute: a record-only executor admits (and records) jobs it

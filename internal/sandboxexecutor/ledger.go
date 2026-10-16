@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -58,6 +59,16 @@ type Ledger struct {
 
 	// reconciled counts rows moved to DISPATCH_AMBIGUOUS at open.
 	reconciled int
+
+	// custodian, when set, is the evidence-custody witness archival
+	// consults before releasing operational rows (see archive.go).
+	custMu    sync.Mutex
+	custodian ArchiveCustodian
+
+	// archiveMu serializes archive passes — two concurrent passes
+	// would pick the same candidates and collide on the archive
+	// primary key.
+	archiveMu sync.Mutex
 }
 
 // ErrDuplicateJobID is returned when a job_id already exists in the
@@ -125,6 +136,9 @@ type LedgerJob struct {
 	// back into this row.
 	ReceiptSHA256  string
 	ArtifactSHA256 string
+	// Archived marks a row read from jobs_archive — the durable
+	// terminal history rather than the operational registry.
+	Archived bool
 	// CleanupPending is set when the job's backend resources (its VM)
 	// could not be removed after the result was observed — tracked
 	// separately from the result so a cleanup failure never masks or
@@ -219,6 +233,13 @@ func OpenLedger(path string) (*Ledger, error) {
 		return nil, err
 	}
 	l.reconciled = reconciled
+	// Finish any archive transition a previous lifetime committed
+	// part-way: archive rows already durable under a non-pending
+	// segment release their operational rows idempotently.
+	if err := l.finalizeArchives(); err != nil {
+		l.Close()
+		return nil, err
+	}
 	return l, nil
 }
 
@@ -232,9 +253,11 @@ func (l *Ledger) Epoch() uint64 { return l.epoch }
 
 // ledgerSchemaVersion bumps when the schema gains columns; pre-v2
 // ledgers (from the admission-only spike) get their new columns via
-// ALTER TABLE rather than a destructive rebuild, and v3 adds the
-// runtime run identity plus cleanup tracking.
-const ledgerSchemaVersion = 6
+// ALTER TABLE rather than a destructive rebuild, v3 adds the runtime
+// run identity plus cleanup tracking, and v7 adds the archive set —
+// job_identities, jobs_archive, archive_segments — separating settled
+// history from operational state without surrendering replay identity.
+const ledgerSchemaVersion = 7
 
 func (l *Ledger) migrate() error {
 	var version int
@@ -345,6 +368,72 @@ func (l *Ledger) migrate() error {
 		// than inferring it from an error's shape.
 		if _, err := l.db.Exec(`ALTER TABLE jobs ADD COLUMN dispatch_class TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("migrate ledger v%d→v6: %w", version, err)
+		}
+	}
+	if version < 7 {
+		// v6 → v7: the archive set. job_identities is the permanent
+		// replay guard — every admitted job_id/contract_hash pair for
+		// the registry's whole life, populated from the existing jobs
+		// rows so a pre-v7 ledger's identities remain replay-proof.
+		// jobs_archive holds settled terminal payloads; archive_segments
+		// records each content-addressed transition.
+		_, err := l.db.Exec(`
+			CREATE TABLE IF NOT EXISTS job_identities (
+				job_id        TEXT PRIMARY KEY,
+				contract_hash TEXT NOT NULL UNIQUE,
+				seq           INTEGER NOT NULL UNIQUE,
+				terminal_seq  INTEGER,
+				archived_at   INTEGER
+			);
+			CREATE TABLE IF NOT EXISTS jobs_archive (
+				job_id         TEXT PRIMARY KEY,
+				contract_hash  TEXT NOT NULL,
+				seq            INTEGER NOT NULL,
+				submitter      TEXT NOT NULL,
+				principal      TEXT NOT NULL,
+				image          TEXT NOT NULL DEFAULT '',
+				contract_json  TEXT NOT NULL,
+				state          TEXT NOT NULL,
+				fence_epoch    INTEGER NOT NULL,
+				backend_id     TEXT NOT NULL DEFAULT '',
+				backend_handle TEXT NOT NULL DEFAULT '',
+				backend_job_id TEXT NOT NULL DEFAULT '',
+				backend_boot_id TEXT NOT NULL DEFAULT '',
+				policy_digest  TEXT NOT NULL DEFAULT '',
+				dispatch_nonce TEXT NOT NULL DEFAULT '',
+				image_digest   TEXT NOT NULL DEFAULT '',
+				runtime_identity TEXT NOT NULL DEFAULT '',
+				dispatch_class TEXT NOT NULL DEFAULT '',
+				received_at    INTEGER NOT NULL,
+				updated_at     INTEGER NOT NULL,
+				exit_code      INTEGER,
+				error          TEXT NOT NULL DEFAULT '',
+				result_json    TEXT NOT NULL DEFAULT '',
+				terminal_seq   INTEGER,
+				receipt_sha256 TEXT NOT NULL DEFAULT '',
+				artifact_sha256 TEXT NOT NULL DEFAULT '',
+				cleanup_pending INTEGER NOT NULL DEFAULT 0,
+				cleanup_error   TEXT NOT NULL DEFAULT '',
+				archived_at    INTEGER NOT NULL,
+				archive_seq    INTEGER NOT NULL
+			);
+			CREATE INDEX IF NOT EXISTS idx_jobs_archive_seq ON jobs_archive(archive_seq);
+			CREATE INDEX IF NOT EXISTS idx_jobs_archive_tseq ON jobs_archive(terminal_seq);
+			CREATE TABLE IF NOT EXISTS archive_segments (
+				segment_seq        INTEGER PRIMARY KEY,
+				first_terminal_seq INTEGER NOT NULL,
+				last_terminal_seq  INTEGER NOT NULL,
+				row_count          INTEGER NOT NULL,
+				sha256             TEXT NOT NULL,
+				custody            TEXT NOT NULL DEFAULT 'local',
+				created_at         INTEGER NOT NULL
+			);
+			INSERT INTO job_identities (job_id, contract_hash, seq, terminal_seq)
+				SELECT job_id, contract_hash, seq, terminal_seq FROM jobs
+				WHERE job_id NOT IN (SELECT job_id FROM job_identities);
+		`)
+		if err != nil {
+			return fmt.Errorf("migrate ledger v%d→v7: %w", version, err)
 		}
 	}
 	if version < ledgerSchemaVersion {
@@ -470,6 +559,18 @@ func (l *Ledger) InsertJob(jobID, contractHash, submitter, principal, image, con
 	if err != nil {
 		return nil, err
 	}
+	// The permanent identity is written first: job_identities survives
+	// archival, so a replayed contract or reused job_id is caught even
+	// after the operational row has long since left the registry.
+	_, err = tx.Exec(
+		`INSERT INTO job_identities (job_id, contract_hash, seq) VALUES (?,?,?)`,
+		jobID, contractHash, seq)
+	if err != nil {
+		if isUniqueViolation(err) {
+			return nil, l.classifyIdentityConflict(tx, jobID, contractHash)
+		}
+		return nil, fmt.Errorf("record job identity %s: %w", jobID, err)
+	}
 	_, err = tx.Exec(
 		`INSERT INTO jobs (job_id, contract_hash, seq, submitter, principal, image,
 		 contract_json, state, fence_epoch, received_at, updated_at)
@@ -502,6 +603,28 @@ func (l *Ledger) hashExistsTx(tx *sql.Tx, hash string) bool {
 		return false
 	}
 	return n > 0
+}
+
+// classifyIdentityConflict reports which permanent identity a rejected
+// insert collided with: an identical resubmission is ErrDuplicateJobID
+// (idempotent retry), the same signed contract under any other job_id
+// is ErrContractReplay, and a new contract under a taken job_id is a
+// duplicate identity claim.
+func (l *Ledger) classifyIdentityConflict(tx *sql.Tx, jobID, contractHash string) error {
+	var existingHash string
+	err := tx.QueryRow(
+		`SELECT contract_hash FROM job_identities WHERE job_id = ?`, jobID).Scan(&existingHash)
+	if err == nil {
+		// The job_id is taken — identical resubmission is the idempotent
+		// retry; a different contract under it is an identity claim.
+		return ErrDuplicateJobID
+	}
+	var n int
+	if err := tx.QueryRow(
+		`SELECT COUNT(1) FROM job_identities WHERE contract_hash = ?`, contractHash).Scan(&n); err == nil && n > 0 {
+		return ErrContractReplay
+	}
+	return ErrDuplicateJobID
 }
 
 // jobColumns is the canonical SELECT list for a full jobs row.
@@ -551,14 +674,17 @@ func finishScan(j *LedgerJob) error {
 	return nil
 }
 
-// Get returns one job, or nil when absent.
+// Get returns one job, or nil when absent. Active rows win; a job whose
+// operational row was archived answers from the archive and marks
+// itself Archived — archive-aware lookup never confuses "settled and
+// stored" with "never admitted".
 func (l *Ledger) Get(jobID string) (*LedgerJob, error) {
 	j := &LedgerJob{}
 	err := l.db.QueryRow(
 		`SELECT `+jobColumns+` FROM jobs WHERE job_id = ?`, jobID).
 		Scan(scanFields(j)...)
 	if err == sql.ErrNoRows {
-		return nil, nil
+		return l.GetArchived(jobID)
 	}
 	if err != nil {
 		return nil, err
@@ -834,8 +960,26 @@ func (l *Ledger) Count() (int, error) {
 	return n, nil
 }
 
-// List returns every recorded job in sequence order.
+// List returns every recorded job in sequence order — the active
+// registry merged with the archive, so a verifier enumerating the
+// ledger sees every job it ever admitted, not only the operational
+// remainder. Archived rows carry Archived=true.
 func (l *Ledger) List() ([]*LedgerJob, error) {
+	active, err := l.listActive()
+	if err != nil {
+		return nil, err
+	}
+	archived, err := l.listArchived()
+	if err != nil {
+		return nil, err
+	}
+	return sortJobs(active, archived), nil
+}
+
+// listArchived and sortJobs live in archive.go.
+
+// listActive returns the operational registry in seq order.
+func (l *Ledger) listActive() ([]*LedgerJob, error) {
 	rows, err := l.db.Query(`SELECT ` + jobColumns + ` FROM jobs ORDER BY seq`)
 	if err != nil {
 		return nil, err
@@ -910,6 +1054,13 @@ func (l *Ledger) Transition(jobID, to string, from []string, mutate func(*Ledger
 		}
 		job.TerminalSeq = next
 		termSeq = next
+		// The permanent identity carries the terminal position too —
+		// the enumeration must still resolve after the row archives.
+		if _, err := tx.Exec(
+			`UPDATE job_identities SET terminal_seq = ? WHERE job_id = ?`,
+			next, jobID); err != nil {
+			return fmt.Errorf("stamp terminal identity %s: %w", jobID, err)
+		}
 	}
 	var exit any
 	if job.ExitCode != nil {
@@ -995,10 +1146,20 @@ func (l *Ledger) TerminalRefs() ([]evidence.TerminalRef, error) {
 func terminalRefs(q interface {
 	Query(query string, args ...any) (*sql.Rows, error)
 }) ([]evidence.TerminalRef, error) {
+	// The terminal enumeration spans both tables: an archived terminal
+	// row is still a checkpoint-covered record. The archive side
+	// excludes any job_id still present in jobs — the crash window of a
+	// custodial handoff — so the enumeration stays dense and dup-free.
 	rows, err := q.Query(
 		`SELECT terminal_seq, job_id, state, contract_hash, result_json,
 		 artifact_sha256, receipt_sha256, backend_id, backend_handle, updated_at
-		 FROM jobs WHERE terminal_seq IS NOT NULL ORDER BY terminal_seq`)
+		 FROM jobs WHERE terminal_seq IS NOT NULL
+		 UNION ALL
+		 SELECT terminal_seq, job_id, state, contract_hash, result_json,
+		 artifact_sha256, receipt_sha256, backend_id, backend_handle, updated_at
+		 FROM jobs_archive a WHERE a.terminal_seq IS NOT NULL
+		 AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.job_id = a.job_id)
+		 ORDER BY terminal_seq`)
 	if err != nil {
 		return nil, err
 	}
