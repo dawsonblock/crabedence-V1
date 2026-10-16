@@ -1,14 +1,18 @@
 package sandboxexecutor
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/openclaw/crabbox/internal/sandboxcustody"
 	_ "modernc.org/sqlite"
 )
 
@@ -295,10 +299,16 @@ type stubCustodian struct {
 	seen     []string
 }
 
-func (c *stubCustodian) WitnessArchive(seg *ArchiveSegment) error {
+func (c *stubCustodian) WitnessArchive(seg *ArchiveSegment, payload []byte) error {
 	if c.failNext > 0 {
 		c.failNext--
 		return fmt.Errorf("custodian offline")
+	}
+	// A real custodian holds the bytes: the stub enforces the same
+	// binding so a payload mismatch can never be attested.
+	sum := sha256.Sum256(payload)
+	if hex.EncodeToString(sum[:]) != seg.SHA256 {
+		return fmt.Errorf("payload digest does not match segment %s", seg.SHA256)
 	}
 	c.seen = append(c.seen, seg.SHA256)
 	return nil
@@ -495,5 +505,94 @@ func TestMigrationBackfillsPermanentIdentities(t *testing.T) {
 	// And the migrated rows archive normally.
 	if seg, err := l2.ArchiveCompleted(0); err != nil || seg == nil || seg.RowCount != 1 {
 		t.Fatalf("archive after migration: %+v, %v", seg, err)
+	}
+}
+
+// End-to-end custody: the ledger releases operational rows only after
+// a real custody daemon holds the segment payload and signs its
+// acknowledgement — the wire protocol, not a stub.
+func TestArchiveCustodyOverSocket(t *testing.T) {
+	l, _ := openLedger(t)
+	custodyDir := t.TempDir()
+	sockDir, err := os.MkdirTemp("", "cx-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(sockDir)
+	witness, err := sandboxcustody.NewServer(sandboxcustody.Config{
+		SocketDir:  sockDir,
+		CustodyDir: custodyDir,
+		KeyPath:    filepath.Join(custodyDir, "witness.key"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := witness.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer witness.Stop()
+
+	// A custodian pinned to a different witness key refuses the
+	// acknowledgement — it is not the custody the operator configured.
+	wrongPin := &SocketCustodian{Socket: witness.SocketPath(), ExpectedSigner: strings.Repeat("0", 64)}
+	l2, _ := openLedger(t)
+	if err := l2.SetArchiveCustodian(wrongPin); err != nil {
+		t.Fatal(err)
+	}
+	settleJob(t, l2, "pin-1", "h-pin-1")
+	if _, err := l2.ArchiveCompleted(0); err == nil {
+		t.Fatal("a foreign signer satisfied the custody pin")
+	}
+
+	custodian := &SocketCustodian{
+		Socket:         witness.SocketPath(),
+		ExpectedSigner: witness.SignerFingerprint(),
+	}
+	if err := l.SetArchiveCustodian(custodian); err != nil {
+		t.Fatal(err)
+	}
+	settleJob(t, l, "sock-1", "h-sock-1")
+	seg, err := l.ArchiveCompleted(0)
+	if err != nil {
+		t.Fatalf("custodial archive: %v", err)
+	}
+	if seg == nil || seg.Custody != "witnessed" {
+		t.Fatalf("custody = %+v", seg)
+	}
+	if n, _ := l.Count(); n != 0 {
+		t.Fatalf("operational row survived witnessed custody: %d", n)
+	}
+	// The witness holds the payload — and it verifies independently.
+	if findings := sandboxcustody.VerifyCustodyDir(custodyDir); len(findings) != 0 {
+		t.Fatalf("custody verify: %v", findings)
+	}
+	held, err := os.ReadFile(filepath.Join(custodyDir, "segments", seg.SHA256))
+	if err != nil {
+		t.Fatalf("witness does not hold the segment: %v", err)
+	}
+	sum := sha256.Sum256(held)
+	if hex.EncodeToString(sum[:]) != seg.SHA256 {
+		t.Fatal("witness holds bytes that do not digest to the segment sha")
+	}
+}
+
+// A custody daemon that is down refuses archival without losing the
+// rows — the registry keeps them for the retry.
+func TestArchiveCustodyOfflineHoldsRows(t *testing.T) {
+	l, _ := openLedger(t)
+	custodian := &SocketCustodian{Socket: filepath.Join(t.TempDir(), "custody.sock")}
+	if err := l.SetArchiveCustodian(custodian); err != nil {
+		t.Fatal(err)
+	}
+	settleJob(t, l, "off-1", "h-off-1")
+	if _, err := l.ArchiveCompleted(0); err == nil {
+		t.Fatal("unreachable custodian still released the archive")
+	}
+	if n, _ := l.Count(); n != 1 {
+		t.Fatalf("operational row released without custody: %d", n)
+	}
+	segs, _ := l.ArchiveSegments()
+	if len(segs) != 1 || segs[0].Custody != "pending" {
+		t.Fatalf("custody = %+v", segs)
 	}
 }

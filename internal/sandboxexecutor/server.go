@@ -120,6 +120,10 @@ type Config struct {
 	// default; negative disables the periodic passes (the startup
 	// recovery walks still run).
 	MaintenanceInterval time.Duration
+	// ArchiveCustodian witnesses archive segments to external custody
+	// before the operational rows release — nil keeps custody local
+	// (the archive is its own custody).
+	ArchiveCustodian ArchiveCustodian
 	// MaxContractTTL bounds contract validity windows. Zero uses the
 	// default; negative disables the bound.
 	MaxContractTTL time.Duration
@@ -315,6 +319,16 @@ func (s *Server) Start() error {
 	s.ledger = ledger
 	if n := ledger.Reconciled(); n > 0 {
 		s.audit("reconciled %d job(s) from a previous lifetime to %s", n, JobStateDispatchAmbig)
+	}
+	// External custody is installed before any archive pass can run —
+	// a pending segment from a previous lifetime must resume under the
+	// same custodian it was committed to.
+	if s.cfg.ArchiveCustodian != nil {
+		if err := ledger.SetArchiveCustodian(s.cfg.ArchiveCustodian); err != nil {
+			_ = s.ledger.Close()
+			s.ledger = nil
+			return err
+		}
 	}
 	// Failures before the evidence chain exists still owe the ledger
 	// its close — a server that never started holds the fence lock

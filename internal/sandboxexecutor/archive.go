@@ -45,8 +45,11 @@ type ArchiveCustodian interface {
 	// WitnessArchive durably acknowledges the segment's content to
 	// external custody. It is called after the segment rows are
 	// committed, before the operational rows are released, and must be
-	// idempotent on the same segment digest.
-	WitnessArchive(seg *ArchiveSegment) error
+	// idempotent on the same segment digest. The payload is the
+	// canonical segment bytes — sha256(payload) == seg.SHA256 — so the
+	// custodian holds the archived content itself, not just a promise
+	// that it existed.
+	WitnessArchive(seg *ArchiveSegment, payload []byte) error
 }
 
 // ArchiveSegment is the immutable record of one archival transition:
@@ -289,7 +292,7 @@ func (l *Ledger) ArchiveCompleted(limit int) (*ArchiveSegment, error) {
 	}
 
 	if custodian != nil {
-		if err := custodian.WitnessArchive(seg); err != nil {
+		if err := custodian.WitnessArchive(seg, segBytes); err != nil {
 			// The archive rows and the pending segment are durable; the
 			// operational rows were never released. A later pass retries
 			// the handoff — nothing is lost and nothing was claimed.
@@ -298,6 +301,7 @@ func (l *Ledger) ArchiveCompleted(limit int) (*ArchiveSegment, error) {
 		if err := l.completeCustodial(seg); err != nil {
 			return nil, err
 		}
+		seg.Custody = "witnessed"
 	}
 	return seg, nil
 }
@@ -366,7 +370,14 @@ func (l *Ledger) retryPendingCustody(c ArchiveCustodian) error {
 		return err
 	}
 	for _, seg := range pending {
-		if err := c.WitnessArchive(seg); err != nil {
+		// Re-derive the canonical payload from the durable archive
+		// rows — the custodian holds the bytes, so the retry hands
+		// over the same content the first attempt computed.
+		payload, err := l.segmentPayload(seg.Seq)
+		if err != nil {
+			return fmt.Errorf("archive custody retry for segment %d cannot rebuild payload: %w", seg.Seq, err)
+		}
+		if err := c.WitnessArchive(seg, payload); err != nil {
 			return fmt.Errorf("archive custody witness refused segment %d: %w", seg.Seq, err)
 		}
 		if err := l.completeCustodial(seg); err != nil {
@@ -552,11 +563,7 @@ func (l *Ledger) VerifyArchiveSegments() []string {
 				seg.Seq, seg.RowCount, len(rows)))
 			continue
 		}
-		payload := make([]archiveRow, 0, len(rows))
-		for _, j := range rows {
-			payload = append(payload, jobArchiveRow(j))
-		}
-		segBytes, err := json.Marshal(payload)
+		segBytes, err := l.segmentPayload(seg.Seq)
 		if err != nil {
 			findings = append(findings, fmt.Sprintf("archive segment %d: marshal: %v", seg.Seq, err))
 			continue
@@ -569,6 +576,21 @@ func (l *Ledger) VerifyArchiveSegments() []string {
 		}
 	}
 	return findings
+}
+
+// segmentPayload rebuilds a segment's canonical payload bytes — the
+// exact byte string its digest commits to — for custody handoffs and
+// custody retries.
+func (l *Ledger) segmentPayload(segSeq int64) ([]byte, error) {
+	rows, err := l.archivedRows(segSeq)
+	if err != nil {
+		return nil, err
+	}
+	payload := make([]archiveRow, 0, len(rows))
+	for _, j := range rows {
+		payload = append(payload, jobArchiveRow(j))
+	}
+	return json.Marshal(payload)
 }
 
 // archivedRows reads one segment's rows outside a tx.

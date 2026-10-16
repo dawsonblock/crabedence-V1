@@ -181,6 +181,56 @@ func signingBytes(r ReceiptV3) []byte {
 	return payload.Bytes()
 }
 
+// SignRecord signs an arbitrary structured record using the same
+// domain-separated, length-prefixed construction as receipts. The
+// domain must differ from the receipt domain so a record signature
+// can never be presented as a receipt signature — a custody
+// acknowledgement is not execution evidence.
+func (s *Signer) SignRecord(domain string, values ...string) (string, error) {
+	payload, err := recordSigningBytes(domain, values)
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(ed25519.Sign(s.key, payload)), nil
+}
+
+// VerifyRecordSignature checks a SignRecord signature — the verifier
+// reconstructs the domain-separated payload from the record's fields
+// and the declared public key, so a signature moved between domains
+// never verifies.
+func VerifyRecordSignature(pub ed25519.PublicKey, domain string, sigB64 string, values ...string) error {
+	payload, err := recordSigningBytes(domain, values)
+	if err != nil {
+		return err
+	}
+	sig, err := base64.StdEncoding.DecodeString(sigB64)
+	if err != nil {
+		return fmt.Errorf("record signature not base64: %w", err)
+	}
+	if !ed25519.Verify(pub, payload, sig) {
+		return fmt.Errorf("record signature invalid")
+	}
+	return nil
+}
+
+// recordSigningBytes builds the domain-separated signing payload —
+// identical framing to receipts, keyed by an explicit domain.
+func recordSigningBytes(domain string, values []string) ([]byte, error) {
+	if domain == "" || domain == signingDomain || strings.HasPrefix(domain, signingDomain) {
+		return nil, fmt.Errorf("invalid record signing domain")
+	}
+	var payload bytes.Buffer
+	payload.WriteString(domain)
+	payload.WriteByte(0)
+	var length [4]byte
+	for _, value := range values {
+		binary.BigEndian.PutUint32(length[:], uint32(len(value)))
+		payload.Write(length[:])
+		payload.WriteString(value)
+	}
+	return payload.Bytes(), nil
+}
+
 func validateFields(r ReceiptV3) error {
 	if r.ReceiptType != ReceiptType {
 		return fmt.Errorf("unsupported receipt_type %q", r.ReceiptType)

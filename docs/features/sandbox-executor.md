@@ -270,6 +270,34 @@ still full of live or unresolved work refuses. `VerifyArchiveSegments`
 re-derives each segment's digest from the archive contents, so a rewrite of
 archived bytes is detectable tampering.
 
+### External custody
+
+With `ArchiveCustodian` configured (`-archive-custody-socket` on
+`sandbox-executord`), archival hands the segment's canonical payload to a
+separate custody daemon — `sandbox-custodyd` — before the operational rows
+release. The witness is an independent attestor with its own key and store:
+
+- It stores the payload content-addressed under `segments/<sha256>` only after
+  re-deriving the digest from the bytes it received — a payload that digests
+  otherwise, carries the wrong row count, or strays outside the claimed
+  terminal range is refused and nothing is stored.
+- Each acknowledgement is appended to `acks.jsonl` as a signed record chained
+  to the previous one (`prev_ack_sha256` is the digest of the previous raw
+  line), signed with the witness's own Ed25519 key — a key the executor never
+  holds.
+- Custody is idempotent on the digest: a retried handoff re-verifies the held
+  bytes and returns the original acknowledgement, so the crash window between
+  the executor's archive commit and the operational release resumes without
+  double-witnessing.
+- `sandbox-custodyd -verify -custody-dir <dir>` re-derives the whole store
+  independently — chain links, signatures, payload digests, and orphaned
+  payloads — from the durable bytes alone.
+
+If the custodian cannot be reached or refuses, the archive rows and the
+pending segment are durable but the operational rows are never released; the
+handoff retries on every later archive pass and across restarts, idempotent on
+the segment digest.
+
 ## Continuous recovery
 
 Startup reconciliation fixes what a previous lifetime left, but a daemon that

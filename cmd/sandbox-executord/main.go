@@ -137,6 +137,7 @@ func main() {
 	ledgerPath := flag.String("ledger", os.Getenv("SANDBOX_EXECUTOR_LEDGER"), "durable job ledger path (or SANDBOX_EXECUTOR_LEDGER)")
 	maxConns := flag.Int("max-conns", 0, "simultaneous connection bound (default 64)")
 	dispatchTimeout := flag.Duration("dispatch-timeout", 0, "bound on one backend launch call (default 45s)")
+	maintenanceInterval := flag.Duration("maintenance-interval", 0, "continuous-recovery cadence: stranded dispatch claims, cleanup retries, re-observation, archival (default 60s; negative disables)")
 	contractMaxTTL := flag.Duration("contract-max-ttl", 0, "bound on contract validity window (default 1h; negative disables)")
 	ceilCPUs := flag.Float64("ceil-cpus", 0, "contract cpus ceiling (0 = no operator ceiling)")
 	ceilMemMB := flag.Uint64("ceil-memory-mb", 0, "contract memory_mb ceiling (0 = no operator ceiling)")
@@ -151,6 +152,9 @@ func main() {
 	poolOutput := flag.Uint64("pool-output-bytes", 0, "aggregate bound on declared output in bytes (required: a positive bound for a configured backend)")
 	evidenceDir := flag.String("evidence-dir", os.Getenv("SANDBOX_EXECUTOR_EVIDENCE_DIR"), "execution-evidence chain directory (or SANDBOX_EXECUTOR_EVIDENCE_DIR)")
 	evidenceKey := flag.String("evidence-key", os.Getenv("SANDBOX_EXECUTOR_EVIDENCE_KEY"), "evidence signer PKCS8 PEM path (or SANDBOX_EXECUTOR_EVIDENCE_KEY)")
+	custodySocket := flag.String("archive-custody-socket", os.Getenv("SANDBOX_EXECUTOR_CUSTODY_SOCKET"), "sandbox-custodyd socket — witnessed external custody for archive segments (or SANDBOX_EXECUTOR_CUSTODY_SOCKET)")
+	custodyTokenFile := flag.String("archive-custody-token-file", os.Getenv("SANDBOX_EXECUTOR_CUSTODY_TOKEN_FILE"), "shared-secret file the custody daemon requires (or SANDBOX_EXECUTOR_CUSTODY_TOKEN_FILE)")
+	custodySigner := flag.String("archive-custody-signer", os.Getenv("SANDBOX_EXECUTOR_CUSTODY_SIGNER"), "pinned custody-witness signer fingerprint — acknowledgements under a different key are refused (or SANDBOX_EXECUTOR_CUSTODY_SIGNER)")
 	flag.Parse()
 
 	peers, err := sandboxexecutor.ParsePeerAllowlist(*peerUIDs)
@@ -244,6 +248,15 @@ func main() {
 		log.Fatalf("sandbox-executord: unknown backend %q (want \"\" or \"microsandbox\")", *backendName)
 	}
 
+	var custodyToken string
+	if *custodyTokenFile != "" {
+		raw, err := os.ReadFile(*custodyTokenFile)
+		if err != nil {
+			log.Fatalf("sandbox-executord: %v", err)
+		}
+		custodyToken = strings.TrimSpace(string(raw))
+	}
+
 	var ceiling *sandboxexecutor.ResourceBudget
 	if *ceilCPUs > 0 || *ceilMemMB > 0 || *ceilDiskMB > 0 || *ceilOutput > 0 || *ceilTimeout > 0 {
 		ceiling = &sandboxexecutor.ResourceBudget{
@@ -271,22 +284,33 @@ func main() {
 		}
 	}
 
-	srv, err := sandboxexecutor.NewServer(sandboxexecutor.Config{
-		SocketDir:       *socketDir,
-		Peers:           peers,
-		Token:           token,
-		AuthorityKeys:   keys,
-		Backend:         backend,
-		LedgerPath:      *ledgerPath,
-		MaxConns:        *maxConns,
-		DispatchTimeout: *dispatchTimeout,
-		MaxContractTTL:  *contractMaxTTL,
-		ResourceCeiling: ceiling,
-		ResourcePool:    pool,
-		EvidenceDir:     *evidenceDir,
-		EvidenceKeyPath: *evidenceKey,
-		Audit:           func(format string, args ...any) { log.Printf(format, args...) },
-	})
+	cfg := sandboxexecutor.Config{
+		SocketDir:           *socketDir,
+		Peers:               peers,
+		Token:               token,
+		AuthorityKeys:       keys,
+		Backend:             backend,
+		LedgerPath:          *ledgerPath,
+		MaxConns:            *maxConns,
+		DispatchTimeout:     *dispatchTimeout,
+		MaintenanceInterval: *maintenanceInterval,
+		MaxContractTTL:      *contractMaxTTL,
+		ResourceCeiling:     ceiling,
+		ResourcePool:        pool,
+		EvidenceDir:         *evidenceDir,
+		EvidenceKeyPath:     *evidenceKey,
+		Audit:               func(format string, args ...any) { log.Printf(format, args...) },
+	}
+	// External custody: archive segments are witnessed to the custody
+	// daemon before their operational rows release.
+	if *custodySocket != "" {
+		cfg.ArchiveCustodian = &sandboxexecutor.SocketCustodian{
+			Socket:         *custodySocket,
+			Token:          custodyToken,
+			ExpectedSigner: *custodySigner,
+		}
+	}
+	srv, err := sandboxexecutor.NewServer(cfg)
 	if err != nil {
 		log.Fatalf("sandbox-executord: %v", err)
 	}
