@@ -50,6 +50,7 @@ jobs:
       tree: ${{ steps.record.outputs.tree }}
       branch: ${{ steps.record.outputs.branch }}
       claimed_lanes: ${{ steps.lanes.outputs.claimed_lanes }}
+      lane_matrix: ${{ steps.lanes.outputs.lane_matrix }}
     steps:
       - name: Check out
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -109,6 +110,21 @@ jobs:
           done
           echo "resolved lane claims: ${resolved:-<none — restricted release>}"
           echo "claimed_lanes=$resolved" >> "$GITHUB_OUTPUT"
+          # The claimed set IS the lane matrix: a job-level `if` cannot
+          # see `matrix` (it is evaluated before matrix expansion), so
+          # claims gate lanes by never scheduling unclaimed ones. Runner
+          # selection is workflow configuration and lives beside the
+          # claim it schedules.
+          matrix='{"include":[]}'
+          for lane in $resolved; do
+            case "$lane" in
+              apple-hypervisor-framework) runner=macos-15 ;;
+              linux-kvm) runner=blacksmith-2vcpu-ubuntu-2404 ;;
+            esac
+            matrix="$(jq -c --arg l "$lane" --arg r "$runner" \
+              '.include += [{lane: $l, runner: $r}]' <<<"$matrix")"
+          done
+          echo "lane_matrix=$matrix" >> "$GITHUB_OUTPUT"
 
       - name: Verify version consistency
         shell: bash
@@ -397,15 +413,9 @@ jobs:
     timeout-minutes: 45
     needs: provenance
     runs-on: ${{ matrix.runner }}
-    if: contains(needs.provenance.outputs.claimed_lanes, matrix.lane)
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - lane: apple-hypervisor-framework
-            runner: macos-15
-          - lane: linux-kvm
-            runner: blacksmith-2vcpu-ubuntu-2404
+      matrix: ${{ fromJSON(needs.provenance.outputs.lane_matrix) }}
     steps:
       - name: Check out
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
