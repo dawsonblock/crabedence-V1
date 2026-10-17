@@ -285,6 +285,61 @@ def _scan_stream(path):
     return scan
 
 
+def lifecycle_findings(scan):
+    """The canonical lifecycle's completeness half — one authoritative
+    implementation shared by generation and verification.
+
+    _scan_stream enforces what the stream may contain (well-formed
+    events in legal order); this enforces what it must contain: exactly
+    one terminal outcome per test, exactly one terminal outcome per
+    package, and outcomes that do not contradict each other. A stream
+    missing any of these is truncated, fabricated, or describes a run
+    that did not pass — none of which may be normalized into evidence.
+
+    The package-outcome rule is part of lifecycle validity, not a
+    verification preference: a package that reports fail or skip while
+    its tests claim pass is an internally contradictory stream, and a
+    package that reports pass while a test failed or never terminated
+    launders failure into success. Neither can be evidence of a
+    passing run.
+    """
+    findings = []
+    for name in scan.order:
+        n = scan.cases[name]["terminal_events"]
+        if n != 1:
+            findings.append(
+                f"test {name} recorded {n} terminal events in the raw stream "
+                "(a genuine go test run produces exactly one)"
+            )
+    for pkg in sorted(p for p in scan.packages if p):
+        n = scan.pkg_terminal.get(pkg, 0)
+        pkg_tests = [t for t, p in scan.test_pkg.items() if p == pkg]
+        if n == 0:
+            findings.append(
+                f"package {pkg} has no terminal outcome — the run did not complete"
+            )
+        elif n > 1:
+            findings.append(f"package {pkg} recorded {n} terminal outcomes")
+        elif scan.pkg_outcome[pkg] != "pass":
+            # A package that failed or skipped is honest evidence of a
+            # failed run, never of a qualified one — a build break, a
+            # TestMain panic, or a skipped suite must not launder the
+            # per-test cases into a passing record.
+            findings.append(
+                f"package {pkg} finished with outcome {scan.pkg_outcome[pkg]} — "
+                "a failed or skipped package run is not passing evidence"
+            )
+        elif any(
+            (scan.cases[t]["status"] or "incomplete") in ("fail", "incomplete")
+            for t in pkg_tests
+        ):
+            findings.append(
+                f"package {pkg} reports pass while the derived test outcomes "
+                "contain a failed or incomplete case"
+            )
+    return findings
+
+
 def parse_stream(path):
     """Parse a go test -json stream into {name: {status, elapsed, out_sha, terminal_events}}.
 
@@ -295,8 +350,9 @@ def parse_stream(path):
     packages the events belonged to.
     """
     scan = _scan_stream(path)
-    if scan.findings:
-        for finding in scan.findings:
+    findings = scan.findings + lifecycle_findings(scan)
+    if findings:
+        for finding in findings:
             print(f"error: {finding}", file=sys.stderr)
         sys.exit(1)
     for rec in scan.cases.values():
@@ -320,47 +376,15 @@ def verify_stream(path, expect_package=""):
     construction the record the stream actually supports.
     """
     scan = _scan_stream(path)
-    findings = scan.findings
+    # Scan findings (what the stream may contain) and lifecycle
+    # findings (what it must contain) come from the same two
+    # implementations generation uses — verify can never reject a
+    # stream for a defect generation would have accepted.
+    findings = scan.findings + lifecycle_findings(scan)
     cases = scan.cases
     order = scan.order
     packages = scan.packages
-    test_pkg = scan.test_pkg
-    pkg_terminal = scan.pkg_terminal
-    pkg_outcome = scan.pkg_outcome
 
-    for name in order:
-        n = cases[name]["terminal_events"]
-        if n != 1:
-            findings.append(
-                f"test {name} recorded {n} terminal events in the raw stream "
-                "(a genuine go test run produces exactly one)"
-            )
-    for pkg in sorted(p for p in packages if p):
-        n = pkg_terminal.get(pkg, 0)
-        pkg_tests = [t for t, p in test_pkg.items() if p == pkg]
-        if n == 0:
-            findings.append(
-                f"package {pkg} has no terminal outcome — the run did not complete"
-            )
-        elif n > 1:
-            findings.append(f"package {pkg} recorded {n} terminal outcomes")
-        elif pkg_outcome[pkg] != "pass":
-            # A package that failed or skipped is honest evidence of a
-            # failed run, never of a qualified one — a build break, a
-            # TestMain panic, or a skipped suite must not launder the
-            # per-test cases into a passing record.
-            findings.append(
-                f"package {pkg} finished with outcome {pkg_outcome[pkg]} — "
-                "a failed or skipped package run is not passing evidence"
-            )
-        elif any(
-            (cases[t]["status"] or "incomplete") in ("fail", "incomplete")
-            for t in pkg_tests
-        ):
-            findings.append(
-                f"package {pkg} reports pass while the derived test outcomes "
-                "contain a failed or incomplete case"
-            )
     if expect_package:
         for pkg in sorted(p for p in packages if p):
             if pkg != expect_package and not pkg.endswith("/" + expect_package):

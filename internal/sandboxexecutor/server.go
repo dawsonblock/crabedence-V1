@@ -886,13 +886,15 @@ func (s *Server) driveDispatch(j *LedgerJob, contract *JobContractV2) (string, e
 			s.audit("job %s: evidence emission failed (%v) — refusing the terminal claim too", j.JobID, rerr)
 			return "", fmt.Errorf("backend refused and evidence emission failed for %q: %v", j.JobID, rerr)
 		}
-		_ = s.ledger.Transition(j.JobID, JobStateDispatchFailed, []string{JobStateDispatching},
+		if err := s.ledger.Transition(j.JobID, JobStateDispatchFailed, []string{JobStateDispatching},
 			func(lj *LedgerJob) error {
 				lj.ReceiptSHA256 = receiptSHA
 				lj.DispatchClass = string(DispatchNotAttempted)
 				lj.Error = fmt.Sprintf("dispatch refused before launch: %v", perr)
 				return nil
-			})
+			}); err != nil {
+			s.audit("job %s: refused-dispatch terminal record could not be committed (%v) — the row stays DISPATCHING for the straggler walk", j.JobID, err)
+		}
 		return JobStateDispatchFailed, fmt.Errorf("backend refused job: %v", perr)
 	}
 	if err := s.ledger.RecordDispatchPlan(j.JobID, s.backendName, plan); err != nil {
@@ -922,13 +924,18 @@ func (s *Server) driveDispatch(j *LedgerJob, contract *JobContractV2) (string, e
 		// The job may already be running. Record everything we
 		// know and refuse the retry path outright — an operator
 		// reconciles against the backend, never a blind relaunch.
-		_ = s.ledger.Transition(j.JobID, JobStateDispatchAmbig, []string{JobStateDispatching},
+		// The record is mandatory: a transition that cannot be
+		// committed leaves the row DISPATCHING, which the straggler
+		// walk resolves to the same uncertain classification.
+		if err := s.ledger.Transition(j.JobID, JobStateDispatchAmbig, []string{JobStateDispatching},
 			func(lj *LedgerJob) error {
 				applyRunIdentity(lj, s.backendName, disp)
 				lj.DispatchClass = string(DispatchUncertain)
 				lj.Error = derr.Error()
 				return nil
-			})
+			}); err != nil {
+			s.audit("job %s: ambiguous dispatch outcome could not be recorded (%v) — the row stays DISPATCHING for the straggler walk; the possibly-running workload is never retried or destroyed", j.JobID, err)
+		}
 		return JobStateDispatchAmbig, fmt.Errorf("dispatch outcome uncertain — reconciling manually; the job will NOT be retried: %v", derr)
 	case errors.Is(derr, ErrDispatchRefused):
 		// Definitive refusal: the backend proved nothing launched,
@@ -942,13 +949,15 @@ func (s *Server) driveDispatch(j *LedgerJob, contract *JobContractV2) (string, e
 			s.audit("job %s: evidence emission failed (%v) — refusing the terminal claim too", j.JobID, rerr)
 			return "", fmt.Errorf("backend refused and evidence emission failed for %q: %v", j.JobID, rerr)
 		}
-		_ = s.ledger.Transition(j.JobID, JobStateDispatchFailed, []string{JobStateDispatching},
+		if err := s.ledger.Transition(j.JobID, JobStateDispatchFailed, []string{JobStateDispatching},
 			func(lj *LedgerJob) error {
 				lj.Error, lj.BackendID, lj.BackendHandle, lj.ReceiptSHA256 =
 					derr.Error(), s.backendName, disp.Handle, receiptSHA
 				lj.DispatchClass = string(DispatchProvenRejected)
 				return nil
-			})
+			}); err != nil {
+			s.audit("job %s: refused-dispatch terminal record could not be committed (%v) — the row stays DISPATCHING for the straggler walk", j.JobID, err)
+		}
 		s.checkpoint()
 		return JobStateDispatchFailed, fmt.Errorf("backend refused job: %v", derr)
 	default:
@@ -957,13 +966,15 @@ func (s *Server) driveDispatch(j *LedgerJob, contract *JobContractV2) (string, e
 		// uncertainty exactly as an ambiguous dispatch — the job
 		// is never retried blind and never receives a NO_EFFECT
 		// receipt it cannot support.
-		_ = s.ledger.Transition(j.JobID, JobStateDispatchAmbig, []string{JobStateDispatching},
+		if err := s.ledger.Transition(j.JobID, JobStateDispatchAmbig, []string{JobStateDispatching},
 			func(lj *LedgerJob) error {
 				applyRunIdentity(lj, s.backendName, disp)
 				lj.DispatchClass = string(DispatchUncertain)
 				lj.Error = fmt.Sprintf("dispatch error could not be classified as a pre-launch refusal — treating the outcome as uncertain: %v", derr)
 				return nil
-			})
+			}); err != nil {
+			s.audit("job %s: uncertain dispatch outcome could not be recorded (%v) — the row stays DISPATCHING for the straggler walk; the possibly-running workload is never retried or destroyed", j.JobID, err)
+		}
 		s.audit("job %s: unclassified dispatch error treated as uncertain (never a no-effect claim): %v", j.JobID, derr)
 		return JobStateDispatchAmbig, fmt.Errorf("dispatch outcome uncertain — reconciling manually; the job will NOT be retried: %v", derr)
 	}

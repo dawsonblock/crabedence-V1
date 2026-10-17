@@ -262,8 +262,12 @@ func (l *Ledger) Epoch() uint64 { return l.epoch }
 // recovery_attempts paces retries across restarts so a crash-looping
 // daemon cannot re-attempt every row on every open, and
 // recovery_events is the durable escalation trail the audit line
-// previously left only in logs.
-const ledgerSchemaVersion = 9
+// previously left only in logs. v10 makes the recovery claim fenced
+// and owned: claim_epoch names the ledger generation holding the
+// attempt and claim_until_ms its exclusive lease, so a claim is one
+// atomic conditional grant rather than a read-check-write pair two
+// claimants could both win.
+const ledgerSchemaVersion = 10
 
 func (l *Ledger) migrate() error {
 	var version int
@@ -477,6 +481,20 @@ func (l *Ledger) migrate() error {
 		`)
 		if err != nil {
 			return fmt.Errorf("migrate ledger v%d→v9: %w", version, err)
+		}
+	}
+	if version < 10 {
+		// v9 → v10: fenced recovery ownership. Existing pacing rows
+		// get a zero epoch and an expired lease — they stay claimable
+		// on the backoff schedule they already earned, and their first
+		// claim under the new schema stamps the owning epoch.
+		for _, ddl := range []string{
+			`ALTER TABLE recovery_attempts ADD COLUMN claim_epoch INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE recovery_attempts ADD COLUMN claim_until_ms INTEGER NOT NULL DEFAULT 0`,
+		} {
+			if _, err := l.db.Exec(ddl); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+				return fmt.Errorf("migrate ledger v%d→v10: %w", version, err)
+			}
 		}
 	}
 	if version < ledgerSchemaVersion {
@@ -935,7 +953,16 @@ func (l *Ledger) AdoptBackendRun(jobID, runID, bootID string) error {
 	if bootID == "" {
 		return fmt.Errorf("adopt run identity for %s: empty boot generation", jobID)
 	}
-	res, err := l.db.Exec(
+	// An execution-identity change is a mandatory recovery record:
+	// the identity update and the durable event that attests it are
+	// one commit — a row that cannot prove who it was adopted as is
+	// left unresolved rather than rewritten without evidence.
+	tx, err := l.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return fmt.Errorf("adopt run identity for %s: %w", jobID, err)
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(
 		`UPDATE jobs SET backend_job_id = ?, backend_boot_id = ? WHERE job_id = ? AND terminal_seq IS NULL`,
 		runID, bootID, jobID)
 	if err != nil {
@@ -944,7 +971,12 @@ func (l *Ledger) AdoptBackendRun(jobID, runID, bootID string) error {
 	if n, _ := res.RowsAffected(); n != 1 {
 		return fmt.Errorf("adopt run identity for %s: no unresolved row", jobID)
 	}
-	return nil
+	if err := l.recordRecoveryEventTx(tx, "adopt", jobID,
+		fmt.Sprintf("runtime run %s under boot generation %s adopted as the job's execution identity", runID, bootID),
+		time.Now().UTC()); err != nil {
+		return fmt.Errorf("adopt run identity for %s: %w", jobID, err)
+	}
+	return tx.Commit()
 }
 
 // MarkCleanupPending records that a job's backend resources could not
@@ -958,7 +990,15 @@ func (l *Ledger) AdoptBackendRun(jobID, runID, bootID string) error {
 // them after the terminal write would invalidate the chain. Cleanup
 // state is operational bookkeeping, outside the attested result.
 func (l *Ledger) MarkCleanupPending(jobID, reason string) error {
-	res, err := l.db.Exec(
+	// Recording that a destructive cleanup was deferred is mandatory
+	// evidence — the flag and its record commit together or not at
+	// all.
+	tx, err := l.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return fmt.Errorf("mark cleanup pending for %s: %w", jobID, err)
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(
 		`UPDATE jobs SET cleanup_pending = 1, cleanup_error = ? WHERE job_id = ?`,
 		reason, jobID)
 	if err != nil {
@@ -967,14 +1007,23 @@ func (l *Ledger) MarkCleanupPending(jobID, reason string) error {
 	if n, _ := res.RowsAffected(); n != 1 {
 		return fmt.Errorf("mark cleanup pending for %s: no such job", jobID)
 	}
-	return nil
+	if err := l.recordRecoveryEventTx(tx, "cleanup_pending", jobID, reason, time.Now().UTC()); err != nil {
+		return fmt.Errorf("mark cleanup pending for %s: %w", jobID, err)
+	}
+	return tx.Commit()
 }
 
 // ClearCleanupPending records that a previously pending cleanup
 // finally succeeded. Like MarkCleanupPending it leaves every
-// checkpoint-covered field untouched.
+// checkpoint-covered field untouched — and like it, the clear and the
+// durable record of the completed removal are one commit.
 func (l *Ledger) ClearCleanupPending(jobID string) error {
-	res, err := l.db.Exec(
+	tx, err := l.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return fmt.Errorf("clear cleanup pending for %s: %w", jobID, err)
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(
 		`UPDATE jobs SET cleanup_pending = 0, cleanup_error = '' WHERE job_id = ?`, jobID)
 	if err != nil {
 		return fmt.Errorf("clear cleanup pending for %s: %w", jobID, err)
@@ -982,7 +1031,11 @@ func (l *Ledger) ClearCleanupPending(jobID string) error {
 	if n, _ := res.RowsAffected(); n != 1 {
 		return fmt.Errorf("clear cleanup pending for %s: no such job", jobID)
 	}
-	return nil
+	if err := l.recordRecoveryEventTx(tx, "cleanup", jobID,
+		"pending backend removal completed", time.Now().UTC()); err != nil {
+		return fmt.Errorf("clear cleanup pending for %s: %w", jobID, err)
+	}
+	return tx.Commit()
 }
 
 // CleanupCandidates returns one page of terminal jobs whose backend
@@ -1165,6 +1218,20 @@ func (l *Ledger) listActive() ([]*LedgerJob, error) {
 // this lifetime's fence epoch — a row that moved under an epoch that
 // is not ours was moved by someone who bypassed the lock.
 func (l *Ledger) Transition(jobID, to string, from []string, mutate func(*LedgerJob) error) error {
+	return l.transition(jobID, to, from, "", "", mutate)
+}
+
+// TransitionWithRecoveryEvent is Transition with the mandatory
+// recovery record bound into the same commit: the state change and
+// the durable record that explains it either both land or neither
+// does — a transition whose mandatory evidence cannot be written
+// leaves the job exactly where it was, unresolved rather than
+// silently recorded.
+func (l *Ledger) TransitionWithRecoveryEvent(jobID, to string, from []string, eventKind, eventDetail string, mutate func(*LedgerJob) error) error {
+	return l.transition(jobID, to, from, eventKind, eventDetail, mutate)
+}
+
+func (l *Ledger) transition(jobID, to string, from []string, eventKind, eventDetail string, mutate func(*LedgerJob) error) error {
 	if len(from) == 0 {
 		return fmt.Errorf("transition of %s requires source states", jobID)
 	}
@@ -1251,6 +1318,11 @@ func (l *Ledger) Transition(jobID, to string, from []string, mutate func(*Ledger
 	}
 	if n, _ := res.RowsAffected(); n != 1 {
 		return fmt.Errorf("%w: %s changed underneath the transition", ErrTransitionConflict, jobID)
+	}
+	if eventKind != "" {
+		if err := l.recordRecoveryEventTx(tx, eventKind, jobID, eventDetail, time.Now().UTC()); err != nil {
+			return fmt.Errorf("record mandatory recovery evidence for %s: %w", jobID, err)
+		}
 	}
 	return tx.Commit()
 }

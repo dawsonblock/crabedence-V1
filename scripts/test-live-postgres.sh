@@ -17,7 +17,9 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PG_IMAGE="${CRABBOX_TEST_PG_IMAGE:-postgres:16}"
+# Same immutable digest as the CI postgres:16 service so a local run
+# exercises the identical image bytes the qualification gate ran.
+PG_IMAGE="${CRABBOX_TEST_PG_IMAGE:-postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94}"
 PG_DB="${CRABBOX_TEST_PG_DB:-crabbox_test}"
 
 usage() {

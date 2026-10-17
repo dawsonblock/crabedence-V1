@@ -789,16 +789,21 @@ func (b *MSBBackend) Dispatch(ctx context.Context, job *JobContractV2, plan *Dis
 	// adopted later.
 	doc, ierr := b.inspectRaw(ctx, name)
 	if ierr != nil {
-		b.destroy(name)
+		// The VM we just created could not be inspected — a
+		// transport failure says nothing about what now occupies
+		// the name, so only a verified-ours sandbox is destroyed.
+		// An unverifiable one is left for reconciliation rather
+		// than removed blind; no guest command has run either way.
+		b.destroyIfOurs(name, nonce)
 		return RunIdentity{}, fmt.Errorf("%w: verify sandbox %s before execution: %v", ErrDispatchRefused, name, ierr)
 	}
 	if verr := verifyBootedPolicy(policy, doc); verr != nil {
-		b.destroy(name)
+		b.destroyIfVerified(name, nonce, doc)
 		return RunIdentity{}, fmt.Errorf("%w: sandbox %s failed policy verification — destroyed before execution: %v", ErrDispatchRefused, name, verr)
 	}
 	bootID, berr := b.sandboxBootID(doc)
 	if berr != nil {
-		b.destroy(name)
+		b.destroyIfVerified(name, nonce, doc)
 		return RunIdentity{}, fmt.Errorf("%w: bind the VM boot generation of %s before execution: %v", ErrDispatchRefused, name, berr)
 	}
 	identity.BootID = bootID
@@ -837,10 +842,19 @@ func (b *MSBBackend) Dispatch(ctx context.Context, job *JobContractV2, plan *Dis
 		switch len(matched) {
 		case 1:
 			// The launch was admitted; only its identity was lost.
+			// The record may be adopted only if it proves to run in
+			// the boot generation this dispatch verified. A mismatch
+			// means the job belongs to a different VM instance — a
+			// substituted or re-created sandbox — and that workload
+			// may still be running: it is preserved for operator
+			// reconciliation, its identity returned as evidence, and
+			// the outcome stays ambiguous. An unverified identity is
+			// never proof the workload stopped, so nothing here is
+			// destroyed and no refusal is claimed.
 			if matched[0].RuntimeBoot != bootID {
-				b.destroy(name)
-				return identity, fmt.Errorf("the sandbox records job %s under boot generation %s, not the verified %s — refusing to adopt a substituted VM instance",
-					matched[0].ID, matched[0].RuntimeBoot, bootID)
+				identity.RunID = matched[0].ID
+				return identity, fmt.Errorf("%w: the sandbox records job %s under boot generation %s, not the verified %s — a substituted VM instance whose workload may be live is left for reconciliation, never destroyed on an identity mismatch",
+					ErrAmbiguousDispatch, matched[0].ID, matched[0].RuntimeBoot, bootID)
 			}
 			identity.RunID = matched[0].ID
 			return identity, nil
@@ -904,6 +918,14 @@ func (b *MSBBackend) destroyIfOurs(name, nonce string) {
 	if err != nil {
 		return
 	}
+	b.destroyIfVerified(name, nonce, doc)
+}
+
+// destroyIfVerified removes the sandbox only when an inspect document
+// this dispatch already holds proves it carries this dispatch's
+// identity label — the pre-execution cleanup of a failed verification
+// never removes a VM it cannot prove this dispatch created.
+func (b *MSBBackend) destroyIfVerified(name, nonce string, doc map[string]any) {
 	cfg, _ := doc["config"].(map[string]any)
 	labels, _ := cfg["labels"].(map[string]any)
 	if jsonString(labels, "crabedence.dispatch") == nonce {

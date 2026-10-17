@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "description": "Reviewed immutable digests for the microVM qualification lane images. A claimed lane must pull exactly these bytes — never whatever a mutable tag resolves to at run time. Digests are per-architecture: apple-hypervisor-framework runs on arm64 (macos-15), linux-kvm on amd64 (ubuntu-latest). Refresh by resolving the tag's manifest list at review time and recording the per-architecture digest.",
+  "image": "python:3.12",
+  "lanes": {
+    "apple-hypervisor-framework": {
+      "architecture": "arm64",
+      "digest": "sha256:80dc3cfc45ae547207a41dad6f0e8bf86fbf11fe53e1b3e3a075893ba132c01d"
+    },
+    "linux-kvm": {
+      "architecture": "amd64",
+      "digest": "sha256:3d361d7fea344d55ac7a0f51ed7faa99213808ccc96fc9b9170adb95b6570b96"
+    }
+  }
+}

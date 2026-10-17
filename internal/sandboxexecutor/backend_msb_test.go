@@ -728,6 +728,20 @@ func fakeExec(dir string, args []string) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
+	if os.Getenv("MSB_FAKE_JOB_DUPLICATED") != "" {
+		// The runtime admitted the launch twice — its durable store
+		// holds two records matching the authorized command.
+		if err := fakeWriteJob(dir, name, command); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			return 1
+		}
+	}
+	if secs := fakeEnvInt("MSB_FAKE_EXEC_SLEEP", 0); secs > 0 {
+		// The launch is admitted and recorded, but its
+		// acknowledgement never returns — a wedged transport the
+		// caller's deadline eventually cancels.
+		time.Sleep(time.Duration(secs) * time.Second)
+	}
 	if os.Getenv("MSB_FAKE_LAUNCH_FAIL") != "" {
 		target := "command"
 		if len(command) > 0 {
@@ -960,6 +974,12 @@ func fakeJobs(dir string, args []string) int {
 	name := fakeName(args)
 	if _, err := os.Stat(fakeStatePath(dir, name)); err != nil {
 		fmt.Fprintf(os.Stderr, "error: sandbox not found: %s\n", name)
+		return 1
+	}
+	if os.Getenv("MSB_FAKE_JOBS_FAIL") != "" {
+		// A runtime that cannot enumerate its durable job store —
+		// the shape a post-restart outage has.
+		fmt.Fprintln(os.Stderr, "error: job enumeration unavailable")
 		return 1
 	}
 	recs, err := fakeReadJobs(dir, name)
@@ -2748,6 +2768,161 @@ func TestMSBDispatchBindsBootGeneration(t *testing.T) {
 	}
 	if _, serr := os.Stat(fakeStatePath(stateDir, name)); serr != nil {
 		t.Fatal("the VM of a possibly-running workload was destroyed instead of left for reconciliation")
+	}
+}
+
+// TestMSBDispatchDiscoveredBootMismatchIsAmbiguous: when the launch's
+// identity is lost in transport and the runtime's discovered job
+// record carries a boot generation other than the verified one, the
+// workload may be live in a substituted VM instance. The sandbox must
+// be left for reconciliation — never destroyed — the discovered job
+// id preserved as evidence, and the outcome classified ambiguous so
+// the job can never be blind-retried or reported dead (F-037b).
+func TestMSBDispatchDiscoveredBootMismatchIsAmbiguous(t *testing.T) {
+	key, _ := testAuthority(t)
+	bin, stateDir := fakeMSB(t, map[string]string{
+		"MSB_FAKE_LAUNCH_FAIL_ADMITTED": "1",
+		"MSB_FAKE_JOB_BOOT_MISMATCH":    "1",
+	})
+	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
+	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "bm-disc"; c.Nonce = "n-bm-disc" })
+	name := backend.msbJobName(job.JobID)
+
+	disp, err := backend.Dispatch(testContext(t), job, nil)
+	if err == nil {
+		t.Fatal("a job discovered in a substituted VM instance was adopted")
+	}
+	if !errors.Is(err, ErrAmbiguousDispatch) {
+		t.Fatalf("an unverified discovered identity is %v — it must be uncertain, never a refusal or a plain failure", err)
+	}
+	if !strings.Contains(err.Error(), "substituted VM instance") {
+		t.Fatalf("refusal %q does not name the boot-generation mismatch", err)
+	}
+	if disp.RunID == "" {
+		t.Fatal("the discovered job id was not preserved as reconciliation evidence")
+	}
+	if disp.Handle != name {
+		t.Fatalf("the ambiguous identity lost the handle: %+v", disp)
+	}
+	if _, serr := os.Stat(fakeStatePath(stateDir, name)); serr != nil {
+		t.Fatal("the VM of a possibly-running workload was destroyed instead of left for reconciliation")
+	}
+	recs, rerr := fakeReadJobs(stateDir, name)
+	if rerr != nil || len(recs) != 1 {
+		t.Fatalf("the runtime's durable job record was disturbed: %+v (%v)", recs, rerr)
+	}
+}
+
+// TestMSBDispatchDuplicateAdmittedJobsIsAmbiguous: the runtime admits
+// the launch twice and loses the identity — two durable records match
+// the authorized command. Nothing can say which run is this dispatch,
+// so the outcome is ambiguous, the sandbox and both records are
+// preserved for the operator, and no retry is implied.
+func TestMSBDispatchDuplicateAdmittedJobsIsAmbiguous(t *testing.T) {
+	key, _ := testAuthority(t)
+	bin, stateDir := fakeMSB(t, map[string]string{
+		"MSB_FAKE_LAUNCH_FAIL_ADMITTED": "1",
+		"MSB_FAKE_JOB_DUPLICATED":       "1",
+	})
+	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
+	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "dup-1"; c.Nonce = "n-dup" })
+	name := backend.msbJobName(job.JobID)
+
+	_, err := backend.Dispatch(testContext(t), job, nil)
+	if err == nil {
+		t.Fatal("two matching runtime job records produced a clean dispatch")
+	}
+	if !errors.Is(err, ErrAmbiguousDispatch) {
+		t.Fatalf("duplicate runtime records resolved as %v — they must stay uncertain", err)
+	}
+	if !strings.Contains(err.Error(), "2 jobs") {
+		t.Fatalf("the ambiguous outcome does not name the record count: %v", err)
+	}
+	if _, serr := os.Stat(fakeStatePath(stateDir, name)); serr != nil {
+		t.Fatal("the VM of possibly-running workloads was destroyed instead of left for reconciliation")
+	}
+	if recs, _ := fakeReadJobs(stateDir, name); len(recs) != 2 {
+		t.Fatalf("the runtime's job records were disturbed: %d", len(recs))
+	}
+}
+
+// TestMSBDispatchProbeFailureIsAmbiguous: the launch may have been
+// admitted and the runtime's job store cannot even be enumerated —
+// the post-restart shape. The outcome is genuinely unknown: ambiguous,
+// the sandbox preserved, and nothing about it is claimed.
+func TestMSBDispatchProbeFailureIsAmbiguous(t *testing.T) {
+	key, _ := testAuthority(t)
+	bin, stateDir := fakeMSB(t, map[string]string{
+		"MSB_FAKE_LAUNCH_FAIL_ADMITTED": "1",
+		"MSB_FAKE_JOBS_FAIL":            "1",
+	})
+	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
+	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "probe-1"; c.Nonce = "n-probe" })
+	name := backend.msbJobName(job.JobID)
+
+	disp, err := backend.Dispatch(testContext(t), job, nil)
+	if err == nil {
+		t.Fatal("an unprobeable launch was reported clean")
+	}
+	if !errors.Is(err, ErrAmbiguousDispatch) {
+		t.Fatalf("an unverifiable launch resolved as %v — it must be uncertain", err)
+	}
+	if disp.Handle != name || disp.BootID == "" {
+		t.Fatalf("the ambiguous identity did not preserve the verified boot generation: %+v", disp)
+	}
+	if _, serr := os.Stat(fakeStatePath(stateDir, name)); serr != nil {
+		t.Fatal("the VM of a possibly-running workload was destroyed instead of left for reconciliation")
+	}
+}
+
+// TestMSBDispatchCancelledAfterAdmissionIsAmbiguous: the controller
+// cancels while the admitted launch is still being acknowledged — the
+// runtime's durable store already holds the job but the transport
+// dies before naming it. Cancellation cannot prove the runtime's
+// state: the outcome is ambiguous, and the recorded job and the VM
+// survive for reconciliation.
+func TestMSBDispatchCancelledAfterAdmissionIsAmbiguous(t *testing.T) {
+	key, _ := testAuthority(t)
+	bin, stateDir := fakeMSB(t, map[string]string{"MSB_FAKE_EXEC_SLEEP": "30"})
+	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
+	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "cancel-1"; c.Nonce = "n-cancel" })
+	name := backend.msbJobName(job.JobID)
+
+	// Cancel the moment the runtime's durable job record exists —
+	// admission observed, acknowledgement still in flight. That is a
+	// synchronized trigger, not a timing guess: the record file is
+	// the evidence the launch reached the runtime.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		deadline := time.Now().Add(20 * time.Second)
+		for time.Now().Before(deadline) {
+			if ctx.Err() != nil {
+				return
+			}
+			if _, err := os.Stat(fakeJobsPath(stateDir, name)); err == nil {
+				cancel()
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		cancel()
+	}()
+	disp, err := backend.Dispatch(ctx, job, nil)
+	if err == nil {
+		t.Fatal("a launch cancelled after admission was reported clean")
+	}
+	if !errors.Is(err, ErrAmbiguousDispatch) {
+		t.Fatalf("a launch cancelled mid-ack resolved as %v — it must be uncertain", err)
+	}
+	if disp.Handle != name {
+		t.Fatalf("the ambiguous dispatch lost its handle: %+v", disp)
+	}
+	if _, serr := os.Stat(fakeStatePath(stateDir, name)); serr != nil {
+		t.Fatal("the VM of a possibly-running workload was destroyed instead of left for reconciliation")
+	}
+	if recs, _ := fakeReadJobs(stateDir, name); len(recs) != 1 {
+		t.Fatalf("the admitted job's record was disturbed: %d", len(recs))
 	}
 }
 

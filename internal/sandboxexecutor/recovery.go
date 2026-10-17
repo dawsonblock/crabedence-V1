@@ -1,6 +1,7 @@
 package sandboxexecutor
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"time"
@@ -39,31 +40,102 @@ type RecoveryEvent struct {
 	Detail  string
 }
 
+// RecoveryClaim is the durable, fenced ownership of one recovery
+// attempt — permission to run exactly one attempt of action on jobID,
+// held exclusively until LeaseUntil. OwnerEpoch is the claiming ledger
+// lifetime's fence epoch: the audit trail can name which generation of
+// the executor held each attempt, and a claim replayed by anything but
+// the owner generation cannot be mistaken for current permission.
+// Attempt is the monotonic ordinal of attempts granted for the pair —
+// it never repeats and never decreases for the life of the pacing row.
+type RecoveryClaim struct {
+	JobID      string
+	Action     string
+	Attempt    int
+	OwnerEpoch uint64
+	ClaimedAt  time.Time
+	LeaseUntil time.Time
+}
+
 // ClaimRecoveryAttempt is the durable version of the old pacing map:
 // the first sighting of a job/action is always due; then once per
 // backoff — across restarts, because the stamp lives in the ledger.
-// Returns whether the attempt may proceed and the ordinal of this
-// attempt (the audit trail can say "attempt 14" and mean it).
-func (l *Ledger) ClaimRecoveryAttempt(jobID, action string, backoff time.Duration, now time.Time) (bool, int, error) {
-	var lastMS int64
+//
+// The claim is one atomic write, not a read-check-write pair. The
+// conditional upsert updates the pacing row only when the previous
+// attempt is older than backoff AND the previous claim's lease has
+// expired, and it commits together with the recovery_events row that
+// records the grant — a claim that cannot be durably evidenced is a
+// claim that never happened, so a failed write leaves the row
+// untouched rather than granting an unrecorded attempt.
+//
+// Returns nil without error when the row is not due. lease bounds how
+// long the grant belongs to this claimant: an abandoned claim expires
+// at ClaimedAt+lease and only then can another claimant take the row —
+// and only when backoff has also elapsed, so a lease can never shorten
+// the pacing window.
+func (l *Ledger) ClaimRecoveryAttempt(jobID, action string, backoff, lease time.Duration, now time.Time) (*RecoveryClaim, error) {
+	if backoff < 0 {
+		return nil, fmt.Errorf("recovery claim %s/%s: negative backoff %s", jobID, action, backoff)
+	}
+	if lease <= 0 {
+		// No explicit window: the pacing window is the ownership
+		// lease — an abandoned claim re-arms exactly when the next
+		// attempt would be due anyway.
+		lease = backoff
+	}
+	if lease <= 0 {
+		return nil, fmt.Errorf("recovery claim %s/%s: non-positive lease %s", jobID, action, lease)
+	}
+	nowMS := now.UnixMilli()
+	dueBeforeMS := now.Add(-backoff).UnixMilli()
+	untilMS := now.Add(lease).UnixMilli()
+
+	tx, err := l.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("recovery claim %s/%s: %w", jobID, action, err)
+	}
+	defer tx.Rollback()
 	var attempts int
-	err := l.db.QueryRow(`SELECT last_attempt_ms, attempts FROM recovery_attempts
-		WHERE job_id = ? AND action = ?`, jobID, action).Scan(&lastMS, &attempts)
-	if err != nil && err != sql.ErrNoRows {
-		return false, 0, fmt.Errorf("recovery claim %s/%s: %w", jobID, action, err)
+	err = tx.QueryRow(`INSERT INTO recovery_attempts
+		(job_id, action, last_attempt_ms, attempts, claim_epoch, claim_until_ms)
+		VALUES (?, ?, ?, 1, ?, ?)
+		ON CONFLICT(job_id, action) DO UPDATE SET
+			last_attempt_ms = MAX(recovery_attempts.last_attempt_ms, excluded.last_attempt_ms),
+			attempts        = recovery_attempts.attempts + 1,
+			claim_epoch     = excluded.claim_epoch,
+			claim_until_ms  = excluded.claim_until_ms
+		WHERE recovery_attempts.last_attempt_ms <= ?
+		  AND recovery_attempts.claim_until_ms  <= ?
+		RETURNING attempts`,
+		jobID, action, nowMS, l.epoch, untilMS, dueBeforeMS, nowMS).Scan(&attempts)
+	if err == sql.ErrNoRows {
+		// Not due or still claimed: no write landed, no evidence is
+		// owed, and no permission was granted.
+		return nil, nil
 	}
-	if err == nil && now.Sub(time.UnixMilli(lastMS)) < backoff {
-		return false, attempts, nil
+	if err != nil {
+		return nil, fmt.Errorf("recovery claim %s/%s: %w", jobID, action, err)
 	}
-	attempts++
-	if _, err := l.db.Exec(`INSERT INTO recovery_attempts (job_id, action, last_attempt_ms, attempts)
-		VALUES (?,?,?,?)
-		ON CONFLICT(job_id, action) DO UPDATE SET last_attempt_ms = excluded.last_attempt_ms,
-		attempts = excluded.attempts`,
-		jobID, action, now.UnixMilli(), attempts); err != nil {
-		return false, 0, fmt.Errorf("recovery claim %s/%s: %w", jobID, action, err)
+	// The grant and its record are one commit: a maintenance pass that
+	// cannot durably record that it took ownership does not run the
+	// attempt — the unresolved row simply waits for the next pass.
+	if err := l.recordRecoveryEventTx(tx, "claim", jobID,
+		fmt.Sprintf("%s attempt %d claimed by epoch %d (lease until %d)",
+			action, attempts, l.epoch, untilMS), now); err != nil {
+		return nil, fmt.Errorf("recovery claim %s/%s: %w", jobID, action, err)
 	}
-	return true, attempts, nil
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit recovery claim %s/%s: %w", jobID, action, err)
+	}
+	return &RecoveryClaim{
+		JobID:      jobID,
+		Action:     action,
+		Attempt:    attempts,
+		OwnerEpoch: l.epoch,
+		ClaimedAt:  time.UnixMilli(nowMS).UTC(),
+		LeaseUntil: time.UnixMilli(untilMS).UTC(),
+	}, nil
 }
 
 // ForgetRecoveryAttempt drops pacing state for a job that resolved —
@@ -73,13 +145,28 @@ func (l *Ledger) ForgetRecoveryAttempt(jobID, action string) error {
 	return err
 }
 
+// recordRecoveryEventTx inserts one durable recovery record inside an
+// in-flight transaction — the write that lets a state change and its
+// mandatory audit evidence commit or roll back as one.
+func (l *Ledger) recordRecoveryEventTx(tx *sql.Tx, kind, subject, detail string, at time.Time) error {
+	_, err := tx.Exec(`INSERT INTO recovery_events (at_ms, kind, subject, detail) VALUES (?,?,?,?)`,
+		at.UnixMilli(), kind, subject, detail)
+	return err
+}
+
 // RecordRecoveryEvent appends one durable recovery record. These are
 // written inside the maintenance pass's own cadence, so growth is
 // bounded by residue — a healthy registry logs nothing here.
 func (l *Ledger) RecordRecoveryEvent(kind, subject, detail string, at time.Time) error {
-	_, err := l.db.Exec(`INSERT INTO recovery_events (at_ms, kind, subject, detail) VALUES (?,?,?,?)`,
-		at.UnixMilli(), kind, subject, detail)
-	return err
+	tx, err := l.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := l.recordRecoveryEventTx(tx, kind, subject, detail, at); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // hasTable reports whether the named table exists — read-only

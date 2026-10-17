@@ -411,3 +411,163 @@ func TestMaintenanceMarksStaleDispatchingAmbiguous(t *testing.T) {
 		t.Fatal("an uncertain outcome received terminal evidence")
 	}
 }
+
+// ─── Mandatory recovery evidence is durable or nothing moves ────────
+
+// failRecoveryEvents installs an INSERT abort on recovery_events —
+// the injected storage failure the mandatory-evidence tests drive.
+func failRecoveryEvents(t *testing.T, srv *Server) {
+	t.Helper()
+	if _, err := srv.Ledger().db.Exec(`CREATE TRIGGER fail_recovery_events
+		BEFORE INSERT ON recovery_events
+		BEGIN SELECT RAISE(ABORT, 'injected recovery_events failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func allowRecoveryEvents(t *testing.T, srv *Server) {
+	t.Helper()
+	if _, err := srv.Ledger().db.Exec(`DROP TRIGGER fail_recovery_events`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func recoveryEventCount(t *testing.T, srv *Server, kind, subject string) int {
+	t.Helper()
+	var n int
+	if err := srv.Ledger().db.QueryRow(
+		`SELECT COUNT(*) FROM recovery_events WHERE kind = ? AND subject = ?`,
+		kind, subject).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// A deferred dispatch claim whose mandatory record cannot commit
+// never happens: the row stays RECORDED and no dispatch is driven —
+// an unevidenced ownership grant is no grant.
+func TestMaintenanceClaimFailsClosedOnEvidenceFailure(t *testing.T) {
+	dir := socketDir(t)
+	key, keys := testAuthority(t)
+	be := &stubBackend{handle: "vm-fc", wait: make(chan *ExecResult)}
+	srv := startServer(t, Config{
+		SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys,
+		Backend: be, MaintenanceInterval: 15 * time.Millisecond,
+	})
+	failRecoveryEvents(t, srv)
+	insertStrandedRecorded(t, srv, key, "fc-claim", nil)
+	// Several passes run with the store faulted: the claim can never
+	// complete, so the row is never claimed and nothing reaches the
+	// backend.
+	time.Sleep(300 * time.Millisecond)
+	j, _ := srv.Ledger().Get("fc-claim")
+	if j.State != JobStateRecorded {
+		t.Fatalf("a stranded row was claimed while its evidence could not commit: %s", j.State)
+	}
+	if be.got != nil {
+		t.Fatal("a dispatch ran without its mandatory claim record")
+	}
+	// Once the store recovers, the very next pass claims it — a
+	// rolled-back claim left nothing half-recorded behind.
+	allowRecoveryEvents(t, srv)
+	j = waitForState(t, srv, "fc-claim", JobStateRunning, JobStateDispatching)
+	if j.State == JobStateRunning && recoveryEventCount(t, srv, "claim", "fc-claim") == 0 {
+		t.Fatal("the claim reached the backend without a durable claim record")
+	}
+}
+
+// The ambiguous mark of a stranded DISPATCHING row is a terminal-class
+// decision: it commits with its recovery record or not at all. Under
+// an evidence-store failure the row stays DISPATCHING — never marked
+// without proof the mark was recorded.
+func TestMaintenanceMarkAmbiguousFailsClosedOnEvidenceFailure(t *testing.T) {
+	dir := socketDir(t)
+	key, keys := testAuthority(t)
+	be := &stubBackend{handle: "vm-stale", live: true}
+	srv := startServer(t, Config{
+		SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys,
+		Backend: be, MaintenanceInterval: 15 * time.Millisecond,
+	})
+	insertStrandedRecorded(t, srv, key, "stale-fc", nil)
+	if err := srv.Ledger().Transition("stale-fc", JobStateDispatching, []string{JobStateRecorded},
+		func(j *LedgerJob) error { j.BackendHandle = "vm-stale"; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().UTC().Add(-(prepareTimeout + 3*srv.cfg.DispatchTimeout)).UnixMilli()
+	if _, err := srv.Ledger().db.Exec(`UPDATE jobs SET updated_at = ? WHERE job_id = ?`, old, "stale-fc"); err != nil {
+		t.Fatal(err)
+	}
+	failRecoveryEvents(t, srv)
+	time.Sleep(300 * time.Millisecond)
+	j, _ := srv.Ledger().Get("stale-fc")
+	if j.State != JobStateDispatching {
+		t.Fatalf("the ambiguous mark committed without its mandatory record: %s", j.State)
+	}
+	allowRecoveryEvents(t, srv)
+	j = waitForState(t, srv, "stale-fc", JobStateDispatchAmbig)
+	if recoveryEventCount(t, srv, "mark_ambiguous", "stale-fc") != 1 {
+		t.Fatal("the ambiguous mark landed without its durable record")
+	}
+}
+
+// A stranded contract's termination is a terminal outcome decision:
+// the receipt is emitted, but if the transition's mandatory record
+// cannot commit, the row stays RECORDED — no silent expiry.
+func TestMaintenanceExpireFailsClosedOnEvidenceFailure(t *testing.T) {
+	dir := socketDir(t)
+	key, keys := testAuthority(t)
+	srv := startServer(t, Config{
+		SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys,
+		Backend: &stubBackend{handle: "vm-x"}, MaintenanceInterval: 15 * time.Millisecond,
+	})
+	insertStrandedRecorded(t, srv, key, "exp-fc", func(c *JobContractV2) {
+		c.ExpiresAt = time.Now().UTC().Add(-time.Minute).Unix()
+	})
+	failRecoveryEvents(t, srv)
+	time.Sleep(300 * time.Millisecond)
+	j, _ := srv.Ledger().Get("exp-fc")
+	if j.State != JobStateRecorded {
+		t.Fatalf("a terminal decision committed without its mandatory record: %s", j.State)
+	}
+	allowRecoveryEvents(t, srv)
+	j = waitForState(t, srv, "exp-fc", JobStateDispatchFailed)
+	if recoveryEventCount(t, srv, "expire", "exp-fc") != 1 {
+		t.Fatal("the expiry committed without its durable record")
+	}
+}
+
+// A residue escalation writes its durable record before the throttle
+// mark — an escalation that cannot be evidenced is retried, never
+// silenced by a throttle stamped on nothing.
+func TestMaintenanceEscalationEvidencePrecedesThrottle(t *testing.T) {
+	dir := socketDir(t)
+	_, keys := testAuthority(t)
+	be := &stubBackend{live: true, resumeErr: ErrExecutionUnobserved}
+	srv := startServer(t, Config{
+		SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys,
+		Backend: be, MaintenanceInterval: 15 * time.Millisecond,
+	})
+	if _, err := srv.Ledger().InsertJob("esc-1", "h-esc-1", "s", "p", "i", "{}"); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Ledger().Transition("esc-1", JobStateDispatching, []string{JobStateRecorded}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Ledger().Transition("esc-1", JobStateDispatchAmbig, []string{JobStateDispatching},
+		func(j *LedgerJob) error { j.BackendHandle = "vm-esc"; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	failRecoveryEvents(t, srv)
+	srv.escalateResidue()
+	if _, found, _ := srv.Ledger().RecoveryState(residueStateKey); found {
+		t.Fatal("the throttle was stamped while the escalation could not be evidenced")
+	}
+	allowRecoveryEvents(t, srv)
+	srv.escalateResidue()
+	if _, found, _ := srv.Ledger().RecoveryState(residueStateKey); !found {
+		t.Fatal("the throttle was never stamped after the evidence store recovered")
+	}
+	if recoveryEventCount(t, srv, "escalation", "registry") != 1 {
+		t.Fatal("the escalation never landed in the durable trail")
+	}
+}

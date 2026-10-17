@@ -100,21 +100,22 @@ func (s *Server) cleanupBackoff() time.Duration {
 	return cleanupRetryBackoff
 }
 
-// claimRecovery reports whether a row is due for another attempt —
-// the first sighting is always due, then once per backoff, with the
-// schedule itself durable in the ledger so a restart inside the
-// backoff does not re-attempt. Ledger failures are reported and the
+// claimRecovery reports whether this lifetime may run one more attempt
+// of action on a row — the first sighting is always due, then once per
+// backoff, with the schedule itself durable in the ledger so a restart
+// inside the backoff does not re-attempt. The grant is atomic and
+// fenced: at most one claimant wins the window, its owning epoch is
+// stamped, and the durable claim record commits in the same
+// transaction as the grant itself, so an attempt whose ownership could
+// not be evidenced never runs. Ledger failures are reported and the
 // row skipped: an unpaceable retry is never run unpaced.
 func (s *Server) claimRecovery(jobID, action string, backoff time.Duration) bool {
-	due, attempts, err := s.ledger.ClaimRecoveryAttempt(jobID, action, backoff, s.now())
+	claim, err := s.ledger.ClaimRecoveryAttempt(jobID, action, backoff, backoff, s.now())
 	if err != nil {
 		s.audit("maintenance: cannot pace %s attempt for %s: %v", action, jobID, err)
 		return false
 	}
-	if due && attempts > 1 {
-		s.recordRecovery("claim", jobID, fmt.Sprintf("%s attempt %d", action, attempts))
-	}
-	return due
+	return claim != nil
 }
 
 // forgetRecovery drops pacing state for a job that resolved — the
@@ -122,15 +123,6 @@ func (s *Server) claimRecovery(jobID, action string, backoff time.Duration) bool
 func (s *Server) forgetRecovery(jobID, action string) {
 	if err := s.ledger.ForgetRecoveryAttempt(jobID, action); err != nil {
 		s.audit("maintenance: cannot drop %s pacing for %s: %v", action, jobID, err)
-	}
-}
-
-// recordRecovery appends to the durable recovery trail. A write
-// failure is audited but never blocks the pass — the trail is a
-// record of work done, not a gate on doing it.
-func (s *Server) recordRecovery(kind, subject, detail string) {
-	if err := s.ledger.RecordRecoveryEvent(kind, subject, detail, s.now()); err != nil {
-		s.audit("maintenance: cannot record %s for %s: %v", kind, subject, err)
 	}
 }
 
@@ -197,15 +189,16 @@ func (s *Server) dispatchRecordedOne(j *LedgerJob) {
 			return
 		}
 	}
-	claimErr := s.ledger.Transition(j.JobID, JobStateDispatching, []string{JobStateRecorded}, nil)
+	claimErr := s.ledger.TransitionWithRecoveryEvent(j.JobID, JobStateDispatching, []string{JobStateRecorded},
+		"claim", "stranded dispatch intent claimed by maintenance", nil)
 	s.admitMu.Unlock()
 	if claimErr != nil {
-		// A live admission claimed it first, or the row moved on its
-		// own — either way this pass must not drive it.
+		// A live admission claimed it first, the row moved on its
+		// own, or the mandatory claim record could not be written —
+		// either way this pass must not drive it.
 		return
 	}
 	s.audit("maintenance: claiming stranded dispatch of %s", j.JobID)
-	s.recordRecovery("claim", j.JobID, "stranded dispatch intent claimed by maintenance")
 	state, reason := s.driveDispatch(j, contract)
 	if state != JobStateRunning {
 		s.audit("maintenance: deferred dispatch of %s -> %s: %v", j.JobID, state, reason)
@@ -233,16 +226,20 @@ func (s *Server) markStaleDispatching() {
 		if s.isStopped() {
 			return
 		}
-		if err := s.ledger.Transition(j.JobID, JobStateDispatchAmbig, []string{JobStateDispatching},
+		// The mark and its mandatory record commit together: a row
+		// whose outcome-uncertainty cannot be durably evidenced stays
+		// DISPATCHING for the next pass, never silently rewritten.
+		if err := s.ledger.TransitionWithRecoveryEvent(j.JobID, JobStateDispatchAmbig, []string{JobStateDispatching},
+			"mark_ambiguous", "dispatching row had no live driver",
 			func(lj *LedgerJob) error {
 				lj.DispatchClass = string(DispatchUncertain)
 				lj.Error = "dispatch driver lost mid-flight — outcome uncertain; reconciled as ambiguous rather than retried or claimed dead"
 				return nil
 			}); err != nil {
+			s.audit("maintenance: cannot mark dispatching job %s uncertain: %v", j.JobID, err)
 			continue
 		}
 		s.audit("maintenance: dispatching job %s has no live driver — marked outcome uncertain", j.JobID)
-		s.recordRecovery("mark_ambiguous", j.JobID, "dispatching row had no live driver")
 	}
 }
 
@@ -256,7 +253,11 @@ func (s *Server) expireRecorded(j *LedgerJob, reason string) {
 		s.audit("maintenance: job %s cannot be terminated — evidence emission failed: %v", j.JobID, rerr)
 		return
 	}
-	if err := s.ledger.Transition(j.JobID, JobStateDispatchFailed, []string{JobStateRecorded},
+	// The terminal decision and its mandatory record are one commit —
+	// a termination whose evidence cannot be durably written leaves
+	// the row RECORDED for the next pass.
+	if err := s.ledger.TransitionWithRecoveryEvent(j.JobID, JobStateDispatchFailed, []string{JobStateRecorded},
+		"expire", reason,
 		func(lj *LedgerJob) error {
 			lj.ReceiptSHA256 = receiptSHA
 			lj.DispatchClass = string(DispatchNotAttempted)
@@ -267,7 +268,6 @@ func (s *Server) expireRecorded(j *LedgerJob, reason string) {
 		return
 	}
 	s.audit("maintenance: job %s terminated without dispatch: %s", j.JobID, reason)
-	s.recordRecovery("expire", j.JobID, reason)
 	s.checkpoint()
 }
 
@@ -310,6 +310,17 @@ func (s *Server) escalateResidue() {
 	if !lastAudit.IsZero() && now.Sub(lastAudit) < residueEscalationRepeat {
 		return
 	}
+	// Evidence before the throttle mark: an escalation whose durable
+	// record cannot be written must not mark the shape as reported —
+	// the next pass escalates again rather than going quiet on an
+	// unrecorded residue.
+	if err := s.ledger.RecordRecoveryEvent("escalation", "registry",
+		fmt.Sprintf("residue persists: %d unresolved (oldest %s ago), %d cleanup pending (oldest %s ago)",
+			r.Unresolved, now.Sub(r.OldestUnresolved).Round(time.Second),
+			r.CleanupPending, now.Sub(r.OldestCleanup).Round(time.Second)), now); err != nil {
+		s.audit("maintenance: cannot record residue escalation durably: %v", err)
+		return
+	}
 	if err := s.ledger.SetRecoveryState(residueStateKey,
 		fmt.Sprintf("%s@%d", sig, now.UnixMilli())); err != nil {
 		s.audit("maintenance: cannot persist residue throttle state: %v", err)
@@ -318,10 +329,6 @@ func (s *Server) escalateResidue() {
 	s.audit("ESCALATION: registry residue persists — %d unresolved job(s) (oldest %s ago), %d cleanup pending (oldest %s ago) — operator reconciliation required; these are never auto-retried blind or auto-destroyed",
 		r.Unresolved, now.Sub(r.OldestUnresolved).Round(time.Second),
 		r.CleanupPending, now.Sub(r.OldestCleanup).Round(time.Second))
-	s.recordRecovery("escalation", "registry",
-		fmt.Sprintf("residue persists: %d unresolved (oldest %s ago), %d cleanup pending (oldest %s ago)",
-			r.Unresolved, now.Sub(r.OldestUnresolved).Round(time.Second),
-			r.CleanupPending, now.Sub(r.OldestCleanup).Round(time.Second)))
 }
 
 // reconcileWalk re-attempts observation of unresolved rows: a run the
