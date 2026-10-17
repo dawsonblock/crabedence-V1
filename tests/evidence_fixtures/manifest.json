@@ -1,0 +1,101 @@
+{
+  "schema_version": 1,
+  "description": "Adversarial go test -json streams for the case-evidence tool. Every entry names its fixture, whether generation must accept it, and (for rejections) a regex a finding must match. Fixture 16 is syntactically valid: its rejection is a PROVENANCE rejection — a syntactically valid stream produced without an authenticated runner is not qualification evidence — so generation accepts it but the emitted record must carry no CI provenance off-CI, which a CI-bound release gate refuses.",
+  "fixtures": [
+    {
+      "file": "01-empty-stream.jsonl",
+      "name": "completely empty stream presented as a run",
+      "accept": false,
+      "want": "no package evidence|no completed package"
+    },
+    {
+      "file": "02-package-pass-no-start.jsonl",
+      "name": "package PASS without a preceding START",
+      "accept": false,
+      "want": "before its start|no package evidence"
+    },
+    {
+      "file": "03-empty-package-name.jsonl",
+      "name": "empty package name on every event",
+      "accept": false,
+      "want": "empty package identity|no package evidence"
+    },
+    {
+      "file": "04-empty-test-name.jsonl",
+      "name": "empty test name on test-scoped events",
+      "accept": false,
+      "want": "empty test identity"
+    },
+    {
+      "file": "05-negative-elapsed.jsonl",
+      "name": "negative elapsed value",
+      "accept": false,
+      "want": "Elapsed is negative"
+    },
+    {
+      "file": "06-boolean-elapsed.jsonl",
+      "name": "boolean elapsed value",
+      "accept": false,
+      "want": "Elapsed is not numeric"
+    },
+    {
+      "file": "07-nan-elapsed.jsonl",
+      "name": "NaN elapsed value (nonstandard JSON constant)",
+      "accept": false,
+      "want": "not a go test -json event line|nonstandard numeric constant"
+    },
+    {
+      "file": "08-infinity-elapsed.jsonl",
+      "name": "Infinity elapsed value (nonstandard JSON constant)",
+      "accept": false,
+      "want": "not a go test -json event line|nonstandard numeric constant"
+    },
+    {
+      "file": "09-missing-test-terminal.jsonl",
+      "name": "test never reaches a terminal outcome",
+      "accept": false,
+      "want": "0 terminal events|incomplete"
+    },
+    {
+      "file": "10-missing-package-terminal.jsonl",
+      "name": "package never reaches a terminal outcome",
+      "accept": false,
+      "want": "no terminal outcome"
+    },
+    {
+      "file": "11-duplicate-start.jsonl",
+      "name": "package records a second start event",
+      "accept": false,
+      "want": "second start"
+    },
+    {
+      "file": "12-duplicate-pass.jsonl",
+      "name": "test records a duplicate terminal outcome",
+      "accept": false,
+      "want": "after its terminal outcome|2 terminal events"
+    },
+    {
+      "file": "13-pass-after-fail.jsonl",
+      "name": "test passes after it already failed",
+      "accept": false,
+      "want": "after its terminal outcome|duplicate run|2 terminal events"
+    },
+    {
+      "file": "14-package-pass-with-failed-test.jsonl",
+      "name": "package reports pass while a test failed",
+      "accept": false,
+      "want": "reports pass while|failed or incomplete"
+    },
+    {
+      "file": "15-valid-empty-package.jsonl",
+      "name": "completed package containing no test cases",
+      "accept": true
+    },
+    {
+      "file": "16-fabricated-no-provenance.jsonl",
+      "name": "valid-looking stream without authenticated runner provenance",
+      "accept": true,
+      "provenance_gate": "the emitted record carries no CI provenance off-CI; a CI-qualified gate refuses it as unauthenticated evidence"
+    }
+  ]
+}

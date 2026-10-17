@@ -266,8 +266,16 @@ func (l *Ledger) Epoch() uint64 { return l.epoch }
 // and owned: claim_epoch names the ledger generation holding the
 // attempt and claim_until_ms its exclusive lease, so a claim is one
 // atomic conditional grant rather than a read-check-write pair two
-// claimants could both win.
-const ledgerSchemaVersion = 10
+// claimants could both win. v11 gives every granted claim a durable,
+// never-reused generation identifier (claim_uid): a claim token held
+// across pacing-row deletion and recreation can never be mistaken for
+// the current owner at a fenced commit boundary. v12 makes recovery
+// history verifiable: recovery_events gains a hash chain
+// (prev_event_sha256, event_sha256) plus the claim generation each
+// event ran under and an authenticated marker for pre-chain rows, and
+// recovery_outbox durably queues signed recovery checkpoints for
+// external custody.
+const ledgerSchemaVersion = 12
 
 func (l *Ledger) migrate() error {
 	var version int
@@ -497,12 +505,125 @@ func (l *Ledger) migrate() error {
 			}
 		}
 	}
+	if version < 11 {
+		// v10 → v11: durable unique claim generations. In every
+		// reachable state the (attempt, epoch, lease) tuple already
+		// identifies a claim, but a claim token that outlives pacing-
+		// row deletion and recreation could collide with a new
+		// generation — claim_uid is a monotonic, never-reused
+		// generation identifier allocated inside the claim
+		// transaction, so a held token can never be mistaken for a
+		// later generation of the same job/action pair.
+		if _, err := l.db.Exec(`ALTER TABLE recovery_attempts ADD COLUMN claim_uid INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			return fmt.Errorf("migrate ledger v%d→v11: %w", version, err)
+		}
+		if _, err := l.db.Exec(`
+			INSERT OR IGNORE INTO executor_meta (key, value) VALUES ('recovery_claim_seq', '0');
+			UPDATE recovery_attempts SET claim_uid = rowid WHERE claim_uid = 0;
+			UPDATE executor_meta SET value = CAST(MAX(CAST(value AS INTEGER), COALESCE((SELECT MAX(claim_uid) FROM recovery_attempts), 0)) AS TEXT)
+				WHERE key = 'recovery_claim_seq';
+		`); err != nil {
+			return fmt.Errorf("migrate ledger v%d→v11: %w", version, err)
+		}
+	}
+	if version < 12 {
+		// v11 → v12: authenticated recovery history. recovery_events
+		// gains the hash chain (prev_event_sha256, event_sha256), the
+		// claim generation each event ran under, and the
+		// authentication marker — rows written before the chain
+		// existed are preserved as legacy unauthenticated evidence
+		// (authenticated=0), hashed into the chain so later tampering
+		// is detected, but never retroactively claimed as attested
+		// history. recovery_outbox is the durable custody queue: every
+		// published recovery checkpoint is an obligation to replicate
+		// that a crash cannot silently drop.
+		for _, ddl := range []string{
+			`ALTER TABLE recovery_events ADD COLUMN prev_event_sha256 TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE recovery_events ADD COLUMN event_sha256 TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE recovery_events ADD COLUMN claim_uid INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE recovery_events ADD COLUMN authenticated INTEGER NOT NULL DEFAULT 0`,
+		} {
+			if _, err := l.db.Exec(ddl); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+				return fmt.Errorf("migrate ledger v%d→v12: %w", version, err)
+			}
+		}
+		if _, err := l.db.Exec(`
+			CREATE TABLE IF NOT EXISTS recovery_outbox (
+				seq            INTEGER PRIMARY KEY AUTOINCREMENT,
+				head_sha256    TEXT NOT NULL DEFAULT '',
+				checkpoint_json TEXT NOT NULL,
+				ack_json       TEXT NOT NULL DEFAULT '',
+				created_ms     INTEGER NOT NULL
+			);
+		`); err != nil {
+			return fmt.Errorf("migrate ledger v%d→v12: %w", version, err)
+		}
+		// Backfill the chain over every pre-existing event in
+		// sequence order — legacy rows carry authenticated=0 but are
+		// bound into the chain so a later rewrite is detected.
+		if err := l.backfillRecoveryChain(); err != nil {
+			return fmt.Errorf("migrate ledger v%d→v12: %w", version, err)
+		}
+	}
 	if version < ledgerSchemaVersion {
 		if _, err := l.db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, ledgerSchemaVersion)); err != nil {
 			return fmt.Errorf("stamp ledger schema version: %w", err)
 		}
 	}
 	return nil
+}
+
+// backfillRecoveryChain binds every pre-v12 recovery event into the
+// hash chain in sequence order. Legacy rows keep authenticated=0 —
+// they were written before attestation existed and are never
+// retroactively claimed as signed history — but their content is
+// digested, so a later rewrite, deletion or reorder is detected the
+// same way as for attested rows.
+func (l *Ledger) backfillRecoveryChain() error {
+	tx, err := l.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	rows, err := tx.Query(`SELECT seq, at_ms, kind, subject, detail FROM recovery_events
+		WHERE event_sha256 = '' ORDER BY seq`)
+	if err != nil {
+		return err
+	}
+	type legacyEvent struct {
+		seq, atMS int64
+		kind      string
+		subject   string
+		detail    string
+	}
+	var legacy []legacyEvent
+	for rows.Next() {
+		var e legacyEvent
+		if err := rows.Scan(&e.seq, &e.atMS, &e.kind, &e.subject, &e.detail); err != nil {
+			rows.Close()
+			return err
+		}
+		legacy = append(legacy, e)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	var prev string
+	if err := tx.QueryRow(`SELECT COALESCE(MAX(event_sha256), '') FROM recovery_events
+		WHERE event_sha256 != '' AND seq < (SELECT COALESCE(MIN(seq),0) FROM recovery_events WHERE event_sha256 = '')`).Scan(&prev); err != nil && err != sql.ErrNoRows {
+		return err
+	}
+	for _, e := range legacy {
+		sha := recoveryEventHash(e.seq, prev, e.kind, e.subject, e.detail, e.atMS, 0)
+		if _, err := tx.Exec(`UPDATE recovery_events SET prev_event_sha256 = ?, event_sha256 = ? WHERE seq = ?`,
+			prev, sha, e.seq); err != nil {
+			return err
+		}
+		prev = sha
+	}
+	return tx.Commit()
 }
 
 // bumpEpoch increments executor_meta.epoch inside an IMMEDIATE
@@ -973,7 +1094,7 @@ func (l *Ledger) AdoptBackendRun(jobID, runID, bootID string) error {
 	}
 	if err := l.recordRecoveryEventTx(tx, "adopt", jobID,
 		fmt.Sprintf("runtime run %s under boot generation %s adopted as the job's execution identity", runID, bootID),
-		time.Now().UTC()); err != nil {
+		time.Now().UTC(), 0); err != nil {
 		return fmt.Errorf("adopt run identity for %s: %w", jobID, err)
 	}
 	return tx.Commit()
@@ -990,6 +1111,12 @@ func (l *Ledger) AdoptBackendRun(jobID, runID, bootID string) error {
 // them after the terminal write would invalidate the chain. Cleanup
 // state is operational bookkeeping, outside the attested result.
 func (l *Ledger) MarkCleanupPending(jobID, reason string) error {
+	return l.MarkCleanupPendingFor(jobID, reason, nil)
+}
+
+// MarkCleanupPendingFor is MarkCleanupPending under a recovery claim:
+// the durable record names the claim generation the mark ran under.
+func (l *Ledger) MarkCleanupPendingFor(jobID, reason string, claim *RecoveryClaim) error {
 	// Recording that a destructive cleanup was deferred is mandatory
 	// evidence — the flag and its record commit together or not at
 	// all.
@@ -1007,10 +1134,19 @@ func (l *Ledger) MarkCleanupPending(jobID, reason string) error {
 	if n, _ := res.RowsAffected(); n != 1 {
 		return fmt.Errorf("mark cleanup pending for %s: no such job", jobID)
 	}
-	if err := l.recordRecoveryEventTx(tx, "cleanup_pending", jobID, reason, time.Now().UTC()); err != nil {
+	if err := l.recordRecoveryEventTx(tx, "cleanup_pending", jobID, reason, time.Now().UTC(), claimUIDOf(claim)); err != nil {
 		return fmt.Errorf("mark cleanup pending for %s: %w", jobID, err)
 	}
 	return tx.Commit()
+}
+
+// claimUIDOf renders the claim generation a durable event ran under —
+// 0 for events outside any claim's scope.
+func claimUIDOf(claim *RecoveryClaim) int64 {
+	if claim == nil {
+		return 0
+	}
+	return claim.ClaimID
 }
 
 // ClearCleanupPending records that a previously pending cleanup
@@ -1018,11 +1154,27 @@ func (l *Ledger) MarkCleanupPending(jobID, reason string) error {
 // checkpoint-covered field untouched — and like it, the clear and the
 // durable record of the completed removal are one commit.
 func (l *Ledger) ClearCleanupPending(jobID string) error {
+	return l.ClearCleanupPendingFor(jobID, nil, time.Now().UTC())
+}
+
+// ClearCleanupPendingFor clears the pending flag under the caller's
+// recovery fence: when claim is non-nil, the flag clear commits only
+// while the claim is still the durable, live owner — a claimant that
+// lost the lease mid-operation cannot commit the outcome it
+// triggered. The flag, the fence check and the durable record are one
+// commit. A nil claim clears unconditionally: the live monitor path
+// owns its job's cleanup outright.
+func (l *Ledger) ClearCleanupPendingFor(jobID string, claim *RecoveryClaim, now time.Time) error {
 	tx, err := l.db.BeginTx(context.Background(), nil)
 	if err != nil {
 		return fmt.Errorf("clear cleanup pending for %s: %w", jobID, err)
 	}
 	defer tx.Rollback()
+	if claim != nil {
+		if err := l.claimValidTx(tx, claim, now, true); err != nil {
+			return fmt.Errorf("clear cleanup pending for %s: %w", jobID, err)
+		}
+	}
 	res, err := tx.Exec(
 		`UPDATE jobs SET cleanup_pending = 0, cleanup_error = '' WHERE job_id = ?`, jobID)
 	if err != nil {
@@ -1032,8 +1184,38 @@ func (l *Ledger) ClearCleanupPending(jobID string) error {
 		return fmt.Errorf("clear cleanup pending for %s: no such job", jobID)
 	}
 	if err := l.recordRecoveryEventTx(tx, "cleanup", jobID,
-		"pending backend removal completed", time.Now().UTC()); err != nil {
+		"pending backend removal completed", now, claimUIDOf(claim)); err != nil {
 		return fmt.Errorf("clear cleanup pending for %s: %w", jobID, err)
+	}
+	return tx.Commit()
+}
+
+// NoteCleanupPending records the latest cleanup classification as the
+// pending reason — why the removal is still owed — without touching
+// the flag itself. The note and its durable event commit together:
+// an outcome classification that cannot be evidenced is not recorded.
+func (l *Ledger) NoteCleanupPending(jobID, reason string) error {
+	return l.NoteCleanupPendingFor(jobID, reason, nil)
+}
+
+// NoteCleanupPendingFor is NoteCleanupPending under a recovery claim:
+// the durable record names the claim generation the note ran under.
+func (l *Ledger) NoteCleanupPendingFor(jobID, reason string, claim *RecoveryClaim) error {
+	tx, err := l.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return fmt.Errorf("note cleanup outcome for %s: %w", jobID, err)
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(
+		`UPDATE jobs SET cleanup_error = ? WHERE job_id = ?`, reason, jobID)
+	if err != nil {
+		return fmt.Errorf("note cleanup outcome for %s: %w", jobID, err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return fmt.Errorf("note cleanup outcome for %s: no such job", jobID)
+	}
+	if err := l.recordRecoveryEventTx(tx, "cleanup_outcome", jobID, reason, time.Now().UTC(), claimUIDOf(claim)); err != nil {
+		return fmt.Errorf("note cleanup outcome for %s: %w", jobID, err)
 	}
 	return tx.Commit()
 }
@@ -1218,7 +1400,7 @@ func (l *Ledger) listActive() ([]*LedgerJob, error) {
 // this lifetime's fence epoch — a row that moved under an epoch that
 // is not ours was moved by someone who bypassed the lock.
 func (l *Ledger) Transition(jobID, to string, from []string, mutate func(*LedgerJob) error) error {
-	return l.transition(jobID, to, from, "", "", mutate)
+	return l.transition(jobID, to, from, "", "", nil, mutate)
 }
 
 // TransitionWithRecoveryEvent is Transition with the mandatory
@@ -1228,10 +1410,21 @@ func (l *Ledger) Transition(jobID, to string, from []string, mutate func(*Ledger
 // leaves the job exactly where it was, unresolved rather than
 // silently recorded.
 func (l *Ledger) TransitionWithRecoveryEvent(jobID, to string, from []string, eventKind, eventDetail string, mutate func(*LedgerJob) error) error {
-	return l.transition(jobID, to, from, eventKind, eventDetail, mutate)
+	return l.transition(jobID, to, from, eventKind, eventDetail, nil, mutate)
 }
 
-func (l *Ledger) transition(jobID, to string, from []string, eventKind, eventDetail string, mutate func(*LedgerJob) error) error {
+// TransitionWithClaim is Transition under a recovery fence: the claim
+// must still be the durable, live owner at commit time — a stale
+// claimant cannot land a protected transition even when its
+// observation completed before the lease lapsed. The fence check and
+// the write are one transaction, so there is no check-then-commit
+// window. A nil claim is an unfenced transition: the live monitor
+// path owns its job's outcome outright.
+func (l *Ledger) TransitionWithClaim(jobID, to string, from []string, claim *RecoveryClaim, mutate func(*LedgerJob) error) error {
+	return l.transition(jobID, to, from, "", "", claim, mutate)
+}
+
+func (l *Ledger) transition(jobID, to string, from []string, eventKind, eventDetail string, claim *RecoveryClaim, mutate func(*LedgerJob) error) error {
 	if len(from) == 0 {
 		return fmt.Errorf("transition of %s requires source states", jobID)
 	}
@@ -1259,6 +1452,11 @@ func (l *Ledger) transition(jobID, to string, from []string, eventKind, eventDet
 	}
 	if !allowed {
 		return fmt.Errorf("%w: %s is %s, not one of %v", ErrTransitionConflict, jobID, job.State, from)
+	}
+	if claim != nil {
+		if err := l.claimValidTx(tx, claim, time.Now().UTC(), true); err != nil {
+			return fmt.Errorf("transition %s under recovery claim: %w", jobID, err)
+		}
 	}
 	if job.FenceEpoch > l.epoch {
 		return fmt.Errorf("job %s carries fence epoch %d from a later lifetime (ours is %d) — the ledger lock was bypassed", jobID, job.FenceEpoch, l.epoch)
@@ -1320,7 +1518,7 @@ func (l *Ledger) transition(jobID, to string, from []string, eventKind, eventDet
 		return fmt.Errorf("%w: %s changed underneath the transition", ErrTransitionConflict, jobID)
 	}
 	if eventKind != "" {
-		if err := l.recordRecoveryEventTx(tx, eventKind, jobID, eventDetail, time.Now().UTC()); err != nil {
+		if err := l.recordRecoveryEventTx(tx, eventKind, jobID, eventDetail, time.Now().UTC(), claimUIDOf(claim)); err != nil {
 			return fmt.Errorf("record mandatory recovery evidence for %s: %w", jobID, err)
 		}
 	}

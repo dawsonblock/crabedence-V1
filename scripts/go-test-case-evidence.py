@@ -52,6 +52,7 @@ reports it.
 import argparse
 import hashlib
 import json
+import math
 import os
 import platform
 import re
@@ -83,6 +84,45 @@ TEST_STATE_DONE = "done"
 # emits output, and reports exactly one terminal outcome. run/pause/
 # cont/bench are per-test states a package can never hold.
 PACKAGE_ACTIONS = frozenset(("start", "output") + TERMINAL_ACTIONS)
+
+# The timestamp form a real `go test -json` event carries when it
+# carries one: RFC3339 with optional fractional seconds and a Z or
+# numeric offset. Anything else is a fabricated or corrupted field.
+TIME_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$"
+)
+
+
+def _reject_constant(name):
+    """json.loads hook: NaN and Infinity are not valid JSON evidence.
+
+    Python's decoder admits these nonstandard literals by default; a
+    qualification stream is not a place for permissive decoding — the
+    constant is a fabrication, never a duration.
+    """
+    raise ValueError(f"nonstandard numeric constant {name!r} in event stream")
+
+
+def _elapsed_finding(elapsed):
+    """The strict numeric contract for a stream's Elapsed field.
+
+    Returns the finding text for an unacceptable value, or None. A
+    boolean is not a number here (Python types it as int); NaN and
+    Infinity are not durations; a negative or float64-overflowing
+    value cannot be a measured runtime.
+    """
+    if isinstance(elapsed, bool) or not isinstance(elapsed, (int, float)):
+        return "Elapsed is not numeric"
+    if isinstance(elapsed, float) and not math.isfinite(elapsed):
+        return "Elapsed is not finite — NaN or Infinity is not a duration"
+    if elapsed < 0:
+        return "Elapsed is negative"
+    # float() must succeed in accumulate: ints larger than a float64
+    # can represent raise OverflowError there, so the bound lives
+    # here where it can be a finding rather than a crash.
+    if isinstance(elapsed, int) and elapsed.bit_length() > 1023:
+        return "Elapsed overflows a float64"
+    return None
 
 
 def new_case():
@@ -169,8 +209,8 @@ def _scan_stream(path):
             if not line:
                 continue
             try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
+                event = json.loads(line, parse_constant=_reject_constant)
+            except ValueError:
                 findings.append(f"{path}:{lineno}: not a go test -json event line")
                 continue
             if not isinstance(event, dict):
@@ -187,17 +227,34 @@ def _scan_stream(path):
             if test is not None and not isinstance(test, str):
                 findings.append(f"{path}:{lineno}: Test is not a string")
                 continue
+            if isinstance(test, str) and not test.strip():
+                findings.append(
+                    f"{path}:{lineno}: test-scoped event carries an empty test identity"
+                )
+                continue
             if "Output" in event and not isinstance(event["Output"], str):
                 findings.append(f"{path}:{lineno}: Output is not a string")
                 continue
-            if "Elapsed" in event and not isinstance(
-                event["Elapsed"], (int, float)
-            ):
-                findings.append(f"{path}:{lineno}: Elapsed is not numeric")
-                continue
+            if "Elapsed" in event:
+                elapsed_finding = _elapsed_finding(event["Elapsed"])
+                if elapsed_finding is not None:
+                    findings.append(f"{path}:{lineno}: {elapsed_finding}")
+                    continue
+            if "Time" in event:
+                tval = event["Time"]
+                if not isinstance(tval, str) or not TIME_RE.match(tval):
+                    findings.append(
+                        f"{path}:{lineno}: Time is not an RFC3339 timestamp"
+                    )
+                    continue
             pkg = event.get("Package")
             if not isinstance(pkg, str):
                 findings.append(f"{path}:{lineno}: event carries no string Package")
+                continue
+            if not pkg.strip():
+                findings.append(
+                    f"{path}:{lineno}: event carries an empty package identity"
+                )
                 continue
             if pkg in done_pkgs:
                 findings.append(
@@ -214,16 +271,30 @@ def _scan_stream(path):
                         )
                     else:
                         scan.pkg_started.add(pkg)
-                elif action in TERMINAL_ACTIONS:
-                    pkg_terminal[pkg] = pkg_terminal.get(pkg, 0) + 1
-                    pkg_outcome[pkg] = action
-                    done_pkgs.add(pkg)
-                elif action not in PACKAGE_ACTIONS:
-                    findings.append(
-                        f"{path}:{lineno}: package {pkg} records test-scoped "
-                        f"action {action} with no test name"
-                    )
+                else:
+                    if pkg not in scan.pkg_started:
+                        # A package outcome — or output — with no
+                        # preceding start is a fabricated lifecycle:
+                        # the run never announced this package.
+                        findings.append(
+                            f"{path}:{lineno}: package {pkg} records {action} "
+                            "before its start event"
+                        )
+                    if action in TERMINAL_ACTIONS:
+                        pkg_terminal[pkg] = pkg_terminal.get(pkg, 0) + 1
+                        pkg_outcome[pkg] = action
+                        done_pkgs.add(pkg)
+                    elif action not in PACKAGE_ACTIONS:
+                        findings.append(
+                            f"{path}:{lineno}: package {pkg} records test-scoped "
+                            f"action {action} with no test name"
+                        )
                 continue
+            if pkg not in scan.pkg_started:
+                findings.append(
+                    f"{path}:{lineno}: test {test} records an event under "
+                    f"package {pkg} before the package's start event"
+                )
             if test not in cases:
                 cases[test] = new_case()
                 order.append(test)
@@ -304,6 +375,15 @@ def lifecycle_findings(scan):
     passing run.
     """
     findings = []
+    if not scan.packages:
+        # A successful test invocation must contain at least one
+        # properly completed package. An empty stream — or one with no
+        # package identity at all — is not a run that produced zero
+        # tests; it is no run at all.
+        findings.append(
+            "the stream contains no package evidence — an empty or "
+            "package-less stream is not a completed test invocation"
+        )
     for name in scan.order:
         n = scan.cases[name]["terminal_events"]
         if n != 1:
@@ -430,8 +510,8 @@ def verify_results(stream_path, results_path, expect_package=""):
     )
     try:
         with open(results_path, "r", encoding="utf-8") as handle:
-            claimed = json.load(handle)
-    except (OSError, json.JSONDecodeError) as exc:
+            claimed = json.load(handle, parse_constant=_reject_constant)
+    except (OSError, ValueError) as exc:
         return findings + [f"results file {results_path} is not valid JSON: {exc}"]
     if not isinstance(claimed, dict):
         return findings + [f"results file {results_path} is not a JSON object"]
@@ -474,7 +554,7 @@ def verify_results(stream_path, results_path, expect_package=""):
                 elapsed_ok = got_elapsed is not None and abs(
                     float(got_elapsed) - derived_case["elapsed_seconds"]
                 ) < 1e-9
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 elapsed_ok = False
             if not elapsed_ok:
                 findings.append(

@@ -174,10 +174,23 @@ type Backend interface {
 	Resume(ctx context.Context, job *JobContractV2, run RunIdentity) (RunIdentity, *ExecResult, error)
 
 	// Cleanup removes the backend resources a finished job leaves
-	// behind (e.g. its sandbox). A failure is recorded as cleanup
-	// pending — the VM's own contract bound is the backstop — and
-	// never masks the job's already-observed result.
-	Cleanup(ctx context.Context, handle string) error
+	// behind (e.g. its sandbox), but only when it can bind the
+	// destructive operation to the exact authorized resource
+	// instance: the request carries the persisted dispatch identity
+	// (handle, dispatch nonce, boot generation, policy digest, run
+	// identity) and an optional recovery fence, and the removal is
+	// conditioned on that identity — a sandbox that cannot present
+	// the dispatch's ownership proof is a substituted or foreign
+	// instance and is never destroyed. The result classifies the
+	// outcome explicitly: REMOVED_VERIFIED and
+	// ALREADY_ABSENT_VERIFIED prove the authorized instance is gone;
+	// IDENTITY_MISMATCH, IDENTITY_UNVERIFIABLE and REMOVAL_UNCERTAIN
+	// leave the cleanup pending for retry and operator escalation.
+	// A non-nil error means the operation could not be attempted or
+	// its outcome could not be classified — the cleanup stays
+	// pending either way, and never masks the job's already-observed
+	// result.
+	Cleanup(ctx context.Context, request CleanupRequest) (CleanupResult, error)
 
 	// Close releases backend resources at daemon shutdown.
 	Close() error

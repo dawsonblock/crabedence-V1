@@ -778,7 +778,7 @@ func (b *MSBBackend) Dispatch(ctx context.Context, job *JobContractV2, plan *Dis
 		// validation error, for instance). Destroy the leftover only
 		// when it carries this dispatch's identity label — proof it
 		// came from this create, not from someone else.
-		b.destroyIfOurs(name, nonce)
+		b.destroyDispatch(nonce)
 		return RunIdentity{}, fmt.Errorf("%w: msb create failed: %v: %s", ErrDispatchRefused, cerr, strings.TrimSpace(string(out)))
 	}
 
@@ -794,16 +794,16 @@ func (b *MSBBackend) Dispatch(ctx context.Context, job *JobContractV2, plan *Dis
 		// the name, so only a verified-ours sandbox is destroyed.
 		// An unverifiable one is left for reconciliation rather
 		// than removed blind; no guest command has run either way.
-		b.destroyIfOurs(name, nonce)
+		b.destroyDispatch(nonce)
 		return RunIdentity{}, fmt.Errorf("%w: verify sandbox %s before execution: %v", ErrDispatchRefused, name, ierr)
 	}
 	if verr := verifyBootedPolicy(policy, doc); verr != nil {
-		b.destroyIfVerified(name, nonce, doc)
+		b.destroyDispatch(nonce)
 		return RunIdentity{}, fmt.Errorf("%w: sandbox %s failed policy verification — destroyed before execution: %v", ErrDispatchRefused, name, verr)
 	}
 	bootID, berr := b.sandboxBootID(doc)
 	if berr != nil {
-		b.destroyIfVerified(name, nonce, doc)
+		b.destroyDispatch(nonce)
 		return RunIdentity{}, fmt.Errorf("%w: bind the VM boot generation of %s before execution: %v", ErrDispatchRefused, name, berr)
 	}
 	identity.BootID = bootID
@@ -897,40 +897,21 @@ func (b *MSBBackend) verifyLaunchedRun(ctx context.Context, name, runID, bootID 
 // wedged runtime cannot pin the admission path.
 func (b *MSBBackend) dispatchProbeTimeout() time.Duration { return 15 * time.Second }
 
-// destroy removes a sandbox this backend created. Failures are
-// ignored by design: the VM's own --max-duration is the backstop, and
-// a destroy that cannot run must not mask the verification failure
-// that triggered it.
-func (b *MSBBackend) destroy(name string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	_, _ = b.runOnce(ctx, "rm", "-f", name)
-}
-
-// destroyIfOurs removes a sandbox left behind by a failed create, but
-// only when its labels carry this dispatch's identity — a sandbox
-// without that proof is not ours to remove (it may be a pre-existing
-// trap the job is supposed to refuse, not adopt).
-func (b *MSBBackend) destroyIfOurs(name, nonce string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	doc, err := b.inspectRaw(ctx, name)
-	if err != nil {
+// destroyDispatch removes only the instance carrying this dispatch's
+// ownership label: the deletion condition is evaluated by the runtime
+// against the labels bound to the instance at creation, so a
+// substituted or foreign sandbox under the same name is never
+// selected — it cannot carry a nonce it was not created with.
+// Failures are ignored by design: the VM's own --max-duration is the
+// backstop, and a destroy that cannot run must not mask the
+// verification failure that triggered it.
+func (b *MSBBackend) destroyDispatch(nonce string) {
+	if nonce == "" {
 		return
 	}
-	b.destroyIfVerified(name, nonce, doc)
-}
-
-// destroyIfVerified removes the sandbox only when an inspect document
-// this dispatch already holds proves it carries this dispatch's
-// identity label — the pre-execution cleanup of a failed verification
-// never removes a VM it cannot prove this dispatch created.
-func (b *MSBBackend) destroyIfVerified(name, nonce string, doc map[string]any) {
-	cfg, _ := doc["config"].(map[string]any)
-	labels, _ := cfg["labels"].(map[string]any)
-	if jsonString(labels, "crabedence.dispatch") == nonce {
-		b.destroy(name)
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_, _ = b.runOnce(ctx, "rm", "-f", "--label", "crabedence.dispatch="+nonce)
 }
 
 // inspectRaw returns the parsed `msb inspect --format json` document.
@@ -1372,22 +1353,186 @@ func (w *boundedArtifactWriter) stats() (int64, bool) {
 	return w.written, w.truncated
 }
 
-// Cleanup removes the sandbox a finished job leaves behind. A sandbox
-// that is already gone is a success — the goal is absence. The
-// operator's forensics posture (KeepSandboxes) turns cleanup into a
-// no-op.
-func (b *MSBBackend) Cleanup(ctx context.Context, handle string) error {
+// Cleanup removes the exact sandbox instance the request authorizes.
+//
+// The removal is identity-bound end to end: the destructive operation
+// is never issued against a reusable name — the runtime is asked to
+// delete every sandbox carrying the dispatch's ownership labels, so
+// the only instance that can match is the one this dispatch created.
+// A substituted or foreign VM under the same name cannot carry those
+// labels and is never selected.
+//
+// Protocol:
+//
+//  1. Verify what currently occupies the handle. Its dispatch label
+//     must equal the request's nonce and (when known) its job label
+//     the request's job — anything else is a substitute or foreign
+//     instance and is reported, never destroyed. A recorded boot
+//     generation that no longer matches is reported too: the instance
+//     still carries our authority, so it is removed, but the
+//     divergence is evidence.
+//  2. `msb rm -f --label crabedence.dispatch=<nonce> --label
+//     crabedence.job=<job>` — the labels are the deletion condition,
+//     AND-matched inside the runtime's own catalog where they are
+//     bound to the immutable sandbox identity; the removal then runs
+//     through the runtime's guarded per-instance delete. No name is
+//     passed, so an instance that does not present the authorized
+//     identity is never a candidate.
+//  3. Post-verify: the handle must now name nothing, or name an
+//     instance that does not carry our labels (a substitute that
+//     survived, correctly). The handle still naming our labels is a
+//     contradiction the runtime claimed to have resolved — uncertain.
+//
+// An error never proves absence, and a timeout after the removal was
+// issued is REMOVAL_UNCERTAIN unless the post-check resolves it. The
+// residual window — the runtime resolves its label selection moments
+// before each guarded per-instance delete — is bounded by msb's own
+// transition guard and documented in the threat model; a name-level
+// substitution landing inside it cannot carry our labels and so
+// cannot be selected.
+func (b *MSBBackend) Cleanup(ctx context.Context, req CleanupRequest) (CleanupResult, error) {
 	if b.KeepSandboxes {
-		return nil
+		return refuse(CleanupAlreadyAbsentVerified,
+			"backend retention policy (keep_sandboxes): the sandbox is intentionally retained — no removal is owed")
 	}
-	out, err := b.runOnce(ctx, "rm", "-f", handle)
-	if err != nil {
-		if strings.Contains(strings.ToLower(string(out)), "not found") {
-			return nil
+	if err := req.Validate(); err != nil {
+		return refuse(CleanupIdentityUnverifiable, "%v", err)
+	}
+	prefix := b.NamePrefix
+	if prefix == "" {
+		prefix = "sx-"
+	}
+	if !strings.HasPrefix(req.Handle, prefix) {
+		return refuse(CleanupIdentityUnverifiable,
+			"handle %q is outside this backend's namespace %q — refusing to destroy outside the jobs this backend launched", req.Handle, prefix)
+	}
+
+	// Step 1 — verify what the handle currently names.
+	var notes string
+	doc, ierr := b.inspectRaw(ctx, req.Handle)
+	switch {
+	case ierr == nil:
+		cfg, _ := doc["config"].(map[string]any)
+		labels, _ := cfg["labels"].(map[string]any)
+		dispatch := jsonString(labels, "crabedence.dispatch")
+		jobLabel := jsonString(labels, "crabedence.job")
+		if dispatch != req.DispatchNonce || (req.JobID != "" && jobLabel != req.JobID) {
+			return refuse(CleanupIdentityMismatch,
+				"sandbox %s carries dispatch %q job %q, not the authorized %q/%q — a substituted or foreign instance is never destroyed; it belongs to an operator",
+				req.Handle, dispatch, jobLabel, req.DispatchNonce, req.JobID)
 		}
-		return fmt.Errorf("remove sandbox %s: %v: %s", handle, err, strings.TrimSpace(string(out)))
+		if req.BootID != "" {
+			if boot, berr := b.sandboxBootID(doc); berr == nil && boot != req.BootID {
+				// Still our instance — labels cannot move — but the
+				// boot generation diverged: someone rebooted it. The
+				// removal remains authorized; the divergence is
+				// evidence for the record.
+				notes = fmt.Sprintf("note: sandbox %s boot generation %s diverged from the recorded %s (instance identity confirmed by labels); ", req.Handle, boot, req.BootID)
+			}
+		}
+	case msbNotFound(ierr):
+		// The handle names nothing. The authorized instance can only
+		// exist at its handle — msb names are unique and an instance
+		// cannot move — so absence at the name is verified absence.
+		return refuse(CleanupAlreadyAbsentVerified,
+			"sandbox %s is already absent — the authorized instance is gone", req.Handle)
+	default:
+		// The current occupant cannot be classified: we cannot prove
+		// the label-conditioned removal would hit only the authorized
+		// instance — but the removal itself is still conditioned, so
+		// issue it and let the post-check resolve the outcome.
 	}
-	return nil
+
+	// Step 2 — identity-conditioned removal. The labels are the
+	// condition; no name is passed, so nothing unmatched can be
+	// selected. The fence is carried on the request for the record —
+	// the runtime cannot evaluate our leases, so the caller's
+	// commit-boundary validation is what makes the fence durable.
+	rmArgs := []string{"rm", "-f",
+		"--label", "crabedence.dispatch=" + req.DispatchNonce}
+	if req.JobID != "" {
+		rmArgs = append(rmArgs, "--label", "crabedence.job="+req.JobID)
+	}
+	out, rerr := b.runOnce(ctx, rmArgs...)
+	switch {
+	case rerr != nil && ctx.Err() == nil:
+		if msbNotFound(fmt.Errorf("%v: %s", rerr, strings.ToLower(string(out)))) {
+			// Nothing carried the authorized identity: either the
+			// instance was already gone, or step 1 could not classify
+			// the occupant and the labels agree there is nothing of
+			// ours. The post-check resolves which.
+		} else {
+			// A real removal failure — possibly after partial effect.
+			return b.postCleanupVerify(ctx, req, notes+"the identity-conditioned removal failed: "+errText(rerr, out))
+		}
+	case ctx.Err() != nil:
+		// The deadline expired with the removal in flight — the
+		// command may or may not have taken effect.
+		return b.postCleanupVerify(context.WithoutCancel(ctx), req, notes+"the removal deadline expired after the command was issued — outcome uncertain")
+	}
+
+	// Step 3 — verify the resulting state independently.
+	return b.postCleanupVerify(context.WithoutCancel(ctx), req, notes)
+}
+
+// postCleanupVerify independently confirms what the handle now names
+// after an identity-conditioned removal (or a failed one): absence or
+// a foreign occupant proves the authorized instance is gone; our
+// labels still present contradict the removal. pre may carry the
+// failure context that forced verification.
+func (b *MSBBackend) postCleanupVerify(ctx context.Context, req CleanupRequest, pre string) (CleanupResult, error) {
+	doc, ierr := b.inspectRaw(ctx, req.Handle)
+	switch {
+	case ierr == nil:
+		cfg, _ := doc["config"].(map[string]any)
+		labels, _ := cfg["labels"].(map[string]any)
+		if jsonString(labels, "crabedence.dispatch") == req.DispatchNonce &&
+			(req.JobID == "" || jsonString(labels, "crabedence.job") == req.JobID) {
+			return refuse(CleanupRemovalUncertain,
+				"%ssandbox %s still carries the authorized identity after the removal — the runtime could not prove it was destroyed", prefixDetail(pre), req.Handle)
+		}
+		return refuse(CleanupRemovedVerified,
+			"%ssandbox %s now names a different instance (dispatch %q) — the authorized instance is verified gone and the substitute survived",
+			prefixDetail(pre), req.Handle, jsonString(labels, "crabedence.dispatch"))
+	case msbNotFound(ierr):
+		if pre != "" {
+			return refuse(CleanupAlreadyAbsentVerified,
+				"%s — sandbox %s is absent; nothing carrying the authorized identity remains", pre, req.Handle)
+		}
+		return refuse(CleanupRemovedVerified,
+			"sandbox %s is absent — the authorized instance was removed and verified gone", req.Handle)
+	default:
+		return refuse(CleanupRemovalUncertain,
+			"%spost-removal verification of %s failed (%v) — the authorized instance may be gone or may still exist", prefixDetail(pre), req.Handle, ierr)
+	}
+}
+
+// prefixDetail joins the forced-verification context to a verdict.
+func prefixDetail(pre string) string {
+	if pre == "" {
+		return ""
+	}
+	return pre + "; "
+}
+
+// errText renders a failed CLI call for evidence strings.
+func errText(err error, out []byte) string {
+	msg := strings.TrimSpace(string(out))
+	if msg == "" {
+		return err.Error()
+	}
+	return fmt.Sprintf("%v: %s", err, msg)
+}
+
+// msbNotFound reports whether a CLI failure means the named sandbox
+// (or the label selection) matched nothing.
+func msbNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "not found") || strings.Contains(text, "does not exist") ||
+		strings.Contains(text, "no sandbox")
 }
 
 // Close releases backend resources. Nothing is long-lived: every

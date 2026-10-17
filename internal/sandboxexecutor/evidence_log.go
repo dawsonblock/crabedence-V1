@@ -104,6 +104,12 @@ func OpenEvidenceLog(dir string, signer *evidence.Signer, backendName string) (*
 // anchor an operator publishes for verifiers.
 func (e *EvidenceLog) SignerFingerprint() string { return e.signer.Fingerprint() }
 
+// Signer exposes the executor's evidence signer for signing recovery
+// checkpoints — the same key that attests receipts and checkpoints,
+// so recovery attestations authenticate under the established trust
+// root rather than a parallel identity.
+func (e *EvidenceLog) Signer() *evidence.Signer { return e.signer }
+
 // emptyEvidenceDigest is the SHA-256 of zero bytes — the evidence
 // digest for outcomes that legitimately produced no artifact
 // (NO_EFFECT dispatch refusals, monitor errors before capture).

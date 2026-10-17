@@ -80,7 +80,29 @@ func (s *Server) maintenancePass() {
 	if _, err := s.ledger.ArchiveCompleted(maxArchiveBatch); err != nil {
 		s.audit("maintenance: archive pass failed: %v", err)
 	}
+	s.recoveryCustodyPass()
 	s.escalateResidue()
+}
+
+// recoveryCustodyPass attests the recovery history once per
+// maintenance pass: a signed checkpoint is queued whenever the chain
+// head advanced, then every pending outbox row is offered to the
+// configured custodian. Emission failures are audited, never silent —
+// an unattested head is a custody gap, not a crash.
+func (s *Server) recoveryCustodyPass() {
+	if s.evidence == nil {
+		return
+	}
+	if _, emitted, err := s.ledger.EmitRecoveryCheckpoint(s.evidence.Signer()); err != nil {
+		s.audit("maintenance: recovery checkpoint emission failed: %v", err)
+	} else if emitted {
+		s.audit("maintenance: recovery checkpoint queued for custody")
+	}
+	if rc, ok := s.cfg.ArchiveCustodian.(RecoveryCustodian); ok && rc != nil {
+		if err := s.ledger.DrainRecoveryCustody(rc, s.audit); err != nil {
+			s.audit("maintenance: recovery custody drain failed: %v", err)
+		}
+	}
 }
 
 // resumeBackoff/cleanupBackoff resolve the configured pacing windows,
@@ -100,29 +122,38 @@ func (s *Server) cleanupBackoff() time.Duration {
 	return cleanupRetryBackoff
 }
 
-// claimRecovery reports whether this lifetime may run one more attempt
-// of action on a row — the first sighting is always due, then once per
-// backoff, with the schedule itself durable in the ledger so a restart
-// inside the backoff does not re-attempt. The grant is atomic and
-// fenced: at most one claimant wins the window, its owning epoch is
+// claimRecovery returns the durable recovery claim under which this
+// lifetime may run one more attempt of action on a row — the first
+// sighting is always due, then once per backoff, with the schedule
+// itself durable in the ledger so a restart inside the backoff does
+// not re-attempt. The grant is atomic and fenced: at most one
+// claimant wins the window, its owning epoch and generation are
 // stamped, and the durable claim record commits in the same
-// transaction as the grant itself, so an attempt whose ownership could
-// not be evidenced never runs. Ledger failures are reported and the
-// row skipped: an unpaceable retry is never run unpaced.
-func (s *Server) claimRecovery(jobID, action string, backoff time.Duration) bool {
+// transaction as the grant itself, so an attempt whose ownership
+// could not be evidenced never runs. The claim is the fencing token
+// every protected operation and commit boundary validates — it is
+// carried whole, never reduced to a boolean. Ledger failures are
+// reported and the row skipped: an unpaceable retry is never run
+// unpaced.
+func (s *Server) claimRecovery(jobID, action string, backoff time.Duration) *RecoveryClaim {
 	claim, err := s.ledger.ClaimRecoveryAttempt(jobID, action, backoff, backoff, s.now())
 	if err != nil {
 		s.audit("maintenance: cannot pace %s attempt for %s: %v", action, jobID, err)
-		return false
+		return nil
 	}
-	return claim != nil
+	return claim
 }
 
-// forgetRecovery drops pacing state for a job that resolved — the
-// table must not grow on history the ledger no longer holds.
-func (s *Server) forgetRecovery(jobID, action string) {
-	if err := s.ledger.ForgetRecoveryAttempt(jobID, action); err != nil {
-		s.audit("maintenance: cannot drop %s pacing for %s: %v", action, jobID, err)
+// releaseRecovery completes the claim's pacing state for work that
+// resolved — the release is ownership-conditioned, so a claimant
+// that went stale mid-operation cannot erase the claim a newer owner
+// now holds.
+func (s *Server) releaseRecovery(claim *RecoveryClaim, detail string) {
+	if claim == nil {
+		return
+	}
+	if err := s.ledger.CompleteRecoveryClaim(claim, detail, s.now()); err != nil {
+		s.audit("maintenance: cannot complete %s claim for %s: %v", claim.Action, claim.JobID, err)
 	}
 }
 
@@ -351,12 +382,13 @@ func (s *Server) reconcileWalk() {
 			if s.isStopped() {
 				return
 			}
-			if !s.claimRecovery(j.JobID, RecoveryActionResume, s.resumeBackoff()) {
+			claim := s.claimRecovery(j.JobID, RecoveryActionResume, s.resumeBackoff())
+			if claim == nil {
 				continue
 			}
-			s.reconcileOne(j)
+			s.reconcileOne(j, claim)
 			if done, _ := s.ledger.Get(j.JobID); done == nil || done.State != JobStateDispatchAmbig && done.State != JobStateInterrupted {
-				s.forgetRecovery(j.JobID, RecoveryActionResume)
+				s.releaseRecovery(claim, "unresolved run settled")
 			}
 		}
 		cursor = jobs[len(jobs)-1].Seq
@@ -379,10 +411,11 @@ func (s *Server) cleanupWalk() {
 			if s.isStopped() {
 				return
 			}
-			if !s.claimRecovery(j.JobID, RecoveryActionCleanup, s.cleanupBackoff()) {
+			claim := s.claimRecovery(j.JobID, RecoveryActionCleanup, s.cleanupBackoff())
+			if claim == nil {
 				continue
 			}
-			s.cleanupOne(j)
+			s.cleanupOne(j, claim)
 		}
 		cursor = jobs[len(jobs)-1].Seq
 	}

@@ -273,3 +273,51 @@ test("a stream of non-JSON lines is refused by both modes", { skip }, (t) => {
   assert.notEqual(runGenerate(file, dir).status, 0);
   assert.notEqual(runVerify(file, claimedResults(t)).status, 0);
 });
+
+// ─── The pinned fixture corpus (tests/evidence_fixtures) ───────────
+//
+// The 16-case catalogue the qualification contract requires: every
+// stream is run through generation AND verification with the
+// disposition the manifest declares. Fixture 16 is the provenance
+// case: syntactically valid, so both modes process it, but the
+// emitted record carries no CI provenance off-CI — it can never
+// satisfy a gate that demands an authenticated runner.
+const FIXTURES = path.join(scripts, "..", "tests", "evidence_fixtures");
+const manifest = JSON.parse(
+  fs.readFileSync(path.join(FIXTURES, "manifest.json"), "utf8"),
+);
+
+for (const fx of manifest.fixtures) {
+  const file = path.join(FIXTURES, fx.file);
+  if (fx.accept) {
+    test(`fixture accepts: ${fx.name}`, { skip }, (t) => {
+      const dir = tmpdir(t);
+      const gen = runGenerate(file, dir);
+      assert.equal(gen.status, 0, `fixture ${fx.file} refused:\n${gen.output}`);
+      const rec = JSON.parse(fs.readFileSync(gen.out, "utf8"));
+      const ver = runVerify(file, gen.out);
+      assert.equal(ver.status, 0, `fixture ${fx.file} failed verify:\n${ver.output}`);
+      if (fx.provenance_gate) {
+        // No authenticated runner produced this evidence: the CI
+        // block must be absent or null — a record that cannot name
+        // its runner is not qualification evidence.
+        assert.ok(
+          rec.ci === null || rec.ci === undefined,
+          `fixture ${fx.file} fabricated CI provenance`,
+        );
+      }
+    });
+  } else {
+    test(`fixture refuses generation: ${fx.name}`, { skip }, (t) => {
+      const dir = tmpdir(t);
+      const gen = runGenerate(file, dir);
+      assert.notEqual(gen.status, 0, `generation accepted ${fx.file}`);
+      assert.match(gen.output, new RegExp(fx.want));
+    });
+    test(`fixture refuses verification: ${fx.name}`, { skip }, (t) => {
+      const ver = runVerify(file, claimedResults(t));
+      assert.notEqual(ver.status, 0, `verification accepted ${fx.file}`);
+      assert.match(ver.output, new RegExp(fx.want));
+    });
+  }
+}

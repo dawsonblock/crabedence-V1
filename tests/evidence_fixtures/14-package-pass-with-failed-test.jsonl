@@ -1,0 +1,4 @@
+{"Action":"start","Package":"example.com/mod/pkg"}
+{"Action":"run","Package":"example.com/mod/pkg","Test":"TestA"}
+{"Action":"fail","Package":"example.com/mod/pkg","Test":"TestA","Elapsed":0.01}
+{"Action":"pass","Package":"example.com/mod/pkg","Elapsed":0.02}

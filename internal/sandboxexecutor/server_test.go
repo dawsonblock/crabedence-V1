@@ -386,7 +386,8 @@ type stubBackend struct {
 	werr       error
 	live       bool
 	cleanupErr error
-	cleaned    []string
+	cleanupRes *CleanupResult
+	cleaned    []CleanupRequest
 	resumeErr  error
 	adoptRunID string
 	adoptBoot  string
@@ -503,12 +504,15 @@ func (b *stubBackend) Resume(ctx context.Context, job *JobContractV2, run RunIde
 	return run, res, err
 }
 
-func (b *stubBackend) Cleanup(ctx context.Context, handle string) error {
+func (b *stubBackend) Cleanup(ctx context.Context, req CleanupRequest) (CleanupResult, error) {
 	if b.cleanupErr != nil {
-		return b.cleanupErr
+		return CleanupResult{}, b.cleanupErr
 	}
-	b.cleaned = append(b.cleaned, handle)
-	return nil
+	b.cleaned = append(b.cleaned, req)
+	if b.cleanupRes != nil {
+		return *b.cleanupRes, nil
+	}
+	return CleanupResult{Outcome: CleanupRemovedVerified, Detail: "stub removal verified"}, nil
 }
 
 func (b *stubBackend) Close() error { return nil }

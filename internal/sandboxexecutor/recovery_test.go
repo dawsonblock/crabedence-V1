@@ -77,20 +77,21 @@ func TestRecoveryForgetClearsPacing(t *testing.T) {
 	l, _ := openLedger(t)
 	defer l.Close()
 	now := time.Now().UTC()
-	if claim, _ := l.ClaimRecoveryAttempt("job-9", RecoveryActionResume, time.Hour, time.Hour, now); claim == nil {
-		t.Fatal("first claim refused")
+	claim, err := l.ClaimRecoveryAttempt("job-9", RecoveryActionResume, time.Hour, time.Hour, now)
+	if err != nil || claim == nil {
+		t.Fatalf("first claim refused: claim=%v err=%v", claim, err)
 	}
-	if err := l.ForgetRecoveryAttempt("job-9", RecoveryActionResume); err != nil {
+	if err := l.CompleteRecoveryClaim(claim, "resolved", now); err != nil {
 		t.Fatal(err)
 	}
-	// Same clock — inside the backoff — but forgotten means resolved,
+	// Same clock — inside the backoff — but resolved means done,
 	// and a resolved job re-sighting is a first sighting again.
-	claim, err := l.ClaimRecoveryAttempt("job-9", RecoveryActionResume, time.Hour, time.Hour, now)
+	claim, err = l.ClaimRecoveryAttempt("job-9", RecoveryActionResume, time.Hour, time.Hour, now)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if claim == nil || claim.Attempt != 1 {
-		t.Fatalf("forgotten claim %+v, want granted/attempt 1", claim)
+		t.Fatalf("completed claim %+v, want granted/attempt 1", claim)
 	}
 }
 

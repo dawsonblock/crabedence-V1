@@ -437,8 +437,22 @@ func (s *Server) reconcileUnresolved() {
 }
 
 // reconcileOne re-establishes observation of one unresolved row, or
-// audits why it cannot be resumed.
-func (s *Server) reconcileOne(j *LedgerJob) {
+// audits why it cannot be resumed. claim is the durable recovery
+// fence the pass holds: it is validated before the external
+// observation is issued and again inside the commit that settles the
+// outcome — a claimant that lost the lease mid-flight can interrogate
+// nothing and commit nothing.
+func (s *Server) reconcileOne(j *LedgerJob, claim *RecoveryClaim) {
+	if err := s.ledger.ValidateRecoveryClaim(claim, s.now()); err != nil {
+		s.audit("reconcile: job %s (%s) claim is no longer valid — skipping the backend observation: %v", j.JobID, j.State, err)
+		return
+	}
+	// The observation may run long: extend the lease to cover the
+	// reconcile window before issuing work the backend cannot recall.
+	if err := s.ledger.ExtendRecoveryLease(claim, s.cfg.ReconcileTimeout+time.Minute, s.now()); err != nil {
+		s.audit("reconcile: job %s (%s) claim could not be extended for the observation window: %v", j.JobID, j.State, err)
+		return
+	}
 	contract, cerr := ParseContract(json.RawMessage(j.ContractJSON))
 	if cerr != nil {
 		s.audit("reconcile: job %s (%s) stored contract is unreadable (%v) — leaving it unresolved", j.JobID, j.State, cerr)
@@ -457,7 +471,7 @@ func (s *Server) reconcileOne(j *LedgerJob) {
 	}
 	if rerr == nil && res != nil {
 		s.audit("reconcile: job %s (%s) resumed from run %s boot %s — settling the observed outcome", j.JobID, j.State, adopted.RunID, adopted.BootID)
-		s.settleObserved(j, []string{JobStateDispatchAmbig, JobStateInterrupted}, adopted, res, contract)
+		s.settleObserved(j, []string{JobStateDispatchAmbig, JobStateInterrupted}, adopted, res, contract, claim)
 		return
 	}
 	// Not resumable: audit the handle's liveness so an orphaned
@@ -494,21 +508,68 @@ func (s *Server) retryCleanups() {
 
 // cleanupOne retries the pending removal of one terminal job's
 // backend resources — the row's outcome is already recorded, so a
-// failure audits rather than rewriting it.
-func (s *Server) cleanupOne(j *LedgerJob) {
+// failure audits rather than rewriting it. The destructive request
+// binds the job's *current* persisted identity — the walk's row is a
+// snapshot and a stale snapshot must never authorize a destroy — and
+// the clear commits only while the recovery claim is still the live
+// owner: a claimant that lost the lease mid-operation cannot commit
+// the outcome it triggered.
+func (s *Server) cleanupOne(j *LedgerJob, claim *RecoveryClaim) {
+	fresh, err := s.ledger.Get(j.JobID)
+	if err != nil || fresh == nil {
+		s.audit("cleanup retry: cannot re-read job %s before issuing a destructive operation: %v", j.JobID, err)
+		return
+	}
+	if !fresh.CleanupPending {
+		return
+	}
+	if err := s.ledger.ValidateRecoveryClaim(claim, s.now()); err != nil {
+		s.audit("cleanup retry: job %s claim is no longer valid — skipping the destructive operation: %v", j.JobID, err)
+		return
+	}
+	req := cleanupRequestFor(fresh)
+	req.RecoveryFence = fenceFromClaim(claim)
 	ctx, cancel := context.WithTimeout(s.shutdown, 15*time.Second)
-	cerr := s.cfg.Backend.Cleanup(ctx, j.BackendHandle)
+	res, cerr := s.cfg.Backend.Cleanup(ctx, req)
 	cancel()
 	if cerr != nil {
-		s.audit("cleanup retry: job %s handle %s still pending: %v", j.JobID, j.BackendHandle, cerr)
+		s.audit("cleanup retry: job %s handle %s still pending: %v", j.JobID, fresh.BackendHandle, cerr)
 		return
 	}
-	if err := s.ledger.ClearCleanupPending(j.JobID); err != nil {
-		s.audit("cleanup retry: job %s removed but the ledger refused the clear: %v", j.JobID, err)
+	if !res.Outcome.ProvesAbsent() {
+		// The backend could not prove the authorized instance is
+		// gone — a substitution it refused to touch, an identity it
+		// could not verify, or an uncertain removal. Record the
+		// classification as the pending reason so the residue
+		// escalation carries why it is still owed.
+		if nerr := s.ledger.NoteCleanupPendingFor(j.JobID, fmt.Sprintf("%s: %s", res.Outcome, res.Detail), claim); nerr != nil {
+			s.audit("cleanup retry: job %s outcome %s could not be recorded: %v", j.JobID, res.Outcome, nerr)
+		}
+		s.audit("cleanup retry: job %s handle %s still pending (%s): %s", j.JobID, fresh.BackendHandle, res.Outcome, res.Detail)
 		return
 	}
-	s.audit("cleanup retry: job %s handle %s removed", j.JobID, j.BackendHandle)
-	s.forgetRecovery(j.JobID, RecoveryActionCleanup)
+	if err := s.ledger.ClearCleanupPendingFor(j.JobID, claim, s.now()); err != nil {
+		s.audit("cleanup retry: job %s removed (%s) but the ledger refused the clear: %v", j.JobID, res.Outcome, err)
+		return
+	}
+	s.audit("cleanup retry: job %s handle %s removed (%s)", j.JobID, fresh.BackendHandle, res.Outcome)
+	s.releaseRecovery(claim, fmt.Sprintf("pending removal completed: %s", res.Outcome))
+}
+
+// cleanupRequestFor builds the identity-bound destruction
+// authorization from the job's persisted dispatch record — the nonce,
+// boot generation, policy digest and run identity a substituted VM
+// cannot present.
+func cleanupRequestFor(j *LedgerJob) CleanupRequest {
+	return CleanupRequest{
+		JobID:         j.JobID,
+		BackendID:     j.BackendID,
+		Handle:        j.BackendHandle,
+		DispatchNonce: j.DispatchNonce,
+		BootID:        j.BackendBootID,
+		PolicyDigest:  j.PolicyDigest,
+		RunID:         j.BackendJobID,
+	}
 }
 
 // Stop shuts the server down in drain order: cancel monitors'
@@ -1031,7 +1092,7 @@ func (s *Server) monitor(jobID string, run RunIdentity) {
 		s.markUnobserved(jobID, fmt.Sprintf("outcome unobserved: %v", werr))
 		return
 	}
-	s.settleObserved(job, []string{JobStateRunning}, run, res, contract)
+	s.settleObserved(job, []string{JobStateRunning}, run, res, contract, nil)
 }
 
 // classifyObserved maps one backend observation to the terminal
@@ -1090,11 +1151,11 @@ func classifyObserved(contract *JobContractV2, res *ExecResult) (state, outcome 
 // terminal row whose transition failed never destroys its VM,
 // because an unresolved row's workload is for an operator to
 // reconcile.
-func (s *Server) settleObserved(job *LedgerJob, from []string, run RunIdentity, res *ExecResult, contract *JobContractV2) {
+func (s *Server) settleObserved(job *LedgerJob, from []string, run RunIdentity, res *ExecResult, contract *JobContractV2, claim *RecoveryClaim) {
 	state, outcome, exit, errText, ok := classifyObserved(contract, res)
 	if !ok {
 		s.audit("job %s: backend returned an unverified outcome (%+v) — refusing the terminal claim", job.JobID, res)
-		if terr := s.ledger.Transition(job.JobID, JobStateDispatchAmbig, from,
+		if terr := s.ledger.TransitionWithClaim(job.JobID, JobStateDispatchAmbig, from, claim,
 			func(j *LedgerJob) error {
 				j.Error = "backend returned an unverified outcome"
 				return nil
@@ -1104,7 +1165,7 @@ func (s *Server) settleObserved(job *LedgerJob, from []string, run RunIdentity, 
 		return
 	}
 	resultJSON, _ := json.Marshal(res)
-	if err := s.finishTerminal(job, from, state, outcome, receiptRunIdentity(job, res), res.OutputSHA256,
+	if err := s.finishTerminal(job, from, state, outcome, receiptRunIdentity(job, res), res.OutputSHA256, claim,
 		func(j *LedgerJob) error {
 			j.ExitCode = exit
 			j.Error = errText
@@ -1116,14 +1177,24 @@ func (s *Server) settleObserved(job *LedgerJob, from []string, run RunIdentity, 
 		return
 	}
 	cleanupPending := false
-	if err := s.cleanupBackend(run.Handle); err != nil {
+	cres, cerr := s.cleanupBackend(job, run, claim)
+	switch {
+	case cerr != nil:
 		cleanupPending = true
-		s.audit("job %s: cleanup pending — %v", job.JobID, err)
-		if merr := s.ledger.MarkCleanupPending(job.JobID, err.Error()); merr != nil {
+		s.audit("job %s: cleanup pending — %v", job.JobID, cerr)
+		if merr := s.ledger.MarkCleanupPendingFor(job.JobID, cerr.Error(), claim); merr != nil {
 			s.audit("job %s: could not record the pending cleanup: %v", job.JobID, merr)
 		}
-	} else if err := s.ledger.ClearCleanupPending(job.JobID); err != nil {
-		s.audit("job %s: cleaned up but the ledger refused the clear: %v", job.JobID, err)
+	case !cres.Outcome.ProvesAbsent():
+		cleanupPending = true
+		s.audit("job %s: cleanup pending (%s) — %s", job.JobID, cres.Outcome, cres.Detail)
+		if merr := s.ledger.NoteCleanupPendingFor(job.JobID, fmt.Sprintf("%s: %s", cres.Outcome, cres.Detail), claim); merr != nil {
+			s.audit("job %s: could not record the cleanup classification: %v", job.JobID, merr)
+		}
+	default:
+		if err := s.ledger.ClearCleanupPendingFor(job.JobID, claim, s.now()); err != nil {
+			s.audit("job %s: cleaned up (%s) but the ledger refused the clear: %v", job.JobID, cres.Outcome, err)
+		}
 	}
 	exitText := "none"
 	if exit != nil {
@@ -1180,12 +1251,32 @@ func applyRunIdentity(j *LedgerJob, backendName string, run RunIdentity) {
 }
 
 // cleanupBackend removes a finished job's backend resources under a
-// bounded deadline. A failure is recorded as cleanup pending, never
-// as a result change.
-func (s *Server) cleanupBackend(handle string) error {
+// bounded deadline, bound to the job's persisted dispatch identity —
+// the request is built from the ledger row with the observed run
+// identity preferred (adoption may have refreshed it this pass). A
+// failure or a non-proven outcome is recorded as cleanup pending,
+// never as a result change.
+func (s *Server) cleanupBackend(job *LedgerJob, run RunIdentity, claim *RecoveryClaim) (CleanupResult, error) {
+	req := cleanupRequestFor(job)
+	if run.Handle != "" {
+		req.Handle = run.Handle
+	}
+	if run.Nonce != "" {
+		req.DispatchNonce = run.Nonce
+	}
+	if run.BootID != "" {
+		req.BootID = run.BootID
+	}
+	if run.RunID != "" {
+		req.RunID = run.RunID
+	}
+	if run.PolicyDigest != "" {
+		req.PolicyDigest = run.PolicyDigest
+	}
+	req.RecoveryFence = fenceFromClaim(claim)
 	ctx, cancel := context.WithTimeout(s.shutdown, 15*time.Second)
 	defer cancel()
-	return s.cfg.Backend.Cleanup(ctx, handle)
+	return s.cfg.Backend.Cleanup(ctx, req)
 }
 
 // markUnobserved records a job whose outcome could not be
@@ -1220,13 +1311,13 @@ func (s *Server) emitReceipt(job *LedgerJob, outcome, artifactSHA, runID string)
 // the next reconcile marks it ambiguous for an operator, never
 // silently terminal or silently lost — and the caller must not treat
 // the job's resources as disposable.
-func (s *Server) finishTerminal(job *LedgerJob, from []string, state, outcome, handle, artifactSHA string, mutate func(*LedgerJob) error) error {
+func (s *Server) finishTerminal(job *LedgerJob, from []string, state, outcome, handle, artifactSHA string, claim *RecoveryClaim, mutate func(*LedgerJob) error) error {
 	receiptSHA, rerr := s.emitReceipt(job, outcome, artifactSHA, handle)
 	if rerr != nil {
 		s.audit("job %s: evidence emission failed (%v) — staying non-terminal for reconcile", job.JobID, rerr)
 		return rerr
 	}
-	err := s.ledger.Transition(job.JobID, state, from,
+	err := s.ledger.TransitionWithClaim(job.JobID, state, from, claim,
 		func(j *LedgerJob) error {
 			j.ReceiptSHA256 = receiptSHA
 			return mutate(j)

@@ -1045,11 +1045,78 @@ func fakeLogs(dir string, args []string) int {
 }
 
 func fakeRemove(dir string, args []string) int {
-	removed := false
-	for _, a := range args {
+	// The real CLI resolves --label K=V selectors to the sandboxes
+	// whose instance labels match every selector, AND-matched, then
+	// removes each match plus every explicitly named sandbox. Labels
+	// bind to the instance, not the name — a re-created sandbox under
+	// a reused name does not carry the deleted one's labels.
+	var names []string
+	var selectors []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--label" && i+1 < len(args) {
+			i++
+			selectors = append(selectors, args[i])
+			continue
+		}
 		if strings.HasPrefix(a, "-") {
 			continue
 		}
+		names = append(names, a)
+	}
+	targets := append([]string{}, names...)
+	// MSB_FAKE_RM_SWAP models a substitution landing inside the
+	// removal window — after the caller's pre-verification but before
+	// the label match below runs. The payload at dir/rm-swap-payload
+	// replaces the state file of the handle it names; the label
+	// condition is evaluated against *that* state, so a substitute
+	// that cannot carry the authorized labels is never selected.
+	if os.Getenv("MSB_FAKE_RM_SWAP") != "" {
+		if raw, err := os.ReadFile(filepath.Join(dir, "rm-swap-payload")); err == nil {
+			var sb struct {
+				Name string `json:"name"`
+			}
+			if json.Unmarshal(raw, &sb) == nil && sb.Name != "" {
+				_ = os.WriteFile(fakeStatePath(dir, sb.Name), raw, 0o600)
+			}
+		}
+	}
+	if len(selectors) > 0 {
+		entries, err := os.ReadDir(dir)
+		if err == nil {
+			for _, e := range entries {
+				name, ok := strings.CutSuffix(e.Name(), ".json")
+				if !ok || strings.HasSuffix(name, ".jobs") {
+					continue
+				}
+				raw, rerr := os.ReadFile(filepath.Join(dir, e.Name()))
+				if rerr != nil {
+					continue
+				}
+				var sb struct {
+					Config struct {
+						Labels map[string]string `json:"labels"`
+					} `json:"config"`
+				}
+				if json.Unmarshal(raw, &sb) != nil {
+					continue
+				}
+				matched := true
+				for _, sel := range selectors {
+					k, v, _ := strings.Cut(sel, "=")
+					if sb.Config.Labels[k] != v {
+						matched = false
+						break
+					}
+				}
+				if matched {
+					targets = append(targets, name)
+				}
+			}
+		}
+	}
+	removed := false
+	for _, a := range targets {
 		if os.Getenv("MSB_FAKE_RM_FAIL") != "" {
 			fmt.Fprintf(os.Stderr, "error: remove failed: sandbox %s is busy\n", a)
 			return 1
@@ -1533,7 +1600,7 @@ func TestMSBDispatchMapsContractToSandbox(t *testing.T) {
 	}
 	// The artifact store is the durable evidence — the VM itself is
 	// removed by Cleanup once the result is collected.
-	if err := backend.Cleanup(testContext(t), disp.Handle); err != nil {
+	if _, err := backend.Cleanup(testContext(t), cleanupReqFor(job, disp)); err != nil {
 		t.Fatalf("cleanup: %v", err)
 	}
 	if _, err := os.Stat(fakeStatePath(stateDir, disp.Handle)); err == nil {
@@ -1973,6 +2040,20 @@ func TestMSBCaptureFailureIsNotFullyVerified(t *testing.T) {
 
 // ─── Cleanup ────────────────────────────────────────────────────────
 
+// cleanupReqFor builds the identity-bound cleanup request a settled
+// job's ledger row would carry — the persisted dispatch identity.
+func cleanupReqFor(job *JobContractV2, disp RunIdentity) CleanupRequest {
+	return CleanupRequest{
+		JobID:         job.JobID,
+		BackendID:     "microsandbox",
+		Handle:        disp.Handle,
+		DispatchNonce: disp.Nonce,
+		BootID:        disp.BootID,
+		PolicyDigest:  disp.PolicyDigest,
+		RunID:         disp.RunID,
+	}
+}
+
 func TestMSBCleanupRemovesSandbox(t *testing.T) {
 	key, _ := testAuthority(t)
 	bin, stateDir := fakeMSB(t, nil)
@@ -1983,16 +2064,24 @@ func TestMSBCleanupRemovesSandbox(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dispatch: %v", err)
 	}
-	if err := backend.Cleanup(testContext(t), disp.Handle); err != nil {
+	res, err := backend.Cleanup(testContext(t), cleanupReqFor(job, disp))
+	if err != nil {
 		t.Fatalf("cleanup: %v", err)
+	}
+	if res.Outcome != CleanupRemovedVerified {
+		t.Fatalf("cleanup outcome %s, want %s: %s", res.Outcome, CleanupRemovedVerified, res.Detail)
 	}
 	if _, err := os.Stat(fakeStatePath(stateDir, disp.Handle)); err == nil {
 		t.Fatal("sandbox survived cleanup")
 	}
-	// A second cleanup of an already-removed sandbox is a success:
-	// the goal is absence.
-	if err := backend.Cleanup(testContext(t), disp.Handle); err != nil {
+	// A second cleanup of an already-removed sandbox is a verified
+	// absence: the goal is absence.
+	res, err = backend.Cleanup(testContext(t), cleanupReqFor(job, disp))
+	if err != nil {
 		t.Fatalf("cleanup of a missing sandbox: %v", err)
+	}
+	if res.Outcome != CleanupAlreadyAbsentVerified {
+		t.Fatalf("second cleanup outcome %s, want %s", res.Outcome, CleanupAlreadyAbsentVerified)
 	}
 }
 
@@ -2006,8 +2095,12 @@ func TestMSBCleanupFailureIsReported(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dispatch: %v", err)
 	}
-	if err := backend.Cleanup(testContext(t), disp.Handle); err == nil {
-		t.Fatal("a failed removal reported success")
+	res, err := backend.Cleanup(testContext(t), cleanupReqFor(job, disp))
+	if err != nil {
+		t.Fatalf("cleanup transport error: %v", err)
+	}
+	if res.Outcome.ProvesAbsent() {
+		t.Fatalf("a failed removal proved absence: %s", res.Detail)
 	}
 	if _, err := os.Stat(fakeStatePath(stateDir, disp.Handle)); err != nil {
 		t.Fatal("the sandbox vanished despite the failed removal")
@@ -2028,8 +2121,12 @@ func TestMSBKeepSandboxesLeavesForensicVM(t *testing.T) {
 	if _, err := backend.Wait(testContext(t), job, disp); err != nil {
 		t.Fatalf("wait: %v", err)
 	}
-	if err := backend.Cleanup(testContext(t), disp.Handle); err != nil {
+	res, err := backend.Cleanup(testContext(t), cleanupReqFor(job, disp))
+	if err != nil {
 		t.Fatalf("cleanup under KeepSandboxes: %v", err)
+	}
+	if !res.Outcome.ProvesAbsent() {
+		t.Fatalf("KeepSandboxes cleanup left the obligation pending: %s", res.Outcome)
 	}
 	if _, err := os.Stat(fakeStatePath(stateDir, disp.Handle)); err != nil {
 		t.Fatal("KeepSandboxes did not leave the VM in place")
