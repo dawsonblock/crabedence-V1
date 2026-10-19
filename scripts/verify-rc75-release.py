@@ -17,37 +17,49 @@ Three operations, all mechanical, all fail closed:
             recursion problem — a manifest inside the archive cannot
             contain the archive's own digest — is resolved here: the
             internal manifest covers content, the sidecar covers the
-            container.
+            container. With --sign-key the attestation is SSH-signed
+            under the rc75-release namespace — the trusted anchor an
+            attacker controlling archive + sidecar cannot forge.
 
   verify    Fresh-extraction verification a clean verifier can run
             without trusting the developer's workspace: unpack the
             archive into an empty directory, prove entry safety and
             manifest closure, re-hash every file, check symlinks,
             version consistency, dependency locks, qualification
-            evidence presence, and the sidecar digest. Any failure is
-            a release blocker; nothing is treated as pass by absence
-            of evidence.
+            evidence presence, and the sidecar digest. With --signature
+            + --allowed-signers + --sign-identity the attestation must
+            first verify under a trusted principal; --require-signature
+            makes that check mandatory. Any failure is a release
+            blocker; nothing is treated as pass by absence of evidence.
 
 Usage:
   verify-rc75-release.py manifest <source-root> <out.json>
       [--exclude PATH ...]
   verify-rc75-release.py attest <archive> <attestation.json>
-      --version V --source-manifest <m.json>
+      --version V --source-manifest <m.json> [--sign-key KEY]
   verify-rc75-release.py verify <archive> --manifest <m.json>
       --attestation <a.json> --version V [--require PATH ...]
+      [--signature <a.json.sig> --allowed-signers <file>
+       --sign-identity <principal>] [--require-signature]
 """
 
 import argparse
 import hashlib
 import json
 import os
+import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import zipfile
 
 MANIFEST_SCHEMA = "rc75-source-manifest-v1"
 ATTEST_SCHEMA = "rc75-release-attestation-v1"
+
+# SSH signature namespace binding attestations to this release purpose —
+# a signature minted for any other use cannot be replayed here.
+SIGN_NAMESPACE = "rc75-release"
 
 BLOCKED_MANIFEST_PATHS = {"release-evidence/rc75-release-attestation.json"}
 
@@ -183,9 +195,10 @@ EMBEDDED_MANIFEST = "release-evidence/rc75-source-manifest.json"
 def cmd_pack(args):
     """Build the distribution ZIP deterministically from the package
     membership list: fixed timestamps and sorted names so the same
-    tree packs to the same bytes. Symlinks are not flattened into the
-    container — the embedded manifest is their authority, and the
-    verifier materializes them on extraction. The manifest travels
+    tree packs to the same bytes. Symlinks ship as real symlink
+    members — the transport artifact and the verified source identity
+    agree without a reconstruction step, and the manifest remains the
+    authority the verifier binds them against. The manifest travels
     inside the archive at a fixed, self-exempt path."""
     root = os.path.abspath(args.root)
     with open(args.from_list) as fh:
@@ -196,11 +209,22 @@ def cmd_pack(args):
             full = os.path.join(root, rel)
             arc = os.path.join(args.topdir, rel).replace(os.sep, "/")
             if os.path.islink(full):
-                continue  # carried by the manifest, not the container
+                # The container carries the link as a real symlink
+                # member (unix S_IFLNK, link text as content) so an
+                # ordinary extraction reproduces the declared tree —
+                # the manifest remains the authority the verifier
+                # binds, the container simply agrees with it.
+                zi = zipfile.ZipInfo(arc, epoch)
+                zi.compress_type = zipfile.ZIP_DEFLATED
+                zi.create_system = 3
+                zi.external_attr = (stat.S_IFLNK | 0o777) << 16
+                zf.writestr(zi, os.readlink(full).encode())
+                continue
             if not os.path.isfile(full):
                 continue
             zi = zipfile.ZipInfo(arc, epoch)
             zi.compress_type = zipfile.ZIP_DEFLATED
+            zi.create_system = 3
             zi.external_attr = (os.stat(full).st_mode & 0o777) << 16
             with open(full, "rb") as fh:
                 zf.writestr(zi, fh.read())
@@ -217,6 +241,26 @@ def cmd_pack(args):
 # ---------------------------------------------------------------------------
 # attest
 # ---------------------------------------------------------------------------
+
+def sign_file(path, key):
+    """SSH-sign a file in place: writes <path>.sig under the release
+    namespace. The signature binds the exact bytes — a modified
+    attestation can never carry a valid original signature."""
+    if shutil.which("ssh-keygen") is None:
+        die("ssh-keygen is required to sign the attestation")
+    sig = path + ".sig"
+    if os.path.exists(sig):
+        os.remove(sig)
+    r = subprocess.run(
+        ["ssh-keygen", "-Y", "sign", "-f", key,
+         "-n", SIGN_NAMESPACE, path],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"attestation signing failed: {r.stderr.strip()}")
+    if not os.path.isfile(sig):
+        die("ssh-keygen reported success but produced no signature")
+    return sig
+
 
 def cmd_attest(args):
     archive = os.path.abspath(args.archive)
@@ -240,6 +284,8 @@ def cmd_attest(args):
         json.dump(att, f, indent=1)
         f.write("\n")
     print(f"attestation: {att['archive_sha256']}")
+    if args.sign_key:
+        print(f"signature: {sign_file(args.attestation, args.sign_key)}")
 
 
 # ---------------------------------------------------------------------------
@@ -260,11 +306,18 @@ class Findings:
             die(msg)
 
 
+def member_is_symlink(info):
+    """A zip member is a symlink when its unix mode declares S_IFLNK —
+    the Info-ZIP convention pack uses and the verifier honors."""
+    return ((info.external_attr >> 16) & 0o170000) == 0o120000
+
+
 def safe_members(zf):
     """Every archive member must extract inside the target — no
-    absolute paths, no drive letters, no '..' — and be a regular file
-    or directory; archive symlinks are rejected (the source manifest
-    covers symlinks, the zip must not smuggle new ones)."""
+    absolute paths, no drive letters, no '..' — and be a regular file,
+    directory, or symlink. Symlink members pass member_is_symlink and
+    are bound to manifest declarations by the verifier — the container
+    cannot smuggle a link the manifest does not declare."""
     for info in zf.infolist():
         name = info.filename
         if name.endswith("/"):
@@ -273,12 +326,6 @@ def safe_members(zf):
         parts = norm.split("/")
         if norm.startswith("/") or ".." in parts or ":" in parts[0]:
             yield None, f"unsafe archive member: {name!r}"
-            continue
-        # zip unix-mode symlink detection
-        mode = (info.external_attr >> 16) & 0o170000
-        if mode == 0o120000:
-            yield None, f"archive member is a symlink: {name!r} — " \
-                "symlinks belong to the source manifest, not the container"
             continue
         yield info, None
 
@@ -324,10 +371,49 @@ def verify_tree_against_manifest(root, manifest, findings):
                                f"unpackaged file in tree: {rel}")
 
 
+def verify_signature(args):
+    """The trusted anchor: the attestation sidecar is hash-binding
+    evidence, not authority — whoever controls archive + sidecar can
+    mint self-consistent hashes. A signature over the attestation from
+    a separately controlled release key is the trust boundary. When a
+    signature is supplied (or required) the attestation must verify
+    under a principal the allowed-signers file authorizes, before any
+    other check runs."""
+    want = bool(args.signature or args.allowed_signers or
+                args.sign_identity)
+    if args.require_signature and not (
+            args.signature and args.allowed_signers and
+            args.sign_identity):
+        die("signature verification required but --signature, "
+            "--allowed-signers and --sign-identity were not all supplied")
+    if not want:
+        return
+    if not (args.signature and args.allowed_signers and
+            args.sign_identity):
+        die("--signature, --allowed-signers and --sign-identity must be "
+            "supplied together — a signature without its trust anchor "
+            "proves nothing")
+    if shutil.which("ssh-keygen") is None:
+        die("ssh-keygen is required to verify the attestation signature")
+    with open(args.attestation, "rb") as fh:
+        attestation_bytes = fh.read()
+    r = subprocess.run(
+        ["ssh-keygen", "-Y", "verify",
+         "-f", args.allowed_signers,
+         "-I", args.sign_identity,
+         "-n", SIGN_NAMESPACE,
+         "-s", args.signature],
+        input=attestation_bytes, capture_output=True)
+    if r.returncode != 0:
+        die("attestation signature verification failed — the release "
+            "identity is not authenticated by a trusted key")
+
+
 def cmd_verify(args):
     f = Findings()
     archive = os.path.abspath(args.archive)
     f.require(os.path.isfile(archive), f"archive not found: {archive}")
+    verify_signature(args)
 
     with open(args.manifest) as fh:
         manifest = json.load(fh)
@@ -355,6 +441,7 @@ def cmd_verify(args):
     with tempfile.TemporaryDirectory(prefix="rc75-verify-") as tmp:
         with zipfile.ZipFile(archive) as zf:
             names = set()
+            container_links = {}
             for info, err in safe_members(zf):
                 if err:
                     f.check(False, err)
@@ -364,6 +451,13 @@ def cmd_verify(args):
                                f"duplicate archive member: {norm}"):
                     continue
                 names.add(norm)
+                if member_is_symlink(info):
+                    # Link text is the member's content; it is
+                    # materialized only once the tree is located and
+                    # the manifest has declared it.
+                    container_links[norm] = \
+                        zf.read(info).decode("utf-8", "surrogateescape")
+                    continue
                 dest = zf.extract(info, tmp)
                 # Python's extractor ignores the unix mode stored in
                 # external_attr; apply it as unzip does so executable
@@ -385,22 +479,54 @@ def cmd_verify(args):
             tree = tmp
         tree = os.path.abspath(tree)
 
-        # Materialize the manifest's symlinks — the container carries
-        # none; the manifest is their authority. A target must be
-        # relative and resolve inside the tree, and it must not
-        # collide with an extracted member.
+        # Container symlink members are bound to the manifest's
+        # declarations: a link the manifest does not declare is
+        # refused, and a declared link whose container target differs
+        # is refused. A target must be relative and resolve inside
+        # the tree, and it must not collide with an extracted member.
+        manifest_links = {e["path"]: e["target"]
+                          for e in manifest["entries"]
+                          if e["type"] == "symlink"}
+        for member, target in container_links.items():
+            dest = os.path.join(tmp, member)
+            rel = os.path.relpath(dest, tree).replace(os.sep, "/")
+            resolved = os.path.normpath(
+                os.path.join(os.path.dirname(dest), target))
+            f.require(
+                not os.path.isabs(target)
+                and resolved.startswith(tree + os.sep),
+                f"archive symlink target escapes the tree: {member}")
+            f.require(not os.path.lexists(dest),
+                      f"archive symlink member collides with an extracted member: {member}")
+            declared = manifest_links.get(rel)
+            f.check(declared is not None,
+                    f"undeclared archive symlink member: {member} — the "
+                    "container cannot carry a link the manifest does not declare")
+            if declared is None:
+                continue
+            if not f.check(target == declared,
+                           f"archive symlink target differs from the "
+                           f"manifest declaration: {member}"):
+                continue
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            os.symlink(target, dest)
+
+        # Manifest-declared links the container did not carry are
+        # materialized from the manifest — the manifest remains their
+        # authority for legacy containers built before the packer
+        # shipped links as members. The same safety rules apply.
         for e in manifest["entries"]:
             if e["type"] != "symlink":
                 continue
             dest = os.path.join(tree, e["path"])
+            if os.path.lexists(dest):
+                continue  # provided by the container and bound above
             resolved = os.path.normpath(
                 os.path.join(os.path.dirname(dest), e["target"]))
             f.require(
                 not os.path.isabs(e["target"])
                 and resolved.startswith(tree + os.sep),
                 f"symlink target escapes the tree: {e['path']}")
-            f.require(not os.path.lexists(dest),
-                      f"archive member collides with a manifest symlink: {e['path']}")
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             os.symlink(e["target"], dest)
 
@@ -489,6 +615,10 @@ def main():
     pa.add_argument("attestation")
     pa.add_argument("--version", required=True)
     pa.add_argument("--source-manifest", required=True)
+    pa.add_argument("--sign-key",
+                    help="SSH private key; signs the attestation in place "
+                         "(writes <attestation>.sig under the rc75-release "
+                         "namespace)")
     pa.set_defaults(fn=cmd_attest)
 
     pv = sub.add_parser("verify", help="fresh-extraction verification")
@@ -497,6 +627,15 @@ def main():
     pv.add_argument("--attestation", required=True)
     pv.add_argument("--version", required=True)
     pv.add_argument("--require", action="append")
+    pv.add_argument("--signature",
+                    help="SSH signature file over the attestation")
+    pv.add_argument("--allowed-signers",
+                    help="ssh-keygen allowed_signers file naming trusted "
+                         "release principals")
+    pv.add_argument("--sign-identity",
+                    help="principal the signature must verify under")
+    pv.add_argument("--require-signature", action="store_true",
+                    help="fail closed unless a trusted signature verifies")
     pv.set_defaults(fn=cmd_verify)
 
     args = p.parse_args()

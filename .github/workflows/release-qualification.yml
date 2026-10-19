@@ -118,15 +118,22 @@ jobs:
           matrix='{"include":[]}'
           for lane in $resolved; do
             # Runner selection is workflow configuration: every claimed
-            # lane must map to a runner that actually provisions on this
-            # repository. The blacksmith label does not resolve here —
-            # jobs queue without a runner — so the KVM lane uses the
-            # GitHub-hosted Linux image, which exposes /dev/kvm.
+            # lane must map to a runner that can actually produce lane
+            # evidence. GitHub-hosted macos-* runners are themselves
+            # virtualized — a second-level hypervisor cannot boot
+            # microVMs, so a hosted macOS lane fails by construction
+            # (observed: run 39186297140, every TestMSBLive* failed at
+            # build_vm). Apple lane evidence must come from bare-metal
+            # Apple Silicon: a self-hosted runner registered to this
+            # repository. Claiming the lane without one queues the lane
+            # job instead of executing a certain failure — a claim with
+            # no evidence cannot pass admission either way, and this
+            # mapping keeps a fake-able lane impossible.
             case "$lane" in
-              apple-hypervisor-framework) runner=macos-15 ;;
-              linux-kvm) runner=ubuntu-latest ;;
+              apple-hypervisor-framework) runner='["self-hosted","macOS","ARM64"]' ;;
+              linux-kvm) runner='"ubuntu-latest"' ;;
             esac
-            matrix="$(jq -c --arg l "$lane" --arg r "$runner" \
+            matrix="$(jq -c --arg l "$lane" --argjson r "$runner" \
               '.include += [{lane: $l, runner: $r}]' <<<"$matrix")"
           done
           echo "lane_matrix=$matrix" >> "$GITHUB_OUTPUT"

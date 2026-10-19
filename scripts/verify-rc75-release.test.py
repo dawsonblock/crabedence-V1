@@ -11,6 +11,7 @@ refused, never normalized into a pass.
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -98,23 +99,11 @@ class PackageFixture(unittest.TestCase):
                         "--attestation", att or self.att,
                         "--version", version)
 
-    def forge_att(self, zip_path):
-        """An attestation honestly computed over attacker bytes —
-        the retained manifest is what keeps the forgery from passing."""
-        att = os.path.join(self.tmp.name,
-                           f"att-{os.path.basename(zip_path)}.json")
-        r = run_tool("attest", zip_path, att,
-                     "--version", "0.54.0-rc.7.5-dev",
-                     "--source-manifest", self.manifest)
-        self.assertEqual(r.returncode, 0, r.stderr)
-        return att
-
-
-class TestPositive(PackageFixture):
-    def test_clean_package_verifies(self):
-        # pack + manifest + attest + verify — the real workflow,
-        # including a source symlink carried by the manifest and
-        # materialized on extraction.
+    def packed_fixture(self):
+        """A package built through the real `pack` subcommand: the
+        archive embeds the manifest and carries source symlinks as
+        real symlink members — the positive fixture for any test that
+        needs verification to reach the end."""
         src2 = os.path.join(self.tmp.name, "src2")
         build_source(src2)
         flist = os.path.join(self.tmp.name, "files.txt")
@@ -137,6 +126,25 @@ class TestPositive(PackageFixture):
                      "--version", "0.54.0-rc.7.5-dev",
                      "--source-manifest", self.manifest)
         self.assertEqual(r.returncode, 0, r.stderr)
+
+    def forge_att(self, zip_path):
+        """An attestation honestly computed over attacker bytes —
+        the retained manifest is what keeps the forgery from passing."""
+        att = os.path.join(self.tmp.name,
+                           f"att-{os.path.basename(zip_path)}.json")
+        r = run_tool("attest", zip_path, att,
+                     "--version", "0.54.0-rc.7.5-dev",
+                     "--source-manifest", self.manifest)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return att
+
+
+class TestPositive(PackageFixture):
+    def test_clean_package_verifies(self):
+        # pack + manifest + attest + verify — the real workflow,
+        # including a source symlink carried by the container as a
+        # real member and bound to the manifest on extraction.
+        self.packed_fixture()
         res = self.verify()
         self.assertEqual(res.returncode, 0, res.stderr)
 
@@ -194,8 +202,8 @@ class TestAdversarial(PackageFixture):
         self.assertIn("unsafe archive member", res.stderr)
 
     def test_symlink_member_rejected(self):
-        """A real zip symlink entry is refused — links belong to the
-        manifest, not smuggled through the container."""
+        """A zip symlink escaping the tree is refused — link targets
+        must be relative and resolve inside the extraction."""
         self.package_and_attest()
         evil = os.path.join(self.tmp.name, "evilsl.zip")
         with zipfile.ZipFile(evil, "w") as zf:
@@ -205,6 +213,55 @@ class TestAdversarial(PackageFixture):
         res = self.verify(zip_path=evil, att=self.forge_att(evil))
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("symlink", res.stderr)
+
+    def test_undeclared_symlink_member_rejected(self):
+        """A container link the manifest does not declare is refused —
+        the manifest remains the authority over what may be a link."""
+        self.package_and_attest()
+        evil = os.path.join(self.tmp.name, "undeclared.zip")
+        with zipfile.ZipFile(self.zip_path) as zin, \
+                zipfile.ZipFile(evil, "w") as zout:
+            for item in zin.infolist():
+                zout.writestr(item, zin.read(item.filename))
+            zi = zipfile.ZipInfo("pkg/internal/x/link.go")
+            zi.external_attr = (0o120777 << 16)
+            zout.writestr(zi, "x.go")
+        res = self.verify(zip_path=evil, att=self.forge_att(evil))
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("undeclared", res.stderr)
+
+    def test_symlink_member_target_mismatch_rejected(self):
+        """A container link whose target differs from the manifest's
+        declaration is refused — container and authority must agree."""
+        src2 = os.path.join(self.tmp.name, "src2")
+        build_source(src2)
+        flist = os.path.join(self.tmp.name, "files.txt")
+        rels = []
+        for dirpath, dirnames, filenames in os.walk(src2, followlinks=False):
+            for n in dirnames + filenames:
+                rels.append(os.path.relpath(
+                    os.path.join(dirpath, n), src2).replace(os.sep, "/"))
+        with open(flist, "w") as fh:
+            fh.write("\n".join(sorted(rels)) + "\n")
+        r = run_tool("manifest", src2, self.manifest,
+                     "--version", "0.54.0-rc.7.5-dev",
+                     "--from-list", flist)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = run_tool("pack", src2, self.zip_path,
+                     "--from-list", flist, "--topdir", "pkg",
+                     "--manifest", self.manifest)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        tampered = os.path.join(self.tmp.name, "tampered.zip")
+        with zipfile.ZipFile(self.zip_path) as zin, \
+                zipfile.ZipFile(tampered, "w") as zout:
+            for item in zin.infolist():
+                if (item.external_attr >> 16) & 0o170000 == 0o120000:
+                    zout.writestr(item, "go.mod")
+                else:
+                    zout.writestr(item, zin.read(item.filename))
+        res = self.verify(zip_path=tampered, att=self.forge_att(tampered))
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("differs from the manifest", res.stderr)
 
     def test_missing_member_rejected(self):
         """An archive short one manifest entry fails closure."""
@@ -309,6 +366,106 @@ class TestAdversarial(PackageFixture):
             m = json.load(fh)
         paths = {e["path"] for e in m["entries"]}
         self.assertNotIn("release-evidence/rc75-release-attestation.json", paths)
+
+
+@unittest.skipUnless(shutil.which("ssh-keygen"),
+                     "ssh-keygen is required for signature tests")
+class TestSignature(PackageFixture):
+    """The trusted-anchor boundary: hash-binding can be forged by
+    anyone controlling archive + sidecar; the signature cannot."""
+
+    IDENTITY = "release@nemo-control"
+
+    def make_key(self, name="release"):
+        keydir = os.path.join(self.tmp.name, "keys")
+        os.makedirs(keydir, exist_ok=True)
+        key = os.path.join(keydir, name)
+        r = subprocess.run(
+            ["ssh-keygen", "-t", "ed25519", "-N", "", "-f", key],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        allowed = os.path.join(keydir, name + ".allowed")
+        with open(key + ".pub") as fh:
+            pub = fh.read().strip()
+        with open(allowed, "w") as fh:
+            fh.write(f"{self.IDENTITY} {pub}\n")
+        return key, allowed
+
+    def signed_attestation(self):
+        self.packed_fixture()
+        key, allowed = self.make_key()
+        r = run_tool("attest", self.zip_path, self.att,
+                     "--version", "0.54.0-rc.7.5-dev",
+                     "--source-manifest", self.manifest,
+                     "--sign-key", key)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(os.path.isfile(self.att + ".sig"))
+        return allowed
+
+    def verify_signed(self, allowed=None, sig=None, identity=None,
+                      att=None, zip_path=None, require=False):
+        argv = ["verify", zip_path or self.zip_path,
+                "--manifest", self.manifest,
+                "--attestation", att or self.att,
+                "--version", "0.54.0-rc.7.5-dev"]
+        if sig is not False:
+            argv += ["--signature", sig or (self.att + ".sig"),
+                     "--allowed-signers", allowed or "",
+                     "--sign-identity", identity or self.IDENTITY]
+        if require:
+            argv.append("--require-signature")
+        return run_tool(*argv)
+
+    def test_signed_package_verifies(self):
+        allowed = self.signed_attestation()
+        res = self.verify_signed(allowed=allowed)
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+    def test_tampered_attestation_rejected(self):
+        """A modified attestation can never carry the original
+        signature — hash self-consistency is not authenticity."""
+        allowed = self.signed_attestation()
+        with open(self.att) as fh:
+            att = json.load(fh)
+        att["version"] = "0.54.0-rc.7.5-dev"  # legal value, forged doc
+        att["archive_size"] += 1
+        with open(self.att, "w") as fh:
+            json.dump(att, fh)
+        res = self.verify_signed(allowed=allowed)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("signature", res.stderr)
+
+    def test_wrong_signer_rejected(self):
+        """A signature from a principal the allowed-signers file does
+        not authorize is refused."""
+        self.signed_attestation()
+        _, allowed = self.make_key(name="other")
+        res = self.verify_signed(allowed=allowed)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("signature", res.stderr)
+
+    def test_wrong_identity_rejected(self):
+        """The signature must verify under the claimed principal, not
+        just any trusted key."""
+        allowed = self.signed_attestation()
+        res = self.verify_signed(allowed=allowed,
+                                 identity="other@nemo-control")
+        self.assertNotEqual(res.returncode, 0)
+
+    def test_missing_signature_rejected_when_required(self):
+        """--require-signature fails closed when the signature sidecar
+        is absent — policy, not presence, decides."""
+        self.package_and_attest()
+        res = self.verify_signed(sig=False, require=True)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("signature", res.stderr)
+
+    def test_unsigned_verifies_without_requirement(self):
+        """Unsigned verification still works for development flow —
+        the flag is what makes trust mandatory."""
+        self.packed_fixture()
+        res = self.verify()
+        self.assertEqual(res.returncode, 0, res.stderr)
 
 
 if __name__ == "__main__":
