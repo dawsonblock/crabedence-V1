@@ -184,8 +184,11 @@ type Backend interface {
 	// instance and is never destroyed. The result classifies the
 	// outcome explicitly: REMOVED_VERIFIED and
 	// ALREADY_ABSENT_VERIFIED prove the authorized instance is gone;
-	// IDENTITY_MISMATCH, IDENTITY_UNVERIFIABLE and REMOVAL_UNCERTAIN
-	// leave the cleanup pending for retry and operator escalation.
+	// RETAINED_BY_POLICY discharges the obligation because the backend
+	// intentionally keeps the instance — a resolution, never a claim
+	// of absence; IDENTITY_MISMATCH, IDENTITY_UNVERIFIABLE and
+	// REMOVAL_UNCERTAIN leave the cleanup pending for retry and
+	// operator escalation.
 	// A non-nil error means the operation could not be attempted or
 	// its outcome could not be classified — the cleanup stays
 	// pending either way, and never masks the job's already-observed

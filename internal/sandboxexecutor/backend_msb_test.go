@@ -1047,9 +1047,10 @@ func fakeLogs(dir string, args []string) int {
 func fakeRemove(dir string, args []string) int {
 	// The real CLI resolves --label K=V selectors to the sandboxes
 	// whose instance labels match every selector, AND-matched, then
-	// removes each match plus every explicitly named sandbox. Labels
-	// bind to the instance, not the name — a re-created sandbox under
-	// a reused name does not carry the deleted one's labels.
+	// removes each match plus every explicitly named sandbox — names
+	// and selectors are unioned. Cleanup issues the delete by the
+	// nonce-bound handle only: the name is itself the identity, so a
+	// record resolved under it can only ever be this dispatch's.
 	var names []string
 	var selectors []string
 	for i := 0; i < len(args); i++ {
@@ -1066,11 +1067,12 @@ func fakeRemove(dir string, args []string) int {
 	}
 	targets := append([]string{}, names...)
 	// MSB_FAKE_RM_SWAP models a substitution landing inside the
-	// removal window — after the caller's pre-verification but before
-	// the label match below runs. The payload at dir/rm-swap-payload
-	// replaces the state file of the handle it names; the label
-	// condition is evaluated against *that* state, so a substitute
-	// that cannot carry the authorized labels is never selected.
+	// removal window — after the caller's pre-verification, inside
+	// this remove. The payload at dir/rm-swap-payload replaces the
+	// state file of the handle it names; the name-scoped delete below
+	// removes whatever sits at that name, because a nonce-bound name
+	// can only ever be this dispatch's — while a sandbox at a
+	// *different* name is never a candidate.
 	if os.Getenv("MSB_FAKE_RM_SWAP") != "" {
 		if raw, err := os.ReadFile(filepath.Join(dir, "rm-swap-payload")); err == nil {
 			var sb struct {
@@ -1296,14 +1298,18 @@ func TestMSBDispatchRefusesPreexistingSandbox(t *testing.T) {
 	bin, stateDir := fakeMSB(t, nil)
 	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "reuse-1"; c.Nonce = "n-reuse" })
-	name := backend.msbJobName(job.JobID)
+	plan, err := backend.Prepare(testContext(t), job)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	name := plan.Handle
 
 	permissive := fakeDefaultConfig()
 	permissive.Network.Policy = fakePublicPolicy()
 	permissive.Network.Policy.DefaultEgress = "allow"
 	writeFakeSandbox(t, stateDir, name, permissive)
 
-	if _, err := backend.Dispatch(testContext(t), job, nil); err == nil {
+	if _, err := backend.Dispatch(testContext(t), job, plan); err == nil {
 		t.Fatal("dispatch reused a pre-existing sandbox")
 	} else if !strings.Contains(err.Error(), "already exists") {
 		t.Fatalf("unexpected refusal: %v", err)
@@ -1330,9 +1336,13 @@ func TestMSBDispatchVerifiesPolicyBeforeExec(t *testing.T) {
 			bin, stateDir := fakeMSB(t, map[string]string{"MSB_FAKE_TAMPER": tamper})
 			backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 			job := testContract(t, key, func(c *JobContractV2) { c.JobID = "verify-1"; c.Nonce = "n-verify" })
-			name := backend.msbJobName(job.JobID)
+			plan, err := backend.Prepare(testContext(t), job)
+			if err != nil {
+				t.Fatalf("prepare: %v", err)
+			}
+			name := plan.Handle
 
-			_, err := backend.Dispatch(testContext(t), job, nil)
+			_, err = backend.Dispatch(testContext(t), job, plan)
 			if err == nil {
 				t.Fatal("dispatch accepted a VM that failed policy verification")
 			}
@@ -1366,8 +1376,8 @@ func TestMSBDispatchAmbiguousCreateLeaksNothing(t *testing.T) {
 	if err == nil || !errors.Is(err, ErrAmbiguousDispatch) {
 		t.Fatalf("want an ambiguous dispatch, got handle=%q err=%v", disp.Handle, err)
 	}
-	if disp.Handle != backend.msbJobName(job.JobID) {
-		t.Fatalf("ambiguous handle = %q", disp.Handle)
+	if disp.Nonce == "" || !strings.HasSuffix(disp.Handle, "-"+disp.Nonce) {
+		t.Fatalf("ambiguous handle %q does not carry the dispatch nonce %q", disp.Handle, disp.Nonce)
 	}
 	entries, rerr := os.ReadDir(filepath.Join(dir, "artifacts"))
 	if rerr == nil && len(entries) != 0 {
@@ -1405,8 +1415,12 @@ func TestMSBDispatchRefusesUnauthorizedPublicRules(t *testing.T) {
 			c.Nonce = "n-pub-extra"
 			c.Network = NetworkPolicy{Mode: NetworkPublic}
 		})
-		name := backend.msbJobName(job.JobID)
-		_, err := backend.Dispatch(testContext(t), job, nil)
+		plan, err := backend.Prepare(testContext(t), job)
+		if err != nil {
+			t.Fatalf("prepare: %v", err)
+		}
+		name := plan.Handle
+		_, err = backend.Dispatch(testContext(t), job, plan)
 		if err == nil || !strings.Contains(err.Error(), "did not authorize") {
 			t.Fatalf("an unauthorized public rule was accepted: %v", err)
 		}
@@ -1424,9 +1438,13 @@ func TestMSBDispatchVerifiesBootedConfiguration(t *testing.T) {
 	bin, stateDir := fakeMSB(t, map[string]string{"MSB_FAKE_TAMPER": "active_diverges"})
 	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "active-1"; c.Nonce = "n-active" })
-	name := backend.msbJobName(job.JobID)
+	plan, err := backend.Prepare(testContext(t), job)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	name := plan.Handle
 
-	_, err := backend.Dispatch(testContext(t), job, nil)
+	_, err = backend.Dispatch(testContext(t), job, plan)
 	if err == nil || !strings.Contains(err.Error(), "booted configuration diverges") {
 		t.Fatalf("a VM running an unauthorized booted policy was accepted: %v", err)
 	}
@@ -1444,9 +1462,13 @@ func TestMSBDispatchFailedCreateRemovesItsOwnLeftover(t *testing.T) {
 	bin, stateDir := fakeMSB(t, map[string]string{"MSB_FAKE_CREATE_FAIL_AFTER": "1"})
 	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "orphan-own"; c.Nonce = "n-orphan" })
-	name := backend.msbJobName(job.JobID)
+	plan, err := backend.Prepare(testContext(t), job)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	name := plan.Handle
 
-	if _, err := backend.Dispatch(testContext(t), job, nil); err == nil {
+	if _, err := backend.Dispatch(testContext(t), job, plan); err == nil {
 		t.Fatal("a failed create was accepted")
 	}
 	if _, err := os.Stat(fakeStatePath(stateDir, name)); err == nil {
@@ -1455,20 +1477,31 @@ func TestMSBDispatchFailedCreateRemovesItsOwnLeftover(t *testing.T) {
 }
 
 // TestMSBDispatchFailedCreateLeavesForeignSandboxAlone: a failed
-// create must not destroy a sandbox it did not create — the
-// pre-existing trap belongs to whoever made it.
+// create must not destroy a sandbox it did not create. Under
+// nonce-bound handles a foreign instance cannot occupy this
+// dispatch's name — minting it requires the dispatch's nonce — so
+// the occupant tested here is a same-job sandbox under a *different*
+// dispatch nonce: the only thing that could ever share the name
+// prefix. The removal is scoped to this dispatch's unforgeable
+// handle, so the other-named instance is never a candidate.
 func TestMSBDispatchFailedCreateLeavesForeignSandboxAlone(t *testing.T) {
 	key, _ := testAuthority(t)
 	bin, stateDir := fakeMSB(t, map[string]string{"MSB_FAKE_CREATE_FAIL": "1"})
 	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "orphan-foreign"; c.Nonce = "n-foreign" })
-	name := backend.msbJobName(job.JobID)
-	writeFakeSandbox(t, stateDir, name, fakeDefaultConfig())
+	plan, err := backend.Prepare(testContext(t), job)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	// A same-job sandbox minted under another dispatch's nonce — a
+	// different unforgeable name, not ours to remove.
+	foreignName := backend.msbJobName(job.JobID, "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f")
+	writeFakeSandbox(t, stateDir, foreignName, fakeDefaultConfig())
 
-	if _, err := backend.Dispatch(testContext(t), job, nil); err == nil {
+	if _, err := backend.Dispatch(testContext(t), job, plan); err == nil {
 		t.Fatal("a failed create was accepted")
 	}
-	if _, err := os.Stat(fakeStatePath(stateDir, name)); err != nil {
+	if _, err := os.Stat(fakeStatePath(stateDir, foreignName)); err != nil {
 		t.Fatal("a failed create destroyed a sandbox it did not create")
 	}
 }
@@ -2125,7 +2158,13 @@ func TestMSBKeepSandboxesLeavesForensicVM(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cleanup under KeepSandboxes: %v", err)
 	}
-	if !res.Outcome.ProvesAbsent() {
+	if res.Outcome != CleanupRetainedByPolicy {
+		t.Fatalf("KeepSandboxes cleanup outcome %s, want %s: %s", res.Outcome, CleanupRetainedByPolicy, res.Detail)
+	}
+	if res.Outcome.ProvesAbsent() {
+		t.Fatalf("retention must never claim absence: %s", res.Detail)
+	}
+	if !res.Outcome.ResolvesObligation() {
 		t.Fatalf("KeepSandboxes cleanup left the obligation pending: %s", res.Outcome)
 	}
 	if _, err := os.Stat(fakeStatePath(stateDir, disp.Handle)); err != nil {
@@ -2291,8 +2330,12 @@ func TestMSBPinsDeploymentProfile(t *testing.T) {
 		bin, stateDir := fakeMSB(t, map[string]string{"MSB_FAKE_TAMPER": "deployment_multi"})
 		backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 		job := testContract(t, key, func(c *JobContractV2) { c.JobID = "prof-2"; c.Nonce = "n-prof-2" })
-		name := backend.msbJobName(job.JobID)
-		_, err := backend.Dispatch(testContext(t), job, nil)
+		plan, err := backend.Prepare(testContext(t), job)
+		if err != nil {
+			t.Fatalf("prepare: %v", err)
+		}
+		name := plan.Handle
+		_, err = backend.Dispatch(testContext(t), job, plan)
 		if err == nil || !strings.Contains(err.Error(), "deployment profile") {
 			t.Fatalf("a downgraded deployment profile was accepted: %v", err)
 		}
@@ -2442,8 +2485,12 @@ func TestMSBPolicyRefusesUnauthorizedSettings(t *testing.T) {
 			bin, stateDir := fakeMSB(t, map[string]string{"MSB_FAKE_TAMPER": tc.tamper})
 			backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 			job := testContract(t, key, func(c *JobContractV2) { c.JobID = "policy-" + tc.tamper; c.Nonce = "n-" + tc.tamper })
-			name := backend.msbJobName(job.JobID)
-			_, err := backend.Dispatch(testContext(t), job, nil)
+			plan, err := backend.Prepare(testContext(t), job)
+			if err != nil {
+				t.Fatalf("prepare: %v", err)
+			}
+			name := plan.Handle
+			_, err = backend.Dispatch(testContext(t), job, plan)
 			if err == nil {
 				t.Fatalf("%s was accepted", tc.tamper)
 			}
@@ -2480,9 +2527,13 @@ func TestMSBPolicyRefusesReorderedExecutionHooks(t *testing.T) {
 			})
 			backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 			job := testContract(t, key, func(c *JobContractV2) { c.JobID = "order-" + tc.tamper; c.Nonce = "n-" + tc.tamper })
-			name := backend.msbJobName(job.JobID)
+			plan, err := backend.Prepare(testContext(t), job)
+			if err != nil {
+				t.Fatalf("prepare: %v", err)
+			}
+			name := plan.Handle
 
-			_, err := backend.Dispatch(testContext(t), job, nil)
+			_, err = backend.Dispatch(testContext(t), job, plan)
 			if err == nil {
 				t.Fatalf("a reordered %s was accepted", tc.tamper)
 			}
@@ -2544,9 +2595,13 @@ func TestMSBPolicyRefusesHostChannelsAndUnknownFields(t *testing.T) {
 			bin, stateDir := fakeMSB(t, map[string]string{"MSB_FAKE_TAMPER": tc.tamper})
 			backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 			job := testContract(t, key, func(c *JobContractV2) { c.JobID = "closed-" + tc.tamper; c.Nonce = "n-" + tc.tamper })
-			name := backend.msbJobName(job.JobID)
+			plan, err := backend.Prepare(testContext(t), job)
+			if err != nil {
+				t.Fatalf("prepare: %v", err)
+			}
+			name := plan.Handle
 
-			_, err := backend.Dispatch(testContext(t), job, nil)
+			_, err = backend.Dispatch(testContext(t), job, plan)
 			if err == nil {
 				t.Fatalf("a VM carrying %s was accepted", tc.tamper)
 			}
@@ -2621,7 +2676,7 @@ func TestMSBCreateArgsArePolicyDerived(t *testing.T) {
 	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "args-1"; c.Nonce = "n-args" })
 
-	args, err := backend.createArgs(job, backend.msbJobName(job.JobID), job.Nonce)
+	args, err := backend.createArgs(job, backend.msbJobName(job.JobID, job.Nonce), job.Nonce)
 	if err != nil {
 		t.Fatalf("createArgs: %v", err)
 	}
@@ -2851,9 +2906,13 @@ func TestMSBDispatchBindsBootGeneration(t *testing.T) {
 	bin, stateDir := fakeMSB(t, map[string]string{"MSB_FAKE_JOB_BOOT_MISMATCH": "1"})
 	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "boot-mismatch"; c.Nonce = "n-boot" })
-	name := backend.msbJobName(job.JobID)
+	plan, err := backend.Prepare(testContext(t), job)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	name := plan.Handle
 
-	_, err := backend.Dispatch(testContext(t), job, nil)
+	_, err = backend.Dispatch(testContext(t), job, plan)
 	if err == nil {
 		t.Fatal("a job in a substituted VM instance was accepted")
 	}
@@ -2883,9 +2942,13 @@ func TestMSBDispatchDiscoveredBootMismatchIsAmbiguous(t *testing.T) {
 	})
 	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "bm-disc"; c.Nonce = "n-bm-disc" })
-	name := backend.msbJobName(job.JobID)
+	plan, err := backend.Prepare(testContext(t), job)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	name := plan.Handle
 
-	disp, err := backend.Dispatch(testContext(t), job, nil)
+	disp, err := backend.Dispatch(testContext(t), job, plan)
 	if err == nil {
 		t.Fatal("a job discovered in a substituted VM instance was adopted")
 	}
@@ -2923,9 +2986,13 @@ func TestMSBDispatchDuplicateAdmittedJobsIsAmbiguous(t *testing.T) {
 	})
 	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "dup-1"; c.Nonce = "n-dup" })
-	name := backend.msbJobName(job.JobID)
+	plan, err := backend.Prepare(testContext(t), job)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	name := plan.Handle
 
-	_, err := backend.Dispatch(testContext(t), job, nil)
+	_, err = backend.Dispatch(testContext(t), job, plan)
 	if err == nil {
 		t.Fatal("two matching runtime job records produced a clean dispatch")
 	}
@@ -2955,9 +3022,13 @@ func TestMSBDispatchProbeFailureIsAmbiguous(t *testing.T) {
 	})
 	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "probe-1"; c.Nonce = "n-probe" })
-	name := backend.msbJobName(job.JobID)
+	plan, err := backend.Prepare(testContext(t), job)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	name := plan.Handle
 
-	disp, err := backend.Dispatch(testContext(t), job, nil)
+	disp, err := backend.Dispatch(testContext(t), job, plan)
 	if err == nil {
 		t.Fatal("an unprobeable launch was reported clean")
 	}
@@ -2983,7 +3054,11 @@ func TestMSBDispatchCancelledAfterAdmissionIsAmbiguous(t *testing.T) {
 	bin, stateDir := fakeMSB(t, map[string]string{"MSB_FAKE_EXEC_SLEEP": "30"})
 	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "cancel-1"; c.Nonce = "n-cancel" })
-	name := backend.msbJobName(job.JobID)
+	plan, err := backend.Prepare(testContext(t), job)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	name := plan.Handle
 
 	// Cancel the moment the runtime's durable job record exists —
 	// admission observed, acknowledgement still in flight. That is a
@@ -3005,7 +3080,7 @@ func TestMSBDispatchCancelledAfterAdmissionIsAmbiguous(t *testing.T) {
 		}
 		cancel()
 	}()
-	disp, err := backend.Dispatch(ctx, job, nil)
+	disp, err := backend.Dispatch(ctx, job, plan)
 	if err == nil {
 		t.Fatal("a launch cancelled after admission was reported clean")
 	}
@@ -3162,9 +3237,13 @@ func TestMSBDispatchPostLaunchFailureIsUncertain(t *testing.T) {
 	bin, stateDir := fakeMSB(t, map[string]string{"MSB_FAKE_JOB_INSPECT_FAIL": "1"})
 	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "post-launch"; c.Nonce = "n-post" })
-	name := backend.msbJobName(job.JobID)
+	plan, err := backend.Prepare(testContext(t), job)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	name := plan.Handle
 
-	disp, err := backend.Dispatch(testContext(t), job, nil)
+	disp, err := backend.Dispatch(testContext(t), job, plan)
 	if err == nil {
 		t.Fatalf("a post-launch verification failure produced a success: %+v", disp)
 	}
@@ -3228,7 +3307,7 @@ func TestMSBPrepareIsSideEffectFree(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
 	}
-	if plan.Handle != backend.msbJobName(job.JobID) || plan.Nonce == "" || plan.PolicyDigest == "" {
+	if plan.Handle != backend.msbJobName(job.JobID, plan.Nonce) || plan.Nonce == "" || plan.PolicyDigest == "" {
 		t.Fatalf("incomplete plan: %+v", plan)
 	}
 	if plan.ImageDigest != job.ImageDigest || plan.RuntimeVersion != PinnedMSBVersion {

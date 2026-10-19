@@ -341,10 +341,13 @@ func TestMSBLiveArtifactIntegrityUnderConcurrency(t *testing.T) {
 	}
 }
 
-// TestMSBLiveRefusesPreexistingSandbox is the live sandbox-reuse
-// attack: a permissive VM already exists under the deterministic
-// handle the job will ask for. The job must refuse — never execute
-// inside it, never destroy it.
+// TestMSBLiveRefusesPreexistingSandbox is the live name-squatting
+// shape under nonce-bound handles: a permissive VM sits on the job's
+// base name — an RC7.5-era leftover or a foreign plant — but the
+// dispatch's handle carries its own unforgeable nonce and can never
+// name the trap. The dispatch must run on its own nonce-bound handle,
+// the job must execute inside the dispatch's VM, and the foreign
+// sandbox must be untouched: name occupancy is not authority.
 func TestMSBLiveRefusesPreexistingSandbox(t *testing.T) {
 	bin := msbOrSkip(t)
 	digest := liveImageDigest(t, bin)
@@ -352,7 +355,8 @@ func TestMSBLiveRefusesPreexistingSandbox(t *testing.T) {
 	jobID := "msb-live-reuse"
 	name := "sx-" + jobID
 
-	// Pre-create the trap: the expected handle with permissive network.
+	// Pre-create the trap: a permissive sandbox squatting the job's
+	// base name — the only part of the handle an outsider can predict.
 	pre := exec.Command(bin, "create", "-q", "-n", name, "--net", "public", liveImage)
 	if out, err := pre.CombinedOutput(); err != nil {
 		t.Fatalf("could not pre-create the trap sandbox: %v: %s", err, out)
@@ -363,11 +367,15 @@ func TestMSBLiveRefusesPreexistingSandbox(t *testing.T) {
 	resp := sendJob(t, conn, reader, liveJob(t, key, digest, jobID, func(c *JobContractV2) {
 		c.Argv = []string{"python3", "-c", "print('must-not-run')"}
 	}))
-	if resp.OK {
-		t.Fatal("job dispatched into a pre-existing sandbox")
+	if !resp.OK {
+		t.Fatalf("a foreign squat on the base name blocked the dispatch: %+v", resp)
 	}
-	if resp.State != JobStateDispatchFailed {
-		t.Fatalf("refusal state = %q, want %s", resp.State, JobStateDispatchFailed)
+	lj := waitLiveTerminal(t, srv, jobID)
+	if lj.State != JobStateSucceeded {
+		t.Fatalf("the job did not run in its own sandbox: %+v", lj)
+	}
+	if lj.BackendHandle != name+"-"+lj.DispatchNonce {
+		t.Fatalf("the dispatch's handle %q is not the nonce-bound name under %q", lj.BackendHandle, name)
 	}
 	// The trap VM is untouched — still present, still permissive.
 	out, err := exec.Command(bin, "inspect", "--format", "json", name).Output()
@@ -377,12 +385,12 @@ func TestMSBLiveRefusesPreexistingSandbox(t *testing.T) {
 	if !strings.Contains(string(out), `"group": "public"`) {
 		t.Fatalf("the pre-existing sandbox's policy changed: %s", out)
 	}
-	// No artifact may exist for a job that never ran.
-	entries, err := os.ReadDir(filepath.Join(dir, "artifacts"))
-	if err == nil {
+	// Its storage may never have hosted this dispatch's run: the only
+	// artifacts present are the real job's, under the nonce-bound name.
+	if entries, err := os.ReadDir(filepath.Join(dir, "artifacts")); err == nil {
 		for _, e := range entries {
-			if strings.Contains(e.Name(), jobID) {
-				t.Fatalf("a refused job left an artifact: %s", e.Name())
+			if strings.Contains(e.Name(), jobID) && !strings.Contains(e.Name(), lj.BackendHandle) {
+				t.Fatalf("an artifact references the job outside its nonce-bound identity: %s", e.Name())
 			}
 		}
 	}
@@ -533,7 +541,6 @@ func TestMSBLiveMonitorInterruptedLeavesJobUncertain(t *testing.T) {
 	digest := liveImageDigest(t, bin)
 	srv, dir, key := liveServer(t, bin)
 	jobID := "msb-live-interrupt"
-	name := "sx-" + jobID
 	conn, reader := connect(t, srv.SocketPath())
 	resp := sendJob(t, conn, reader, liveJob(t, key, digest, jobID, func(c *JobContractV2) {
 		c.Resources.TimeoutSeconds = 10
@@ -555,6 +562,10 @@ func TestMSBLiveMonitorInterruptedLeavesJobUncertain(t *testing.T) {
 	if err != nil || lj == nil {
 		t.Fatalf("job lost across the interrupted lifetime: %v", err)
 	}
+	if lj.BackendHandle == "" {
+		t.Fatalf("the interrupted dispatch lost its nonce-bound handle: %+v", lj)
+	}
+	name := lj.BackendHandle
 	switch lj.State {
 	case JobStateInterrupted, JobStateDispatchAmbig:
 	default:
@@ -614,7 +625,6 @@ func TestMSBLiveTransportFailureLeavesJobUncertain(t *testing.T) {
 		SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys, Backend: backend,
 	})
 	jobID := "msb-live-transport"
-	name := "sx-" + jobID
 	conn, reader := connect(t, srv.SocketPath())
 	resp := sendJob(t, conn, reader, liveJob(t, key, digest, jobID, func(c *JobContractV2) {
 		c.Resources.TimeoutSeconds = 3
@@ -626,8 +636,13 @@ func TestMSBLiveTransportFailureLeavesJobUncertain(t *testing.T) {
 	time.Sleep(2 * time.Second)
 	// Destroy the runtime's record out from under the observation —
 	// the "transport failed" shape, which a CLI exit code alone
-	// would misreport as a guest failure.
-	if out, err := exec.Command(bin, "rm", "-f", name).CombinedOutput(); err != nil {
+	// would misreport as a guest failure. The nonce-bound handle is
+	// durable state: read it from the row, never re-derive it.
+	row, gerr := srv.Ledger().Get(jobID)
+	if gerr != nil || row == nil || row.BackendHandle == "" {
+		t.Fatalf("the dispatched row carries no handle: %v %+v", gerr, row)
+	}
+	if out, err := exec.Command(bin, "rm", "-f", row.BackendHandle).CombinedOutput(); err != nil {
 		t.Fatalf("remove sandbox: %v: %s", err, out)
 	}
 
@@ -780,7 +795,6 @@ func TestMSBLiveRecoveryResumesInterruptedJob(t *testing.T) {
 	backend := &MSBBackend{Bin: bin, StateDir: filepath.Join(dir, "artifacts")}
 	verifyLiveBackend(t, backend)
 	jobID := "msb-live-recover"
-	name := "sx-" + jobID
 
 	// First lifetime: the job is dispatched and the daemon stops while
 	// the guest is still running.
@@ -828,7 +842,7 @@ func TestMSBLiveRecoveryResumesInterruptedJob(t *testing.T) {
 		t.Fatalf("recovered result does not carry the runtime's observation: %+v", res)
 	}
 	// The recovered VM is cleaned up like any other settled job.
-	if out, err := exec.Command(bin, "inspect", "--format", "json", name).Output(); err == nil {
+	if out, err := exec.Command(bin, "inspect", "--format", "json", lj.BackendHandle).Output(); err == nil {
 		t.Fatalf("recovered sandbox survived cleanup: %s", out)
 	}
 	srv2.Stop()
@@ -855,7 +869,6 @@ func TestMSBLiveSubstitutedVMIsNeverAdopted(t *testing.T) {
 	}
 	verifyLiveBackend(t, backend)
 	jobID := "msb-live-substitute"
-	name := "sx-" + jobID
 
 	// First lifetime: a job runs to completion and the daemon stops
 	// before it observes the result, so the row stays unresolved with
@@ -891,6 +904,10 @@ func TestMSBLiveSubstitutedVMIsNeverAdopted(t *testing.T) {
 	if row.BackendBootID == "" || !bootIDPattern.MatchString(row.BackendBootID) {
 		t.Fatalf("the dispatch did not record a boot generation: %+v", row)
 	}
+	// The substitute occupies the recorded handle itself — an actor
+	// that learned the nonce-bound name (a compromise-scope event):
+	// recovery must still refuse it on its boot generation.
+	name := row.BackendHandle
 
 	// Substitute the VM: remove the sandbox and create a new one under
 	// the same name — a fresh boot generation with no job records.

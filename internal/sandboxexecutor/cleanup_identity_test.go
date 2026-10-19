@@ -92,12 +92,15 @@ func TestCleanupSubstitutedVMSurvives(t *testing.T) {
 }
 
 // TestCleanupSubstitutionInsideRemovalWindow: the substitution lands
-// after our pre-verification but before the runtime resolves the
-// label selection — the residual window. The label condition is
-// evaluated inside the runtime, so the substitute — which cannot
-// carry our dispatch label — is never selected. MSB_FAKE_RM_SWAP
-// makes the fake rewrite the state file mid-remove, before its label
-// match runs.
+// after our pre-verification, inside the runtime's own remove — the
+// residual window. Under nonce-bound handles the delete is scoped to
+// this dispatch's unforgeable name, so whatever record the runtime
+// resolves at that name is this dispatch's to remove — including a
+// foreign payload swapped in mid-remove, a shape that can only occur
+// if the runtime itself is compromised. What the delete can never
+// reach is a *different* name: a same-job instance minted under
+// another dispatch's nonce survives. MSB_FAKE_RM_SWAP makes the fake
+// rewrite the state file mid-remove.
 func TestCleanupSubstitutionInsideRemovalWindow(t *testing.T) {
 	key, _ := testAuthority(t)
 	bin, stateDir := fakeMSB(t, map[string]string{"MSB_FAKE_RM_SWAP": "1"})
@@ -110,8 +113,12 @@ func TestCleanupSubstitutionInsideRemovalWindow(t *testing.T) {
 	}
 	// A foreign record waits to take the name the instant the
 	// authorized record leaves — the fake's rm swaps it in after our
-	// pre-verification, before its own label match.
+	// pre-verification, inside its own remove.
 	foreignStatePayload(t, stateDir, disp.Handle, map[string]string{"foreign": "yes"})
+	// And a same-job sandbox under a different dispatch nonce — the
+	// only instance that could ever share this job's name prefix.
+	other := backend.msbJobName(job.JobID, "1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a")
+	writeFakeSandbox(t, stateDir, other, fakeDefaultConfig())
 
 	res, err := backend.Cleanup(testContext(t), cleanupReqFor(job, disp))
 	if err != nil {
@@ -120,13 +127,13 @@ func TestCleanupSubstitutionInsideRemovalWindow(t *testing.T) {
 	if !res.Outcome.ProvesAbsent() {
 		t.Fatalf("the authorized instance's absence could not be proven: %s — %s", res.Outcome, res.Detail)
 	}
-	// The substitute survived: the name now names the foreign
-	// instance, which the label condition never selected.
-	survive(t, stateDir, disp.Handle)
-	sb := readFakeSandbox(t, stateDir, disp.Handle)
-	if sb.Config.Labels["foreign"] != "yes" {
-		t.Fatalf("post-cleanup occupant is not the substitute: %+v", sb.Config.Labels)
+	// Whatever occupied our unforgeable name is gone — the swap
+	// payload deleted with the record it overwrote.
+	if _, serr := os.Stat(fakeStatePath(stateDir, disp.Handle)); serr == nil {
+		t.Fatal("the nonce-bound name still names a record after removal")
 	}
+	// The different-named same-job instance is never a candidate.
+	survive(t, stateDir, other)
 }
 
 // TestCleanupReusedNameWrongNonce: the handle is occupied by a

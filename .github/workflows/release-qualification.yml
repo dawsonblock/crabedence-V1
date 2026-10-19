@@ -529,7 +529,11 @@ jobs:
   evidence:
     name: Release evidence + admission
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Evidence generation re-runs the heavyweight gates (the sandboxexecutor
+    # race suite alone takes ~15min in CI) plus the postgres-backed live
+    # suites; 30min could not fit a fully-green run — observed cancelled at
+    # 29m11s into the step on run 39216619316.
+    timeout-minutes: 60
     needs: [provenance, go-tests, go-race, worker, postgres, nemo, cross-language, live-microvm]
     # Run when every need succeeded OR a claimed lane job did not run at
     # all (no lanes claimed → matrix skips). A failed lane — like any
@@ -666,8 +670,21 @@ jobs:
           # the signature then covers the bundle the predicate describes.
           echo "evidence_sha256=$(jq -r '.sha256' dist/release-evidence/evidence-manifest.json)" >> "$GITHUB_OUTPUT"
 
+      # actions/attest cannot persist attestations on user-owned private
+      # repositories ("Feature not available for user-owned private
+      # repositories") — observed failing the otherwise-green evidence job
+      # on run 39228255743. Attestation is skipped there with an explicit
+      # warning; the verified evidence bundle still uploads. Organization
+      # private repos and all public repos attest normally.
+      - name: Note attestation unavailability on this repository
+        if: ${{ github.event.repository.private && github.event.repository.owner.type == 'User' }}
+        run: |
+          echo '::warning::GitHub artifact attestation is unavailable on user-owned private repositories; the verified release-evidence bundle uploads without an attestation reference.'
+          echo 'attestation=unavailable-user-owned-private-repo' >> "$GITHUB_STEP_SUMMARY"
+
       - name: Create GitHub artifact attestation
         id: attestation
+        if: ${{ !(github.event.repository.private && github.event.repository.owner.type == 'User') }}
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: dist/release-evidence/evidence-manifest.json
@@ -687,6 +704,7 @@ jobs:
       # manifest cover an attestation of that same manifest, which can never
       # be packaged.
       - name: Save attestation reference
+        if: ${{ steps.attestation.outputs.attestation-id != '' }}
         run: |
           mkdir -p dist/attestation
           echo '${{ steps.attestation.outputs.attestation-id }}' > dist/attestation/attestation-id.txt

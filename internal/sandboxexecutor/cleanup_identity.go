@@ -44,6 +44,11 @@ const (
 	// a timeout after removal was sent, or post-removal verification
 	// failed. The resource may be gone or may still exist.
 	CleanupRemovalUncertain CleanupOutcome = "REMOVAL_UNCERTAIN"
+	// CleanupRetainedByPolicy: the authorized instance still exists —
+	// the backend's retention policy intentionally keeps it (forensic
+	// retention). The obligation is discharged by the policy decision
+	// itself; the outcome must never be read as evidence of absence.
+	CleanupRetainedByPolicy CleanupOutcome = "RETAINED_BY_POLICY"
 )
 
 // ProvesAbsent reports whether the outcome demonstrates that the
@@ -52,6 +57,16 @@ const (
 // retried on the next pass, escalated to an operator, never assumed.
 func (o CleanupOutcome) ProvesAbsent() bool {
 	return o == CleanupRemovedVerified || o == CleanupAlreadyAbsentVerified
+}
+
+// ResolvesObligation reports whether the outcome discharges a pending
+// cleanup: either the authorized instance is proven gone, or the
+// backend's retention policy intentionally keeps it. This is wider
+// than ProvesAbsent by design — retention settles the obligation
+// without claiming the resource is absent, and must never feed
+// accounting that asserts the instance no longer exists.
+func (o CleanupOutcome) ResolvesObligation() bool {
+	return o.ProvesAbsent() || o == CleanupRetainedByPolicy
 }
 
 // RecoveryFence carries the caller's current recovery claim to the

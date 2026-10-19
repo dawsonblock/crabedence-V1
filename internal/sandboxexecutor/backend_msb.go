@@ -443,21 +443,36 @@ func (f *msbJobFailure) text() string {
 	return strings.Join(parts, ": ")
 }
 
-// msbJobName derives the deterministic sandbox handle for a job.
-// Deterministic naming is the ambiguity control: if Dispatch's
-// outcome is uncertain, the name is still known and Inspect can
-// reconcile whether a VM actually exists.
-func (b *MSBBackend) msbJobName(jobID string) string {
+// msbJobName derives the sandbox handle for one dispatch attempt:
+// the job identity suffixed with the attempt's dispatch nonce. The
+// nonce tail is what makes the handle unforgeable — no other
+// dispatch, tenant, or re-attempt can mint the same name — so the
+// handle is itself the deletion key: `msb rm <handle>` destroys by
+// identity, and a substituted or foreign instance can never occupy
+// the name it resolves.
+//
+// Determinism survives crash recovery through persistence, not
+// re-derivation: the plan's handle and nonce are committed to the
+// ledger before any VM exists, so a later lifetime reconciles the
+// recorded handle and never needs to guess it.
+//
+// msb bounds names at 128 UTF-8 bytes; the nonce tail is the part
+// that must never be truncated away, so a long job id is hashed out
+// of the middle and the nonce is always preserved intact.
+func (b *MSBBackend) msbJobName(jobID, nonce string) string {
 	prefix := b.NamePrefix
 	if prefix == "" {
 		prefix = "sx-"
 	}
-	name := prefix + jobID
-	// msb bounds names at 128 UTF-8 bytes; the tail matters more
-	// than the head for uniqueness, so truncate the middle.
+	suffix := "-" + nonce
+	name := prefix + jobID + suffix
 	if len(name) > 120 {
 		sum := sha256.Sum256([]byte(name))
-		name = name[:100] + "-" + hex.EncodeToString(sum[:])[:16]
+		head := 120 - len(suffix) - 17
+		if head < 0 {
+			head = 0
+		}
+		name = name[:head] + "-" + hex.EncodeToString(sum[:])[:16] + suffix
 	}
 	return name
 }
@@ -716,11 +731,11 @@ func (b *MSBBackend) Prepare(ctx context.Context, job *JobContractV2) (*Dispatch
 	if job == nil {
 		return nil, fmt.Errorf("prepare requires a signed job contract")
 	}
-	handle := b.msbJobName(job.JobID)
 	nonce, err := dispatchNonce()
 	if err != nil {
 		return nil, err
 	}
+	handle := b.msbJobName(job.JobID, nonce)
 	policy, digest, err := b.policyFor(ctx, job, handle, nonce)
 	if err != nil {
 		return nil, err
@@ -775,10 +790,14 @@ func (b *MSBBackend) Dispatch(ctx context.Context, job *JobContractV2, plan *Dis
 			return RunIdentity{}, fmt.Errorf("%w: sandbox %q already exists — refusing to reuse a VM this dispatch did not create", ErrDispatchRefused, name)
 		}
 		// A create can fail after the VM was already booted (a guest
-		// validation error, for instance). Destroy the leftover only
-		// when it carries this dispatch's identity label — proof it
-		// came from this create, not from someone else.
-		b.destroyDispatch(nonce)
+		// validation error, for instance). The leftover is removed
+		// through the identity-bound cleanup path; when its absence
+		// cannot be verified the resource is not a proven refusal —
+		// the outcome is ambiguous and reconciliation owns the
+		// residue the dispatch identity now records.
+		if !b.refusedCleanup(ctx, job, name, nonce) {
+			return identity, fmt.Errorf("%w: msb create failed (%v: %s) and the leftover instance could not be proven removed — resource cleanup remains owed under the dispatch identity", ErrAmbiguousDispatch, cerr, strings.TrimSpace(string(out)))
+		}
 		return RunIdentity{}, fmt.Errorf("%w: msb create failed: %v: %s", ErrDispatchRefused, cerr, strings.TrimSpace(string(out)))
 	}
 
@@ -791,19 +810,26 @@ func (b *MSBBackend) Dispatch(ctx context.Context, job *JobContractV2, plan *Dis
 	if ierr != nil {
 		// The VM we just created could not be inspected — a
 		// transport failure says nothing about what now occupies
-		// the name, so only a verified-ours sandbox is destroyed.
-		// An unverifiable one is left for reconciliation rather
-		// than removed blind; no guest command has run either way.
-		b.destroyDispatch(nonce)
+		// the name. Removal still goes through the verified,
+		// identity-bound path; if absence cannot be proven, the
+		// resource stays owed under the recorded dispatch identity
+		// rather than forgotten under a refusal claim.
+		if !b.refusedCleanup(ctx, job, name, nonce) {
+			return identity, fmt.Errorf("%w: verify sandbox %s before execution failed (%v) and the leftover instance could not be proven removed — resource cleanup remains owed under the dispatch identity", ErrAmbiguousDispatch, name, ierr)
+		}
 		return RunIdentity{}, fmt.Errorf("%w: verify sandbox %s before execution: %v", ErrDispatchRefused, name, ierr)
 	}
 	if verr := verifyBootedPolicy(policy, doc); verr != nil {
-		b.destroyDispatch(nonce)
+		if !b.refusedCleanup(ctx, job, name, nonce) {
+			return identity, fmt.Errorf("%w: sandbox %s failed policy verification and the leftover instance could not be proven removed — resource cleanup remains owed under the dispatch identity: %v", ErrAmbiguousDispatch, name, verr)
+		}
 		return RunIdentity{}, fmt.Errorf("%w: sandbox %s failed policy verification — destroyed before execution: %v", ErrDispatchRefused, name, verr)
 	}
 	bootID, berr := b.sandboxBootID(doc)
 	if berr != nil {
-		b.destroyDispatch(nonce)
+		if !b.refusedCleanup(ctx, job, name, nonce) {
+			return identity, fmt.Errorf("%w: could not bind the VM boot generation of %s and the leftover instance could not be proven removed — resource cleanup remains owed under the dispatch identity: %v", ErrAmbiguousDispatch, name, berr)
+		}
 		return RunIdentity{}, fmt.Errorf("%w: bind the VM boot generation of %s before execution: %v", ErrDispatchRefused, name, berr)
 	}
 	identity.BootID = bootID
@@ -897,21 +923,28 @@ func (b *MSBBackend) verifyLaunchedRun(ctx context.Context, name, runID, bootID 
 // wedged runtime cannot pin the admission path.
 func (b *MSBBackend) dispatchProbeTimeout() time.Duration { return 15 * time.Second }
 
-// destroyDispatch removes only the instance carrying this dispatch's
-// ownership label: the deletion condition is evaluated by the runtime
-// against the labels bound to the instance at creation, so a
-// substituted or foreign sandbox under the same name is never
-// selected — it cannot carry a nonce it was not created with.
-// Failures are ignored by design: the VM's own --max-duration is the
-// backstop, and a destroy that cannot run must not mask the
-// verification failure that triggered it.
-func (b *MSBBackend) destroyDispatch(nonce string) {
-	if nonce == "" {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+// refusedCleanupTimeout bounds the identity-bound removal a refused
+// dispatch still owes its leftover VM. It is detached from the
+// dispatch context — which may be nearly spent — but never
+// unbounded: inspect, conditional removal, and post-verification all
+// run inside this window.
+const refusedCleanupTimeout = 45 * time.Second
+
+// refusedCleanup settles the resource accounting for a dispatch that
+// is being refused after a VM may already exist. The leftover goes
+// through the same identity-bound, verified removal a finished job's
+// cleanup uses — never a best-effort destroy whose result is
+// discarded. It reports whether the authorized instance is proven
+// gone; when it is not, the caller returns the dispatch identity with
+// ErrAmbiguousDispatch so the residue stays durable under
+// reconciliation instead of evaporating behind a NO_EFFECT claim.
+func (b *MSBBackend) refusedCleanup(ctx context.Context, job *JobContractV2, name, nonce string) bool {
+	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), refusedCleanupTimeout)
 	defer cancel()
-	_, _ = b.runOnce(ctx, "rm", "-f", "--label", "crabedence.dispatch="+nonce)
+	res, err := b.Cleanup(cctx, CleanupRequest{
+		JobID: job.JobID, BackendID: b.Name(), Handle: name, DispatchNonce: nonce,
+	})
+	return err == nil && res.Outcome.ProvesAbsent()
 }
 
 // inspectRaw returns the parsed `msb inspect --format json` document.
@@ -1371,13 +1404,17 @@ func (w *boundedArtifactWriter) stats() (int64, bool) {
 //     generation that no longer matches is reported too: the instance
 //     still carries our authority, so it is removed, but the
 //     divergence is evidence.
-//  2. `msb rm -f --label crabedence.dispatch=<nonce> --label
-//     crabedence.job=<job>` — the labels are the deletion condition,
-//     AND-matched inside the runtime's own catalog where they are
-//     bound to the immutable sandbox identity; the removal then runs
-//     through the runtime's guarded per-instance delete. No name is
-//     passed, so an instance that does not present the authorized
-//     identity is never a candidate.
+//  2. `msb rm -f <handle>` — deletion by the nonce-bound name. The
+//     handle embeds this dispatch's 128-bit nonce (see msbJobName),
+//     so the name the runtime resolves can only ever have been minted
+//     by this dispatch: a substitute would have to occupy an
+//     unforgeable name, which it cannot. That closes the resolve→
+//     delete window by construction rather than by trusting the
+//     runtime's internal timing — the identity condition is the name
+//     itself, not a selector the CLI first maps onto a reusable one.
+//     The label check in step 1 remains as the authorization gate:
+//     a handle whose occupant presents foreign labels is refused
+//     before the delete is ever issued.
 //  3. Post-verify: the handle must now name nothing, or name an
 //     instance that does not carry our labels (a substitute that
 //     survived, correctly). The handle still naming our labels is a
@@ -1385,15 +1422,19 @@ func (w *boundedArtifactWriter) stats() (int64, bool) {
 //
 // An error never proves absence, and a timeout after the removal was
 // issued is REMOVAL_UNCERTAIN unless the post-check resolves it. The
-// residual window — the runtime resolves its label selection moments
-// before each guarded per-instance delete — is bounded by msb's own
-// transition guard and documented in the threat model; a name-level
-// substitution landing inside it cannot carry our labels and so
-// cannot be selected.
+// one residual the CLI cannot close is a runtime-internal fault: msb
+// resolves the name to its catalog record before deleting it, and if
+// the runtime itself swapped the record under an occupied name the
+// boundary cannot observe it — but occupying the name requires the
+// nonce, and the nonce never leaves this executor's dispatch
+// identity, so the residual requires a compromised runtime, at which
+// point no CLI contract helps. A native conditional-delete binding
+// (msb's own catalog-locked removal) remains the upgrade path and is
+// tracked with the defect register.
 func (b *MSBBackend) Cleanup(ctx context.Context, req CleanupRequest) (CleanupResult, error) {
 	if b.KeepSandboxes {
-		return refuse(CleanupAlreadyAbsentVerified,
-			"backend retention policy (keep_sandboxes): the sandbox is intentionally retained — no removal is owed")
+		return refuse(CleanupRetainedByPolicy,
+			"backend retention policy (keep_sandboxes): the sandbox is intentionally retained — the removal obligation is discharged by policy, not by verified absence")
 	}
 	if err := req.Validate(); err != nil {
 		return refuse(CleanupIdentityUnverifiable, "%v", err)
@@ -1405,6 +1446,14 @@ func (b *MSBBackend) Cleanup(ctx context.Context, req CleanupRequest) (CleanupRe
 	if !strings.HasPrefix(req.Handle, prefix) {
 		return refuse(CleanupIdentityUnverifiable,
 			"handle %q is outside this backend's namespace %q — refusing to destroy outside the jobs this backend launched", req.Handle, prefix)
+	}
+	if !strings.HasSuffix(req.Handle, "-"+req.DispatchNonce) {
+		// Every handle this backend mints ends with its dispatch
+		// nonce — the nonce is the deletion key. A request whose
+		// handle and claimed nonce disagree is malformed authority,
+		// not an identity to verify: nothing is removed.
+		return refuse(CleanupIdentityUnverifiable,
+			"handle %q does not end with the claimed dispatch nonce — the deletion key and the asserted identity disagree", req.Handle)
 	}
 
 	// Step 1 — verify what the handle currently names.
@@ -1443,16 +1492,15 @@ func (b *MSBBackend) Cleanup(ctx context.Context, req CleanupRequest) (CleanupRe
 		// issue it and let the post-check resolve the outcome.
 	}
 
-	// Step 2 — identity-conditioned removal. The labels are the
-	// condition; no name is passed, so nothing unmatched can be
-	// selected. The fence is carried on the request for the record —
-	// the runtime cannot evaluate our leases, so the caller's
-	// commit-boundary validation is what makes the fence durable.
-	rmArgs := []string{"rm", "-f",
-		"--label", "crabedence.dispatch=" + req.DispatchNonce}
-	if req.JobID != "" {
-		rmArgs = append(rmArgs, "--label", "crabedence.job="+req.JobID)
-	}
+	// Step 2 — identity-bound removal. The handle is the deletion
+	// condition: it embeds this dispatch's nonce, so the name the
+	// runtime resolves can only name this dispatch's instance — a
+	// substitute or foreign sandbox cannot mint it, and a reused job
+	// name under a newer nonce is a different name entirely. The
+	// fence is carried on the request for the record — the runtime
+	// cannot evaluate our leases, so the caller's commit-boundary
+	// validation is what makes the fence durable.
+	rmArgs := []string{"rm", "-f", req.Handle}
 	out, rerr := b.runOnce(ctx, rmArgs...)
 	switch {
 	case rerr != nil && ctx.Err() == nil:
@@ -1463,16 +1511,36 @@ func (b *MSBBackend) Cleanup(ctx context.Context, req CleanupRequest) (CleanupRe
 			// ours. The post-check resolves which.
 		} else {
 			// A real removal failure — possibly after partial effect.
-			return b.postCleanupVerify(ctx, req, notes+"the identity-conditioned removal failed: "+errText(rerr, out))
+			vctx, vcancel := postCleanupCtx(ctx)
+			defer vcancel()
+			return b.postCleanupVerify(vctx, req, notes+"the identity-conditioned removal failed: "+errText(rerr, out))
 		}
 	case ctx.Err() != nil:
 		// The deadline expired with the removal in flight — the
 		// command may or may not have taken effect.
-		return b.postCleanupVerify(context.WithoutCancel(ctx), req, notes+"the removal deadline expired after the command was issued — outcome uncertain")
+		vctx, vcancel := postCleanupCtx(ctx)
+		defer vcancel()
+		return b.postCleanupVerify(vctx, req, notes+"the removal deadline expired after the command was issued — outcome uncertain")
 	}
 
 	// Step 3 — verify the resulting state independently.
-	return b.postCleanupVerify(context.WithoutCancel(ctx), req, notes)
+	vctx, vcancel := postCleanupCtx(ctx)
+	defer vcancel()
+	return b.postCleanupVerify(vctx, req, notes)
+}
+
+// postCleanupVerifyTimeout bounds post-removal verification. The
+// check runs detached from the caller's deadline — which may already
+// be spent — but never unbounded: a hung inspect is REMOVAL_UNCERTAIN
+// after this window, not an indefinite block on the external CLI.
+const postCleanupVerifyTimeout = 15 * time.Second
+
+// postCleanupCtx gives post-removal verification its own bounded
+// lifetime: detached from the caller's (possibly already-expired)
+// cancellation so the check can run to a conclusion, and re-deadlined
+// so a hung runtime cannot park cleanup accounting forever.
+func postCleanupCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), postCleanupVerifyTimeout)
 }
 
 // postCleanupVerify independently confirms what the handle now names

@@ -70,10 +70,19 @@ type RecoveryClaim struct {
 // The claim is one atomic write, not a read-check-write pair. The
 // conditional upsert updates the pacing row only when the previous
 // attempt is older than backoff AND the previous claim's lease has
-// expired, and it commits together with the recovery_events row that
-// records the grant — a claim that cannot be durably evidenced is a
-// claim that never happened, so a failed write leaves the row
-// untouched rather than granting an unrecorded attempt.
+// expired OR was issued by an older epoch — and it commits together
+// with the recovery_events row that records the grant, so a claim
+// that cannot be durably evidenced is a claim that never happened.
+//
+// The epoch disjunct is the crash-convergence bound: the ledger's
+// exclusive flock is held for a process lifetime, so a claim stamped
+// with an epoch older than ours can only have been left by a lifetime
+// that released the lock — dead, conclusively. Its outstanding lease
+// is abandoned property, not live ownership, and must not strand
+// recovery until expiry; the backoff term still paces the retry so a
+// crash-looping daemon cannot re-attempt every open. A claim stamped
+// with our own epoch keeps its lease — within one lifetime a lease
+// may still fence an in-flight attempt.
 //
 // Returns nil without error when the row is not due. lease bounds how
 // long the grant belongs to this claimant: an abandoned claim expires
@@ -126,9 +135,10 @@ func (l *Ledger) ClaimRecoveryAttempt(jobID, action string, backoff, lease time.
 			claim_until_ms  = excluded.claim_until_ms,
 			claim_uid       = excluded.claim_uid
 		WHERE recovery_attempts.last_attempt_ms <= ?
-		  AND recovery_attempts.claim_until_ms  <= ?
+		  AND (recovery_attempts.claim_until_ms <= ?
+		       OR recovery_attempts.claim_epoch < ?)
 		RETURNING attempts`,
-		jobID, action, nowMS, l.epoch, untilMS, uid, dueBeforeMS, nowMS).Scan(&attempts)
+		jobID, action, nowMS, l.epoch, untilMS, uid, dueBeforeMS, nowMS, l.epoch).Scan(&attempts)
 	if err == sql.ErrNoRows {
 		// Not due or still claimed: no write landed, no evidence is
 		// owed, and no permission was granted.

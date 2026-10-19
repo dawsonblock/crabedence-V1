@@ -406,6 +406,34 @@ def cmd_verify(args):
 
         verify_tree_against_manifest(tree, manifest, f)
 
+        # The embedded manifest is exempt from the entry checks above —
+        # a manifest cannot list itself — which means nothing has bound
+        # its CONTENT yet. A package could ship an embedded manifest
+        # asserting a different source root than the one this
+        # verification ran against, and nothing would notice. Bind it:
+        # the embedded commitment must equal the authenticated external
+        # manifest field for field.
+        embedded_path = os.path.join(tree, EMBEDDED_MANIFEST)
+        if f.check(os.path.isfile(embedded_path),
+                   f"embedded source manifest missing: {EMBEDDED_MANIFEST}"):
+            embedded = None
+            try:
+                with open(embedded_path) as fh:
+                    embedded = json.load(fh)
+            except (OSError, json.JSONDecodeError) as exc:
+                f.check(False,
+                        f"embedded source manifest does not parse: {exc}")
+            if embedded is not None:
+                f.check(embedded.get("schema") == MANIFEST_SCHEMA,
+                        "embedded source manifest schema mismatch")
+                for field in ("version", "entry_count", "root_hash"):
+                    f.check(embedded.get(field) == manifest.get(field),
+                            f"embedded manifest {field} does not match the "
+                            "authenticated external manifest")
+                f.check(embedded.get("entries") == manifest.get("entries"),
+                        "embedded manifest entry list differs from the "
+                        "authenticated external manifest")
+
         # Version consistency: the extracted VERSION file must declare
         # exactly the qualified version.
         vpath = os.path.join(tree, "VERSION")

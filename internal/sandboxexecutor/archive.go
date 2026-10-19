@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"time"
+
+	"github.com/openclaw/crabbox/internal/sandboxcustody"
 )
 
 // Durable archival: the jobs table is the ACTIVE registry — every row
@@ -52,6 +54,12 @@ type ArchiveCustodian interface {
 	// custody reference the ledger persists with the segment before
 	// any row may leave.
 	WitnessArchive(seg *ArchiveSegment, payload []byte) (*CustodyAck, error)
+	// CustodyTrustRoot declares the witness trust under which this
+	// custodian's acknowledgements must verify — controlled
+	// configuration, never learned from an acknowledgement. The
+	// recording boundary re-verifies every returned ack against it:
+	// an empty root means no custody can be recorded, failing closed.
+	CustodyTrustRoot() *sandboxcustody.TrustRoot
 }
 
 // CustodyAck is the verified custody acknowledgement reference the
@@ -67,6 +75,10 @@ type CustodyAck struct {
 	// AckJSON is the canonical signed acknowledgement record — the
 	// complete evidence an auditor re-verifies, not a summary.
 	AckJSON string `json:"ack_json"`
+	// RequestCreatedAt is the witness-request timestamp a v2
+	// acknowledgement binds — surfaced so the recording boundary can
+	// re-verify request-instance identity, not just the adapter.
+	RequestCreatedAt int64 `json:"request_created_at,omitempty"`
 }
 
 // ArchiveSegment is the immutable record of one archival transition:
@@ -316,6 +328,13 @@ func (l *Ledger) ArchiveCompleted(limit int) (*ArchiveSegment, error) {
 			// the handoff — nothing is lost and nothing was claimed.
 			return nil, fmt.Errorf("archive custody witness refused: %w", err)
 		}
+		// The boundary verifies — the adapter's own check is defense
+		// in depth, never the enforcement point: the recorded ack must
+		// bind this exact segment and verify under the custodian's
+		// declared trust root before any operational row may leave.
+		if err := verifyArchiveCustodyAck(seg, ack, custodian.CustodyTrustRoot()); err != nil {
+			return nil, fmt.Errorf("archive custody acknowledgement failed boundary verification — the segment stays pending: %w", err)
+		}
 		if err := l.completeCustodial(seg, ack); err != nil {
 			return nil, err
 		}
@@ -408,6 +427,9 @@ func (l *Ledger) retryPendingCustody(c ArchiveCustodian) error {
 		ack, err := c.WitnessArchive(seg, payload)
 		if err != nil {
 			return fmt.Errorf("archive custody witness refused segment %d: %w", seg.Seq, err)
+		}
+		if err := verifyArchiveCustodyAck(seg, ack, c.CustodyTrustRoot()); err != nil {
+			return fmt.Errorf("archive custody acknowledgement for segment %d failed boundary verification: %w", seg.Seq, err)
 		}
 		if err := l.completeCustodial(seg, ack); err != nil {
 			return err

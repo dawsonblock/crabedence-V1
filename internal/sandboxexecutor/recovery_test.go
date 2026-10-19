@@ -1,6 +1,7 @@
 package sandboxexecutor
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -382,6 +383,68 @@ func TestRecoveryClaimOwnershipFollowsTheFenceEpoch(t *testing.T) {
 	}
 	if c2.Attempt != 2 {
 		t.Fatalf("reclaimed attempt %d, want the monotonic 2", c2.Attempt)
+	}
+}
+
+// A claim abandoned by a dead lifetime cannot strand recovery on its
+// outstanding lease: the flock the new epoch holds is conclusive proof
+// the claimant is gone, so the row re-arms at backoff even while the
+// dead claim's lease still runs. The converse stays true — backoff
+// still paces the takeover, so a crash-looping daemon gets no free
+// retry on every open.
+func TestRecoveryClaimDeadEpochLeaseDoesNotBlockTakeover(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ledger.db")
+	now := time.Now().UTC()
+
+	l, err := OpenLedger(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A claimed row whose lease far outruns its backoff — the shape a
+	// reconcile-extended claim leaves when its daemon dies mid-pass.
+	c1, err := l.ClaimRecoveryAttempt("job-e", RecoveryActionResume, 30*time.Second, time.Hour, now)
+	if err != nil || c1 == nil {
+		t.Fatalf("first claim: c=%v err=%v", c1, err)
+	}
+	epoch1 := c1.OwnerEpoch
+	l.Close()
+
+	l2, err := OpenLedger(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Inside the dead claim's lease, past its backoff: the new epoch
+	// takes over — the abandoned lease is residue, not authority.
+	c2, err := l2.ClaimRecoveryAttempt("job-e", RecoveryActionResume, 30*time.Second, time.Hour, now.Add(35*time.Second))
+	if err != nil || c2 == nil {
+		t.Fatalf("dead-epoch takeover inside the abandoned lease refused: c=%v err=%v", c2, err)
+	}
+	if c2.OwnerEpoch == epoch1 {
+		t.Fatal("the successor lifetime did not advance the owner epoch")
+	}
+	if c2.Attempt != c1.Attempt+1 {
+		t.Fatalf("takeover attempt %d, want %d", c2.Attempt, c1.Attempt+1)
+	}
+	// The dead claimant's token is fence-dead under the successor.
+	if err := l2.ValidateRecoveryClaim(c1, now.Add(35*time.Second)); !errors.Is(err, ErrClaimStale) {
+		t.Fatalf("the dead lifetime's token validated after takeover: %v", err)
+	}
+	l2.Close()
+
+	// And the pacing term still holds: a third lifetime inside the
+	// fresh claim's backoff is refused — dead-epoch takeover is not a
+	// free retry.
+	l3, err := OpenLedger(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l3.Close()
+	if c3, err := l3.ClaimRecoveryAttempt("job-e", RecoveryActionResume, 30*time.Second, time.Hour, now.Add(40*time.Second)); err != nil || c3 != nil {
+		t.Fatalf("dead-epoch reclaim ignored backoff: c=%v err=%v", c3, err)
+	}
+	c3, err := l3.ClaimRecoveryAttempt("job-e", RecoveryActionResume, 30*time.Second, time.Hour, now.Add(70*time.Second))
+	if err != nil || c3 == nil || c3.Attempt != 3 {
+		t.Fatalf("takeover after backoff: c=%v err=%v", c3, err)
 	}
 }
 

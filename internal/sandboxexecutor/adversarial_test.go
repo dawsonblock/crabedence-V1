@@ -164,8 +164,12 @@ func TestAdversarialFaultMatrix(t *testing.T) {
 			bin, stateDir := fakeMSB(t, map[string]string{"MSB_FAKE_TAMPER": tamper})
 			backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
 			job := testContract(t, key, func(c *JobContractV2) { c.JobID = "adv-pol"; c.Nonce = "n-adv-pol" })
-			name := backend.msbJobName(job.JobID)
-			if _, err := backend.Dispatch(testContext(t), job, nil); err == nil {
+			plan, err := backend.Prepare(testContext(t), job)
+			if err != nil {
+				t.Fatalf("prepare: %v", err)
+			}
+			name := plan.Handle
+			if _, err := backend.Dispatch(testContext(t), job, plan); err == nil {
 				targets.acceptedForbidden++
 				return
 			}

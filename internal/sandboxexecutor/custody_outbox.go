@@ -32,15 +32,28 @@ import (
 
 // RecoveryCustodian is the pluggable custody hook for signed recovery
 // checkpoints. It is called after the checkpoint row lands in the
-// outbox; the returned acknowledgement is independently verified and
-// then persisted on the outbox row — custody is recorded only when
-// the custodian's own proof verifies.
+// outbox; the returned acknowledgement is independently verified by
+// the recording boundary — not trusted from the adapter — and then
+// persisted on the outbox row. Custody is recorded only when the
+// custodian's own proof verifies at the boundary.
+//
+// The acknowledgement contract is fixed: the signed record must bind
+// the offered checkpoint's bytes and outbox position — SegmentSeq,
+// FirstTerminalSeq and LastTerminalSeq equal to the outbox sequence,
+// RowCount 1, PayloadSHA256 equal to sha256(checkpointJSON) — under
+// the custody ack signing protocol, verified against the trust root
+// CustodyTrustRoot declares.
 type RecoveryCustodian interface {
 	// WitnessRecoveryCheckpoint hands one serialized checkpoint to
 	// the custodian and returns its signed acknowledgement. The
 	// implementation must be idempotent: re-witnessing the same
 	// checkpoint must return an acknowledgement that verifies.
 	WitnessRecoveryCheckpoint(outboxSeq int64, checkpointJSON []byte) (*CustodyAck, error)
+	// CustodyTrustRoot declares the witness trust under which this
+	// custodian's acknowledgements must verify — controlled
+	// configuration, never learned from an acknowledgement. An empty
+	// root means no custody can be recorded: the boundary fails closed.
+	CustodyTrustRoot() *sandboxcustody.TrustRoot
 }
 
 // EnqueueRecoveryCheckpoint durably records the obligation to
@@ -157,6 +170,17 @@ func (l *Ledger) DrainRecoveryCustody(c RecoveryCustodian, audit func(string, ..
 			}
 			continue
 		}
+		// The boundary verifies — the adapter's own check is defense
+		// in depth, never the enforcement point: the returned record
+		// must be signed under the declared trust root and bind this
+		// exact checkpoint payload and outbox position, or the row
+		// stays pending and the failure is audited.
+		if err := verifyRecoveryCustodyAck(row, ack, c.CustodyTrustRoot()); err != nil {
+			if audit != nil {
+				audit("recovery custody: outbox %d acknowledgement failed boundary verification — not recorded as custody: %v", row.Seq, err)
+			}
+			continue
+		}
 		last, err := l.lastRecoveryAckSeq()
 		if err != nil {
 			if audit != nil {
@@ -180,7 +204,76 @@ func (l *Ledger) DrainRecoveryCustody(c RecoveryCustodian, audit func(string, ..
 	return nil
 }
 
-// SocketCustodian's recovery witness: a signed recovery checkpoint is
+// parseCustodyAckRecord unpacks a returned acknowledgement's signed
+// record and proves the summary fields the caller reported agree with
+// what was actually signed — a wrapper that claims one seq or signer
+// over a record that attests another is refused before verification
+// is even attempted.
+func parseCustodyAckRecord(ack *CustodyAck) (*sandboxcustody.AckRecord, error) {
+	if ack == nil || ack.AckJSON == "" {
+		return nil, fmt.Errorf("custodian returned no signed acknowledgement record")
+	}
+	rec := &sandboxcustody.AckRecord{}
+	if err := json.Unmarshal([]byte(ack.AckJSON), rec); err != nil {
+		return nil, fmt.Errorf("custody acknowledgement does not parse: %w", err)
+	}
+	if ack.AckSeq != rec.AckSeq || ack.Signer != rec.Signer || ack.PayloadSHA256 != rec.PayloadSHA256 {
+		return nil, fmt.Errorf("custody acknowledgement summary contradicts its signed record")
+	}
+	return rec, nil
+}
+
+// verifyArchiveCustodyAck is the recording boundary's own check on a
+// witnessed archive segment — independent of the adapter's internal
+// verification. The signed record must bind the segment's exact
+// identity and verify under the custodian's declared trust root; the
+// request-instance field is reconstructed from the durable segment
+// (the request derives from it), so a replayed or foreign ack fails.
+func verifyArchiveCustodyAck(seg *ArchiveSegment, ack *CustodyAck, trust *sandboxcustody.TrustRoot) error {
+	if trust.Empty() {
+		return fmt.Errorf("no custody trust root declared — a self-declared acknowledgement is not evidence")
+	}
+	rec, err := parseCustodyAckRecord(ack)
+	if err != nil {
+		return err
+	}
+	want := &sandboxcustody.AckBinding{
+		SegmentSeq:       seg.Seq,
+		FirstTerminalSeq: seg.FirstTerminalSeq,
+		LastTerminalSeq:  seg.LastTerminalSeq,
+		RowCount:         seg.RowCount,
+		PayloadSHA256:    seg.SHA256,
+		RequestCreatedAt: seg.CreatedAt.UnixMilli(),
+	}
+	return sandboxcustody.VerifyWitnessAck(rec, want, trust)
+}
+
+// verifyRecoveryCustodyAck is the recording boundary's own check on
+// one returned acknowledgement — independent of whatever the
+// custodian adapter already did. The acknowledgement must carry a
+// parseable signed record whose summary fields agree with it, bind
+// this exact outbox position and checkpoint payload, and verify under
+// the custodian's declared trust root. Anything less is not custody.
+func verifyRecoveryCustodyAck(row *RecoveryOutboxRow, ack *CustodyAck, trust *sandboxcustody.TrustRoot) error {
+	if trust.Empty() {
+		return fmt.Errorf("no custody trust root declared — a self-declared acknowledgement is not evidence")
+	}
+	rec, err := parseCustodyAckRecord(ack)
+	if err != nil {
+		return err
+	}
+	sum := sha256.Sum256([]byte(row.CheckpointJSON))
+	want := &sandboxcustody.AckBinding{
+		SegmentSeq:       row.Seq,
+		FirstTerminalSeq: row.Seq,
+		LastTerminalSeq:  row.Seq,
+		RowCount:         1,
+		PayloadSHA256:    hex.EncodeToString(sum[:]),
+		RequestCreatedAt: ack.RequestCreatedAt,
+	}
+	return sandboxcustody.VerifyWitnessAck(rec, want, trust)
+}
+
 // handed to the custody daemon as a witnessed payload — the same
 // verified-acknowledgement protocol archive custody uses, bound to
 // this checkpoint's bytes. The daemon's acknowledgement is proof the
@@ -218,9 +311,10 @@ func (c *SocketCustodian) WitnessRecoveryCheckpoint(outboxSeq int64, checkpointJ
 		return nil, fmt.Errorf("marshal verified custody ack: %w", err)
 	}
 	return &CustodyAck{
-		AckSeq:        resp.Ack.AckSeq,
-		Signer:        resp.Ack.Signer,
-		PayloadSHA256: resp.Ack.PayloadSHA256,
-		AckJSON:       string(ackJSON),
+		AckSeq:           resp.Ack.AckSeq,
+		Signer:           resp.Ack.Signer,
+		PayloadSHA256:    resp.Ack.PayloadSHA256,
+		AckJSON:          string(ackJSON),
+		RequestCreatedAt: req.CreatedAt,
 	}, nil
 }

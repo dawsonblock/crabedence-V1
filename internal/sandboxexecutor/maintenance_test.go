@@ -356,13 +356,17 @@ func TestMaintenanceArchivesSettledRows(t *testing.T) {
 func TestMaintenanceAmbiguousDispatchReconcilesNotRetries(t *testing.T) {
 	dir := socketDir(t)
 	key, keys := testAuthority(t)
-	be := &stubBackend{handle: "vm-ambig", err: ErrAmbiguousDispatch}
+	be := &stubBackend{handle: "vm-ambig", err: ErrAmbiguousDispatch,
+		resumeGate: make(chan struct{})}
 	srv := startServer(t, Config{
 		SocketDir: dir, Peers: selfPeer(t), AuthorityKeys: keys,
 		Backend: be, MaintenanceInterval: 15 * time.Millisecond,
 	})
 	insertStrandedRecorded(t, srv, key, "amb-1", nil)
 
+	// The gate holds Resume, so the transient state cannot collapse
+	// before the test observes it — the ordering is deterministic,
+	// not a poll racing the next maintenance tick.
 	j := waitForState(t, srv, "amb-1", JobStateDispatchAmbig)
 	if j.DispatchClass != string(DispatchUncertain) || j.BackendHandle == "" {
 		t.Fatalf("ambiguous dispatch lost its uncertainty record: %+v", j)
@@ -370,13 +374,15 @@ func TestMaintenanceAmbiguousDispatchReconcilesNotRetries(t *testing.T) {
 	if j.ReceiptSHA256 != "" {
 		t.Fatal("an uncertain outcome carried a receipt")
 	}
-	// The reconcile pass observes the run through Resume — Dispatch
-	// is not called again (the stub's got field stays the row from
-	// the single dispatch).
-	be.err = nil // Resume path: the run completes and settles.
+	// Release the reconcile pass: Resume now observes the run to
+	// completion — Dispatch is not called again.
+	close(be.resumeGate)
 	j = waitForState(t, srv, "amb-1", JobStateSucceeded)
 	if j.ReceiptSHA256 == "" {
 		t.Fatal("reconciled job settled without a receipt")
+	}
+	if n := be.dispatches.Load(); n != 1 {
+		t.Fatalf("reconcile re-dispatched the job: %d dispatches", n)
 	}
 }
 

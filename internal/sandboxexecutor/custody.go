@@ -51,6 +51,14 @@ func (c *SocketCustodian) trust() *sandboxcustody.TrustRoot {
 	return nil
 }
 
+// CustodyTrustRoot declares the witness trust root this custodian's
+// acknowledgements must verify under — the recording boundary
+// re-verifies every ack against it, so an adapter-level check is
+// additional defense, never the sole enforcement point.
+func (c *SocketCustodian) CustodyTrustRoot() *sandboxcustody.TrustRoot {
+	return c.trust()
+}
+
 // WitnessArchive hands the segment to the custody daemon and
 // independently verifies the signed acknowledgement — digest and
 // fingerprint comparisons are not custody evidence. A verified
@@ -87,9 +95,10 @@ func (c *SocketCustodian) WitnessArchive(seg *ArchiveSegment, payload []byte) (*
 		return nil, fmt.Errorf("marshal verified custody ack: %w", err)
 	}
 	return &CustodyAck{
-		AckSeq:        resp.Ack.AckSeq,
-		Signer:        resp.Ack.Signer,
-		PayloadSHA256: resp.Ack.PayloadSHA256,
-		AckJSON:       string(ackJSON),
+		AckSeq:           resp.Ack.AckSeq,
+		Signer:           resp.Ack.Signer,
+		PayloadSHA256:    resp.Ack.PayloadSHA256,
+		AckJSON:          string(ackJSON),
+		RequestCreatedAt: req.CreatedAt,
 	}, nil
 }

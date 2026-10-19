@@ -2,7 +2,10 @@ package sandboxexecutor
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"path/filepath"
@@ -11,6 +14,7 @@ import (
 	"time"
 
 	"github.com/openclaw/crabbox/internal/evidence"
+	"github.com/openclaw/crabbox/internal/sandboxcustody"
 )
 
 // The WP4 gate (INV-05): committed recovery history is a hash chain
@@ -293,12 +297,24 @@ func TestRecoveryEventWriteIsAtomicWithState(t *testing.T) {
 
 // fakeRecoveryCustodian answers WitnessRecoveryCheckpoint from a
 // scripted sequence of ack sequences, to drive drain, retry, and
-// competing-head tests.
+// competing-head tests. The recording boundary re-verifies every ack
+// cryptographically, so the fake must genuinely sign its
+// acknowledgements under the witness key the declared trust root
+// approves — a fabricated ack proves nothing at the boundary.
 type fakeRecoveryCustodian struct {
 	ackSeq   int64
 	calls    int
 	failNext bool
 	seen     map[string]bool
+	// witness signs the returned ack records; nil produces an
+	// unsigned record the boundary must refuse.
+	witness *evidence.Signer
+	// trust is the declared root the boundary verifies against.
+	trust *sandboxcustody.TrustRoot
+}
+
+func (f *fakeRecoveryCustodian) CustodyTrustRoot() *sandboxcustody.TrustRoot {
+	return f.trust
 }
 
 func (f *fakeRecoveryCustodian) WitnessRecoveryCheckpoint(outboxSeq int64, checkpointJSON []byte) (*CustodyAck, error) {
@@ -310,14 +326,61 @@ func (f *fakeRecoveryCustodian) WitnessRecoveryCheckpoint(outboxSeq int64, check
 	if f.seen == nil {
 		f.seen = map[string]bool{}
 	}
-	sum := fmt.Sprintf("%x", checkpointJSON)
-	f.seen[sum] = true
+	f.seen[string(checkpointJSON)] = true
+	sum := sha256.Sum256(checkpointJSON)
+	created := time.Now().UTC().UnixMilli()
+	rec := &sandboxcustody.AckRecord{
+		RecordType:       sandboxcustody.AckRecordTypeV2,
+		AckSeq:           f.ackSeq,
+		SegmentSeq:       outboxSeq,
+		FirstTerminalSeq: outboxSeq,
+		LastTerminalSeq:  outboxSeq,
+		RowCount:         1,
+		PayloadSHA256:    hex.EncodeToString(sum[:]),
+		RequestCreatedAt: created,
+		WitnessedAt:      time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	if f.witness != nil {
+		pub := f.witness.PublicKey()
+		rec.PublicKey = base64.StdEncoding.EncodeToString(pub)
+		rec.Signer = evidence.Fingerprint(pub)
+		fields, err := rec.SigningFields()
+		if err != nil {
+			return nil, err
+		}
+		sig, err := f.witness.SignRecord(sandboxcustody.WitnessDomain, fields...)
+		if err != nil {
+			return nil, err
+		}
+		rec.Signature = sig
+	}
+	raw, err := json.Marshal(rec)
+	if err != nil {
+		return nil, err
+	}
 	return &CustodyAck{
-		AckSeq:        f.ackSeq,
-		Signer:        "fake-witness",
-		PayloadSHA256: "00",
-		AckJSON:       fmt.Sprintf(`{"ack_seq":%d,"signer":"fake-witness"}`, f.ackSeq),
+		AckSeq:           rec.AckSeq,
+		Signer:           rec.Signer,
+		PayloadSHA256:    rec.PayloadSHA256,
+		AckJSON:          string(raw),
+		RequestCreatedAt: created,
 	}, nil
+}
+
+// trustedCustodian wires a fake custodian with a real witness key and
+// the trust root that approves it — what a correctly configured
+// custody integration looks like at the boundary.
+func trustedCustodian(t *testing.T, ackSeq int64) *fakeRecoveryCustodian {
+	t.Helper()
+	wit, err := evidence.GenerateSigner()
+	if err != nil {
+		t.Fatalf("witness key: %v", err)
+	}
+	return &fakeRecoveryCustodian{
+		ackSeq:  ackSeq,
+		witness: wit,
+		trust:   sandboxcustody.NewTrustRoot(wit.PublicKey()),
+	}
 }
 
 func TestRecoveryCustodyOutboxDrainsAndRetries(t *testing.T) {
@@ -332,7 +395,8 @@ func TestRecoveryCustodyOutboxDrainsAndRetries(t *testing.T) {
 		t.Fatalf("pending after emit: %d err=%v", len(pending), err)
 	}
 	// A failed witness leaves the obligation durable.
-	fc := &fakeRecoveryCustodian{ackSeq: 1, failNext: true}
+	fc := trustedCustodian(t, 1)
+	fc.failNext = true
 	if err := l.DrainRecoveryCustody(fc, nil); err != nil {
 		t.Fatalf("drain: %v", err)
 	}
@@ -369,7 +433,7 @@ func TestRecoveryCustodyDetectsCompetingHead(t *testing.T) {
 	// ack sequence is presenting a competing checkpoint head — the
 	// second ack is escalated and left pending, never recorded.
 	var audits []string
-	fc := &fakeRecoveryCustodian{ackSeq: 5}
+	fc := trustedCustodian(t, 5)
 	if err := l.DrainRecoveryCustody(fc, func(f string, a ...any) {
 		audits = append(audits, fmt.Sprintf(f, a...))
 	}); err != nil {
@@ -390,6 +454,52 @@ func TestRecoveryCustodyDetectsCompetingHead(t *testing.T) {
 	pending, _ = l.PendingRecoveryCustody(0)
 	if len(pending) != 0 {
 		t.Fatalf("advancing ack did not record custody")
+	}
+}
+
+// The recording boundary verifies the acknowledgement itself: a
+// custodian returning a well-formed but unsigned record — the adapter
+// trusted, its claim unproven — records nothing. The obligation stays
+// pending and the failure is audited, exactly like an unreachable
+// custodian.
+func TestRecoveryCustodyRefusesUnverifiableAck(t *testing.T) {
+	l, _ := openLedger(t)
+	signer, _ := evidence.GenerateSigner()
+	recordN(t, l, 1)
+	if _, _, err := l.EmitRecoveryCheckpoint(signer); err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+	// An unsigned record under a real trust root: the signature
+	// check must refuse it.
+	fc := trustedCustodian(t, 1)
+	fc.witness = nil
+	var audits []string
+	if err := l.DrainRecoveryCustody(fc, func(f string, a ...any) {
+		audits = append(audits, fmt.Sprintf(f, a...))
+	}); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if pending, _ := l.PendingRecoveryCustody(0); len(pending) != 1 {
+		t.Fatal("an unsigned acknowledgement was recorded as custody")
+	}
+	if len(audits) == 0 || !strings.Contains(audits[0], "boundary verification") {
+		t.Fatalf("unverifiable ack not audited: %v", audits)
+	}
+	// No declared trust root fails closed the same way.
+	fc = &fakeRecoveryCustodian{ackSeq: 1, witness: nil, trust: nil}
+	if err := l.DrainRecoveryCustody(fc, nil); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if pending, _ := l.PendingRecoveryCustody(0); len(pending) != 1 {
+		t.Fatal("custody recorded without a declared trust root")
+	}
+	// A genuinely signed ack under the approved witness records.
+	fc = trustedCustodian(t, 1)
+	if err := l.DrainRecoveryCustody(fc, nil); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if pending, _ := l.PendingRecoveryCustody(0); len(pending) != 0 {
+		t.Fatal("a verified acknowledgement was not recorded")
 	}
 }
 

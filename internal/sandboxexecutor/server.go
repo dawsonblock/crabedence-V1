@@ -536,12 +536,12 @@ func (s *Server) cleanupOne(j *LedgerJob, claim *RecoveryClaim) {
 		s.audit("cleanup retry: job %s handle %s still pending: %v", j.JobID, fresh.BackendHandle, cerr)
 		return
 	}
-	if !res.Outcome.ProvesAbsent() {
-		// The backend could not prove the authorized instance is
-		// gone — a substitution it refused to touch, an identity it
-		// could not verify, or an uncertain removal. Record the
-		// classification as the pending reason so the residue
-		// escalation carries why it is still owed.
+	if !res.Outcome.ResolvesObligation() {
+		// The backend could not resolve the obligation — a
+		// substitution it refused to touch, an identity it could not
+		// verify, or an uncertain removal. Record the classification
+		// as the pending reason so the residue escalation carries
+		// why it is still owed.
 		if nerr := s.ledger.NoteCleanupPendingFor(j.JobID, fmt.Sprintf("%s: %s", res.Outcome, res.Detail), claim); nerr != nil {
 			s.audit("cleanup retry: job %s outcome %s could not be recorded: %v", j.JobID, res.Outcome, nerr)
 		}
@@ -552,7 +552,7 @@ func (s *Server) cleanupOne(j *LedgerJob, claim *RecoveryClaim) {
 		s.audit("cleanup retry: job %s removed (%s) but the ledger refused the clear: %v", j.JobID, res.Outcome, err)
 		return
 	}
-	s.audit("cleanup retry: job %s handle %s removed (%s)", j.JobID, fresh.BackendHandle, res.Outcome)
+	s.audit("cleanup retry: job %s handle %s obligation resolved (%s)", j.JobID, fresh.BackendHandle, res.Outcome)
 	s.releaseRecovery(claim, fmt.Sprintf("pending removal completed: %s", res.Outcome))
 }
 
@@ -1185,7 +1185,7 @@ func (s *Server) settleObserved(job *LedgerJob, from []string, run RunIdentity, 
 		if merr := s.ledger.MarkCleanupPendingFor(job.JobID, cerr.Error(), claim); merr != nil {
 			s.audit("job %s: could not record the pending cleanup: %v", job.JobID, merr)
 		}
-	case !cres.Outcome.ProvesAbsent():
+	case !cres.Outcome.ResolvesObligation():
 		cleanupPending = true
 		s.audit("job %s: cleanup pending (%s) — %s", job.JobID, cres.Outcome, cres.Detail)
 		if merr := s.ledger.NoteCleanupPendingFor(job.JobID, fmt.Sprintf("%s: %s", cres.Outcome, cres.Detail), claim); merr != nil {

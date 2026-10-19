@@ -3,7 +3,9 @@ package sandboxexecutor
 import (
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -12,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/openclaw/crabbox/internal/evidence"
 	"github.com/openclaw/crabbox/internal/sandboxcustody"
 	_ "modernc.org/sqlite"
 )
@@ -293,11 +296,18 @@ func TestListMergesActiveAndArchive(t *testing.T) {
 }
 
 // stubCustodian records witnessed segments and can be told to refuse —
-// standing in for the external evidence-custody witness.
+// standing in for the external evidence-custody witness. The recording
+// boundary re-verifies every acknowledgement cryptographically, so the
+// stub must genuinely sign under a witness key its declared trust root
+// approves; a fabricated record proves nothing at the boundary.
 type stubCustodian struct {
 	failNext int
 	seen     []string
+	witness  *evidence.Signer
+	trust    *sandboxcustody.TrustRoot
 }
+
+func (c *stubCustodian) CustodyTrustRoot() *sandboxcustody.TrustRoot { return c.trust }
 
 func (c *stubCustodian) WitnessArchive(seg *ArchiveSegment, payload []byte) (*CustodyAck, error) {
 	if c.failNext > 0 {
@@ -311,17 +321,63 @@ func (c *stubCustodian) WitnessArchive(seg *ArchiveSegment, payload []byte) (*Cu
 		return nil, fmt.Errorf("payload digest does not match segment %s", seg.SHA256)
 	}
 	c.seen = append(c.seen, seg.SHA256)
+	rec := &sandboxcustody.AckRecord{
+		RecordType:       sandboxcustody.AckRecordTypeV2,
+		AckSeq:           int64(len(c.seen)),
+		SegmentSeq:       seg.Seq,
+		FirstTerminalSeq: seg.FirstTerminalSeq,
+		LastTerminalSeq:  seg.LastTerminalSeq,
+		RowCount:         seg.RowCount,
+		PayloadSHA256:    seg.SHA256,
+		RequestCreatedAt: seg.CreatedAt.UnixMilli(),
+		WitnessedAt:      time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	if c.witness != nil {
+		pub := c.witness.PublicKey()
+		rec.PublicKey = base64.StdEncoding.EncodeToString(pub)
+		rec.Signer = evidence.Fingerprint(pub)
+		fields, err := rec.SigningFields()
+		if err != nil {
+			return nil, err
+		}
+		sig, err := c.witness.SignRecord(sandboxcustody.WitnessDomain, fields...)
+		if err != nil {
+			return nil, err
+		}
+		rec.Signature = sig
+	}
+	raw, err := json.Marshal(rec)
+	if err != nil {
+		return nil, err
+	}
 	return &CustodyAck{
-		AckSeq:        int64(len(c.seen)),
-		Signer:        "stub-witness",
-		PayloadSHA256: seg.SHA256,
-		AckJSON:       `{"record_type":"stub","payload_sha256":"` + seg.SHA256 + `"}`,
+		AckSeq:           rec.AckSeq,
+		Signer:           rec.Signer,
+		PayloadSHA256:    rec.PayloadSHA256,
+		AckJSON:          string(raw),
+		RequestCreatedAt: rec.RequestCreatedAt,
 	}, nil
+}
+
+// newStubCustodian wires a stub custodian whose acknowledgements
+// genuinely sign under a test witness key the declared trust root
+// approves — the correctly-configured shape the boundary accepts.
+func newStubCustodian(t *testing.T, failNext int) *stubCustodian {
+	t.Helper()
+	wit, err := evidence.GenerateSigner()
+	if err != nil {
+		t.Fatalf("witness key: %v", err)
+	}
+	return &stubCustodian{
+		failNext: failNext,
+		witness:  wit,
+		trust:    sandboxcustody.NewTrustRoot(wit.PublicKey()),
+	}
 }
 
 func TestCustodialArchiveHoldsRowsUntilWitnessed(t *testing.T) {
 	l, _ := openLedger(t)
-	c := &stubCustodian{failNext: 1}
+	c := newStubCustodian(t, 1)
 	if err := l.SetArchiveCustodian(c); err != nil {
 		t.Fatal(err)
 	}
@@ -368,7 +424,7 @@ func TestCustodialArchiveHoldsRowsUntilWitnessed(t *testing.T) {
 
 func TestCustodialArchiveResumesAfterRestart(t *testing.T) {
 	l, path := openLedger(t)
-	c := &stubCustodian{failNext: 1}
+	c := newStubCustodian(t, 1)
 	if err := l.SetArchiveCustodian(c); err != nil {
 		t.Fatal(err)
 	}
@@ -382,7 +438,7 @@ func TestCustodialArchiveResumesAfterRestart(t *testing.T) {
 
 	// New lifetime, custodian healthy: finalize must not release the
 	// pending row, and the next pass must re-witness and release it.
-	c2 := &stubCustodian{}
+	c2 := newStubCustodian(t, 0)
 	l2, err := OpenLedger(path)
 	if err != nil {
 		t.Fatal(err)

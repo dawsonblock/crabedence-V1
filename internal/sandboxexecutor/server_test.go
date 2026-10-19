@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -393,6 +394,14 @@ type stubBackend struct {
 	adoptBoot  string
 	noRunID    bool
 	prepareErr error
+	// resumeGate, when non-nil, holds every Resume call until the
+	// channel is closed — the deterministic barrier a test uses to
+	// observe a transient DISPATCH_AMBIGUOUS state before the
+	// reconcile pass is allowed to settle it.
+	resumeGate chan struct{}
+	// dispatches counts Dispatch invocations — the no-duplicate-effect
+	// assertion for reconciliation tests.
+	dispatches atomic.Int32
 }
 
 // stubIdentity is the execution identity a stub dispatch reports: a
@@ -428,6 +437,7 @@ func (b *stubBackend) Prepare(ctx context.Context, job *JobContractV2) (*Dispatc
 }
 
 func (b *stubBackend) Dispatch(ctx context.Context, job *JobContractV2, plan *DispatchPlan) (RunIdentity, error) {
+	b.dispatches.Add(1)
 	cpy := *job
 	b.got = &cpy
 	ident := b.stubIdentity()
@@ -488,6 +498,13 @@ func (b *stubBackend) Inspect(ctx context.Context, handle string) (bool, error) 
 }
 
 func (b *stubBackend) Resume(ctx context.Context, job *JobContractV2, run RunIdentity) (RunIdentity, *ExecResult, error) {
+	if b.resumeGate != nil {
+		select {
+		case <-b.resumeGate:
+		case <-ctx.Done():
+			return run, nil, ctx.Err()
+		}
+	}
 	if b.resumeErr != nil {
 		return run, nil, b.resumeErr
 	}
