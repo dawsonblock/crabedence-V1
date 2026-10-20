@@ -428,6 +428,124 @@ func TestCleanupOutsideNamespaceRefused(t *testing.T) {
 	}
 }
 
+// TestRetentionInventoryTracksPolicyKeptResource: a cleanup resolved
+// RETAINED_BY_POLICY discharges the removal obligation while the
+// resource still exists. The obligation flag clears — but the live
+// instance must land in the retained-resources inventory under its
+// persisted dispatch identity, or cleanup accounting is correct while
+// resource accounting silently loses a real VM.
+func TestRetentionInventoryTracksPolicyKeptResource(t *testing.T) {
+	key, keys := testAuthority(t)
+	bin, stateDir := fakeMSB(t, nil)
+	be := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
+	be.KeepSandboxes = true
+	srv := startServer(t, Config{SocketDir: socketDir(t), Peers: selfPeer(t), AuthorityKeys: keys, Backend: be})
+	conn, reader := connect(t, srv.SocketPath())
+	resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV2) {
+		c.JobID = "retain-1"
+		c.Nonce = "n-retain"
+	}))
+	if !resp.OK {
+		t.Fatalf("submit: %+v", resp)
+	}
+	lj := waitLedgerState(t, srv, "retain-1", JobStateSucceeded)
+
+	// Retention resolves the obligation — the flag clears — but the
+	// live instance must enter the inventory first. Poll: the settle
+	// path's cleanup runs after the terminal transition lands.
+	deadline := time.Now().Add(5 * time.Second)
+	var retained []*RetainedResource
+	for time.Now().Before(deadline) {
+		lj, _ = srv.Ledger().Get("retain-1")
+		retained, _ = srv.Ledger().RetainedResources()
+		if !lj.CleanupPending && len(retained) == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if lj.CleanupPending {
+		t.Fatalf("a policy-discharge left the obligation pending: %+v", lj)
+	}
+	if len(retained) != 1 {
+		t.Fatalf("the retained VM is not inventoried: %d records", len(retained))
+	}
+	rec := retained[0]
+	if rec.JobID != "retain-1" || rec.Handle != lj.BackendHandle || rec.DispatchNonce != lj.DispatchNonce || rec.BackendID != "microsandbox" {
+		t.Fatalf("retention record does not bind the persisted dispatch identity: %+v vs row %+v", rec, lj)
+	}
+	if !rec.DisposedAt.IsZero() {
+		t.Fatalf("a live retention is already disposed: %+v", rec)
+	}
+	// The resource itself still exists — nothing was claimed absent.
+	if _, err := os.Stat(fakeStatePath(stateDir, lj.BackendHandle)); err != nil {
+		t.Fatal("the retained VM vanished under a policy discharge")
+	}
+	// Disposal closes the live record; the inventory empties and a
+	// re-record for the disposed job is refused — disposal is final.
+	if err := srv.Ledger().DisposeRetainedResource("retain-1"); err != nil {
+		t.Fatalf("dispose: %v", err)
+	}
+	if retained, _ := srv.Ledger().RetainedResources(); len(retained) != 0 {
+		t.Fatal("a disposed resource still lists as retained")
+	}
+	if err := srv.Ledger().RecordRetainedResource("retain-1", "microsandbox", "h", "n", "again"); err == nil {
+		t.Fatal("a disposed retention record was silently rewritten")
+	}
+	srv.Stop()
+}
+
+// TestCleanupSubstituteAfterRemovalSurvives: the adversary cannot
+// mint our nonce-bound name — but if the runtime itself is hostile,
+// a foreign record could be planted under it between the delete
+// returning and the post-removal inspect. The verdict must be exact:
+// nothing carrying the authorized identity exists (verified absent),
+// and the substitute is named in the evidence — never destroyed by
+// us, never mistaken for our instance.
+func TestCleanupSubstituteAfterRemovalSurvives(t *testing.T) {
+	key, _ := testAuthority(t)
+	bin, stateDir := fakeMSB(t, map[string]string{"MSB_FAKE_RM_RECREATE": "1"})
+	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
+	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "post-1"; c.Nonce = "n-post" })
+
+	disp, err := backend.Dispatch(testContext(t), job, nil)
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	// The foreign record the fake plants under our handle the moment
+	// its delete returns — post-verify sees it, not absence.
+	conf := fakeDefaultConfig()
+	conf.Name = disp.Handle
+	conf.Labels = map[string]string{"foreign": "occupant"}
+	raw, err := json.Marshal(fakeSandbox{
+		Name: disp.Handle, Status: "Running", BootID: fakeBootID(disp.Handle),
+		Config: conf, ActiveConfig: &conf,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stateDir, "rm-recreate-payload"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := backend.Cleanup(testContext(t), cleanupReqFor(job, disp))
+	if err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	if res.Outcome != CleanupRemovedVerified {
+		t.Fatalf("post-remove substitute classified %s, want %s: %s", res.Outcome, CleanupRemovedVerified, res.Detail)
+	}
+	if !strings.Contains(res.Detail, "different instance") {
+		t.Fatalf("the substitute's survival is not in the evidence: %s", res.Detail)
+	}
+	// The substitute itself was never destroyed — a foreign occupant
+	// is an operator's problem, not ours to delete.
+	survive(t, stateDir, disp.Handle)
+	sb := readFakeSandbox(t, stateDir, disp.Handle)
+	if sb.Config.Labels["foreign"] != "occupant" {
+		t.Fatalf("the post-remove occupant was modified: %+v", sb.Config.Labels)
+	}
+}
+
 // foreignStatePayload rewrites a sandbox's record inside the fake's
 // own `rm` — the substitution-inside-the-window the label condition
 // exists to defeat. MSB_FAKE_RM_SWAP makes fakeRemove move the

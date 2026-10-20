@@ -680,14 +680,37 @@ jobs:
       # actions/attest cannot persist attestations on user-owned private
       # repositories ("Feature not available for user-owned private
       # repositories") — observed failing the otherwise-green evidence job
-      # on run 39228255743. Attestation is skipped there with an explicit
-      # warning; the verified evidence bundle still uploads. Organization
-      # private repos and all public repos attest normally.
-      - name: Note attestation unavailability on this repository
+      # on run 39228255743. Skipping attestation silently is an accepted
+      # omission this release model does not permit: the fallback signs
+      # the frozen evidence manifest with a separately controlled release
+      # key (RELEASE_EVIDENCE_SIGNING_KEY secret) under the
+      # rc75-qualification namespace — the same trust model the release
+      # verifier's --signature path enforces — and when no key is
+      # configured the bundle is marked 'missing' so promotion gates see
+      # an unattested closure and fail closed rather than inferring
+      # success from a skipped step.
+      - name: Attest or mark evidence attestation status
         if: ${{ github.event.repository.private && github.event.repository.owner.type == 'User' }}
+        env:
+          RELEASE_EVIDENCE_SIGNING_KEY: ${{ secrets.RELEASE_EVIDENCE_SIGNING_KEY }}
         run: |
-          echo '::warning::GitHub artifact attestation is unavailable on user-owned private repositories; the verified release-evidence bundle uploads without an attestation reference.'
-          echo 'attestation=unavailable-user-owned-private-repo' >> "$GITHUB_STEP_SUMMARY"
+          mkdir -p dist/attestation
+          if [ -n "$RELEASE_EVIDENCE_SIGNING_KEY" ] && command -v ssh-keygen >/dev/null 2>&1; then
+            keyfile="$(mktemp)"
+            chmod 600 "$keyfile"
+            printf '%s\n' "$RELEASE_EVIDENCE_SIGNING_KEY" > "$keyfile"
+            ssh-keygen -Y sign -f "$keyfile" -n rc75-qualification \
+              dist/release-evidence/evidence-manifest.json
+            rm -f "$keyfile"
+            mv dist/release-evidence/evidence-manifest.json.sig \
+              dist/attestation/evidence-manifest.json.sig
+            echo 'ssh-signature' > dist/attestation/attestation-status.txt
+            echo 'attestation=ssh-signature-fallback' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'missing' > dist/attestation/attestation-status.txt
+            echo '::warning::GitHub artifact attestation is unavailable on user-owned private repositories and no RELEASE_EVIDENCE_SIGNING_KEY fallback is configured; the evidence bundle is unattested and must not promote.'
+            echo 'attestation=missing-no-authenticated-fallback' >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Create GitHub artifact attestation
         id: attestation
@@ -714,6 +737,7 @@ jobs:
         if: ${{ steps.attestation.outputs.attestation-id != '' }}
         run: |
           mkdir -p dist/attestation
+          echo 'github-actions-attest' > dist/attestation/attestation-status.txt
           echo '${{ steps.attestation.outputs.attestation-id }}' > dist/attestation/attestation-id.txt
           echo '${{ steps.attestation.outputs.attestation-url }}' > dist/attestation/attestation-url.txt
           cat > dist/attestation/attestation.json <<'EOF'
@@ -733,5 +757,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-evidence
-          path: dist/release-evidence/
+          path: |
+            dist/release-evidence/
+            dist/attestation/
           retention-days: 90

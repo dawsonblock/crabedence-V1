@@ -1141,6 +1141,21 @@ func fakeRemove(dir string, args []string) int {
 		fmt.Fprintln(os.Stderr, "error: sandbox not found")
 		return 1
 	}
+	// MSB_FAKE_RM_RECREATE models a foreign instance taking the
+	// freed name the instant the delete returns — before the caller's
+	// post-removal inspect. The payload at dir/rm-recreate-payload
+	// names the state file it lands under; the post-verify must see
+	// the foreign labels, not absence or our identity.
+	if os.Getenv("MSB_FAKE_RM_RECREATE") != "" {
+		if raw, err := os.ReadFile(filepath.Join(dir, "rm-recreate-payload")); err == nil {
+			var sb struct {
+				Name string `json:"name"`
+			}
+			if json.Unmarshal(raw, &sb) == nil && sb.Name != "" {
+				_ = os.WriteFile(fakeStatePath(dir, sb.Name), raw, 0o600)
+			}
+		}
+	}
 	return 0
 }
 

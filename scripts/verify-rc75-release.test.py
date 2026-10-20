@@ -94,10 +94,13 @@ class PackageFixture(unittest.TestCase):
 
     def verify(self, zip_path=None, att=None, manifest=None,
                version="0.54.0-rc.7.5-dev"):
+        # Fixture packages are development artifacts — unsigned by
+        # construction. The explicit escape is what production
+        # promotion can never supply by accident.
         return run_tool("verify", zip_path or self.zip_path,
                         "--manifest", manifest or self.manifest,
                         "--attestation", att or self.att,
-                        "--version", version)
+                        "--version", version, "--allow-unsigned")
 
     def packed_fixture(self):
         """A package built through the real `pack` subcommand: the
@@ -460,9 +463,22 @@ class TestSignature(PackageFixture):
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("signature", res.stderr)
 
+    def test_unsigned_rejected_by_default(self):
+        """Fail-closed is the default posture: a candidate with no
+        signature and no explicit --allow-unsigned is refused before
+        any content check — an omitted flag can never admit an
+        unauthenticated artifact."""
+        self.packed_fixture()
+        res = run_tool("verify", self.zip_path,
+                       "--manifest", self.manifest,
+                       "--attestation", self.att,
+                       "--version", "0.54.0-rc.7.5-dev")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("signature", res.stderr)
+
     def test_unsigned_verifies_without_requirement(self):
         """Unsigned verification still works for development flow —
-        the flag is what makes trust mandatory."""
+        the explicit escape flag is what makes the omission a choice."""
         self.packed_fixture()
         res = self.verify()
         self.assertEqual(res.returncode, 0, res.stderr)

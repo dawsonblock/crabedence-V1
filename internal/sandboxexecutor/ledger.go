@@ -16,6 +16,7 @@ import (
 
 	"github.com/gofrs/flock"
 	"github.com/openclaw/crabbox/internal/evidence"
+	"github.com/openclaw/crabbox/internal/sandboxcustody"
 	_ "modernc.org/sqlite"
 )
 
@@ -62,8 +63,13 @@ type Ledger struct {
 
 	// custodian, when set, is the evidence-custody witness archival
 	// consults before releasing operational rows (see archive.go).
-	custMu    sync.Mutex
-	custodian ArchiveCustodian
+	// custodyTrust is the operator-administered witness trust root —
+	// separately configured from the custodian adapter so the
+	// recording boundary never asks the acknowledgement producer
+	// which witnesses to believe (see custodyVerifyRoot).
+	custMu       sync.Mutex
+	custodian    ArchiveCustodian
+	custodyTrust *sandboxcustody.TrustRoot
 
 	// archiveMu serializes archive passes — two concurrent passes
 	// would pick the same candidates and collide on the archive
@@ -275,7 +281,7 @@ func (l *Ledger) Epoch() uint64 { return l.epoch }
 // event ran under and an authenticated marker for pre-chain rows, and
 // recovery_outbox durably queues signed recovery checkpoints for
 // external custody.
-const ledgerSchemaVersion = 12
+const ledgerSchemaVersion = 13
 
 func (l *Ledger) migrate() error {
 	var version int
@@ -563,6 +569,29 @@ func (l *Ledger) migrate() error {
 		// bound into the chain so a later rewrite is detected.
 		if err := l.backfillRecoveryChain(); err != nil {
 			return fmt.Errorf("migrate ledger v%d→v12: %w", version, err)
+		}
+	}
+	if version < 13 {
+		// v12 → v13: the retained-resource inventory. A cleanup that
+		// resolves RETAINED_BY_POLICY discharges the removal
+		// obligation while the resource still exists — without this
+		// table the ledger would be correct about cleanup accounting
+		// and silent about resource accounting. Each row names the
+		// job's persisted dispatch identity (handle, nonce, backend)
+		// so the retained instance can be inventoried, audited and
+		// finally disposed without guesswork.
+		if _, err := l.db.Exec(`
+			CREATE TABLE IF NOT EXISTS retained_resources (
+				job_id         TEXT PRIMARY KEY,
+				backend_id     TEXT NOT NULL DEFAULT '',
+				handle         TEXT NOT NULL DEFAULT '',
+				dispatch_nonce TEXT NOT NULL DEFAULT '',
+				reason         TEXT NOT NULL DEFAULT '',
+				retained_at_ms INTEGER NOT NULL,
+				disposed_at_ms INTEGER
+			);
+		`); err != nil {
+			return fmt.Errorf("migrate ledger v%d→v13: %w", version, err)
 		}
 	}
 	if version < ledgerSchemaVersion {
@@ -1188,6 +1217,102 @@ func (l *Ledger) ClearCleanupPendingFor(jobID string, claim *RecoveryClaim, now 
 		return fmt.Errorf("clear cleanup pending for %s: %w", jobID, err)
 	}
 	return tx.Commit()
+}
+
+// RetainedResource is the inventory record for a backend resource a
+// cleanup resolved as RETAINED_BY_POLICY: the obligation is discharged
+// by policy, but the instance still exists and remains accountable —
+// owner (job), identity (handle, dispatch nonce), when it was
+// retained, and (once an operator removes it) when it was disposed.
+type RetainedResource struct {
+	JobID         string
+	BackendID     string
+	Handle        string
+	DispatchNonce string
+	Reason        string
+	RetainedAt    time.Time
+	DisposedAt    time.Time // zero while still retained
+}
+
+// RecordRetainedResource writes or refreshes the inventory record for
+// a resource retention policy chose to keep. The record is keyed on
+// the job's persisted dispatch identity, so the retained instance is
+// traceable back to the exact dispatch that created it. A re-record
+// for a disposed resource fails: disposal is terminal bookkeeping.
+func (l *Ledger) RecordRetainedResource(jobID, backendID, handle, nonce, reason string) error {
+	tx, err := l.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return fmt.Errorf("record retained resource for %s: %w", jobID, err)
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(
+		`INSERT INTO retained_resources
+			(job_id, backend_id, handle, dispatch_nonce, reason, retained_at_ms)
+		 VALUES (?,?,?,?,?,?)
+		 ON CONFLICT(job_id) DO UPDATE SET
+			backend_id = excluded.backend_id,
+			handle = excluded.handle,
+			dispatch_nonce = excluded.dispatch_nonce,
+			reason = excluded.reason,
+			retained_at_ms = excluded.retained_at_ms
+		 WHERE retained_resources.disposed_at_ms IS NULL`,
+		jobID, backendID, handle, nonce, reason, time.Now().UTC().UnixMilli())
+	if err != nil {
+		return fmt.Errorf("record retained resource for %s: %w", jobID, err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return fmt.Errorf("record retained resource for %s: a disposed record is final — not rewritten", jobID)
+	}
+	if err := l.recordRecoveryEventTx(tx, "retention", jobID,
+		fmt.Sprintf("resource %s retained by policy: %s", handle, reason), time.Now().UTC(), 0); err != nil {
+		return fmt.Errorf("record retained resource for %s: %w", jobID, err)
+	}
+	return tx.Commit()
+}
+
+// DisposeRetainedResource marks a retained resource finally removed —
+// the instance the policy kept is verifiably gone. The inventory row
+// is preserved (it is evidence a resource existed), only its live
+// status closes. Idempotent: disposing an already-disposed record is
+// a no-op.
+func (l *Ledger) DisposeRetainedResource(jobID string) error {
+	res, err := l.db.Exec(
+		`UPDATE retained_resources SET disposed_at_ms = ? WHERE job_id = ? AND disposed_at_ms IS NULL`,
+		time.Now().UTC().UnixMilli(), jobID)
+	if err != nil {
+		return fmt.Errorf("dispose retained resource for %s: %w", jobID, err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return fmt.Errorf("dispose retained resource for %s: no live retention record", jobID)
+	}
+	return nil
+}
+
+// RetainedResources lists every resource retention policy still holds
+// — the live inventory an operator reconciles and disposes.
+func (l *Ledger) RetainedResources() ([]*RetainedResource, error) {
+	rows, err := l.db.Query(`SELECT job_id, backend_id, handle, dispatch_nonce, reason,
+		retained_at_ms, disposed_at_ms FROM retained_resources
+		WHERE disposed_at_ms IS NULL ORDER BY retained_at_ms`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*RetainedResource
+	for rows.Next() {
+		r := &RetainedResource{}
+		var retained, disposed sql.NullInt64
+		if err := rows.Scan(&r.JobID, &r.BackendID, &r.Handle, &r.DispatchNonce,
+			&r.Reason, &retained, &disposed); err != nil {
+			return nil, err
+		}
+		r.RetainedAt = time.UnixMilli(retained.Int64).UTC()
+		if disposed.Valid {
+			r.DisposedAt = time.UnixMilli(disposed.Int64).UTC()
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 // NoteCleanupPending records the latest cleanup classification as the

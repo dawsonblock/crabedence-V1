@@ -311,13 +311,17 @@ type fakeRecoveryCustodian struct {
 	witness *evidence.Signer
 	// trust is the declared root the boundary verifies against.
 	trust *sandboxcustody.TrustRoot
+	// createdSkew shifts the request-instance timestamp the fake
+	// signs — nonzero produces an acknowledgement minted for a
+	// different request instance than the durable row committed.
+	createdSkew int64
 }
 
 func (f *fakeRecoveryCustodian) CustodyTrustRoot() *sandboxcustody.TrustRoot {
 	return f.trust
 }
 
-func (f *fakeRecoveryCustodian) WitnessRecoveryCheckpoint(outboxSeq int64, checkpointJSON []byte) (*CustodyAck, error) {
+func (f *fakeRecoveryCustodian) WitnessRecoveryCheckpoint(row *RecoveryOutboxRow) (*CustodyAck, error) {
 	f.calls++
 	if f.failNext {
 		f.failNext = false
@@ -326,15 +330,18 @@ func (f *fakeRecoveryCustodian) WitnessRecoveryCheckpoint(outboxSeq int64, check
 	if f.seen == nil {
 		f.seen = map[string]bool{}
 	}
-	f.seen[string(checkpointJSON)] = true
-	sum := sha256.Sum256(checkpointJSON)
-	created := time.Now().UTC().UnixMilli()
+	f.seen[row.CheckpointJSON] = true
+	sum := sha256.Sum256([]byte(row.CheckpointJSON))
+	// The witness binds the durable request instance the ledger
+	// committed — the row's own created_ms. An ack minted for any
+	// other request instance must fail at the recording boundary.
+	created := row.CreatedMS + f.createdSkew
 	rec := &sandboxcustody.AckRecord{
 		RecordType:       sandboxcustody.AckRecordTypeV2,
 		AckSeq:           f.ackSeq,
-		SegmentSeq:       outboxSeq,
-		FirstTerminalSeq: outboxSeq,
-		LastTerminalSeq:  outboxSeq,
+		SegmentSeq:       row.Seq,
+		FirstTerminalSeq: row.Seq,
+		LastTerminalSeq:  row.Seq,
 		RowCount:         1,
 		PayloadSHA256:    hex.EncodeToString(sum[:]),
 		RequestCreatedAt: created,
@@ -500,6 +507,97 @@ func TestRecoveryCustodyRefusesUnverifiableAck(t *testing.T) {
 	}
 	if pending, _ := l.PendingRecoveryCustody(0); len(pending) != 0 {
 		t.Fatal("a verified acknowledgement was not recorded")
+	}
+}
+
+// The acknowledgement's request-instance timestamp is reconstructed
+// from the durable outbox row — the created_ms the ledger committed
+// when it queued the obligation — never from the acknowledgement's
+// own claim. An ack whose signed request instance differs from the
+// row's is evidence for a different request and records nothing.
+func TestRecoveryCustodyRefusesForeignRequestInstance(t *testing.T) {
+	l, _ := openLedger(t)
+	signer, _ := evidence.GenerateSigner()
+	recordN(t, l, 1)
+	if _, _, err := l.EmitRecoveryCheckpoint(signer); err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+	fc := trustedCustodian(t, 1)
+	fc.createdSkew = 1 // ack minted for a different request instance
+	var audits []string
+	if err := l.DrainRecoveryCustody(fc, func(f string, a ...any) {
+		audits = append(audits, fmt.Sprintf(f, a...))
+	}); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if pending, _ := l.PendingRecoveryCustody(0); len(pending) != 1 {
+		t.Fatal("an ack bound to a foreign request instance was recorded as custody")
+	}
+	if len(audits) == 0 || !strings.Contains(audits[0], "boundary verification") {
+		t.Fatalf("foreign-request ack not audited: %v", audits)
+	}
+	// An ack bound to the durable request instance records.
+	fc.createdSkew = 0
+	if err := l.DrainRecoveryCustody(fc, nil); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if pending, _ := l.PendingRecoveryCustody(0); len(pending) != 0 {
+		t.Fatal("a request-instance-bound acknowledgement was not recorded")
+	}
+}
+
+// The recording boundary's trust root is operator-administered
+// configuration (SetCustodyTrust), never the ack-producing adapter's
+// own declaration. An installed operator root overrides whatever the
+// adapter claims — both ways: an adapter that lies about approving
+// the real witness cannot expand trust, and an adapter that declares
+// an unrelated root cannot shrink it.
+func TestRecoveryCustodyOperatorTrustOverridesAdapterDeclared(t *testing.T) {
+	l, _ := openLedger(t)
+	signer, _ := evidence.GenerateSigner()
+	recordN(t, l, 1)
+	if _, _, err := l.EmitRecoveryCheckpoint(signer); err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+	foreign, err := evidence.GenerateSigner()
+	if err != nil {
+		t.Fatalf("foreign witness key: %v", err)
+	}
+	// The adapter declares a root approving a foreign witness — its
+	// declaration is not consulted once the operator root exists, so
+	// the genuinely signed ack under the operator-approved witness
+	// records anyway.
+	fc := trustedCustodian(t, 1)
+	fc.trust = sandboxcustody.NewTrustRoot(foreign.PublicKey())
+	l.SetCustodyTrust(sandboxcustody.NewTrustRoot(fc.witness.PublicKey()))
+	if err := l.DrainRecoveryCustody(fc, nil); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if pending, _ := l.PendingRecoveryCustody(0); len(pending) != 0 {
+		t.Fatal("the adapter's declared root displaced the operator-administered root")
+	}
+
+	// The inverse: an adapter whose declared root would approve the
+	// ack, while the operator root approves only a foreign witness —
+	// the operator root wins and the ack is refused.
+	l2, _ := openLedger(t)
+	recordN(t, l2, 1)
+	if _, _, err := l2.EmitRecoveryCheckpoint(signer); err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+	fc2 := trustedCustodian(t, 1)
+	l2.SetCustodyTrust(sandboxcustody.NewTrustRoot(foreign.PublicKey()))
+	var audits []string
+	if err := l2.DrainRecoveryCustody(fc2, func(f string, a ...any) {
+		audits = append(audits, fmt.Sprintf(f, a...))
+	}); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if pending, _ := l2.PendingRecoveryCustody(0); len(pending) != 1 {
+		t.Fatal("an ack unapproved by the operator trust root was recorded — the adapter's declared root was consulted")
+	}
+	if len(audits) == 0 || !strings.Contains(audits[0], "boundary verification") {
+		t.Fatalf("operator-unapproved ack not audited: %v", audits)
 	}
 }
 

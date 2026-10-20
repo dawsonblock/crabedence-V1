@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/openclaw/crabbox/internal/evidence"
+	"github.com/openclaw/crabbox/internal/sandboxcustody"
 	"github.com/openclaw/crabbox/internal/sockfile"
 )
 
@@ -132,6 +133,14 @@ type Config struct {
 	// before the operational rows release — nil keeps custody local
 	// (the archive is its own custody).
 	ArchiveCustodian ArchiveCustodian
+	// CustodyTrust is the operator-administered custody-witness trust
+	// root the recording boundary verifies acknowledgements under.
+	// It is mandatory whenever ArchiveCustodian is configured: the
+	// trust decision must come from controlled configuration, never
+	// from the acknowledgement-producing component itself — an
+	// adapter that names its own trusted witnesses grades its own
+	// work.
+	CustodyTrust *sandboxcustody.TrustRoot
 	// MaxContractTTL bounds contract validity windows. Zero uses the
 	// default; negative disables the bound.
 	MaxContractTTL time.Duration
@@ -242,6 +251,9 @@ func NewServer(cfg Config) (*Server, error) {
 			return nil, err
 		}
 	}
+	if cfg.ArchiveCustodian != nil && (cfg.CustodyTrust == nil || cfg.CustodyTrust.Empty()) {
+		return nil, fmt.Errorf("a configured custodian requires an operator-administered custody trust root — trusting the acknowledgement producer to name its own witnesses is not custody")
+	}
 	if cfg.LedgerPath == "" {
 		cfg.LedgerPath = filepath.Join(cfg.SocketDir, "executor-ledger.db")
 	}
@@ -329,6 +341,10 @@ func (s *Server) Start() error {
 			s.ledger = nil
 			return err
 		}
+		// The operator's trust root is installed separately from the
+		// custodian adapter: the recording boundary verifies every
+		// acknowledgement under this root and this root only.
+		ledger.SetCustodyTrust(s.cfg.CustodyTrust)
 	}
 	// Failures before the evidence chain exists still owe the ledger
 	// its close — a server that never started holds the fence lock
@@ -547,6 +563,17 @@ func (s *Server) cleanupOne(j *LedgerJob, claim *RecoveryClaim) {
 		}
 		s.audit("cleanup retry: job %s handle %s still pending (%s): %s", j.JobID, fresh.BackendHandle, res.Outcome, res.Detail)
 		return
+	}
+	if res.Outcome == CleanupRetainedByPolicy {
+		// Retention discharges the removal obligation while the
+		// resource still exists — record it in the inventory before
+		// the clear, so cleanup accounting can never leave resource
+		// accounting silent about a live instance.
+		if rerr := s.ledger.RecordRetainedResource(fresh.JobID, fresh.BackendID, fresh.BackendHandle,
+			fresh.DispatchNonce, res.Detail); rerr != nil {
+			s.audit("cleanup retry: job %s retained by policy but the inventory refused the record — keeping the obligation pending: %v", j.JobID, rerr)
+			return
+		}
 	}
 	if err := s.ledger.ClearCleanupPendingFor(j.JobID, claim, s.now()); err != nil {
 		s.audit("cleanup retry: job %s removed (%s) but the ledger refused the clear: %v", j.JobID, res.Outcome, err)
@@ -1192,6 +1219,18 @@ func (s *Server) settleObserved(job *LedgerJob, from []string, run RunIdentity, 
 			s.audit("job %s: could not record the cleanup classification: %v", job.JobID, merr)
 		}
 	default:
+		if cres.Outcome == CleanupRetainedByPolicy {
+			// The obligation is discharged by policy while the
+			// resource still exists — the inventory record must land
+			// before the clear or the live instance becomes
+			// unaccounted-for.
+			if rerr := s.ledger.RecordRetainedResource(job.JobID, job.BackendID, job.BackendHandle,
+				job.DispatchNonce, cres.Detail); rerr != nil {
+				s.audit("job %s: retained by policy but the inventory refused the record — keeping the obligation pending: %v", job.JobID, rerr)
+				cleanupPending = true
+				break
+			}
+		}
 		if err := s.ledger.ClearCleanupPendingFor(job.JobID, claim, s.now()); err != nil {
 			s.audit("job %s: cleaned up (%s) but the ledger refused the clear: %v", job.JobID, cres.Outcome, err)
 		}

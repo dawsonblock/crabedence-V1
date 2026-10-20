@@ -23,22 +23,35 @@ blocker, not an absorbed assumption.
 removes the substitute — destroying someone else's VM or masking the
 original leak.
 
-*Control (INV-01).* Destruction is bound to the dispatch identity:
-labels `crabedence.dispatch=<nonce>` + `crabedence.job=<id>` are
-verified by inspection, and removal itself is label-conditioned
-(`msb rm --label …`), so the remove targets only instances carrying
-the authorized nonce. Post-removal inspection independently confirms
-absence vs. surviving-substitute vs. unverifiable. Cleanup stays
-pending on any non-proven outcome.
+*Control (INV-01).* Destruction is bound to the dispatch identity.
+Sandbox handles are minted nonce-bound (`sx-<job>-<nonce>`, 128-bit
+random per dispatch), so the name the runtime resolves can only ever
+have been issued by this dispatch — a substitute cannot mint an
+unforgeable name, and a re-used job name under another nonce is a
+different name entirely. Before issue, inspection verifies the
+occupant's `crabedence.dispatch=<nonce>` / `crabedence.job=<id>`
+labels — a foreign occupant is refused, never destroyed. Removal is
+then name-scoped (`msb rm -f <handle>`); post-removal inspection
+independently confirms absence vs. surviving-substitute vs.
+unverifiable. Cleanup stays pending on any non-proven outcome.
 
-*Residual.* `msb rm --label` resolves labels→names, then deletes by
-name — a substitution *inside* msb's resolve→delete window is
-bounded by msb's own transition guard, but is not a documented
-atomic conditional-delete contract in the CLI surface. The
-identity-checked `remove_identified` SDK primitive exists but is
-unreachable from the CLI without a Rust shim. Residual accepted
-with pre+post verification plus honest `REMOVAL_UNCERTAIN`; the
-Linux/KVM lane must exercise the race against real VMs.
+*Residual.* An unforgeable name is not an atomic conditional delete:
+msb resolves the name to a catalog record inside its own process, and
+a swap of that record between the executor's inspect and msb's
+resolve is unobservable from the CLI. Closing that window by
+construction therefore requires a **stated deployment assumption —
+exclusive namespace ownership**: no principal other than this
+executor may create, rename, or replace sandboxes under its `sx-`
+prefix (and nothing else may learn the dispatch nonces, which are
+exposed through process argv, logs, and sandbox listings — secrecy
+of the nonce is a hardening measure, not the invariant). Under that
+assumption the name can only ever have resolved to this dispatch's
+instance. The stronger primitive — a runtime-native catalog-locked
+conditional delete binding the immutable instance ID — remains the
+upgrade path (D-RC75-5 register entry) and is required before the
+executor may run in a shared sandbox namespace. Post-verify
+classification already detects reoccupation and reports the
+substitute rather than claiming clean absence.
 
 ### T2 — Ambiguous effects replayed
 
@@ -132,3 +145,15 @@ manifest cannot cover.
 - A malicious `msb` runtime — the runtime is pinned, but a replaced
   binary is a supply-chain matter covered by T7's artifact binding,
   not by runtime behavior.
+- Exclusive sandbox-namespace ownership is a *stated deployment
+  assumption*, not a proven property: until a native conditional
+  delete lands, the executor must be the only principal able to
+  create or replace sandboxes under its handle prefix. A shared
+  namespace makes T1's residual reachable; qualification is scoped
+  to the exclusive-ownership posture.
+- Custody acknowledgements are verified at the recording boundary
+  under an operator-administered trust root (separately configured
+  from the custodian adapter); an adapter that declares its own
+  trust root is not the authority — but the *deployment* of an
+  independently administered custodian remains an operational
+  control the code cannot supply.

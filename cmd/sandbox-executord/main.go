@@ -331,6 +331,16 @@ func main() {
 			log.Fatalf("sandbox-executord: -archive-custody-socket requires an approved witness — pass -archive-custody-trust-file or -archive-custody-signer")
 		}
 		cfg.ArchiveCustodian = custodian
+		// The recording boundary's trust root is administered here —
+		// from the daemon's own flags — and installed on the ledger
+		// separately from the custodian adapter. The adapter's own
+		// declared root is then defense in depth only: a substituted
+		// custodian cannot name its own witnesses.
+		if custodian.Trust != nil {
+			cfg.CustodyTrust = custodian.Trust
+		} else {
+			cfg.CustodyTrust = sandboxcustody.NewFingerprintTrust(*custodySigner)
+		}
 	} else if *custodyTrustFile != "" || *custodySigner != "" || *custodyTokenFile != "" {
 		log.Fatalf("sandbox-executord: custody trust/token configured without -archive-custody-socket — a witness the executor never calls is not custody")
 	}

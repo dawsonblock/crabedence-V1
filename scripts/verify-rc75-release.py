@@ -28,9 +28,12 @@ Three operations, all mechanical, all fail closed:
             version consistency, dependency locks, qualification
             evidence presence, and the sidecar digest. With --signature
             + --allowed-signers + --sign-identity the attestation must
-            first verify under a trusted principal; --require-signature
-            makes that check mandatory. Any failure is a release
-            blocker; nothing is treated as pass by absence of evidence.
+            first verify under a trusted principal. That check is
+            mandatory by default — a release candidate fails closed
+            without an authenticated identity; --allow-unsigned is the
+            explicit escape for development-tree verification only.
+            Any failure is a release blocker; nothing is treated as
+            pass by absence of evidence.
 
 Usage:
   verify-rc75-release.py manifest <source-root> <out.json>
@@ -40,7 +43,7 @@ Usage:
   verify-rc75-release.py verify <archive> --manifest <m.json>
       --attestation <a.json> --version V [--require PATH ...]
       [--signature <a.json.sig> --allowed-signers <file>
-       --sign-identity <principal>] [--require-signature]
+       --sign-identity <principal>] [--allow-unsigned]
 """
 
 import argparse
@@ -375,24 +378,28 @@ def verify_signature(args):
     """The trusted anchor: the attestation sidecar is hash-binding
     evidence, not authority — whoever controls archive + sidecar can
     mint self-consistent hashes. A signature over the attestation from
-    a separately controlled release key is the trust boundary. When a
-    signature is supplied (or required) the attestation must verify
-    under a principal the allowed-signers file authorizes, before any
-    other check runs."""
-    want = bool(args.signature or args.allowed_signers or
-                args.sign_identity)
-    if args.require_signature and not (
-            args.signature and args.allowed_signers and
-            args.sign_identity):
-        die("signature verification required but --signature, "
-            "--allowed-signers and --sign-identity were not all supplied")
-    if not want:
-        return
-    if not (args.signature and args.allowed_signers and
-            args.sign_identity):
+    a separately controlled release key is the trust boundary, and it
+    is mandatory by default: a candidate whose identity is not
+    authenticated by a trusted principal fails closed before any
+    content check runs. --allow-unsigned is the explicit development
+    escape — an operator must type it, so an unsigned artifact can
+    never slide into promotion through an omitted flag."""
+    supplied = bool(args.signature or args.allowed_signers or
+                    args.sign_identity)
+    if args.allow_unsigned and args.require_signature:
+        die("--allow-unsigned and --require-signature contradict each "
+            "other — pick one posture")
+    if supplied and not (args.signature and args.allowed_signers and
+                         args.sign_identity):
         die("--signature, --allowed-signers and --sign-identity must be "
             "supplied together — a signature without its trust anchor "
             "proves nothing")
+    if not args.allow_unsigned and not supplied:
+        die("no attestation signature supplied — verification fails "
+            "closed without a trusted release identity (development "
+            "trees may pass --allow-unsigned explicitly)")
+    if not supplied:
+        return
     if shutil.which("ssh-keygen") is None:
         die("ssh-keygen is required to verify the attestation signature")
     with open(args.attestation, "rb") as fh:
@@ -635,7 +642,13 @@ def main():
     pv.add_argument("--sign-identity",
                     help="principal the signature must verify under")
     pv.add_argument("--require-signature", action="store_true",
-                    help="fail closed unless a trusted signature verifies")
+                    help="kept for compatibility — signature "
+                         "verification is already mandatory unless "
+                         "--allow-unsigned is given")
+    pv.add_argument("--allow-unsigned", action="store_true",
+                    help="development escape: verify the archive "
+                         "without an attestation signature — never "
+                         "valid for release promotion")
     pv.set_defaults(fn=cmd_verify)
 
     args = p.parse_args()

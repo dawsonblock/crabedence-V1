@@ -59,6 +59,13 @@ type ArchiveCustodian interface {
 	// configuration, never learned from an acknowledgement. The
 	// recording boundary re-verifies every returned ack against it:
 	// an empty root means no custody can be recorded, failing closed.
+	//
+	// This is the adapter-declared root — a compatibility fallback the
+	// boundary consults only when no operator-administered root was
+	// configured through SetCustodyTrust. A production deployment
+	// always installs the operator root: trusting the
+	// acknowledgement-producing component to also name the trusted
+	// witnesses is trusting it to grade its own work.
 	CustodyTrustRoot() *sandboxcustody.TrustRoot
 }
 
@@ -179,6 +186,35 @@ func (l *Ledger) SetArchiveCustodian(c ArchiveCustodian) error {
 	}
 	l.custodian = c
 	return nil
+}
+
+// SetCustodyTrust installs the operator-administered witness trust
+// root — trust configuration that arrives over a path independent of
+// the custodian adapter (server config, controlled deployment). Once
+// set it is the recording boundary's only authority on which witness
+// may vouch: an adapter's own declared root is then defense in depth,
+// never the source of truth. The server requires this whenever a
+// custodian is configured; direct ledger users may still rely on the
+// adapter-declared fallback below, which is the weaker model.
+func (l *Ledger) SetCustodyTrust(trust *sandboxcustody.TrustRoot) {
+	l.custMu.Lock()
+	defer l.custMu.Unlock()
+	l.custodyTrust = trust
+}
+
+// custodyVerifyRoot resolves the trust root the recording boundary
+// verifies acknowledgements under: the operator-administered root when
+// one was installed — it cannot be overridden by the
+// acknowledgement-producing adapter — else the adapter-declared root
+// for compatibility with embedders that treat their custodian
+// implementation as part of the trusted configuration.
+func (l *Ledger) custodyVerifyRoot(adapterRoot *sandboxcustody.TrustRoot) *sandboxcustody.TrustRoot {
+	l.custMu.Lock()
+	defer l.custMu.Unlock()
+	if l.custodyTrust != nil && !l.custodyTrust.Empty() {
+		return l.custodyTrust
+	}
+	return adapterRoot
 }
 
 // nextArchiveSeq allocates the archive's monotonic segment counter —
@@ -330,9 +366,10 @@ func (l *Ledger) ArchiveCompleted(limit int) (*ArchiveSegment, error) {
 		}
 		// The boundary verifies — the adapter's own check is defense
 		// in depth, never the enforcement point: the recorded ack must
-		// bind this exact segment and verify under the custodian's
-		// declared trust root before any operational row may leave.
-		if err := verifyArchiveCustodyAck(seg, ack, custodian.CustodyTrustRoot()); err != nil {
+		// bind this exact segment and verify under the resolved
+		// (operator-administered) trust root before any operational
+		// row may leave.
+		if err := verifyArchiveCustodyAck(seg, ack, l.custodyVerifyRoot(custodian.CustodyTrustRoot())); err != nil {
 			return nil, fmt.Errorf("archive custody acknowledgement failed boundary verification — the segment stays pending: %w", err)
 		}
 		if err := l.completeCustodial(seg, ack); err != nil {
@@ -428,7 +465,7 @@ func (l *Ledger) retryPendingCustody(c ArchiveCustodian) error {
 		if err != nil {
 			return fmt.Errorf("archive custody witness refused segment %d: %w", seg.Seq, err)
 		}
-		if err := verifyArchiveCustodyAck(seg, ack, c.CustodyTrustRoot()); err != nil {
+		if err := verifyArchiveCustodyAck(seg, ack, l.custodyVerifyRoot(c.CustodyTrustRoot())); err != nil {
 			return fmt.Errorf("archive custody acknowledgement for segment %d failed boundary verification: %w", seg.Seq, err)
 		}
 		if err := l.completeCustodial(seg, ack); err != nil {
