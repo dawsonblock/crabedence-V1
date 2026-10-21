@@ -22,8 +22,14 @@ import (
 	"time"
 )
 
-// OpWitnessArchive is the only operation the witness speaks.
+// The operations the witness speaks. Both witness opaque payload
+// bytes bound by digest; they differ only in the structural claim the
+// witness checks before attesting: an archive segment is a canonical
+// row array whose terminal sequences land inside the declared range;
+// a recovery checkpoint is a single signed record whose declared
+// position is one outbox row (first == last == segment seq, one row).
 const OpWitnessArchive = "witness_archive"
+const OpWitnessCheckpoint = "witness_checkpoint"
 
 // witnessDomain separates custody signatures from every other signed
 // record — a custody acknowledgement can never be presented as a

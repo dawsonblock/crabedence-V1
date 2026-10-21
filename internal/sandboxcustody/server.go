@@ -214,7 +214,7 @@ func (s *Server) handle(conn *net.UnixConn) *WitnessResponse {
 		subtle.ConstantTimeCompare([]byte(req.Token), []byte(s.cfg.Token)) != 1 {
 		return &WitnessResponse{Error: "custody token refused"}
 	}
-	if req.Op != OpWitnessArchive {
+	if req.Op != OpWitnessArchive && req.Op != OpWitnessCheckpoint {
 		return &WitnessResponse{Error: fmt.Sprintf("unknown op %q", req.Op)}
 	}
 	ack, err := s.witness(req)
@@ -255,17 +255,34 @@ func (s *Server) witness(req *WitnessRequest) (*WitnessResponse, error) {
 		// digest disagrees with the claim is refused outright.
 		return nil, fmt.Errorf("segment %d payload digests to %s, not the claimed %s — refusing to witness", req.SegmentSeq, gotSHA, req.SHA256)
 	}
-	var rows []payloadRow
-	if err := json.Unmarshal(payload, &rows); err != nil {
-		return nil, fmt.Errorf("segment %d payload is not the canonical row array: %w", req.SegmentSeq, err)
-	}
-	if len(rows) != req.RowCount {
-		return nil, fmt.Errorf("segment %d claims %d rows but carries %d", req.SegmentSeq, req.RowCount, len(rows))
-	}
-	for i, r := range rows {
-		if r.TerminalSeq < req.FirstTerminalSeq || r.TerminalSeq > req.LastTerminalSeq {
-			return nil, fmt.Errorf("segment %d row %d terminal_seq %d outside %d..%d",
-				req.SegmentSeq, i, r.TerminalSeq, req.FirstTerminalSeq, req.LastTerminalSeq)
+	switch req.Op {
+	case OpWitnessCheckpoint:
+		// A checkpoint custodies one signed record at one outbox
+		// position: the declared range must collapse onto the row's
+		// sequence and the payload must be a single JSON object — the
+		// witness attests bytes it can describe, never an opaque blob
+		// with a claimed shape it did not check.
+		if req.RowCount != 1 || req.FirstTerminalSeq != req.SegmentSeq || req.LastTerminalSeq != req.SegmentSeq {
+			return nil, fmt.Errorf("checkpoint request %d declares range %d..%d over %d rows — a checkpoint custodies exactly one outbox position",
+				req.SegmentSeq, req.FirstTerminalSeq, req.LastTerminalSeq, req.RowCount)
+		}
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(payload, &obj); err != nil {
+			return nil, fmt.Errorf("checkpoint %d payload is not a JSON record: %w", req.SegmentSeq, err)
+		}
+	default:
+		var rows []payloadRow
+		if err := json.Unmarshal(payload, &rows); err != nil {
+			return nil, fmt.Errorf("segment %d payload is not the canonical row array: %w", req.SegmentSeq, err)
+		}
+		if len(rows) != req.RowCount {
+			return nil, fmt.Errorf("segment %d claims %d rows but carries %d", req.SegmentSeq, req.RowCount, len(rows))
+		}
+		for i, r := range rows {
+			if r.TerminalSeq < req.FirstTerminalSeq || r.TerminalSeq > req.LastTerminalSeq {
+				return nil, fmt.Errorf("segment %d row %d terminal_seq %d outside %d..%d",
+					req.SegmentSeq, i, r.TerminalSeq, req.FirstTerminalSeq, req.LastTerminalSeq)
+			}
 		}
 	}
 

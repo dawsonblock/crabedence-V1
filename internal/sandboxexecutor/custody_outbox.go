@@ -317,7 +317,7 @@ func (c *SocketCustodian) WitnessRecoveryCheckpoint(row *RecoveryOutboxRow, depl
 	sum := hex.EncodeToString(sumRaw[:])
 	cli := &sandboxcustody.Client{Socket: c.Socket, Timeout: c.Timeout, Token: c.Token}
 	req := &sandboxcustody.WitnessRequest{
-		Op:               sandboxcustody.OpWitnessArchive,
+		Op:               sandboxcustody.OpWitnessCheckpoint,
 		SegmentSeq:       row.Seq,
 		FirstTerminalSeq: row.Seq,
 		LastTerminalSeq:  row.Seq,
