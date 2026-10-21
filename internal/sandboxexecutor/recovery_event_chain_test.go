@@ -315,13 +315,17 @@ type fakeRecoveryCustodian struct {
 	// signs — nonzero produces an acknowledgement minted for a
 	// different request instance than the durable row committed.
 	createdSkew int64
+	// depSkew, when set, replaces the deployment scope the fake
+	// signs — an acknowledgement minted under a foreign ledger's
+	// scope must fail at the recording boundary.
+	depSkew string
 }
 
 func (f *fakeRecoveryCustodian) CustodyTrustRoot() *sandboxcustody.TrustRoot {
 	return f.trust
 }
 
-func (f *fakeRecoveryCustodian) WitnessRecoveryCheckpoint(row *RecoveryOutboxRow) (*CustodyAck, error) {
+func (f *fakeRecoveryCustodian) WitnessRecoveryCheckpoint(row *RecoveryOutboxRow, deployment string) (*CustodyAck, error) {
 	f.calls++
 	if f.failNext {
 		f.failNext = false
@@ -333,11 +337,16 @@ func (f *fakeRecoveryCustodian) WitnessRecoveryCheckpoint(row *RecoveryOutboxRow
 	f.seen[row.CheckpointJSON] = true
 	sum := sha256.Sum256([]byte(row.CheckpointJSON))
 	// The witness binds the durable request instance the ledger
-	// committed — the row's own created_ms. An ack minted for any
-	// other request instance must fail at the recording boundary.
+	// committed — the row's own created_ms — and this ledger's
+	// deployment scope. An ack minted for any other request
+	// instance or any other deployment must fail at the boundary.
 	created := row.CreatedMS + f.createdSkew
+	dep := deployment
+	if f.depSkew != "" {
+		dep = f.depSkew
+	}
 	rec := &sandboxcustody.AckRecord{
-		RecordType:       sandboxcustody.AckRecordTypeV2,
+		RecordType:       sandboxcustody.AckRecordTypeV3,
 		AckSeq:           f.ackSeq,
 		SegmentSeq:       row.Seq,
 		FirstTerminalSeq: row.Seq,
@@ -345,6 +354,7 @@ func (f *fakeRecoveryCustodian) WitnessRecoveryCheckpoint(row *RecoveryOutboxRow
 		RowCount:         1,
 		PayloadSHA256:    hex.EncodeToString(sum[:]),
 		RequestCreatedAt: created,
+		DeploymentID:     dep,
 		WitnessedAt:      time.Now().UTC().Format(time.RFC3339Nano),
 	}
 	if f.witness != nil {
@@ -543,6 +553,81 @@ func TestRecoveryCustodyRefusesForeignRequestInstance(t *testing.T) {
 	}
 	if pending, _ := l.PendingRecoveryCustody(0); len(pending) != 0 {
 		t.Fatal("a request-instance-bound acknowledgement was not recorded")
+	}
+}
+
+// A genuinely signed ack bound to another ledger's deployment scope
+// is custody for that ledger — never for this one. The scope is the
+// durable identity the ledger itself issued, so a foreign-scoped ack
+// fails at the boundary even under the approved witness key.
+func TestRecoveryCustodyRefusesForeignDeployment(t *testing.T) {
+	l, _ := openLedger(t)
+	signer, _ := evidence.GenerateSigner()
+	recordN(t, l, 1)
+	if _, _, err := l.EmitRecoveryCheckpoint(signer); err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+	fc := trustedCustodian(t, 1)
+	fc.depSkew = "another-ledger" // signed under a foreign deployment scope
+	var audits []string
+	if err := l.DrainRecoveryCustody(fc, func(f string, a ...any) {
+		audits = append(audits, fmt.Sprintf(f, a...))
+	}); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if pending, _ := l.PendingRecoveryCustody(0); len(pending) != 1 {
+		t.Fatal("an ack bound to a foreign deployment was recorded as this ledger's custody")
+	}
+	if len(audits) == 0 || !strings.Contains(audits[0], "boundary verification") {
+		t.Fatalf("foreign-deployment ack not audited: %v", audits)
+	}
+	// An ack under this ledger's own scope records.
+	fc.depSkew = ""
+	if err := l.DrainRecoveryCustody(fc, nil); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if pending, _ := l.PendingRecoveryCustody(0); len(pending) != 0 {
+		t.Fatal("a deployment-bound acknowledgement was not recorded")
+	}
+}
+
+// The deployment scope is durable ledger identity: generated once,
+// stable across reopens, and unique per ledger file — two ledgers
+// sharing a custodian still hold disjoint evidence.
+func TestCustodyDeploymentIsDurablePerLedger(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "l.db")
+	l1, err := OpenLedger(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dep1, err := l1.custodyDeployment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dep1 == "" {
+		t.Fatal("empty deployment scope")
+	}
+	l1.Close()
+	l2, err := OpenLedger(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l2.Close()
+	dep2, err := l2.custodyDeployment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dep2 != dep1 {
+		t.Fatal("deployment scope changed across reopen — persisted scope is the binding, not a fresh identity")
+	}
+	other, _ := openLedger(t)
+	dep3, err := other.custodyDeployment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dep3 == dep1 {
+		t.Fatal("two ledgers minted the same deployment scope — cross-ledger evidence would be indistinguishable")
 	}
 }
 

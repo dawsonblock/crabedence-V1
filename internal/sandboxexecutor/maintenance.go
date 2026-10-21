@@ -319,12 +319,12 @@ func (s *Server) escalateResidue() {
 		s.audit("maintenance: cannot read registry residue: %v", err)
 		return
 	}
-	if r.Unresolved == 0 && r.CleanupPending == 0 {
+	if r.Unresolved == 0 && r.CleanupPending == 0 && r.Retained == 0 {
 		return
 	}
 	now := s.now()
-	sig := fmt.Sprintf("%d/%d/%d/%d", r.Unresolved, r.CleanupPending,
-		r.OldestUnresolved.Unix(), r.OldestCleanup.Unix())
+	sig := fmt.Sprintf("%d/%d/%d/%d/%d/%d", r.Unresolved, r.CleanupPending, r.Retained,
+		r.OldestUnresolved.Unix(), r.OldestCleanup.Unix(), r.OldestRetained.Unix())
 	prev, found, err := s.ledger.RecoveryState(residueStateKey)
 	if err != nil {
 		s.audit("maintenance: cannot read residue throttle state: %v", err)
@@ -345,10 +345,15 @@ func (s *Server) escalateResidue() {
 	// record cannot be written must not mark the shape as reported —
 	// the next pass escalates again rather than going quiet on an
 	// unrecorded residue.
+	retainedNote := ""
+	if r.Retained > 0 {
+		retainedNote = fmt.Sprintf(", %d retained by policy (oldest %s ago — live resources, not residue-free)",
+			r.Retained, now.Sub(r.OldestRetained).Round(time.Second))
+	}
 	if err := s.ledger.RecordRecoveryEvent("escalation", "registry",
-		fmt.Sprintf("residue persists: %d unresolved (oldest %s ago), %d cleanup pending (oldest %s ago)",
+		fmt.Sprintf("residue persists: %d unresolved (oldest %s ago), %d cleanup pending (oldest %s ago)%s",
 			r.Unresolved, now.Sub(r.OldestUnresolved).Round(time.Second),
-			r.CleanupPending, now.Sub(r.OldestCleanup).Round(time.Second)), now); err != nil {
+			r.CleanupPending, now.Sub(r.OldestCleanup).Round(time.Second), retainedNote), now); err != nil {
 		s.audit("maintenance: cannot record residue escalation durably: %v", err)
 		return
 	}

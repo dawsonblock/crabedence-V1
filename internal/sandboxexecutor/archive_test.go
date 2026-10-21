@@ -309,7 +309,7 @@ type stubCustodian struct {
 
 func (c *stubCustodian) CustodyTrustRoot() *sandboxcustody.TrustRoot { return c.trust }
 
-func (c *stubCustodian) WitnessArchive(seg *ArchiveSegment, payload []byte) (*CustodyAck, error) {
+func (c *stubCustodian) WitnessArchive(seg *ArchiveSegment, payload []byte, deployment string) (*CustodyAck, error) {
 	if c.failNext > 0 {
 		c.failNext--
 		return nil, fmt.Errorf("custodian offline")
@@ -322,7 +322,7 @@ func (c *stubCustodian) WitnessArchive(seg *ArchiveSegment, payload []byte) (*Cu
 	}
 	c.seen = append(c.seen, seg.SHA256)
 	rec := &sandboxcustody.AckRecord{
-		RecordType:       sandboxcustody.AckRecordTypeV2,
+		RecordType:       sandboxcustody.AckRecordTypeV3,
 		AckSeq:           int64(len(c.seen)),
 		SegmentSeq:       seg.Seq,
 		FirstTerminalSeq: seg.FirstTerminalSeq,
@@ -330,6 +330,7 @@ func (c *stubCustodian) WitnessArchive(seg *ArchiveSegment, payload []byte) (*Cu
 		RowCount:         seg.RowCount,
 		PayloadSHA256:    seg.SHA256,
 		RequestCreatedAt: seg.CreatedAt.UnixMilli(),
+		DeploymentID:     deployment,
 		WitnessedAt:      time.Now().UTC().Format(time.RFC3339Nano),
 	}
 	if c.witness != nil {

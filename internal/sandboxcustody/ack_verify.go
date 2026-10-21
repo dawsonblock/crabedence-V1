@@ -19,6 +19,12 @@ type AckBinding struct {
 	RowCount         int
 	PayloadSHA256    string
 	RequestCreatedAt int64
+	// DeploymentID is the deployment scope the request committed.
+	// When set, only a v3 acknowledgement signing that exact scope
+	// satisfies the binding — a v1/v2 record (no signed deployment)
+	// or a record minted for another deployment is evidence for a
+	// different custody event.
+	DeploymentID string
 }
 
 // BindingFor derives the binding a verifier expects from the request
@@ -32,6 +38,7 @@ func BindingFor(req *WitnessRequest) *AckBinding {
 		RowCount:         req.RowCount,
 		PayloadSHA256:    req.SHA256,
 		RequestCreatedAt: req.CreatedAt,
+		DeploymentID:     req.DeploymentID,
 	}
 }
 
@@ -50,7 +57,8 @@ func VerifyWitnessAck(ack *AckRecord, want *AckBinding, trust *TrustRoot) error 
 	if ack == nil {
 		return fmt.Errorf("custody acknowledgement absent — a self-declared success is not evidence")
 	}
-	if ack.RecordType != AckRecordTypeV1 && ack.RecordType != AckRecordTypeV2 {
+	if ack.RecordType != AckRecordTypeV1 && ack.RecordType != AckRecordTypeV2 &&
+		ack.RecordType != AckRecordTypeV3 {
 		return fmt.Errorf("custody ack record_type %q unsupported", ack.RecordType)
 	}
 	if want != nil {
@@ -65,9 +73,20 @@ func VerifyWitnessAck(ack *AckRecord, want *AckBinding, trust *TrustRoot) error 
 		// v2 binds the request instance; a replayed acknowledgement
 		// minted for another request fails here even when every
 		// segment field coincidentally matches.
-		if ack.RecordType == AckRecordTypeV2 && ack.RequestCreatedAt != want.RequestCreatedAt {
+		if (ack.RecordType == AckRecordTypeV2 || ack.RecordType == AckRecordTypeV3) &&
+			ack.RequestCreatedAt != want.RequestCreatedAt {
 			return fmt.Errorf("custody ack binds a different request instance (created_at %d, want %d)",
 				ack.RequestCreatedAt, want.RequestCreatedAt)
+		}
+		// A deployment-scoped binding is satisfied only by a v3
+		// record signing that exact scope: v1/v2 records carry no
+		// signed deployment field at all, so an acknowledgement from
+		// another ledger — or an unscoped request — can never be
+		// replayed as this deployment's custody.
+		if want.DeploymentID != "" &&
+			(ack.RecordType != AckRecordTypeV3 || ack.DeploymentID != want.DeploymentID) {
+			return fmt.Errorf("custody ack binds deployment %q — not the requesting deployment %q",
+				ack.DeploymentID, want.DeploymentID)
 		}
 	}
 	pub, err := base64.StdEncoding.DecodeString(ack.PublicKey)

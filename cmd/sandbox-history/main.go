@@ -42,6 +42,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/openclaw/crabbox/internal/evidence"
 	"github.com/openclaw/crabbox/internal/history"
@@ -64,8 +65,24 @@ func main() {
 	flag.Parse()
 
 	args := flag.Args()
-	if *dbPath == "" || len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: sandbox-history -db PATH <ingest-git|ingest-ledger|ingest-evidence|ingest-custody|ingest-doc|ingest-teststream|query|stats|verify> [args]")
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: sandbox-history -db PATH <ingest-git|ingest-ledger|ingest-evidence|ingest-custody|ingest-doc|ingest-teststream|ingest-recovery|append|query|stats|verify|checkpoint|verify-checkpoint|retained|dispose-retained> [args]")
+		os.Exit(2)
+	}
+	op := args[0]
+	rest := args[1:]
+
+	// Ledger-scoped ops act on an executor ledger directly and need
+	// no history store. `retained` reads live policy-held resources
+	// (read-only — safe while the executor runs); `dispose-retained`
+	// marks one finally removed — a writable operation that takes the
+	// ledger fence, so the executor must be stopped first.
+	if op == "retained" || op == "dispose-retained" {
+		runRetained(op, rest)
+		return
+	}
+	if *dbPath == "" {
+		fmt.Fprintln(os.Stderr, "usage: sandbox-history -db PATH <...> [args] — -db is required")
 		os.Exit(2)
 	}
 	trustedSet := map[string]bool{}
@@ -75,8 +92,6 @@ func main() {
 		}
 	}
 
-	op := args[0]
-	rest := args[1:]
 	var s *history.Store
 	var err error
 	if op == "verify" || op == "query" || op == "stats" ||
@@ -327,6 +342,50 @@ func main() {
 		fmt.Fprintln(os.Stderr, "unknown op:", op)
 		os.Exit(2)
 	}
+}
+
+// runRetained lists or disposes policy-retained backend resources —
+// the live inventory of VMs that cleanup deliberately kept. Listing
+// is read-only; disposal is terminal bookkeeping under the ledger
+// fence, and fails if the executor still holds it.
+func runRetained(op string, rest []string) {
+	if op == "retained" {
+		if len(rest) != 1 {
+			usage("retained LEDGER.db")
+		}
+		l, err := sx.InspectLedger(rest[0])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "inspect ledger:", err)
+			os.Exit(1)
+		}
+		defer l.Close()
+		recs, err := l.RetainedResources()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "list retained resources:", err)
+			os.Exit(1)
+		}
+		fmt.Printf("%d retained resource(s)\n", len(recs))
+		for _, r := range recs {
+			fmt.Printf("  %s  backend=%s  handle=%s  nonce=%s  since=%s  %s\n",
+				r.JobID, r.BackendID, r.Handle, r.DispatchNonce,
+				r.RetainedAt.Format(time.RFC3339), r.Reason)
+		}
+		return
+	}
+	if len(rest) != 2 {
+		usage("dispose-retained LEDGER.db JOB_ID")
+	}
+	l, err := sx.OpenLedger(rest[0])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "open ledger (the executor must be stopped to dispose):", err)
+		os.Exit(1)
+	}
+	defer l.Close()
+	if err := l.DisposeRetainedResource(rest[1]); err != nil {
+		fmt.Fprintln(os.Stderr, "dispose retained resource:", err)
+		os.Exit(1)
+	}
+	fmt.Printf("disposed retained resource for %s\n", rest[1])
 }
 
 // openContentStore resolves the object dir: explicit -content-dir,

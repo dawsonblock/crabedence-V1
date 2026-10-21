@@ -795,10 +795,16 @@ func (b *MSBBackend) Dispatch(ctx context.Context, job *JobContractV2, plan *Dis
 		// cannot be verified the resource is not a proven refusal —
 		// the outcome is ambiguous and reconciliation owns the
 		// residue the dispatch identity now records.
-		if !b.refusedCleanup(ctx, job, name, nonce) {
+		res := b.refusedCleanup(ctx, job, name, nonce)
+		switch {
+		case res == nil || !res.Outcome.ResolvesObligation():
 			return identity, fmt.Errorf("%w: msb create failed (%v: %s) and the leftover instance could not be proven removed — resource cleanup remains owed under the dispatch identity", ErrAmbiguousDispatch, cerr, strings.TrimSpace(string(out)))
+		case res.Outcome == CleanupRetainedByPolicy:
+			identity.RetainedByPolicy = true
+			return identity, fmt.Errorf("%w: msb create failed: %v: %s — the leftover instance is retained by policy and stays inventoried", ErrDispatchRefused, cerr, strings.TrimSpace(string(out)))
+		default:
+			return RunIdentity{}, fmt.Errorf("%w: msb create failed: %v: %s", ErrDispatchRefused, cerr, strings.TrimSpace(string(out)))
 		}
-		return RunIdentity{}, fmt.Errorf("%w: msb create failed: %v: %s", ErrDispatchRefused, cerr, strings.TrimSpace(string(out)))
 	}
 
 	// Pre-execution policy verification: the VM that boots must be
@@ -814,23 +820,41 @@ func (b *MSBBackend) Dispatch(ctx context.Context, job *JobContractV2, plan *Dis
 		// identity-bound path; if absence cannot be proven, the
 		// resource stays owed under the recorded dispatch identity
 		// rather than forgotten under a refusal claim.
-		if !b.refusedCleanup(ctx, job, name, nonce) {
+		res := b.refusedCleanup(ctx, job, name, nonce)
+		switch {
+		case res == nil || !res.Outcome.ResolvesObligation():
 			return identity, fmt.Errorf("%w: verify sandbox %s before execution failed (%v) and the leftover instance could not be proven removed — resource cleanup remains owed under the dispatch identity", ErrAmbiguousDispatch, name, ierr)
+		case res.Outcome == CleanupRetainedByPolicy:
+			identity.RetainedByPolicy = true
+			return identity, fmt.Errorf("%w: verify sandbox %s before execution: %v — the leftover instance is retained by policy and stays inventoried", ErrDispatchRefused, name, ierr)
+		default:
+			return RunIdentity{}, fmt.Errorf("%w: verify sandbox %s before execution: %v", ErrDispatchRefused, name, ierr)
 		}
-		return RunIdentity{}, fmt.Errorf("%w: verify sandbox %s before execution: %v", ErrDispatchRefused, name, ierr)
 	}
 	if verr := verifyBootedPolicy(policy, doc); verr != nil {
-		if !b.refusedCleanup(ctx, job, name, nonce) {
+		res := b.refusedCleanup(ctx, job, name, nonce)
+		switch {
+		case res == nil || !res.Outcome.ResolvesObligation():
 			return identity, fmt.Errorf("%w: sandbox %s failed policy verification and the leftover instance could not be proven removed — resource cleanup remains owed under the dispatch identity: %v", ErrAmbiguousDispatch, name, verr)
+		case res.Outcome == CleanupRetainedByPolicy:
+			identity.RetainedByPolicy = true
+			return identity, fmt.Errorf("%w: sandbox %s failed policy verification — destroyed before execution: %v — the leftover instance is retained by policy and stays inventoried", ErrDispatchRefused, name, verr)
+		default:
+			return RunIdentity{}, fmt.Errorf("%w: sandbox %s failed policy verification — destroyed before execution: %v", ErrDispatchRefused, name, verr)
 		}
-		return RunIdentity{}, fmt.Errorf("%w: sandbox %s failed policy verification — destroyed before execution: %v", ErrDispatchRefused, name, verr)
 	}
 	bootID, berr := b.sandboxBootID(doc)
 	if berr != nil {
-		if !b.refusedCleanup(ctx, job, name, nonce) {
+		res := b.refusedCleanup(ctx, job, name, nonce)
+		switch {
+		case res == nil || !res.Outcome.ResolvesObligation():
 			return identity, fmt.Errorf("%w: could not bind the VM boot generation of %s and the leftover instance could not be proven removed — resource cleanup remains owed under the dispatch identity: %v", ErrAmbiguousDispatch, name, berr)
+		case res.Outcome == CleanupRetainedByPolicy:
+			identity.RetainedByPolicy = true
+			return identity, fmt.Errorf("%w: bind the VM boot generation of %s before execution: %v — the leftover instance is retained by policy and stays inventoried", ErrDispatchRefused, name, berr)
+		default:
+			return RunIdentity{}, fmt.Errorf("%w: bind the VM boot generation of %s before execution: %v", ErrDispatchRefused, name, berr)
 		}
-		return RunIdentity{}, fmt.Errorf("%w: bind the VM boot generation of %s before execution: %v", ErrDispatchRefused, name, berr)
 	}
 	identity.BootID = bootID
 
@@ -938,13 +962,23 @@ const refusedCleanupTimeout = 45 * time.Second
 // gone; when it is not, the caller returns the dispatch identity with
 // ErrAmbiguousDispatch so the residue stays durable under
 // reconciliation instead of evaporating behind a NO_EFFECT claim.
-func (b *MSBBackend) refusedCleanup(ctx context.Context, job *JobContractV2, name, nonce string) bool {
+// refusedCleanup runs the identity-bound cleanup for a dispatch that
+// failed before launch and returns the full outcome — the caller
+// distinguishes proven absence (a clean refusal), policy retention
+// (a refused dispatch whose leftover is deliberately kept — real
+// residue to inventory, not uncertainty), and everything else (the
+// leftover's fate is unknown — an ambiguous outcome, never a
+// refusal). nil means the cleanup call itself failed.
+func (b *MSBBackend) refusedCleanup(ctx context.Context, job *JobContractV2, name, nonce string) *CleanupResult {
 	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), refusedCleanupTimeout)
 	defer cancel()
 	res, err := b.Cleanup(cctx, CleanupRequest{
 		JobID: job.JobID, BackendID: b.Name(), Handle: name, DispatchNonce: nonce,
 	})
-	return err == nil && res.Outcome.ProvesAbsent()
+	if err != nil {
+		return nil
+	}
+	return &res
 }
 
 // inspectRaw returns the parsed `msb inspect --format json` document.

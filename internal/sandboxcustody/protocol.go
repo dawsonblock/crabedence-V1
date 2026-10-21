@@ -40,8 +40,13 @@ type WitnessRequest struct {
 	RowCount         int    `json:"row_count"`
 	SHA256           string `json:"sha256"`
 	CreatedAt        int64  `json:"created_at"`
-	PayloadB64       string `json:"payload_b64"`
-	Token            string `json:"token,omitempty"`
+	// DeploymentID is the requesting ledger's durable deployment scope.
+	// The witness signs it into v3 acknowledgements so a record minted
+	// for one deployment can never be replayed as custody for another —
+	// two ledgers sharing a witness still hold disjoint evidence.
+	DeploymentID string `json:"deployment_id,omitempty"`
+	PayloadB64   string `json:"payload_b64"`
+	Token        string `json:"token,omitempty"`
 }
 
 // WitnessResponse is the custody acknowledgement: ok means the bytes

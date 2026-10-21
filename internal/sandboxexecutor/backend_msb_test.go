@@ -1491,6 +1491,38 @@ func TestMSBDispatchFailedCreateRemovesItsOwnLeftover(t *testing.T) {
 	}
 }
 
+// TestMSBDispatchFailedCreateRetainedLeftoverIsRefusedNotAmbiguous:
+// under KeepSandboxes a failed create's leftover is policy-retained —
+// a definite state, not an uncertain one. The dispatch refuses
+// (the workload never ran) and flags the retained instance so the
+// caller inventories it; it must not be misclassified as ambiguous,
+// which would describe a fate the cleanup actually resolved.
+func TestMSBDispatchFailedCreateRetainedLeftoverIsRefusedNotAmbiguous(t *testing.T) {
+	key, _ := testAuthority(t)
+	bin, stateDir := fakeMSB(t, map[string]string{"MSB_FAKE_CREATE_FAIL_AFTER": "1"})
+	backend := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
+	backend.KeepSandboxes = true
+	job := testContract(t, key, func(c *JobContractV2) { c.JobID = "orphan-retain"; c.Nonce = "n-oretain" })
+	plan, err := backend.Prepare(testContext(t), job)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	disp, err := backend.Dispatch(testContext(t), job, plan)
+	if !errors.Is(err, ErrDispatchRefused) {
+		t.Fatalf("retained-refusal classified %v, want ErrDispatchRefused", err)
+	}
+	if errors.Is(err, ErrAmbiguousDispatch) {
+		t.Fatal("a policy-retained leftover was reported ambiguous — a resolved outcome is not uncertain")
+	}
+	if !disp.RetainedByPolicy || disp.Handle != plan.Handle || disp.Nonce != plan.Nonce {
+		t.Fatalf("the retained instance is not bound to the dispatch identity: %+v", disp)
+	}
+	// The retained leftover still exists — nothing claimed it absent.
+	if _, err := os.Stat(fakeStatePath(stateDir, plan.Handle)); err != nil {
+		t.Fatal("a policy-retained instance vanished")
+	}
+}
+
 // TestMSBDispatchFailedCreateLeavesForeignSandboxAlone: a failed
 // create must not destroy a sandbox it did not create. Under
 // nonce-bound handles a foreign instance cannot occupy this

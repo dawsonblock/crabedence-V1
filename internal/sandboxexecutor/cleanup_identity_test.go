@@ -494,6 +494,55 @@ func TestRetentionInventoryTracksPolicyKeptResource(t *testing.T) {
 	srv.Stop()
 }
 
+// TestRetentionInventoryCoversRefusedDispatch: a dispatch refused
+// before launch can still leave a real instance when the backend's
+// retention policy keeps it. That VM is not an ambiguous residue —
+// it is deliberate residue, and the inventory must record it under
+// the dispatch identity even though the job ends DISPATCH_FAILED.
+func TestRetentionInventoryCoversRefusedDispatch(t *testing.T) {
+	key, keys := testAuthority(t)
+	bin, stateDir := fakeMSB(t, map[string]string{"MSB_FAKE_CREATE_FAIL_AFTER": "1"})
+	be := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
+	be.KeepSandboxes = true
+	srv := startServer(t, Config{SocketDir: socketDir(t), Peers: selfPeer(t), AuthorityKeys: keys, Backend: be})
+	conn, reader := connect(t, srv.SocketPath())
+	resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV2) {
+		c.JobID = "retain-refused"
+		c.Nonce = "n-rref"
+	}))
+	if resp.OK || resp.State != JobStateDispatchFailed {
+		t.Fatalf("a retained-refusal must refuse, not report success: %+v", resp)
+	}
+	lj, err := srv.Ledger().Get("retain-refused")
+	if err != nil || lj == nil {
+		t.Fatalf("ledger lost the refused job: %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	var retained []*RetainedResource
+	for time.Now().Before(deadline) {
+		retained, _ = srv.Ledger().RetainedResources()
+		if len(retained) == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(retained) != 1 {
+		t.Fatalf("the refused dispatch's retained VM is not inventoried: %d records", len(retained))
+	}
+	rec := retained[0]
+	if rec.JobID != "retain-refused" || rec.Handle != lj.BackendHandle ||
+		rec.DispatchNonce != lj.DispatchNonce || rec.BackendID != "microsandbox" {
+		t.Fatalf("retention record does not bind the dispatch identity: %+v vs row %+v", rec, lj)
+	}
+	// The instance still exists under the persisted handle — the
+	// NO_EFFECT receipt attests the workload, never the VM's absence.
+	if _, err := os.Stat(fakeStatePath(stateDir, lj.BackendHandle)); err != nil {
+		t.Fatal("a policy-retained instance vanished from the backend")
+	}
+	srv.Stop()
+}
+
 // TestCleanupSubstituteAfterRemovalSurvives: the adversary cannot
 // mint our nonce-bound name — but if the runtime itself is hostile,
 // a foreign record could be planted under it between the delete

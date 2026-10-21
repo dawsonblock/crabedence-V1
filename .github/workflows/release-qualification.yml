@@ -753,6 +753,22 @@ jobs:
           }
           EOF
 
+      # Promotion is fail-closed on attestation evidence: a bundle
+      # whose attestation path produced neither a GitHub attestation
+      # reference nor an SSH-signature fallback is an unattested
+      # closure — the workflow fails here rather than uploading a
+      # bundle that looks promotable only because the step ran.
+      - name: Require attestation evidence
+        run: |
+          status="$(cat dist/attestation/attestation-status.txt 2>/dev/null || echo absent)"
+          case "$status" in
+            github-actions-attest|ssh-signature)
+              echo "evidence attestation: $status" ;;
+            *)
+              echo "::error::release evidence carries no valid attestation (status=$status) — the bundle is unattested and cannot promote"
+              exit 1 ;;
+          esac
+
       - name: Upload release evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

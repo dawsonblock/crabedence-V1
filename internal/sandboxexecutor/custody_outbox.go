@@ -49,10 +49,13 @@ type RecoveryCustodian interface {
 	// request must bind the row's durable request instance — its
 	// outbox position and committed created_ms — so the returned
 	// acknowledgement can never be replayed against a different
-	// request than the one the ledger queued. The implementation
+	// request than the one the ledger queued. deployment is the
+	// ledger's durable custody scope the request must carry: an
+	// acknowledgement minted under another deployment's scope is
+	// evidence for that deployment, not this one. The implementation
 	// must be idempotent: re-witnessing the same row must return an
 	// acknowledgement that verifies.
-	WitnessRecoveryCheckpoint(row *RecoveryOutboxRow) (*CustodyAck, error)
+	WitnessRecoveryCheckpoint(row *RecoveryOutboxRow, deployment string) (*CustodyAck, error)
 	// CustodyTrustRoot declares the witness trust under which this
 	// custodian's acknowledgements must verify — controlled
 	// configuration, never learned from an acknowledgement. An empty
@@ -163,8 +166,17 @@ func (l *Ledger) DrainRecoveryCustody(c RecoveryCustodian, audit func(string, ..
 	if err != nil {
 		return fmt.Errorf("enumerate pending recovery custody: %w", err)
 	}
+	if len(pending) == 0 {
+		return nil
+	}
+	// The deployment scope comes from the ledger itself — durable,
+	// generated once, never from the adapter or the acknowledgement.
+	dep, err := l.custodyDeployment()
+	if err != nil {
+		return fmt.Errorf("recovery custody scope: %w", err)
+	}
 	for _, row := range pending {
-		ack, err := c.WitnessRecoveryCheckpoint(row)
+		ack, err := c.WitnessRecoveryCheckpoint(row, dep)
 		if err != nil {
 			if audit != nil {
 				audit("recovery custody: outbox %d not acknowledged: %v", row.Seq, err)
@@ -183,7 +195,7 @@ func (l *Ledger) DrainRecoveryCustody(c RecoveryCustodian, audit func(string, ..
 		// must be signed under the declared trust root and bind this
 		// exact checkpoint payload and outbox position, or the row
 		// stays pending and the failure is audited.
-		if err := verifyRecoveryCustodyAck(row, ack, trust); err != nil {
+		if err := verifyRecoveryCustodyAck(row, ack, trust, dep); err != nil {
 			if audit != nil {
 				audit("recovery custody: outbox %d acknowledgement failed boundary verification — not recorded as custody: %v", row.Seq, err)
 			}
@@ -237,7 +249,7 @@ func parseCustodyAckRecord(ack *CustodyAck) (*sandboxcustody.AckRecord, error) {
 // identity and verify under the custodian's declared trust root; the
 // request-instance field is reconstructed from the durable segment
 // (the request derives from it), so a replayed or foreign ack fails.
-func verifyArchiveCustodyAck(seg *ArchiveSegment, ack *CustodyAck, trust *sandboxcustody.TrustRoot) error {
+func verifyArchiveCustodyAck(seg *ArchiveSegment, ack *CustodyAck, trust *sandboxcustody.TrustRoot, deployment string) error {
 	if trust.Empty() {
 		return fmt.Errorf("no custody trust root declared — a self-declared acknowledgement is not evidence")
 	}
@@ -252,6 +264,7 @@ func verifyArchiveCustodyAck(seg *ArchiveSegment, ack *CustodyAck, trust *sandbo
 		RowCount:         seg.RowCount,
 		PayloadSHA256:    seg.SHA256,
 		RequestCreatedAt: seg.CreatedAt.UnixMilli(),
+		DeploymentID:     deployment,
 	}
 	return sandboxcustody.VerifyWitnessAck(rec, want, trust)
 }
@@ -265,7 +278,7 @@ func verifyArchiveCustodyAck(seg *ArchiveSegment, ack *CustodyAck, trust *sandbo
 // own created_ms, never a timestamp the acknowledgement itself
 // declares), and verify under the resolved trust root. Anything less
 // is not custody.
-func verifyRecoveryCustodyAck(row *RecoveryOutboxRow, ack *CustodyAck, trust *sandboxcustody.TrustRoot) error {
+func verifyRecoveryCustodyAck(row *RecoveryOutboxRow, ack *CustodyAck, trust *sandboxcustody.TrustRoot, deployment string) error {
 	if trust.Empty() {
 		return fmt.Errorf("no custody trust root declared — a self-declared acknowledgement is not evidence")
 	}
@@ -281,6 +294,7 @@ func verifyRecoveryCustodyAck(row *RecoveryOutboxRow, ack *CustodyAck, trust *sa
 		RowCount:         1,
 		PayloadSHA256:    hex.EncodeToString(sum[:]),
 		RequestCreatedAt: row.CreatedMS,
+		DeploymentID:     deployment,
 	}
 	return sandboxcustody.VerifyWitnessAck(rec, want, trust)
 }
@@ -290,10 +304,11 @@ func verifyRecoveryCustodyAck(row *RecoveryOutboxRow, ack *CustodyAck, trust *sa
 // this checkpoint's bytes and to the durable request instance the
 // outbox row committed when it was queued. The daemon's
 // acknowledgement is proof the checkpoint reached custody outside
-// the executor's own storage — and a v2 ack attests the request
-// instance the ledger recorded, so an acknowledgement minted for
-// some other request cannot be replayed here.
-func (c *SocketCustodian) WitnessRecoveryCheckpoint(row *RecoveryOutboxRow) (*CustodyAck, error) {
+// the executor's own storage — a v2 ack attests the request instance
+// the ledger recorded, and a v3 ack additionally attests this
+// ledger's deployment scope, so an acknowledgement minted for some
+// other request or some other ledger cannot be replayed here.
+func (c *SocketCustodian) WitnessRecoveryCheckpoint(row *RecoveryOutboxRow, deployment string) (*CustodyAck, error) {
 	trust := c.trust()
 	if trust.Empty() {
 		return nil, fmt.Errorf("custody witness trust not configured — refusing self-declared custody")
@@ -309,6 +324,7 @@ func (c *SocketCustodian) WitnessRecoveryCheckpoint(row *RecoveryOutboxRow) (*Cu
 		RowCount:         1,
 		SHA256:           sum,
 		CreatedAt:        row.CreatedMS,
+		DeploymentID:     deployment,
 		PayloadB64:       base64.StdEncoding.EncodeToString([]byte(row.CheckpointJSON)),
 	}
 	resp, err := cli.Witness(context.Background(), req)

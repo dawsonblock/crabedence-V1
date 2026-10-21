@@ -2,6 +2,7 @@ package sandboxexecutor
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -754,6 +755,42 @@ func (l *Ledger) nextSeq(tx *sql.Tx) (uint64, error) {
 	return seq, nil
 }
 
+// custodyDeployment returns this ledger's durable deployment scope —
+// the identity every custody request and acknowledgement binds. It is
+// generated once and persisted in executor_meta, so every copy of
+// this ledger (restarts, restores, failover replicas that share the
+// file) is the same deployment, while no other ledger can ever
+// produce acknowledgements that satisfy this one's scope. That is
+// the cross-ledger replay boundary: a custody ack minted under a
+// different deployment ID is evidence for a different custody event.
+func (l *Ledger) custodyDeployment() (string, error) {
+	var dep string
+	err := l.db.QueryRow(
+		`SELECT value FROM executor_meta WHERE key = 'custody_deployment_id'`).Scan(&dep)
+	switch {
+	case err == nil && dep != "":
+		return dep, nil
+	case err != nil && err != sql.ErrNoRows:
+		return "", fmt.Errorf("read custody deployment identity: %w", err)
+	}
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("generate custody deployment identity: %w", err)
+	}
+	if _, err := l.db.Exec(
+		`INSERT OR IGNORE INTO executor_meta (key, value) VALUES ('custody_deployment_id', ?)`,
+		hex.EncodeToString(raw[:])); err != nil {
+		return "", fmt.Errorf("write custody deployment identity: %w", err)
+	}
+	// Re-read the committed winner — a concurrent first-writer's value
+	// is authoritative, never the candidate this call lost with.
+	if err := l.db.QueryRow(
+		`SELECT value FROM executor_meta WHERE key = 'custody_deployment_id'`).Scan(&dep); err != nil {
+		return "", fmt.Errorf("read committed custody deployment identity: %w", err)
+	}
+	return dep, nil
+}
+
 // InsertJob durably records a newly admitted job in RECORDED state
 // inside one IMMEDIATE transaction that also allocates its sequence.
 // The record exists before any backend is asked to run it — dispatch
@@ -1025,28 +1062,34 @@ func (l *Ledger) DispatchingStragglers(limit int, cutoff time.Time) ([]*LedgerJo
 // escalates on: rows still waiting on something — an unresolved
 // backend outcome or an unverified cleanup — and the age of the
 // oldest of each. Archived history is deliberately excluded: it is
-// settled, not residue.
+// settled, not residue. Retained counts policy-kept live instances:
+// their cleanup obligation is discharged but the resource still
+// exists, so it remains residue until an operator disposes it.
 type RegistryResidue struct {
 	Unresolved       int
 	CleanupPending   int
+	Retained         int
 	OldestUnresolved time.Time
 	OldestCleanup    time.Time
+	OldestRetained   time.Time
 }
 
 // PendingResidue counts the residue without loading rows — the
 // escalation summary needs counts and ages, not payloads.
 func (l *Ledger) PendingResidue() (*RegistryResidue, error) {
 	r := &RegistryResidue{}
-	var oldestU, oldestC sql.NullInt64
+	var oldestU, oldestC, oldestR sql.NullInt64
 	err := l.db.QueryRow(
 		`SELECT
 			(SELECT COUNT(1) FROM jobs WHERE state IN (?, ?)),
 			(SELECT MIN(updated_at) FROM jobs WHERE state IN (?, ?)),
 			(SELECT COUNT(1) FROM jobs WHERE cleanup_pending = 1),
-			(SELECT MIN(updated_at) FROM jobs WHERE cleanup_pending = 1)`,
+			(SELECT MIN(updated_at) FROM jobs WHERE cleanup_pending = 1),
+			(SELECT COUNT(1) FROM retained_resources WHERE disposed_at_ms IS NULL),
+			(SELECT MIN(retained_at_ms) FROM retained_resources WHERE disposed_at_ms IS NULL)`,
 		JobStateDispatchAmbig, JobStateInterrupted,
 		JobStateDispatchAmbig, JobStateInterrupted).
-		Scan(&r.Unresolved, &oldestU, &r.CleanupPending, &oldestC)
+		Scan(&r.Unresolved, &oldestU, &r.CleanupPending, &oldestC, &r.Retained, &oldestR)
 	if err != nil {
 		return nil, err
 	}
@@ -1055,6 +1098,9 @@ func (l *Ledger) PendingResidue() (*RegistryResidue, error) {
 	}
 	if oldestC.Valid {
 		r.OldestCleanup = time.UnixMilli(oldestC.Int64).UTC()
+	}
+	if oldestR.Valid {
+		r.OldestRetained = time.UnixMilli(oldestR.Int64).UTC()
 	}
 	return r, nil
 }

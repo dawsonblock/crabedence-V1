@@ -172,7 +172,7 @@ func TestWitnessedSegmentDurableOnReturn(t *testing.T) {
 	if err != nil || !resp.OK {
 		t.Fatalf("witness: %v %+v", err, resp)
 	}
-	if resp.Ack == nil || resp.Ack.RecordType != AckRecordTypeV2 || resp.Ack.RequestCreatedAt == 0 {
+	if resp.Ack == nil || resp.Ack.RecordType != AckRecordTypeV3 || resp.Ack.RequestCreatedAt == 0 {
 		t.Fatalf("response lacks the verifiable ack: %+v", resp.Ack)
 	}
 	// Payload and chain link are durable files, not buffered state.

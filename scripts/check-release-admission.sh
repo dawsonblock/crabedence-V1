@@ -234,6 +234,34 @@ if [ -f "$MANIFEST_JSON" ]; then
   done < <(jq -r '.supported_lanes // [] | .[]' "$MANIFEST_JSON" 2>/dev/null)
 fi
 
+# ─── Evidence attestation status ──────────────────────────────────────
+# Bundles produced by the release-qualification workflow carry
+# attestation/ beside release-evidence/: attestation-status.txt names
+# how the frozen evidence manifest was externally attested. A bundle
+# that carries the directory but records 'missing' (or an unknown
+# status, or no status file) closed unattested — admission refuses it
+# rather than inferring provenance from a skipped step. A bundle with
+# no attestation directory at all predates the mechanism and can only
+# warn: absent markers cannot be told apart from a workflow that never
+# produced one, so the workflow's own Require-attestation-evidence
+# gate is what makes the production path fail closed.
+ATTEST_DIR="$(dirname "$EVIDENCE_DIR")/attestation"
+if [ -d "$ATTEST_DIR" ]; then
+  ATTEST_STATUS="$(cat "$ATTEST_DIR/attestation-status.txt" 2>/dev/null || echo "")"
+  case "$ATTEST_STATUS" in
+    github-actions-attest|ssh-signature)
+      echo "  Attestation: $ATTEST_STATUS" ;;
+    ""|missing)
+      echo "  INCONSISTENCY: evidence bundle closed without a valid attestation (status: ${ATTEST_STATUS:-none}) — an unattested closure cannot promote" >&2
+      CONSISTENT=false ;;
+    *)
+      echo "  INCONSISTENCY: unknown attestation status '$ATTEST_STATUS'" >&2
+      CONSISTENT=false ;;
+  esac
+else
+  echo "  WARNING: no attestation/ directory beside the evidence bundle — predates attestation-status enforcement or the workflow never produced one" >&2
+fi
+
 # ─── Trusted runtime pins binding ──────────────────────────────────────
 # The pin manifest the live lanes were required to match is part of the
 # qualified source. A bundle carrying runtime evidence must bind the

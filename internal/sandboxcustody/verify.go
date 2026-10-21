@@ -60,11 +60,13 @@ func verifyCustodyDir(dir string, trust *TrustRoot) []string {
 			prevRaw = nil
 			continue
 		}
-		if rec.RecordType != AckRecordTypeV1 && rec.RecordType != AckRecordTypeV2 {
+		if rec.RecordType != AckRecordTypeV1 && rec.RecordType != AckRecordTypeV2 &&
+			rec.RecordType != AckRecordTypeV3 {
 			findings = append(findings, fmt.Sprintf("ack %d record_type %q", lineNo, rec.RecordType))
 		}
-		if rec.RecordType == AckRecordTypeV2 && rec.RequestCreatedAt <= 0 {
-			findings = append(findings, fmt.Sprintf("ack %d v2 record carries no request identity", lineNo))
+		if (rec.RecordType == AckRecordTypeV2 || rec.RecordType == AckRecordTypeV3) &&
+			rec.RequestCreatedAt <= 0 {
+			findings = append(findings, fmt.Sprintf("ack %d %s record carries no request identity", lineNo, rec.RecordType))
 		}
 		if rec.AckSeq != wantSeq {
 			findings = append(findings, fmt.Sprintf("ack %d seq %d — expected %d (gap or reorder)", lineNo, rec.AckSeq, wantSeq))

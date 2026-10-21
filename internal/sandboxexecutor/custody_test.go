@@ -91,7 +91,7 @@ func daemonAck(t *testing.T, signer *evidence.Signer, req *sandboxcustody.Witnes
 	t.Helper()
 	pub := signer.PublicKey()
 	ack := &sandboxcustody.AckRecord{
-		RecordType:       sandboxcustody.AckRecordTypeV2,
+		RecordType:       sandboxcustody.AckRecordTypeV3,
 		AckSeq:           ackSeq,
 		SegmentSeq:       req.SegmentSeq,
 		FirstTerminalSeq: req.FirstTerminalSeq,
@@ -99,6 +99,7 @@ func daemonAck(t *testing.T, signer *evidence.Signer, req *sandboxcustody.Witnes
 		RowCount:         req.RowCount,
 		PayloadSHA256:    req.SHA256,
 		RequestCreatedAt: req.CreatedAt,
+		DeploymentID:     req.DeploymentID,
 		WitnessedAt:      time.Now().UTC().Format(time.RFC3339Nano),
 		PublicKey:        base64.StdEncoding.EncodeToString(pub),
 		Signer:           evidence.Fingerprint(pub),
@@ -117,7 +118,7 @@ func daemonAck(t *testing.T, signer *evidence.Signer, req *sandboxcustody.Witnes
 
 func witnessSeg(t *testing.T, c *SocketCustodian, seg *ArchiveSegment, payload []byte) error {
 	t.Helper()
-	_, err := c.WitnessArchive(seg, payload)
+	_, err := c.WitnessArchive(seg, payload, "test-deployment")
 	return err
 }
 

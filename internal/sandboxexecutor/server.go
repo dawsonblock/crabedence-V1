@@ -1046,6 +1046,17 @@ func (s *Server) driveDispatch(j *LedgerJob, contract *JobContractV2) (string, e
 			}); err != nil {
 			s.audit("job %s: refused-dispatch terminal record could not be committed (%v) — the row stays DISPATCHING for the straggler walk", j.JobID, err)
 		}
+		// A refused dispatch that left a policy-retained instance is
+		// definitive about the workload (it never ran — the NO_EFFECT
+		// receipt stands) but the leftover is real residue: inventory
+		// it under the dispatch identity rather than letting a
+		// retained VM vanish from resource accounting.
+		if disp.RetainedByPolicy {
+			if err := s.ledger.RecordRetainedResource(j.JobID, s.backendName, disp.Handle, disp.Nonce,
+				fmt.Sprintf("dispatch refused — backend retained the leftover instance by policy: %v", derr)); err != nil {
+				s.audit("job %s: retained-resource inventory record failed (%v) — the instance exists but is not inventoried", j.JobID, err)
+			}
+		}
 		s.checkpoint()
 		return JobStateDispatchFailed, fmt.Errorf("backend refused job: %v", derr)
 	default:

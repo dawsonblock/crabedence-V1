@@ -153,7 +153,9 @@ manifest cannot cover.
   to the exclusive-ownership posture.
 - Custody acknowledgements are verified at the recording boundary
   under an operator-administered trust root (separately configured
-  from the custodian adapter); an adapter that declares its own
-  trust root is not the authority — but the *deployment* of an
-  independently administered custodian remains an operational
-  control the code cannot supply.
+  from the custodian adapter) and bound to the ledger's durable
+  deployment scope (v3 records sign the request's deployment_id, so
+  an ack minted for one ledger is evidence for no other); an adapter
+  that declares its own trust root is not the authority — but the
+  *deployment* of an independently administered custodian remains an
+  operational control the code cannot supply.

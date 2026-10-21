@@ -299,7 +299,9 @@ func (s *Server) witness(req *WitnessRequest) (*WitnessResponse, error) {
 			ack.FirstTerminalSeq != req.FirstTerminalSeq ||
 			ack.LastTerminalSeq != req.LastTerminalSeq ||
 			ack.RowCount != req.RowCount ||
-			(ack.RecordType == AckRecordTypeV2 && ack.RequestCreatedAt != req.CreatedAt) {
+			(ack.RecordType == AckRecordTypeV2 && ack.RequestCreatedAt != req.CreatedAt) ||
+			(ack.RecordType == AckRecordTypeV3 &&
+				(ack.RequestCreatedAt != req.CreatedAt || ack.DeploymentID != req.DeploymentID)) {
 			return nil, fmt.Errorf("segment %s held under a different identity (ack segment %d, terminal %d..%d, %d rows) — refusing conflicting custody claim",
 				req.SHA256, ack.SegmentSeq, ack.FirstTerminalSeq, ack.LastTerminalSeq, ack.RowCount)
 		}
@@ -330,9 +332,12 @@ func (s *Server) witness(req *WitnessRequest) (*WitnessResponse, error) {
 // Acknowledgement record types. v2 binds the exact request instance
 // (its created-at timestamp) into the signature so an acknowledgement
 // is evidence for one specific witness request, not just a digest.
+// v3 additionally binds the requesting deployment's scope, so an
+// acknowledgement minted for one ledger is evidence for no other.
 const (
 	AckRecordTypeV1 = "archive-custody-ack/v1"
 	AckRecordTypeV2 = "archive-custody-ack/v2"
+	AckRecordTypeV3 = "archive-custody-ack/v3"
 )
 
 // AckRecord is one link of the custody chain — the signed
@@ -348,12 +353,17 @@ type AckRecord struct {
 	// RequestCreatedAt is the witness request's own timestamp —
 	// bound into v2 signatures so the acknowledgement identifies
 	// this request, not any request naming the same digest.
-	RequestCreatedAt int64  `json:"request_created_at,omitempty"`
-	PrevAckSHA256    string `json:"prev_ack_sha256"`
-	WitnessedAt      string `json:"witnessed_at"`
-	PublicKey        string `json:"public_key"`
-	Signer           string `json:"signer"`
-	Signature        string `json:"signature"`
+	RequestCreatedAt int64 `json:"request_created_at,omitempty"`
+	// DeploymentID is the requesting deployment's durable scope,
+	// bound into v3 signatures. An empty deployment is signed
+	// honestly — scope-less requests produce scope-less records —
+	// but a verifier requiring a deployment refuses them.
+	DeploymentID  string `json:"deployment_id,omitempty"`
+	PrevAckSHA256 string `json:"prev_ack_sha256"`
+	WitnessedAt   string `json:"witnessed_at"`
+	PublicKey     string `json:"public_key"`
+	Signer        string `json:"signer"`
+	Signature     string `json:"signature"`
 }
 
 // SigningFields is the versioned signing vector — every field the
@@ -375,6 +385,8 @@ func (a *AckRecord) SigningFields() ([]string, error) {
 		// Legacy records predate request-instance binding.
 	case AckRecordTypeV2:
 		fields = append(fields, fmt.Sprint(a.RequestCreatedAt))
+	case AckRecordTypeV3:
+		fields = append(fields, fmt.Sprint(a.RequestCreatedAt), a.DeploymentID)
 	default:
 		return nil, fmt.Errorf("unknown custody ack record_type %q", a.RecordType)
 	}
@@ -396,7 +408,7 @@ func (s *Server) appendAck(req *WitnessRequest) (*WitnessResponse, error) {
 	}
 	pub := s.signer.PublicKey()
 	ack := &AckRecord{
-		RecordType:       AckRecordTypeV2,
+		RecordType:       AckRecordTypeV3,
 		AckSeq:           nextSeq,
 		SegmentSeq:       req.SegmentSeq,
 		FirstTerminalSeq: req.FirstTerminalSeq,
@@ -404,6 +416,7 @@ func (s *Server) appendAck(req *WitnessRequest) (*WitnessResponse, error) {
 		RowCount:         req.RowCount,
 		PayloadSHA256:    req.SHA256,
 		RequestCreatedAt: req.CreatedAt,
+		DeploymentID:     req.DeploymentID,
 		PrevAckSHA256:    prevSHA,
 		WitnessedAt:      time.Now().UTC().Format(time.RFC3339Nano),
 		PublicKey:        base64.StdEncoding.EncodeToString(pub),

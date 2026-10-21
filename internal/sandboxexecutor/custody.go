@@ -61,10 +61,13 @@ func (c *SocketCustodian) CustodyTrustRoot() *sandboxcustody.TrustRoot {
 
 // WitnessArchive hands the segment to the custody daemon and
 // independently verifies the signed acknowledgement — digest and
-// fingerprint comparisons are not custody evidence. A verified
-// acknowledgement is returned for the ledger to persist before the
-// operational rows may release.
-func (c *SocketCustodian) WitnessArchive(seg *ArchiveSegment, payload []byte) (*CustodyAck, error) {
+// fingerprint comparisons are not custody evidence. deployment is
+// the ledger's durable custody scope, passed through verbatim into
+// the request: the boundary re-verifies the acknowledgement binds
+// it, so an adapter substituting another scope refuses itself. A
+// verified acknowledgement is returned for the ledger to persist
+// before the operational rows may release.
+func (c *SocketCustodian) WitnessArchive(seg *ArchiveSegment, payload []byte, deployment string) (*CustodyAck, error) {
 	trust := c.trust()
 	if trust.Empty() {
 		return nil, fmt.Errorf("custody witness trust not configured — refusing self-declared custody")
@@ -78,6 +81,7 @@ func (c *SocketCustodian) WitnessArchive(seg *ArchiveSegment, payload []byte) (*
 		RowCount:         seg.RowCount,
 		SHA256:           seg.SHA256,
 		CreatedAt:        seg.CreatedAt.UnixMilli(),
+		DeploymentID:     deployment,
 		PayloadB64:       base64.StdEncoding.EncodeToString(payload),
 	}
 	resp, err := cli.Witness(context.Background(), req)

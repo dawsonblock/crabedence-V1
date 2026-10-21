@@ -50,10 +50,12 @@ type ArchiveCustodian interface {
 	// idempotent on the same segment digest. The payload is the
 	// canonical segment bytes — sha256(payload) == seg.SHA256 — so the
 	// custodian holds the archived content itself, not just a promise
-	// that it existed. The returned acknowledgement is the verified
-	// custody reference the ledger persists with the segment before
-	// any row may leave.
-	WitnessArchive(seg *ArchiveSegment, payload []byte) (*CustodyAck, error)
+	// that it existed. deployment is the ledger's durable custody
+	// scope the witness request must carry — the returned
+	// acknowledgement is the verified custody reference the ledger
+	// persists with the segment before any row may leave, and it must
+	// bind that exact scope.
+	WitnessArchive(seg *ArchiveSegment, payload []byte, deployment string) (*CustodyAck, error)
 	// CustodyTrustRoot declares the witness trust under which this
 	// custodian's acknowledgements must verify — controlled
 	// configuration, never learned from an acknowledgement. The
@@ -357,7 +359,11 @@ func (l *Ledger) ArchiveCompleted(limit int) (*ArchiveSegment, error) {
 	}
 
 	if custodian != nil {
-		ack, err := custodian.WitnessArchive(seg, segBytes)
+		dep, derr := l.custodyDeployment()
+		if derr != nil {
+			return nil, fmt.Errorf("archive custody scope: %w", derr)
+		}
+		ack, err := custodian.WitnessArchive(seg, segBytes, dep)
 		if err != nil {
 			// The archive rows and the pending segment are durable; the
 			// operational rows were never released. A later pass retries
@@ -366,10 +372,10 @@ func (l *Ledger) ArchiveCompleted(limit int) (*ArchiveSegment, error) {
 		}
 		// The boundary verifies — the adapter's own check is defense
 		// in depth, never the enforcement point: the recorded ack must
-		// bind this exact segment and verify under the resolved
-		// (operator-administered) trust root before any operational
-		// row may leave.
-		if err := verifyArchiveCustodyAck(seg, ack, l.custodyVerifyRoot(custodian.CustodyTrustRoot())); err != nil {
+		// bind this exact segment and this ledger's deployment scope,
+		// and verify under the resolved (operator-administered) trust
+		// root before any operational row may leave.
+		if err := verifyArchiveCustodyAck(seg, ack, l.custodyVerifyRoot(custodian.CustodyTrustRoot()), dep); err != nil {
 			return nil, fmt.Errorf("archive custody acknowledgement failed boundary verification — the segment stays pending: %w", err)
 		}
 		if err := l.completeCustodial(seg, ack); err != nil {
@@ -453,6 +459,13 @@ func (l *Ledger) retryPendingCustody(c ArchiveCustodian) error {
 	if err != nil {
 		return err
 	}
+	if len(pending) == 0 {
+		return nil
+	}
+	dep, err := l.custodyDeployment()
+	if err != nil {
+		return fmt.Errorf("archive custody scope: %w", err)
+	}
 	for _, seg := range pending {
 		// Re-derive the canonical payload from the durable archive
 		// rows — the custodian holds the bytes, so the retry hands
@@ -461,11 +474,11 @@ func (l *Ledger) retryPendingCustody(c ArchiveCustodian) error {
 		if err != nil {
 			return fmt.Errorf("archive custody retry for segment %d cannot rebuild payload: %w", seg.Seq, err)
 		}
-		ack, err := c.WitnessArchive(seg, payload)
+		ack, err := c.WitnessArchive(seg, payload, dep)
 		if err != nil {
 			return fmt.Errorf("archive custody witness refused segment %d: %w", seg.Seq, err)
 		}
-		if err := verifyArchiveCustodyAck(seg, ack, l.custodyVerifyRoot(c.CustodyTrustRoot())); err != nil {
+		if err := verifyArchiveCustodyAck(seg, ack, l.custodyVerifyRoot(c.CustodyTrustRoot()), dep); err != nil {
 			return fmt.Errorf("archive custody acknowledgement for segment %d failed boundary verification: %w", seg.Seq, err)
 		}
 		if err := l.completeCustodial(seg, ack); err != nil {

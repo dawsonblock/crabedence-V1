@@ -83,6 +83,12 @@ type RunIdentity struct {
 	// presents this exact nonce — a matching command or sandbox name
 	// alone never authorizes adoption.
 	Nonce string
+	// RetainedByPolicy reports that a refused dispatch left a real
+	// instance the backend's retention policy intentionally keeps.
+	// Set only alongside ErrDispatchRefused — never on a launched
+	// run — so the caller can inventory the retained resource while
+	// still attesting the workload never ran.
+	RetainedByPolicy bool
 }
 
 // DispatchPlan is the dispatch identity computed BEFORE any VM exists:

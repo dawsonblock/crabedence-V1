@@ -55,6 +55,7 @@ func bindingFor(ack *AckRecord) *AckBinding {
 		RowCount:         ack.RowCount,
 		PayloadSHA256:    ack.PayloadSHA256,
 		RequestCreatedAt: ack.RequestCreatedAt,
+		DeploymentID:     ack.DeploymentID,
 	}
 }
 
@@ -145,6 +146,54 @@ func TestVerifyWitnessAckRejectsReplayedAck(t *testing.T) {
 	}())
 	if err := VerifyWitnessAck(replay, want, trust); err == nil {
 		t.Fatal("an ack for an earlier request instance satisfied this one")
+	}
+}
+
+// Deployment scope: a v3 ack attests the requesting deployment — a
+// scoped want refuses acks minted for another deployment, unscoped
+// records, and records whose signed scope was stripped. An unscoped
+// want verifies v3 acks of any deployment (chain verification does
+// not adjudicate scope).
+func TestVerifyWitnessAckDeploymentScope(t *testing.T) {
+	signer, _ := evidence.GenerateSigner()
+	trust := NewTrustRoot(signer.PublicKey())
+
+	v3 := func(dep string) *AckRecord {
+		a := v2Ack()
+		a.RecordType = AckRecordTypeV3
+		a.DeploymentID = dep
+		return a
+	}
+	scopedWant := bindingFor(v3("ledger-A"))
+
+	// The right deployment verifies.
+	if err := VerifyWitnessAck(signedAck(t, signer, v3("ledger-A")), scopedWant, trust); err != nil {
+		t.Fatalf("the deployment's own ack refused: %v", err)
+	}
+	// A genuinely signed ack for another deployment is refused.
+	if err := VerifyWitnessAck(signedAck(t, signer, v3("ledger-B")), scopedWant, trust); err == nil {
+		t.Fatal("an ack minted under a foreign deployment satisfied this ledger's scope")
+	}
+	// A v2 record — no signed deployment field — cannot satisfy a
+	// scoped want even when it claims the field.
+	claimed := signedAck(t, signer, func() *AckRecord {
+		a := v2Ack()
+		a.DeploymentID = "ledger-A" // present in JSON but unsigned
+		return a
+	}())
+	if err := VerifyWitnessAck(claimed, scopedWant, trust); err == nil {
+		t.Fatal("an unsigned deployment claim satisfied a scoped binding")
+	}
+	// An unscoped want accepts the v3 ack — scope is the requester's
+	// requirement, not the record's defect.
+	if err := VerifyWitnessAck(signedAck(t, signer, v3("ledger-A")), bindingFor(v2Ack()), trust); err != nil {
+		t.Fatalf("an unscoped binding refused a scoped ack: %v", err)
+	}
+	// Tampering with the signed deployment field breaks the signature.
+	tampered := signedAck(t, signer, v3("ledger-A"))
+	tampered.DeploymentID = "ledger-B"
+	if err := VerifyWitnessAck(tampered, bindingFor(v3("ledger-B")), trust); err == nil {
+		t.Fatal("a re-scoped signature verified")
 	}
 }
 
