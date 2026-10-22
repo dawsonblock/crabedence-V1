@@ -289,7 +289,6 @@ func main() {
 	n, _ = pending(ledgerA)
 	outageHeld := n == 1
 	report("outage-hold", fmt.Sprintf("witness killed mid-queue: pending=%d (want 1, row must outlive the crash)", n), outageHeld)
-	primary.stop()
 	primary, err = startCustodyd(bin, *workdir, "primary")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "sandbox-custody-drill: restart:", err)
@@ -309,9 +308,7 @@ func main() {
 	report("replay", fmt.Sprintf("seized ack re-presented for a new row: pending=%d (want 1 — binding refusal)", n), n == 1)
 	_ = ledgerA.DrainRecoveryCustody(tap, audit) // clear the row legitimately for the next drill
 	n, _ = pending(ledgerA)
-	if n != 0 {
-		report("replay-clear", fmt.Sprintf("legitimate drain after refused replay: pending=%d (want 0)", n), false)
-	}
+	report("replay-clear", fmt.Sprintf("legitimate drain after refused replay: pending=%d (want 0)", n), n == 0)
 
 	// ── forgery: unapproved witness ──────────────────────────────────
 	rogue, err := startCustodyd(bin, *workdir, "rogue")

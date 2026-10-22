@@ -252,6 +252,18 @@ creation), and a row whose contract cannot be parsed or that declares no timeout
 is never released this way: the bound cannot be established, so the reservation
 is held rather than guessed away.
 
+A cleanup that resolves by retention is a third outcome, not a form of
+absence: `RETAINED_BY_POLICY` (the keep-sandboxes policy deliberately holds a
+failed-launch VM for inspection) resolves the cleanup obligation, but the
+live instance is inventoried in `retained_resources` under its persisted
+dispatch identity — including on the refused-dispatch path, where a retained
+leftover stays a refusal rather than going ambiguous. Live retained resources
+count into the residue escalation and are visible to operators through
+`sandbox-history retained LEDGER.db`; `dispose-retained LEDGER.db JOB_ID`
+closes the record (it takes the ledger fence, so the executor must be
+stopped — correct semantics for terminal bookkeeping, and a re-record attempt
+after disposal is refused).
+
 ## Registry archival
 
 The registry bound counts **active** work — jobs whose outcome or cleanup could
@@ -280,7 +292,11 @@ release. The witness is an independent attestor with its own key and store:
 - It stores the payload content-addressed under `segments/<sha256>` only after
   re-deriving the digest from the bytes it received — a payload that digests
   otherwise, carries the wrong row count, or strays outside the claimed
-  terminal range is refused and nothing is stored.
+  terminal range is refused and nothing is stored. Two request shapes are
+  spoken: `witness_archive` validates the canonical row array against the
+  declared terminal range, and `witness_checkpoint` (used for recovery-outbox
+  payloads) requires a single JSON record at exactly one outbox position —
+  each op's payload shape is checked, never the other's.
 - Each acknowledgement is appended to `acks.jsonl` as a signed record chained
   to the previous one (`prev_ack_sha256` is the digest of the previous raw
   line), signed with the witness's own Ed25519 key — a key the executor never
@@ -296,10 +312,12 @@ release. The witness is an independent attestor with its own key and store:
   acknowledgements by witnesses the operator never approved.
 
 The response carries the complete signed acknowledgement (record type
-`archive-custody-ack/v2`), and the executor independently verifies it before
+`archive-custody-ack/v3`), and the executor independently verifies it before
 any row may leave: the record must bind this exact segment (sequence,
-terminal range, row count, payload digest, and the request's own
-`created_at`), carry a signer identity consistent with its embedded public
+terminal range, row count, payload digest, the request's own `created_at`,
+and the ledger's `deployment_id` — a durable per-ledger scope minted once in
+`executor_meta`, so an acknowledgement issued to one ledger is evidence for
+no other), carry a signer identity consistent with its embedded public
 key, hold a valid Ed25519 signature over the versioned custody domain — and
 the signer must be an approved witness. Witness trust is explicit
 configuration, never learned from a response: `-archive-custody-trust-file`
@@ -325,6 +343,22 @@ If the custodian cannot be reached or refuses, the archive rows and the
 pending segment are durable but the operational rows are never released; the
 handoff retries on every later archive pass and across restarts, idempotent on
 the segment digest.
+
+Signed recovery checkpoints travel the same path: `EmitRecoveryCheckpoint`
+queues each new chain head in a durable outbox (`recovery_outbox`) before the
+ledger ever claims custody, and `DrainRecoveryCustody` witnesses pending rows
+to the daemon (`witness_checkpoint`) — an acknowledgement is recorded only
+after the boundary re-verifies it binds the durable row's own committed
+request instance and the ledger's deployment scope. A witness killed
+mid-queue loses nothing: the row stays pending and drains on the next pass.
+
+`sandbox-custody-drill` is the live exercise for all of this — it launches a
+real `sandbox-custodyd` (own key, own store, unix socket) against a real
+ledger and runs the qualification drills: baseline custody, witness killed
+mid-queue and restarted, a seized acknowledgement replayed against a new row,
+an unapproved-witness forgery, a foreign-deployment acknowledgement replayed
+across ledgers, and a `-verify` audit of the custody store. Exit is non-zero
+when any drill does not produce its required refusal/survival.
 
 ## Continuous recovery
 

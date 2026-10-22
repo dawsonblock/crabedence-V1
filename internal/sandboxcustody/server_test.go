@@ -272,3 +272,110 @@ func strings64(c byte) string {
 	}
 	return string(b)
 }
+
+// checkpointPayload builds a single signed-record payload — the shape
+// recovery-custody witness requests carry, a JSON object rather than
+// the archive segment's row array.
+func checkpointPayload(t *testing.T) ([]byte, string) {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{
+		"schema":            "recovery-checkpoint",
+		"chain_head_sha256": strings64('a'),
+		"signature":         "sig",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(payload)
+	return payload, hex.EncodeToString(sum[:])
+}
+
+func checkpointReq(seq int64, payload []byte, sha string) *WitnessRequest {
+	return &WitnessRequest{
+		Op:               OpWitnessCheckpoint,
+		SegmentSeq:       seq,
+		FirstTerminalSeq: seq,
+		LastTerminalSeq:  seq,
+		RowCount:         1,
+		SHA256:           sha,
+		CreatedAt:        time.Now().UTC().UnixMilli(),
+		PayloadB64:       base64.StdEncoding.EncodeToString(payload),
+	}
+}
+
+// A checkpoint witness request custodies one signed record at one
+// outbox position and is acknowledged like any other segment.
+func TestWitnessCheckpointAccepted(t *testing.T) {
+	dir := t.TempDir()
+	srv := startCustody(t, dir)
+	payload, sha := checkpointPayload(t)
+	resp, err := (&Client{Socket: srv.SocketPath()}).Witness(
+		context.Background(), checkpointReq(7, payload, sha))
+	if err != nil || !resp.OK {
+		t.Fatalf("checkpoint witness refused: %v %+v", err, resp)
+	}
+	if resp.Ack == nil || resp.Ack.RecordType != AckRecordTypeV3 || resp.Ack.PayloadSHA256 != sha {
+		t.Fatalf("checkpoint ack malformed: %+v", resp.Ack)
+	}
+}
+
+// The checkpoint op must not be a payload-shape bypass: an archive
+// row array under the checkpoint op is refused, and a checkpoint
+// object under the archive op is refused by the row-array check.
+func TestWitnessPayloadShapeIsOpBound(t *testing.T) {
+	dir := t.TempDir()
+	srv := startCustody(t, dir)
+	cli := &Client{Socket: srv.SocketPath()}
+
+	rows, rowsSHA := testPayload(t, 3)
+	if resp, err := cli.Witness(context.Background(), checkpointReq(3, rows, rowsSHA)); err != nil {
+		t.Fatal(err)
+	} else if resp.OK {
+		t.Fatal("archive row array accepted under the checkpoint op")
+	}
+
+	obj, objSHA := checkpointPayload(t)
+	req := checkpointReq(4, obj, objSHA)
+	req.Op = OpWitnessArchive
+	if resp, err := cli.Witness(context.Background(), req); err != nil {
+		t.Fatal(err)
+	} else if resp.OK {
+		t.Fatal("checkpoint record accepted under the archive op")
+	}
+}
+
+// A checkpoint claim wider than one outbox position is refused — the
+// witness never attests a range it did not inspect.
+func TestWitnessCheckpointRefusesNonUnitPosition(t *testing.T) {
+	dir := t.TempDir()
+	srv := startCustody(t, dir)
+	cli := &Client{Socket: srv.SocketPath()}
+	payload, sha := checkpointPayload(t)
+	for _, req := range []*WitnessRequest{
+		func() *WitnessRequest { r := checkpointReq(5, payload, sha); r.LastTerminalSeq = 6; return r }(),
+		func() *WitnessRequest { r := checkpointReq(5, payload, sha); r.RowCount = 2; return r }(),
+		func() *WitnessRequest { r := checkpointReq(5, payload, sha); r.FirstTerminalSeq = 4; return r }(),
+	} {
+		if resp, err := cli.Witness(context.Background(), req); err != nil {
+			t.Fatal(err)
+		} else if resp.OK {
+			t.Fatalf("non-unit checkpoint claim accepted: %+v", req)
+		}
+	}
+}
+
+// An operation the protocol does not define is refused outright.
+func TestWitnessUnknownOpRefused(t *testing.T) {
+	dir := t.TempDir()
+	srv := startCustody(t, dir)
+	payload, sha := checkpointPayload(t)
+	req := checkpointReq(1, payload, sha)
+	req.Op = "witness_anything"
+	resp, err := (&Client{Socket: srv.SocketPath()}).Witness(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.OK {
+		t.Fatal("unknown op accepted")
+	}
+}

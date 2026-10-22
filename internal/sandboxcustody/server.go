@@ -270,7 +270,7 @@ func (s *Server) witness(req *WitnessRequest) (*WitnessResponse, error) {
 		if err := json.Unmarshal(payload, &obj); err != nil {
 			return nil, fmt.Errorf("checkpoint %d payload is not a JSON record: %w", req.SegmentSeq, err)
 		}
-	default:
+	case OpWitnessArchive:
 		var rows []payloadRow
 		if err := json.Unmarshal(payload, &rows); err != nil {
 			return nil, fmt.Errorf("segment %d payload is not the canonical row array: %w", req.SegmentSeq, err)
@@ -284,6 +284,11 @@ func (s *Server) witness(req *WitnessRequest) (*WitnessResponse, error) {
 					req.SegmentSeq, i, r.TerminalSeq, req.FirstTerminalSeq, req.LastTerminalSeq)
 			}
 		}
+	default:
+		// The connection gate admits only the two known ops — an op
+		// that reaches here without its own payload-shape check is a
+		// protocol addition that skipped validation, not an archive.
+		return nil, fmt.Errorf("op %q has no payload validation", req.Op)
 	}
 
 	s.mu.Lock()
