@@ -5,11 +5,11 @@
   "lanes": {
     "apple-hypervisor-framework": {
       "architecture": "arm64",
-      "digest": "sha256:80dc3cfc45ae547207a41dad6f0e8bf86fbf11fe53e1b3e3a075893ba132c01d"
+      "digest": "sha256:b8d63c04cb26910a5e5e6fb1ff569ee5c54df0b7fa8ca401853c147645ffc56b"
     },
     "linux-kvm": {
       "architecture": "amd64",
-      "digest": "sha256:3d361d7fea344d55ac7a0f51ed7faa99213808ccc96fc9b9170adb95b6570b96"
+      "digest": "sha256:065c242211a32384e228ac6d7d45be2a349cdd06b18cbbf222a5ac4a351fe0ff"
     }
   }
 }
