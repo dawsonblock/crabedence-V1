@@ -420,6 +420,10 @@ def cmd_verify(args):
     f = Findings()
     archive = os.path.abspath(args.archive)
     f.require(os.path.isfile(archive), f"archive not found: {archive}")
+    f.require(os.path.isfile(args.manifest),
+              f"source manifest not found: {args.manifest}")
+    f.require(os.path.isfile(args.attestation),
+              f"attestation not found: {args.attestation}")
     verify_signature(args)
 
     with open(args.manifest) as fh:

@@ -1055,6 +1055,16 @@ func (s *Server) driveDispatch(j *LedgerJob, contract *JobContractV2) (string, e
 			if err := s.ledger.RecordRetainedResource(j.JobID, s.backendName, disp.Handle, disp.Nonce,
 				fmt.Sprintf("dispatch refused — backend retained the leftover instance by policy: %v", derr)); err != nil {
 				s.audit("job %s: retained-resource inventory record failed (%v) — the instance exists but is not inventoried", j.JobID, err)
+				// Fail closed: the dispatch plan persisted the handle
+				// and nonce, so a pending mark gives the straggler
+				// walk a live retry — it re-runs the backend
+				// classification and re-attempts the inventory record
+				// rather than letting a retained VM escape resource
+				// accounting on a transient write failure.
+				if merr := s.ledger.MarkCleanupPendingFor(j.JobID,
+					fmt.Sprintf("retained-resource inventory record failed — retry owed: %v", err), nil); merr != nil {
+					s.audit("job %s: could not mark the retained-instance inventory retry pending (%v) — the instance is live and uninventoried", j.JobID, merr)
+				}
 			}
 		}
 		s.checkpoint()

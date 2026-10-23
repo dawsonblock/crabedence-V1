@@ -543,6 +543,52 @@ func TestRetentionInventoryCoversRefusedDispatch(t *testing.T) {
 	srv.Stop()
 }
 
+// TestRetentionInventoryRecordFailureMarksObligationPending: the
+// refused-dispatch inventory write is fail-closed. When the ledger
+// refuses the record — here because a disposed record for the same
+// job is final — the cleanup obligation is marked durably pending so
+// the straggler walk keeps the live instance visible. A retained VM
+// must never escape resource accounting behind a terminal refusal
+// and a transient write failure.
+func TestRetentionInventoryRecordFailureMarksObligationPending(t *testing.T) {
+	key, keys := testAuthority(t)
+	bin, _ := fakeMSB(t, map[string]string{"MSB_FAKE_CREATE_FAIL_AFTER": "1"})
+	be := testBackend(t, bin, filepath.Join(t.TempDir(), "artifacts"))
+	be.KeepSandboxes = true
+	srv := startServer(t, Config{SocketDir: socketDir(t), Peers: selfPeer(t), AuthorityKeys: keys, Backend: be})
+	conn, reader := connect(t, srv.SocketPath())
+
+	// Poison the inventory first: a disposed record for this job is
+	// final, so the refused path's inventory write below must fail —
+	// the durable obligation mark is then the only accounting left.
+	if err := srv.Ledger().RecordRetainedResource("retain-refused-fail", "microsandbox", "old", "old", "seed"); err != nil {
+		t.Fatalf("seed retention: %v", err)
+	}
+	if err := srv.Ledger().DisposeRetainedResource("retain-refused-fail"); err != nil {
+		t.Fatalf("dispose seed: %v", err)
+	}
+
+	resp := sendJob(t, conn, reader, signedJobReq(t, key, func(c *JobContractV2) {
+		c.JobID = "retain-refused-fail"
+		c.Nonce = "n-rref-fail"
+	}))
+	if resp.OK || resp.State != JobStateDispatchFailed {
+		t.Fatalf("a retained-refusal must refuse, not report success: %+v", resp)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		lj, _ := srv.Ledger().Get("retain-refused-fail")
+		if lj != nil && lj.CleanupPending {
+			srv.Stop()
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	lj, _ := srv.Ledger().Get("retain-refused-fail")
+	srv.Stop()
+	t.Fatalf("an unrecorded retained instance left no pending obligation: %+v", lj)
+}
+
 // TestCleanupSubstituteAfterRemovalSurvives: the adversary cannot
 // mint our nonce-bound name — but if the runtime itself is hostile,
 // a foreign record could be planted under it between the delete

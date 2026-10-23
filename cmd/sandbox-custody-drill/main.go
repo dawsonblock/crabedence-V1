@@ -112,7 +112,10 @@ func startCustodyd(bin, root, name string) (*custodyd, error) {
 			cmd.Process.Kill()
 			return nil, fmt.Errorf("custodyd %s did not create its socket", name)
 		}
-		if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
+		// ProcessState stays nil until Wait returns, so probe liveness
+		// directly — an early custodyd exit must fail the drill now,
+		// not after the deadline.
+		if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
 			return nil, fmt.Errorf("custodyd %s exited during startup", name)
 		}
 		time.Sleep(50 * time.Millisecond)

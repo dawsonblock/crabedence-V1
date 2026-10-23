@@ -1319,8 +1319,10 @@ func (l *Ledger) RecordRetainedResource(jobID, backendID, handle, nonce, reason 
 // DisposeRetainedResource marks a retained resource finally removed —
 // the instance the policy kept is verifiably gone. The inventory row
 // is preserved (it is evidence a resource existed), only its live
-// status closes. Idempotent: disposing an already-disposed record is
-// a no-op.
+// status closes. Disposal is terminal bookkeeping and refuses
+// repetition: a second dispose, or one naming a job that was never
+// retained, fails rather than recording a quiet no-op — a mistaken or
+// replayed disposal must never look like a fresh resolution.
 func (l *Ledger) DisposeRetainedResource(jobID string) error {
 	res, err := l.db.Exec(
 		`UPDATE retained_resources SET disposed_at_ms = ? WHERE job_id = ? AND disposed_at_ms IS NULL`,
